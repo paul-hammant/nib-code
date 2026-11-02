@@ -70,6 +70,15 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
             assert ("end" if ok else "error") in events[-1], events
             return events
 
+        ask("plain text", "--effort", "high", overrides={"NIB_THINKING": "off"})
+        assert requests()[-1]["body"]["reasoning"]["effort"] == "high"
+        ask("plain text", "--effort", "off")
+        assert requests()[-1]["body"]["reasoning"]["effort"] == "low"
+        ask("plain text", "--effort", "default", overrides={"NIB_REASONING_EFFORT": "high"})
+        assert "reasoning" not in requests()[-1]["body"]
+        invalid = ask("plain text", "--effort", "hgh", ok=False)
+        assert "--effort" in invalid[-1]["error"]["message"]
+
         plain = ask("plain text")
         assert plain[-1]["end"]["text"] == "Mock text complete."
         assert "".join(e["delta"]["text"] for e in plain if e.get("delta", {}).get("kind") == "text") == "Mock text complete."

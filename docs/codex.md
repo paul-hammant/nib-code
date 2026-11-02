@@ -28,6 +28,19 @@ NIB_PROVIDER=codex NIB_MODEL=gpt-6-sol NIB_REASONING_EFFORT=high ./zig-out/bin/n
 
 未知模型需设置 NIB_CONTEXT_WINDOW，避免猜测窗口。模型是否可用取决于账号。
 
+也可以不用环境变量，直接控制当前进程的 effort：
+
+```sh
+NIB_PROVIDER=codex ./zig-out/bin/nib --effort high
+NIB_PROVIDER=codex ./zig-out/bin/nib ask --effort high '你好'
+```
+
+TUI 用 `/effort` 查询，`/effort high` 切换，状态栏显示请求使用的 effort。
+
+`--effort` 和 `/effort` 接受 `default|off|none|minimal|low|medium|high|xhigh|max`，具体档位是否可用由模型和服务端决定。显式档位会启用 thinking 并覆盖环境配置；`off` 按模型能力关闭或降到最低档；`default` 清除 thinking/effort 覆盖，交由服务端决定。这里只显示客户端请求配置，不代表服务端确认的实际推理量。
+
+TUI 切换只在空闲时处理，从后续 Turn 生效，子 agent 同步继承；不会写入持久配置，恢复会话时仍以本次启动参数和环境变量为准。摘要继续使用独立的最低推理策略。
+
 NIB_THINKING=on 默认用 medium；NIB_REASONING_EFFORT 可显式指定服务端支持的 effort。NIB_THINKING=off 覆盖 effort：能关闭的模型用 none，sol/astra 用允许的最低档 low；未设置则沿用服务端默认。
 
 摘要始终使用当前模型，保留原请求前缀和该模型的加密推理条目，以命中缓存并避免跨模型传递密文。能关闭推理时关闭，否则用 low。Codex 摘要不沿用 Chat Completions 的小额总输出限制：按 pi 的请求格式不发送 max_output_tokens，保留服务端正常输出额度；原 32–2048-token 预算只写进提示约束摘要文字，给推理留出空间（pi 目录 maxTokens 为 128000，实际限额仍由服务端决定）。空摘要、截断、压缩无效等失败，自动压缩发 notice 后继续；手动压缩报告错误。

@@ -66,6 +66,10 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
             agent_input = true;
         } else if (ask and std.mem.eql(u8, arg, "--json")) {} else if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--continue")) {
             options.continue_latest = true;
+        } else if (std.mem.eql(u8, arg, "--effort")) {
+            i += 1;
+            if (i == args.len) return error.MissingReasoningEffort;
+            try cfg.llm.setEffort(args[i]);
         } else if (std.mem.eql(u8, arg, "--resume")) {
             i += 1;
             if (i == args.len) return error.MissingSessionId;
@@ -154,6 +158,7 @@ fn onSignal(_: std.posix.SIG) callconv(.c) void {
 
 fn errorMessage(err: anyerror) []const u8 {
     return switch (err) {
+        error.InvalidReasoningEffort, error.MissingReasoningEffort => "Use --effort default|off|none|minimal|low|medium|high|xhigh|max (model support varies).",
         error.SessionProviderMismatch => "Cannot resume this session with a different provider; use its original NIB_PROVIDER or start a new session.",
         error.SessionModelMismatch => "Cannot resume this Codex session with a different model; set NIB_MODEL to its original model or start a new session.",
         error.UnknownCodexModelContextWindow => "Unknown Codex model context window; set NIB_CONTEXT_WINDOW explicitly (see pi model catalog).",

@@ -24,7 +24,7 @@ pub fn contextWindow(model: []const u8) !u64 {
     return (modelInfo(model) orelse return error.UnknownCodexModelContextWindow).context_window;
 }
 
-fn reasoningEffort(cfg: p.Config) ?[]const u8 {
+pub fn reasoningEffort(cfg: p.Config) ?[]const u8 {
     if (cfg.thinking == false) {
         if (modelInfo(cfg.model)) |model| if (!model.can_disable_reasoning) return "low";
         return "none";

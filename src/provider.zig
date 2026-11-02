@@ -37,6 +37,27 @@ pub const Config = struct {
         };
     }
 
+    pub fn setEffort(cfg: *Config, value: []const u8) !void {
+        if (std.mem.eql(u8, value, "default")) {
+            cfg.thinking = null;
+            cfg.reasoning_effort = null;
+        } else if (std.mem.eql(u8, value, "off")) {
+            cfg.thinking = false;
+            cfg.reasoning_effort = null;
+        } else {
+            const Effort = enum { none, minimal, low, medium, high, xhigh, max };
+            const effort = std.meta.stringToEnum(Effort, value) orelse return error.InvalidReasoningEffort;
+            cfg.thinking = true;
+            cfg.reasoning_effort = @tagName(effort);
+        }
+    }
+
+    pub fn effectiveEffort(cfg: Config) []const u8 {
+        if (cfg.provider == .codex) return codex.reasoningEffort(cfg) orelse "server default";
+        if (cfg.thinking == false) return "off";
+        return cfg.reasoning_effort orelse if (cfg.thinking == true) "on (server default effort)" else "server default";
+    }
+
     pub fn missingKey(cfg: Config) bool {
         return cfg.provider == .chat_completions and cfg.api_key.len == 0;
     }
@@ -149,4 +170,26 @@ test "configuration selects one provider and its model window without credential
     try t.expectError(error.UnknownCodexModelContextWindow, Config.fromEnv(arena.allocator(), &env));
     try env.put("NIB_CONTEXT_WINDOW", "10000");
     try t.expectEqual(@as(u64, 10000), (try Config.fromEnv(arena.allocator(), &env)).context_window);
+}
+
+test "explicit effort overrides thinking and stores stable names" {
+    const t = std.testing;
+    var cfg: Config = .{ .base_url = "", .api_key = "", .model = "gpt-6.1-sol", .provider = .codex, .thinking = false };
+    var value = [_]u8{ 'h', 'i', 'g', 'h' };
+    try cfg.setEffort(&value);
+    value[0] = 'x';
+    try t.expectEqualStrings("high", cfg.effectiveEffort());
+    try t.expectEqual(@as(?bool, true), cfg.thinking);
+    try cfg.setEffort("off");
+    try t.expectEqualStrings("low", cfg.effectiveEffort());
+    try cfg.setEffort("default");
+    try t.expectEqualStrings("server default", cfg.effectiveEffort());
+    try t.expectEqual(@as(?bool, null), cfg.thinking);
+    try t.expectError(error.InvalidReasoningEffort, cfg.setEffort("hgh"));
+    try t.expectEqualStrings("server default", cfg.effectiveEffort());
+    cfg.provider = .chat_completions;
+    try cfg.setEffort("max");
+    try t.expectEqualStrings("max", cfg.effectiveEffort());
+    try cfg.setEffort("off");
+    try t.expectEqualStrings("off", cfg.effectiveEffort());
 }
