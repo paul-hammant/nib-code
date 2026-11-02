@@ -193,5 +193,6 @@ test {
     _ = @import("tui/menu.zig");
     _ = @import("tui/status.zig");
     _ = @import("tui/view.zig");
+    _ = @import("tui/selection.zig");
     _ = @import("session.zig");
 }

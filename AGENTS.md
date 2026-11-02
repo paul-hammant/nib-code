@@ -20,7 +20,7 @@
 - `src/provider.zig`：Provider 接口与配置；`provider/` 下是各线路协议和 SSE 解析。
 - `src/sandbox.zig`：QuickJS Run 与宿主桥接。
 - `src/tools.zig`：工具表（给模型看的 JS 说明集中在这里）、`Tools` 共享状态与调度。`tools/` 下每个工具族一个入口文件，函数名即工具名：`files.zig`（read/edit/write）、`search.zig`（grep/glob）、`web.zig`（fetch）、`bash.zig`、`agent.zig`；其余是它们的辅助模块。加工具：在 `tools/` 写入口函数，再在表里加一行。
-- `src/tui.zig`：TUI 事件循环（按键、`/` 指令分派、Session 事件、后台 Turn）；`tui/` 下：`transcript.zig`（对话条目与折叠）、`viewport.zig`（滚动锚定）、`view.zig`（一帧的布局绘制）、`status.zig`（阶段与状态栏）、`menu.zig`（`/` 候选菜单）、`commands.zig`（指令表）、`editor.zig`（输入框）、`markdown.zig`。
+- `src/tui.zig`：TUI 事件循环（按键、`/` 指令分派、Session 事件、后台 Turn）；`tui/` 下：`transcript.zig`（对话条目与折叠）、`viewport.zig`（滚动锚定）、`view.zig`（一帧的布局绘制）、`status.zig`（阶段与状态栏）、`menu.zig`（`/` 候选菜单）、`commands.zig`（指令表）、`editor.zig`（输入框）、`markdown.zig`、`selection.zig`（鼠标选区、高亮与剪贴板复制）。
 - `tests/`：端到端测试和 mock 服务器；`scripts/`：辅助脚本。
 
 **代码的读者是 agent。** 不写复述代码、解释思路或记录改动历史的注释；过时的注释比没有注释更容易误导模型。只在代码表达不了、不知道就会改错的地方写一行：外部限制、协议怪癖、内存归属、并发不变量。含义靠命名、类型和测试承载；给人看的解释写进 `docs/`。

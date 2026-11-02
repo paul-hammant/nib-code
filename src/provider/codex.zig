@@ -71,8 +71,8 @@ fn authError(gpa: std.mem.Allocator, detail: *?[]u8, message: []const u8) !std.j
     return error.InvalidCredentials;
 }
 
-pub fn stream(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.Client, cfg: p.Config, messages: []const p.Message, tools_json: []const u8, max_tokens: ?u32, sink: p.Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !p.Reply {
-    const body = try requestBody(gpa, cfg, messages, tools_json, max_tokens);
+pub fn stream(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.Client, cfg: p.Config, cache_key: []const u8, messages: []const p.Message, tools_json: []const u8, max_tokens: ?u32, sink: p.Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !p.Reply {
+    const body = try requestBody(gpa, cfg, cache_key, messages, tools_json, max_tokens);
     defer gpa.free(body);
     const url = try std.fmt.allocPrint(gpa, "{s}/codex/responses", .{std.mem.trimEnd(u8, cfg.base_url, "/")});
     defer gpa.free(url);
@@ -89,6 +89,8 @@ pub fn stream(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.
                 .{ .name = "chatgpt-account-id", .value = auth.value.tokens.account_id },
                 .{ .name = "OpenAI-Beta", .value = "responses=experimental" },
                 .{ .name = "originator", .value = "nib" },
+                .{ .name = "session-id", .value = cache_key },
+                .{ .name = "x-client-request-id", .value = cache_key },
             },
         });
         defer req.deinit();
@@ -116,7 +118,7 @@ pub fn stream(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.
     unreachable;
 }
 
-fn requestBody(gpa: std.mem.Allocator, cfg: p.Config, messages: []const p.Message, tools_json: []const u8, max_tokens: ?u32) ![]u8 {
+fn requestBody(gpa: std.mem.Allocator, cfg: p.Config, cache_key: []const u8, messages: []const p.Message, tools_json: []const u8, max_tokens: ?u32) ![]u8 {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -164,8 +166,8 @@ fn requestBody(gpa: std.mem.Allocator, cfg: p.Config, messages: []const p.Messag
     const effort = reasoningEffort(cfg);
     const reasoning = if (effort) |value| try std.fmt.allocPrint(a, ",\"reasoning\":{{\"effort\":{f}}}", .{std.json.fmt(value, .{})}) else "";
     return std.fmt.allocPrint(gpa,
-        \\{{"model":{f},"store":false,"stream":true,"instructions":{f},"input":{s},"include":["reasoning.encrypted_content"]{s}{s}}}
-    , .{ std.json.fmt(cfg.model, .{}), std.json.fmt(instructions, .{}), input.written(), if (tools.len == 0) "" else try std.fmt.allocPrint(a, ",\"tools\":{s}", .{tool_writer.written()}), reasoning });
+        \\{{"model":{f},"prompt_cache_key":{f},"store":false,"stream":true,"instructions":{f},"input":{s},"include":["reasoning.encrypted_content"]{s}{s}}}
+    , .{ std.json.fmt(cfg.model, .{}), std.json.fmt(cache_key, .{}), std.json.fmt(instructions, .{}), input.written(), if (tools.len == 0) "" else try std.fmt.allocPrint(a, ",\"tools\":{s}", .{tool_writer.written()}), reasoning });
 }
 
 const Output = struct {
@@ -285,4 +287,15 @@ test "Codex reasoning mapping and readable summaries" {
     const text = try reasoningText(t.allocator, "[{\"encrypted_content\":\"fake-ciphertext\",\"summary\":[{\"text\":\"readable\"}]}]");
     defer t.allocator.free(text);
     try t.expectEqualStrings("readable", text);
+}
+
+test "Codex request body carries the session cache key" {
+    const t = std.testing;
+    const cfg: p.Config = .{ .provider = .codex, .model = default_model, .api_key = "", .base_url = "" };
+    const cache_key = "0123456789abcdef0123456789abcdef";
+    const body = try requestBody(t.allocator, cfg, cache_key, &.{.{ .role = "user", .content = "hello" }}, "[]", null);
+    defer t.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, body, .{});
+    defer parsed.deinit();
+    try t.expectEqualStrings(cache_key, parsed.value.object.get("prompt_cache_key").?.string);
 }

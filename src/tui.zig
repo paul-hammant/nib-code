@@ -13,6 +13,7 @@ const Viewport = @import("tui/viewport.zig").Viewport;
 const Menu = @import("tui/menu.zig").Menu;
 const status = @import("tui/status.zig");
 const view = @import("tui/view.zig");
+const selection = @import("tui/selection.zig");
 
 const Event = union(enum) {
     key_press: vaxis.Key,
@@ -128,6 +129,7 @@ pub fn run(init: std.process.Init, session: *Session) !void {
         .gpa = gpa,
         .io = io,
         .session = session,
+        .environ = init.environ_map,
         .cfg = session.cfg,
         .vx = &vx,
         .w = w,
@@ -164,6 +166,8 @@ const App = struct {
     vx: *vaxis.Vaxis,
     w: *std.Io.Writer,
     loop: *vaxis.Loop(Event),
+    environ: *const std.process.Environ.Map,
+    selection: selection.Selection = .{},
     transcript: Transcript = .{},
     input: Editor = .{},
     pasting: bool = false,
@@ -193,13 +197,23 @@ const App = struct {
             .key_press => |k| return app.onKey(k),
             .paste_start => app.pasting = true,
             .paste_end => app.pasting = false,
-            .mouse => |m| switch (m.button) {
-                .wheel_up => app.scroll.pending -= 3,
-                .wheel_down => app.scroll.pending += 3,
-                else => {},
+            .mouse => |m| {
+                // vaxis.Loop already translates pixel mouse events to cell coordinates.
+                if (m.button == .wheel_up or m.button == .wheel_down) {
+                    app.selection.clear();
+                    app.scroll.pending += if (m.button == .wheel_up) @as(i64, -3) else 3;
+                } else if (app.selection.mouse(m, &app.vx.screen)) {
+                    const text = try app.selection.text(gpa, &app.vx.screen);
+                    defer gpa.free(text);
+                    try selection.copy(app.vx, app.w, gpa, app.io, app.environ, text);
+                    try app.report(.info, "copied {d} chars", .{try std.unicode.utf8CountCodepoints(text)});
+                }
             },
             .tick => {},
-            .winsize => |ws| try app.vx.resize(gpa, app.w, ws),
+            .winsize => |ws| {
+                app.selection.clear();
+                try app.vx.resize(gpa, app.w, ws);
+            },
             .delta => |d| {
                 defer gpa.free(d.text);
                 if (app.activity.phase != .compacting) app.activity.set(app.io, if (d.kind == .reasoning) .thinking else .writing);
@@ -385,6 +399,7 @@ const App = struct {
     fn render(app: *App) !void {
         try app.menu.load(app.io, app.input.text(), app.session);
         const menu = app.menu.items(app.input.text());
+        if (app.scroll.pending != 0) app.selection.clear();
         view.draw(app.vx.window(), app.transcript.entries.items, &app.input, &app.scroll, menu, @min(app.menu.sel, menu.len -| 1), .{
             .cfg = app.cfg,
             .usage = app.usage,
@@ -392,6 +407,7 @@ const App = struct {
             .context = app.context,
             .busy = if (app.turn != null) app.activity.label(app.io) else null,
         }, &app.status_text);
+        app.selection.highlight(&app.vx.screen);
         try app.vx.render(app.w);
         try app.w.flush();
     }

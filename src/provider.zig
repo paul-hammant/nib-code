@@ -137,6 +137,7 @@ pub fn stream(
     out: std.mem.Allocator,
     client: *std.http.Client,
     cfg: Config,
+    cache_key: []const u8,
     messages: []const Message,
     tools_json: []const u8,
     max_tokens: ?u32,
@@ -146,7 +147,7 @@ pub fn stream(
 ) !Reply {
     return switch (cfg.provider) {
         .chat_completions => chat.stream(gpa, out, client, cfg, messages, tools_json, max_tokens, sink, cancel, detail),
-        .codex => codex.stream(gpa, out, client, cfg, messages, tools_json, max_tokens, sink, cancel, detail),
+        .codex => codex.stream(gpa, out, client, cfg, cache_key, messages, tools_json, max_tokens, sink, cancel, detail),
     };
 }
 

@@ -150,7 +150,7 @@ pub const Session = struct {
         // Thinking would spend the small summary budget on reasoning.
         var cfg = s.cfg;
         cfg.thinking = false;
-        const reply = try provider.stream(s.gpa, a, s.client, cfg, request.items, "[]", @intCast(@min(2048, @max(32, s.cfg.context_window / 8))), .{ .ctx = s, .onDelta = Silent.delta }, cancel, detail);
+        const reply = try provider.stream(s.gpa, a, s.client, cfg, s.id, request.items, "[]", @intCast(@min(2048, @max(32, s.cfg.context_window / 8))), .{ .ctx = s, .onDelta = Silent.delta }, cancel, detail);
         s.usage.add(reply.usage);
         try sink.emit(sink.ctx, .{ .usage = s.usage });
         if (cancel.load(.acquire)) return error.Canceled;
@@ -295,7 +295,7 @@ pub const Session = struct {
         while (true) : (attempt += 1) {
             var fwd: Forward = .{ .sink = sink, .gpa = s.gpa, .partial = partial };
             const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta };
-            return provider.stream(s.gpa, s.arena.allocator(), s.client, s.cfg, messages, tools_json, null, provider_sink, cancel, detail) catch |err| {
+            return provider.stream(s.gpa, s.arena.allocator(), s.client, s.cfg, s.id, messages, tools_json, null, provider_sink, cancel, detail) catch |err| {
                 if (fwd.emitted or attempt == max_attempts or !transient(err) or cancel.load(.acquire)) return err;
                 const delay_ms = @as(u64, 1000) << @intCast(attempt - 1);
                 try sink.emit(sink.ctx, .{ .retry = .{ .attempt = attempt, .delay_ms = delay_ms, .reason = detail.* orelse @errorName(err) } });

@@ -60,6 +60,14 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
         def requests():
             return [json.loads(line) for line in requests_path.read_text().splitlines()]
 
+        def assert_cache_key(recorded, session_id):
+            assert recorded
+            for request in recorded:
+                assert request["body"]["prompt_cache_key"] == session_id, request
+                headers = {k.lower(): v for k, v in request["headers"].items()}
+                assert headers["session-id"] == session_id, headers
+                assert headers["x-client-request-id"] == session_id, headers
+
         def ask(prompt, *args, ok=True, overrides=None, workdir=cwd):
             result = subprocess.run([str(BIN), "ask", "--json", prompt, *args], cwd=workdir,
                                     env=dict(env, **(overrides or {})), capture_output=True, timeout=20)
@@ -98,6 +106,7 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
         assert tool["type"] == "function" and tool["name"] == "run" and tool["strict"] is False
         assert "description" in tool and "parameters" in tool and "function" not in tool
         session = plain[0]["start"]["session_id"]
+        assert_cache_key([request], session)
         history, records = replay(tmp / f"data/nib/sessions/{session}.jsonl")
         assert records[0]["provider"] == "codex" and records[0]["model"] == "gpt-6.1-sol"
         reasoning = history[-1]["reasoning"]
@@ -106,6 +115,7 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
         assert len(items) == 2 and all(item["encrypted_content"].startswith("fake-encrypted-") for item in items)
         assert items[0]["summary"] == [{"type": "summary_text", "text": "Mock reasoning."}]
         ask("plain text", "--resume", session)
+        assert_cache_key(requests()[-1:], session)
         assert all(item in requests()[-1]["body"]["input"] for item in items)
         assert next(item for item in requests()[-1]["body"]["input"] if item.get("role") == "assistant")["phase"] == "final_answer"
         disabled = ask("plain text", overrides={"NIB_MODEL": "gpt-6.1-terra", "NIB_THINKING": "off"})
@@ -128,6 +138,9 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
         assert tool_events[-1]["end"]["usage"] == {"prompt_tokens": 6600, "completion_tokens": 40, "prompt_cache_hit_tokens": 128}
         assert "hello from codex mock" in tool_events[-1]["end"]["text"]
         steps = requests()[before:]
+        tool_id = tool_events[0]["start"]["session_id"]
+        assert tool_id != session
+        assert_cache_key(steps, tool_id)
         second_input = steps[1]["body"]["input"]
         call = next(item for item in second_input if item.get("type") == "function_call")
         result = next(item for item in second_input if item.get("type") == "function_call_output")
@@ -144,13 +157,26 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
             assert request["body"]["model"] == "gpt-6-sol" and request["body"]["reasoning"]["effort"] == "high"
             assert {k.lower(): v for k, v in request["headers"].items()}["authorization"] == "Bearer fake-access-initial"
         assert sum("async agent({" not in r["body"]["instructions"] for r in steps) == 1
+        parent_id = delegated[0]["start"]["session_id"]
+        child_logs = [p for p in (tmp / "data/nib/sessions").glob("*.jsonl")
+                      if json.loads(p.read_text().splitlines()[0]).get("parent_session_id") == parent_id]
+        assert len(child_logs) == 1
+        child_id = child_logs[0].stem
+        assert child_id != parent_id
+        for request in steps:
+            assert_cache_key([request], child_id if "async agent({" not in request["body"]["instructions"] else parent_id)
 
         before = len(requests())
         compact_dir = tmp / "compact"
         compact_dir.mkdir()
         for index in range(3):
-            ask(f"compact {index}", overrides={"NIB_CONTEXT_WINDOW": "4096"}, workdir=compact_dir,
+            compact = ask(f"compact {index}", overrides={"NIB_CONTEXT_WINDOW": "4096"}, workdir=compact_dir,
                 *(["--continue"] if index else []))
+            if index == 0:
+                compact_id = compact[0]["start"]["session_id"]
+            assert compact[0]["start"]["session_id"] == compact_id
+        assert compact_id not in (session, tool_id, parent_id, child_id)
+        assert_cache_key(requests()[before:], compact_id)
         summaries = [r["body"] for r in requests()[before:] if not r["body"].get("tools")]
         assert summaries and all(body["reasoning"]["effort"] == "low" and body["model"] == "gpt-6.1-sol" for body in summaries), summaries
         assert all("max_tokens" not in body and "max_output_tokens" not in body for body in summaries)
