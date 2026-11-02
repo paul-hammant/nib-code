@@ -268,6 +268,28 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
                 stalled.kill()
                 stalled.wait()
 
+        interrupted = subprocess.Popen([str(BIN), "ask", "--json", "interrupt me"],
+                                       cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            session_id = json.loads(interrupted.stdout.readline())["start"]["session_id"]
+            while "partial answer" not in interrupted.stdout.readline().decode():
+                assert interrupted.poll() is None
+            interrupted.terminate()
+            interrupted.communicate(timeout=5)
+            assert interrupted.returncode != 0
+        finally:
+            if interrupted.poll() is None:
+                interrupted.kill()
+                interrupted.wait()
+        interrupted_log = tmp / "data/nib/sessions" / f"{session_id}.jsonl"
+        kept, _ = replay(interrupted_log)
+        assert kept[-2] == {"role": "user", "content": "interrupt me"}, kept
+        assert kept[-1]["content"] == "partial answer\n\n[interrupted by user]", kept[-1]
+        assert kept[-1]["reasoning_content"] == "想一想。", kept[-1]
+        ask("after interrupt", "--resume", session_id)
+        assert read_requests(requests_path)[-2]["messages"] == kept + [{"role": "user", "content": "after interrupt"}]
+        print("Interrupted Turn E2E passed: user message and streamed text are kept, and the session continues")
+
         startup = []
         for _ in range(10):
             started = time.monotonic()

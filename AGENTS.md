@@ -17,7 +17,7 @@
 
 新会话按基础指令、全局 `$XDG_CONFIG_HOME/nib/AGENTS.md`（默认 `~/.config/nib/AGENTS.md`）、项目 `AGENTS.md` 的顺序拼接 system，后者优先。项目目录是从 cwd 向上遇到的第一个 `.git` 标记所在目录；没有则用 cwd。只读取 `AGENTS.md`。恢复会话沿用日志中的原始 system，之后修改指令文件只影响新会话。
 
-会话日志位于 `$XDG_DATA_HOME/nib/sessions/<ID>.jsonl`（默认 `~/.local/share/nib/sessions/`）。日志只在完整 Step 后提交；恢复不重执行已提交的 Run；未完成 Step 可能已产生外部副作用，日志不回滚这些变化。
+会话日志位于 `$XDG_DATA_HOME/nib/sessions/<ID>.jsonl`（默认 `~/.local/share/nib/sessions/`）。日志只在完整 Step 后提交；取消（TUI 的 Esc、ask 收到 SIGTERM/SIGINT）时额外提交本轮用户消息和已流出的文本，末尾标记 `[interrupted by user]`，未完成的工具调用丢弃；恢复不重执行已提交的 Run；未完成 Step 可能已产生外部副作用，日志不回滚这些变化。
 
 `nib ask --json '<prompt>'` 的 stdout 是 NDJSON：每行一个单键对象，按产生顺序输出并立即 flush；stderr 没有人类可读进度或颜色。prompt 为 `-` 时从 stdin 读到 EOF（普通 ask 也支持）。退出码成功 0，失败非 0。
 

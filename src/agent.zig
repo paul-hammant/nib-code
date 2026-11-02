@@ -186,13 +186,57 @@ pub const Session = struct {
     }
 
     pub fn turn(s: *Session, user_text: []const u8, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
-        const a = s.arena.allocator();
         var pending: std.ArrayList(provider.Message) = .empty;
         defer pending.deinit(s.gpa);
-        try pending.append(s.gpa, .{ .role = "user", .content = try a.dupe(u8, user_text) });
+        var partial: Partial = .{};
+        defer partial.deinit(s.gpa);
+        try pending.append(s.gpa, .{ .role = "user", .content = try s.arena.allocator().dupe(u8, user_text) });
         s.usage = .{};
         s.steps = 0;
+        s.runSteps(&pending, &partial, sink, cancel, detail) catch |err| {
+            // A signal can surface as a read error instead of error.Canceled.
+            if (err == error.Canceled or cancel.load(.acquire)) try s.commitInterrupted(pending.items, &partial);
+            return err;
+        };
+    }
 
+    const Partial = struct {
+        text: std.ArrayList(u8) = .empty,
+        reasoning: std.ArrayList(u8) = .empty,
+
+        fn clear(p: *Partial) void {
+            p.text.clearRetainingCapacity();
+            p.reasoning.clearRetainingCapacity();
+        }
+
+        fn deinit(p: *Partial, gpa: std.mem.Allocator) void {
+            p.text.deinit(gpa);
+            p.reasoning.deinit(gpa);
+        }
+    };
+
+    /// Keeps the log in line with the screen: the user message and whatever streamed before Esc.
+    /// An unfinished Step is dropped, since its tool calls would need results.
+    fn commitInterrupted(s: *Session, pending: []const provider.Message, partial: *const Partial) !void {
+        const a = s.arena.allocator();
+        const marker = "[interrupted by user]";
+        const text = if (partial.text.items.len == 0) marker else try std.fmt.allocPrint(a, "{s}\n\n{s}", .{ partial.text.items, marker });
+        var reasoning: ?provider.Reasoning = null;
+        if (s.cfg.provider == .chat_completions and s.cfg.thinking != false) {
+            // DeepSeek thinking mode rejects any later request whose assistant messages lack reasoning_content.
+            reasoning = .{ .provider = .chat_completions, .data = if (partial.reasoning.items.len == 0) marker else try a.dupe(u8, partial.reasoning.items) };
+        }
+        var messages: std.ArrayList(provider.Message) = .empty;
+        defer messages.deinit(s.gpa);
+        for (pending) |m| {
+            if (!std.mem.eql(u8, m.role, "user")) break;
+            try messages.append(s.gpa, m);
+        }
+        try messages.append(s.gpa, .{ .role = "assistant", .content = text, .reasoning = reasoning });
+        try s.commit(s.history.items.len, messages.items, s.context_tokens + estimateTokens(messages.items), null);
+    }
+
+    fn runSteps(s: *Session, pending: *std.ArrayList(provider.Message), partial: *Partial, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
         for (0..max_steps) |_| {
             const size = s.context_tokens + estimateTokens(pending.items);
             if (size >= s.cfg.context_window - s.cfg.context_window / 4 and size >= s.compact_backoff)
@@ -201,7 +245,8 @@ pub const Session = struct {
             defer request.deinit(s.gpa);
             try request.appendSlice(s.gpa, s.history.items);
             try request.appendSlice(s.gpa, pending.items);
-            const reply = try s.complete(request.items, sink, cancel, detail);
+            const reply = try s.complete(request.items, sink, cancel, detail, partial);
+            partial.clear();
             s.usage.add(reply.usage);
             try sink.emit(sink.ctx, .{ .usage = s.usage });
             s.steps += 1;
@@ -231,19 +276,22 @@ pub const Session = struct {
 
     /// Retries transient failures, but only while nothing has been streamed:
     /// a retry after partial output would duplicate it in the frontend.
-    fn complete(s: *Session, messages: []const provider.Message, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !provider.Reply {
+    fn complete(s: *Session, messages: []const provider.Message, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, partial: *Partial) !provider.Reply {
         const Forward = struct {
             sink: Sink,
+            gpa: std.mem.Allocator,
+            partial: *Partial,
             emitted: bool = false,
             fn onDelta(ctx: *anyopaque, kind: provider.Kind, text: []const u8) !void {
                 const f: *@This() = @ptrCast(@alignCast(ctx));
                 f.emitted = true;
+                try (if (kind == .text) &f.partial.text else &f.partial.reasoning).appendSlice(f.gpa, text);
                 try f.sink.emit(f.sink.ctx, .{ .delta = .{ .kind = kind, .text = text } });
             }
         };
         var attempt: u32 = 1;
         while (true) : (attempt += 1) {
-            var fwd: Forward = .{ .sink = sink };
+            var fwd: Forward = .{ .sink = sink, .gpa = s.gpa, .partial = partial };
             const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta };
             return provider.stream(s.gpa, s.arena.allocator(), s.client, s.cfg, messages, tools_json, null, provider_sink, cancel, detail) catch |err| {
                 if (fwd.emitted or attempt == max_attempts or !transient(err) or cancel.load(.acquire)) return err;
