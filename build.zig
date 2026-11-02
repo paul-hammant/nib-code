@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // QuickJS-ng core only: no quickjs-libc, so scripts get no fs/net/process.
+    // No quickjs-libc: it would give scripts fs/net/process access.
     const qjs_dep = b.dependency("quickjs", .{});
     const qjs = b.addLibrary(.{
         .name = "quickjs",

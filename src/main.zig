@@ -7,7 +7,6 @@ const agent = @import("agent.zig");
 pub const Config = struct {
     llm: openai.Config,
 
-    /// `DEEPSEEK_API_KEY` (or `NIB_API_KEY`), `NIB_BASE_URL`, `NIB_MODEL`.
     fn fromEnv(env: *const std.process.Environ.Map) Config {
         return .{ .llm = .{
             .api_key = env.get("NIB_API_KEY") orelse env.get("DEEPSEEK_API_KEY") orelse "",
@@ -26,7 +25,6 @@ pub fn main(init: std.process.Init) !void {
     var out = std.Io.File.stdout().writer(init.io, &out_buf);
     const stdout = &out.interface;
 
-    // `nib js '<code>'`: evaluate one script in the sandbox and print the result.
     if (args.len >= 3 and std.mem.eql(u8, args[1], "js")) {
         const r = try js.eval(gpa, init.io, args[2], .{}, null, null);
         defer r.deinit(gpa);
@@ -40,7 +38,6 @@ pub fn main(init: std.process.Init) !void {
     defer client.deinit();
     try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
 
-    // `nib ask '<prompt>'`: one headless Turn. Answer on stdout, Runs on stderr.
     if (args.len >= 3 and std.mem.eql(u8, args[1], "ask")) {
         if (cfg.llm.api_key.len == 0) fatal("set DEEPSEEK_API_KEY (or NIB_API_KEY)");
         var session = try agent.Session.init(gpa, init.io, &client, cfg.llm);

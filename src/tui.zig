@@ -1,7 +1,3 @@
-//! Chat TUI: transcript above, input line below. A Turn runs on a worker
-//! thread that posts events into the vaxis queue, so the UI thread never
-//! blocks on the network or on a Run.
-
 const std = @import("std");
 const vaxis = @import("vaxis");
 const js = @import("js.zig");
@@ -11,7 +7,7 @@ const openai = @import("provider/openai.zig");
 const Event = union(enum) {
     key_press: vaxis.Key,
     winsize: vaxis.Winsize,
-    /// Slices below are owned by the receiver.
+    /// Slices are owned by the receiver.
     delta: struct { kind: openai.Kind, text: []u8 },
     run_start: []u8,
     run_end: struct { ok: bool, output: []u8 },
@@ -24,11 +20,9 @@ const Entry = struct {
     text: std.ArrayList(u8) = .empty,
 };
 
-/// Lines of Run output shown in the transcript; the model sees all of it.
 const run_output_lines = 12;
 
-/// Owns the worker thread for one Turn. The Session is not touched by the UI
-/// thread while a Turn is running.
+/// The UI thread must not touch the Session while a Turn is running.
 const Turn = struct {
     gpa: std.mem.Allocator,
     session: *agent.Session,
@@ -96,7 +90,6 @@ pub fn run(init: std.process.Init, client: *std.http.Client, cfg: openai.Config)
         entries.deinit(gpa);
     }
 
-    // Session.usage is written by the worker; copy it after each Turn ends.
     var usage: openai.Usage = .{};
     var turn: ?*Turn = null;
     defer if (turn) |t| {
@@ -179,7 +172,6 @@ pub fn run(init: std.process.Init, client: *std.http.Client, cfg: openai.Config)
     }
 }
 
-/// Append at most `max_lines` lines of `text`, noting how many were left out.
 fn appendHead(gpa: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8, max_lines: usize) !void {
     var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, text, "\n"), '\n');
     var n: usize = 0;
@@ -228,8 +220,7 @@ fn draw(win: vaxis.Window, entries: []const Entry, input: *vaxis.widgets.TextInp
     if (win.height < 4 or win.width < 4) return;
 
     const body = win.child(.{ .x_off = 1, .width = win.width - 2, .height = win.height - 3 });
-    // A window extending far above `body` lets us measure wrapped height
-    // without clipping; nothing is drawn while measuring.
+    // Measuring needs a window taller than the content, or print() clips.
     const tall = body.child(.{ .y_off = -10_000 });
 
     var heights: [256]u16 = undefined;

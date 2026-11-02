@@ -1,6 +1,3 @@
-//! OpenAI-compatible Chat Completions with streaming and tool calls. Covers
-//! DeepSeek, OpenRouter, vLLM, Ollama and friends.
-
 const std = @import("std");
 const sse = @import("../sse.zig");
 
@@ -33,7 +30,7 @@ pub const Usage = struct {
     prompt_cache_hit_tokens: u64 = 0,
 };
 
-/// One model response, allocated with the `out` allocator passed to `stream`.
+/// Allocated with the `out` allocator passed to `stream`.
 pub const Reply = struct {
     text: []const u8,
     tool_calls: []const ToolCall,
@@ -77,9 +74,7 @@ const PartialCall = struct {
     }
 };
 
-/// Stream one completion. `tools_json` is the raw JSON array for the `tools`
-/// field. On a non-2xx status returns `error.HttpStatus` and sets `detail` to
-/// the response body (caller frees).
+/// On `error.HttpStatus`, `detail` holds the response body (caller frees).
 pub fn stream(
     gpa: std.mem.Allocator,
     out: std.mem.Allocator,
@@ -131,7 +126,6 @@ pub fn stream(
 
     var parser: sse.Parser = .{};
     defer parser.deinit(gpa);
-    // One arena for all chunk parses, reset after each: no per-delta heap churn.
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
 

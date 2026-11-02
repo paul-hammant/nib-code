@@ -1,5 +1,4 @@
-//! The Session engine: the Turn loop, Runs and the history sent to the model.
-//! It knows nothing about the TUI; frontends observe it through `Sink`.
+//! No frontend dependencies: frontends observe a Session only through `Sink`.
 
 const std = @import("std");
 const js = @import("js.zig");
@@ -7,7 +6,7 @@ const tools = @import("tools.zig");
 const openai = @import("provider/openai.zig");
 
 pub const Event = union(enum) {
-    /// Slices are borrowed: valid only during the callback.
+    /// Slices are valid only during the callback.
     delta: struct { kind: openai.Kind, text: []const u8 },
     run_start: []const u8,
     run_end: struct { ok: bool, output: []const u8 },
@@ -33,11 +32,10 @@ const system_template =
     \\
     \\You act by calling the `run` tool with JavaScript. Each call runs in a fresh sandbox: no variables survive between calls, so write anything you need later to a file. The script can affect the outside world only through these functions:
     \\
-    \\```ts
+    \\```js
     \\{s}```
     \\
     \\Writing scripts:
-    \\- Write plain JavaScript, not TypeScript: no type annotations, interfaces or `as` casts.
     \\- Top-level `await` works. Combine related steps in one script (read several files, run a command, filter the output) and return only what you need.
     \\- The value of the last expression comes back to you, together with anything passed to console.log. Large output is truncated, so filter before returning it.
     \\
@@ -49,7 +47,7 @@ pub const Session = struct {
     io: std.Io,
     client: *std.http.Client,
     cfg: openai.Config,
-    /// Owns every string in `history`. Append-only, like the history itself.
+    /// Owns every string in `history`.
     arena: std.heap.ArenaAllocator,
     history: std.ArrayList(openai.Message) = .empty,
     usage: openai.Usage = .{},
@@ -67,7 +65,7 @@ pub const Session = struct {
         errdefer s.arena.deinit();
         const a = s.arena.allocator();
         const cwd = try std.process.currentPathAlloc(io, a);
-        const system = try std.fmt.allocPrint(a, system_template, .{ cwd, tools.declarations });
+        const system = try std.fmt.allocPrint(a, system_template, .{ cwd, tools.docs });
         try s.history.append(gpa, .{ .role = "system", .content = system });
         return s;
     }
@@ -77,9 +75,8 @@ pub const Session = struct {
         s.arena.deinit();
     }
 
-    /// Run one Turn. On failure the history is rolled back to the last point
-    /// the provider will accept: after the last complete Step, or to before
-    /// the user message if no Step completed.
+    /// On failure, history is rolled back to the end of the last complete Step,
+    /// or to before the user message if none completed.
     pub fn turn(s: *Session, user_text: []const u8, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
         const a = s.arena.allocator();
         const before = s.history.items.len;
@@ -117,7 +114,7 @@ pub const Session = struct {
         return error.TooManySteps;
     }
 
-    /// Execute one tool call; returns the text sent back to the model (arena-owned).
+    /// Result is arena-owned.
     fn execute(s: *Session, call: openai.ToolCall, sink: Sink, cancel: *const std.atomic.Value(bool)) ![]const u8 {
         const a = s.arena.allocator();
         if (!std.mem.eql(u8, call.function.name, "run"))
@@ -144,13 +141,7 @@ fn formatOutcome(gpa: std.mem.Allocator, o: js.Outcome) ![]u8 {
     const logs = std.mem.trimEnd(u8, o.logs, "\n");
     const sep: []const u8 = if (logs.len > 0) "\n" else "";
     if (o.ok) return std.fmt.allocPrint(gpa, "{s}{s}result: {s}", .{ logs, sep, o.text });
-    // QuickJS reports TypeScript syntax with unhelpful messages
-    // ("missing initializer for variable"), so name the likely cause.
-    const hint = if (std.mem.startsWith(u8, o.text, "SyntaxError"))
-        "\nhint: scripts must be plain JavaScript; TypeScript syntax (type annotations, interfaces, `as`) is not supported."
-    else
-        "";
-    return std.fmt.allocPrint(gpa, "{s}{s}{s}{s}", .{ logs, sep, o.text, hint });
+    return std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ logs, sep, o.text });
 }
 
 test "formatOutcome" {
@@ -165,4 +156,17 @@ test "formatOutcome" {
     const bad = try formatOutcome(gpa, .{ .ok = false, .text = &err, .logs = &none });
     defer gpa.free(bad);
     try std.testing.expectEqualStrings("Error: x", bad);
+}
+
+test "system prompt documents every tool in JavaScript" {
+    const gpa = std.testing.allocator;
+    const prompt = try std.fmt.allocPrint(gpa, system_template, .{ "/work", tools.docs });
+    defer gpa.free(prompt);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "```js\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "TypeScript") == null);
+    for (tools.names) |name| {
+        const call = try std.fmt.allocPrint(gpa, "async {s}({{", .{name});
+        defer gpa.free(call);
+        try std.testing.expect(std.mem.indexOf(u8, prompt, call) != null);
+    }
 }

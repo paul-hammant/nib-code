@@ -1,19 +1,16 @@
-//! Server-sent events: feed lines, get back each event's `data` payload.
-
 const std = @import("std");
 
 pub const Parser = struct {
     data: std.ArrayList(u8) = .empty,
     pending: bool = false,
-    /// The previous `feed` returned `data`; clear it before the next line.
+    /// `data` was returned by the previous `feed`.
     emitted: bool = false,
 
     pub fn deinit(p: *Parser, gpa: std.mem.Allocator) void {
         p.data.deinit(gpa);
     }
 
-    /// Feed one line without its `\n`. Returns the joined `data` fields when a
-    /// blank line completes an event; the slice is valid until the next call.
+    /// The returned slice is valid until the next call.
     pub fn feed(p: *Parser, gpa: std.mem.Allocator, raw: []const u8) !?[]const u8 {
         if (p.emitted) {
             p.data.clearRetainingCapacity();

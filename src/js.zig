@@ -1,10 +1,4 @@
-//! One fresh QuickJS runtime per Run. No state survives between Runs;
-//! the Session log is the only source of truth.
-//!
-//! Scripts see `tools.<name>(args)` (async, backed by `Host.call`) and
-//! `console.log`. Top-level `await` works. Host calls currently execute
-//! synchronously on the Run's thread, so `Promise.all` over tools is
-//! correct but not concurrent.
+//! Host calls run synchronously on the Run's thread: `Promise.all` over tools is not concurrent.
 
 const std = @import("std");
 const c = @import("qjs");
@@ -20,7 +14,7 @@ pub const Limits = struct {
 };
 
 pub const ToolResult = union(enum) {
-    /// JSON text of the result.
+    /// JSON.
     ok: []u8,
     err: []u8,
 };
@@ -28,15 +22,14 @@ pub const ToolResult = union(enum) {
 pub const Host = struct {
     ctx: *anyopaque,
     names: []const []const u8,
-    /// Returned slices are owned by the caller (allocated with `gpa`).
+    /// Returned slices are allocated with `gpa` and owned by the caller.
     call: *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8, args_json: []const u8) ToolResult,
 };
 
 pub const Outcome = struct {
     ok: bool,
-    /// JSON of the completion value on success, error message + stack on failure.
+    /// Completion value as JSON when `ok`, otherwise error message and stack.
     text: []u8,
-    /// Everything the script wrote through `console.*`.
     logs: []u8,
 
     pub fn deinit(o: Outcome, gpa: std.mem.Allocator) void {
@@ -76,7 +69,6 @@ const prelude =
     \\})();
 ;
 
-/// Evaluate `code` in a fresh sandbox. Caller owns the returned Outcome.
 pub fn eval(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -112,7 +104,6 @@ pub fn eval(
         if (c.JS_IsException(v)) return error.PreludeFailed;
     }
 
-    // JS_Eval needs a NUL-terminated buffer.
     const src = try gpa.dupeSentinel(u8, code, 0);
     defer gpa.free(src);
 
@@ -260,8 +251,6 @@ fn toStr(gpa: std.mem.Allocator, ctx: *c.JSContext, val: c.JSValue) ![]u8 {
     defer c.JS_FreeCString(ctx, p);
     return gpa.dupe(u8, p[0..len]);
 }
-
-// ---- tests ----
 
 const testing = std.testing;
 
