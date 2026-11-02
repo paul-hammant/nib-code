@@ -53,7 +53,7 @@
 
 - **跨进程保存输入历史。** 现在只在本次会话内可翻阅。等实际使用中需要时再做。
 
-Run 内工具并发已实现，见 ADR 0009；子 agent 及其机器接口见尚在实施的 ADR 0010。其他被搁置的方案记在对应 ADR 里：系统层沙箱（[0004](adr/0004-two-layer-isolation.md)）、守护进程（[0005](adr/0005-process-per-session.md)）、跨 Run 的变量存储（[0003](adr/0003-stateless-runs.md)）、混合原生工具调用和 Python 运行时（[0002](adr/0002-run-code-only.md)）。
+Run 内工具并发已实现，见 ADR 0009；`nib ask --json` 已提供 NDJSON 事件接口，格式见 [AGENTS.md](../AGENTS.md)；子 agent 见尚在实施的 ADR 0010。其他被搁置的方案记在对应 ADR 里：系统层沙箱（[0004](adr/0004-two-layer-isolation.md)）、守护进程（[0005](adr/0005-process-per-session.md)）、跨 Run 的变量存储（[0003](adr/0003-stateless-runs.md)）、混合原生工具调用和 Python 运行时（[0002](adr/0002-run-code-only.md)）。
 
 ## 度量
 

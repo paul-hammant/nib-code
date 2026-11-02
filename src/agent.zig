@@ -7,14 +7,7 @@ const openai = @import("provider/openai.zig");
 const session_log = @import("log.zig");
 const instructions = @import("instructions.zig");
 
-pub const Event = union(enum) {
-    /// Slices are valid only during the callback.
-    delta: struct { kind: openai.Kind, text: []const u8 },
-    run_start: []const u8,
-    run_end: struct { ok: bool, output: []const u8 },
-    retry: struct { attempt: u32, delay_ms: u64, reason: []const u8 },
-    notice: []const u8,
-};
+pub const Event = @import("events.zig").Event;
 
 pub const Sink = struct {
     ctx: *anyopaque,
@@ -64,6 +57,7 @@ pub const Session = struct {
     compact_backoff: u64 = 0,
     tools: tools.Tools,
     log: session_log.Log = undefined,
+    id: []const u8 = undefined,
 
     pub const Options = struct { home: []const u8, data_home: []const u8, config_home: []const u8, resume_id: ?[]const u8 = null, continue_latest: bool = false };
 
@@ -87,11 +81,13 @@ pub const Session = struct {
                 if (id.len != 32 or std.mem.indexOfNone(u8, id, "0123456789abcdef") != null) return error.InvalidSessionId;
                 break :blk try std.fmt.allocPrint(a, "{s}/{s}.jsonl", .{ directory, id });
             } else try session_log.latest(io, a, directory, cwd);
+            s.id = try a.dupe(u8, std.fs.path.stem(path));
             s.log = try session_log.Log.restore(io, gpa, a, path, &s.history, &s.context_tokens);
         } else {
             var random: [16]u8 = undefined;
             io.random(&random);
             const path = try std.fmt.allocPrint(a, "{s}/{s}.jsonl", .{ directory, std.fmt.bytesToHex(random, .lower) });
+            s.id = try a.dupe(u8, std.fs.path.stem(path));
             s.log = try session_log.Log.create(io, path);
             errdefer s.log.close(io);
             const base = try std.fmt.allocPrint(a, system_template, .{ cwd, tools.docs });

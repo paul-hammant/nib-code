@@ -77,9 +77,9 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         global_agents.parent.mkdir(parents=True)
         global_agents.write_text("GLOBAL_MARKER")
 
-        def ask(*args, workdir=cwd, window="128000", ok=True):
+        def ask(*args, workdir=cwd, window="128000", ok=True, input=None):
             result = subprocess.run([str(BIN), "ask", *args], cwd=workdir,
-                                    env=dict(env, NIB_CONTEXT_WINDOW=window), capture_output=True, timeout=10)
+                                    env=dict(env, NIB_CONTEXT_WINDOW=window), capture_output=True, timeout=10, input=input)
             assert (result.returncode == 0) == ok, result.stderr.decode()
             return result
 
@@ -129,6 +129,36 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         assert compacted[1]["content"].startswith("Earlier session summary:")
         ask("three", "-c", workdir=other, window="4096")
         assert read_requests(requests_path)[-2]["messages"] == compacted + [{"role": "user", "content": "three"}]
+        def events(result):
+            assert result.stderr == b"", result.stderr
+            assert result.stdout.endswith(b"\n")
+            parsed = [json.loads(line) for line in result.stdout.splitlines()]
+            assert all(len(event) == 1 for event in parsed), parsed
+            return parsed
+
+        streamed = events(ask("--json", "-", input=b"stdin prompt\nsecond line"))
+        session_id = streamed[0]["start"]["session_id"]
+        assert len(session_id) == 32 and all(c in "0123456789abcdef" for c in session_id)
+        final = streamed[-1]["end"]
+        assert final["steps"] == 2 and final["usage"] == {
+            "prompt_tokens": 6600, "completion_tokens": 30, "prompt_cache_hit_tokens": 192}
+        assert "hello from bash" in final["text"]
+        assert any(e.get("delta", {}).get("kind") == "reasoning" for e in streamed)
+        assert any("run_start" in e for e in streamed)
+        assert any(e.get("run_end", {}).get("ok") for e in streamed)
+        assert read_requests(requests_path)[-2]["messages"][-1]["content"] == "stdin prompt\nsecond line"
+        assert (tmp / "data/nib/sessions" / (session_id + ".jsonl")).exists()
+        resumed = events(ask("--resume", session_id, "--json", "json resume"))
+        assert resumed[0]["start"]["session_id"] == session_id
+        failed = events(ask("reject1", "--json", ok=False))
+        assert "start" in failed[0] and "error" in failed[-1]
+        assert not any("end" in e for e in failed)
+        assert events(ask("--json", ok=False)) == [{"error": {"message": "MissingPrompt"}}]
+        json_cwd = tmp / "json"
+        json_cwd.mkdir()
+        compact_json = events(ask("json compact", "--json", workdir=json_cwd, window="4096"))
+        assert any("notice" in e for e in compact_json)
+        print("JSON E2E passed: NDJSON events, stdin, final text/usage/steps, resume, errors and notices")
         for request in read_requests(requests_path):
             valid_messages(request["messages"])
         for path in (tmp / "data/nib/sessions").glob("*.jsonl"):
