@@ -33,6 +33,8 @@ pub const Status = struct {
     context: u64 = 0,
     /// Set while a Turn runs.
     busy: ?Activity.Label = null,
+    /// A transient message, such as a copy confirmation.
+    notice: ?[]const u8 = null,
 };
 
 /// Text the status line prints; owned by the caller because vaxis reads
@@ -47,6 +49,7 @@ pub const Text = struct {
         else
             "";
         const separator: []const u8 = if (doing.len > 0) " · " else "";
+        if (s.notice) |notice| return std.fmt.bufPrint(&text.status, "{s}{s}{s}", .{ doing, separator, notice }) catch "";
         if (scrolled) return std.fmt.bufPrint(&text.status, "{s}{s}↑ history", .{ doing, separator }) catch "";
         return std.fmt.bufPrint(&text.status, "{s}{s}{s} · effort {s} · ctx {d}% · last turn: {d} steps, in {d} (cache {d}), out {d}", .{
             doing,
@@ -69,4 +72,5 @@ test "status line shows activity first, and only history hints while scrolled" {
     try std.testing.expect(std.mem.startsWith(u8, idle, "m · effort "));
     try std.testing.expect(std.mem.indexOf(u8, idle, "ctx 25% · last turn: 2 steps") != null);
     try std.testing.expectEqualStrings("⠙ running 0s · ↑ history", text.format(.{ .cfg = cfg, .busy = .{ .phase = .running, .ms = 150 } }, true));
+    try std.testing.expectEqualStrings("⠙ running 0s · copied 3 chars", text.format(.{ .cfg = cfg, .busy = .{ .phase = .running, .ms = 150 }, .notice = "copied 3 chars" }, true));
 }

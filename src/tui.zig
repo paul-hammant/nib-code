@@ -123,6 +123,8 @@ pub fn run(init: std.process.Init, session: *Session) !void {
     try w.flush();
     try vx.queryTerminal(w, .fromSeconds(1));
     try vx.setBracketedPaste(w, true);
+    // Selection needs cell coordinates; some terminals claim SGR pixel mode yet report cells.
+    vx.caps.sgr_pixels = false;
     try vx.setMouseMode(w, true);
 
     var app: App = .{
@@ -168,6 +170,9 @@ const App = struct {
     loop: *vaxis.Loop(Event),
     environ: *const std.process.Environ.Map,
     selection: selection.Selection = .{},
+    /// Shown on the status line until the next key or click; not part of the transcript.
+    notice: ?[]const u8 = null,
+    notice_buf: [64]u8 = undefined,
     transcript: Transcript = .{},
     input: Editor = .{},
     pasting: bool = false,
@@ -198,15 +203,19 @@ const App = struct {
             .paste_start => app.pasting = true,
             .paste_end => app.pasting = false,
             .mouse => |m| {
-                // vaxis.Loop already translates pixel mouse events to cell coordinates.
+                if (m.type == .press) app.notice = null;
                 if (m.button == .wheel_up or m.button == .wheel_down) {
                     app.selection.clear();
                     app.scroll.pending += if (m.button == .wheel_up) @as(i64, -3) else 3;
                 } else if (app.selection.mouse(m, &app.vx.screen)) {
                     const text = try app.selection.text(gpa, &app.vx.screen);
                     defer gpa.free(text);
-                    try selection.copy(app.vx, app.w, gpa, app.io, app.environ, text);
-                    try app.report(.info, "copied {d} chars", .{try std.unicode.utf8CountCodepoints(text)});
+                    if (std.mem.trim(u8, text, " \n").len == 0) {
+                        app.selection.clear();
+                    } else {
+                        try selection.copy(app.vx, app.w, gpa, app.io, app.environ, text);
+                        app.notice = std.fmt.bufPrint(&app.notice_buf, "copied {d} chars", .{std.unicode.utf8CountCodepoints(text) catch text.len}) catch null;
+                    }
                 }
             },
             .tick => {},
@@ -248,6 +257,7 @@ const App = struct {
     }
 
     fn onKey(app: *App, k: vaxis.Key) !bool {
+        app.notice = null;
         const gpa = app.gpa;
         const input = &app.input;
         const page = @max(app.vx.window().height / 2, 1);
@@ -406,6 +416,7 @@ const App = struct {
             .steps = app.steps,
             .context = app.context,
             .busy = if (app.turn != null) app.activity.label(app.io) else null,
+            .notice = app.notice,
         }, &app.status_text);
         app.selection.highlight(&app.vx.screen);
         try app.vx.render(app.w);
