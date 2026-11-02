@@ -35,22 +35,25 @@
   - [0005 一个 Session 一个进程](adr/0005-process-per-session.md)
   - [0006 不审批，宿主侧拒绝危险命令](adr/0006-deny-dangerous-commands.md)
   - [0007 保持 system 稳定，按完整 Step 压缩上下文](adr/0007-context-compaction.md)
+  - [0008 支持 thinking 模型，默认 deepseek-flash](adr/0008-thinking-models.md)（提议中）
+  - [0009 Run 内工具调用真正并发，顺序按 JS 语义](adr/0009-concurrent-tools.md)（提议中）
+  - [0010 子 agent：tools.agent 派生独立 nib 子进程](adr/0010-subagents.md)（提议中）
 
 ## 没写成 ADR 的选择
 
 这些容易撤回，记一笔即可：
 
 - Provider 先只做 OpenAI 兼容的 Chat Completions，测试用 DeepSeek（用户偏好，不用 Claude 测试）。接 Anthropic 原生协议时，`sse.zig` 可复用。
-- TUI 用 libvaxis。
+- TUI 用 libvaxis。操作：PgUp/PgDn 翻半屏，shift+↑↓ 滚 3 行；向上翻看时视口按顶部条目锚定，新内容到达不推移画面，回到底部后恢复跟随。输入框中 shift+enter / alt+enter / ctrl+j 换行，粘贴内容中的回车不会提交；光标在首行按 ↑、末行按 ↓ 翻阅本次会话的输入历史（不跨进程保存）。assistant 文本渲染基础 Markdown：代码围栏（含未闭合的）、行内代码、粗体、标题。
 - 会话持久化、恢复和项目指令已实现（2026-11-01，一手源码：`src/agent.zig`、`src/log.zig`、`src/instructions.zig`、`src/main.zig`）。日志按完整 Step 同步落盘；详细行为见根目录 [AGENTS.md](../AGENTS.md)，端到端检查可运行 `zig build` 后执行 `python3 scripts/test_session.py`。
 
 ## 暂缓的想法
 
 想到了、但现在不做的事。每条写清楚为什么暂缓、什么时候再考虑，避免遗忘，也避免被误当成已定的计划。
 
-- **工具真正并发。** 现在 Run 里的工具调用同步执行，`Promise.all` 结果正确但不并发。等出现明显需要并行的任务（比如同时读很多文件、同时跑多个命令）再接入 `std.Io` 的并发。
+- **跨进程保存输入历史。** 现在只在本次会话内可翻阅。等实际使用中需要时再做。
 
-其他被搁置的方案记在对应 ADR 里：系统层沙箱（[0004](adr/0004-two-layer-isolation.md)）、守护进程（[0005](adr/0005-process-per-session.md)）、跨 Run 的变量存储（[0003](adr/0003-stateless-runs.md)）、混合原生工具调用和 Python 运行时（[0002](adr/0002-run-code-only.md)）。
+已决定但尚未实现的方向见 ADR 0008–0010（推进顺序：thinking → 工具并发 → `nib ask --json` → `tools.agent`）。其他被搁置的方案记在对应 ADR 里：系统层沙箱（[0004](adr/0004-two-layer-isolation.md)）、守护进程（[0005](adr/0005-process-per-session.md)）、跨 Run 的变量存储（[0003](adr/0003-stateless-runs.md)）、混合原生工具调用和 Python 运行时（[0002](adr/0002-run-code-only.md)）。
 
 ## 度量
 
@@ -58,7 +61,8 @@
 
 | 项目 | 实测值 | 警报线 | 测量方式 |
 |---|---|---|---|
-| 源码行数（`src/` + `build.zig`，含测试） | 2632（2026-11-01，Session 持久化与压缩后） | — | `wc -l build.zig src/**/*.zig`（zsh） |
+| 源码行数（`src/` + `build.zig`，含测试） | 3101（2026-11-01，合并 session-core 与 tui-polish 后） | — | `wc -l build.zig src/**/*.zig`（zsh） |
+| TUI 单帧 draw 耗时，5000 条目、100×24 | 底部跟随 102.5 → 29.7 µs；上翻 1200 行 1149.5 → 57.2 µs（2026-11-01，ReleaseFast，加高度缓存前 → 后） | — | 预热后每组 32 帧，5 组平均值取中位数，只测 draw（feat/tui-polish 的报告） |
 | `nib js '1+1'` 平均耗时（含进程启动） | 1.6 ms（2026-11-01，ReleaseFast） | — | 循环 100 次取平均 |
 | 上述命令峰值 RSS | 3.7 MB（2026-11-01） | — | `/usr/bin/time -f %M` |
 | 二进制体积（ReleaseFast，strip 后） | 1.9 MB（2026-11-01） | — | `strip` 后 `ls -l` |
