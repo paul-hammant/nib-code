@@ -1,13 +1,17 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
-const sandbox = @import("sandbox.zig");
 const Session = @import("session.zig").Session;
 const SessionEvent = @import("session.zig").Event;
+const Sink = @import("session.zig").Sink;
 const provider = @import("provider.zig");
 const Editor = @import("tui/editor.zig").Editor;
-const markdown = @import("tui/markdown.zig");
 const commands = @import("tui/commands.zig");
-const session_log = @import("session/log.zig");
+const Transcript = @import("tui/transcript.zig").Transcript;
+const EntryKind = @import("tui/transcript.zig").Kind;
+const Viewport = @import("tui/viewport.zig").Viewport;
+const Menu = @import("tui/menu.zig").Menu;
+const status = @import("tui/status.zig");
+const view = @import("tui/view.zig");
 
 const Event = union(enum) {
     key_press: vaxis.Key,
@@ -27,100 +31,6 @@ const Event = union(enum) {
     failed: []u8,
 };
 
-const Entry = struct {
-    kind: enum { user, assistant, reasoning, run, info, err },
-    /// For `.run`: the script.
-    text: std.ArrayList(u8) = .empty,
-    /// For `.run`: the first lines of its output.
-    output: std.ArrayList(u8) = .empty,
-    /// One-line summary of a collapsible entry. vaxis keeps printed slices
-    /// until render, so this must outlive draw(); see `refreshLabel`.
-    label: std.ArrayList(u8) = .empty,
-    run: enum { running, ok, failed } = .running,
-    elapsed_ms: u64 = 0,
-    /// Collapsible kinds (`.run`, `.reasoning`) show one summary line unless open.
-    open: bool = false,
-    cached: ?struct { width: u16, len: usize, open: bool, rows: u16 } = null,
-
-    fn deinit(e: *Entry, gpa: std.mem.Allocator) void {
-        e.text.deinit(gpa);
-        e.output.deinit(gpa);
-        e.label.deinit(gpa);
-    }
-
-    fn refreshLabel(e: *Entry, gpa: std.mem.Allocator) !void {
-        e.label.clearRetainingCapacity();
-        switch (e.kind) {
-            .run => {
-                var buf: [96]u8 = undefined;
-                const used = toolSummary(e.text.items, &buf);
-                if (e.run == .running) {
-                    try e.label.print(gpa, "{s} · running", .{used});
-                } else {
-                    try e.label.print(gpa, "{s} · {d}.{d}s", .{ used, e.elapsed_ms / 1000, e.elapsed_ms % 1000 / 100 });
-                }
-            },
-            .reasoning => {
-                const lines = std.mem.count(u8, std.mem.trimEnd(u8, e.text.items, "\n"), "\n") + 1;
-                try e.label.print(gpa, "∴ thinking · {d} line{s} · ctrl+o to expand", .{ lines, if (lines == 1) "" else "s" });
-            },
-            else => {},
-        }
-    }
-
-    fn collapsible(e: *const Entry) bool {
-        return e.kind == .run or e.kind == .reasoning;
-    }
-
-    fn print(e: *const Entry, win: vaxis.Window, commit: bool) u16 {
-        if (e.kind == .assistant) return markdown.print(win, e.text.items, commit);
-        var segs: [7]vaxis.Segment = undefined;
-        const folded = e.collapsible() and !e.open;
-        const wrap: @FieldType(vaxis.Window.PrintOptions, "wrap") = if (folded) .none else if (e.kind == .run) .grapheme else .word;
-        const r = win.print(segmentsFor(e, &segs), .{ .wrap = wrap, .commit = commit });
-        return if (folded) 1 else @max(1, r.row +| @intFromBool(r.col > 0));
-    }
-
-    fn height(e: *Entry, win: vaxis.Window) u16 {
-        const len = e.text.items.len + e.output.items.len;
-        if (e.cached) |c| {
-            if (c.width == win.width and c.len == len and c.open == e.open) return c.rows;
-        }
-        var measure = win;
-        measure.height = std.math.maxInt(u16);
-        const rows = e.print(measure, false);
-        e.cached = .{ .width = win.width, .len = len, .open = e.open, .rows = rows };
-        return rows;
-    }
-};
-
-/// Text the status line prints; owned by the caller because vaxis reads
-/// printed slices only at render time.
-const StatusText = struct {
-    status: [320]u8 = undefined,
-    activity: [64]u8 = undefined,
-};
-
-const Phase = enum { thinking, writing, running, retrying, compacting };
-
-const spinner = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
-
-const Activity = struct {
-    phase: Phase = .thinking,
-    since: std.Io.Clock.Timestamp,
-
-    const Label = struct { phase: Phase, ms: u64 };
-
-    fn set(a: *Activity, io: std.Io, phase: Phase) void {
-        if (a.phase == phase) return;
-        a.* = .{ .phase = phase, .since = .now(io, .awake) };
-    }
-
-    fn label(a: Activity, io: std.Io) Label {
-        return .{ .phase = a.phase, .ms = @intCast(@max(a.since.untilNow(io).raw.toMilliseconds(), 0)) };
-    }
-};
-
 /// Posts `.tick` while `busy` so the spinner and timer advance without input.
 const Ticker = struct {
     io: std.Io,
@@ -136,66 +46,7 @@ const Ticker = struct {
     }
 };
 
-const Anchor = struct {
-    entry: usize = 0,
-    row: u16 = 0,
-
-    fn atOrAfter(a: Anchor, b: Anchor) bool {
-        return a.entry > b.entry or (a.entry == b.entry and a.row >= b.row);
-    }
-};
-
-const Viewport = struct {
-    top: ?Anchor = null,
-    pending: i64 = 0,
-
-    fn bottom(entries: []Entry, win: vaxis.Window) Anchor {
-        var i = entries.len;
-        var rows: i64 = -1;
-        while (i > 0 and rows < win.height) {
-            i -= 1;
-            rows += @as(i64, entries[i].height(win)) + 1;
-        }
-        return .{ .entry = i, .row = @intCast(@max(rows - win.height, 0)) };
-    }
-
-    fn layout(v: *Viewport, entries: []Entry, win: vaxis.Window) Anchor {
-        const end = bottom(entries, win);
-        var top = v.top orelse end;
-        if (entries.len > 0) top.row = @min(top.row, entries[top.entry].height(win));
-        var left = @abs(v.pending);
-        while (left > 0 and entries.len > 0) {
-            if (v.pending < 0) {
-                const step = @min(left, top.row);
-                top.row -= @intCast(step);
-                left -= step;
-                if (left == 0 or top.entry == 0) break;
-                top.entry -= 1;
-                top.row = entries[top.entry].height(win) +| 1;
-            } else {
-                const step = @min(left, @as(u32, entries[top.entry].height(win)) + 1 - top.row);
-                top.row += @intCast(step);
-                left -= step;
-                if (top.row <= entries[top.entry].height(win)) break;
-                if (top.entry + 1 == entries.len) break;
-                top.entry += 1;
-                top.row = 0;
-            }
-        }
-        v.pending = 0;
-        if (top.atOrAfter(end)) {
-            v.top = null;
-            return end;
-        }
-        v.top = top;
-        return top;
-    }
-};
-
-const run_output_lines = 12;
-const max_menu_rows = 8;
-
-/// The UI thread must not touch the Session while a Turn is running.
+/// A Turn or `/compact` on its own thread. The UI thread must not touch the Session meanwhile.
 const Turn = struct {
     gpa: std.mem.Allocator,
     session: *Session,
@@ -204,14 +55,29 @@ const Turn = struct {
     cancel: std.atomic.Value(bool) = .init(false),
     thread: std.Thread = undefined,
 
-    fn work(t: *Turn) void {
+    fn spawn(gpa: std.mem.Allocator, session: *Session, loop: *vaxis.Loop(Event), text: []const u8, compact: bool) !*Turn {
+        const t = try gpa.create(Turn);
+        errdefer gpa.destroy(t);
+        t.* = .{ .gpa = gpa, .session = session, .text = text, .loop = loop };
+        t.thread = try std.Thread.spawn(.{}, work, .{ t, compact });
+        return t;
+    }
+
+    fn work(t: *Turn, compact: bool) void {
         var detail: ?[]u8 = null;
-        t.session.turn(t.text, .{ .ctx = t, .emit = emit }, &t.cancel, &detail) catch |err| {
+        t.execute(compact, &detail) catch |err| {
             const msg = detail orelse (t.gpa.dupe(u8, @errorName(err)) catch return);
             t.loop.postEvent(.{ .failed = msg }) catch t.gpa.free(msg);
             return;
         };
         t.loop.postEvent(.done) catch {};
+    }
+
+    fn execute(t: *Turn, compact: bool, detail: *?[]u8) !void {
+        const sink: Sink = .{ .ctx = t, .emit = emit };
+        if (compact) {
+            _ = try t.session.compact(sink, &t.cancel, detail);
+        } else try t.session.turn(t.text, sink, &t.cancel, detail);
     }
 
     fn emit(ctx: *anyopaque, ev: SessionEvent) !void {
@@ -238,7 +104,6 @@ const Turn = struct {
 pub fn run(init: std.process.Init, session: *Session) !void {
     const io = init.io;
     const gpa = init.gpa;
-    var cfg = session.cfg;
 
     var tty_buf: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &tty_buf);
@@ -255,29 +120,22 @@ pub fn run(init: std.process.Init, session: *Session) !void {
     try vx.enterAltScreen(w);
     try w.flush();
     try vx.queryTerminal(w, .fromSeconds(1));
-
     try vx.setBracketedPaste(w, true);
     try vx.setMouseMode(w, true);
-    var input: Editor = .{};
-    defer input.deinit(gpa);
-    var pasting = false;
-    var scroll: Viewport = .{};
 
-    var entries: std.ArrayList(Entry) = .empty;
-    defer {
-        for (entries.items) |*e| e.deinit(gpa);
-        entries.deinit(gpa);
-    }
-    var expanded = false;
-    var status_text: StatusText = .{};
-    var menu_buf: [16]commands.Candidate = undefined;
-    var menu_sel: usize = 0;
-    var menu_closed = false;
-    var choices_arena: std.heap.ArenaAllocator = .init(gpa);
-    defer choices_arena.deinit();
-    var session_choices: []const commands.Choice = &.{};
-    var session_choices_loaded = false;
-    var activity: Activity = .{ .since = .now(io, .awake) };
+    var app: App = .{
+        .gpa = gpa,
+        .io = io,
+        .session = session,
+        .cfg = session.cfg,
+        .vx = &vx,
+        .w = w,
+        .loop = &loop,
+        .menu = .init(gpa),
+        .activity = .start(io, .thinking),
+        .context = session.context_tokens,
+    };
+    defer app.deinit();
     var ticker: Ticker = .{ .io = io, .loop = &loop };
     const ticker_thread = try std.Thread.spawn(.{}, Ticker.work, .{&ticker});
     defer {
@@ -285,663 +143,257 @@ pub fn run(init: std.process.Init, session: *Session) !void {
         ticker_thread.join();
     }
 
-    var usage: provider.Usage = .{};
-    var steps: u32 = 0;
-    var context: u64 = session.context_tokens;
-    var turn: ?*Turn = null;
-    defer if (turn) |t| {
-        t.cancel.store(true, .release);
-        t.finish();
-    };
-
-    try addHistory(gpa, &entries, session.history.items);
+    try app.transcript.addHistory(gpa, session.history.items);
     for (session.history.items) |m| {
-        if (std.mem.eql(u8, m.role, "user")) try input.remember(gpa, m.content orelse "");
+        if (std.mem.eql(u8, m.role, "user")) try app.input.remember(gpa, m.content orelse "");
     }
-    if (cfg.missingKey()) try addEntry(gpa, &entries, .err, "no API key: set DEEPSEEK_API_KEY (or NIB_API_KEY). /js <code> still works.");
+    if (app.cfg.missingKey()) try app.transcript.add(gpa, .err, "no API key: set DEEPSEEK_API_KEY (or NIB_API_KEY). /js <code> still works.");
 
-    while (true) {
-        switch (try loop.nextEvent()) {
-            .key_press => |key| {
-                const page = @max(vx.window().height / 2, 1);
-                if (key.matches('c', .{ .ctrl = true })) break;
-                if (key.matches('d', .{ .ctrl = true }) and input.text().len == 0) break;
-                const menu = if (menu_closed) menu_buf[0..0] else commands.candidates(input.text(), session_choices, &menu_buf);
-                const selected: ?commands.Candidate = if (menu.len > 0) menu[@min(menu_sel, menu.len - 1)] else null;
-                const before = std.hash.Wyhash.hash(0, input.text());
-                var submitted: ?[]u8 = null;
+    while (try app.handle(try loop.nextEvent())) {
+        ticker.busy.store(app.turn != null, .release);
+        try app.render();
+    }
+}
 
-                if (selected != null and key.matches(vaxis.Key.escape, .{})) {
-                    menu_closed = true;
-                } else if (selected != null and key.matches(vaxis.Key.up, .{})) {
-                    menu_sel = (@min(menu_sel, menu.len - 1) + menu.len - 1) % menu.len;
-                } else if (selected != null and key.matches(vaxis.Key.down, .{})) {
-                    menu_sel = (@min(menu_sel, menu.len - 1) + 1) % menu.len;
-                } else if (selected != null and (key.matches(vaxis.Key.tab, .{}) or (key.matches(vaxis.Key.enter, .{}) and !pasting and !selected.?.runs()))) {
-                    const completion = try selected.?.completion(gpa);
-                    defer gpa.free(completion);
-                    try input.replace(gpa, completion);
-                } else if (selected != null and key.matches(vaxis.Key.enter, .{}) and !pasting) {
-                    const line = try selected.?.line(gpa);
-                    defer gpa.free(line);
-                    try input.replace(gpa, line);
-                    if (turn == null or busyCommand(line)) submitted = try input.take(gpa);
-                } else if (key.matches(vaxis.Key.escape, .{})) {
-                    if (turn) |t| t.cancel.store(true, .release);
-                } else if (key.matches(vaxis.Key.page_up, .{})) {
-                    scroll.pending -= page;
-                } else if (key.matches(vaxis.Key.page_down, .{})) {
-                    scroll.pending += page;
-                } else if (key.matches('o', .{ .ctrl = true })) {
-                    expanded = !expanded;
-                    for (entries.items) |*e| if (e.collapsible()) {
-                        e.open = expanded;
-                    };
-                } else if (key.matches(vaxis.Key.up, .{ .shift = true })) {
-                    scroll.pending -= 3;
-                } else if (key.matches(vaxis.Key.down, .{ .shift = true })) {
-                    scroll.pending += 3;
-                } else if (isNewline(key, pasting)) {
-                    try input.insert(gpa, "\n");
-                } else if (key.matches(vaxis.Key.enter, .{})) {
-                    if (turn == null or busyCommand(input.text())) submitted = try input.take(gpa);
-                } else {
-                    _ = try input.key(gpa, key);
-                }
-                if (std.hash.Wyhash.hash(0, input.text()) != before) {
-                    menu_sel = 0;
-                    menu_closed = false;
-                    if (!std.mem.startsWith(u8, input.text(), "/resume ")) session_choices_loaded = false;
-                }
+const App = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    session: *Session,
+    cfg: provider.Config,
+    vx: *vaxis.Vaxis,
+    w: *std.Io.Writer,
+    loop: *vaxis.Loop(Event),
+    transcript: Transcript = .{},
+    input: Editor = .{},
+    pasting: bool = false,
+    scroll: Viewport = .{},
+    menu: Menu,
+    status_text: status.Text = .{},
+    activity: status.Activity,
+    usage: provider.Usage = .{},
+    steps: u32 = 0,
+    context: u64 = 0,
+    turn: ?*Turn = null,
 
-                if (submitted) |line| dispatch: {
-                    scroll = .{};
-                    session_choices_loaded = false;
-                    if (line.len == 0) {
-                        gpa.free(line);
-                    } else if (commands.parse(line)) |parsed| {
-                        defer gpa.free(line);
-                        switch (parsed) {
-                            .unknown => |name| {
-                                const message = try std.fmt.allocPrint(gpa, "unknown command /{s} · /help lists commands", .{name});
-                                defer gpa.free(message);
-                                try addEntry(gpa, &entries, .err, message);
-                            },
-                            .known => |c| switch (c.command) {
-                                .help => {
-                                    const text = try commands.helpText(gpa);
-                                    defer gpa.free(text);
-                                    try addEntry(gpa, &entries, .info, text);
-                                },
-                                .new, .@"resume" => {
-                                    const id = if (c.command == .new) null else resolveSession(io, choices_arena.allocator(), session, c.arg) catch |err| {
-                                        try addEntry(gpa, &entries, .err, switch (err) {
-                                            error.MissingSessionId => "usage: /resume <id> · type /resume and a space to pick one",
-                                            error.UnknownSession => "no session here starts with that id",
-                                            error.AmbiguousSession => "several sessions start with that id; type more of it",
-                                            else => @errorName(err),
-                                        });
-                                        break :dispatch;
-                                    };
-                                    if (id != null and std.mem.eql(u8, id.?, session.id)) {
-                                        try addEntry(gpa, &entries, .info, "already in this session");
-                                        break :dispatch;
-                                    }
-                                    session.reopen(id) catch |err| {
-                                        const message = try std.fmt.allocPrint(gpa, "could not open session: {s}", .{@errorName(err)});
-                                        defer gpa.free(message);
-                                        try addEntry(gpa, &entries, .err, message);
-                                        break :dispatch;
-                                    };
-                                    for (entries.items) |*e| e.deinit(gpa);
-                                    entries.clearRetainingCapacity();
-                                    try addHistory(gpa, &entries, session.history.items);
-                                    usage = .{};
-                                    steps = 0;
-                                    context = session.context_tokens;
-                                    const message = try std.fmt.allocPrint(gpa, "{s} session {s}", .{ if (c.command == .new) "new" else "resumed", session.id[0..8] });
-                                    defer gpa.free(message);
-                                    try addEntry(gpa, &entries, .info, message);
-                                },
-                                .copy => {
-                                    const answer = for (0..entries.items.len) |i| {
-                                        const e = &entries.items[entries.items.len - 1 - i];
-                                        if (e.kind == .assistant) break e.text.items;
-                                    } else {
-                                        try addEntry(gpa, &entries, .err, "no answer to copy yet");
-                                        break :dispatch;
-                                    };
-                                    try vx.copyToSystemClipboard(w, answer, gpa);
-                                    const message = try std.fmt.allocPrint(gpa, "copied {d} bytes (needs a terminal with OSC 52 clipboard support)", .{answer.len});
-                                    defer gpa.free(message);
-                                    try addEntry(gpa, &entries, .info, message);
-                                },
-                                .effort => {
-                                    if (c.arg.len > 0) {
-                                        cfg.setEffort(c.arg) catch {
-                                            try addEntry(gpa, &entries, .err, "usage: /effort [default|off|none|minimal|low|medium|high|xhigh|max]");
-                                            break :dispatch;
-                                        };
-                                        session.cfg = cfg;
-                                        session.tools.cfg = cfg;
-                                    }
-                                    const message = try std.fmt.allocPrint(gpa, "effort: {s} · thinking: {s} · configured: {s} (model support varies)", .{
-                                        cfg.effectiveEffort(),
-                                        if (cfg.thinking) |on| (if (on) "on" else "off") else "default",
-                                        cfg.reasoning_effort orelse "default",
-                                    });
-                                    defer gpa.free(message);
-                                    try addEntry(gpa, &entries, .info, message);
-                                },
-                                .js => {
-                                    if (c.arg.len == 0) {
-                                        try addEntry(gpa, &entries, .err, "usage: /js <code>");
-                                        break :dispatch;
-                                    }
-                                    try addEntry(gpa, &entries, .user, line);
-                                    const r = try session.run(c.arg, null);
-                                    usage = session.usage;
-                                    defer r.deinit(gpa);
-                                    if (r.logs.len > 0) try addEntry(gpa, &entries, .info, std.mem.trimEnd(u8, r.logs, "\n"));
-                                    try addEntry(gpa, &entries, if (r.ok) .info else .err, r.text);
-                                },
-                                .compact => {
-                                    const t = try gpa.create(Turn);
-                                    t.* = .{ .gpa = gpa, .session = session, .text = try gpa.dupe(u8, line), .loop = &loop };
-                                    t.thread = try std.Thread.spawn(.{}, struct {
-                                        fn work(task: *Turn) void {
-                                            var detail: ?[]u8 = null;
-                                            _ = task.session.compact(.{ .ctx = task, .emit = Turn.emit }, &task.cancel, &detail) catch |err| {
-                                                const msg = detail orelse (task.gpa.dupe(u8, @errorName(err)) catch return);
-                                                task.loop.postEvent(.{ .failed = msg }) catch task.gpa.free(msg);
-                                                return;
-                                            };
-                                            task.loop.postEvent(.done) catch {};
-                                        }
-                                    }.work, .{t});
-                                    turn = t;
-                                    activity = .{ .phase = .compacting, .since = .now(io, .awake) };
-                                },
-                            },
-                        }
-                    } else if (cfg.missingKey()) {
-                        gpa.free(line);
-                        try addEntry(gpa, &entries, .err, "no API key");
-                    } else {
-                        try addEntry(gpa, &entries, .user, line);
-                        const t = try gpa.create(Turn);
-                        t.* = .{ .gpa = gpa, .session = session, .text = line, .loop = &loop };
-                        t.thread = try std.Thread.spawn(.{}, Turn.work, .{t});
-                        turn = t;
-                        activity = .{ .since = .now(io, .awake) };
-                    }
-                }
-            },
-            .paste_start => pasting = true,
-            .paste_end => pasting = false,
+    fn deinit(app: *App) void {
+        if (app.turn) |t| {
+            t.cancel.store(true, .release);
+            t.finish();
+        }
+        app.menu.deinit();
+        app.transcript.deinit(app.gpa);
+        app.input.deinit(app.gpa);
+    }
+
+    /// False to quit.
+    fn handle(app: *App, event: Event) !bool {
+        const gpa = app.gpa;
+        switch (event) {
+            .key_press => |k| return app.onKey(k),
+            .paste_start => app.pasting = true,
+            .paste_end => app.pasting = false,
             .mouse => |m| switch (m.button) {
-                .wheel_up => scroll.pending -= 3,
-                .wheel_down => scroll.pending += 3,
+                .wheel_up => app.scroll.pending -= 3,
+                .wheel_down => app.scroll.pending += 3,
                 else => {},
             },
             .tick => {},
-            .winsize => |ws| try vx.resize(gpa, w, ws),
+            .winsize => |ws| try app.vx.resize(gpa, app.w, ws),
             .delta => |d| {
                 defer gpa.free(d.text);
-                const kind: @FieldType(Entry, "kind") = if (d.kind == .reasoning) .reasoning else .assistant;
-                if (activity.phase != .compacting) activity.set(io, if (d.kind == .reasoning) .thinking else .writing);
-                const last = if (entries.items.len > 0) &entries.items[entries.items.len - 1] else null;
-                if (last == null or last.?.kind != kind) try entries.append(gpa, .{ .kind = kind, .open = expanded });
-                const current = &entries.items[entries.items.len - 1];
-                try current.text.appendSlice(gpa, d.text);
-                if (kind == .reasoning) try current.refreshLabel(gpa);
+                if (app.activity.phase != .compacting) app.activity.set(app.io, if (d.kind == .reasoning) .thinking else .writing);
+                try app.transcript.appendDelta(gpa, d.kind, d.text);
             },
             .run_start => |code| {
                 defer gpa.free(code);
-                activity.set(io, .running);
-                var e: Entry = .{ .kind = .run, .open = expanded };
-                try e.text.appendSlice(gpa, std.mem.trim(u8, code, "\n"));
-                try e.refreshLabel(gpa);
-                try entries.append(gpa, e);
+                app.activity.set(app.io, .running);
+                try app.transcript.startRun(gpa, code);
             },
             .run_end => |r| {
                 defer gpa.free(r.output);
-                const elapsed = activity.label(io).ms;
-                activity.set(io, .thinking);
-                if (lastRunning(entries.items)) |e| {
-                    e.run = if (r.ok) .ok else .failed;
-                    e.elapsed_ms = elapsed;
-                    try appendHead(gpa, &e.output, r.output, run_output_lines);
-                    try e.refreshLabel(gpa);
-                    e.cached = null;
-                }
+                const elapsed = app.activity.label(app.io).ms;
+                app.activity.set(app.io, .thinking);
+                try app.transcript.endRun(gpa, r.ok, r.output, elapsed);
             },
             .retry, .notice => |msg| {
                 defer gpa.free(msg);
-                if (std.mem.startsWith(u8, msg, "retry")) activity.set(io, .retrying);
-                try addEntry(gpa, &entries, .info, msg);
+                if (std.mem.startsWith(u8, msg, "retry")) app.activity.set(app.io, .retrying);
+                try app.transcript.add(gpa, .info, msg);
             },
-            .usage => |u| usage = u,
-            .done => {
-                turn.?.finish();
-                turn = null;
-                usage = session.usage;
-                steps = session.steps;
-                context = session.context_tokens;
-            },
+            .usage => |u| app.usage = u,
+            .done => app.finishTurn(),
             .failed => |msg| {
                 defer gpa.free(msg);
-                const canceled = turn.?.cancel.load(.acquire);
-                try addEntry(gpa, &entries, if (canceled) .info else .err, if (canceled) "canceled" else msg);
-                turn.?.finish();
-                turn = null;
-                usage = session.usage;
-                steps = session.steps;
-                context = session.context_tokens;
+                const canceled = app.turn.?.cancel.load(.acquire);
+                try app.transcript.add(gpa, if (canceled) .info else .err, if (canceled) "canceled" else msg);
+                app.finishTurn();
             },
         }
+        return true;
+    }
 
-        ticker.busy.store(turn != null, .release);
-        if (!session_choices_loaded and std.mem.startsWith(u8, input.text(), "/resume ")) {
-            _ = choices_arena.reset(.retain_capacity);
-            session_choices = try sessionChoices(io, choices_arena.allocator(), session);
-            session_choices_loaded = true;
+    fn onKey(app: *App, k: vaxis.Key) !bool {
+        const gpa = app.gpa;
+        const input = &app.input;
+        const page = @max(app.vx.window().height / 2, 1);
+        if (k.matches('c', .{ .ctrl = true })) return false;
+        if (k.matches('d', .{ .ctrl = true }) and input.text().len == 0) return false;
+        const selected = app.menu.selected(input.text());
+        const before = std.hash.Wyhash.hash(0, input.text());
+        var submitted: ?[]u8 = null;
+
+        if (selected != null and k.matches(vaxis.Key.escape, .{})) {
+            app.menu.closed = true;
+        } else if (selected != null and k.matches(vaxis.Key.up, .{})) {
+            app.menu.move(input.text(), false);
+        } else if (selected != null and k.matches(vaxis.Key.down, .{})) {
+            app.menu.move(input.text(), true);
+        } else if (selected != null and (k.matches(vaxis.Key.tab, .{}) or (k.matches(vaxis.Key.enter, .{}) and !app.pasting and !selected.?.runs()))) {
+            const completion = try selected.?.completion(gpa);
+            defer gpa.free(completion);
+            try input.replace(gpa, completion);
+        } else if (selected != null and k.matches(vaxis.Key.enter, .{}) and !app.pasting) {
+            const line = try selected.?.line(gpa);
+            defer gpa.free(line);
+            try input.replace(gpa, line);
+            if (app.turn == null or commands.allowedWhileBusy(line)) submitted = try input.take(gpa);
+        } else if (k.matches(vaxis.Key.escape, .{})) {
+            if (app.turn) |t| t.cancel.store(true, .release);
+        } else if (k.matches(vaxis.Key.page_up, .{})) {
+            app.scroll.pending -= page;
+        } else if (k.matches(vaxis.Key.page_down, .{})) {
+            app.scroll.pending += page;
+        } else if (k.matches('o', .{ .ctrl = true })) {
+            app.transcript.toggleExpanded();
+        } else if (k.matches(vaxis.Key.up, .{ .shift = true })) {
+            app.scroll.pending -= 3;
+        } else if (k.matches(vaxis.Key.down, .{ .shift = true })) {
+            app.scroll.pending += 3;
+        } else if (isNewline(k, app.pasting)) {
+            try input.insert(gpa, "\n");
+        } else if (k.matches(vaxis.Key.enter, .{})) {
+            if (app.turn == null or commands.allowedWhileBusy(input.text())) submitted = try input.take(gpa);
+        } else {
+            _ = try input.key(gpa, k);
         }
-        const menu = if (menu_closed) menu_buf[0..0] else commands.candidates(input.text(), session_choices, &menu_buf);
-        draw(vx.window(), entries.items, &input, &scroll, menu, @min(menu_sel, menu.len -| 1), cfg, usage, steps, context, if (turn != null) activity.label(io) else null, &status_text);
-        try vx.render(w);
-        try w.flush();
+        if (std.hash.Wyhash.hash(0, input.text()) != before) app.menu.inputChanged(input.text());
+        if (submitted) |line| try app.submit(line);
+        return true;
     }
-}
 
-fn appendHead(gpa: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8, max_lines: usize) !void {
-    var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, text, "\n"), '\n');
-    var n: usize = 0;
-    while (it.next()) |line| : (n += 1) {
-        if (n == max_lines) {
-            var rest: usize = 1;
-            while (it.next()) |_| rest += 1;
-            try out.print(gpa, "\n… {d} more lines", .{rest});
-            return;
-        }
-        if (n > 0) try out.append(gpa, '\n');
-        try out.appendSlice(gpa, line);
-    }
-}
-
-fn addHistory(gpa: std.mem.Allocator, entries: *std.ArrayList(Entry), history: []const provider.Message) !void {
-    for (history) |m| {
-        const content = m.content orelse "";
-        if (std.mem.eql(u8, m.role, "user")) {
-            try addEntry(gpa, entries, .user, content);
-        } else if (std.mem.eql(u8, m.role, "assistant")) {
-            if (m.reasoning) |r| {
-                const text = try r.display(gpa);
-                defer gpa.free(text);
-                if (text.len > 0) {
-                    try addEntry(gpa, entries, .reasoning, text);
-                    try entries.items[entries.items.len - 1].refreshLabel(gpa);
-                }
-            }
-            if (content.len > 0) try addEntry(gpa, entries, .assistant, content);
-            for (m.tool_calls orelse &.{}) |call| {
-                const Args = struct { code: []const u8 = "" };
-                const args = std.json.parseFromSlice(Args, gpa, call.function.arguments, .{ .ignore_unknown_fields = true }) catch continue;
-                defer args.deinit();
-                var e: Entry = .{ .kind = .run };
-                try e.text.appendSlice(gpa, std.mem.trim(u8, args.value.code, "\n"));
-                try e.refreshLabel(gpa);
-                try entries.append(gpa, e);
-            }
-        } else if (std.mem.eql(u8, m.role, "tool")) {
-            if (lastRunning(entries.items)) |e| {
-                e.run = .ok;
-                try appendHead(gpa, &e.output, content, run_output_lines);
-                try e.refreshLabel(gpa);
-            }
-        }
-    }
-}
-
-/// Commands marked `while_busy` may run while a Turn is in progress.
-fn busyCommand(line: []const u8) bool {
-    const parsed = commands.parse(line) orelse return false;
-    return switch (parsed) {
-        .known => |c| commands.specs.get(c.command).while_busy,
-        .unknown => false,
-    };
-}
-
-fn sessionChoices(io: std.Io, a: std.mem.Allocator, session: *const Session) ![]const commands.Choice {
-    const directory = try std.fs.path.join(a, &.{ session.options.data_home, "nib/sessions" });
-    const cwd = try std.process.currentPathAlloc(io, a);
-    const found = try session_log.list(io, a, directory, cwd);
-    const now = std.Io.Clock.real.now(io).nanoseconds;
-    const choices = try a.alloc(commands.Choice, found.len);
-    for (found, choices) |f, *c| {
-        const seconds: u64 = @intCast(@max(@divTrunc(now - f.modified_ns, std.time.ns_per_s), 0));
-        var ago_buf: [16]u8 = undefined;
-        const ago = if (seconds < 60)
-            "now"
-        else if (seconds < 3600)
-            try std.fmt.bufPrint(&ago_buf, "{d}m ago", .{seconds / 60})
-        else if (seconds < 86400)
-            try std.fmt.bufPrint(&ago_buf, "{d}h ago", .{seconds / 3600})
-        else
-            try std.fmt.bufPrint(&ago_buf, "{d}d ago", .{seconds / 86400});
-        const current = std.mem.eql(u8, f.id, session.id);
-        c.* = .{
-            .value = f.id,
-            .label = f.id[0..@min(8, f.id.len)],
-            .detail = try std.fmt.allocPrint(a, "{s}{s} · {s}", .{ ago, if (current) " (current)" else "", if (f.preview.len > 0) f.preview else "(no messages)" }),
-        };
-    }
-    return choices;
-}
-
-fn resolveSession(io: std.Io, a: std.mem.Allocator, session: *const Session, arg: []const u8) ![]const u8 {
-    if (arg.len == 0) return error.MissingSessionId;
-    if (arg.len == 32) return arg;
-    var match: ?[]const u8 = null;
-    for (try sessionChoices(io, a, session)) |c| {
-        if (!std.mem.startsWith(u8, c.value, arg)) continue;
-        if (match != null) return error.AmbiguousSession;
-        match = c.value;
-    }
-    return match orelse error.UnknownSession;
-}
-
-fn lastRunning(entries: []Entry) ?*Entry {
-    var i = entries.len;
-    while (i > 0) {
-        i -= 1;
-        if (entries[i].kind == .run and entries[i].run == .running) return &entries[i];
-    }
-    return null;
-}
-
-/// "bash ×2, read" from the `tools.<name>(` calls in a script.
-fn toolSummary(code: []const u8, buf: []u8) []const u8 {
-    var names: [8][]const u8 = undefined;
-    var counts: [8]u32 = undefined;
-    var n: usize = 0;
-    var rest = code;
-    while (std.mem.indexOf(u8, rest, "tools.")) |i| {
-        rest = rest[i + 6 ..];
-        var end: usize = 0;
-        while (end < rest.len and (std.ascii.isAlphanumeric(rest[end]) or rest[end] == '_')) end += 1;
-        if (end == 0) continue;
-        const name = rest[0..end];
-        for (names[0..n], counts[0..n]) |known, *count| {
-            if (std.mem.eql(u8, known, name)) {
-                count.* += 1;
-                break;
-            }
-        } else if (n < names.len) {
-            names[n] = name;
-            counts[n] = 1;
-            n += 1;
-        }
-    }
-    if (n == 0) return "js";
-    var w: std.Io.Writer = .fixed(buf);
-    for (names[0..n], counts[0..n], 0..) |name, count, i| {
-        if (i > 0) w.writeAll(", ") catch break;
-        w.writeAll(name) catch break;
-        if (count > 1) w.print(" ×{d}", .{count}) catch break;
-    }
-    return w.buffered();
-}
-
-fn addEntry(gpa: std.mem.Allocator, entries: *std.ArrayList(Entry), kind: @FieldType(Entry, "kind"), text: []const u8) !void {
-    var e: Entry = .{ .kind = kind };
-    try e.text.appendSlice(gpa, text);
-    try entries.append(gpa, e);
-}
-
-fn segmentsFor(e: *const Entry, segs: *[7]vaxis.Segment) []const vaxis.Segment {
-    const dim: vaxis.Style = .{ .dim = true };
-    switch (e.kind) {
-        .user => {
-            segs[0] = .{ .text = "› ", .style = .{ .bold = true, .fg = .{ .index = 4 } } };
-            segs[1] = .{ .text = e.text.items, .style = .{ .bold = true } };
-            return segs[0..2];
-        },
-        .assistant => segs[0] = .{ .text = e.text.items },
-        .reasoning => {
-            segs[0] = .{ .text = if (e.open) e.text.items else e.label.items, .style = .{ .dim = true, .italic = true } };
-        },
-        .run => {
-            segs[0] = switch (e.run) {
-                .running => .{ .text = "◌ ", .style = .{ .fg = .{ .index = 3 } } },
-                .ok => .{ .text = "✓ ", .style = .{ .fg = .{ .index = 2 } } },
-                .failed => .{ .text = "✗ ", .style = .{ .fg = .{ .index = 1 } } },
+    /// Takes ownership of `line`.
+    fn submit(app: *App, line: []u8) !void {
+        const gpa = app.gpa;
+        app.scroll = .{};
+        app.menu.forgetSessions();
+        if (line.len == 0) return gpa.free(line);
+        if (commands.parse(line)) |parsed| {
+            defer gpa.free(line);
+            return switch (parsed) {
+                .unknown => |name| app.report(.err, "unknown command /{s} · /help lists commands", .{name}),
+                .known => |c| app.command(c.command, c.arg, line),
             };
-            segs[1] = .{ .text = "run ", .style = .{ .fg = .{ .index = 3 }, .bold = true } };
-            segs[2] = .{ .text = e.label.items, .style = dim };
-            if (!e.open) return segs[0..3];
-            segs[3] = .{ .text = "\n" };
-            segs[4] = .{ .text = e.text.items, .style = .{ .fg = .{ .index = 3 } } };
-            if (e.output.items.len == 0) return segs[0..5];
-            segs[5] = .{ .text = "\n" };
-            segs[6] = .{ .text = e.output.items, .style = if (e.run == .failed) .{ .fg = .{ .index = 1 }, .dim = true } else dim };
-            return segs[0..7];
-        },
-        .info => segs[0] = .{ .text = e.text.items, .style = dim },
-        .err => segs[0] = .{ .text = e.text.items, .style = .{ .fg = .{ .index = 1 } } },
+        }
+        if (app.cfg.missingKey()) {
+            gpa.free(line);
+            return app.transcript.add(gpa, .err, "no API key");
+        }
+        try app.transcript.add(gpa, .user, line);
+        app.turn = try Turn.spawn(gpa, app.session, app.loop, line, false);
+        app.activity = .start(app.io, .thinking);
     }
-    return segs[0..1];
-}
+
+    fn command(app: *App, c: commands.Command, arg: []const u8, line: []const u8) !void {
+        const gpa = app.gpa;
+        const session = app.session;
+        switch (c) {
+            .help => {
+                const text = try commands.helpText(gpa);
+                defer gpa.free(text);
+                try app.transcript.add(gpa, .info, text);
+            },
+            .new, .@"resume" => {
+                const id = if (c == .new) null else app.menu.resolveSession(app.io, session, arg) catch |err| {
+                    return app.transcript.add(gpa, .err, switch (err) {
+                        error.MissingSessionId => "usage: /resume <id> · type /resume and a space to pick one",
+                        error.UnknownSession => "no session here starts with that id",
+                        error.AmbiguousSession => "several sessions start with that id; type more of it",
+                        else => @errorName(err),
+                    });
+                };
+                if (id != null and std.mem.eql(u8, id.?, session.id)) return app.transcript.add(gpa, .info, "already in this session");
+                session.reopen(id) catch |err| return app.report(.err, "could not open session: {s}", .{@errorName(err)});
+                app.transcript.clear(gpa);
+                try app.transcript.addHistory(gpa, session.history.items);
+                app.usage = .{};
+                app.steps = 0;
+                app.context = session.context_tokens;
+                try app.report(.info, "{s} session {s}", .{ if (c == .new) "new" else "resumed", session.id[0..8] });
+            },
+            .copy => {
+                const answer = app.transcript.lastAnswer() orelse return app.transcript.add(gpa, .err, "no answer to copy yet");
+                try app.vx.copyToSystemClipboard(app.w, answer, gpa);
+                try app.report(.info, "copied {d} bytes (needs a terminal with OSC 52 clipboard support)", .{answer.len});
+            },
+            .effort => {
+                if (arg.len > 0) {
+                    app.cfg.setEffort(arg) catch return app.transcript.add(gpa, .err, "usage: /effort [default|off|none|minimal|low|medium|high|xhigh|max]");
+                    session.cfg = app.cfg;
+                    session.tools.cfg = app.cfg;
+                }
+                try app.report(.info, "effort: {s} · thinking: {s} · configured: {s} (model support varies)", .{
+                    app.cfg.effectiveEffort(),
+                    if (app.cfg.thinking) |on| (if (on) "on" else "off") else "default",
+                    app.cfg.reasoning_effort orelse "default",
+                });
+            },
+            .js => {
+                if (arg.len == 0) return app.transcript.add(gpa, .err, "usage: /js <code>");
+                try app.transcript.add(gpa, .user, line);
+                const r = try session.run(arg, null);
+                app.usage = session.usage;
+                defer r.deinit(gpa);
+                if (r.logs.len > 0) try app.transcript.add(gpa, .info, std.mem.trimEnd(u8, r.logs, "\n"));
+                try app.transcript.add(gpa, if (r.ok) .info else .err, r.text);
+            },
+            .compact => {
+                app.turn = try Turn.spawn(gpa, session, app.loop, try gpa.dupe(u8, line), true);
+                app.activity = .start(app.io, .compacting);
+            },
+        }
+    }
+
+    fn report(app: *App, kind: EntryKind, comptime fmt: []const u8, args: anytype) !void {
+        const message = try std.fmt.allocPrint(app.gpa, fmt, args);
+        defer app.gpa.free(message);
+        try app.transcript.add(app.gpa, kind, message);
+    }
+
+    fn finishTurn(app: *App) void {
+        app.turn.?.finish();
+        app.turn = null;
+        app.usage = app.session.usage;
+        app.steps = app.session.steps;
+        app.context = app.session.context_tokens;
+    }
+
+    fn render(app: *App) !void {
+        try app.menu.load(app.io, app.input.text(), app.session);
+        const menu = app.menu.items(app.input.text());
+        view.draw(app.vx.window(), app.transcript.entries.items, &app.input, &app.scroll, menu, @min(app.menu.sel, menu.len -| 1), .{
+            .cfg = app.cfg,
+            .usage = app.usage,
+            .steps = app.steps,
+            .context = app.context,
+            .busy = if (app.turn != null) app.activity.label(app.io) else null,
+        }, &app.status_text);
+        try app.vx.render(app.w);
+        try app.w.flush();
+    }
+};
 
 fn isNewline(key: vaxis.Key, pasting: bool) bool {
     const enter = vaxis.Key.enter;
     return (pasting and key.matches(enter, .{})) or key.matches(enter, .{ .shift = true }) or
         key.matches(enter, .{ .alt = true }) or key.matches('j', .{ .ctrl = true });
-}
-
-fn draw(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewport, menu: []const commands.Candidate, menu_sel: usize, cfg: provider.Config, usage: provider.Usage, steps: u32, context: u64, busy: ?Activity.Label, text: *StatusText) void {
-    win.clear();
-    win.hideCursor();
-    if (win.height < 6 or win.width < 8) return;
-
-    const input_rows = input.rows(win.child(.{ .x_off = 3 }));
-    const input_h: u16 = @min(input_rows, win.height / 3);
-    const menu_h: u16 = @intCast(@min(menu.len, max_menu_rows, (win.height - 1 - input_h) / 2));
-    const body_h: u16 = win.height - 1 - input_h - menu_h;
-    const body = win.child(.{ .x_off = 1, .width = win.width - 2, .height = body_h });
-    const top = scroll.layout(entries, body);
-    var y: i32 = -@as(i32, top.row);
-    for (entries[top.entry..]) |*e| {
-        if (y >= body_h) break;
-        const h = e.height(body);
-        if (y + h > 0) _ = e.print(body.child(.{ .y_off = @intCast(y), .height = h }), true);
-        y += @as(i32, h) + 1;
-    }
-
-    const status_buf = &text.status;
-    const activity_buf = &text.activity;
-    const doing: []const u8 = if (busy) |b|
-        std.fmt.bufPrint(activity_buf, "{s} {s} {d}s", .{ spinner[(b.ms / 100) % spinner.len], @tagName(b.phase), b.ms / 1000 }) catch ""
-    else
-        "";
-    const separator: []const u8 = if (doing.len > 0) " · " else "";
-    const status = if (scroll.top != null)
-        std.fmt.bufPrint(status_buf, "{s}{s}↑ history", .{ doing, separator }) catch ""
-    else
-        std.fmt.bufPrint(status_buf, "{s}{s}{s} · effort {s} · ctx {d}% · last turn: {d} steps, in {d} (cache {d}), out {d}", .{
-            doing,
-            separator,
-            cfg.model,
-            cfg.effectiveEffort(),
-            context * 100 / @max(cfg.context_window, 1),
-            steps,
-            usage.prompt_tokens,
-            usage.prompt_cache_hit_tokens,
-            usage.completion_tokens,
-        }) catch "";
-    const status_style: vaxis.Style = if (busy != null) .{ .fg = .{ .index = 3 } } else .{ .dim = true };
-    const first = if (menu_sel >= menu_h) menu_sel + 1 - menu_h else 0;
-    for (0..menu_h) |i| {
-        const c = menu[first + i];
-        const chosen = first + i == menu_sel;
-        const row = win.child(.{ .x_off = 1, .y_off = @intCast(body_h + i), .height = 1 });
-        const name_style: vaxis.Style = if (chosen) .{ .reverse = true, .bold = true } else .{ .bold = true };
-        _ = row.printSegment(.{ .text = c.label, .style = name_style }, .{ .wrap = .none });
-        _ = row.child(.{ .x_off = 14 }).printSegment(.{ .text = c.detail, .style = .{ .dim = true } }, .{ .wrap = .none });
-    }
-    _ = win.child(.{ .x_off = 1, .y_off = body_h + menu_h, .height = 1 }).printSegment(.{ .text = status, .style = status_style }, .{ .wrap = .none });
-
-    _ = win.child(.{ .x_off = 1, .y_off = body_h + menu_h + 1, .height = 1 }).printSegment(.{ .text = "› ", .style = .{ .fg = .{ .index = 4 } } }, .{});
-    input.draw(win.child(.{ .x_off = 3, .y_off = body_h + menu_h + 1, .height = input_h }));
-}
-
-test "runs fold to one line until expanded" {
-    const gpa = std.testing.allocator;
-    var screen: vaxis.Screen = .{};
-    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 60, .height = 24, .screen = &screen };
-    var e: Entry = .{ .kind = .run, .run = .ok, .elapsed_ms = 1234 };
-    defer e.deinit(gpa);
-    try e.text.appendSlice(gpa, "const a = await tools.bash({});\nconst b = await tools.bash({});\nawait tools.read({})");
-    try e.output.appendSlice(gpa, "line 1\nline 2");
-    try e.refreshLabel(gpa);
-    try std.testing.expectEqual(@as(u16, 1), e.height(win));
-    var segs: [7]vaxis.Segment = undefined;
-    try std.testing.expectEqualStrings("bash ×2, read · 1.2s", segmentsFor(&e, &segs)[2].text);
-    e.open = true;
-    try std.testing.expectEqual(@as(u16, 6), e.height(win));
-}
-
-test "toolSummary" {
-    var buf: [80]u8 = undefined;
-    try std.testing.expectEqualStrings("js", toolSummary("1 + 1", &buf));
-    try std.testing.expectEqualStrings("agent ×2", toolSummary("Promise.all([tools.agent({}), tools.agent({})])", &buf));
-}
-
-test "draw benchmark: 5000 entries" {
-    const benchmark = std.testing.environ.getPosix("NIB_TUI_BENCH") != null;
-    const frames: u8 = if (benchmark) 32 else 1;
-    const gpa = std.testing.allocator;
-    const entries = try gpa.alloc(Entry, 5000);
-    defer gpa.free(entries);
-    const sample = "A long session entry with enough words to wrap over several lines. A long session entry with enough words to wrap over several lines. A long session entry with enough words to wrap over several lines. A long session entry with enough words to wrap over several lines. A long session entry with enough words to wrap over several lines. A long session entry with enough words to wrap over several lines. ";
-    for (entries) |*e| e.* = .{ .kind = .assistant, .text = .fromOwnedSlice(@constCast(sample)) };
-    var screen = try vaxis.Screen.init(gpa, .{ .cols = 100, .rows = 24, .x_pixel = 0, .y_pixel = 0 });
-    defer screen.deinit(gpa);
-    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 100, .height = 24, .screen = &screen };
-    var status_text: StatusText = .{};
-    var input: Editor = .{};
-    defer input.deinit(gpa);
-    const cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "mock" };
-    for ([_]u32{ 0, 1200 }) |offset| {
-        var samples: [5]i96 = undefined;
-        for (&samples) |*sample_ns| {
-            var scroll: Viewport = .{ .pending = -@as(i64, offset) };
-            draw(win, entries, &input, &scroll, &.{}, 0, cfg, .{}, 0, 0, null, &status_text);
-            const before = std.Io.Clock.awake.now(std.testing.io);
-            for (0..frames) |_| {
-                draw(win, entries, &input, &scroll, &.{}, 0, cfg, .{}, 0, 0, null, &status_text);
-            }
-            sample_ns.* = @divTrunc(before.untilNow(std.testing.io, .awake).nanoseconds, frames);
-        }
-        std.mem.sort(i96, &samples, {}, std.sort.asc(i96));
-        if (benchmark) std.debug.print("\nTUI draw: 5000 entries, offset {d}, median {d} ns/frame\n", .{ offset, samples[2] });
-        try std.testing.expect(screen.cursor_vis);
-    }
-}
-
-test "entry height cache reuses measurements and invalidates on width or append" {
-    const gpa = std.testing.allocator;
-    var screen: vaxis.Screen = .{};
-    var win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 10, .height = 24, .screen = &screen };
-    var e: Entry = .{ .kind = .assistant };
-    defer e.text.deinit(gpa);
-    try e.text.appendSlice(gpa, "1234567890");
-    try std.testing.expectEqual(@as(u16, 1), e.height(win));
-    e.cached.?.rows = 123;
-    try std.testing.expectEqual(@as(u16, 123), e.height(win));
-    win.width = 5;
-    try std.testing.expectEqual(@as(u16, 2), e.height(win));
-    try e.text.appendSlice(gpa, "12345");
-    try std.testing.expectEqual(@as(u16, 3), e.height(win));
-}
-
-test "viewport anchors survive streaming and appended Run output then resume following" {
-    const gpa = std.testing.allocator;
-    var screen: vaxis.Screen = .{};
-    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 20, .height = 4, .screen = &screen };
-    var entries: std.ArrayList(Entry) = .empty;
-    defer {
-        for (entries.items) |*e| e.deinit(gpa);
-        entries.deinit(gpa);
-    }
-    try addEntry(gpa, &entries, .user, "one");
-    try addEntry(gpa, &entries, .assistant, "two\nthree\nfour");
-    var view: Viewport = .{ .pending = -2 };
-    const top = view.layout(entries.items, win);
-    try std.testing.expect(view.top != null);
-    try entries.items[1].text.appendSlice(gpa, "\nfive\nsix");
-    try std.testing.expectEqualDeep(top, view.layout(entries.items, win));
-    try addEntry(gpa, &entries, .info, "output\nmore output");
-    try std.testing.expectEqualDeep(top, view.layout(entries.items, win));
-    view.pending = 100;
-    _ = view.layout(entries.items, win);
-    try std.testing.expect(view.top == null);
-    try addEntry(gpa, &entries, .assistant, "done");
-    try std.testing.expectEqualDeep(Viewport.bottom(entries.items, win), view.layout(entries.items, win));
-}
-
-test "viewport can traverse all 5000 entries and gaps in both directions" {
-    const gpa = std.testing.allocator;
-    const entries = try gpa.alloc(Entry, 5000);
-    defer gpa.free(entries);
-    for (entries) |*e| e.* = .{ .kind = .info };
-    var screen: vaxis.Screen = .{};
-    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 10, .height = 4, .screen = &screen };
-    var view: Viewport = .{ .pending = -100_000 };
-    try std.testing.expectEqualDeep(Anchor{}, view.layout(entries, win));
-    view.pending = 1;
-    try std.testing.expectEqualDeep(Anchor{ .row = 1 }, view.layout(entries, win));
-    view.pending = 1;
-    try std.testing.expectEqualDeep(Anchor{ .entry = 1 }, view.layout(entries, win));
-    view.pending = -1;
-    try std.testing.expectEqualDeep(Anchor{ .row = 1 }, view.layout(entries, win));
-    view.pending = 100_000;
-    try std.testing.expectEqualDeep(Viewport.bottom(entries, win), view.layout(entries, win));
-    try std.testing.expect(view.top == null);
-}
-
-test "draw keeps scrolled body fixed while output arrives and caps input height" {
-    const gpa = std.testing.allocator;
-    var screen = try vaxis.Screen.init(gpa, .{ .cols = 100, .rows = 24, .x_pixel = 0, .y_pixel = 0 });
-    defer screen.deinit(gpa);
-    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 100, .height = 24, .screen = &screen };
-    var entries: std.ArrayList(Entry) = .empty;
-    defer {
-        for (entries.items) |*e| e.deinit(gpa);
-        entries.deinit(gpa);
-    }
-    var paragraph: std.ArrayList(u8) = .empty;
-    defer paragraph.deinit(gpa);
-    for (0..40) |i| try paragraph.print(gpa, "line {d}\n", .{i});
-    try addEntry(gpa, &entries, .assistant, paragraph.items);
-    try addEntry(gpa, &entries, .assistant, "stream");
-    var input: Editor = .{};
-    defer input.deinit(gpa);
-    var status_text: StatusText = .{};
-    var view: Viewport = .{ .pending = -30 };
-    const cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "mock" };
-    draw(win, entries.items, &input, &view, &.{}, 0, cfg, .{}, 0, 0, .{ .phase = .thinking, .ms = 0 }, &status_text);
-    const body_before = try gpa.dupe(vaxis.Cell, screen.buf[0 .. 22 * 100]);
-    defer gpa.free(body_before);
-    try entries.items[1].text.appendSlice(gpa, "\nmore streamed text");
-    try addEntry(gpa, &entries, .info, "Run output");
-    draw(win, entries.items, &input, &view, &.{}, 0, cfg, .{}, 0, 0, .{ .phase = .thinking, .ms = 0 }, &status_text);
-    try std.testing.expectEqualDeep(body_before, screen.buf[0 .. 22 * 100]);
-    for (0..16) |i| try input.buf.print(gpa, "input {d}\n", .{i});
-    input.cursor = input.buf.items.len;
-    draw(win, entries.items, &input, &view, &.{}, 0, cfg, .{}, 0, 0, .{ .phase = .thinking, .ms = 0 }, &status_text);
-    try std.testing.expectEqual(@as(u16, 9), input.top_row);
-    try std.testing.expectEqual(@as(u16, 23), screen.cursor.row);
-    try std.testing.expect(screen.cursor_vis);
-    try std.testing.expectEqualStrings("i", screen.readCell(3, 16).?.char.grapheme);
 }

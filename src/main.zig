@@ -180,5 +180,10 @@ test {
     _ = @import("tools/html.zig");
     _ = @import("tui/editor.zig");
     _ = @import("tui/commands.zig");
+    _ = @import("tui/transcript.zig");
+    _ = @import("tui/viewport.zig");
+    _ = @import("tui/menu.zig");
+    _ = @import("tui/status.zig");
+    _ = @import("tui/view.zig");
     _ = @import("session.zig");
 }

@@ -53,6 +53,14 @@ pub fn parse(line: []const u8) ?Parsed {
     return .{ .known = .{ .command = command, .arg = std.mem.trim(u8, line[end..], " \t\n") } };
 }
 
+pub fn allowedWhileBusy(line: []const u8) bool {
+    const parsed = parse(line) orelse return false;
+    return switch (parsed) {
+        .known => |c| specs.get(c.command).while_busy,
+        .unknown => false,
+    };
+}
+
 pub const Choice = struct {
     value: []const u8,
     label: []const u8,
