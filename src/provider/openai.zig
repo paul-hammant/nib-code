@@ -90,6 +90,7 @@ pub fn stream(
     cfg: Config,
     messages: []const Message,
     tools_json: []const u8,
+    max_tokens: ?u32,
     sink: Sink,
     cancel: *const std.atomic.Value(bool),
     detail: *?[]u8,
@@ -98,7 +99,7 @@ pub fn stream(
     defer gpa.free(url);
     const auth = try std.fmt.allocPrint(gpa, "Bearer {s}", .{cfg.api_key});
     defer gpa.free(auth);
-    const body = try requestBody(gpa, cfg.model, messages, tools_json);
+    const body = try requestBody(gpa, cfg.model, messages, tools_json, max_tokens);
     defer gpa.free(body);
 
     var req = try client.request(.POST, try std.Uri.parse(url), .{
@@ -125,7 +126,7 @@ pub fn stream(
     const reader = response.reader(buf);
 
     if (response.head.status.class() != .success) {
-        const status = @intFromEnum(response.head.status);
+        const status = @backingInt(response.head.status);
         const text = reader.allocRemaining(gpa, .limited(64 * 1024)) catch "";
         defer if (text.len > 0) gpa.free(text);
         detail.* = try std.fmt.allocPrint(gpa, "HTTP {d}: {s}", .{ status, text });
@@ -146,6 +147,7 @@ pub fn stream(
     }
 
     var usage: Usage = .{};
+    var done = false;
     while (true) {
         if (cancel.load(.acquire)) return error.Canceled;
         const line = reader.takeDelimiter('\n') catch |err| switch (err) {
@@ -153,12 +155,15 @@ pub fn stream(
             else => return err,
         } orelse break;
         const data = (try parser.feed(gpa, line)) orelse continue;
-        if (std.mem.eql(u8, data, "[DONE]")) break;
+        if (std.mem.eql(u8, data, "[DONE]")) {
+            done = true;
+            break;
+        }
 
         defer _ = arena.reset(.retain_capacity);
         const chunk = std.json.parseFromSliceLeaky(Chunk, arena.allocator(), data, .{
             .ignore_unknown_fields = true,
-        }) catch continue;
+        }) catch return error.InvalidResponse;
         if (chunk.usage) |u| usage = u;
         for (chunk.choices) |choice| {
             const d = choice.delta;
@@ -178,6 +183,10 @@ pub fn stream(
         }
     }
 
+    if (!done) return error.IncompleteResponse;
+    for (calls.items) |p| {
+        if (p.id.items.len == 0 or p.name.items.len == 0) return error.InvalidResponse;
+    }
     const tool_calls = try out.alloc(ToolCall, calls.items.len);
     for (calls.items, tool_calls) |p, *tc| tc.* = .{
         .id = try out.dupe(u8, p.id.items),
@@ -186,11 +195,15 @@ pub fn stream(
     return .{ .text = try out.dupe(u8, text.items), .tool_calls = tool_calls, .usage = usage };
 }
 
-fn requestBody(gpa: std.mem.Allocator, model: []const u8, messages: []const Message, tools_json: []const u8) ![]u8 {
+fn requestBody(gpa: std.mem.Allocator, model: []const u8, messages: []const Message, tools_json: []const u8, max_tokens: ?u32) ![]u8 {
     const opts: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
+    const limit = if (max_tokens) |n| try std.fmt.allocPrint(gpa, ",\"max_tokens\":{d}", .{n}) else try gpa.dupe(u8, "");
+    defer gpa.free(limit);
+    const tool_field = if (std.mem.eql(u8, tools_json, "[]")) try gpa.dupe(u8, "") else try std.fmt.allocPrint(gpa, ",\"tools\":{s}", .{tools_json});
+    defer gpa.free(tool_field);
     return std.fmt.allocPrint(gpa,
-        \\{{"model":{f},"messages":{f},"tools":{s},"stream":true,"stream_options":{{"include_usage":true}}}}
-    , .{ std.json.fmt(model, opts), std.json.fmt(messages, opts), tools_json });
+        \\{{"model":{f},"messages":{f}{s}{s},"stream":true,"stream_options":{{"include_usage":true}}}}
+    , .{ std.json.fmt(model, opts), std.json.fmt(messages, opts), tool_field, limit });
 }
 
 test "chunk decodes deepseek deltas, tool call fragments and usage" {
@@ -206,16 +219,26 @@ test "chunk decodes deepseek deltas, tool call fragments and usage" {
     try std.testing.expectEqual(@as(u64, 4), c.usage.?.prompt_cache_hit_tokens);
 }
 
-test "request body omits null fields and embeds tools verbatim" {
+test "request body omits null fields and absent tools" {
     const gpa = std.testing.allocator;
     const msgs = [_]Message{
         .{ .role = "user", .content = "hi" },
         .{ .role = "assistant", .content = "", .tool_calls = &.{.{ .id = "c1", .function = .{ .name = "run", .arguments = "{}" } }} },
         .{ .role = "tool", .content = "ok", .tool_call_id = "c1" },
     };
-    const body = try requestBody(gpa, "m", &msgs, "[]");
+    const body = try requestBody(gpa, "m", &msgs, "[]", null);
     defer gpa.free(body);
     try std.testing.expectEqualStrings(
-        \\{"model":"m","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"run","arguments":"{}"}}]},{"role":"tool","content":"ok","tool_call_id":"c1"}],"tools":[],"stream":true,"stream_options":{"include_usage":true}}
+        \\{"model":"m","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"run","arguments":"{}"}}]},{"role":"tool","content":"ok","tool_call_id":"c1"}],"stream":true,"stream_options":{"include_usage":true}}
     , body);
+}
+
+test "summary request limits output and omits tools" {
+    const t = std.testing;
+    const body = try requestBody(t.allocator, "m", &.{.{ .role = "user", .content = "summary" }}, "[]", 512);
+    defer t.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, body, .{});
+    defer parsed.deinit();
+    try t.expect(!parsed.value.object.contains("tools"));
+    try t.expectEqual(@as(i64, 512), parsed.value.object.get("max_tokens").?.integer);
 }

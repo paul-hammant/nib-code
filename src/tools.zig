@@ -61,7 +61,7 @@ pub const docs = blk: {
     ;
 };
 
-const max_output = 64 * 1024;
+const max_output = 16 * 1024;
 
 pub const Tools = struct {
     io: std.Io,

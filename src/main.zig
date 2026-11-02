@@ -35,15 +35,40 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    var options: agent.Session.Options = .{
+        .home = init.environ_map.get("HOME") orelse "",
+        .data_home = init.environ_map.get("XDG_DATA_HOME") orelse try std.fs.path.join(init.arena.allocator(), &.{ init.environ_map.get("HOME") orelse "", ".local/share" }),
+        .config_home = init.environ_map.get("XDG_CONFIG_HOME") orelse try std.fs.path.join(init.arena.allocator(), &.{ init.environ_map.get("HOME") orelse "", ".config" }),
+    };
+    var ask = false;
+    var prompt: ?[]const u8 = null;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (!ask and std.mem.eql(u8, arg, "ask")) {
+            ask = true;
+        } else if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--continue")) {
+            options.continue_latest = true;
+        } else if (std.mem.eql(u8, arg, "--resume")) {
+            i += 1;
+            if (i == args.len) fatal("--resume requires a session id");
+            options.resume_id = args[i];
+        } else if (ask and prompt == null) {
+            prompt = arg;
+        } else fatal("usage: nib [ask '<prompt>'] [-c | --continue | --resume <id>]");
+    }
+    if (options.continue_latest and options.resume_id != null) fatal("choose --continue or --resume");
+    if (ask and prompt == null) fatal("ask requires a prompt");
+
     var client: std.http.Client = .{ .allocator = gpa, .io = init.io };
     defer client.deinit();
     try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
 
-    if (args.len >= 3 and std.mem.eql(u8, args[1], "ask")) {
-        if (cfg.llm.api_key.len == 0) fatal("set DEEPSEEK_API_KEY (or NIB_API_KEY)");
-        var session = try agent.Session.init(gpa, init.io, &client, cfg.llm, init.environ_map.get("HOME") orelse "");
-        defer session.deinit();
+    if (ask and cfg.llm.api_key.len == 0) fatal("set DEEPSEEK_API_KEY (or NIB_API_KEY)");
+    var session = agent.Session.init(gpa, init.io, &client, cfg.llm, options) catch |err| fatal(@errorName(err));
+    defer session.deinit();
 
+    if (ask) {
         const Print = struct {
             w: *std.Io.Writer,
             fn emit(ctx: *anyopaque, ev: agent.Event) !void {
@@ -64,7 +89,7 @@ pub fn main(init: std.process.Init) !void {
         var cancel: std.atomic.Value(bool) = .init(false);
         var detail: ?[]u8 = null;
         defer if (detail) |d| gpa.free(d);
-        session.turn(args[2], .{ .ctx = &p, .emit = Print.emit }, &cancel, &detail) catch |err| {
+        session.turn(prompt.?, .{ .ctx = &p, .emit = Print.emit }, &cancel, &detail) catch |err| {
             fatal(detail orelse @errorName(err));
         };
         try stdout.print("\n", .{});
@@ -76,8 +101,6 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    var session = try agent.Session.init(gpa, init.io, &client, cfg.llm, init.environ_map.get("HOME") orelse "");
-    defer session.deinit();
     try tui.run(init, &session);
 }
 

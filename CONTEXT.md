@@ -5,11 +5,11 @@
 ## 会话与回合
 
 **Session**（会话）：
-用户与 agent 的一次完整对话，从启动到退出。
+用户与 agent 的一段完整对话，可通过 Session log 在进程退出后恢复。一个进程一次只持有一个 Session。
 _Avoid_: conversation, thread, chat
 
 **Session log**（会话日志）：
-一个 Session 里发生的一切的只追加记录；是唯一的事实来源，恢复、分叉、回放都从它重建。
+一个 Session 的模型上下文的只追加记录，是模型上下文的唯一事实来源。恢复从它重建 system、已完成的 Step 和压缩后的上下文；它不记录完整界面事件，也不能撤销或重放文件、命令的外部副作用。
 _Avoid_: history, transcript（transcript 只指界面上显示的内容）
 
 **Turn**（回合）：
@@ -17,7 +17,7 @@ _Avoid_: history, transcript（transcript 只指界面上显示的内容）
 _Avoid_: round。注意：pi 的 `turn_start` 指的是单次模型调用，相当于这里的 Step。
 
 **Step**（步）：
-一个 Turn 内的一次模型请求与响应，以及随后执行的 Run（如果有）。
+一个 Turn 内的一次模型请求与响应，以及随后执行的全部 Run（如果有）。Step 完整后才提交日志；首个 Step 同时提交该 Turn 的用户消息。
 _Avoid_: iteration, turn
 
 ## 执行
@@ -31,7 +31,7 @@ _Avoid_: eval, cell, code-mode call, PTC call
 _Avoid_: VM, REPL, kernel（这些词暗示跨 Run 的持久状态）
 
 **Tool**（工具）：
-宿主暴露给 Run 内脚本的一项能力，如 `tools.read`；每次调用都经过参数校验并写入 Session log。`run` 本身不叫 Tool。
+宿主暴露给 Run 内脚本的一项能力，如 `tools.read`；调用参数经过宿主校验。Session log 记录 Run 代码与最终返回给模型的结果，不逐项记录脚本内部的 Tool 调用。`run` 本身不叫 Tool。
 _Avoid_: function, programmatic tool, native tool
 
 ## 模型
@@ -43,3 +43,7 @@ _Avoid_: backend, API（太宽泛）
 **Reasoning**（推理内容）：
 模型输出的思考过程；展示给用户，但不进入发给模型的历史。
 _Avoid_: thinking（在本项目中两者同义，统一用 Reasoning）
+
+**Context compaction**（上下文压缩）：
+用摘要替换较早的模型上下文，保留 system 和近期完整的 Turn 或 Step。Session log 追加替换记录，原始记录仍在文件里；恢复使用最新替换结果。
+_Avoid_: 清空会话、删除日志
