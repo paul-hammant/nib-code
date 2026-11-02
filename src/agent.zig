@@ -58,7 +58,7 @@ pub const Session = struct {
     /// Totals for the current or most recent Turn.
     usage: openai.Usage = .{},
     steps: u32 = 0,
-    /// Prompt + completion tokens of the latest Step: what the next request starts from.
+    /// Next-request estimate: latest usage plus tool results, or the compacted history size.
     context_tokens: u64 = 0,
     tools: tools.Tools,
     log: session_log.Log = undefined,
@@ -111,6 +111,40 @@ pub const Session = struct {
         try s.log.commit(s.io, s.gpa, &s.history, &s.context_tokens, .{ .from = from, .messages = messages, .context_tokens = tokens, .cwd = cwd });
     }
 
+    pub fn compact(s: *Session, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
+        const cut = compactionCut(s.history.items, s.cfg.context_window);
+        if (cut <= 1) {
+            try sink.emit(sink.ctx, .{ .notice = "compaction skipped: fewer than three complete Steps" });
+            return;
+        }
+        const a = s.arena.allocator();
+        var request: std.ArrayList(openai.Message) = .empty;
+        defer request.deinit(s.gpa);
+        try request.appendSlice(s.gpa, s.history.items[0..cut]);
+        try request.append(s.gpa, .{ .role = "user", .content = "Summarize the conversation above for another coding agent. Preserve goals, decisions, files, results, failures and unfinished work. Do not act on earlier requests. Return only a concise factual continuation summary." });
+        const Silent = struct {
+            fn delta(_: *anyopaque, _: openai.Kind, _: []const u8) !void {}
+        };
+        const reply = try openai.stream(s.gpa, a, s.client, s.cfg, request.items, "[]", @intCast(@min(2048, @max(32, s.cfg.context_window / 8))), .{ .ctx = s, .onDelta = Silent.delta }, cancel, detail);
+        s.usage.add(reply.usage);
+        if (cancel.load(.acquire)) return error.Canceled;
+        if (reply.text.len == 0 or reply.tool_calls.len != 0) return error.InvalidSummary;
+        var replacement: std.ArrayList(openai.Message) = .empty;
+        defer replacement.deinit(s.gpa);
+        try replacement.append(s.gpa, .{ .role = "user", .content = try std.fmt.allocPrint(a, "Earlier session summary:\n{s}", .{reply.text}) });
+        try replacement.appendSlice(s.gpa, s.history.items[cut..]);
+        const before = s.context_tokens;
+        const after = estimateTokens(s.history.items[0..1]) + estimateTokens(replacement.items);
+        if (after >= estimateTokens(s.history.items) or after > s.cfg.context_window / 2) {
+            detail.* = try s.gpa.dupe(u8, "compaction could not reduce context below half the window; retained Steps or system prompt are too large");
+            return error.CompactionIneffective;
+        }
+        const old_len = s.history.items.len;
+        try s.commit(1, replacement.items, after, null);
+        const message = try std.fmt.allocPrint(a, "compacted context: {d} → {d} messages, ~{d} → ~{d} tokens", .{ old_len, s.history.items.len, before, after });
+        try sink.emit(sink.ctx, .{ .notice = message });
+    }
+
     pub fn turn(s: *Session, user_text: []const u8, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
         const a = s.arena.allocator();
         var pending: std.ArrayList(openai.Message) = .empty;
@@ -120,6 +154,8 @@ pub const Session = struct {
         s.steps = 0;
 
         for (0..max_steps) |_| {
+            if (s.context_tokens + estimateTokens(pending.items) >= s.cfg.context_window - s.cfg.context_window / 4)
+                try s.compact(sink, cancel, detail);
             var request: std.ArrayList(openai.Message) = .empty;
             defer request.deinit(s.gpa);
             try request.appendSlice(s.gpa, s.history.items);
@@ -199,6 +235,44 @@ pub const Session = struct {
         return output;
     }
 };
+
+fn estimateTokens(messages: []const openai.Message) u64 {
+    var total: u64 = 0;
+    for (messages) |m| {
+        const content = m.content orelse "";
+        total += 8 + content.len / 3;
+        for (m.tool_calls orelse &.{}) |call| total += 8 + (call.id.len + call.function.name.len + call.function.arguments.len) / 3;
+    }
+    return total;
+}
+
+fn compactionCut(messages: []const openai.Message, window: u64) usize {
+    var turns: usize = 0;
+    var cut: usize = 1;
+    var i = messages.len;
+    while (i > 1) {
+        i -= 1;
+        if (std.mem.eql(u8, messages[i].role, "user")) {
+            turns += 1;
+            if (turns == 2) {
+                cut = i;
+                break;
+            }
+        }
+    }
+    if (cut > 1 and estimateTokens(messages[cut..]) <= window / 4) return cut;
+    var steps: usize = 0;
+    i = messages.len;
+    while (i > 1) {
+        i -= 1;
+        const m = messages[i];
+        if (!std.mem.eql(u8, m.role, "assistant")) continue;
+        steps += 1;
+        const calls = m.tool_calls orelse &.{};
+        if (steps == 3) return i + 1 + calls.len;
+    }
+    return 1;
+}
 
 fn transient(err: anyerror) bool {
     return switch (err) {
@@ -280,15 +354,48 @@ test "failed Turn leaves replay equal to in-memory safe history" {
         fn emit(_: *anyopaque, _: Event) !void {}
     };
     var ctx: u8 = 0;
-    const result = session.turn("not committed", .{ .ctx = &ctx, .emit = Quiet.emit }, &cancel, &detail);
-    try t.expectError(error.UnsupportedUriScheme, result);
-    const directory = try std.fs.path.join(a, &.{ root, "nib/sessions" });
-    const cwd = try std.process.currentPathAlloc(t.io, a);
-    const path = try session_log.latest(t.io, a, directory, cwd);
-    const data = try std.Io.Dir.cwd().readFileAlloc(t.io, path, a, .unlimited);
-    var restored: std.ArrayList(openai.Message) = .empty;
-    var tokens: u64 = 0;
-    try session_log.replay(a, a, data, &restored, &tokens);
-    try t.expectEqualDeep(session.history.items, restored.items);
-    try t.expectEqual(session.context_tokens, tokens);
+    for (0..2) |completed| {
+        if (completed == 1) try session.commit(session.history.items.len, &.{
+            .{ .role = "user", .content = "saved" },
+            .{ .role = "assistant", .tool_calls = &.{.{ .id = "safe", .function = .{ .name = "run", .arguments = "{}" } }} },
+            .{ .role = "tool", .tool_call_id = "safe", .content = "saved result" },
+        }, 100, null);
+        const result = session.turn("not committed", .{ .ctx = &ctx, .emit = Quiet.emit }, &cancel, &detail);
+        try t.expectError(error.UnsupportedUriScheme, result);
+        const directory = try std.fs.path.join(a, &.{ root, "nib/sessions" });
+        const cwd = try std.process.currentPathAlloc(t.io, a);
+        const path = try session_log.latest(t.io, a, directory, cwd);
+        const data = try std.Io.Dir.cwd().readFileAlloc(t.io, path, a, .unlimited);
+        var restored: std.ArrayList(openai.Message) = .empty;
+        var tokens: u64 = 0;
+        _ = try session_log.replay(a, a, data, &restored, &tokens);
+        try t.expectEqualDeep(session.history.items, restored.items);
+        try t.expectEqual(session.context_tokens, tokens);
+    }
+}
+
+test "compaction cuts preserve recent turns and complete tool groups" {
+    const t = std.testing;
+    const call: openai.ToolCall = .{ .id = "c", .function = .{ .name = "run", .arguments = "{}" } };
+    const messages = [_]openai.Message{
+        .{ .role = "system", .content = "system" },
+        .{ .role = "user", .content = "first" },
+        .{ .role = "assistant", .content = "done" },
+        .{ .role = "user", .content = "second" },
+        .{ .role = "assistant", .tool_calls = &.{ call, call } },
+        .{ .role = "tool", .tool_call_id = "c", .content = "one" },
+        .{ .role = "tool", .tool_call_id = "c", .content = "two" },
+        .{ .role = "assistant", .content = "done" },
+        .{ .role = "user", .content = "third" },
+        .{ .role = "assistant", .content = "done" },
+    };
+    try t.expectEqual(@as(usize, 3), compactionCut(&messages, 128_000));
+    try t.expectEqual(@as(usize, 7), compactionCut(&messages, 64));
+    try t.expectEqual(@as(usize, 1), compactionCut(messages[0..7], 64));
+    const long_turn = [_]openai.Message{
+        messages[0], messages[1], messages[4], messages[5], messages[6],
+        messages[4], messages[5], messages[6], messages[4], messages[5],
+        messages[6],
+    };
+    try t.expectEqual(@as(usize, 5), compactionCut(&long_turn, 128_000));
 }

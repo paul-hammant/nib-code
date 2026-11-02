@@ -144,6 +144,21 @@ pub fn run(init: std.process.Init, session: *agent.Session) !void {
                         defer r.deinit(gpa);
                         if (r.logs.len > 0) try addEntry(gpa, &entries, .run_output, std.mem.trimEnd(u8, r.logs, "\n"));
                         try addEntry(gpa, &entries, if (r.ok) .info else .err, r.text);
+                    } else if (std.mem.eql(u8, line, "/compact")) {
+                        const t = try gpa.create(Turn);
+                        t.* = .{ .gpa = gpa, .session = session, .text = line, .loop = &loop };
+                        t.thread = try std.Thread.spawn(.{}, struct {
+                            fn work(task: *Turn) void {
+                                var detail: ?[]u8 = null;
+                                task.session.compact(.{ .ctx = task, .emit = Turn.emit }, &task.cancel, &detail) catch |err| {
+                                    const msg = detail orelse (task.gpa.dupe(u8, @errorName(err)) catch return);
+                                    task.loop.postEvent(.{ .failed = msg }) catch task.gpa.free(msg);
+                                    return;
+                                };
+                                task.loop.postEvent(.done) catch {};
+                            }
+                        }.work, .{t});
+                        turn = t;
                     } else if (cfg.api_key.len == 0) {
                         gpa.free(line);
                         try addEntry(gpa, &entries, .err, "no API key");

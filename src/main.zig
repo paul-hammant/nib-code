@@ -45,7 +45,7 @@ pub fn main(init: std.process.Init) !void {
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "ask")) {
+        if (!ask and std.mem.eql(u8, arg, "ask")) {
             ask = true;
         } else if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--continue")) {
             options.continue_latest = true;

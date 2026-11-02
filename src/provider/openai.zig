@@ -147,6 +147,7 @@ pub fn stream(
     }
 
     var usage: Usage = .{};
+    var done = false;
     while (true) {
         if (cancel.load(.acquire)) return error.Canceled;
         const line = reader.takeDelimiter('\n') catch |err| switch (err) {
@@ -154,12 +155,15 @@ pub fn stream(
             else => return err,
         } orelse break;
         const data = (try parser.feed(gpa, line)) orelse continue;
-        if (std.mem.eql(u8, data, "[DONE]")) break;
+        if (std.mem.eql(u8, data, "[DONE]")) {
+            done = true;
+            break;
+        }
 
         defer _ = arena.reset(.retain_capacity);
         const chunk = std.json.parseFromSliceLeaky(Chunk, arena.allocator(), data, .{
             .ignore_unknown_fields = true,
-        }) catch continue;
+        }) catch return error.InvalidResponse;
         if (chunk.usage) |u| usage = u;
         for (chunk.choices) |choice| {
             const d = choice.delta;
@@ -179,6 +183,10 @@ pub fn stream(
         }
     }
 
+    if (!done) return error.IncompleteResponse;
+    for (calls.items) |p| {
+        if (p.id.items.len == 0 or p.name.items.len == 0) return error.InvalidResponse;
+    }
     const tool_calls = try out.alloc(ToolCall, calls.items.len);
     for (calls.items, tool_calls) |p, *tc| tc.* = .{
         .id = try out.dupe(u8, p.id.items),
@@ -211,7 +219,7 @@ test "chunk decodes deepseek deltas, tool call fragments and usage" {
     try std.testing.expectEqual(@as(u64, 4), c.usage.?.prompt_cache_hit_tokens);
 }
 
-test "request body omits null fields and embeds tools verbatim" {
+test "request body omits null fields and absent tools" {
     const gpa = std.testing.allocator;
     const msgs = [_]Message{
         .{ .role = "user", .content = "hi" },
@@ -223,4 +231,14 @@ test "request body omits null fields and embeds tools verbatim" {
     try std.testing.expectEqualStrings(
         \\{"model":"m","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"run","arguments":"{}"}}]},{"role":"tool","content":"ok","tool_call_id":"c1"}],"stream":true,"stream_options":{"include_usage":true}}
     , body);
+}
+
+test "summary request limits output and omits tools" {
+    const t = std.testing;
+    const body = try requestBody(t.allocator, "m", &.{.{ .role = "user", .content = "summary" }}, "[]", 512);
+    defer t.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, body, .{});
+    defer parsed.deinit();
+    try t.expect(!parsed.value.object.contains("tools"));
+    try t.expectEqual(@as(i64, 512), parsed.value.object.get("max_tokens").?.integer);
 }

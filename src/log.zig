@@ -29,9 +29,9 @@ pub const Log = struct {
         errdefer file.close(io);
         var reader = file.reader(io, &.{});
         const data = try reader.interface.allocRemaining(a, .unlimited);
-        try replay(gpa, a, data, history, tokens);
+        const needs_repair = try replay(gpa, a, data, history, tokens);
         var log: Log = .{ .file = file, .offset = data.len };
-        if (data.len > 0 and data[data.len - 1] != '\n') {
+        if (needs_repair) {
             try log.append(io, a, .{ .repair = true });
             try log.file.sync(io);
         }
@@ -67,14 +67,13 @@ fn apply(history: *std.ArrayList(openai.Message), record: Record) void {
     history.appendSliceAssumeCapacity(record.messages);
 }
 
-pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, history: *std.ArrayList(openai.Message), tokens: *u64) !void {
+pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, history: *std.ArrayList(openai.Message), tokens: *u64) !bool {
     var lines = std.mem.splitScalar(u8, data, '\n');
     var torn = false;
     while (lines.next()) |line| {
         if (lines.peek() == null) break;
         if (line.len == 0) continue;
         const r = std.json.parseFromSliceLeaky(Record, a, line, .{ .allocate = .alloc_always }) catch {
-            if (torn) return error.InvalidSessionLog;
             torn = true;
             continue;
         };
@@ -88,7 +87,8 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
         try validate(history.items);
         tokens.* = r.context_tokens;
     }
-    if (torn or history.items.len == 0) return error.InvalidSessionLog;
+    if (history.items.len == 0) return error.InvalidSessionLog;
+    return torn or data[data.len - 1] != '\n';
 }
 
 fn validate(messages: []const openai.Message) !void {
@@ -121,9 +121,15 @@ pub fn latest(io: std.Io, a: std.mem.Allocator, directory: []const u8, cwd: []co
         defer file.close(io);
         const stat = try file.stat(io);
         if (stat.mtime.nanoseconds < newest) continue;
-        const data = try dir.readFileAlloc(io, entry.name, a, .unlimited);
-        const line = data[0 .. std.mem.indexOfScalar(u8, data, '\n') orelse continue];
-        const r = std.json.parseFromSliceLeaky(Record, a, line, .{ .allocate = .alloc_always }) catch continue;
+        var buffer: [4096]u8 = undefined;
+        var reader = file.reader(io, &buffer);
+        var header: std.Io.Writer.Allocating = .init(a);
+        defer header.deinit();
+        _ = reader.interface.streamDelimiter(&header.writer, '\n') catch |err| switch (err) {
+            error.EndOfStream => continue,
+            else => return err,
+        };
+        const r = std.json.parseFromSliceLeaky(Record, a, header.written(), .{ .allocate = .alloc_always }) catch continue;
         if (!std.mem.eql(u8, r.cwd orelse "", cwd)) continue;
         newest = stat.mtime.nanoseconds;
         best = try std.fs.path.join(a, &.{ directory, entry.name });
@@ -152,11 +158,11 @@ test "commit and replay preserve safe history, compaction and torn tail" {
         const data = try tmp.dir.readFileAlloc(t.io, "s.jsonl", a, .unlimited);
         var restored: std.ArrayList(openai.Message) = .empty;
         var tokens: u64 = 0;
-        try replay(a, a, data, &restored, &tokens);
+        _ = try replay(a, a, data, &restored, &tokens);
         try t.expectEqualDeep(history.items, restored.items);
         try t.expectEqual(r.context_tokens, tokens);
     }
-    try log.file.writePositionalAll(t.io, "{\"from\":", log.offset);
+    try log.file.writePositionalAll(t.io, "{\"from\":\n{\"repair\":", log.offset);
     log.close(t.io);
     var restored: std.ArrayList(openai.Message) = .empty;
     var tokens: u64 = 0;
@@ -165,6 +171,21 @@ test "commit and replay preserve safe history, compaction and torn tail" {
     try t.expectEqualDeep(history.items, restored.items);
     try log.commit(t.io, a, &restored, &tokens, .{ .from = restored.items.len, .messages = &.{.{ .role = "assistant", .content = "next" }} });
     var again: std.ArrayList(openai.Message) = .empty;
-    try replay(a, a, try tmp.dir.readFileAlloc(t.io, "s.jsonl", a, .unlimited), &again, &tokens);
+    _ = try replay(a, a, try tmp.dir.readFileAlloc(t.io, "s.jsonl", a, .unlimited), &again, &tokens);
     try t.expectEqualDeep(restored.items, again.items);
+}
+
+test "replay rejects dangling tool calls and unrepaired interior corruption" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var history: std.ArrayList(openai.Message) = .empty;
+    var tokens: u64 = 0;
+    const header = "{\"messages\":[{\"role\":\"system\",\"content\":\"base\"}]}\n";
+    const dangling = header ++ "{\"from\":1,\"messages\":[{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"c\",\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}]}\n";
+    try t.expectError(error.InvalidSessionLog, replay(a, a, dangling, &history, &tokens));
+    history.clearRetainingCapacity();
+    const corrupt = header ++ "broken\n{\"from\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}\n";
+    try t.expectError(error.InvalidSessionLog, replay(a, a, corrupt, &history, &tokens));
 }
