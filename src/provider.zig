@@ -14,7 +14,7 @@ pub const Config = struct {
     thinking: ?bool = null,
     reasoning_effort: ?[]const u8 = null,
     pub fn fromEnv(a: std.mem.Allocator, env: *const std.process.Environ.Map) !Config {
-        const id = std.meta.stringToEnum(Id, env.get("NIB_PROVIDER") orelse "chat_completions") orelse return error.InvalidProvider;
+        const id = std.meta.stringToEnum(Id, env.get("NIB_PROVIDER") orelse "codex") orelse return error.InvalidProvider;
         const model = env.get("NIB_MODEL") orelse switch (id) {
             .chat_completions => "deepseek-flash",
             .codex => codex.default_model,
@@ -158,16 +158,18 @@ test "configuration selects one provider and its model window without credential
     defer env.deinit();
     try env.put("HOME", "/fictional");
     try env.put("NIB_API_KEY", "fictional-api-key");
-    const chat_cfg = try Config.fromEnv(arena.allocator(), &env);
-    try t.expectEqual(Id.chat_completions, chat_cfg.provider);
-    try t.expectEqualStrings("deepseek-flash", chat_cfg.model);
-    try t.expectEqual(@as(u64, 1_000_000), chat_cfg.context_window);
-    try env.put("NIB_PROVIDER", "codex");
     const codex_cfg = try Config.fromEnv(arena.allocator(), &env);
+    try t.expectEqual(Id.codex, codex_cfg.provider);
+    try t.expectEqualStrings("gpt-6.1-sol", codex_cfg.model);
     try t.expectEqualStrings("", codex_cfg.api_key);
     try t.expectEqualStrings("/fictional/.codex", codex_cfg.codex_home.?);
     try t.expectEqual(@as(u64, 500_000), codex_cfg.context_window);
     try t.expectError(error.SessionProviderMismatch, codex_cfg.checkSession(.chat_completions, null));
+    try env.put("NIB_PROVIDER", "chat_completions");
+    const chat_cfg = try Config.fromEnv(arena.allocator(), &env);
+    try t.expectEqualStrings("deepseek-flash", chat_cfg.model);
+    try t.expectEqual(@as(u64, 1_000_000), chat_cfg.context_window);
+    try env.put("NIB_PROVIDER", "codex");
     try env.put("NIB_MODEL", "gpt-6-sol");
     try t.expectEqual(@as(u64, 272_000), (try Config.fromEnv(arena.allocator(), &env)).context_window);
     try env.put("NIB_MODEL", "unknown");

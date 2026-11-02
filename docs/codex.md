@@ -3,11 +3,10 @@
 先通过 `codex` 完成 ChatGPT 登录，再运行：
 
 ```sh
-cd /home/yang/myself/nibcode
-NIB_PROVIDER=codex ./zig-out/bin/nib
-NIB_PROVIDER=codex ./zig-out/bin/nib ask '你好'
-NIB_PROVIDER=codex ./zig-out/bin/nib ask --json '你好'
-NIB_PROVIDER=codex ./zig-out/bin/nib --continue
+nib
+nib ask '你好'
+nib ask --json '你好'
+nib --continue
 ```
 
 默认读取 `~/.codex/auth.json`，可用 `CODEX_HOME=/path/to/codex` 指定目录。无需 NIB_API_KEY；已有 NIB_BASE_URL、NIB_MODEL、NIB_CONTEXT_WINDOW 覆盖仍会生效，切换服务时清理不适用的旧覆盖。
@@ -15,7 +14,7 @@ NIB_PROVIDER=codex ./zig-out/bin/nib --continue
 默认模型 `gpt-6.1-sol`，窗口 500,000 tokens。显式选模型：
 
 ```sh
-NIB_PROVIDER=codex NIB_MODEL=gpt-6-sol NIB_REASONING_EFFORT=high ./zig-out/bin/nib ask '你好'
+NIB_MODEL=gpt-6-sol NIB_REASONING_EFFORT=high nib ask '你好'
 ```
 
 本机 pi `catalog/providers/openai-codex.ts` 的列表（2026-11-01，一手源码）：
@@ -31,8 +30,8 @@ NIB_PROVIDER=codex NIB_MODEL=gpt-6-sol NIB_REASONING_EFFORT=high ./zig-out/bin/n
 也可以不用环境变量，直接控制当前进程的 effort：
 
 ```sh
-NIB_PROVIDER=codex ./zig-out/bin/nib --effort high
-NIB_PROVIDER=codex ./zig-out/bin/nib ask --effort high '你好'
+nib --effort high
+nib ask --effort high '你好'
 ```
 
 TUI 用 `/effort` 查询，`/effort high` 切换，状态栏显示请求使用的 effort。
@@ -45,7 +44,7 @@ NIB_THINKING=on 默认用 medium；NIB_REASONING_EFFORT 可显式指定服务端
 
 摘要始终使用当前模型，保留原请求前缀和该模型的加密推理条目，以命中缓存并避免跨模型传递密文。能关闭推理时关闭，否则用 low。Codex 摘要不沿用 Chat Completions 的小额总输出限制：按 pi 的请求格式不发送 max_output_tokens，保留服务端正常输出额度；原 32–2048-token 预算只写进提示约束摘要文字，给推理留出空间（pi 目录 maxTokens 为 128000，实际限额仍由服务端决定）。空摘要、截断、压缩无效等失败，自动压缩发 notice 后继续；手动压缩报告错误。
 
-会话记录 provider 和模型；跨 provider 恢复会拒绝，使用原 provider 或开新会话。Codex 恢复模型也要相同，以免加密推理条目跨模型；Chat Completions 恢复沿用原行为，采用当前模型配置。未设置 NIB_PROVIDER（或设 chat_completions）仍使用原 Chat Completions 线路，默认 DeepSeek。
+会话记录 provider 和模型；跨 provider 恢复会拒绝，使用原 provider 或开新会话。Codex 恢复模型也要相同，以免加密推理条目跨模型；Chat Completions 恢复沿用原行为，采用当前模型配置。未设置 NIB_PROVIDER 时默认使用 Codex（2026-11-02 起，此前默认 DeepSeek）；设 `NIB_PROVIDER=chat_completions` 使用 Chat Completions 线路，默认 DeepSeek。
 
 凭证缺失、格式错误或 401 会给出登录提示。401 只重新读取文件并重试一次，让 Codex CLI 已刷新的凭证生效；仍失败请运行 `codex` 重新登录。nib 不使用 refresh_token。凭证不进入会话日志、argv 或子进程环境。tools.agent 从 stdin 接收有效配置，各自读取 auth.json；bash 不继承常见密钥环境变量。read/edit/write 拒绝凭证文件，bash 拒绝引用凭证目录；这些是防误操作保护，不是系统沙箱，详见 [ADR 0006](adr/0006-deny-dangerous-commands.md)。
 
