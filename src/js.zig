@@ -1,5 +1,3 @@
-//! Host calls run synchronously on the Run's thread: `Promise.all` over tools is not concurrent.
-
 const std = @import("std");
 const c = @import("qjs");
 
@@ -23,6 +21,7 @@ pub const Host = struct {
     ctx: *anyopaque,
     names: []const []const u8,
     /// Returned slices are allocated with `gpa` and owned by the caller.
+    cancel: ?*std.atomic.Value(bool) = null,
     call: *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8, args_json: []const u8) ToolResult,
 };
 
@@ -48,6 +47,102 @@ const State = struct {
     deadline: std.Io.Clock.Timestamp,
     cancel: ?*const std.atomic.Value(bool),
     oom: bool = false,
+    calls: std.ArrayList(*Call) = .empty,
+    mutex: std.Io.Mutex = .init,
+    completed: std.Io.Condition = .init,
+    ready: ?*Call = null,
+    ready_tail: ?*Call = null,
+
+    const Call = struct {
+        state: *State,
+        name: []u8,
+        args: []u8,
+        settle: [2]c.JSValue,
+        thread: ?std.Thread = null,
+        result: ?ToolResult = null,
+        next: ?*Call = null,
+
+        fn work(call: *Call) void {
+            const st = call.state;
+            const h = st.host.?;
+            const result = h.call(h.ctx, st.gpa, call.name, call.args);
+            st.mutex.lockUncancelable(st.io);
+            defer st.mutex.unlock(st.io);
+            call.result = result;
+            if (st.ready_tail) |tail| tail.next = call else st.ready = call;
+            st.ready_tail = call;
+            st.completed.signal(st.io);
+        }
+    };
+
+    fn stop(st: *State) void {
+        if (st.host) |h| if (h.cancel) |flag| flag.store(true, .release);
+    }
+
+    fn deinit(st: *State, ctx: *c.JSContext) void {
+        st.stop();
+        for (st.calls.items) |call| if (call.thread) |thread| thread.join();
+        for (st.calls.items) |call| {
+            if (call.result) |result| switch (result) {
+                inline else => |bytes| st.gpa.free(bytes),
+            };
+            for (call.settle) |value| c.JS_FreeValue(ctx, value);
+            st.gpa.free(call.name);
+            st.gpa.free(call.args);
+            st.gpa.destroy(call);
+        }
+        st.calls.deinit(st.gpa);
+    }
+
+    fn jobs(st: *State, ctx: *c.JSContext, rt: *c.JSRuntime, promise: c.JSValue) !void {
+        var active: usize = 0;
+        var next: usize = 0;
+        while (true) {
+            if (isInterrupted(st) or c.JS_PromiseState(ctx, promise) == c.JS_PROMISE_REJECTED) {
+                st.stop();
+                return;
+            }
+            var pctx: ?*c.JSContext = null;
+            const n = c.JS_ExecutePendingJob(rt, &pctx);
+            if (n < 0) return;
+            if (n > 0) continue;
+            st.mutex.lockUncancelable(st.io);
+            var ready = st.ready;
+            st.ready = null;
+            st.ready_tail = null;
+            st.mutex.unlock(st.io);
+            while (ready) |call| {
+                ready = call.next;
+                call.thread.?.join();
+                call.thread = null;
+                active -= 1;
+                const result = call.result.?;
+                const value = switch (result) {
+                    .ok => |json| c.JS_ParseJSON(ctx, json.ptr, json.len, "<tool>"),
+                    .err => |msg| blk: {
+                        const err = c.JS_NewError(ctx);
+                        _ = c.JS_SetPropertyStr(ctx, err, "message", c.JS_NewStringLen(ctx, msg.ptr, msg.len));
+                        break :blk err;
+                    },
+                };
+                const rejected = result == .err or c.JS_IsException(value);
+                const arg = if (c.JS_IsException(value)) c.JS_GetException(ctx) else value;
+                const r = c.JS_Call(ctx, call.settle[@intFromBool(rejected)], js_undefined, 1, @constCast(&arg));
+                c.JS_FreeValue(ctx, r);
+                c.JS_FreeValue(ctx, arg);
+            }
+            if (c.JS_IsJobPending(rt)) continue;
+            while (next < st.calls.items.len and active < 8) : (next += 1) {
+                const call = st.calls.items[next];
+                call.thread = try std.Thread.spawn(.{}, Call.work, .{call});
+                active += 1;
+            }
+            if (active == 0) return;
+            st.mutex.lockUncancelable(st.io);
+            if (st.ready == null) st.completed.waitTimeout(st.io, &st.mutex, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch {};
+            st.mutex.unlock(st.io);
+        }
+    }
 };
 
 const prelude =
@@ -61,9 +156,9 @@ const prelude =
     \\  const out = (...a) => log(a.map(fmt).join(" ") + "\n");
     \\  globalThis.console = Object.freeze({ log: out, info: out, warn: out, error: out });
     \\  const call = async (name, args) => {
-    \\    const r = JSON.parse(host(name, JSON.stringify(args ?? {})));
-    \\    if ("error" in r) throw new Error(name + ": " + r.error);
-    \\    return r.ok;
+    \\    let r;
+    \\    try { r = await host(name, JSON.stringify(args ?? {})); } catch (e) { throw new Error(name + ": " + e.message); }
+    \\    return r;
     \\  };
     \\  globalThis.tools = Object.freeze(Object.fromEntries(names.map((n) => [n, (a) => call(n, a)])));
     \\})();
@@ -95,6 +190,7 @@ pub fn eval(
 
     const ctx = c.JS_NewContext(rt) orelse return error.OutOfMemory;
     defer c.JS_FreeContext(ctx);
+    defer st.deinit(ctx);
     c.JS_SetContextOpaque(ctx, &st);
 
     try install(gpa, ctx, host);
@@ -115,8 +211,7 @@ pub fn eval(
     if (c.JS_IsException(promise)) {
         text = try takeException(gpa, ctx);
     } else {
-        var pctx: ?*c.JSContext = null;
-        while (c.JS_ExecutePendingJob(rt, &pctx) > 0) {}
+        try st.jobs(ctx, rt, promise);
         switch (c.JS_PromiseState(ctx, promise)) {
             c.JS_PROMISE_FULFILLED => {
                 const res = c.JS_PromiseResult(ctx, promise);
@@ -137,7 +232,8 @@ pub fn eval(
     }
     errdefer gpa.free(text);
 
-    if (!ok and isInterrupted(&st)) {
+    if (isInterrupted(&st)) {
+        ok = false;
         gpa.free(text);
         text = try gpa.dupe(u8, if (st.cancel != null and st.cancel.?.load(.acquire)) "Error: run canceled" else "Error: run timed out");
     }
@@ -182,39 +278,28 @@ fn nativeLog(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue)
     return js_undefined;
 }
 
-/// `__host(name, argsJson)` → `{"ok": <json>}` or `{"error": "<msg>"}` as a string.
 fn nativeHost(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
-    const st = state(ctx);
-    const reply = hostReply(st, ctx, argc, argv) catch {
-        const oom = "{\"error\":\"out of memory\"}";
-        return c.JS_NewStringLen(ctx, oom, oom.len);
-    };
-    defer st.gpa.free(reply);
-    return c.JS_NewStringLen(ctx, reply.ptr, reply.len);
+    return enqueue(state(ctx), ctx.?, argc, argv) catch c.JS_ThrowOutOfMemory(ctx);
 }
 
-fn hostReply(st: *State, ctx: ?*c.JSContext, argc: c_int, argv: [*c]c.JSValue) ![]u8 {
-    const gpa = st.gpa;
-    const host = st.host orelse return std.json.Stringify.valueAlloc(gpa, .{ .@"error" = "no tools available" }, .{});
-    if (argc < 2) return std.json.Stringify.valueAlloc(gpa, .{ .@"error" = "bad host call" }, .{});
-
-    var nlen: usize = 0;
-    const name = c.JS_ToCStringLen2(ctx, &nlen, argv[0], false) orelse return error.OutOfMemory;
-    defer c.JS_FreeCString(ctx, name);
-    var alen: usize = 0;
-    const args = c.JS_ToCStringLen2(ctx, &alen, argv[1], false) orelse return error.OutOfMemory;
-    defer c.JS_FreeCString(ctx, args);
-
-    switch (host.call(host.ctx, gpa, name[0..nlen], args[0..alen])) {
-        .ok => |json| {
-            defer gpa.free(json);
-            return std.fmt.allocPrint(gpa, "{{\"ok\":{s}}}", .{json});
-        },
-        .err => |msg| {
-            defer gpa.free(msg);
-            return std.json.Stringify.valueAlloc(gpa, .{ .@"error" = msg }, .{});
-        },
+fn enqueue(st: *State, ctx: *c.JSContext, argc: c_int, argv: [*c]c.JSValue) !c.JSValue {
+    if (st.host == null or argc < 2) return error.InvalidHostCall;
+    const call = try st.gpa.create(State.Call);
+    errdefer st.gpa.destroy(call);
+    const name = try toStr(st.gpa, ctx, argv[0]);
+    errdefer st.gpa.free(name);
+    const args = try toStr(st.gpa, ctx, argv[1]);
+    errdefer st.gpa.free(args);
+    var settle: [2]c.JSValue = undefined;
+    const promise = c.JS_NewPromiseCapability(ctx, &settle);
+    if (c.JS_IsException(promise)) return error.OutOfMemory;
+    errdefer {
+        c.JS_FreeValue(ctx, promise);
+        for (settle) |v| c.JS_FreeValue(ctx, v);
     }
+    call.* = .{ .state = st, .name = name, .args = args, .settle = settle };
+    try st.calls.append(st.gpa, call);
+    return promise;
 }
 
 fn takeException(gpa: std.mem.Allocator, ctx: *c.JSContext) ![]u8 {

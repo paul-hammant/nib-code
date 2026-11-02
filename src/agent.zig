@@ -249,7 +249,6 @@ pub const Session = struct {
         defer args.deinit();
 
         try sink.emit(sink.ctx, .{ .run_start = args.value.code });
-        s.tools.cancel = cancel;
         const o = try js.eval(s.gpa, s.io, args.value.code, .{}, s.tools.host(), cancel);
         defer o.deinit(s.gpa);
 

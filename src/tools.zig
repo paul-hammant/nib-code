@@ -1,5 +1,6 @@
 const std = @import("std");
 const js = @import("js.zig");
+const process = @import("process.zig");
 const policy = @import("policy.zig");
 
 const Tool = struct {
@@ -66,10 +67,38 @@ const max_output = 16 * 1024;
 pub const Tools = struct {
     io: std.Io,
     home: []const u8,
-    cancel: ?*const std.atomic.Value(bool) = null,
+    cancel: std.atomic.Value(bool) = .init(false),
+    paths_mutex: std.Io.Mutex = .init,
+    paths_changed: std.Io.Condition = .init,
+    paths: ?*PathLock = null,
+
+    const PathLock = struct { path: []const u8, next: ?*PathLock = null };
+
+    fn lockPath(t: *Tools, lock: *PathLock) void {
+        t.paths_mutex.lockUncancelable(t.io);
+        defer t.paths_mutex.unlock(t.io);
+        while (true) {
+            var item = t.paths;
+            while (item) |p| : (item = p.next) if (std.mem.eql(u8, p.path, lock.path)) break;
+            if (item == null) break;
+            t.paths_changed.waitUncancelable(t.io, &t.paths_mutex);
+        }
+        lock.next = t.paths;
+        t.paths = lock;
+    }
+
+    fn unlockPath(t: *Tools, lock: *PathLock) void {
+        t.paths_mutex.lockUncancelable(t.io);
+        defer t.paths_mutex.unlock(t.io);
+        var link = &t.paths;
+        while (link.* != lock) link = &link.*.?.next;
+        link.* = lock.next;
+        t.paths_changed.broadcast(t.io);
+    }
 
     pub fn host(t: *Tools) js.Host {
-        return .{ .ctx = t, .names = &names, .call = call };
+        t.cancel.store(false, .release);
+        return .{ .ctx = t, .names = &names, .call = call, .cancel = &t.cancel };
     }
 
     fn call(ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8, args: []const u8) js.ToolResult {
@@ -117,6 +146,12 @@ pub const Tools = struct {
             return fail(gpa, "expected {{ path: string, old_text: string, new_text: string, all?: boolean }}", .{});
         defer a.deinit();
         const v = a.value;
+        const path = try normalizedPath(t.io, gpa, v.path);
+        defer gpa.free(path);
+        var lock: PathLock = .{ .path = path };
+        t.lockPath(&lock);
+        defer t.unlockPath(&lock);
+        if (t.cancel.load(.acquire)) return error.Canceled;
         if (v.old_text.len == 0) return fail(gpa, "old_text is empty; use write to create a file", .{});
 
         const dir = std.Io.Dir.cwd();
@@ -142,6 +177,12 @@ pub const Tools = struct {
             return fail(gpa, "expected {{ path: string, content: string }}", .{});
         defer a.deinit();
         const v = a.value;
+        const path = try normalizedPath(t.io, gpa, v.path);
+        defer gpa.free(path);
+        var lock: PathLock = .{ .path = path };
+        t.lockPath(&lock);
+        defer t.unlockPath(&lock);
+        if (t.cancel.load(.acquire)) return error.Canceled;
 
         const dir = std.Io.Dir.cwd();
         if (std.fs.path.dirname(v.path)) |parent| dir.createDirPath(t.io, parent) catch |err|
@@ -166,58 +207,46 @@ pub const Tools = struct {
         const script = try std.fmt.allocPrint(gpa, "exec 2>&1\n{s}", .{a.value.command});
         defer gpa.free(script);
 
-        var child = try std.process.spawn(t.io, .{
+        const result = process.run(gpa, t.io, .{
             .argv = &.{ "bash", "-c", script },
             .stdin = .ignore,
             .stdout = .pipe,
             .stderr = .ignore,
-            .pgid = 0,
-        });
-        defer child.kill(t.io);
-
-        var streams: std.Io.File.MultiReader.Buffer(1) = undefined;
-        var mr: std.Io.File.MultiReader = undefined;
-        mr.init(gpa, t.io, streams.toStreams(), &.{child.stdout.?});
-        defer mr.deinit();
-
-        const deadline: std.Io.Clock.Timestamp = .fromNow(t.io, .{ .raw = .fromMilliseconds(a.value.timeout_ms), .clock = .awake });
-        while (true) {
-            mr.fill(4096, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch |err| switch (err) {
-                error.EndOfStream => break,
-                error.Timeout => {},
-                else => return err,
-            };
-            const stop: ?[]const u8 = if (t.cancel != null and t.cancel.?.load(.acquire))
-                "canceled"
-            else if (std.Io.Clock.Timestamp.now(t.io, .awake).compare(.gte, deadline))
-                "timed out"
-            else if (mr.reader(0).buffered().len > 8 * 1024 * 1024)
-                "output exceeded 8 MiB"
-            else
-                null;
-            if (stop) |why| {
-                // The whole process group, so children of the command die too.
-                if (child.id) |pid| std.posix.kill(-pid, .KILL) catch {};
-                return if (std.mem.eql(u8, why, "timed out"))
-                    fail(gpa, "timed out after {d} ms", .{a.value.timeout_ms})
-                else
-                    fail(gpa, "{s}", .{why});
-            }
-        }
-        try mr.checkAnyError();
-        const term = try child.wait(t.io);
-        const stdout = try mr.toOwnedSlice(0);
+        }, &t.cancel, a.value.timeout_ms) catch |err| return switch (err) {
+            error.TimedOut => fail(gpa, "timed out after {d} ms", .{a.value.timeout_ms}),
+            error.Canceled => fail(gpa, "canceled", .{}),
+            else => err,
+        };
+        const stdout = result.output;
         defer gpa.free(stdout);
-
         const output = try truncateMiddle(gpa, stdout);
         defer gpa.free(output);
-        const code: ?u8 = switch (term) {
+        const code: ?u8 = switch (result.term) {
             .exited => |e| e,
             else => null,
         };
         return .{ .ok = try std.json.Stringify.valueAlloc(gpa, .{ .exit_code = code, .output = output }, .{}) };
     }
 };
+
+fn normalizedPath(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const absolute = if (std.fs.path.isAbsolute(path)) try gpa.dupe(u8, path) else try std.fs.path.join(gpa, &.{ cwd, path });
+    defer gpa.free(absolute);
+    return canonicalPath(io, gpa, absolute);
+}
+
+fn canonicalPath(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = std.Io.Dir.cwd().realPathFile(io, path, &buffer) catch |err| {
+        if (err != error.FileNotFound) return err;
+        const parent = try canonicalPath(io, gpa, std.fs.path.dirname(path) orelse return err);
+        defer gpa.free(parent);
+        return std.fs.path.resolve(gpa, &.{ parent, std.fs.path.basename(path) });
+    };
+    return gpa.dupe(u8, buffer[0..len]);
+}
 
 fn fail(gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !js.ToolResult {
     return .{ .err = try std.fmt.allocPrint(gpa, fmt, args) };
@@ -335,8 +364,7 @@ test "bash timeout kills the whole process group" {
 }
 
 test "bash cancel" {
-    var flag: std.atomic.Value(bool) = .init(true);
-    var t: Tools = .{ .io = testing.io, .home = "/home/nobody", .cancel = &flag };
+    var t: Tools = .{ .io = testing.io, .home = "/home/nobody", .cancel = .init(true) };
     const r = Tools.call(&t, testing.allocator, "bash", "{\"command\":\"sleep 5\"}");
     defer freeResult(r);
     try testing.expectEqualStrings("canceled", r.err);
@@ -384,4 +412,68 @@ test "truncateMiddle keeps head and tail" {
     defer testing.allocator.free(t);
     try testing.expect(t.len < big.len);
     try testing.expect(std.mem.indexOf(u8, t, "bytes omitted") != null);
+}
+
+test "Promise.all runs bash concurrently and await remains sequential" {
+    var t: Tools = .{ .io = testing.io, .home = "/home/nobody" };
+    const clock = std.Io.Clock.awake;
+    const start = clock.now(testing.io);
+    const parallel = try js.eval(testing.allocator, testing.io,
+        \\await Promise.all([tools.bash({command: "sleep 0.3"}), tools.bash({command: "sleep 0.3"})])
+    , .{}, t.host(), null);
+    defer parallel.deinit(testing.allocator);
+    const middle = clock.now(testing.io);
+    const serial = try js.eval(testing.allocator, testing.io,
+        \\await tools.bash({command: "sleep 0.3"}); await tools.bash({command: "sleep 0.3"})
+    , .{}, t.host(), null);
+    defer serial.deinit(testing.allocator);
+    const end = clock.now(testing.io);
+    try testing.expect(parallel.ok and serial.ok);
+    try testing.expect(start.durationTo(middle).toMilliseconds() < 550);
+    try testing.expect(middle.durationTo(end).toMilliseconds() >= 600);
+}
+
+test "cancel and deadline join running tools and discard queued calls" {
+    const Cancel = struct {
+        fn work(io: std.Io, flag: *std.atomic.Value(bool)) void {
+            std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(80), .clock = .awake }, io) catch unreachable;
+            flag.store(true, .release);
+        }
+    };
+    var t: Tools = .{ .io = testing.io, .home = "/home/nobody" };
+    var flag: std.atomic.Value(bool) = .init(false);
+    const thread = try std.Thread.spawn(.{}, Cancel.work, .{ testing.io, &flag });
+    defer thread.join();
+    const code = "await Promise.all(Array.from({length: 12}, () => tools.bash({command: 'sleep 5'})))";
+    const canceled = try js.eval(testing.allocator, testing.io, code, .{}, t.host(), &flag);
+    defer canceled.deinit(testing.allocator);
+    try testing.expectEqualStrings("Error: run canceled", canceled.text);
+    const timed = try js.eval(testing.allocator, testing.io, code, .{ .timeout_ms = 80 }, t.host(), null);
+    defer timed.deinit(testing.allocator);
+    try testing.expectEqualStrings("Error: run timed out", timed.text);
+}
+
+test "parallel edits lock the normalized path through read and write" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "f", .data = "abcdefghijklmnop" });
+    const code = try std.fmt.allocPrint(testing.allocator,
+        \\await Promise.all(Array.from('abcdefghijklmnop', (letter, i) => tools.edit({{
+        \\ path: '.zig-cache/tmp/{s}/' + (i % 2 ? './f' : 'f'), old_text: letter, new_text: letter.toUpperCase()
+        \\}})))
+    , .{tmp.sub_path});
+    defer testing.allocator.free(code);
+    var t: Tools = .{ .io = testing.io, .home = "/home/nobody" };
+    const result = try js.eval(testing.allocator, testing.io, code, .{}, t.host(), null);
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.ok);
+    const data = try tmp.dir.readFileAlloc(testing.io, "f", testing.allocator, .limited(100));
+    defer testing.allocator.free(data);
+    try testing.expectEqualStrings("ABCDEFGHIJKLMNOP", data);
+}
+
+test "bash timeout still applies after output pipes close" {
+    const result = try callTool("bash", "{\"command\":\"exec 1>&- 2>&-; sleep 5\",\"timeout_ms\":80}");
+    defer freeResult(result);
+    try testing.expectEqualStrings("timed out after 80 ms", result.err);
 }
