@@ -20,6 +20,10 @@ _Avoid_: round。注意：pi 的 `turn_start` 指的是单次模型调用，相�
 一个 Turn 内的一次模型请求与响应，以及随后执行的全部 Run（如果有）。Step 完整后才提交日志；首个 Step 同时提交该 Turn 的用户消息。
 _Avoid_: iteration, turn
 
+**Subagent**（子 agent）：
+父 Session 委派一个任务后创建的独立 Session，完成一个 Turn 后把最终回答与用量交还父 Session。任务上下文由委派的 prompt 表达，不继承父 Session 的对话历史。
+_Avoid_: worker（仅指工具工作线程）, 常驻 agent
+
 ## 执行
 
 **Run**：

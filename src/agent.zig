@@ -58,8 +58,9 @@ pub const Session = struct {
     tools: tools.Tools,
     log: session_log.Log = undefined,
     id: []const u8 = undefined,
+    parent_session_id: ?[]const u8 = null,
 
-    pub const Options = struct { home: []const u8, data_home: []const u8, config_home: []const u8, resume_id: ?[]const u8 = null, continue_latest: bool = false };
+    pub const Options = struct { environ: ?*const std.process.Environ.Map = null, depth: u32 = 0, parent_session_id: ?[]const u8 = null, home: []const u8, data_home: []const u8, config_home: []const u8, resume_id: ?[]const u8 = null, continue_latest: bool = false };
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, client: *std.http.Client, cfg: openai.Config, options: Options) !Session {
         var s: Session = .{
@@ -68,7 +69,8 @@ pub const Session = struct {
             .client = client,
             .cfg = cfg,
             .arena = .init(gpa),
-            .tools = .{ .io = io, .home = options.home },
+            .tools = .{ .io = io, .home = options.home, .depth = options.depth, .environ = options.environ },
+            .parent_session_id = options.parent_session_id,
         };
         errdefer s.arena.deinit();
         errdefer s.history.deinit(gpa);
@@ -83,6 +85,8 @@ pub const Session = struct {
             } else try session_log.latest(io, a, directory, cwd);
             s.id = try a.dupe(u8, std.fs.path.stem(path));
             s.log = try session_log.Log.restore(io, gpa, a, path, &s.history, &s.context_tokens);
+            s.parent_session_id = s.log.parent_session_id;
+            if (s.parent_session_id != null) s.tools.depth = @max(s.tools.depth, 1);
         } else {
             var random: [16]u8 = undefined;
             io.random(&random);
@@ -90,12 +94,13 @@ pub const Session = struct {
             s.id = try a.dupe(u8, std.fs.path.stem(path));
             s.log = try session_log.Log.create(io, path);
             errdefer s.log.close(io);
-            const base = try std.fmt.allocPrint(a, system_template, .{ cwd, tools.docs });
+            const base = try std.fmt.allocPrint(a, system_template, .{ cwd, s.tools.api().docs });
             const global = try std.fs.path.join(a, &.{ options.config_home, "nib/AGENTS.md" });
             const project = try std.fs.path.join(a, &.{ try instructions.projectRoot(io, a, cwd), "AGENTS.md" });
             const system = try instructions.append(io, a, base, global, project);
             try s.commit(0, &.{.{ .role = "system", .content = system }}, 0, cwd);
         }
+        s.tools.session_id = s.id;
         return s;
     }
 
@@ -106,7 +111,7 @@ pub const Session = struct {
     }
 
     fn commit(s: *Session, from: usize, messages: []const openai.Message, tokens: u64, cwd: ?[]const u8) !void {
-        try s.log.commit(s.io, s.gpa, &s.history, &s.context_tokens, .{ .from = from, .messages = messages, .context_tokens = tokens, .cwd = cwd });
+        try s.log.commit(s.io, s.gpa, &s.history, &s.context_tokens, .{ .from = from, .messages = messages, .context_tokens = tokens, .cwd = cwd, .parent_session_id = if (cwd != null) s.parent_session_id else null });
     }
 
     pub const Compaction = enum { compacted, too_few_steps, ineffective };
@@ -130,6 +135,7 @@ pub const Session = struct {
         cfg.thinking = false;
         const reply = try openai.stream(s.gpa, a, s.client, cfg, request.items, "[]", @intCast(@min(2048, @max(32, s.cfg.context_window / 8))), .{ .ctx = s, .onDelta = Silent.delta }, cancel, detail);
         s.usage.add(reply.usage);
+        try sink.emit(sink.ctx, .{ .usage = s.usage });
         if (cancel.load(.acquire)) return error.Canceled;
         if (reply.text.len == 0 or reply.tool_calls.len != 0) return error.InvalidSummary;
         var replacement: std.ArrayList(openai.Message) = .empty;
@@ -182,6 +188,7 @@ pub const Session = struct {
             try request.appendSlice(s.gpa, pending.items);
             const reply = try s.complete(request.items, sink, cancel, detail);
             s.usage.add(reply.usage);
+            try sink.emit(sink.ctx, .{ .usage = s.usage });
             s.steps += 1;
             try pending.append(s.gpa, .{
                 .role = "assistant",
@@ -192,6 +199,7 @@ pub const Session = struct {
             var output_tokens: u64 = 0;
             for (reply.tool_calls) |call| {
                 const result = try s.execute(call, sink, cancel);
+                try sink.emit(sink.ctx, .{ .usage = s.usage });
                 try pending.append(s.gpa, .{ .role = "tool", .content = result, .tool_call_id = call.id });
                 output_tokens += result.len / 3 + 1;
             }
@@ -233,6 +241,11 @@ pub const Session = struct {
         }
     }
 
+    pub fn run(s: *Session, code: []const u8, cancel: ?*const std.atomic.Value(bool)) !js.Outcome {
+        defer s.usage.add(s.tools.takeUsage());
+        return js.eval(s.gpa, s.io, code, .{}, s.tools.host(), cancel);
+    }
+
     /// Result is arena-owned.
     fn execute(s: *Session, call: openai.ToolCall, sink: Sink, cancel: *const std.atomic.Value(bool)) ![]const u8 {
         const a = s.arena.allocator();
@@ -245,7 +258,7 @@ pub const Session = struct {
         defer args.deinit();
 
         try sink.emit(sink.ctx, .{ .run_start = args.value.code });
-        const o = try js.eval(s.gpa, s.io, args.value.code, .{}, s.tools.host(), cancel);
+        const o = try s.run(args.value.code, cancel);
         defer o.deinit(s.gpa);
 
         const formatted = try formatOutcome(s.gpa, o);

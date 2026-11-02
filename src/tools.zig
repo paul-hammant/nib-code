@@ -1,9 +1,12 @@
 const std = @import("std");
 const js = @import("js.zig");
+const openai = @import("provider/openai.zig");
+const JsonEvent = @import("events.zig").JsonEvent;
 const process = @import("process.zig");
 const policy = @import("policy.zig");
 
 const Tool = struct {
+    root_only: bool = false,
     name: []const u8,
     doc: []const u8,
     run: *const fn (t: *Tools, gpa: std.mem.Allocator, args: []const u8) anyerror!js.ToolResult,
@@ -42,31 +45,56 @@ const all = [_]Tool{
         \\  async bash({ command, timeout_ms = 120000 }) {}, // → { exit_code, output }
         ,
     },
+    .{
+        .name = "agent",
+        .root_only = true,
+        .run = Tools.agent,
+        .doc =
+        \\  // Delegate one Turn to an independent nib Session. Only prompt is shared; usage counts toward this Turn.
+        \\  async agent({ prompt }) {}, // → { text, usage }
+        ,
+    },
 };
 
-pub const names = blk: {
-    var n: [all.len][]const u8 = undefined;
-    for (all, &n) |t, *name| name.* = t.name;
-    const final = n;
-    break :blk final;
-};
+const Api = struct { names: []const []const u8, docs: []const u8 };
 
-pub const docs = blk: {
-    var s: []const u8 = "const tools = {\n";
-    for (all) |t| s = s ++ t.doc ++ "\n";
-    break :blk s ++
+fn enabled(tool: Tool, depth: u32) bool {
+    return !tool.root_only or depth == 0;
+}
+
+fn makeApi(comptime depth: u32) Api {
+    var n: []const []const u8 = &.{};
+    var d: []const u8 = "const tools = {\n";
+    for (all) |tool| {
+        if (!enabled(tool, depth)) continue;
+        n = n ++ .{tool.name};
+        d = d ++ tool.doc ++ "\n";
+    }
+    return .{ .names = n, .docs = d ++
         \\};
         \\// Strings print as-is, other values as JSON.
         \\console.log(...values);
         \\
-    ;
-};
+    };
+}
+
+const root_api = makeApi(0);
+const child_api = makeApi(1);
+pub const names = root_api.names;
+pub const docs = root_api.docs;
 
 const max_output = 16 * 1024;
 
 pub const Tools = struct {
     io: std.Io,
     home: []const u8,
+    environ: ?*const std.process.Environ.Map = null,
+    depth: u32 = 0,
+    session_id: ?[]const u8 = null,
+    agents_mutex: std.Io.Mutex = .init,
+    agents_changed: std.Io.Condition = .init,
+    agents_active: usize = 0,
+    agent_usage: openai.Usage = .{},
     cancel: std.atomic.Value(bool) = .init(false),
     paths_mutex: std.Io.Mutex = .init,
     paths_changed: std.Io.Condition = .init,
@@ -96,14 +124,27 @@ pub const Tools = struct {
         t.paths_changed.broadcast(t.io);
     }
 
+    pub fn api(t: *const Tools) Api {
+        return if (t.depth == 0) root_api else child_api;
+    }
+
+    pub fn takeUsage(t: *Tools) openai.Usage {
+        t.agents_mutex.lockUncancelable(t.io);
+        defer t.agents_mutex.unlock(t.io);
+        const usage = t.agent_usage;
+        t.agent_usage = .{};
+        return usage;
+    }
+
     pub fn host(t: *Tools) js.Host {
         t.cancel.store(false, .release);
-        return .{ .ctx = t, .names = &names, .call = call, .cancel = &t.cancel };
+        return .{ .ctx = t, .names = t.api().names, .call = call, .cancel = &t.cancel };
     }
 
     fn call(ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8, args: []const u8) js.ToolResult {
         const t: *Tools = @ptrCast(@alignCast(ctx));
         const r = for (all) |tool| {
+            if (!enabled(tool, t.depth)) continue;
             if (std.mem.eql(u8, name, tool.name)) break tool.run(t, gpa, args);
         } else fail(gpa, "unknown tool", .{});
         return r catch |err| fail(gpa, "{s}", .{@errorName(err)}) catch .{ .err = &.{} };
@@ -192,6 +233,76 @@ pub const Tools = struct {
         return .{ .ok = try std.fmt.allocPrint(gpa, "{{\"bytes\":{d}}}", .{v.content.len}) };
     }
 
+    fn agent(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !js.ToolResult {
+        const a = std.json.parseFromSlice(struct { prompt: []const u8 }, gpa, args, .{ .ignore_unknown_fields = true }) catch
+            return fail(gpa, "expected {{ prompt: string }}", .{});
+        defer a.deinit();
+        t.agents_mutex.lockUncancelable(t.io);
+        while (t.agents_active >= 4 and !t.cancel.load(.acquire))
+            t.agents_changed.waitTimeout(t.io, &t.agents_mutex, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch {};
+        const canceled = t.cancel.load(.acquire);
+        if (!canceled) t.agents_active += 1;
+        t.agents_mutex.unlock(t.io);
+        if (canceled) return error.Canceled;
+        defer {
+            t.agents_mutex.lockUncancelable(t.io);
+            t.agents_active -= 1;
+            t.agents_changed.signal(t.io);
+            t.agents_mutex.unlock(t.io);
+        }
+        var env = try (t.environ orelse return error.AgentEnvironmentUnavailable).clone(gpa);
+        defer env.deinit();
+        const depth = try std.fmt.allocPrint(gpa, "{d}", .{t.depth + 1});
+        defer gpa.free(depth);
+        try env.put("NIB_AGENT_DEPTH", depth);
+        try env.put("NIB_PARENT_SESSION_ID", t.session_id orelse return error.MissingSessionId);
+        const executable = try std.process.executablePathAlloc(t.io, gpa);
+        defer gpa.free(executable);
+        const result = try process.run(gpa, t.io, .{
+            .spawn = .{ .argv = &.{ executable, "ask", "--json", "-" }, .environ_map = &env, .stdout = .pipe, .stderr = .ignore },
+            .input = a.value.prompt,
+            .cancel = &t.cancel,
+            .timeout_ms = 5 * 60 * 1000,
+            .termination_grace_ms = 500,
+        });
+        defer gpa.free(result.output);
+        var usage: openai.Usage = .{};
+        defer {
+            t.agents_mutex.lockUncancelable(t.io);
+            t.agent_usage.add(usage);
+            t.agents_mutex.unlock(t.io);
+        }
+        var terminal: ?std.json.Parsed(JsonEvent) = null;
+        defer if (terminal) |parsed| parsed.deinit();
+        var lines = std.mem.splitScalar(u8, result.output, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            const parsed = try std.json.parseFromSlice(std.json.Value, gpa, line, .{});
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidAgentOutput;
+            if (parsed.value.object.get("usage")) |snapshot| {
+                const u = try std.json.parseFromValue(openai.Usage, gpa, snapshot, .{ .ignore_unknown_fields = true });
+                defer u.deinit();
+                usage = u.value;
+            }
+            if (!parsed.value.object.contains("end") and !parsed.value.object.contains("error")) continue;
+            if (terminal != null) return error.InvalidAgentOutput;
+            terminal = try std.json.parseFromSlice(JsonEvent, gpa, line, .{ .ignore_unknown_fields = true });
+        }
+        const event = (terminal orelse return result.stop orelse error.MissingAgentResult).value;
+        usage = switch (event) {
+            .end => |end| end.usage,
+            .@"error" => |err| err.usage,
+            else => return error.InvalidAgentOutput,
+        };
+        if (result.stop) |err| return err;
+        return switch (event) {
+            .end => |end| if (result.term.success()) .{ .ok = try std.json.Stringify.valueAlloc(gpa, .{ .text = end.text, .usage = end.usage }, .{}) } else error.AgentFailed,
+            .@"error" => |err| fail(gpa, "subagent: {s}", .{err.message}),
+            else => error.InvalidAgentOutput,
+        };
+    }
+
     fn bash(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !js.ToolResult {
         const A = struct { command: []const u8, timeout_ms: i64 = 120_000 };
         const a = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch
@@ -207,18 +318,18 @@ pub const Tools = struct {
         const script = try std.fmt.allocPrint(gpa, "exec 2>&1\n{s}", .{a.value.command});
         defer gpa.free(script);
 
-        const result = process.run(gpa, t.io, .{
+        const result = try process.run(gpa, t.io, .{ .spawn = .{
             .argv = &.{ "bash", "-c", script },
             .stdin = .ignore,
             .stdout = .pipe,
             .stderr = .ignore,
-        }, &t.cancel, a.value.timeout_ms) catch |err| return switch (err) {
-            error.TimedOut => fail(gpa, "timed out after {d} ms", .{a.value.timeout_ms}),
-            error.Canceled => fail(gpa, "canceled", .{}),
-            else => err,
-        };
+        }, .cancel = &t.cancel, .timeout_ms = a.value.timeout_ms });
         const stdout = result.output;
         defer gpa.free(stdout);
+        if (result.stop) |err| return switch (err) {
+            error.TimedOut => fail(gpa, "timed out after {d} ms", .{a.value.timeout_ms}),
+            error.Canceled => fail(gpa, "canceled", .{}),
+        };
         const output = try truncateMiddle(gpa, stdout);
         defer gpa.free(output);
         const code: ?u8 = switch (result.term) {
@@ -504,4 +615,29 @@ test "dangling symlink and target share the same path lock" {
     const b = try normalizedPath(testing.io, testing.allocator, target);
     defer testing.allocator.free(b);
     try testing.expectEqualStrings(a, b);
+}
+
+test "child API filters agent from both docs and sandbox" {
+    var t: Tools = .{ .io = testing.io, .home = "/home/nobody", .depth = 1 };
+    try testing.expect(std.mem.indexOf(u8, t.api().docs, "async agent({") == null);
+    const result = try js.eval(testing.allocator, testing.io, "[typeof tools.agent, Object.keys(tools)]", .{}, t.host(), null);
+    defer result.deinit(testing.allocator);
+    try testing.expectEqualStrings("[\"undefined\",[\"read\",\"edit\",\"write\",\"bash\"]]", result.text);
+}
+
+test "process deadline covers a blocked stdin writer" {
+    const input = try testing.allocator.alloc(u8, 128 * 1024);
+    defer testing.allocator.free(input);
+    @memset(input, 'x');
+    var cancel: std.atomic.Value(bool) = .init(false);
+    const start = std.Io.Clock.awake.now(testing.io);
+    const result = try process.run(testing.allocator, testing.io, .{
+        .spawn = .{ .argv = &.{ "bash", "-c", "sleep 5" }, .stdout = .pipe, .stderr = .ignore },
+        .input = input,
+        .cancel = &cancel,
+        .timeout_ms = 50,
+    });
+    defer testing.allocator.free(result.output);
+    try testing.expectEqual(error.TimedOut, result.stop.?);
+    try testing.expect(start.durationTo(std.Io.Clock.awake.now(testing.io)).toMilliseconds() < 1000);
 }

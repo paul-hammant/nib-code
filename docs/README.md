@@ -37,7 +37,7 @@
   - [0007 保持 system 稳定，按完整 Step 压缩上下文](adr/0007-context-compaction.md)
   - [0008 支持 thinking 模型，默认 deepseek-flash](adr/0008-thinking-models.md)
   - [0009 Run 内工具调用真正并发，顺序按 JS 语义](adr/0009-concurrent-tools.md)
-  - [0010 子 agent：tools.agent 派生独立 nib 子进程](adr/0010-subagents.md)（提议中）
+  - [0010 子 agent：tools.agent 派生独立 nib 子进程](adr/0010-subagents.md)
 
 ## 没写成 ADR 的选择
 
@@ -53,7 +53,7 @@
 
 - **跨进程保存输入历史。** 现在只在本次会话内可翻阅。等实际使用中需要时再做。
 
-Run 内工具并发已实现，见 ADR 0009；`nib ask --json` 已提供 NDJSON 事件接口，格式见 [AGENTS.md](../AGENTS.md)；子 agent 见尚在实施的 ADR 0010。其他被搁置的方案记在对应 ADR 里：系统层沙箱（[0004](adr/0004-two-layer-isolation.md)）、守护进程（[0005](adr/0005-process-per-session.md)）、跨 Run 的变量存储（[0003](adr/0003-stateless-runs.md)）、混合原生工具调用和 Python 运行时（[0002](adr/0002-run-code-only.md)）。
+Run 内工具并发、`nib ask --json` 和 `tools.agent` 均已实现，见 ADR 0009–0010；NDJSON 格式与调用约定见 [AGENTS.md](../AGENTS.md)。`zig build` 后执行 `python3 scripts/test_session.py` 可检查会话恢复、机器事件、子 agent 并发/深度/用量/取消及启动开销（全程本地 mock，无真实 key）。其他被搁置的方案记在对应 ADR 里：系统层沙箱（[0004](adr/0004-two-layer-isolation.md)）、守护进程（[0005](adr/0005-process-per-session.md)）、跨 Run 的变量存储（[0003](adr/0003-stateless-runs.md)）、混合原生工具调用和 Python 运行时（[0002](adr/0002-run-code-only.md)）。
 
 ## 度量
 
@@ -61,9 +61,11 @@ Run 内工具并发已实现，见 ADR 0009；`nib ask --json` 已提供 NDJSON 
 
 | 项目 | 实测值 | 警报线 | 测量方式 |
 |---|---|---|---|
-| 源码行数（`src/` + `build.zig`，含测试） | 3101（2026-11-01，合并 session-core 与 tui-polish 后） | — | `wc -l build.zig src/**/*.zig`（zsh） |
+| 源码行数（`src/` + `build.zig`，含测试） | 3766（2026-11-01，实现工具并发、NDJSON 与子 agent 后） | — | `wc -l build.zig src/**/*.zig`（zsh） |
 | TUI 单帧 draw 耗时，5000 条目、100×24 | 底部跟随 102.5 → 29.7 µs；上翻 1200 行 1149.5 → 57.2 µs（2026-11-01，ReleaseFast，加高度缓存前 → 后） | — | 预热后每组 32 帧，5 组平均值取中位数，只测 draw（feat/tui-polish 的报告） |
 | `nib js '1+1'` 平均耗时（含进程启动） | 1.6 ms（2026-11-01，ReleaseFast） | — | 循环 100 次取平均 |
+| 工具 Promise.all / 依次 await：两个 sleep 0.3 | 307 / 611 ms（2026-11-01，Debug） | — | `src/tools.zig` 测试，见 ADR 0009 |
+| 子进程启动至 NDJSON start（含日志同步，不含 TLS） | Debug 中位数 11.82 ms；ReleaseFast 中位数 1.30 ms（2026-11-01） | — | `scripts/test_session.py`，10 次，见 ADR 0010 |
 | 上述命令峰值 RSS | 3.7 MB（2026-11-01） | — | `/usr/bin/time -f %M` |
 | 二进制体积（ReleaseFast，strip 后） | 1.9 MB（2026-11-01） | — | `strip` 后 `ls -l` |
 | TUI 进程空闲 PSS（一轮对话后，无 TLS） | 3.08 MB/进程，10 个合计 30.8 MB（2026-11-01，ReleaseFast） | — | 10 个 TUI 对本地模拟服务器各聊一轮，读 `/proc/<pid>/smaps_rollup` 的 `Pss` |

@@ -23,6 +23,7 @@ pub const Config = struct {
 pub fn main(init: std.process.Init) void {
     var out_buf: [4096]u8 = undefined;
     var out = std.Io.File.stdout().writer(init.io, &out_buf);
+    var failure: JsonEvent.Failure = .{};
     var detail: ?[]u8 = null;
     defer if (detail) |d| init.gpa.free(d);
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch {
@@ -31,15 +32,16 @@ pub fn main(init: std.process.Init) void {
     const json = args.len > 1 and std.mem.eql(u8, args[1], "ask") and for (args[2..]) |arg| {
         if (std.mem.eql(u8, arg, "--json")) break true;
     } else false;
-    run(init, args, &out.interface, json, &detail) catch |err| {
+    run(init, args, &out.interface, json, &detail, &failure) catch |err| {
         if (json) {
-            JsonEvent.write(.{ .@"error" = .{ .message = detail orelse @errorName(err) } }, &out.interface) catch {};
+            failure.message = detail orelse @errorName(err);
+            JsonEvent.write(.{ .@"error" = failure }, &out.interface) catch {};
         } else std.debug.print("nib: {s}\n", .{detail orelse @errorName(err)});
         std.process.exit(1);
     };
 }
 
-fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer, json: bool, detail: *?[]u8) !void {
+fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer, json: bool, detail: *?[]u8, failure: *JsonEvent.Failure) !void {
     const gpa = init.gpa;
     const cfg = try Config.fromEnv(init.environ_map);
     if (args.len >= 3 and std.mem.eql(u8, args[1], "js")) {
@@ -52,6 +54,9 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
     }
 
     var options: agent.Session.Options = .{
+        .environ = init.environ_map,
+        .depth = if (init.environ_map.get("NIB_AGENT_DEPTH")) |v| try std.fmt.parseInt(u32, v, 10) else 0,
+        .parent_session_id = init.environ_map.get("NIB_PARENT_SESSION_ID"),
         .home = init.environ_map.get("HOME") orelse "",
         .data_home = init.environ_map.get("XDG_DATA_HOME") orelse try std.fs.path.join(init.arena.allocator(), &.{ init.environ_map.get("HOME") orelse "", ".local/share" }),
         .config_home = init.environ_map.get("XDG_CONFIG_HOME") orelse try std.fs.path.join(init.arena.allocator(), &.{ init.environ_map.get("HOME") orelse "", ".config" }),
@@ -83,6 +88,10 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
     if (ask and cfg.llm.api_key.len == 0) return error.MissingApiKey;
     var session = try agent.Session.init(gpa, init.io, &client, cfg.llm, options);
     defer session.deinit();
+    defer {
+        failure.usage = session.usage;
+        failure.steps = session.steps;
+    }
 
     if (ask) {
         const Print = struct {
@@ -99,6 +108,7 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
                     .run_start => |code| std.debug.print("\n\x1b[33mrun ▸\x1b[0m {s}\n", .{code}),
                     .run_end => |r| std.debug.print("\x1b[2m{s}\x1b[0m\n", .{r.output}),
                     .retry => |r| std.debug.print("\x1b[2mretry {d} in {d}s: {s}\x1b[0m\n", .{ r.attempt, r.delay_ms / 1000, r.reason }),
+                    .usage => {},
                     .notice => |m| std.debug.print("\x1b[2m{s}\x1b[0m\n", .{m}),
                 }
             }
@@ -109,8 +119,10 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
         }
         if (json) try JsonEvent.write(.{ .start = .{ .session_id = session.id } }, stdout);
         var p: Print = .{ .w = stdout, .json = json };
-        var cancel: std.atomic.Value(bool) = .init(false);
-        try session.turn(prompt.?, .{ .ctx = &p, .emit = Print.emit }, &cancel, detail);
+        const action: std.posix.Sigaction = .{ .handler = .{ .handler = onSignal }, .mask = std.posix.sigemptyset(), .flags = 0 };
+        std.posix.sigaction(.TERM, &action, null);
+        std.posix.sigaction(.INT, &action, null);
+        try session.turn(prompt.?, .{ .ctx = &p, .emit = Print.emit }, &ask_cancel, detail);
         if (json) {
             try JsonEvent.write(.{ .end = .{
                 .text = session.history.items[session.history.items.len - 1].content orelse "",
@@ -129,6 +141,12 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
     }
 
     try tui.run(init, &session);
+}
+
+var ask_cancel: std.atomic.Value(bool) = .init(false);
+
+fn onSignal(_: std.posix.SIG) callconv(.c) void {
+    ask_cancel.store(true, .release);
 }
 
 fn parseSwitch(v: []const u8) ?bool {

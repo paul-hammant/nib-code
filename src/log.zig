@@ -3,6 +3,7 @@ const openai = @import("provider/openai.zig");
 
 pub const Record = struct {
     cwd: ?[]const u8 = null,
+    parent_session_id: ?[]const u8 = null,
     from: usize = 0,
     messages: []const openai.Message = &.{},
     context_tokens: u64 = 0,
@@ -13,6 +14,7 @@ pub const Log = struct {
     file: std.Io.File,
     offset: u64,
     poisoned: bool = false,
+    parent_session_id: ?[]const u8 = null,
 
     pub fn create(io: std.Io, path: []const u8) !Log {
         return .{ .file = try std.Io.Dir.cwd().createFile(io, path, .{
@@ -29,9 +31,9 @@ pub const Log = struct {
         errdefer file.close(io);
         var reader = file.reader(io, &.{});
         const data = try reader.interface.allocRemaining(a, .unlimited);
-        const needs_repair = try replay(gpa, a, data, history, tokens);
-        var log: Log = .{ .file = file, .offset = data.len };
-        if (needs_repair) {
+        const restored = try replay(gpa, a, data, history, tokens);
+        var log: Log = .{ .file = file, .offset = data.len, .parent_session_id = restored.parent_session_id };
+        if (restored.needs_repair) {
             try log.append(io, a, .{ .repair = true });
             try log.file.sync(io);
         }
@@ -67,7 +69,8 @@ fn apply(history: *std.ArrayList(openai.Message), record: Record) void {
     history.appendSliceAssumeCapacity(record.messages);
 }
 
-pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, history: *std.ArrayList(openai.Message), tokens: *u64) !bool {
+pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, history: *std.ArrayList(openai.Message), tokens: *u64) !struct { needs_repair: bool, parent_session_id: ?[]const u8 } {
+    var parent_session_id: ?[]const u8 = null;
     var lines = std.mem.splitScalar(u8, data, '\n');
     var torn = false;
     while (lines.next()) |line| {
@@ -77,6 +80,7 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
             torn = true;
             continue;
         };
+        if (history.items.len == 0) parent_session_id = r.parent_session_id;
         if (r.repair) {
             torn = false;
             continue;
@@ -88,7 +92,7 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
         tokens.* = r.context_tokens;
     }
     if (history.items.len == 0) return error.InvalidSessionLog;
-    return torn or data[data.len - 1] != '\n';
+    return .{ .needs_repair = torn or data[data.len - 1] != '\n', .parent_session_id = parent_session_id };
 }
 
 fn validate(messages: []const openai.Message) !void {
@@ -130,7 +134,7 @@ pub fn latest(io: std.Io, a: std.mem.Allocator, directory: []const u8, cwd: []co
             else => return err,
         };
         const r = std.json.parseFromSliceLeaky(Record, a, header.written(), .{ .allocate = .alloc_always }) catch continue;
-        if (!std.mem.eql(u8, r.cwd orelse "", cwd)) continue;
+        if (r.parent_session_id != null or !std.mem.eql(u8, r.cwd orelse "", cwd)) continue;
         newest = stat.mtime.nanoseconds;
         best = try std.fs.path.join(a, &.{ directory, entry.name });
     }

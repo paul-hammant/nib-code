@@ -18,6 +18,7 @@ const Event = union(enum) {
     retry: []u8,
     notice: []u8,
     done,
+    usage: openai.Usage,
     failed: []u8,
 };
 
@@ -131,6 +132,7 @@ const Turn = struct {
             .run_end => |r| .{ .run_end = .{ .ok = r.ok, .output = try gpa.dupe(u8, r.output) } },
             .retry => |r| .{ .retry = try std.fmt.allocPrint(gpa, "retry {d} in {d}s: {s}", .{ r.attempt, r.delay_ms / 1000, r.reason }) },
             .notice => |m| .{ .notice = try gpa.dupe(u8, m) },
+            .usage => |u| .{ .usage = u },
         });
     }
 
@@ -219,7 +221,8 @@ pub fn run(init: std.process.Init, session: *agent.Session) !void {
                     if (std.mem.startsWith(u8, line, "/js ")) {
                         defer gpa.free(line);
                         try addEntry(gpa, &entries, .user, line);
-                        const r = try js.eval(gpa, io, line[4..], .{}, session.tools.host(), null);
+                        const r = try session.run(line[4..], null);
+                        usage = session.usage;
                         defer r.deinit(gpa);
                         if (r.logs.len > 0) try addEntry(gpa, &entries, .run_output, std.mem.trimEnd(u8, r.logs, "\n"));
                         try addEntry(gpa, &entries, if (r.ok) .info else .err, r.text);
@@ -276,6 +279,7 @@ pub fn run(init: std.process.Init, session: *agent.Session) !void {
                 defer gpa.free(msg);
                 try addEntry(gpa, &entries, .info, msg);
             },
+            .usage => |u| usage = u,
             .done => {
                 turn.?.finish();
                 turn = null;

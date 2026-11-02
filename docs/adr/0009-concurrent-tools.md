@@ -17,5 +17,7 @@ bash 的进程组启动、限时输出轮询、取消和回收移入 `src/proces
 
 **把握程度：** 实测（2026-11-01，本机 Debug，`src/tools.zig` 测试）：两个 `sleep 0.3`，Promise.all 为 307 ms，依次 await 为 611 ms。50 项单元测试通过，覆盖 JS 异常、12 个调用执行期间取消/超时、16 个同路径并行 edit、悬空符号链接别名和 EOF 后超时；Session 端到端测试通过。一手源码（同日，Zig 0.17 `std/process.zig`、`std/start.zig`）：Init.gpa 明确保证线程安全；Debug/ReleaseSafe 使用 SafeAllocator，本项目链接 libc 的 ReleaseFast/Small 使用 c_allocator。
 
+后续验证（同日）：Debug/ReleaseFast 均通过 53 项单元测试与端到端测试；ReleaseFast 暴露并修正了工具 JSON 缓冲的零结尾要求（一手源码：QuickJS `quickjs.h` 的 `JS_ParseJSON` 声明）。
+
 **何时重新考虑：**
 - 观察到模型在 `Promise.all` 里并行做了互相依赖的副作用操作并因此出错。

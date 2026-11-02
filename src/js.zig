@@ -126,7 +126,12 @@ const State = struct {
                 active -= 1;
                 const result = call.result.?;
                 const value = switch (result) {
-                    .ok => |json| c.JS_ParseJSON(ctx, json.ptr, json.len, "<tool>"),
+                    .ok => |json| blk: {
+                        // QuickJS requires buf[len] == 0 even with an explicit length.
+                        const source = try st.gpa.dupeSentinel(u8, json, 0);
+                        defer st.gpa.free(source);
+                        break :blk c.JS_ParseJSON(ctx, source.ptr, source.len, "<tool>");
+                    },
                     .err => |msg| blk: {
                         const err = c.JS_NewError(ctx);
                         _ = c.JS_SetPropertyStr(ctx, err, "message", c.JS_NewStringLen(ctx, msg.ptr, msg.len));
@@ -424,4 +429,26 @@ test "tools route through the host, errors become exceptions" {
         "{\"a\":{\"tool\":\"echo\",\"args\":{\"x\":1}},\"b\":{\"tool\":\"echo\",\"args\":{}},\"msg\":\"fail: nope\",\"keys\":[\"echo\",\"fail\"]}",
         r.text,
     );
+}
+
+test "tool concurrency is bounded while excess calls queue" {
+    const Slow = struct {
+        active: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        fn call(ctx: *anyopaque, gpa: std.mem.Allocator, _: []const u8, _: []const u8) ToolResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const active = self.active.fetchAdd(1, .acq_rel) + 1;
+            defer _ = self.active.fetchSub(1, .acq_rel);
+            _ = self.peak.fetchMax(active, .monotonic);
+            std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(20), .clock = .awake }, testing.io) catch unreachable;
+            return .{ .ok = gpa.dupe(u8, "1") catch unreachable };
+        }
+    };
+    var slow: Slow = .{};
+    const result = try run("(await Promise.all(Array.from({length: 24}, () => tools.slow()))).length", .{}, .{ .ctx = &slow, .names = &.{"slow"}, .call = Slow.call });
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.ok);
+    try testing.expectEqualStrings("24", result.text);
+    try testing.expect(slow.peak.load(.monotonic) > 1 and slow.peak.load(.monotonic) <= 8);
+    try testing.expectEqual(0, slow.active.load(.monotonic));
 }

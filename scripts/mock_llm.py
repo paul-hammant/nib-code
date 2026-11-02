@@ -11,15 +11,21 @@ thinking.type "disabled": replies then stream reasoning_content, and like
 DeepSeek, a request with tools whose assistant messages lack reasoning_content
 gets HTTP 400. "reject1"/"reject2" return HTTP 400 before
 the first/second Step; "truncated" closes the stream without [DONE].
-Each request is logged to LOGFILE as one JSON line."""
-import http.server, json, os, sys, time
+"delegate" runs two children; "delegate_many" runs six; "delegate_failure"
+catches a failed child's error. "delegate_cancel PATH" runs a child whose bash
+writes its pid to PATH and sleeps. "child probe" answers without a Run.
+Child Runs report the exposed tools, allowing depth-limit checks.
+Each request is logged to LOGFILE as one JSON line, with a monotonic received time."""
+import http.server, json, os, shlex, sys, threading, time
 LOG=open(sys.argv[2],'a')
+LOG_LOCK = threading.Lock()
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self,*a): pass
     def do_POST(self):
         body=json.loads(self.rfile.read(int(self.headers['content-length'])))
         msgs=body['messages']
-        LOG.write(json.dumps({"n":len(msgs),"roles":[m['role'] for m in msgs],"has_tools":(body.get('tools') or [{}])[0].get('function',{}).get('name'),
+        with LOG_LOCK:
+            LOG.write(json.dumps({"received":time.monotonic(),"n":len(msgs),"roles":[m['role'] for m in msgs],"has_tools":(body.get('tools') or [{}])[0].get('function',{}).get('name'),
                               "messages":msgs,"thinking":body.get('thinking'),"system_has_tools_api":'const tools = {' in msgs[0].get('content','')})+"\n"); LOG.flush()
         summary = 'max_tokens' in body and not body.get('tools')
         lastuser=[m for m in msgs if m['role']=='user'][-1]['content']
@@ -29,6 +35,8 @@ class H(http.server.BaseHTTPRequestHandler):
         if thinking and body.get('tools') and any(m['role']=='assistant' and not m.get('reasoning_content') for m in msgs):
             self.send_response(400); self.send_header('content-type','application/json'); self.end_headers()
             self.wfile.write(b'{"error":{"message":"The reasoning_content in the thinking mode must be passed back to the API."}}'); return
+        if msgs[-1]['role']=='tool' and lastuser == 'child stall2':
+            time.sleep(3)
         if msgs[-1]['role']=='tool' and 'fail2' in lastuser:
             self.send_response(500); self.send_header('content-type','application/json'); self.end_headers(); self.wfile.write(b'{"error":"boom"}'); return
         self.send_response(200); self.send_header('content-type','text/event-stream'); self.send_header('transfer-encoding','chunked'); self.end_headers()
@@ -41,8 +49,28 @@ class H(http.server.BaseHTTPRequestHandler):
             return sum(len(m.get('content') or '') for m in msgs)//3 if compacted else int(os.environ.get('MOCK_PROMPT_TOKENS',default))
         if summary:
             ev({'choices':[{'delta':{'content':'Earlier work: ran bash successfully. Continue the user task.'}}], 'usage':{'prompt_tokens':100,'completion_tokens':15}})
+        elif last['role']=='user' and lastuser == 'child probe':
+            if thinking: ev({"choices":[{"delta":{"reasoning_content":"Probe."}}]})
+            ev({"choices":[{"delta":{"content":"probe complete"}}], "usage":{"prompt_tokens":prompt_tokens(100),"completion_tokens":10}})
         elif last['role']=='user':
             code = 'const r = await tools.bash({command: "echo hello from bash; printf \'a\\\\nb\\\\nc\\\\n\' | wc -l"});\nconsole.log("exit", r.exit_code);\nr.output.trim().split("\\n")'
+            if lastuser.startswith('delegate_cancel '):
+                code = 'await tools.agent({prompt: ' + json.dumps('child cancel ' + lastuser.split(' ', 1)[1]) + '})'
+            elif lastuser == 'delegate_stall':
+                code = 'await tools.agent({prompt: "child stall2"})'
+            elif lastuser == 'delegate_failure':
+                code = 'try { await tools.agent({prompt: "child reject2"}); } catch (e) { e.message }'
+            elif lastuser == 'delegate_many':
+                code = 'await Promise.all(Array.from({length: 6}, (_, i) => tools.agent({prompt: "child " + i})))'
+            elif lastuser == 'delegate_probe':
+                code = 'await tools.agent({prompt: "child probe"})'
+            elif lastuser == 'delegate':
+                code = 'await Promise.all([tools.agent({prompt: "child alpha"}), tools.agent({prompt: "child beta"})])'
+            elif lastuser.startswith('child '):
+                command = 'sleep 0.3'
+                if lastuser.startswith('child cancel '):
+                    command = 'echo $$ > ' + shlex.quote(lastuser.split(' ', 2)[2]) + '; exec sleep 30'
+                code = 'await tools.bash({command: ' + json.dumps(command) + '}); ({prompt: ' + json.dumps(lastuser) + ', agent: typeof tools.agent, keys: Object.keys(tools)})'
             if 'bad' in last['content']: code='const x: number = 1; x'
             args=json.dumps({"code":code})
             if thinking: ev({"choices":[{"delta":{"reasoning_content":"先用 bash 看看。"}}]})

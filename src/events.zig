@@ -8,13 +8,16 @@ pub const Event = union(enum) {
     run_end: struct { ok: bool, output: []const u8 },
     retry: struct { attempt: u32, delay_ms: u64, reason: []const u8 },
     notice: []const u8,
+    usage: openai.Usage,
 };
 
 pub const JsonEvent = union(enum) {
     start: struct { session_id: []const u8 },
     event: Event,
     end: End,
-    @"error": struct { message: []const u8 },
+    @"error": Failure,
+
+    pub const Failure = struct { message: []const u8 = "", usage: openai.Usage = .{}, steps: u32 = 0 };
 
     pub const End = struct { text: []const u8, usage: openai.Usage, steps: u32 };
 
