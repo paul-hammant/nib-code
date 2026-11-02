@@ -1,57 +1,75 @@
-//! Chat TUI: transcript above, input line below. The model streams on a
-//! worker thread that posts deltas into the vaxis event queue, so the UI
-//! thread never blocks on the network.
+//! Chat TUI: transcript above, input line below. A Turn runs on a worker
+//! thread that posts events into the vaxis queue, so the UI thread never
+//! blocks on the network or on a Run.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
 const js = @import("js.zig");
+const agent = @import("agent.zig");
 const openai = @import("provider/openai.zig");
 
 const Event = union(enum) {
     key_press: vaxis.Key,
     winsize: vaxis.Winsize,
-    /// `text` is owned by the receiver.
+    /// Slices below are owned by the receiver.
     delta: struct { kind: openai.Kind, text: []u8 },
-    done: openai.Usage,
-    /// Owned by the receiver.
+    run_start: []u8,
+    run_end: struct { ok: bool, output: []u8 },
+    done,
     failed: []u8,
 };
 
 const Entry = struct {
-    kind: enum { user, assistant, reasoning, info, err },
+    kind: enum { user, assistant, reasoning, run_code, run_output, run_error, info, err },
     text: std.ArrayList(u8) = .empty,
 };
 
-/// State shared with the worker thread for one model turn. `messages` is not
-/// mutated while the turn runs.
+/// Lines of Run output shown in the transcript; the model sees all of it.
+const run_output_lines = 12;
+
+/// Owns the worker thread for one Turn. The Session is not touched by the UI
+/// thread while a Turn is running.
 const Turn = struct {
     gpa: std.mem.Allocator,
-    client: *std.http.Client,
-    cfg: openai.Config,
-    messages: []const openai.Message,
+    session: *agent.Session,
+    text: []const u8,
     loop: *vaxis.Loop(Event),
     cancel: std.atomic.Value(bool) = .init(false),
+    thread: std.Thread = undefined,
 
     fn work(t: *Turn) void {
         var detail: ?[]u8 = null;
-        const sink: openai.Sink = .{ .ctx = t, .onDelta = onDelta };
-        const usage = openai.stream(t.gpa, t.client, t.cfg, t.messages, sink, &t.cancel, &detail) catch |err| {
+        t.session.turn(t.text, .{ .ctx = t, .emit = emit }, &t.cancel, &detail) catch |err| {
             const msg = detail orelse (t.gpa.dupe(u8, @errorName(err)) catch return);
             t.loop.postEvent(.{ .failed = msg }) catch t.gpa.free(msg);
             return;
         };
-        t.loop.postEvent(.{ .done = usage }) catch {};
+        t.loop.postEvent(.done) catch {};
     }
 
-    fn onDelta(ctx: *anyopaque, kind: openai.Kind, text: []const u8) !void {
+    fn emit(ctx: *anyopaque, ev: agent.Event) !void {
         const t: *Turn = @ptrCast(@alignCast(ctx));
-        try t.loop.postEvent(.{ .delta = .{ .kind = kind, .text = try t.gpa.dupe(u8, text) } });
+        const gpa = t.gpa;
+        try t.loop.postEvent(switch (ev) {
+            .delta => |d| .{ .delta = .{ .kind = d.kind, .text = try gpa.dupe(u8, d.text) } },
+            .run_start => |code| .{ .run_start = try gpa.dupe(u8, code) },
+            .run_end => |r| .{ .run_end = .{ .ok = r.ok, .output = try gpa.dupe(u8, r.output) } },
+        });
+    }
+
+    fn finish(t: *Turn) void {
+        t.thread.join();
+        t.gpa.free(t.text);
+        t.gpa.destroy(t);
     }
 };
 
 pub fn run(init: std.process.Init, client: *std.http.Client, cfg: openai.Config) !void {
     const io = init.io;
     const gpa = init.gpa;
+
+    var session = try agent.Session.init(gpa, io, client, cfg);
+    defer session.deinit();
 
     var tty_buf: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &tty_buf);
@@ -73,22 +91,18 @@ pub fn run(init: std.process.Init, client: *std.http.Client, cfg: openai.Config)
     defer input.deinit();
 
     var entries: std.ArrayList(Entry) = .empty;
-    var history: std.ArrayList(openai.Message) = .empty;
     defer {
         for (entries.items) |*e| e.text.deinit(gpa);
         entries.deinit(gpa);
-        for (history.items) |m| gpa.free(m.content);
-        history.deinit(gpa);
     }
 
+    // Session.usage is written by the worker; copy it after each Turn ends.
+    var usage: openai.Usage = .{};
     var turn: ?*Turn = null;
-    var thread: ?std.Thread = null;
     defer if (turn) |t| {
         t.cancel.store(true, .release);
-        thread.?.join();
-        gpa.destroy(t);
+        t.finish();
     };
-    var usage: openai.Usage = .{};
 
     if (cfg.api_key.len == 0) try addEntry(gpa, &entries, .err, "no API key: set DEEPSEEK_API_KEY (or NIB_API_KEY). /js <code> still works.");
 
@@ -99,25 +113,28 @@ pub fn run(init: std.process.Init, client: *std.http.Client, cfg: openai.Config)
                 if (key.matches(vaxis.Key.escape, .{})) {
                     if (turn) |t| t.cancel.store(true, .release);
                 } else if (key.matches(vaxis.Key.enter, .{})) {
-                    if (turn != null) continue; // one turn at a time
+                    if (turn != null) continue; // one Turn at a time
                     const line = try input.toOwnedSlice();
-                    defer gpa.free(line);
-                    if (line.len == 0) continue;
-
+                    if (line.len == 0) {
+                        gpa.free(line);
+                        continue;
+                    }
                     if (std.mem.startsWith(u8, line, "/js ")) {
+                        defer gpa.free(line);
                         try addEntry(gpa, &entries, .user, line);
-                        const r = try js.eval(gpa, line[4..], .{});
-                        defer gpa.free(r.text);
+                        const r = try js.eval(gpa, io, line[4..], .{}, session.tools.host(), null);
+                        defer r.deinit(gpa);
+                        if (r.logs.len > 0) try addEntry(gpa, &entries, .run_output, std.mem.trimEnd(u8, r.logs, "\n"));
                         try addEntry(gpa, &entries, if (r.ok) .info else .err, r.text);
                     } else if (cfg.api_key.len == 0) {
+                        gpa.free(line);
                         try addEntry(gpa, &entries, .err, "no API key");
                     } else {
                         try addEntry(gpa, &entries, .user, line);
-                        try history.append(gpa, .{ .role = "user", .content = try gpa.dupe(u8, line) });
                         const t = try gpa.create(Turn);
-                        t.* = .{ .gpa = gpa, .client = client, .cfg = cfg, .messages = history.items, .loop = &loop };
+                        t.* = .{ .gpa = gpa, .session = &session, .text = line, .loop = &loop };
+                        t.thread = try std.Thread.spawn(.{}, Turn.work, .{t});
                         turn = t;
-                        thread = try std.Thread.spawn(.{}, Turn.work, .{t});
                     }
                 } else {
                     try input.update(.{ .key_press = key });
@@ -131,22 +148,28 @@ pub fn run(init: std.process.Init, client: *std.http.Client, cfg: openai.Config)
                 if (last == null or last.?.kind != kind) try entries.append(gpa, .{ .kind = kind });
                 try entries.items[entries.items.len - 1].text.appendSlice(gpa, d.text);
             },
-            .done => |u| {
-                usage = u;
-                // The answer joins the history; reasoning stays display-only.
-                const last = &entries.items[entries.items.len - 1];
-                const answer = if (last.kind == .assistant) last.text.items else "";
-                try history.append(gpa, .{ .role = "assistant", .content = try gpa.dupe(u8, answer) });
-                endTurn(gpa, &turn, &thread);
+            .run_start => |code| {
+                defer gpa.free(code);
+                try addEntry(gpa, &entries, .run_code, std.mem.trim(u8, code, "\n"));
+            },
+            .run_end => |r| {
+                defer gpa.free(r.output);
+                var e: Entry = .{ .kind = if (r.ok) .run_output else .run_error };
+                try appendHead(gpa, &e.text, r.output, run_output_lines);
+                try entries.append(gpa, e);
+            },
+            .done => {
+                turn.?.finish();
+                turn = null;
+                usage = session.usage;
             },
             .failed => |msg| {
                 defer gpa.free(msg);
                 const canceled = turn.?.cancel.load(.acquire);
                 try addEntry(gpa, &entries, if (canceled) .info else .err, if (canceled) "canceled" else msg);
-                // Drop the unanswered user message so history stays well-formed.
-                const m = history.pop().?;
-                gpa.free(m.content);
-                endTurn(gpa, &turn, &thread);
+                turn.?.finish();
+                turn = null;
+                usage = session.usage;
             },
         }
 
@@ -156,11 +179,20 @@ pub fn run(init: std.process.Init, client: *std.http.Client, cfg: openai.Config)
     }
 }
 
-fn endTurn(gpa: std.mem.Allocator, turn: *?*Turn, thread: *?std.Thread) void {
-    thread.*.?.join();
-    gpa.destroy(turn.*.?);
-    turn.* = null;
-    thread.* = null;
+/// Append at most `max_lines` lines of `text`, noting how many were left out.
+fn appendHead(gpa: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8, max_lines: usize) !void {
+    var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, text, "\n"), '\n');
+    var n: usize = 0;
+    while (it.next()) |line| : (n += 1) {
+        if (n == max_lines) {
+            var rest: usize = 1;
+            while (it.next()) |_| rest += 1;
+            try out.print(gpa, "\n… {d} more lines", .{rest});
+            return;
+        }
+        if (n > 0) try out.append(gpa, '\n');
+        try out.appendSlice(gpa, line);
+    }
 }
 
 fn addEntry(gpa: std.mem.Allocator, entries: *std.ArrayList(Entry), kind: @FieldType(Entry, "kind"), text: []const u8) !void {
@@ -178,6 +210,13 @@ fn segmentsFor(e: *const Entry, buf: *[2]vaxis.Segment) []const vaxis.Segment {
         },
         .assistant => buf[0] = .{ .text = e.text.items },
         .reasoning => buf[0] = .{ .text = e.text.items, .style = .{ .dim = true, .italic = true } },
+        .run_code => {
+            buf[0] = .{ .text = "run ▸ ", .style = .{ .fg = .{ .index = 3 }, .bold = true } };
+            buf[1] = .{ .text = e.text.items, .style = .{ .fg = .{ .index = 3 } } };
+            return buf[0..2];
+        },
+        .run_output => buf[0] = .{ .text = e.text.items, .style = .{ .dim = true } },
+        .run_error => buf[0] = .{ .text = e.text.items, .style = .{ .fg = .{ .index = 1 }, .dim = true } },
         .info => buf[0] = .{ .text = e.text.items, .style = .{ .dim = true } },
         .err => buf[0] = .{ .text = e.text.items, .style = .{ .fg = .{ .index = 1 } } },
     }

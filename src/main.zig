@@ -2,6 +2,7 @@ const std = @import("std");
 const js = @import("js.zig");
 const openai = @import("provider/openai.zig");
 const tui = @import("tui.zig");
+const agent = @import("agent.zig");
 
 pub const Config = struct {
     llm: openai.Config,
@@ -27,9 +28,9 @@ pub fn main(init: std.process.Init) !void {
 
     // `nib js '<code>'`: evaluate one script in the sandbox and print the result.
     if (args.len >= 3 and std.mem.eql(u8, args[1], "js")) {
-        const r = try js.eval(gpa, args[2], .{});
-        defer gpa.free(r.text);
-        try stdout.print("{s}{s}\n", .{ if (r.ok) "" else "error: ", r.text });
+        const r = try js.eval(gpa, init.io, args[2], .{}, null, null);
+        defer r.deinit(gpa);
+        try stdout.print("{s}{s}{s}\n", .{ r.logs, if (r.ok) "" else "error: ", r.text });
         try stdout.flush();
         if (!r.ok) std.process.exit(1);
         return;
@@ -39,30 +40,38 @@ pub fn main(init: std.process.Init) !void {
     defer client.deinit();
     try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
 
-    // `nib ask '<prompt>'`: one headless streamed completion.
+    // `nib ask '<prompt>'`: one headless Turn. Answer on stdout, Runs on stderr.
     if (args.len >= 3 and std.mem.eql(u8, args[1], "ask")) {
         if (cfg.llm.api_key.len == 0) fatal("set DEEPSEEK_API_KEY (or NIB_API_KEY)");
+        var session = try agent.Session.init(gpa, init.io, &client, cfg.llm);
+        defer session.deinit();
+
         const Print = struct {
             w: *std.Io.Writer,
-            fn onDelta(ctx: *anyopaque, kind: openai.Kind, text: []const u8) !void {
+            fn emit(ctx: *anyopaque, ev: agent.Event) !void {
                 const self: *@This() = @ptrCast(@alignCast(ctx));
-                if (kind == .reasoning) return; // `ask` prints the answer only
-                try self.w.writeAll(text);
-                try self.w.flush();
+                switch (ev) {
+                    .delta => |d| if (d.kind == .text) {
+                        try self.w.writeAll(d.text);
+                        try self.w.flush();
+                    },
+                    .run_start => |code| std.debug.print("\n\x1b[33mrun ▸\x1b[0m {s}\n", .{code}),
+                    .run_end => |r| std.debug.print("\x1b[2m{s}\x1b[0m\n", .{r.output}),
+                }
             }
         };
         var p: Print = .{ .w = stdout };
         var cancel: std.atomic.Value(bool) = .init(false);
         var detail: ?[]u8 = null;
         defer if (detail) |d| gpa.free(d);
-        const msgs = [_]openai.Message{.{ .role = "user", .content = args[2] }};
-        const usage = openai.stream(gpa, &client, cfg.llm, &msgs, .{ .ctx = &p, .onDelta = Print.onDelta }, &cancel, &detail) catch |err| {
+        session.turn(args[2], .{ .ctx = &p, .emit = Print.emit }, &cancel, &detail) catch |err| {
             fatal(detail orelse @errorName(err));
         };
         try stdout.print("\n", .{});
         try stdout.flush();
-        std.debug.print("[{s}] in={d} (cache hit {d}) out={d}\n", .{
-            cfg.llm.model, usage.prompt_tokens, usage.prompt_cache_hit_tokens, usage.completion_tokens,
+        const u = session.usage;
+        std.debug.print("[{s}] last step: in={d} (cache hit {d}) out={d}\n", .{
+            cfg.llm.model, u.prompt_tokens, u.prompt_cache_hit_tokens, u.completion_tokens,
         });
         return;
     }
@@ -79,4 +88,6 @@ test {
     _ = js;
     _ = openai;
     _ = @import("sse.zig");
+    _ = @import("tools.zig");
+    _ = agent;
 }

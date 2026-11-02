@@ -35,7 +35,7 @@
 
 | 项目 | 实测值 | 警报线 | 测量方式 |
 |---|---|---|---|
-| 源码行数（`src/` + `build.zig`，含测试） | 661（2026-11-01） | 5000 | `wc -l build.zig src/**/*.zig`（zsh） |
+| 源码行数（`src/` + `build.zig`，含测试） | 1399（2026-11-01，run(code) 接通后） | 5000 | `wc -l build.zig src/**/*.zig`（zsh） |
 | `nib js '1+1'` 平均耗时（含进程启动） | 1.6 ms（2026-11-01，ReleaseFast） | — | 循环 100 次取平均 |
 | 上述命令峰值 RSS | 3.7 MB（2026-11-01） | — | `/usr/bin/time -f %M` |
 | 二进制体积（ReleaseFast，strip 后） | 1.9 MB（2026-11-01） | — | `strip` 后 `ls -l` |

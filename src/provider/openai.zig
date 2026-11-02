@@ -1,5 +1,5 @@
-//! OpenAI-compatible Chat Completions with streaming. Covers DeepSeek,
-//! OpenRouter, vLLM, Ollama and friends.
+//! OpenAI-compatible Chat Completions with streaming and tool calls. Covers
+//! DeepSeek, OpenRouter, vLLM, Ollama and friends.
 
 const std = @import("std");
 const sse = @import("../sse.zig");
@@ -10,9 +10,20 @@ pub const Config = struct {
     model: []const u8,
 };
 
+pub const ToolCall = struct {
+    id: []const u8,
+    type: []const u8 = "function",
+    function: struct {
+        name: []const u8,
+        arguments: []const u8,
+    },
+};
+
 pub const Message = struct {
     role: []const u8,
-    content: []const u8,
+    content: ?[]const u8 = null,
+    tool_calls: ?[]const ToolCall = null,
+    tool_call_id: ?[]const u8 = null,
 };
 
 pub const Usage = struct {
@@ -20,6 +31,13 @@ pub const Usage = struct {
     completion_tokens: u64 = 0,
     /// DeepSeek reports prompt-cache hits under this name.
     prompt_cache_hit_tokens: u64 = 0,
+};
+
+/// One model response, allocated with the `out` allocator passed to `stream`.
+pub const Reply = struct {
+    text: []const u8,
+    tool_calls: []const ToolCall,
+    usage: Usage,
 };
 
 pub const Kind = enum { text, reasoning };
@@ -34,32 +52,50 @@ const Chunk = struct {
         delta: struct {
             content: ?[]const u8 = null,
             reasoning_content: ?[]const u8 = null,
+            tool_calls: []const struct {
+                index: usize = 0,
+                id: ?[]const u8 = null,
+                function: struct {
+                    name: ?[]const u8 = null,
+                    arguments: ?[]const u8 = null,
+                } = .{},
+            } = &.{},
         } = .{},
     } = &.{},
     usage: ?Usage = null,
 };
 
-/// Stream one completion. On a non-2xx status returns `error.HttpStatus` and
-/// sets `detail` to the response body (caller frees).
+const PartialCall = struct {
+    id: std.ArrayList(u8) = .empty,
+    name: std.ArrayList(u8) = .empty,
+    args: std.ArrayList(u8) = .empty,
+
+    fn deinit(p: *PartialCall, gpa: std.mem.Allocator) void {
+        p.id.deinit(gpa);
+        p.name.deinit(gpa);
+        p.args.deinit(gpa);
+    }
+};
+
+/// Stream one completion. `tools_json` is the raw JSON array for the `tools`
+/// field. On a non-2xx status returns `error.HttpStatus` and sets `detail` to
+/// the response body (caller frees).
 pub fn stream(
     gpa: std.mem.Allocator,
+    out: std.mem.Allocator,
     client: *std.http.Client,
     cfg: Config,
     messages: []const Message,
+    tools_json: []const u8,
     sink: Sink,
     cancel: *const std.atomic.Value(bool),
     detail: *?[]u8,
-) !Usage {
+) !Reply {
     const url = try std.fmt.allocPrint(gpa, "{s}/chat/completions", .{cfg.base_url});
     defer gpa.free(url);
     const auth = try std.fmt.allocPrint(gpa, "Bearer {s}", .{cfg.api_key});
     defer gpa.free(auth);
-    const body = try std.json.Stringify.valueAlloc(gpa, .{
-        .model = cfg.model,
-        .messages = messages,
-        .stream = true,
-        .stream_options = .{ .include_usage = true },
-    }, .{});
+    const body = try requestBody(gpa, cfg.model, messages, tools_json);
     defer gpa.free(body);
 
     var req = try client.request(.POST, try std.Uri.parse(url), .{
@@ -99,6 +135,14 @@ pub fn stream(
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
 
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    var calls: std.ArrayList(PartialCall) = .empty;
+    defer {
+        for (calls.items) |*p| p.deinit(gpa);
+        calls.deinit(gpa);
+    }
+
     var usage: Usage = .{};
     while (true) {
         if (cancel.load(.acquire)) return error.Canceled;
@@ -115,20 +159,61 @@ pub fn stream(
         }) catch continue;
         if (chunk.usage) |u| usage = u;
         for (chunk.choices) |choice| {
-            if (choice.delta.reasoning_content) |t| if (t.len > 0) try sink.onDelta(sink.ctx, .reasoning, t);
-            if (choice.delta.content) |t| if (t.len > 0) try sink.onDelta(sink.ctx, .text, t);
+            const d = choice.delta;
+            if (d.reasoning_content) |t| if (t.len > 0) try sink.onDelta(sink.ctx, .reasoning, t);
+            if (d.content) |t| if (t.len > 0) {
+                try text.appendSlice(gpa, t);
+                try sink.onDelta(sink.ctx, .text, t);
+            };
+            for (d.tool_calls) |tc| {
+                if (tc.index > 64) return error.TooManyToolCalls;
+                while (calls.items.len <= tc.index) try calls.append(gpa, .{});
+                const p = &calls.items[tc.index];
+                if (tc.id) |s| try p.id.appendSlice(gpa, s);
+                if (tc.function.name) |s| try p.name.appendSlice(gpa, s);
+                if (tc.function.arguments) |s| try p.args.appendSlice(gpa, s);
+            }
         }
     }
-    return usage;
+
+    const tool_calls = try out.alloc(ToolCall, calls.items.len);
+    for (calls.items, tool_calls) |p, *tc| tc.* = .{
+        .id = try out.dupe(u8, p.id.items),
+        .function = .{ .name = try out.dupe(u8, p.name.items), .arguments = try out.dupe(u8, p.args.items) },
+    };
+    return .{ .text = try out.dupe(u8, text.items), .tool_calls = tool_calls, .usage = usage };
 }
 
-test "chunk decodes deepseek deltas and usage" {
+fn requestBody(gpa: std.mem.Allocator, model: []const u8, messages: []const Message, tools_json: []const u8) ![]u8 {
+    const opts: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
+    return std.fmt.allocPrint(gpa,
+        \\{{"model":{f},"messages":{f},"tools":{s},"stream":true,"stream_options":{{"include_usage":true}}}}
+    , .{ std.json.fmt(model, opts), std.json.fmt(messages, opts), tools_json });
+}
+
+test "chunk decodes deepseek deltas, tool call fragments and usage" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const c = try std.json.parseFromSliceLeaky(Chunk, arena.allocator(),
-        \\{"id":"x","choices":[{"index":0,"delta":{"content":"hi","reasoning_content":null}}],
+        \\{"id":"x","choices":[{"index":0,"delta":{"content":"hi","reasoning_content":null,
+        \\  "tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"run","arguments":"{\"co"}}]}}],
         \\ "usage":{"prompt_tokens":5,"completion_tokens":1,"prompt_cache_hit_tokens":4,"total_tokens":6}}
     , .{ .ignore_unknown_fields = true });
     try std.testing.expectEqualStrings("hi", c.choices[0].delta.content.?);
+    try std.testing.expectEqualStrings("{\"co", c.choices[0].delta.tool_calls[0].function.arguments.?);
     try std.testing.expectEqual(@as(u64, 4), c.usage.?.prompt_cache_hit_tokens);
+}
+
+test "request body omits null fields and embeds tools verbatim" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]Message{
+        .{ .role = "user", .content = "hi" },
+        .{ .role = "assistant", .content = "", .tool_calls = &.{.{ .id = "c1", .function = .{ .name = "run", .arguments = "{}" } }} },
+        .{ .role = "tool", .content = "ok", .tool_call_id = "c1" },
+    };
+    const body = try requestBody(gpa, "m", &msgs, "[]");
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings(
+        \\{"model":"m","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"run","arguments":"{}"}}]},{"role":"tool","content":"ok","tool_call_id":"c1"}],"tools":[],"stream":true,"stream_options":{"include_usage":true}}
+    , body);
 }

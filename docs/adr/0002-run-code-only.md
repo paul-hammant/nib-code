@@ -16,7 +16,8 @@ date: 2026-11-01
 - DeepSeek Harness 的 PTC：只暴露 `run_code`，每段程序起一个新 Node 进程，后来删除了"原生调用和 PTC 混用"的模式（**二手**：第三方博客 redreamality.com，未经官方核实）
 
 **把握程度：**
-- 实测：QuickJS 嵌入、内存上限、无宿主能力（`src/js.zig` 中的测试）。
+- 实测：QuickJS 嵌入、内存上限、无宿主能力、顶层 await、工具调用、超时中断（`src/js.zig` 中的测试）；完整的"模型调用 run → 执行 → 结果回传 → 回答"循环，用本地模拟服务器跑通（2026-11-01）。
+- 实测：模型写出 TS 语法时，QuickJS 的报错（如 `missing initializer for variable`）看不出原因，所以对 SyntaxError 追加了一句提示，指出可能是 TS 语法。这个提示能不能帮模型自我修正，还没用真实模型验证。
 - 推测，未实测：DeepSeek 能稳定地按 TS 声明写出合法 JS；简单操作（如读一个文件）用 PTC 方式的 token 开销是否可接受。
 
 **何时重新考虑：**
