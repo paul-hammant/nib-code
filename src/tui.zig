@@ -11,6 +11,8 @@ const Event = union(enum) {
     winsize: vaxis.Winsize,
     paste_start,
     paste_end,
+    mouse: vaxis.Mouse,
+    tick,
     /// Slices are owned by the receiver.
     delta: struct { kind: provider.Kind, text: []u8 },
     run_start: []u8,
@@ -23,26 +25,111 @@ const Event = union(enum) {
 };
 
 const Entry = struct {
-    kind: enum { user, assistant, reasoning, run_code, run_output, run_error, info, err },
+    kind: enum { user, assistant, reasoning, run, info, err },
+    /// For `.run`: the script.
     text: std.ArrayList(u8) = .empty,
-    cached: ?struct { width: u16, len: usize, rows: u16 } = null,
+    /// For `.run`: the first lines of its output.
+    output: std.ArrayList(u8) = .empty,
+    /// One-line summary of a collapsible entry. vaxis keeps printed slices
+    /// until render, so this must outlive draw(); see `refreshLabel`.
+    label: std.ArrayList(u8) = .empty,
+    run: enum { running, ok, failed } = .running,
+    elapsed_ms: u64 = 0,
+    /// Collapsible kinds (`.run`, `.reasoning`) show one summary line unless open.
+    open: bool = false,
+    cached: ?struct { width: u16, len: usize, open: bool, rows: u16 } = null,
+
+    fn deinit(e: *Entry, gpa: std.mem.Allocator) void {
+        e.text.deinit(gpa);
+        e.output.deinit(gpa);
+        e.label.deinit(gpa);
+    }
+
+    fn refreshLabel(e: *Entry, gpa: std.mem.Allocator) !void {
+        e.label.clearRetainingCapacity();
+        switch (e.kind) {
+            .run => {
+                var buf: [96]u8 = undefined;
+                const used = toolSummary(e.text.items, &buf);
+                if (e.run == .running) {
+                    try e.label.print(gpa, "{s} · running", .{used});
+                } else {
+                    try e.label.print(gpa, "{s} · {d}.{d}s", .{ used, e.elapsed_ms / 1000, e.elapsed_ms % 1000 / 100 });
+                }
+            },
+            .reasoning => {
+                const lines = std.mem.count(u8, std.mem.trimEnd(u8, e.text.items, "\n"), "\n") + 1;
+                try e.label.print(gpa, "∴ thinking · {d} line{s} · ctrl+o to expand", .{ lines, if (lines == 1) "" else "s" });
+            },
+            else => {},
+        }
+    }
+
+    fn collapsible(e: *const Entry) bool {
+        return e.kind == .run or e.kind == .reasoning;
+    }
 
     fn print(e: *const Entry, win: vaxis.Window, commit: bool) u16 {
         if (e.kind == .assistant) return markdown.print(win, e.text.items, commit);
-        var segs: [2]vaxis.Segment = undefined;
-        const r = win.print(segmentsFor(e, &segs), .{ .wrap = .word, .commit = commit });
-        return @max(1, r.row +| @intFromBool(r.col > 0));
+        var segs: [7]vaxis.Segment = undefined;
+        const folded = e.collapsible() and !e.open;
+        const wrap: @FieldType(vaxis.Window.PrintOptions, "wrap") = if (folded) .none else if (e.kind == .run) .grapheme else .word;
+        const r = win.print(segmentsFor(e, &segs), .{ .wrap = wrap, .commit = commit });
+        return if (folded) 1 else @max(1, r.row +| @intFromBool(r.col > 0));
     }
 
     fn height(e: *Entry, win: vaxis.Window) u16 {
+        const len = e.text.items.len + e.output.items.len;
         if (e.cached) |c| {
-            if (c.width == win.width and c.len == e.text.items.len) return c.rows;
+            if (c.width == win.width and c.len == len and c.open == e.open) return c.rows;
         }
         var measure = win;
         measure.height = std.math.maxInt(u16);
         const rows = e.print(measure, false);
-        e.cached = .{ .width = win.width, .len = e.text.items.len, .rows = rows };
+        e.cached = .{ .width = win.width, .len = len, .open = e.open, .rows = rows };
         return rows;
+    }
+};
+
+/// Text the status line prints; owned by the caller because vaxis reads
+/// printed slices only at render time.
+const StatusText = struct {
+    status: [320]u8 = undefined,
+    activity: [64]u8 = undefined,
+};
+
+const Phase = enum { thinking, writing, running, retrying, compacting };
+
+const spinner = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+
+const Activity = struct {
+    phase: Phase = .thinking,
+    since: std.Io.Clock.Timestamp,
+
+    const Label = struct { phase: Phase, ms: u64 };
+
+    fn set(a: *Activity, io: std.Io, phase: Phase) void {
+        if (a.phase == phase) return;
+        a.* = .{ .phase = phase, .since = .now(io, .awake) };
+    }
+
+    fn label(a: Activity, io: std.Io) Label {
+        return .{ .phase = a.phase, .ms = @intCast(@max(a.since.untilNow(io).raw.toMilliseconds(), 0)) };
+    }
+};
+
+/// Posts `.tick` while `busy` so the spinner and timer advance without input.
+const Ticker = struct {
+    io: std.Io,
+    loop: *vaxis.Loop(Event),
+    busy: std.atomic.Value(bool) = .init(false),
+    stop: std.atomic.Value(bool) = .init(false),
+
+    fn work(t: *Ticker) void {
+        while (!t.stop.load(.acquire)) {
+            std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(100), .clock = .awake }, t.io) catch return;
+            if (t.busy.load(.acquire)) t.loop.postEvent(.tick) catch {};
+        }
     }
 };
 
@@ -147,7 +234,7 @@ const Turn = struct {
 pub fn run(init: std.process.Init, session: *agent.Session) !void {
     const io = init.io;
     const gpa = init.gpa;
-    const cfg = session.cfg;
+    var cfg = session.cfg;
 
     var tty_buf: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &tty_buf);
@@ -166,6 +253,7 @@ pub fn run(init: std.process.Init, session: *agent.Session) !void {
     try vx.queryTerminal(w, .fromSeconds(1));
 
     try vx.setBracketedPaste(w, true);
+    try vx.setMouseMode(w, true);
     var input: Editor = .{};
     defer input.deinit(gpa);
     var pasting = false;
@@ -173,8 +261,17 @@ pub fn run(init: std.process.Init, session: *agent.Session) !void {
 
     var entries: std.ArrayList(Entry) = .empty;
     defer {
-        for (entries.items) |*e| e.text.deinit(gpa);
+        for (entries.items) |*e| e.deinit(gpa);
         entries.deinit(gpa);
+    }
+    var expanded = false;
+    var status_text: StatusText = .{};
+    var activity: Activity = .{ .since = .now(io, .awake) };
+    var ticker: Ticker = .{ .io = io, .loop = &loop };
+    const ticker_thread = try std.Thread.spawn(.{}, Ticker.work, .{&ticker});
+    defer {
+        ticker.stop.store(true, .release);
+        ticker_thread.join();
     }
 
     var usage: provider.Usage = .{};
@@ -204,6 +301,11 @@ pub fn run(init: std.process.Init, session: *agent.Session) !void {
                     scroll.pending -= page;
                 } else if (key.matches(vaxis.Key.page_down, .{})) {
                     scroll.pending += page;
+                } else if (key.matches('o', .{ .ctrl = true })) {
+                    expanded = !expanded;
+                    for (entries.items) |*e| if (e.collapsible()) {
+                        e.open = expanded;
+                    };
                 } else if (key.matches(vaxis.Key.up, .{ .shift = true })) {
                     scroll.pending -= 3;
                 } else if (key.matches(vaxis.Key.down, .{ .shift = true })) {
@@ -218,13 +320,30 @@ pub fn run(init: std.process.Init, session: *agent.Session) !void {
                         gpa.free(line);
                         continue;
                     }
-                    if (std.mem.startsWith(u8, line, "/js ")) {
+                    if (std.mem.eql(u8, line, "/effort") or std.mem.startsWith(u8, line, "/effort ")) {
+                        defer gpa.free(line);
+                        if (line.len > 7) {
+                            cfg.setEffort(std.mem.trim(u8, line[8..], " \t")) catch {
+                                try addEntry(gpa, &entries, .err, "usage: /effort [default|off|none|minimal|low|medium|high|xhigh|max]");
+                                continue;
+                            };
+                            session.cfg = cfg;
+                            session.tools.cfg = cfg;
+                        }
+                        const message = try std.fmt.allocPrint(gpa, "effort: {s} · thinking: {s} · configured: {s} (model support varies)", .{
+                            cfg.effectiveEffort(),
+                            if (cfg.thinking) |on| (if (on) "on" else "off") else "default",
+                            cfg.reasoning_effort orelse "default",
+                        });
+                        defer gpa.free(message);
+                        try addEntry(gpa, &entries, .info, message);
+                    } else if (std.mem.startsWith(u8, line, "/js ")) {
                         defer gpa.free(line);
                         try addEntry(gpa, &entries, .user, line);
                         const r = try session.run(line[4..], null);
                         usage = session.usage;
                         defer r.deinit(gpa);
-                        if (r.logs.len > 0) try addEntry(gpa, &entries, .run_output, std.mem.trimEnd(u8, r.logs, "\n"));
+                        if (r.logs.len > 0) try addEntry(gpa, &entries, .info, std.mem.trimEnd(u8, r.logs, "\n"));
                         try addEntry(gpa, &entries, if (r.ok) .info else .err, r.text);
                     } else if (std.mem.eql(u8, line, "/compact")) {
                         const t = try gpa.create(Turn);
@@ -241,6 +360,7 @@ pub fn run(init: std.process.Init, session: *agent.Session) !void {
                             }
                         }.work, .{t});
                         turn = t;
+                        activity = .{ .phase = .compacting, .since = .now(io, .awake) };
                     } else if (cfg.missingKey()) {
                         gpa.free(line);
                         try addEntry(gpa, &entries, .err, "no API key");
@@ -250,6 +370,7 @@ pub fn run(init: std.process.Init, session: *agent.Session) !void {
                         t.* = .{ .gpa = gpa, .session = session, .text = line, .loop = &loop };
                         t.thread = try std.Thread.spawn(.{}, Turn.work, .{t});
                         turn = t;
+                        activity = .{ .since = .now(io, .awake) };
                     }
                 } else {
                     _ = try input.key(gpa, key);
@@ -257,26 +378,46 @@ pub fn run(init: std.process.Init, session: *agent.Session) !void {
             },
             .paste_start => pasting = true,
             .paste_end => pasting = false,
+            .mouse => |m| switch (m.button) {
+                .wheel_up => scroll.pending -= 3,
+                .wheel_down => scroll.pending += 3,
+                else => {},
+            },
+            .tick => {},
             .winsize => |ws| try vx.resize(gpa, w, ws),
             .delta => |d| {
                 defer gpa.free(d.text);
                 const kind: @FieldType(Entry, "kind") = if (d.kind == .reasoning) .reasoning else .assistant;
+                if (activity.phase != .compacting) activity.set(io, if (d.kind == .reasoning) .thinking else .writing);
                 const last = if (entries.items.len > 0) &entries.items[entries.items.len - 1] else null;
-                if (last == null or last.?.kind != kind) try entries.append(gpa, .{ .kind = kind });
-                try entries.items[entries.items.len - 1].text.appendSlice(gpa, d.text);
+                if (last == null or last.?.kind != kind) try entries.append(gpa, .{ .kind = kind, .open = expanded });
+                const current = &entries.items[entries.items.len - 1];
+                try current.text.appendSlice(gpa, d.text);
+                if (kind == .reasoning) try current.refreshLabel(gpa);
             },
             .run_start => |code| {
                 defer gpa.free(code);
-                try addEntry(gpa, &entries, .run_code, std.mem.trim(u8, code, "\n"));
+                activity.set(io, .running);
+                var e: Entry = .{ .kind = .run, .open = expanded };
+                try e.text.appendSlice(gpa, std.mem.trim(u8, code, "\n"));
+                try e.refreshLabel(gpa);
+                try entries.append(gpa, e);
             },
             .run_end => |r| {
                 defer gpa.free(r.output);
-                var e: Entry = .{ .kind = if (r.ok) .run_output else .run_error };
-                try appendHead(gpa, &e.text, r.output, run_output_lines);
-                try entries.append(gpa, e);
+                const elapsed = activity.label(io).ms;
+                activity.set(io, .thinking);
+                if (lastRunning(entries.items)) |e| {
+                    e.run = if (r.ok) .ok else .failed;
+                    e.elapsed_ms = elapsed;
+                    try appendHead(gpa, &e.output, r.output, run_output_lines);
+                    try e.refreshLabel(gpa);
+                    e.cached = null;
+                }
             },
             .retry, .notice => |msg| {
                 defer gpa.free(msg);
+                if (std.mem.startsWith(u8, msg, "retry")) activity.set(io, .retrying);
                 try addEntry(gpa, &entries, .info, msg);
             },
             .usage => |u| usage = u,
@@ -299,7 +440,8 @@ pub fn run(init: std.process.Init, session: *agent.Session) !void {
             },
         }
 
-        draw(vx.window(), entries.items, &input, &scroll, cfg, usage, steps, context, turn != null);
+        ticker.busy.store(turn != null, .release);
+        draw(vx.window(), entries.items, &input, &scroll, cfg, usage, steps, context, if (turn != null) activity.label(io) else null, &status_text);
         try vx.render(w);
         try w.flush();
     }
@@ -329,21 +471,71 @@ fn addHistory(gpa: std.mem.Allocator, entries: *std.ArrayList(Entry), history: [
             if (m.reasoning) |r| {
                 const text = try r.display(gpa);
                 defer gpa.free(text);
-                if (text.len > 0) try addEntry(gpa, entries, .reasoning, text);
+                if (text.len > 0) {
+                    try addEntry(gpa, entries, .reasoning, text);
+                    try entries.items[entries.items.len - 1].refreshLabel(gpa);
+                }
             }
             if (content.len > 0) try addEntry(gpa, entries, .assistant, content);
             for (m.tool_calls orelse &.{}) |call| {
                 const Args = struct { code: []const u8 = "" };
                 const args = std.json.parseFromSlice(Args, gpa, call.function.arguments, .{ .ignore_unknown_fields = true }) catch continue;
                 defer args.deinit();
-                try addEntry(gpa, entries, .run_code, std.mem.trim(u8, args.value.code, "\n"));
+                var e: Entry = .{ .kind = .run };
+                try e.text.appendSlice(gpa, std.mem.trim(u8, args.value.code, "\n"));
+                try e.refreshLabel(gpa);
+                try entries.append(gpa, e);
             }
         } else if (std.mem.eql(u8, m.role, "tool")) {
-            var e: Entry = .{ .kind = .run_output };
-            try appendHead(gpa, &e.text, content, run_output_lines);
-            try entries.append(gpa, e);
+            if (lastRunning(entries.items)) |e| {
+                e.run = .ok;
+                try appendHead(gpa, &e.output, content, run_output_lines);
+                try e.refreshLabel(gpa);
+            }
         }
     }
+}
+
+fn lastRunning(entries: []Entry) ?*Entry {
+    var i = entries.len;
+    while (i > 0) {
+        i -= 1;
+        if (entries[i].kind == .run and entries[i].run == .running) return &entries[i];
+    }
+    return null;
+}
+
+/// "bash ×2, read" from the `tools.<name>(` calls in a script.
+fn toolSummary(code: []const u8, buf: []u8) []const u8 {
+    var names: [8][]const u8 = undefined;
+    var counts: [8]u32 = undefined;
+    var n: usize = 0;
+    var rest = code;
+    while (std.mem.indexOf(u8, rest, "tools.")) |i| {
+        rest = rest[i + 6 ..];
+        var end: usize = 0;
+        while (end < rest.len and (std.ascii.isAlphanumeric(rest[end]) or rest[end] == '_')) end += 1;
+        if (end == 0) continue;
+        const name = rest[0..end];
+        for (names[0..n], counts[0..n]) |known, *count| {
+            if (std.mem.eql(u8, known, name)) {
+                count.* += 1;
+                break;
+            }
+        } else if (n < names.len) {
+            names[n] = name;
+            counts[n] = 1;
+            n += 1;
+        }
+    }
+    if (n == 0) return "js";
+    var w: std.Io.Writer = .fixed(buf);
+    for (names[0..n], counts[0..n], 0..) |name, count, i| {
+        if (i > 0) w.writeAll(", ") catch break;
+        w.writeAll(name) catch break;
+        if (count > 1) w.print(" ×{d}", .{count}) catch break;
+    }
+    return w.buffered();
 }
 
 fn addEntry(gpa: std.mem.Allocator, entries: *std.ArrayList(Entry), kind: @FieldType(Entry, "kind"), text: []const u8) !void {
@@ -352,26 +544,38 @@ fn addEntry(gpa: std.mem.Allocator, entries: *std.ArrayList(Entry), kind: @Field
     try entries.append(gpa, e);
 }
 
-fn segmentsFor(e: *const Entry, buf: *[2]vaxis.Segment) []const vaxis.Segment {
+fn segmentsFor(e: *const Entry, segs: *[7]vaxis.Segment) []const vaxis.Segment {
+    const dim: vaxis.Style = .{ .dim = true };
     switch (e.kind) {
         .user => {
-            buf[0] = .{ .text = "› ", .style = .{ .bold = true, .fg = .{ .index = 4 } } };
-            buf[1] = .{ .text = e.text.items, .style = .{ .bold = true } };
-            return buf[0..2];
+            segs[0] = .{ .text = "› ", .style = .{ .bold = true, .fg = .{ .index = 4 } } };
+            segs[1] = .{ .text = e.text.items, .style = .{ .bold = true } };
+            return segs[0..2];
         },
-        .assistant => buf[0] = .{ .text = e.text.items },
-        .reasoning => buf[0] = .{ .text = e.text.items, .style = .{ .dim = true, .italic = true } },
-        .run_code => {
-            buf[0] = .{ .text = "run ▸ ", .style = .{ .fg = .{ .index = 3 }, .bold = true } };
-            buf[1] = .{ .text = e.text.items, .style = .{ .fg = .{ .index = 3 } } };
-            return buf[0..2];
+        .assistant => segs[0] = .{ .text = e.text.items },
+        .reasoning => {
+            segs[0] = .{ .text = if (e.open) e.text.items else e.label.items, .style = .{ .dim = true, .italic = true } };
         },
-        .run_output => buf[0] = .{ .text = e.text.items, .style = .{ .dim = true } },
-        .run_error => buf[0] = .{ .text = e.text.items, .style = .{ .fg = .{ .index = 1 }, .dim = true } },
-        .info => buf[0] = .{ .text = e.text.items, .style = .{ .dim = true } },
-        .err => buf[0] = .{ .text = e.text.items, .style = .{ .fg = .{ .index = 1 } } },
+        .run => {
+            segs[0] = switch (e.run) {
+                .running => .{ .text = "◌ ", .style = .{ .fg = .{ .index = 3 } } },
+                .ok => .{ .text = "✓ ", .style = .{ .fg = .{ .index = 2 } } },
+                .failed => .{ .text = "✗ ", .style = .{ .fg = .{ .index = 1 } } },
+            };
+            segs[1] = .{ .text = "run ", .style = .{ .fg = .{ .index = 3 }, .bold = true } };
+            segs[2] = .{ .text = e.label.items, .style = dim };
+            if (!e.open) return segs[0..3];
+            segs[3] = .{ .text = "\n" };
+            segs[4] = .{ .text = e.text.items, .style = .{ .fg = .{ .index = 3 } } };
+            if (e.output.items.len == 0) return segs[0..5];
+            segs[5] = .{ .text = "\n" };
+            segs[6] = .{ .text = e.output.items, .style = if (e.run == .failed) .{ .fg = .{ .index = 1 }, .dim = true } else dim };
+            return segs[0..7];
+        },
+        .info => segs[0] = .{ .text = e.text.items, .style = dim },
+        .err => segs[0] = .{ .text = e.text.items, .style = .{ .fg = .{ .index = 1 } } },
     }
-    return buf[0..1];
+    return segs[0..1];
 }
 
 fn isNewline(key: vaxis.Key, pasting: bool) bool {
@@ -380,7 +584,7 @@ fn isNewline(key: vaxis.Key, pasting: bool) bool {
         key.matches(enter, .{ .alt = true }) or key.matches('j', .{ .ctrl = true });
 }
 
-fn draw(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewport, cfg: provider.Config, usage: provider.Usage, steps: u32, context: u64, busy: bool) void {
+fn draw(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewport, cfg: provider.Config, usage: provider.Usage, steps: u32, context: u64, busy: ?Activity.Label, text: *StatusText) void {
     win.clear();
     win.hideCursor();
     if (win.height < 6 or win.width < 8) return;
@@ -398,23 +602,52 @@ fn draw(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewport, 
         y += @as(i32, h) + 1;
     }
 
-    var status_buf: [256]u8 = undefined;
-    const status = if (scroll.top != null)
-        "↑ history · PgDn / shift+↓ to return"
+    const status_buf = &text.status;
+    const activity_buf = &text.activity;
+    const doing: []const u8 = if (busy) |b|
+        std.fmt.bufPrint(activity_buf, "{s} {s} {d}s · esc to cancel", .{ spinner[(b.ms / 100) % spinner.len], @tagName(b.phase), b.ms / 1000 }) catch ""
     else
-        std.fmt.bufPrint(&status_buf, "{s} · ctx {d}% · last turn: {d} steps, in {d} (cache {d}), out {d} · {s}", .{
+        "shift+enter newline · ctrl+o expand runs · ctrl-c quit";
+    const status = if (scroll.top != null)
+        std.fmt.bufPrint(status_buf, "{s} · ↑ history · PgDn / wheel to return", .{if (busy != null) doing else "idle"}) catch ""
+    else
+        std.fmt.bufPrint(status_buf, "{s} · {s} · effort {s} · ctx {d}% · last turn: {d} steps, in {d} (cache {d}), out {d}", .{
+            doing,
             cfg.model,
+            cfg.effectiveEffort(),
             context * 100 / @max(cfg.context_window, 1),
             steps,
             usage.prompt_tokens,
             usage.prompt_cache_hit_tokens,
             usage.completion_tokens,
-            if (busy) "working… esc to cancel" else "shift+enter newline · ctrl-c quit",
         }) catch "";
-    _ = win.child(.{ .x_off = 1, .y_off = body_h, .height = 1 }).printSegment(.{ .text = status, .style = .{ .dim = true } }, .{ .wrap = .none });
+    const status_style: vaxis.Style = if (busy != null) .{ .fg = .{ .index = 3 } } else .{ .dim = true };
+    _ = win.child(.{ .x_off = 1, .y_off = body_h, .height = 1 }).printSegment(.{ .text = status, .style = status_style }, .{ .wrap = .none });
 
     _ = win.child(.{ .x_off = 1, .y_off = body_h + 1, .height = 1 }).printSegment(.{ .text = "› ", .style = .{ .fg = .{ .index = 4 } } }, .{});
     input.draw(win.child(.{ .x_off = 3, .y_off = body_h + 1, .height = input_h }));
+}
+
+test "runs fold to one line until expanded" {
+    const gpa = std.testing.allocator;
+    var screen: vaxis.Screen = .{};
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 60, .height = 24, .screen = &screen };
+    var e: Entry = .{ .kind = .run, .run = .ok, .elapsed_ms = 1234 };
+    defer e.deinit(gpa);
+    try e.text.appendSlice(gpa, "const a = await tools.bash({});\nconst b = await tools.bash({});\nawait tools.read({})");
+    try e.output.appendSlice(gpa, "line 1\nline 2");
+    try e.refreshLabel(gpa);
+    try std.testing.expectEqual(@as(u16, 1), e.height(win));
+    var segs: [7]vaxis.Segment = undefined;
+    try std.testing.expectEqualStrings("bash ×2, read · 1.2s", segmentsFor(&e, &segs)[2].text);
+    e.open = true;
+    try std.testing.expectEqual(@as(u16, 6), e.height(win));
+}
+
+test "toolSummary" {
+    var buf: [80]u8 = undefined;
+    try std.testing.expectEqualStrings("js", toolSummary("1 + 1", &buf));
+    try std.testing.expectEqualStrings("agent ×2", toolSummary("Promise.all([tools.agent({}), tools.agent({})])", &buf));
 }
 
 test "draw benchmark: 5000 entries" {
@@ -428,6 +661,7 @@ test "draw benchmark: 5000 entries" {
     var screen = try vaxis.Screen.init(gpa, .{ .cols = 100, .rows = 24, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(gpa);
     const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 100, .height = 24, .screen = &screen };
+    var status_text: StatusText = .{};
     var input: Editor = .{};
     defer input.deinit(gpa);
     const cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "mock" };
@@ -435,10 +669,10 @@ test "draw benchmark: 5000 entries" {
         var samples: [5]i96 = undefined;
         for (&samples) |*sample_ns| {
             var scroll: Viewport = .{ .pending = -@as(i64, offset) };
-            draw(win, entries, &input, &scroll, cfg, .{}, 0, 0, false);
+            draw(win, entries, &input, &scroll, cfg, .{}, 0, 0, null, &status_text);
             const before = std.Io.Clock.awake.now(std.testing.io);
             for (0..frames) |_| {
-                draw(win, entries, &input, &scroll, cfg, .{}, 0, 0, false);
+                draw(win, entries, &input, &scroll, cfg, .{}, 0, 0, null, &status_text);
             }
             sample_ns.* = @divTrunc(before.untilNow(std.testing.io, .awake).nanoseconds, frames);
         }
@@ -470,7 +704,7 @@ test "viewport anchors survive streaming and appended Run output then resume fol
     const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 20, .height = 4, .screen = &screen };
     var entries: std.ArrayList(Entry) = .empty;
     defer {
-        for (entries.items) |*e| e.text.deinit(gpa);
+        for (entries.items) |*e| e.deinit(gpa);
         entries.deinit(gpa);
     }
     try addEntry(gpa, &entries, .user, "one");
@@ -480,7 +714,7 @@ test "viewport anchors survive streaming and appended Run output then resume fol
     try std.testing.expect(view.top != null);
     try entries.items[1].text.appendSlice(gpa, "\nfive\nsix");
     try std.testing.expectEqualDeep(top, view.layout(entries.items, win));
-    try addEntry(gpa, &entries, .run_output, "output\nmore output");
+    try addEntry(gpa, &entries, .info, "output\nmore output");
     try std.testing.expectEqualDeep(top, view.layout(entries.items, win));
     view.pending = 100;
     _ = view.layout(entries.items, win);
@@ -516,7 +750,7 @@ test "draw keeps scrolled body fixed while output arrives and caps input height"
     const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 100, .height = 24, .screen = &screen };
     var entries: std.ArrayList(Entry) = .empty;
     defer {
-        for (entries.items) |*e| e.text.deinit(gpa);
+        for (entries.items) |*e| e.deinit(gpa);
         entries.deinit(gpa);
     }
     var paragraph: std.ArrayList(u8) = .empty;
@@ -526,18 +760,19 @@ test "draw keeps scrolled body fixed while output arrives and caps input height"
     try addEntry(gpa, &entries, .assistant, "stream");
     var input: Editor = .{};
     defer input.deinit(gpa);
+    var status_text: StatusText = .{};
     var view: Viewport = .{ .pending = -30 };
     const cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "mock" };
-    draw(win, entries.items, &input, &view, cfg, .{}, 0, 0, true);
+    draw(win, entries.items, &input, &view, cfg, .{}, 0, 0, .{ .phase = .thinking, .ms = 0 }, &status_text);
     const body_before = try gpa.dupe(vaxis.Cell, screen.buf[0 .. 22 * 100]);
     defer gpa.free(body_before);
     try entries.items[1].text.appendSlice(gpa, "\nmore streamed text");
-    try addEntry(gpa, &entries, .run_output, "Run output");
-    draw(win, entries.items, &input, &view, cfg, .{}, 0, 0, true);
+    try addEntry(gpa, &entries, .info, "Run output");
+    draw(win, entries.items, &input, &view, cfg, .{}, 0, 0, .{ .phase = .thinking, .ms = 0 }, &status_text);
     try std.testing.expectEqualDeep(body_before, screen.buf[0 .. 22 * 100]);
     for (0..16) |i| try input.buf.print(gpa, "input {d}\n", .{i});
     input.cursor = input.buf.items.len;
-    draw(win, entries.items, &input, &view, cfg, .{}, 0, 0, true);
+    draw(win, entries.items, &input, &view, cfg, .{}, 0, 0, .{ .phase = .thinking, .ms = 0 }, &status_text);
     try std.testing.expectEqual(@as(u16, 9), input.top_row);
     try std.testing.expectEqual(@as(u16, 23), screen.cursor.row);
     try std.testing.expect(screen.cursor_vis);

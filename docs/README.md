@@ -46,7 +46,7 @@
 这些容易撤回，记一笔即可：
 
 - Provider 支持 Chat Completions（默认 DeepSeek）与 Codex Responses，见 [0011](adr/0011-provider-wire-protocols.md)。
-- TUI 用 libvaxis。操作：PgUp/PgDn 翻半屏，shift+↑↓ 滚 3 行；向上翻看时视口按顶部条目锚定，新内容到达不推移画面，回到底部后恢复跟随。输入框中 shift+enter / alt+enter / ctrl+j 换行，粘贴内容中的回车不会提交；光标在首行按 ↑、末行按 ↓ 翻阅本次会话的输入历史（不跨进程保存）。assistant 文本渲染基础 Markdown：代码围栏（含未闭合的）、行内代码、粗体、标题。
+- TUI 用 libvaxis。回合进行中，状态栏最前面显示转圈指示、当前阶段（thinking / writing / running / retrying / compacting）和该阶段已用秒数。Run 和推理默认各折叠成一行（Run 显示状态、用到的工具和耗时），ctrl+o 全部展开或收起。TUI 开启了鼠标上报：滚轮滚动对话区；需要选中复制文字时，大多数终端要按住 shift 拖动。操作：PgUp/PgDn 翻半屏，shift+↑↓ 滚 3 行；向上翻看时视口按顶部条目锚定，新内容到达不推移画面，回到底部后恢复跟随。输入框中 shift+enter / alt+enter / ctrl+j 换行，粘贴内容中的回车不会提交；光标在首行按 ↑、末行按 ↓ 翻阅本次会话的输入历史（不跨进程保存）。assistant 文本渲染基础 Markdown：代码围栏（含未闭合的）、行内代码、粗体、标题。
 - 会话持久化、恢复和项目指令已实现（2026-11-01，一手源码：`src/agent.zig`、`src/log.zig`、`src/instructions.zig`、`src/main.zig`）。日志按完整 Step 同步落盘；详细行为见根目录 [AGENTS.md](../AGENTS.md)，端到端检查可运行 `zig build` 后执行 `python3 scripts/test_session.py`。
 
 ## 暂缓的想法
