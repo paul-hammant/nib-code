@@ -241,6 +241,17 @@ fn canonicalPath(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
     var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const len = std.Io.Dir.cwd().realPathFile(io, path, &buffer) catch |err| {
         if (err != error.FileNotFound) return err;
+        if (std.Io.Dir.cwd().readLink(io, path, &buffer)) |n| {
+            const target = if (std.fs.path.isAbsolute(buffer[0..n]))
+                try gpa.dupe(u8, buffer[0..n])
+            else
+                try std.fs.path.join(gpa, &.{ std.fs.path.dirname(path).?, buffer[0..n] });
+            defer gpa.free(target);
+            return canonicalPath(io, gpa, target);
+        } else |link_err| switch (link_err) {
+            error.FileNotFound, error.NotLink => {},
+            else => return link_err,
+        }
         const parent = try canonicalPath(io, gpa, std.fs.path.dirname(path) orelse return err);
         defer gpa.free(parent);
         return std.fs.path.resolve(gpa, &.{ parent, std.fs.path.basename(path) });
@@ -476,4 +487,21 @@ test "bash timeout still applies after output pipes close" {
     const result = try callTool("bash", "{\"command\":\"exec 1>&- 2>&-; sleep 5\",\"timeout_ms\":80}");
     defer freeResult(result);
     try testing.expectEqualStrings("timed out after 80 ms", result.err);
+}
+
+test "dangling symlink and target share the same path lock" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.symLink(testing.io, "target", "link", .{});
+    const root = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer testing.allocator.free(root);
+    const link = try std.fs.path.join(testing.allocator, &.{ root, "link" });
+    defer testing.allocator.free(link);
+    const target = try std.fs.path.join(testing.allocator, &.{ root, "target" });
+    defer testing.allocator.free(target);
+    const a = try normalizedPath(testing.io, testing.allocator, link);
+    defer testing.allocator.free(a);
+    const b = try normalizedPath(testing.io, testing.allocator, target);
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings(a, b);
 }

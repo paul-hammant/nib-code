@@ -47,7 +47,7 @@ const State = struct {
     deadline: std.Io.Clock.Timestamp,
     cancel: ?*const std.atomic.Value(bool),
     oom: bool = false,
-    calls: std.ArrayList(*Call) = .empty,
+    calls: std.ArrayList(?*Call) = .empty,
     mutex: std.Io.Mutex = .init,
     completed: std.Io.Condition = .init,
     ready: ?*Call = null,
@@ -55,12 +55,24 @@ const State = struct {
 
     const Call = struct {
         state: *State,
+        index: usize,
         name: []u8,
         args: []u8,
         settle: [2]c.JSValue,
         thread: ?std.Thread = null,
         result: ?ToolResult = null,
         next: ?*Call = null,
+
+        fn deinit(call: *Call, ctx: *c.JSContext) void {
+            const gpa = call.state.gpa;
+            if (call.result) |result| switch (result) {
+                inline else => |bytes| gpa.free(bytes),
+            };
+            for (call.settle) |value| c.JS_FreeValue(ctx, value);
+            gpa.free(call.name);
+            gpa.free(call.args);
+            gpa.destroy(call);
+        }
 
         fn work(call: *Call) void {
             const st = call.state;
@@ -81,16 +93,8 @@ const State = struct {
 
     fn deinit(st: *State, ctx: *c.JSContext) void {
         st.stop();
-        for (st.calls.items) |call| if (call.thread) |thread| thread.join();
-        for (st.calls.items) |call| {
-            if (call.result) |result| switch (result) {
-                inline else => |bytes| st.gpa.free(bytes),
-            };
-            for (call.settle) |value| c.JS_FreeValue(ctx, value);
-            st.gpa.free(call.name);
-            st.gpa.free(call.args);
-            st.gpa.destroy(call);
-        }
+        for (st.calls.items) |item| if (item) |call| if (call.thread) |thread| thread.join();
+        for (st.calls.items) |item| if (item) |call| call.deinit(ctx);
         st.calls.deinit(st.gpa);
     }
 
@@ -98,6 +102,10 @@ const State = struct {
         var active: usize = 0;
         var next: usize = 0;
         while (true) {
+            if (active == 0 and next == st.calls.items.len) {
+                st.calls.clearRetainingCapacity();
+                next = 0;
+            }
             if (isInterrupted(st) or c.JS_PromiseState(ctx, promise) == c.JS_PROMISE_REJECTED) {
                 st.stop();
                 return;
@@ -130,10 +138,12 @@ const State = struct {
                 const r = c.JS_Call(ctx, call.settle[@intFromBool(rejected)], js_undefined, 1, @constCast(&arg));
                 c.JS_FreeValue(ctx, r);
                 c.JS_FreeValue(ctx, arg);
+                st.calls.items[call.index] = null;
+                call.deinit(ctx);
             }
             if (c.JS_IsJobPending(rt)) continue;
             while (next < st.calls.items.len and active < 8) : (next += 1) {
-                const call = st.calls.items[next];
+                const call = st.calls.items[next].?;
                 call.thread = try std.Thread.spawn(.{}, Call.work, .{call});
                 active += 1;
             }
@@ -297,7 +307,7 @@ fn enqueue(st: *State, ctx: *c.JSContext, argc: c_int, argv: [*c]c.JSValue) !c.J
         c.JS_FreeValue(ctx, promise);
         for (settle) |v| c.JS_FreeValue(ctx, v);
     }
-    call.* = .{ .state = st, .name = name, .args = args, .settle = settle };
+    call.* = .{ .state = st, .index = st.calls.items.len, .name = name, .args = args, .settle = settle };
     try st.calls.append(st.gpa, call);
     return promise;
 }
