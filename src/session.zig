@@ -1,13 +1,13 @@
 //! No frontend dependencies: frontends observe a Session only through `Sink`.
 
 const std = @import("std");
-const js = @import("js.zig");
+const sandbox = @import("sandbox.zig");
 const tools = @import("tools.zig");
 const provider = @import("provider.zig");
-const session_log = @import("log.zig");
-const instructions = @import("instructions.zig");
+const session_log = @import("session/log.zig");
+const instructions = @import("session/instructions.zig");
 
-pub const Event = @import("events.zig").Event;
+pub const Event = @import("session/events.zig").Event;
 
 pub const Sink = struct {
     ctx: *anyopaque,
@@ -305,9 +305,9 @@ pub const Session = struct {
         }
     }
 
-    pub fn run(s: *Session, code: []const u8, cancel: ?*const std.atomic.Value(bool)) !js.Outcome {
+    pub fn run(s: *Session, code: []const u8, cancel: ?*const std.atomic.Value(bool)) !sandbox.Outcome {
         defer s.usage.add(s.tools.takeUsage());
-        return js.eval(s.gpa, s.io, code, .{}, s.tools.host(), cancel);
+        return sandbox.eval(s.gpa, s.io, code, .{}, s.tools.host(), cancel);
     }
 
     /// Result is arena-owned.
@@ -389,7 +389,7 @@ fn sleep(io: std.Io, ms: u64, cancel: *const std.atomic.Value(bool)) !void {
     }
 }
 
-fn formatOutcome(gpa: std.mem.Allocator, o: js.Outcome) ![]u8 {
+fn formatOutcome(gpa: std.mem.Allocator, o: sandbox.Outcome) ![]u8 {
     const logs = std.mem.trimEnd(u8, o.logs, "\n");
     const value: []const u8 = if (o.ok and std.mem.eql(u8, o.text, "undefined")) "" else o.text;
     if (logs.len == 0 and value.len == 0) return gpa.dupe(u8, "(no output)");

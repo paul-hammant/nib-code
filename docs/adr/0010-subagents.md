@@ -9,7 +9,7 @@ Run 里可以调用 `await tools.agent({ prompt })`。每个子 agent 是一个�
 
 **为什么：** 代码驱动最有价值的能力之一是把工作分出去并行做，例如 `Promise.all(tasks.map(t => tools.agent({ prompt: t })))`。用子进程而不是线程，和 [0005](0005-process-per-session.md) 一致：故障隔离、退出即回收内存、取消复用进程组终止；Zig 进程启动只要毫秒级。返回最终结果而不是常驻加消息，概念最少，并且与 JS 的 `await` / `Promise.all` 天然契合。
 
-**实现选择：** 深度上限 1，`NIB_AGENT_DEPTH` 传给子进程；工具表按深度同时生成说明和 JS API，子会话完全不暴露 agent。同时最多运行 4 个子 agent，超出排队（全部工具上限 8）。用当前可执行文件启动 `nib ask --json -`，prompt 与有效 provider 配置通过 stdin JSON 发送，避免命令行长度限制和密钥环境继承（见 [0011](0011-provider-wire-protocols.md)）；共用 `src/process.zig` 的进程组、20 ms 轮询、超时和回收，stdin 写入也受取消/超时约束。
+**实现选择：** 深度上限 1，`NIB_AGENT_DEPTH` 传给子进程；工具表按深度同时生成说明和 JS API，子会话完全不暴露 agent。同时最多运行 4 个子 agent，超出排队（全部工具上限 8）。用当前可执行文件启动 `nib ask --json -`，prompt 与有效 provider 配置通过 stdin JSON 发送，避免命令行长度限制和密钥环境继承（见 [0011](0011-provider-wire-protocols.md)）；共用 `src/tools/process.zig` 的进程组、20 ms 轮询、超时和回收，stdin 写入也受取消/超时约束。
 
 **实施时的调整与理由：**
 - 嵌套进程组不会随外层组自动被杀。父进程先给子 nib 的组发 SIGTERM，子 nib 取消自己的工具组；500 ms 后再 SIGKILL。仍在阻塞 HTTP 的子 nib 也能被强制回收。
@@ -24,7 +24,7 @@ Run 里可以调用 `await tools.agent({ prompt })`。每个子 agent 是一个�
 
 **依赖：** [0009](0009-concurrent-tools.md) 的工具并发；`nib ask --json`。
 
-**把握程度：** 实测（2026-11-01，本机 Debug，`scripts/test_session.py` + `mock_llm.py`）：两个含 `sleep 0.3` 的子会话，首个请求至第二个请求的并行跨度 552.7 ms，各自耗时合计 1104.6 ms；父 Turn 输入用量 6600 → 19800、输出 30 → 90。6 个子会话分两批运行，最多 4 个；深度过滤、结果、日志关联、失败用量、取消中正在运行的 bash、卡住 HTTP 后的强杀用量及恢复行为均通过检查。Debug/ReleaseFast 的 53 项单元测试和 Session 端到端测试通过。
+**把握程度：** 实测（2026-11-01，本机 Debug，`tests/test_session.py` + `mock_llm.py`）：两个含 `sleep 0.3` 的子会话，首个请求至第二个请求的并行跨度 552.7 ms，各自耗时合计 1104.6 ms；父 Turn 输入用量 6600 → 19800、输出 30 → 90。6 个子会话分两批运行，最多 4 个；深度过滤、结果、日志关联、失败用量、取消中正在运行的 bash、卡住 HTTP 后的强杀用量及恢复行为均通过检查。Debug/ReleaseFast 的 53 项单元测试和 Session 端到端测试通过。
 
 子进程启动至 start 事件（10 次，含 Session 日志同步，不含模型请求/TLS）：Debug 中位数 11.82 ms，范围 8.82–19.83 ms；ReleaseFast 中位数 1.30 ms，范围 0.85–1.48 ms。测量脚本采用相同的当前可执行文件、stdin 和深度环境变量。路径锁、深度及取消均不提供系统层隔离；父进程直接被 SIGKILL 时无法执行清理。真实 HTTPS 握手尚未测量，不能把本地 HTTP 测量当成真实模型延迟。
 

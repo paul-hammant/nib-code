@@ -1,5 +1,26 @@
 const std = @import("std");
 const html = @import("html.zig");
+const sandbox = @import("../sandbox.zig");
+const tools = @import("../tools.zig");
+const Tools = tools.Tools;
+const fail = tools.fail;
+
+pub fn fetch(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolResult {
+    const a = std.json.parseFromSlice(Options, gpa, args, .{ .ignore_unknown_fields = true }) catch
+        return fail(gpa, "expected {{ url: string, raw?: boolean, timeout_ms?: number }}", .{});
+    defer a.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var content_type: []const u8 = "";
+    const page = get(t.io, gpa, arena.allocator(), t.environ, a.value, &t.cancel, &content_type) catch |err| return switch (err) {
+        error.Canceled => fail(gpa, "canceled", .{}),
+        error.Timeout => fail(gpa, "timed out after {d} ms", .{a.value.timeout_ms}),
+        error.BinaryContent => fail(gpa, "binary content ({s}); download it with bash if needed", .{content_type}),
+        error.ResponseTooLarge => fail(gpa, "response exceeds 5 MB", .{}),
+        else => fail(gpa, "{s}: {s}", .{ a.value.url, @errorName(err) }),
+    };
+    return .{ .ok = try std.json.Stringify.valueAlloc(gpa, page, .{}) };
+}
 
 pub const Options = struct {
     url: []const u8,

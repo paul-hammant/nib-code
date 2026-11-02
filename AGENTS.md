@@ -2,12 +2,24 @@
 
 用 Zig 0.17 写的编码 agent，命令名 `nib`。
 
-- 构建：`zig build`；测试：`zig build test --summary all`
+- 构建：`zig build`；测试：`zig build test --summary all`；端到端（本地 mock，无真实 key）：`zig build` 后 `python3 tests/test_session.py`、`python3 tests/test_codex.py`
 - 运行：`./zig-out/bin/nib`（TUI）、`nib ask '<prompt>'`、`nib js '<code>'`；TUI 用 `/compact` 手动压缩上下文。
 - 推理强度：`nib --effort high` / `nib ask --effort high '<prompt>'`；TUI `/effort` 查询、`/effort high` 切换。支持 `default|off|none|minimal|low|medium|high|xhigh|max`（服务端支持因模型而异）；显式设置覆盖 thinking/effort 环境配置，`default` 清除覆盖。只影响当前进程，子会话继承。
 - 恢复：`nib -c` / `nib --continue` 继续当前目录最近的根会话（跳过子会话）；`nib --resume <32位小写十六进制ID>` 指定会话；`ask` 也支持这些选项，放在 prompt 前后均可。
 - 环境变量：`DEEPSEEK_API_KEY`（或 `NIB_API_KEY`）、`NIB_BASE_URL`、`NIB_MODEL`、`NIB_CONTEXT_WINDOW`（DeepSeek 默认 1000000）、`NIB_THINKING`（`on`/`off`，不设则用服务端默认）、`NIB_REASONING_EFFORT`（如 `low`/`high`/`max`）。默认模型 `deepseek-flash`
 - Codex：`NIB_PROVIDER=codex ./zig-out/bin/nib`（或 `ask '你好'`）；读取 `$CODEX_HOME/auth.json`，默认 `~/.codex/auth.json`，无需 API key。默认 `gpt-6.1-sol` / 500000 tokens。模型、推理配置、恢复和凭证边界见 [docs/codex.md](docs/codex.md) 与 [ADR 0011](docs/adr/0011-provider-wire-protocols.md)。
+
+## 代码地图
+
+目录按 [CONTEXT.md](CONTEXT.md) 的概念划分。`x.zig` 是该部分的入口和对外接口，`x/` 放它的内部实现；新代码放进所属概念的目录，不再往 `src/` 顶层平铺。
+
+- `src/main.zig`：命令行入口，分派到 TUI、`ask`、`js`。
+- `src/session.zig`：Session 引擎（Turn、Step、压缩、取消）；`session/` 下是日志、指令拼接、事件。
+- `src/provider.zig`：Provider 接口与配置；`provider/` 下是各线路协议和 SSE 解析。
+- `src/sandbox.zig`：QuickJS Run 与宿主桥接。
+- `src/tools.zig`：工具表（给模型看的 JS 说明集中在这里）、`Tools` 共享状态与调度。`tools/` 下每个工具族一个入口文件，函数名即工具名：`files.zig`（read/edit/write）、`search.zig`（grep/glob）、`web.zig`（fetch）、`bash.zig`、`agent.zig`；其余是它们的辅助模块。加工具：在 `tools/` 写入口函数，再在表里加一行。
+- `src/tui.zig`：TUI 主循环；`tui/` 下是输入框、Markdown 渲染、`/` 指令表。
+- `tests/`：端到端测试和 mock 服务器；`scripts/`：辅助脚本。
 
 **代码的读者是 agent。** 不写复述代码、解释思路或记录改动历史的注释；过时的注释比没有注释更容易误导模型。只在代码表达不了、不知道就会改错的地方写一行：外部限制、协议怪癖、内存归属、并发不变量。含义靠命名、类型和测试承载；给人看的解释写进 `docs/`。
 
@@ -29,7 +41,7 @@
 - `{"end":{"text":"<最终回答>","usage":{"prompt_tokens":0,"completion_tokens":0,"prompt_cache_hit_tokens":0},"steps":1}}`：Turn 成功结束；usage 只统计本轮，含自动压缩和子会话。最终回答取这里的 text，不拼接所有 delta。
 - `{"error":{"message":"...","usage":{"prompt_tokens":0,"completion_tokens":0,"prompt_cache_hit_tokens":0},"steps":0}}`：命令或 Turn 失败，没有 end；初始化失败时可能没有 start。usage/steps 保留失败前已报告的统计。错误文本供诊断，不作为稳定错误码。
 
-事件结构与序列化定义在 `src/events.zig`。字符串中的换行经过 JSON 转义，每个物理行都是完整 JSON。
+事件结构与序列化定义在 `src/session/events.zig`。字符串中的换行经过 JSON 转义，每个物理行都是完整 JSON。
 
 根会话可调用 `await tools.agent({ prompt })`，返回 `{ text, usage }`；`Promise.all` 并行派生，最多同时运行 4 个子会话（全部工具最多同时运行 8 个）。子会话独立读取指令文件，沿用 cwd 和有效 provider/模型配置（通过 stdin 管道传递；Codex 凭证各自读取），不继承父会话历史。内部环境变量 `NIB_AGENT_DEPTH` 从 0 递增，深度达到 1 时，工具说明与实际 JS API 都移除 agent。`NIB_PARENT_SESSION_ID` 写入子会话日志首条记录的 `parent_session_id`。显式 `--resume` 子会话仍保留深度限制；`--continue` 跳过子会话。
 

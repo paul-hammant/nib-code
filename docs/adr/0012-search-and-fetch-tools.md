@@ -13,9 +13,9 @@ date: 2026-11-01
 
 **怎么做（参考了 pi 的 grep.ts/find.ts、oh-my-pi 的 fetch.ts/grep.ts/glob.ts、jcode 的 webfetch.rs，没有复用代码）：**
 - **不依赖外部程序。** pi 调用 rg/fd，没装就自动下载；nib 不下载可执行文件，全部用 Zig 实现：
-  - `src/walk.zig`：目录遍历、.gitignore 规则、glob 匹配。glob 工具、grep 的 `glob` 过滤和 .gitignore 共用同一个 glob 匹配器。
-  - `src/grep.zig`：多线程搜索。最多 8 个线程，按文件序号领取任务，所以截断后的结果和顺序扫描完全一样。
-  - `src/regex.zig`：包装 QuickJS 自带的 libregexp。
+  - `src/tools/walk.zig`：目录遍历、.gitignore 规则、glob 匹配。glob 工具、grep 的 `glob` 过滤和 .gitignore 共用同一个 glob 匹配器。
+  - `src/tools/grep.zig`：多线程搜索。最多 8 个线程，按文件序号领取任务，所以截断后的结果和顺序扫描完全一样。
+  - `src/tools/regex.zig`：包装 QuickJS 自带的 libregexp。
 - **正则就是 JS RegExp。** 和模型在 Run 里写的正则语法一致，不新增依赖。
   - 匹配开启 multiline，所以 `^`/`$` 按行匹配。
   - 纯 ASCII 文件按字节匹配；含非 ASCII 的合法 UTF-8 文件先转成 UTF-16 再匹配，中文模式能命中。
@@ -27,7 +27,7 @@ date: 2026-11-01
   - 隐藏文件照常搜索，因为 `.github/` 这类目录写代码时用得到。
 - **fetch**：
   - 请求头 `Accept` 优先要 `text/markdown`（借鉴 oh-my-pi）。越来越多文档站会直接返回 Markdown，比如 DeepSeek 文档。
-  - 拿到 HTML 时由 `src/html.zig` 转成 Markdown。页面有 `<main>`（其次 `<article>`）时只转换这部分；去掉 script、style、nav、aside、form 等非正文内容（这份清单借鉴自 jcode）；相对链接补全成绝对地址。
+  - 拿到 HTML 时由 `src/tools/html.zig` 转成 Markdown。页面有 `<main>`（其次 `<article>`）时只转换这部分；去掉 script、style、nav、aside、form 等非正文内容（这份清单借鉴自 jcode）；相对链接补全成绝对地址。
   - 下载上限 5 MB，返回给 JS 的文本上限 1 MB，模型最终只看到 Run 输出的 16 KiB。
   - 最多跟随 5 次重定向；二进制内容直接报错。
   - 请求在 `std.Io` 的并发任务里执行，超时或 Esc 会取消这个任务，连卡住的读取也能打断。实测服务端卡住 3 秒、`timeout_ms: 300` 时，整轮 0.78 秒结束。
@@ -42,7 +42,7 @@ date: 2026-11-01
 - 实测：
   - 本机 `~/myself`（多个大型仓库）全量 grep 约 100 ms；nibcode 的 `src` 内搜索约 1 ms。
   - 真实抓取 example.com、ziglang.org/download、DeepSeek 文档：HTTPS 和重定向都正常，DeepSeek 文档的表格转换正确。
-  - 单元测试覆盖 glob、.gitignore、凭证跳过、UTF-8 匹配、上下文、截断、HTML 转换；`scripts/test_session.py` 用 mock 覆盖了重定向、Accept 请求头、HTML 转 Markdown 和超时打断。
+  - 单元测试覆盖 glob、.gitignore、凭证跳过、UTF-8 匹配、上下文、截断、HTML 转换；`tests/test_session.py` 用 mock 覆盖了重定向、Accept 请求头、HTML 转 Markdown 和超时打断。
 - 已知局限：
   - .gitignore 只读各级目录里的 `.gitignore`，不读 `.git/info/exclude`、全局 excludes 和 `.ignore`。
   - grep 先遍历完目录再搜索，`limit` 很小时也要走完整棵目录树。

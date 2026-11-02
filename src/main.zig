@@ -1,9 +1,10 @@
 const std = @import("std");
-const js = @import("js.zig");
+const sandbox = @import("sandbox.zig");
 const provider = @import("provider.zig");
 const tui = @import("tui.zig");
-const JsonEvent = @import("events.zig").JsonEvent;
-const agent = @import("agent.zig");
+const JsonEvent = @import("session/events.zig").JsonEvent;
+const Session = @import("session.zig").Session;
+const Event = @import("session.zig").Event;
 
 pub const Config = struct {
     llm: provider.Config,
@@ -38,7 +39,7 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
     const gpa = init.gpa;
     var cfg = try Config.fromEnv(init.arena.allocator(), init.environ_map);
     if (args.len >= 3 and std.mem.eql(u8, args[1], "js")) {
-        const r = try js.eval(gpa, init.io, args[2], .{}, null, null);
+        const r = try sandbox.eval(gpa, init.io, args[2], .{}, null, null);
         defer r.deinit(gpa);
         try stdout.print("{s}{s}{s}\n", .{ r.logs, if (r.ok) "" else "error: ", r.text });
         try stdout.flush();
@@ -46,7 +47,7 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
         return;
     }
 
-    var options: agent.Session.Options = .{
+    var options: Session.Options = .{
         .environ = init.environ_map,
         .depth = if (init.environ_map.get("NIB_AGENT_DEPTH")) |v| try std.fmt.parseInt(u32, v, 10) else 0,
         .parent_session_id = init.environ_map.get("NIB_PARENT_SESSION_ID"),
@@ -93,7 +94,7 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
         prompt = envelope.prompt;
     }
     if (ask and cfg.llm.missingKey()) return error.MissingApiKey;
-    var session = try agent.Session.init(gpa, init.io, &client, cfg.llm, options);
+    var session = try Session.init(gpa, init.io, &client, cfg.llm, options);
     defer session.deinit();
     defer {
         failure.usage = session.usage;
@@ -104,7 +105,7 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
         const Print = struct {
             w: *std.Io.Writer,
             json: bool,
-            fn emit(ctx: *anyopaque, ev: agent.Event) !void {
+            fn emit(ctx: *anyopaque, ev: Event) !void {
                 const self: *@This() = @ptrCast(@alignCast(ctx));
                 if (self.json) return JsonEvent.write(.{ .event = ev }, self.w);
                 switch (ev) {
@@ -167,17 +168,17 @@ fn errorMessage(err: anyerror) []const u8 {
 }
 
 test {
-    _ = js;
+    _ = sandbox;
     _ = provider;
-    _ = @import("sse.zig");
+    _ = @import("provider/sse.zig");
     _ = @import("tools.zig");
-    _ = @import("policy.zig");
-    _ = @import("editor.zig");
-    _ = @import("commands.zig");
-    _ = @import("walk.zig");
-    _ = @import("regex.zig");
-    _ = @import("grep.zig");
-    _ = @import("html.zig");
-    _ = @import("fetch.zig");
-    _ = agent;
+    _ = @import("tools/policy.zig");
+    _ = @import("tools/process.zig");
+    _ = @import("tools/walk.zig");
+    _ = @import("tools/regex.zig");
+    _ = @import("tools/grep.zig");
+    _ = @import("tools/html.zig");
+    _ = @import("tui/editor.zig");
+    _ = @import("tui/commands.zig");
+    _ = @import("session.zig");
 }

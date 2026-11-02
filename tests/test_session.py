@@ -61,7 +61,7 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
     env = dict(os.environ, NIB_PROVIDER="chat_completions", NIB_API_KEY="mock", NIB_BASE_URL=f"http://127.0.0.1:{port}",
                NIB_CONTEXT_WINDOW="128000", XDG_DATA_HOME=str(tmp / "data"),
                XDG_CONFIG_HOME=str(tmp / "config"), CODEX_HOME=str(tmp / "codex"), HOME=str(tmp))
-    server = subprocess.Popen(["python3", str(ROOT / "scripts/mock_llm.py"), str(port), str(requests_path)],
+    server = subprocess.Popen(["python3", str(ROOT / "tests/mock_llm.py"), str(port), str(requests_path)],
                               env=dict(env, MOCK_PROMPT_TOKENS="3300"), stdout=subprocess.DEVNULL)
     try:
         for _ in range(100):

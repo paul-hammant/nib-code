@@ -54,7 +54,7 @@ NIB_THINKING=on 默认用 medium；NIB_REASONING_EFFORT 可显式指定服务端
 ```sh
 zig build test --summary all
 zig build
-python3 scripts/test_session.py
-python3 scripts/test_codex.py
+python3 tests/test_session.py
+python3 tests/test_codex.py
 zig build -Doptimize=ReleaseFast
 ```

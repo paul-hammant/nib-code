@@ -1,6 +1,6 @@
 """Codex Responses E2E with fabricated credentials. Run after `zig build`.
 
-    python3 scripts/test_codex.py
+    python3 tests/test_codex.py
 """
 import json
 import os
@@ -45,7 +45,7 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
                XDG_CONFIG_HOME=str(tmp / "config"))
     cwd = tmp / "project"
     cwd.mkdir()
-    server = subprocess.Popen(["python3", str(ROOT / "scripts/mock_codex.py"), str(port), str(requests_path)],
+    server = subprocess.Popen(["python3", str(ROOT / "tests/mock_codex.py"), str(port), str(requests_path)],
                               env=dict(env, MOCK_CODEX_AUTH=str(auth_path)), stdout=subprocess.DEVNULL)
     try:
         for _ in range(100):

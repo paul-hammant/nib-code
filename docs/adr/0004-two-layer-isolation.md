@@ -16,7 +16,7 @@ date: 2026-11-01
 **参考：** DeepSeek Harness 依赖系统层沙箱（Linux 上 bwrap + Landlock），并明确否定 `node:vm` 作为安全边界（**二手**：第三方博客，未核实）。它否定 `node:vm` 的理由，是 vm 与 Node 共享全部系统能力；这一点不适用于不加载 quickjs-libc 的 QuickJS。
 
 **把握程度：**
-- 实测：语言层。`src/js.zig` 中的测试确认 `require/process/std/os/fetch` 均不存在。
+- 实测：语言层。`src/sandbox.zig` 中的测试确认 `require/process/std/os/fetch` 均不存在。
 - 未实现：系统层。Landlock 与 bwrap 的具体组合、对网络的限制方式、在用户机器上的可用性都还没验证。
 
 **何时重新考虑：**

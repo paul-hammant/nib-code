@@ -1,5 +1,5 @@
 const std = @import("std");
-const provider = @import("provider.zig");
+const provider = @import("../provider.zig");
 
 pub const Event = union(enum) {
     /// Slices are valid only during the callback.

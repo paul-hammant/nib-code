@@ -14,7 +14,7 @@ date: 2026-11-01
 - 显式的 `store/load` 变量存储，按内容寻址写入日志（讨论中曾提出）：能兼顾两者，但多了一个概念；在出现实际需求前不做。
 
 **事实来源与把握程度（2026-11-01）：**
-- 一手源码：`src/js.zig` 每次求值创建 runtime/context；`src/agent.zig` 与 `src/log.zig` 仅恢复模型上下文。
+- 一手源码：`src/sandbox.zig` 每次求值创建 runtime/context；`src/session.zig` 与 `src/session/log.zig` 仅恢复模型上下文。
 - 推测，未实测：跨 Run 状态不是刚需；用文件替代够用。
 - 未单独测量：新建 QuickJS context 的耗时。目前只有"进程启动 + 新建 runtime + 求值"合计 1.6 ms 的数据。
 

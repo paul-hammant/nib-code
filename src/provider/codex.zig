@@ -1,6 +1,6 @@
 const std = @import("std");
 const p = @import("../provider.zig");
-const sse = @import("../sse.zig");
+const sse = @import("sse.zig");
 
 const Model = struct { id: []const u8, context_window: u64, can_disable_reasoning: bool = true };
 const models = [_]Model{

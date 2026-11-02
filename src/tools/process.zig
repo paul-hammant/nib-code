@@ -148,3 +148,22 @@ test "process strips credentials and preserves ordinary environment" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "NIB_TEST_ORDINARY=kept") != null);
     try std.testing.expect(env.contains("NIB_API_KEY"));
 }
+
+const testing = std.testing;
+
+test "process deadline covers a blocked stdin writer" {
+    const input = try testing.allocator.alloc(u8, 128 * 1024);
+    defer testing.allocator.free(input);
+    @memset(input, 'x');
+    var cancel: std.atomic.Value(bool) = .init(false);
+    const start = std.Io.Clock.awake.now(testing.io);
+    const result = try run(testing.allocator, testing.io, .{
+        .spawn = .{ .argv = &.{ "bash", "-c", "sleep 5" }, .stdout = .pipe, .stderr = .ignore },
+        .input = input,
+        .cancel = &cancel,
+        .timeout_ms = 50,
+    });
+    defer testing.allocator.free(result.output);
+    try testing.expectEqual(error.TimedOut, result.stop.?);
+    try testing.expect(start.durationTo(std.Io.Clock.awake.now(testing.io)).toMilliseconds() < 1000);
+}

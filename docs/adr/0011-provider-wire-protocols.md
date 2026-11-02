@@ -23,6 +23,6 @@ Codex 摘要不沿用原来的 32–2048-token 总输出限制：跟随 pi 不�
 
 **证据与边界（2026-11-01）：** 本机 pi 一手源码 `packages/ai/src/api/openai-codex-responses.ts`、`openai-responses-shared.ts`、`catalog/providers/openai-codex.ts`、`catalog/families/openai.ts`；[OpenAI Responses 条目文档](https://developers.openai.com/api/reference/resources/conversations/subresources/items/methods/create) 说明使用 output_item.done 的 encrypted_content 继续无状态会话。本地 Responses mock 验证请求头、文本、工具往返、两条推理数据、多轮恢复、摘要、子 agent、usage、401 和凭证隔离。模型列表是源码快照，不代表所有账号都可用；未知模型需显式设置 NIB_CONTEXT_WINDOW。
 
-**验证（2026-11-01）：** `zig build test --summary all` 62/62 通过；`scripts/test_session.py`、`scripts/test_codex.py` 与 ReleaseFast 构建通过。Responses mock 额外覆盖超过 100KB 的加密条目、assistant phase、同模型摘要 low、空/截断摘要后继续，以及跨模型恢复拒绝。真实请求用 ReleaseFast 从临时空目录发出“你好。”，隔离全局/项目指令，不带仓库内容：gpt-6.1-sol 返回“你好！有什么我可以帮你的吗？”，1 Step，输入 479、输出 13 tokens，无 Run，stderr 为空。真实工具、长会话和压缩未额外调用服务，覆盖来自本地 mock。
+**验证（2026-11-01）：** `zig build test --summary all` 62/62 通过；`tests/test_session.py`、`tests/test_codex.py` 与 ReleaseFast 构建通过。Responses mock 额外覆盖超过 100KB 的加密条目、assistant phase、同模型摘要 low、空/截断摘要后继续，以及跨模型恢复拒绝。真实请求用 ReleaseFast 从临时空目录发出“你好。”，隔离全局/项目指令，不带仓库内容：gpt-6.1-sol 返回“你好！有什么我可以帮你的吗？”，1 Step，输入 479、输出 13 tokens，无 Run，stderr 为空。真实工具、长会话和压缩未额外调用服务，覆盖来自本地 mock。
 
 **何时重新考虑：** 后端协议或模型窗口变更，出现第三种协议，或实际需要跨 provider 转换历史、OAuth 登录、服务器端压缩。

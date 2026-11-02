@@ -220,7 +220,7 @@ test "multi-line editing with UTF-8" {
 }
 
 test {
-    _ = @import("tui.zig");
+    _ = @import("../tui.zig");
 }
 
 test "input history keeps multiline entries and restores draft cursor" {

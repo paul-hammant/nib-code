@@ -18,7 +18,7 @@
 
 - **概念少，而且各管一件事。** Session、Turn、Step、Run、Tool 各有明确边界（见 [CONTEXT.md](../CONTEXT.md)）。要加新概念时，先问能不能用已有概念表达。
 - **模块深。** 接口简单，复杂性藏在内部。例如界面只需要 `Session.turn`、`Session.compact` 和一个事件 `Sink`。
-- **同一件事只在一处定义。** 例如每个 Tool 的名字、给模型看的说明和实现在 `tools.zig` 的同一张表里，说明由表生成。
+- **同一件事只在一处定义。** 例如每个 Tool 的名字、给模型看的说明和实现入口登记在 `tools.zig` 的同一张表里，说明由表生成；实现放在 `tools/` 下。
 - **说法前后一致。** 例如要模型写 JS，给它看的接口说明也用 JS。
 - **不为还没出现的需求设计，没有证据不加特例。**
 
@@ -47,8 +47,8 @@
 这些容易撤回，记一笔即可：
 
 - Provider 支持 Chat Completions（默认 DeepSeek）与 Codex Responses，见 [0011](adr/0011-provider-wire-protocols.md)。
-- TUI 用 libvaxis。`/` 指令：`/help`、`/new`、`/resume <id>`、`/compact`、`/effort [level]`、`/copy`、`/js <code>`，定义在 `src/commands.zig` 的一张表里，`/help`、候选列表和参数候选都由它生成。输入 `/` 时在输入框上方按前缀列出候选：↑↓ 选择，Tab 补全，Enter 执行（需要参数的指令先补全再等参数），Esc 关闭。`/resume` 的候选是当前目录下有用户消息的会话（最近的在前），没说过话的空会话不列出，`-c` 同样跳过它们。`/help` 和 `/copy` 在回合进行中也能用；`/copy` 通过终端的 OSC 52 写剪贴板，终端不支持时不会生效。回合进行中，状态栏最前面显示转圈指示、当前阶段（thinking / writing / running / retrying / compacting）和该阶段已用秒数。Run 和推理默认各折叠成一行（Run 显示状态、用到的工具和耗时），ctrl+o 全部展开或收起。TUI 开启了鼠标上报：滚轮滚动对话区；需要选中复制文字时，大多数终端要按住 shift 拖动。操作：PgUp/PgDn 翻半屏，shift+↑↓ 滚 3 行；向上翻看时视口按顶部条目锚定，新内容到达不推移画面，回到底部后恢复跟随。输入框中 shift+enter / alt+enter / ctrl+j 换行，粘贴内容中的回车不会提交；光标在首行按 ↑、末行按 ↓ 翻阅本次会话的输入历史（不跨进程保存）。assistant 文本渲染基础 Markdown：代码围栏（含未闭合的）、行内代码、粗体、标题。
-- 会话持久化、恢复和项目指令已实现（2026-11-01，一手源码：`src/agent.zig`、`src/log.zig`、`src/instructions.zig`、`src/main.zig`）。日志按完整 Step 同步落盘；详细行为见根目录 [AGENTS.md](../AGENTS.md)，端到端检查可运行 `zig build` 后执行 `python3 scripts/test_session.py`。
+- TUI 用 libvaxis。`/` 指令：`/help`、`/new`、`/resume <id>`、`/compact`、`/effort [level]`、`/copy`、`/js <code>`，定义在 `src/tui/commands.zig` 的一张表里，`/help`、候选列表和参数候选都由它生成。输入 `/` 时在输入框上方按前缀列出候选：↑↓ 选择，Tab 补全，Enter 执行（需要参数的指令先补全再等参数），Esc 关闭。`/resume` 的候选是当前目录下有用户消息的会话（最近的在前），没说过话的空会话不列出，`-c` 同样跳过它们。`/help` 和 `/copy` 在回合进行中也能用；`/copy` 通过终端的 OSC 52 写剪贴板，终端不支持时不会生效。回合进行中，状态栏最前面显示转圈指示、当前阶段（thinking / writing / running / retrying / compacting）和该阶段已用秒数。Run 和推理默认各折叠成一行（Run 显示状态、用到的工具和耗时），ctrl+o 全部展开或收起。TUI 开启了鼠标上报：滚轮滚动对话区；需要选中复制文字时，大多数终端要按住 shift 拖动。操作：PgUp/PgDn 翻半屏，shift+↑↓ 滚 3 行；向上翻看时视口按顶部条目锚定，新内容到达不推移画面，回到底部后恢复跟随。输入框中 shift+enter / alt+enter / ctrl+j 换行，粘贴内容中的回车不会提交；光标在首行按 ↑、末行按 ↓ 翻阅本次会话的输入历史（不跨进程保存）。assistant 文本渲染基础 Markdown：代码围栏（含未闭合的）、行内代码、粗体、标题。
+- 会话持久化、恢复和项目指令已实现（2026-11-01，一手源码：`src/session.zig`、`src/session/log.zig`、`src/session/instructions.zig`、`src/main.zig`）。日志按完整 Step 同步落盘；详细行为见根目录 [AGENTS.md](../AGENTS.md)，端到端检查可运行 `zig build` 后执行 `python3 tests/test_session.py`。
 
 ## 暂缓的想法
 
@@ -56,7 +56,7 @@
 
 - **跨进程保存输入历史。** 现在只在本次会话内可翻阅。等实际使用中需要时再做。
 
-Run 内工具并发、`nib ask --json` 和 `tools.agent` 均已实现，见 ADR 0009–0010；NDJSON 格式与调用约定见 [AGENTS.md](../AGENTS.md)。`zig build` 后执行 `python3 scripts/test_session.py` 可检查会话恢复、机器事件、子 agent 并发/深度/用量/取消及启动开销（全程本地 mock，无真实 key）。其他被搁置的方案记在对应 ADR 里：系统层沙箱（[0004](adr/0004-two-layer-isolation.md)）、守护进程（[0005](adr/0005-process-per-session.md)）、跨 Run 的变量存储（[0003](adr/0003-stateless-runs.md)）、混合原生工具调用和 Python 运行时（[0002](adr/0002-run-code-only.md)）。
+Run 内工具并发、`nib ask --json` 和 `tools.agent` 均已实现，见 ADR 0009–0010；NDJSON 格式与调用约定见 [AGENTS.md](../AGENTS.md)。`zig build` 后执行 `python3 tests/test_session.py` 可检查会话恢复、机器事件、子 agent 并发/深度/用量/取消及启动开销（全程本地 mock，无真实 key）。其他被搁置的方案记在对应 ADR 里：系统层沙箱（[0004](adr/0004-two-layer-isolation.md)）、守护进程（[0005](adr/0005-process-per-session.md)）、跨 Run 的变量存储（[0003](adr/0003-stateless-runs.md)）、混合原生工具调用和 Python 运行时（[0002](adr/0002-run-code-only.md)）。
 
 ## 度量
 
@@ -68,7 +68,7 @@ Run 内工具并发、`nib ask --json` 和 `tools.agent` 均已实现，见 ADR 
 | TUI 单帧 draw 耗时，5000 条目、100×24 | 底部跟随 102.5 → 29.7 µs；上翻 1200 行 1149.5 → 57.2 µs（2026-11-01，ReleaseFast，加高度缓存前 → 后） | — | 预热后每组 32 帧，5 组平均值取中位数，只测 draw（feat/tui-polish 的报告） |
 | `nib js '1+1'` 平均耗时（含进程启动） | 1.6 ms（2026-11-01，ReleaseFast） | — | 循环 100 次取平均 |
 | 工具 Promise.all / 依次 await：两个 sleep 0.3 | 307 / 611 ms（2026-11-01，Debug） | — | `src/tools.zig` 测试，见 ADR 0009 |
-| 子进程启动至 NDJSON start（含日志同步，不含 TLS） | Debug 中位数 11.82 ms；ReleaseFast 中位数 1.30 ms（2026-11-01） | — | `scripts/test_session.py`，10 次，见 ADR 0010 |
+| 子进程启动至 NDJSON start（含日志同步，不含 TLS） | Debug 中位数 11.82 ms；ReleaseFast 中位数 1.30 ms（2026-11-01） | — | `tests/test_session.py`，10 次，见 ADR 0010 |
 | 上述命令峰值 RSS | 3.7 MB（2026-11-01） | — | `/usr/bin/time -f %M` |
 | 二进制体积（ReleaseFast，strip 后） | 1.9 MB（2026-11-01） | — | `strip` 后 `ls -l` |
 | TUI 进程空闲 PSS（一轮对话后，无 TLS） | 3.08 MB/进程，10 个合计 30.8 MB（2026-11-01，ReleaseFast） | — | 10 个 TUI 对本地模拟服务器各聊一轮，读 `/proc/<pid>/smaps_rollup` 的 `Pss` |

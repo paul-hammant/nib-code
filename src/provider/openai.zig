@@ -1,5 +1,5 @@
 const std = @import("std");
-const sse = @import("../sse.zig");
+const sse = @import("sse.zig");
 
 const Config = @import("../provider.zig").Config;
 const Message = @import("../provider.zig").Message;

@@ -1,5 +1,5 @@
 const std = @import("std");
-const provider = @import("provider.zig");
+const provider = @import("../provider.zig");
 
 pub const Record = struct {
     cwd: ?[]const u8 = null,

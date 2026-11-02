@@ -1,5 +1,5 @@
 const std = @import("std");
-const provider = @import("provider.zig");
+const provider = @import("../provider.zig");
 
 pub const Command = enum { help, new, @"resume", compact, effort, copy, js };
 

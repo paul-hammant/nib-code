@@ -1,12 +1,13 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
-const js = @import("js.zig");
-const agent = @import("agent.zig");
+const sandbox = @import("sandbox.zig");
+const Session = @import("session.zig").Session;
+const SessionEvent = @import("session.zig").Event;
 const provider = @import("provider.zig");
-const Editor = @import("editor.zig").Editor;
-const markdown = @import("markdown.zig");
-const commands = @import("commands.zig");
-const session_log = @import("log.zig");
+const Editor = @import("tui/editor.zig").Editor;
+const markdown = @import("tui/markdown.zig");
+const commands = @import("tui/commands.zig");
+const session_log = @import("session/log.zig");
 
 const Event = union(enum) {
     key_press: vaxis.Key,
@@ -197,7 +198,7 @@ const max_menu_rows = 8;
 /// The UI thread must not touch the Session while a Turn is running.
 const Turn = struct {
     gpa: std.mem.Allocator,
-    session: *agent.Session,
+    session: *Session,
     text: []const u8,
     loop: *vaxis.Loop(Event),
     cancel: std.atomic.Value(bool) = .init(false),
@@ -213,7 +214,7 @@ const Turn = struct {
         t.loop.postEvent(.done) catch {};
     }
 
-    fn emit(ctx: *anyopaque, ev: agent.Event) !void {
+    fn emit(ctx: *anyopaque, ev: SessionEvent) !void {
         const t: *Turn = @ptrCast(@alignCast(ctx));
         const gpa = t.gpa;
         try t.loop.postEvent(switch (ev) {
@@ -234,7 +235,7 @@ const Turn = struct {
 };
 
 /// `session` may already hold history (a resumed Session); it is shown first.
-pub fn run(init: std.process.Init, session: *agent.Session) !void {
+pub fn run(init: std.process.Init, session: *Session) !void {
     const io = init.io;
     const gpa = init.gpa;
     var cfg = session.cfg;
@@ -611,7 +612,7 @@ fn busyCommand(line: []const u8) bool {
     };
 }
 
-fn sessionChoices(io: std.Io, a: std.mem.Allocator, session: *const agent.Session) ![]const commands.Choice {
+fn sessionChoices(io: std.Io, a: std.mem.Allocator, session: *const Session) ![]const commands.Choice {
     const directory = try std.fs.path.join(a, &.{ session.options.data_home, "nib/sessions" });
     const cwd = try std.process.currentPathAlloc(io, a);
     const found = try session_log.list(io, a, directory, cwd);
@@ -638,7 +639,7 @@ fn sessionChoices(io: std.Io, a: std.mem.Allocator, session: *const agent.Sessio
     return choices;
 }
 
-fn resolveSession(io: std.Io, a: std.mem.Allocator, session: *const agent.Session, arg: []const u8) ![]const u8 {
+fn resolveSession(io: std.Io, a: std.mem.Allocator, session: *const Session, arg: []const u8) ![]const u8 {
     if (arg.len == 0) return error.MissingSessionId;
     if (arg.len == 32) return arg;
     var match: ?[]const u8 = null;
