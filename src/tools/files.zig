@@ -65,6 +65,7 @@ pub fn edit(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
 
     const out = try std.mem.replaceOwned(u8, gpa, data, v.old_text, v.new_text);
     defer gpa.free(out);
+    try t.noteBefore(gpa, path, data);
     dir.writeFile(t.io, .{ .sub_path = v.path, .data = out }) catch |err|
         return fail(gpa, "{s}: {s}", .{ v.path, @errorName(err) });
     return .{ .ok = try std.fmt.allocPrint(gpa, "{{\"replaced\":{d}}}", .{count}) };
@@ -85,6 +86,14 @@ pub fn write(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolR
     if (t.cancel.load(.acquire)) return error.Canceled;
 
     const dir = std.Io.Dir.cwd();
+    if (t.track_changes) track: {
+        const before = dir.readFileAlloc(t.io, path, gpa, .limited(16 * 1024 * 1024)) catch |err| {
+            if (err == error.FileNotFound) try t.noteBefore(gpa, path, null);
+            break :track;
+        };
+        defer gpa.free(before);
+        try t.noteBefore(gpa, path, before);
+    }
     if (std.fs.path.dirname(v.path)) |parent| dir.createDirPath(t.io, parent) catch |err|
         return fail(gpa, "{s}: {s}", .{ parent, @errorName(err) });
     dir.writeFile(t.io, .{ .sub_path = v.path, .data = v.content }) catch |err|

@@ -8,6 +8,7 @@ const Editor = @import("tui/editor.zig").Editor;
 const commands = @import("tui/commands.zig");
 const Transcript = @import("tui/transcript.zig").Transcript;
 const EntryKind = @import("tui/transcript.zig").Kind;
+const ChangeText = @import("tui/transcript.zig").ChangeText;
 const Viewport = @import("tui/viewport.zig").Viewport;
 const Menu = @import("tui/menu.zig").Menu;
 const status = @import("tui/status.zig");
@@ -23,7 +24,7 @@ const Event = union(enum) {
     /// Slices are owned by the receiver.
     delta: struct { kind: provider.Kind, text: []u8 },
     run_start: []u8,
-    run_end: struct { ok: bool, output: []u8 },
+    run_end: struct { ok: bool, output: []u8, changes: ChangeText },
     retry: []u8,
     notice: []u8,
     done,
@@ -86,7 +87,7 @@ const Turn = struct {
         try t.loop.postEvent(switch (ev) {
             .delta => |d| .{ .delta = .{ .kind = d.kind, .text = try gpa.dupe(u8, d.text) } },
             .run_start => |code| .{ .run_start = try gpa.dupe(u8, code) },
-            .run_end => |r| .{ .run_end = .{ .ok = r.ok, .output = try gpa.dupe(u8, r.output) } },
+            .run_end => |r| .{ .run_end = .{ .ok = r.ok, .output = try gpa.dupe(u8, r.output), .changes = try .init(gpa, r.changes) } },
             .retry => |r| .{ .retry = try std.fmt.allocPrint(gpa, "retry {d} in {d}s: {s}", .{ r.attempt, r.delay_ms / 1000, r.reason }) },
             .notice => |m| .{ .notice = try gpa.dupe(u8, m) },
             .usage => |u| .{ .usage = u },
@@ -213,7 +214,7 @@ const App = struct {
                 defer gpa.free(r.output);
                 const elapsed = app.activity.label(app.io).ms;
                 app.activity.set(app.io, .thinking);
-                try app.transcript.endRun(gpa, r.ok, r.output, elapsed);
+                try app.transcript.endRun(gpa, r.ok, r.output, elapsed, r.changes);
             },
             .retry, .notice => |msg| {
                 defer gpa.free(msg);
@@ -350,11 +351,15 @@ const App = struct {
             .js => {
                 if (arg.len == 0) return app.transcript.add(gpa, .err, "usage: /js <code>");
                 try app.transcript.add(gpa, .user, line);
-                const r = try session.run(arg, null);
+                const ran = try session.run(arg, null);
+                const r = ran.outcome;
                 app.usage = session.usage;
                 defer r.deinit(gpa);
                 if (r.logs.len > 0) try app.transcript.add(gpa, .info, std.mem.trimEnd(u8, r.logs, "\n"));
                 try app.transcript.add(gpa, if (r.ok) .info else .err, r.text);
+                var changes: ChangeText = try .init(gpa, ran.changes);
+                defer changes.deinit(gpa);
+                if (changes.diff.len > 0) try app.transcript.add(gpa, .info, std.mem.trimEnd(u8, changes.diff, "\n"));
             },
             .compact => {
                 app.turn = try Turn.spawn(gpa, session, app.loop, try gpa.dupe(u8, line), true);

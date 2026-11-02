@@ -35,7 +35,7 @@
 
 - `{"start":{"session_id":"<32位小写十六进制>"}}`：Session 已初始化；恢复时沿用原 id。
 - `{"delta":{"kind":"text|reasoning","text":"..."}}`：模型流式片段，包含中间 Step 的文本。
-- `{"run_start":"<JS代码>"}`、`{"run_end":{"ok":true,"output":"..."}}`：一次 Run 的开始和结果；Run 失败可由模型继续处理。
+- `{"run_start":"<JS代码>"}`、`{"run_end":{"ok":true,"output":"...","changes":[...]}}`：一次 Run 的开始和结果；Run 失败可由模型继续处理。`changes` 列出这次 Run 里 edit/write 改动的文件：`{"path","added","removed","created","diff"}`，与 Run 开始前的内容比较（改了又改回的文件不列出）；`diff` 是带一行上下文的 `+`/`-`/` ` 行，超过 200 行截断。bash 和子会话的改动不在其中。
 - `{"usage":{"prompt_tokens":0,"completion_tokens":0,"prompt_cache_hit_tokens":0}}`：本轮累计用量快照（含已报告的子会话用量），不是增量；用于中途显示与强制终止后的统计。
 - `{"retry":{"attempt":1,"delay_ms":1000,"reason":"..."}}`、`{"notice":"..."}`：重试与通知。
 - `{"end":{"text":"<最终回答>","usage":{"prompt_tokens":0,"completion_tokens":0,"prompt_cache_hit_tokens":0},"steps":1}}`：Turn 成功结束；usage 只统计本轮，含自动压缩和子会话。最终回答取这里的 text，不拼接所有 delta。

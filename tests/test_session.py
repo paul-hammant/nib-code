@@ -290,6 +290,15 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         assert read_requests(requests_path)[-2]["messages"] == kept + [{"role": "user", "content": "after interrupt"}]
         print("Interrupted Turn E2E passed: user message and streamed text are kept, and the session continues")
 
+        (cwd / "same.txt").write_text("x\n")
+        edited = events(ask("--json", "edit_test"))
+        end = next(e["run_end"] for e in edited if "run_end" in e)
+        assert end["changes"] == [{"path": "notes.txt", "added": 2, "removed": 0, "created": True, "diff": "+a\n+B\n"}], end
+        (cwd / "notes.txt").write_text("a\nc\n")
+        human = ask("edit_test")
+        assert b"changed notes.txt +1 \xe2\x88\x921" in human.stderr, human.stderr
+        print("Change E2E passed: edit/write changes per Run, diffed against the files before the Run, unchanged files omitted")
+
         started = time.monotonic()
         fetched = events(ask("--json", "fetch_test"))
         elapsed = time.monotonic() - started

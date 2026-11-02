@@ -114,7 +114,10 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
                         try self.w.flush();
                     },
                     .run_start => |code| std.debug.print("\n\x1b[33mrun ▸\x1b[0m {s}\n", .{code}),
-                    .run_end => |r| std.debug.print("\x1b[2m{s}\x1b[0m\n", .{r.output}),
+                    .run_end => |r| {
+                        std.debug.print("\x1b[2m{s}\x1b[0m\n", .{r.output});
+                        for (r.changes) |c| std.debug.print("\x1b[2mchanged {s}{s} +{d} −{d}\x1b[0m\n", .{ c.path, if (c.created) " (new)" else "", c.added, c.removed });
+                    },
                     .retry => |r| std.debug.print("\x1b[2mretry {d} in {d}s: {s}\x1b[0m\n", .{ r.attempt, r.delay_ms / 1000, r.reason }),
                     .usage => {},
                     .notice => |m| std.debug.print("\x1b[2m{s}\x1b[0m\n", .{m}),
@@ -178,6 +181,7 @@ test {
     _ = @import("tools/regex.zig");
     _ = @import("tools/grep.zig");
     _ = @import("tools/html.zig");
+    _ = @import("tools/diff.zig");
     _ = @import("tui/editor.zig");
     _ = @import("tui/commands.zig");
     _ = @import("tui/transcript.zig");

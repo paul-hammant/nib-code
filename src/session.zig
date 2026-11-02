@@ -3,6 +3,7 @@
 const std = @import("std");
 const sandbox = @import("sandbox.zig");
 const tools = @import("tools.zig");
+const Change = @import("tools/diff.zig").Change;
 const provider = @import("provider.zig");
 const session_log = @import("session/log.zig");
 const instructions = @import("session/instructions.zig");
@@ -70,7 +71,7 @@ pub const Session = struct {
             .client = client,
             .cfg = cfg,
             .arena = .init(gpa),
-            .tools = .{ .io = io, .home = options.home, .depth = options.depth, .environ = options.environ, .cfg = cfg },
+            .tools = .{ .io = io, .home = options.home, .depth = options.depth, .environ = options.environ, .cfg = cfg, .track_changes = true },
             .parent_session_id = options.parent_session_id,
             .options = options,
         };
@@ -120,6 +121,7 @@ pub const Session = struct {
     }
 
     pub fn deinit(s: *Session) void {
+        s.tools.discardChanges(s.gpa);
         s.log.close(s.io);
         s.history.deinit(s.gpa);
         s.arena.deinit();
@@ -305,9 +307,18 @@ pub const Session = struct {
         }
     }
 
-    pub fn run(s: *Session, code: []const u8, cancel: ?*const std.atomic.Value(bool)) !sandbox.Outcome {
+    pub const Ran = struct {
+        outcome: sandbox.Outcome,
+        /// Session-arena-owned.
+        changes: []const Change,
+    };
+
+    pub fn run(s: *Session, code: []const u8, cancel: ?*const std.atomic.Value(bool)) !Ran {
         defer s.usage.add(s.tools.takeUsage());
-        return sandbox.eval(s.gpa, s.io, code, .{}, s.tools.host(), cancel);
+        s.tools.discardChanges(s.gpa);
+        const outcome = try sandbox.eval(s.gpa, s.io, code, .{}, s.tools.host(), cancel);
+        errdefer outcome.deinit(s.gpa);
+        return .{ .outcome = outcome, .changes = try s.tools.takeChanges(s.gpa, s.arena.allocator()) };
     }
 
     /// Result is arena-owned.
@@ -322,13 +333,14 @@ pub const Session = struct {
         defer args.deinit();
 
         try sink.emit(sink.ctx, .{ .run_start = args.value.code });
-        const o = try s.run(args.value.code, cancel);
+        const ran = try s.run(args.value.code, cancel);
+        const o = ran.outcome;
         defer o.deinit(s.gpa);
 
         const formatted = try formatOutcome(s.gpa, o);
         defer s.gpa.free(formatted);
         const output = try tools.truncateMiddle(a, formatted);
-        try sink.emit(sink.ctx, .{ .run_end = .{ .ok = o.ok, .output = output } });
+        try sink.emit(sink.ctx, .{ .run_end = .{ .ok = o.ok, .output = output, .changes = ran.changes } });
         return output;
     }
 };

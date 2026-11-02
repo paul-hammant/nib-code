@@ -2,8 +2,11 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const provider = @import("../provider.zig");
 const markdown = @import("markdown.zig");
+const Change = @import("../tools/diff.zig").Change;
 
 const run_output_lines = 12;
+const max_diff_lines = 60;
+const max_segments = 8 + max_diff_lines + 2;
 
 pub const Kind = enum { user, assistant, reasoning, run, info, err };
 
@@ -13,6 +16,8 @@ pub const Entry = struct {
     text: std.ArrayList(u8) = .empty,
     /// For `.run`: the first lines of its output.
     output: std.ArrayList(u8) = .empty,
+    /// For `.run`: see `ChangeText`.
+    changes: ChangeText = .{},
     /// One-line summary of a collapsible entry. vaxis keeps printed slices
     /// until render, so this must outlive draw(); see `refreshLabel`.
     label: std.ArrayList(u8) = .empty,
@@ -26,6 +31,7 @@ pub const Entry = struct {
         e.text.deinit(gpa);
         e.output.deinit(gpa);
         e.label.deinit(gpa);
+        e.changes.deinit(gpa);
     }
 
     fn refreshLabel(e: *Entry, gpa: std.mem.Allocator) !void {
@@ -39,6 +45,7 @@ pub const Entry = struct {
                 } else {
                     try e.label.print(gpa, "{s} · {d}.{d}s", .{ used, e.elapsed_ms / 1000, e.elapsed_ms % 1000 / 100 });
                 }
+                if (e.changes.summary.len > 0) try e.label.print(gpa, " · {s}", .{e.changes.summary});
             },
             .reasoning => {
                 const lines = std.mem.count(u8, std.mem.trimEnd(u8, e.text.items, "\n"), "\n") + 1;
@@ -54,7 +61,7 @@ pub const Entry = struct {
 
     pub fn print(e: *const Entry, win: vaxis.Window, commit: bool) u16 {
         if (e.kind == .assistant) return markdown.print(win, e.text.items, commit);
-        var segs: [7]vaxis.Segment = undefined;
+        var segs: [max_segments]vaxis.Segment = undefined;
         const folded = e.collapsible() and !e.open;
         const wrap: @FieldType(vaxis.Window.PrintOptions, "wrap") = if (folded) .none else if (e.kind == .run) .grapheme else .word;
         const r = win.print(segments(e, &segs), .{ .wrap = wrap, .commit = commit });
@@ -62,7 +69,7 @@ pub const Entry = struct {
     }
 
     pub fn height(e: *Entry, win: vaxis.Window) u16 {
-        const len = e.text.items.len + e.output.items.len;
+        const len = e.text.items.len + e.output.items.len + e.changes.diff.len;
         if (e.cached) |c| {
             if (c.width == win.width and c.len == len and c.open == e.open) return c.rows;
         }
@@ -73,7 +80,7 @@ pub const Entry = struct {
         return rows;
     }
 
-    fn segments(e: *const Entry, segs: *[7]vaxis.Segment) []const vaxis.Segment {
+    fn segments(e: *const Entry, segs: *[max_segments]vaxis.Segment) []const vaxis.Segment {
         const dim: vaxis.Style = .{ .dim = true };
         switch (e.kind) {
             .user => {
@@ -96,10 +103,29 @@ pub const Entry = struct {
                 if (!e.open) return segs[0..3];
                 segs[3] = .{ .text = "\n" };
                 segs[4] = .{ .text = e.text.items, .style = .{ .fg = .{ .index = 3 } } };
-                if (e.output.items.len == 0) return segs[0..5];
-                segs[5] = .{ .text = "\n" };
-                segs[6] = .{ .text = e.output.items, .style = if (e.run == .failed) .{ .fg = .{ .index = 1 }, .dim = true } else dim };
-                return segs[0..7];
+                var n: usize = 5;
+                if (e.output.items.len > 0) {
+                    segs[5] = .{ .text = "\n" };
+                    segs[6] = .{ .text = e.output.items, .style = if (e.run == .failed) .{ .fg = .{ .index = 1 }, .dim = true } else dim };
+                    n = 7;
+                }
+                const diff = std.mem.trimEnd(u8, e.changes.diff, "\n");
+                if (diff.len == 0) return segs[0..n];
+                segs[n] = .{ .text = "\n" };
+                n += 1;
+                var start: usize = 0;
+                while (start < diff.len and n < segs.len) : (n += 1) {
+                    const end = if (std.mem.indexOfScalarPos(u8, diff, start, '\n')) |nl| nl + 1 else diff.len;
+                    const line = diff[start..end];
+                    segs[n] = .{ .text = line, .style = switch (line[0]) {
+                        '+' => .{ .fg = .{ .index = 2 } },
+                        '-' => .{ .fg = .{ .index = 1 } },
+                        ' ' => dim,
+                        else => if (std.mem.startsWith(u8, line, "…")) dim else .{ .bold = true },
+                    } };
+                    start = end;
+                }
+                return segs[0..n];
             },
             .info => segs[0] = .{ .text = e.text.items, .style = dim },
             .err => segs[0] = .{ .text = e.text.items, .style = .{ .fg = .{ .index = 1 } } },
@@ -159,10 +185,17 @@ pub const Transcript = struct {
         try t.addRun(gpa, code, t.expanded);
     }
 
-    pub fn endRun(t: *Transcript, gpa: std.mem.Allocator, ok: bool, output: []const u8, elapsed_ms: u64) !void {
-        const e = t.lastRunning() orelse return;
+    /// Takes ownership of `changes`.
+    pub fn endRun(t: *Transcript, gpa: std.mem.Allocator, ok: bool, output: []const u8, elapsed_ms: u64, changes: ChangeText) !void {
+        const e = t.lastRunning() orelse {
+            var c = changes;
+            c.deinit(gpa);
+            return;
+        };
         e.run = if (ok) .ok else .failed;
         e.elapsed_ms = elapsed_ms;
+        e.changes.deinit(gpa);
+        e.changes = changes;
         try appendHead(gpa, &e.output, output, run_output_lines);
         try e.refreshLabel(gpa);
         e.cached = null;
@@ -214,6 +247,60 @@ pub const Transcript = struct {
             if (e.kind == .run and e.run == .running) return e;
         }
         return null;
+    }
+};
+
+/// What a Run changed, as shown: the one-line summary and the colored diff.
+pub const ChangeText = struct {
+    /// "src/a.zig +3 −1", or "4 files +20 −5"; empty when nothing changed.
+    summary: []u8 = &.{},
+    /// Per file a header line, then its diff lines; at most `max_diff_lines` in all.
+    diff: []u8 = &.{},
+
+    pub fn init(gpa: std.mem.Allocator, changes: []const Change) !ChangeText {
+        if (changes.len == 0) return .{};
+        var summary: std.ArrayList(u8) = .empty;
+        errdefer summary.deinit(gpa);
+        if (changes.len <= 2) {
+            for (changes, 0..) |c, i| {
+                if (i > 0) try summary.appendSlice(gpa, ", ");
+                try summary.print(gpa, "{s}{s} +{d} −{d}", .{ c.path, if (c.created) " (new)" else "", c.added, c.removed });
+            }
+        } else {
+            var added: usize = 0;
+            var removed: usize = 0;
+            for (changes) |c| {
+                added += c.added;
+                removed += c.removed;
+            }
+            try summary.print(gpa, "{d} files +{d} −{d}", .{ changes.len, added, removed });
+        }
+        var diff: std.ArrayList(u8) = .empty;
+        errdefer diff.deinit(gpa);
+        var shown: usize = 0;
+        var hidden: usize = 0;
+        for (changes) |c| {
+            var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, c.diff, "\n"), '\n');
+            if (shown < max_diff_lines) {
+                try diff.print(gpa, "{s}{s} +{d} −{d}\n", .{ c.path, if (c.created) " (new)" else "", c.added, c.removed });
+                shown += 1;
+            } else hidden += 1;
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                if (shown < max_diff_lines) {
+                    try diff.print(gpa, "{s}\n", .{line});
+                    shown += 1;
+                } else hidden += 1;
+            }
+        }
+        if (hidden > 0) try diff.print(gpa, "… {d} more lines\n", .{hidden});
+        return .{ .summary = try summary.toOwnedSlice(gpa), .diff = try diff.toOwnedSlice(gpa) };
+    }
+
+    pub fn deinit(c: *ChangeText, gpa: std.mem.Allocator) void {
+        gpa.free(c.summary);
+        gpa.free(c.diff);
+        c.* = .{};
     }
 };
 
@@ -274,10 +361,10 @@ test "runs fold to one line until expanded" {
     var t: Transcript = .{};
     defer t.deinit(gpa);
     try t.startRun(gpa, "const a = await tools.bash({});\nconst b = await tools.bash({});\nawait tools.read({})");
-    try t.endRun(gpa, true, "line 1\nline 2", 1234);
+    try t.endRun(gpa, true, "line 1\nline 2", 1234, .{});
     const e = &t.entries.items[0];
     try testing.expectEqual(@as(u16, 1), e.height(win));
-    var segs: [7]vaxis.Segment = undefined;
+    var segs: [max_segments]vaxis.Segment = undefined;
     try testing.expectEqualStrings("bash ×2, read · 1.2s", e.segments(&segs)[2].text);
     t.toggleExpanded();
     try testing.expectEqual(@as(u16, 6), e.height(win));
@@ -324,4 +411,34 @@ test "streamed deltas group by kind and history replays runs with results" {
     try testing.expectEqual(@as(usize, 2), t.entries.items.len);
     try testing.expectEqualStrings("out", t.entries.items[1].output.items);
     try testing.expect(t.entries.items[1].run == .ok);
+}
+
+test "a Run shows changed files in its summary and a colored diff when open" {
+    const gpa = testing.allocator;
+    var screen: vaxis.Screen = .{};
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 60, .height = 24, .screen = &screen };
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    try t.startRun(gpa, "await tools.edit({})");
+    const changes = [_]Change{
+        .{ .path = "src/a.zig", .added = 1, .removed = 1, .diff = " keep\n-old\n+new\n" },
+        .{ .path = "b.md", .added = 1, .removed = 0, .created = true, .diff = "+hi\n" },
+    };
+    try t.endRun(gpa, true, "", 300, try .init(gpa, &changes));
+    const e = &t.entries.items[0];
+    try testing.expectEqualStrings("edit · 0.3s · src/a.zig +1 −1, b.md (new) +1 −0", e.label.items);
+    try testing.expectEqual(@as(u16, 1), e.height(win));
+    t.toggleExpanded();
+    var segs: [max_segments]vaxis.Segment = undefined;
+    const shown = e.segments(&segs);
+    try testing.expectEqualStrings("-old\n", shown[8].text);
+    try testing.expectEqual(@as(u8, 1), shown[8].style.fg.index);
+    try testing.expectEqualStrings("+hi", shown[11].text);
+    try testing.expectEqual(@as(u16, 8), e.height(win));
+
+    var many: [3]Change = undefined;
+    for (&many) |*c| c.* = .{ .path = "x", .added = 2, .removed = 1, .diff = "" };
+    var text: ChangeText = try .init(gpa, &many);
+    defer text.deinit(gpa);
+    try testing.expectEqualStrings("3 files +6 −3", text.summary);
 }

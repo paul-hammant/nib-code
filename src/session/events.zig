@@ -1,11 +1,12 @@
 const std = @import("std");
 const provider = @import("../provider.zig");
+const Change = @import("../tools/diff.zig").Change;
 
 pub const Event = union(enum) {
     /// Slices are valid only during the callback.
     delta: struct { kind: provider.Kind, text: []const u8 },
     run_start: []const u8,
-    run_end: struct { ok: bool, output: []const u8 },
+    run_end: struct { ok: bool, output: []const u8, changes: []const Change = &.{} },
     retry: struct { attempt: u32, delay_ms: u64, reason: []const u8 },
     notice: []const u8,
     usage: provider.Usage,

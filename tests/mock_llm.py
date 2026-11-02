@@ -14,7 +14,8 @@ the first/second Step; "truncated" closes the stream without [DONE].
 "delegate" runs two children; "delegate_many" runs six; "delegate_failure"
 catches a failed child's error. "delegate_cancel PATH" runs a child whose bash
 writes its pid to PATH and sleeps. "child probe" answers without a Run. "interrupt me" streams
-partial text, then stalls for a second. "fetch_test" fetches GET /redirect (to /page) and
+partial text, then stalls for a second. "edit_test" writes and
+edits files. "fetch_test" fetches GET /redirect (to /page) and
 /slow (3 s) with a short timeout; GET serves those pages.
 Child Runs report the exposed tools, allowing depth-limit checks.
 Each request is logged to LOGFILE as one JSON line, with a monotonic received time."""
@@ -82,6 +83,10 @@ class H(http.server.BaseHTTPRequestHandler):
                 code = 'await Promise.all(Array.from({length: 6}, (_, i) => tools.agent({prompt: "child " + i})))'
             elif lastuser == 'delegate_probe':
                 code = 'await tools.agent({prompt: "child probe"})'
+            elif lastuser == 'edit_test':
+                code = ('await tools.write({path: "notes.txt", content: "a\\nb\\n"});\n'
+                        'await tools.edit({path: "notes.txt", old_text: "b", new_text: "B"});\n'
+                        'await tools.write({path: "same.txt", content: "x\\n"}); "done"')
             elif lastuser == 'fetch_test':
                 base = 'http://127.0.0.1:' + sys.argv[1]
                 code = ('const page = await tools.fetch({url: "' + base + '/redirect"});\n'
