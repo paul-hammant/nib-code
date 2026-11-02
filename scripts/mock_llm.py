@@ -14,7 +14,8 @@ the first/second Step; "truncated" closes the stream without [DONE].
 "delegate" runs two children; "delegate_many" runs six; "delegate_failure"
 catches a failed child's error. "delegate_cancel PATH" runs a child whose bash
 writes its pid to PATH and sleeps. "child probe" answers without a Run. "interrupt me" streams
-partial text, then stalls for a second.
+partial text, then stalls for a second. "fetch_test" fetches GET /redirect (to /page) and
+/slow (3 s) with a short timeout; GET serves those pages.
 Child Runs report the exposed tools, allowing depth-limit checks.
 Each request is logged to LOGFILE as one JSON line, with a monotonic received time."""
 import http.server, json, os, shlex, sys, threading, time
@@ -22,6 +23,15 @@ LOG=open(sys.argv[2],'a')
 LOG_LOCK = threading.Lock()
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self,*a): pass
+    def do_GET(self):
+        if self.path == '/redirect':
+            self.send_response(302); self.send_header('location','/page'); self.send_header('content-length','0'); self.end_headers(); return
+        if self.path == '/slow':
+            time.sleep(3)
+        body = '<html><head><title>t</title></head><body><nav>menu</nav><main><h1>Mock page</h1><p>Accept: ' + self.headers.get('accept','') + '</p></main></body></html>'
+        self.send_response(200); self.send_header('content-type','text/html; charset=utf-8'); self.send_header('content-length',str(len(body.encode()))); self.end_headers()
+        try: self.wfile.write(body.encode())
+        except OSError: pass
     def do_POST(self):
         body=json.loads(self.rfile.read(int(self.headers['content-length'])))
         msgs=body['messages']
@@ -72,6 +82,11 @@ class H(http.server.BaseHTTPRequestHandler):
                 code = 'await Promise.all(Array.from({length: 6}, (_, i) => tools.agent({prompt: "child " + i})))'
             elif lastuser == 'delegate_probe':
                 code = 'await tools.agent({prompt: "child probe"})'
+            elif lastuser == 'fetch_test':
+                base = 'http://127.0.0.1:' + sys.argv[1]
+                code = ('const page = await tools.fetch({url: "' + base + '/redirect"});\n'
+                        'const slow = await tools.fetch({url: "' + base + '/slow", timeout_ms: 300}).catch(e => e.message);\n'
+                        '({url: page.url, status: page.status, text: page.text, slow})')
             elif lastuser == 'delegate':
                 code = 'await Promise.all([tools.agent({prompt: "child alpha"}), tools.agent({prompt: "child beta"})])'
             elif lastuser.startswith('child '):

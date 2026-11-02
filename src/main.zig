@@ -174,5 +174,10 @@ test {
     _ = @import("policy.zig");
     _ = @import("editor.zig");
     _ = @import("commands.zig");
+    _ = @import("walk.zig");
+    _ = @import("regex.zig");
+    _ = @import("grep.zig");
+    _ = @import("html.zig");
+    _ = @import("fetch.zig");
     _ = agent;
 }

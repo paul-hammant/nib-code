@@ -290,6 +290,15 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         assert read_requests(requests_path)[-2]["messages"] == kept + [{"role": "user", "content": "after interrupt"}]
         print("Interrupted Turn E2E passed: user message and streamed text are kept, and the session continues")
 
+        started = time.monotonic()
+        fetched = events(ask("--json", "fetch_test"))
+        elapsed = time.monotonic() - started
+        output = json.loads(next(e["run_end"]["output"] for e in fetched if "run_end" in e).removeprefix("result: "))
+        assert output["url"] == f"http://127.0.0.1:{port}/page" and output["status"] == 200, output
+        assert output["text"].startswith("# Mock page\n\nAccept: text/markdown") and "menu" not in output["text"], output
+        assert output["slow"] == "fetch: timed out after 300 ms" and elapsed < 2.5, (output, elapsed)
+        print(f"Fetch E2E passed: redirect, HTML to Markdown, Accept header and timeout of a stalled read ({elapsed:.2f} s)")
+
         startup = []
         for _ in range(10):
             started = time.monotonic()

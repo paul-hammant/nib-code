@@ -39,6 +39,7 @@
   - [0009 Run 内工具调用真正并发，顺序按 JS 语义](adr/0009-concurrent-tools.md)
   - [0010 子 agent：tools.agent 派生独立 nib 子进程](adr/0010-subagents.md)
   - [0011 一个 Provider 接口，两种线路协议](adr/0011-provider-wire-protocols.md)
+  - [0012 新增 grep、glob、fetch，搜索用 Zig 原生实现](adr/0012-search-and-fetch-tools.md)
 - [codex.md](codex.md)：使用本机 Codex 登录、配置与凭证边界
 
 ## 没写成 ADR 的选择
