@@ -109,6 +109,9 @@ pub fn run(init: std.process.Init, session: *agent.Session) !void {
     };
 
     try addHistory(gpa, &entries, session.history.items);
+    for (session.history.items) |m| {
+        if (std.mem.eql(u8, m.role, "user")) try input.remember(gpa, m.content orelse "");
+    }
     if (cfg.api_key.len == 0) try addEntry(gpa, &entries, .err, "no API key: set DEEPSEEK_API_KEY (or NIB_API_KEY). /js <code> still works.");
 
     while (true) {
@@ -278,7 +281,7 @@ fn isNewline(key: vaxis.Key, pasting: bool) bool {
 }
 
 /// `scroll` counts rows above the bottom and is clamped to the transcript.
-fn draw(win: vaxis.Window, entries: []const Entry, input: *const Editor, scroll: *u32, cfg: openai.Config, usage: openai.Usage, steps: u32, context: u64, busy: bool) void {
+fn draw(win: vaxis.Window, entries: []const Entry, input: *Editor, scroll: *u32, cfg: openai.Config, usage: openai.Usage, steps: u32, context: u64, busy: bool) void {
     win.clear();
     win.hideCursor();
     if (win.height < 6 or win.width < 8) return;
