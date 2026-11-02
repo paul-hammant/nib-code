@@ -23,6 +23,80 @@ const Event = union(enum) {
 const Entry = struct {
     kind: enum { user, assistant, reasoning, run_code, run_output, run_error, info, err },
     text: std.ArrayList(u8) = .empty,
+    cached: ?struct { width: u16, len: usize, rows: u16 } = null,
+
+    fn print(e: *const Entry, win: vaxis.Window, commit: bool) u16 {
+        var segs: [2]vaxis.Segment = undefined;
+        const r = win.print(segmentsFor(e, &segs), .{ .wrap = .word, .commit = commit });
+        return @max(1, r.row +| @intFromBool(r.col > 0));
+    }
+
+    fn height(e: *Entry, win: vaxis.Window) u16 {
+        if (e.cached) |c| {
+            if (c.width == win.width and c.len == e.text.items.len) return c.rows;
+        }
+        var measure = win;
+        measure.height = std.math.maxInt(u16);
+        const rows = e.print(measure, false);
+        e.cached = .{ .width = win.width, .len = e.text.items.len, .rows = rows };
+        return rows;
+    }
+};
+
+const Anchor = struct {
+    entry: usize = 0,
+    row: u16 = 0,
+
+    fn atOrAfter(a: Anchor, b: Anchor) bool {
+        return a.entry > b.entry or (a.entry == b.entry and a.row >= b.row);
+    }
+};
+
+const Viewport = struct {
+    top: ?Anchor = null,
+    pending: i64 = 0,
+
+    fn bottom(entries: []Entry, win: vaxis.Window) Anchor {
+        var i = entries.len;
+        var rows: i64 = -1;
+        while (i > 0 and rows < win.height) {
+            i -= 1;
+            rows += @as(i64, entries[i].height(win)) + 1;
+        }
+        return .{ .entry = i, .row = @intCast(@max(rows - win.height, 0)) };
+    }
+
+    fn layout(v: *Viewport, entries: []Entry, win: vaxis.Window) Anchor {
+        const end = bottom(entries, win);
+        var top = v.top orelse end;
+        if (entries.len > 0) top.row = @min(top.row, entries[top.entry].height(win));
+        var left = @abs(v.pending);
+        while (left > 0 and entries.len > 0) {
+            if (v.pending < 0) {
+                const step = @min(left, top.row);
+                top.row -= @intCast(step);
+                left -= step;
+                if (left == 0 or top.entry == 0) break;
+                top.entry -= 1;
+                top.row = entries[top.entry].height(win) +| 1;
+            } else {
+                const step = @min(left, @as(u32, entries[top.entry].height(win)) + 1 - top.row);
+                top.row += @intCast(step);
+                left -= step;
+                if (top.row <= entries[top.entry].height(win)) break;
+                if (top.entry + 1 == entries.len) break;
+                top.entry += 1;
+                top.row = 0;
+            }
+        }
+        v.pending = 0;
+        if (top.atOrAfter(end)) {
+            v.top = null;
+            return end;
+        }
+        v.top = top;
+        return top;
+    }
 };
 
 const run_output_lines = 12;
@@ -91,7 +165,7 @@ pub fn run(init: std.process.Init, session: *agent.Session) !void {
     var input: Editor = .{};
     defer input.deinit(gpa);
     var pasting = false;
-    var scroll: u32 = 0;
+    var scroll: Viewport = .{};
 
     var entries: std.ArrayList(Entry) = .empty;
     defer {
@@ -123,18 +197,18 @@ pub fn run(init: std.process.Init, session: *agent.Session) !void {
                 if (key.matches(vaxis.Key.escape, .{})) {
                     if (turn) |t| t.cancel.store(true, .release);
                 } else if (key.matches(vaxis.Key.page_up, .{})) {
-                    scroll +|= page;
+                    scroll.pending -= page;
                 } else if (key.matches(vaxis.Key.page_down, .{})) {
-                    scroll -|= page;
+                    scroll.pending += page;
                 } else if (key.matches(vaxis.Key.up, .{ .shift = true })) {
-                    scroll +|= 3;
+                    scroll.pending -= 3;
                 } else if (key.matches(vaxis.Key.down, .{ .shift = true })) {
-                    scroll -|= 3;
+                    scroll.pending += 3;
                 } else if (isNewline(key, pasting)) {
                     try input.insert(gpa, "\n");
                 } else if (key.matches(vaxis.Key.enter, .{})) {
                     if (turn != null) continue; // one Turn at a time
-                    scroll = 0;
+                    scroll = .{};
                     const line = try input.take(gpa);
                     if (line.len == 0) {
                         gpa.free(line);
@@ -280,47 +354,27 @@ fn isNewline(key: vaxis.Key, pasting: bool) bool {
         key.matches(enter, .{ .alt = true }) or key.matches('j', .{ .ctrl = true });
 }
 
-/// `scroll` counts rows above the bottom and is clamped to the transcript.
-fn draw(win: vaxis.Window, entries: []const Entry, input: *Editor, scroll: *u32, cfg: openai.Config, usage: openai.Usage, steps: u32, context: u64, busy: bool) void {
+fn draw(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewport, cfg: openai.Config, usage: openai.Usage, steps: u32, context: u64, busy: bool) void {
     win.clear();
     win.hideCursor();
     if (win.height < 6 or win.width < 8) return;
 
-    // Measuring needs a window taller than the content, or print() clips.
-    const input_rows = input.rows(win.child(.{ .x_off = 3, .y_off = -10_000 }));
+    const input_rows = input.rows(win.child(.{ .x_off = 3 }));
     const input_h: u16 = @min(input_rows, win.height / 3);
     const body_h: u16 = win.height - 1 - input_h;
     const body = win.child(.{ .x_off = 1, .width = win.width - 2, .height = body_h });
-    const tall = body.child(.{ .y_off = -10_000 });
-
-    var heights: [1024]u16 = undefined;
-    const want: i64 = @as(i64, body_h) + scroll.*;
-    var content: i64 = -1;
-    var start = entries.len;
-    while (start > 0 and entries.len - start < heights.len and content < want) {
-        start -= 1;
-        var segs: [2]vaxis.Segment = undefined;
-        const r = tall.print(segmentsFor(&entries[start], &segs), .{ .wrap = .word, .commit = false });
-        const h: u16 = if (r.col == 0 and r.row > 0) r.row else r.row + 1;
-        heights[entries.len - 1 - start] = h;
-        content += h + 1;
-    }
-    content = @max(content, 0);
-    if (content < want) scroll.* = @intCast(@max(content - body_h, 0));
-
-    var y: i64 = if (content > body_h) @as(i64, body_h) + scroll.* - content else 0;
-    for (entries[start..], start..) |*e, i| {
-        const h = heights[entries.len - 1 - i];
-        if (y < body_h and y + h > 0) {
-            var segs: [2]vaxis.Segment = undefined;
-            _ = body.child(.{ .y_off = @intCast(y), .height = h }).print(segmentsFor(e, &segs), .{ .wrap = .word });
-        }
-        y += h + 1;
+    const top = scroll.layout(entries, body);
+    var y: i32 = -@as(i32, top.row);
+    for (entries[top.entry..]) |*e| {
+        if (y >= body_h) break;
+        const h = e.height(body);
+        if (y + h > 0) _ = e.print(body.child(.{ .y_off = @intCast(y), .height = h }), true);
+        y += @as(i32, h) + 1;
     }
 
     var status_buf: [256]u8 = undefined;
-    const status = if (scroll.* > 0)
-        std.fmt.bufPrint(&status_buf, "↑ {d} rows up · PgDn / shift+↓ to return", .{scroll.*}) catch ""
+    const status = if (scroll.top != null)
+        "↑ history · PgDn / shift+↓ to return"
     else
         std.fmt.bufPrint(&status_buf, "{s} · ctx {d}% · last turn: {d} steps, in {d} (cache {d}), out {d} · {s}", .{
             cfg.model,
@@ -335,4 +389,131 @@ fn draw(win: vaxis.Window, entries: []const Entry, input: *Editor, scroll: *u32,
 
     _ = win.child(.{ .x_off = 1, .y_off = body_h + 1, .height = 1 }).printSegment(.{ .text = "› ", .style = .{ .fg = .{ .index = 4 } } }, .{});
     input.draw(win.child(.{ .x_off = 3, .y_off = body_h + 1, .height = input_h }));
+}
+
+test "draw benchmark: 5000 entries" {
+    const benchmark = std.testing.environ.getPosix("NIB_TUI_BENCH") != null;
+    const frames: u8 = if (benchmark) 32 else 1;
+    const gpa = std.testing.allocator;
+    const entries = try gpa.alloc(Entry, 5000);
+    defer gpa.free(entries);
+    const sample = "A long session entry with enough words to wrap over several lines. A long session entry with enough words to wrap over several lines. A long session entry with enough words to wrap over several lines. A long session entry with enough words to wrap over several lines. A long session entry with enough words to wrap over several lines. A long session entry with enough words to wrap over several lines. ";
+    for (entries) |*e| e.* = .{ .kind = .assistant, .text = .fromOwnedSlice(@constCast(sample)) };
+    var screen = try vaxis.Screen.init(gpa, .{ .cols = 100, .rows = 24, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(gpa);
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 100, .height = 24, .screen = &screen };
+    var input: Editor = .{};
+    defer input.deinit(gpa);
+    const cfg: openai.Config = .{ .base_url = "", .api_key = "", .model = "mock" };
+    for ([_]u32{ 0, 1200 }) |offset| {
+        var samples: [5]i96 = undefined;
+        for (&samples) |*sample_ns| {
+            var scroll: Viewport = .{ .pending = -@as(i64, offset) };
+            draw(win, entries, &input, &scroll, cfg, .{}, 0, 0, false);
+            const before = std.Io.Clock.awake.now(std.testing.io);
+            for (0..frames) |_| {
+                draw(win, entries, &input, &scroll, cfg, .{}, 0, 0, false);
+            }
+            sample_ns.* = @divTrunc(before.untilNow(std.testing.io, .awake).nanoseconds, frames);
+        }
+        std.mem.sort(i96, &samples, {}, std.sort.asc(i96));
+        if (benchmark) std.debug.print("\nTUI draw: 5000 entries, offset {d}, median {d} ns/frame\n", .{ offset, samples[2] });
+        try std.testing.expect(screen.cursor_vis);
+    }
+}
+
+test "entry height cache reuses measurements and invalidates on width or append" {
+    const gpa = std.testing.allocator;
+    var screen: vaxis.Screen = .{};
+    var win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 10, .height = 24, .screen = &screen };
+    var e: Entry = .{ .kind = .assistant };
+    defer e.text.deinit(gpa);
+    try e.text.appendSlice(gpa, "1234567890");
+    try std.testing.expectEqual(@as(u16, 1), e.height(win));
+    e.cached.?.rows = 123;
+    try std.testing.expectEqual(@as(u16, 123), e.height(win));
+    win.width = 5;
+    try std.testing.expectEqual(@as(u16, 2), e.height(win));
+    try e.text.appendSlice(gpa, "12345");
+    try std.testing.expectEqual(@as(u16, 3), e.height(win));
+}
+
+test "viewport anchors survive streaming and appended Run output then resume following" {
+    const gpa = std.testing.allocator;
+    var screen: vaxis.Screen = .{};
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 20, .height = 4, .screen = &screen };
+    var entries: std.ArrayList(Entry) = .empty;
+    defer {
+        for (entries.items) |*e| e.text.deinit(gpa);
+        entries.deinit(gpa);
+    }
+    try addEntry(gpa, &entries, .user, "one");
+    try addEntry(gpa, &entries, .assistant, "two\nthree\nfour");
+    var view: Viewport = .{ .pending = -2 };
+    const top = view.layout(entries.items, win);
+    try std.testing.expect(view.top != null);
+    try entries.items[1].text.appendSlice(gpa, "\nfive\nsix");
+    try std.testing.expectEqualDeep(top, view.layout(entries.items, win));
+    try addEntry(gpa, &entries, .run_output, "output\nmore output");
+    try std.testing.expectEqualDeep(top, view.layout(entries.items, win));
+    view.pending = 100;
+    _ = view.layout(entries.items, win);
+    try std.testing.expect(view.top == null);
+    try addEntry(gpa, &entries, .assistant, "done");
+    try std.testing.expectEqualDeep(Viewport.bottom(entries.items, win), view.layout(entries.items, win));
+}
+
+test "viewport can traverse all 5000 entries and gaps in both directions" {
+    const gpa = std.testing.allocator;
+    const entries = try gpa.alloc(Entry, 5000);
+    defer gpa.free(entries);
+    for (entries) |*e| e.* = .{ .kind = .info };
+    var screen: vaxis.Screen = .{};
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 10, .height = 4, .screen = &screen };
+    var view: Viewport = .{ .pending = -100_000 };
+    try std.testing.expectEqualDeep(Anchor{}, view.layout(entries, win));
+    view.pending = 1;
+    try std.testing.expectEqualDeep(Anchor{ .row = 1 }, view.layout(entries, win));
+    view.pending = 1;
+    try std.testing.expectEqualDeep(Anchor{ .entry = 1 }, view.layout(entries, win));
+    view.pending = -1;
+    try std.testing.expectEqualDeep(Anchor{ .row = 1 }, view.layout(entries, win));
+    view.pending = 100_000;
+    try std.testing.expectEqualDeep(Viewport.bottom(entries, win), view.layout(entries, win));
+    try std.testing.expect(view.top == null);
+}
+
+test "draw keeps scrolled body fixed while output arrives and caps input height" {
+    const gpa = std.testing.allocator;
+    var screen = try vaxis.Screen.init(gpa, .{ .cols = 100, .rows = 24, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(gpa);
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 100, .height = 24, .screen = &screen };
+    var entries: std.ArrayList(Entry) = .empty;
+    defer {
+        for (entries.items) |*e| e.text.deinit(gpa);
+        entries.deinit(gpa);
+    }
+    var paragraph: std.ArrayList(u8) = .empty;
+    defer paragraph.deinit(gpa);
+    for (0..40) |i| try paragraph.print(gpa, "line {d}\n", .{i});
+    try addEntry(gpa, &entries, .assistant, paragraph.items);
+    try addEntry(gpa, &entries, .assistant, "stream");
+    var input: Editor = .{};
+    defer input.deinit(gpa);
+    var view: Viewport = .{ .pending = -30 };
+    const cfg: openai.Config = .{ .base_url = "", .api_key = "", .model = "mock" };
+    draw(win, entries.items, &input, &view, cfg, .{}, 0, 0, true);
+    const body_before = try gpa.dupe(vaxis.Cell, screen.buf[0 .. 22 * 100]);
+    defer gpa.free(body_before);
+    try entries.items[1].text.appendSlice(gpa, "\nmore streamed text");
+    try addEntry(gpa, &entries, .run_output, "Run output");
+    draw(win, entries.items, &input, &view, cfg, .{}, 0, 0, true);
+    try std.testing.expectEqualDeep(body_before, screen.buf[0 .. 22 * 100]);
+    for (0..16) |i| try input.buf.print(gpa, "input {d}\n", .{i});
+    input.cursor = input.buf.items.len;
+    draw(win, entries.items, &input, &view, cfg, .{}, 0, 0, true);
+    try std.testing.expectEqual(@as(u16, 9), input.top_row);
+    try std.testing.expectEqual(@as(u16, 23), screen.cursor.row);
+    try std.testing.expect(screen.cursor_vis);
+    try std.testing.expectEqualStrings("i", screen.readCell(3, 16).?.char.grapheme);
 }
