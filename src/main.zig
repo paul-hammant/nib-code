@@ -11,8 +11,10 @@ pub const Config = struct {
         return .{ .llm = .{
             .api_key = env.get("NIB_API_KEY") orelse env.get("DEEPSEEK_API_KEY") orelse "",
             .base_url = env.get("NIB_BASE_URL") orelse "https://api.deepseek.com",
-            .model = env.get("NIB_MODEL") orelse "deepseek-chat",
-            .context_window = if (env.get("NIB_CONTEXT_WINDOW")) |v| std.fmt.parseInt(u64, v, 10) catch fatal("NIB_CONTEXT_WINDOW must be an integer") else 128_000,
+            .model = env.get("NIB_MODEL") orelse "deepseek-flash",
+            .context_window = if (env.get("NIB_CONTEXT_WINDOW")) |v| std.fmt.parseInt(u64, v, 10) catch fatal("NIB_CONTEXT_WINDOW must be an integer") else 1_000_000,
+            .thinking = if (env.get("NIB_THINKING")) |v| parseSwitch(v) orelse fatal("NIB_THINKING must be on or off") else null,
+            .reasoning_effort = env.get("NIB_REASONING_EFFORT"),
         } };
     }
 };
@@ -65,7 +67,10 @@ pub fn main(init: std.process.Init) !void {
     try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
 
     if (ask and cfg.llm.api_key.len == 0) fatal("set DEEPSEEK_API_KEY (or NIB_API_KEY)");
-    var session = agent.Session.init(gpa, init.io, &client, cfg.llm, options) catch |err| fatal(@errorName(err));
+    var session = agent.Session.init(gpa, init.io, &client, cfg.llm, options) catch |err| switch (err) {
+        error.NoSession => fatal("no session to continue here; start one without -c, or pass --resume <id>"),
+        else => fatal(@errorName(err)),
+    };
     defer session.deinit();
 
     if (ask) {
@@ -102,6 +107,12 @@ pub fn main(init: std.process.Init) !void {
     }
 
     try tui.run(init, &session);
+}
+
+fn parseSwitch(v: []const u8) ?bool {
+    if (std.mem.eql(u8, v, "on")) return true;
+    if (std.mem.eql(u8, v, "off")) return false;
+    return null;
 }
 
 fn fatal(msg: []const u8) noreturn {

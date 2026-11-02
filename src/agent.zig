@@ -60,6 +60,8 @@ pub const Session = struct {
     steps: u32 = 0,
     /// Next-request estimate: latest usage plus tool results, or the compacted history size.
     context_tokens: u64 = 0,
+    /// Automatic compaction is not retried until the context reaches this size.
+    compact_backoff: u64 = 0,
     tools: tools.Tools,
     log: session_log.Log = undefined,
 
@@ -111,11 +113,13 @@ pub const Session = struct {
         try s.log.commit(s.io, s.gpa, &s.history, &s.context_tokens, .{ .from = from, .messages = messages, .context_tokens = tokens, .cwd = cwd });
     }
 
-    pub fn compact(s: *Session, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
+    pub const Compaction = enum { compacted, too_few_steps, ineffective };
+
+    pub fn compact(s: *Session, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !Compaction {
         const cut = compactionCut(s.history.items, s.cfg.context_window);
         if (cut <= 1) {
             try sink.emit(sink.ctx, .{ .notice = "compaction skipped: fewer than three complete Steps" });
-            return;
+            return .too_few_steps;
         }
         const a = s.arena.allocator();
         var request: std.ArrayList(openai.Message) = .empty;
@@ -125,7 +129,10 @@ pub const Session = struct {
         const Silent = struct {
             fn delta(_: *anyopaque, _: openai.Kind, _: []const u8) !void {}
         };
-        const reply = try openai.stream(s.gpa, a, s.client, s.cfg, request.items, "[]", @intCast(@min(2048, @max(32, s.cfg.context_window / 8))), .{ .ctx = s, .onDelta = Silent.delta }, cancel, detail);
+        // Thinking would spend the small summary budget on reasoning.
+        var cfg = s.cfg;
+        cfg.thinking = false;
+        const reply = try openai.stream(s.gpa, a, s.client, cfg, request.items, "[]", @intCast(@min(2048, @max(32, s.cfg.context_window / 8))), .{ .ctx = s, .onDelta = Silent.delta }, cancel, detail);
         s.usage.add(reply.usage);
         if (cancel.load(.acquire)) return error.Canceled;
         if (reply.text.len == 0 or reply.tool_calls.len != 0) return error.InvalidSummary;
@@ -136,13 +143,29 @@ pub const Session = struct {
         const before = s.context_tokens;
         const after = estimateTokens(s.history.items[0..1]) + estimateTokens(replacement.items);
         if (after >= estimateTokens(s.history.items) or after > s.cfg.context_window / 2) {
-            detail.* = try s.gpa.dupe(u8, "compaction could not reduce context below half the window; retained Steps or system prompt are too large");
-            return error.CompactionIneffective;
+            try sink.emit(sink.ctx, .{ .notice = "compaction skipped: it would not bring context below half the window (retained Steps or system prompt are too large)" });
+            return .ineffective;
         }
         const old_len = s.history.items.len;
         try s.commit(1, replacement.items, after, null);
         const message = try std.fmt.allocPrint(a, "compacted context: {d} → {d} messages, ~{d} → ~{d} tokens", .{ old_len, s.history.items.len, before, after });
         try sink.emit(sink.ctx, .{ .notice = message });
+        return .compacted;
+    }
+
+    fn autoCompact(s: *Session, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
+        const result = s.compact(sink, cancel, detail) catch |err| switch (err) {
+            error.Canceled, error.OutOfMemory => return err,
+            else => blk: {
+                const msg = try std.fmt.allocPrint(s.arena.allocator(), "automatic compaction failed, continuing without it: {s}", .{detail.* orelse @errorName(err)});
+                if (detail.*) |d| s.gpa.free(d);
+                detail.* = null;
+                try sink.emit(sink.ctx, .{ .notice = msg });
+                break :blk .ineffective;
+            },
+        };
+        // Only a spent summary request backs off; too_few_steps resolves itself a Step later.
+        if (result == .ineffective) s.compact_backoff = s.context_tokens + s.cfg.context_window / 8;
     }
 
     pub fn turn(s: *Session, user_text: []const u8, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
@@ -154,8 +177,9 @@ pub const Session = struct {
         s.steps = 0;
 
         for (0..max_steps) |_| {
-            if (s.context_tokens + estimateTokens(pending.items) >= s.cfg.context_window - s.cfg.context_window / 4)
-                try s.compact(sink, cancel, detail);
+            const size = s.context_tokens + estimateTokens(pending.items);
+            if (size >= s.cfg.context_window - s.cfg.context_window / 4 and size >= s.compact_backoff)
+                try s.autoCompact(sink, cancel, detail);
             var request: std.ArrayList(openai.Message) = .empty;
             defer request.deinit(s.gpa);
             try request.appendSlice(s.gpa, s.history.items);
@@ -167,6 +191,7 @@ pub const Session = struct {
                 .role = "assistant",
                 .content = reply.text,
                 .tool_calls = if (reply.tool_calls.len > 0) reply.tool_calls else null,
+                .reasoning_content = if (reply.reasoning.len > 0) reply.reasoning else null,
             });
             var output_tokens: u64 = 0;
             for (reply.tool_calls) |call| {

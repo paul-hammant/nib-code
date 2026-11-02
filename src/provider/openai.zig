@@ -5,7 +5,11 @@ pub const Config = struct {
     base_url: []const u8,
     api_key: []const u8,
     model: []const u8,
-    context_window: u64 = 128_000,
+    context_window: u64 = 1_000_000,
+    /// null leaves the provider default and sends nothing, so other
+    /// OpenAI-compatible servers never see the DeepSeek-specific fields.
+    thinking: ?bool = null,
+    reasoning_effort: ?[]const u8 = null,
 };
 
 pub const ToolCall = struct {
@@ -22,6 +26,9 @@ pub const Message = struct {
     content: ?[]const u8 = null,
     tool_calls: ?[]const ToolCall = null,
     tool_call_id: ?[]const u8 = null,
+    /// DeepSeek thinking mode: with `tools` in the request, every earlier
+    /// assistant message must carry its reasoning back or the API returns 400.
+    reasoning_content: ?[]const u8 = null,
 };
 
 pub const Usage = struct {
@@ -40,6 +47,7 @@ pub const Usage = struct {
 /// Allocated with the `out` allocator passed to `stream`.
 pub const Reply = struct {
     text: []const u8,
+    reasoning: []const u8,
     tool_calls: []const ToolCall,
     usage: Usage,
 };
@@ -99,7 +107,7 @@ pub fn stream(
     defer gpa.free(url);
     const auth = try std.fmt.allocPrint(gpa, "Bearer {s}", .{cfg.api_key});
     defer gpa.free(auth);
-    const body = try requestBody(gpa, cfg.model, messages, tools_json, max_tokens);
+    const body = try requestBody(gpa, cfg, messages, tools_json, max_tokens);
     defer gpa.free(body);
 
     var req = try client.request(.POST, try std.Uri.parse(url), .{
@@ -140,6 +148,8 @@ pub fn stream(
 
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(gpa);
+    var reasoning: std.ArrayList(u8) = .empty;
+    defer reasoning.deinit(gpa);
     var calls: std.ArrayList(PartialCall) = .empty;
     defer {
         for (calls.items) |*p| p.deinit(gpa);
@@ -167,7 +177,10 @@ pub fn stream(
         if (chunk.usage) |u| usage = u;
         for (chunk.choices) |choice| {
             const d = choice.delta;
-            if (d.reasoning_content) |t| if (t.len > 0) try sink.onDelta(sink.ctx, .reasoning, t);
+            if (d.reasoning_content) |t| if (t.len > 0) {
+                try reasoning.appendSlice(gpa, t);
+                try sink.onDelta(sink.ctx, .reasoning, t);
+            };
             if (d.content) |t| if (t.len > 0) {
                 try text.appendSlice(gpa, t);
                 try sink.onDelta(sink.ctx, .text, t);
@@ -192,18 +205,28 @@ pub fn stream(
         .id = try out.dupe(u8, p.id.items),
         .function = .{ .name = try out.dupe(u8, p.name.items), .arguments = try out.dupe(u8, p.args.items) },
     };
-    return .{ .text = try out.dupe(u8, text.items), .tool_calls = tool_calls, .usage = usage };
+    return .{ .text = try out.dupe(u8, text.items), .reasoning = try out.dupe(u8, reasoning.items), .tool_calls = tool_calls, .usage = usage };
 }
 
-fn requestBody(gpa: std.mem.Allocator, model: []const u8, messages: []const Message, tools_json: []const u8, max_tokens: ?u32) ![]u8 {
+fn requestBody(gpa: std.mem.Allocator, cfg: Config, messages: []const Message, tools_json: []const u8, max_tokens: ?u32) ![]u8 {
     const opts: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
     const limit = if (max_tokens) |n| try std.fmt.allocPrint(gpa, ",\"max_tokens\":{d}", .{n}) else try gpa.dupe(u8, "");
     defer gpa.free(limit);
     const tool_field = if (std.mem.eql(u8, tools_json, "[]")) try gpa.dupe(u8, "") else try std.fmt.allocPrint(gpa, ",\"tools\":{s}", .{tools_json});
     defer gpa.free(tool_field);
+    const thinking = if (cfg.thinking) |on|
+        try std.fmt.allocPrint(gpa, ",\"thinking\":{{\"type\":\"{s}\"}}", .{if (on) "enabled" else "disabled"})
+    else
+        try gpa.dupe(u8, "");
+    defer gpa.free(thinking);
+    const effort = if (cfg.reasoning_effort != null and cfg.thinking != false)
+        try std.fmt.allocPrint(gpa, ",\"reasoning_effort\":{f}", .{std.json.fmt(cfg.reasoning_effort.?, opts)})
+    else
+        try gpa.dupe(u8, "");
+    defer gpa.free(effort);
     return std.fmt.allocPrint(gpa,
-        \\{{"model":{f},"messages":{f}{s}{s},"stream":true,"stream_options":{{"include_usage":true}}}}
-    , .{ std.json.fmt(model, opts), std.json.fmt(messages, opts), tool_field, limit });
+        \\{{"model":{f},"messages":{f}{s}{s}{s}{s},"stream":true,"stream_options":{{"include_usage":true}}}}
+    , .{ std.json.fmt(cfg.model, opts), std.json.fmt(messages, opts), tool_field, limit, thinking, effort });
 }
 
 test "chunk decodes deepseek deltas, tool call fragments and usage" {
@@ -226,16 +249,30 @@ test "request body omits null fields and absent tools" {
         .{ .role = "assistant", .content = "", .tool_calls = &.{.{ .id = "c1", .function = .{ .name = "run", .arguments = "{}" } }} },
         .{ .role = "tool", .content = "ok", .tool_call_id = "c1" },
     };
-    const body = try requestBody(gpa, "m", &msgs, "[]", null);
+    const body = try requestBody(gpa, .{ .base_url = "", .api_key = "", .model = "m" }, &msgs, "[]", null);
     defer gpa.free(body);
     try std.testing.expectEqualStrings(
         \\{"model":"m","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"run","arguments":"{}"}}]},{"role":"tool","content":"ok","tool_call_id":"c1"}],"stream":true,"stream_options":{"include_usage":true}}
     , body);
 }
 
+test "request body passes reasoning back and sends thinking only when configured" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]Message{.{ .role = "assistant", .content = "a", .reasoning_content = "r" }};
+    const on = try requestBody(gpa, .{ .base_url = "", .api_key = "", .model = "m", .thinking = true, .reasoning_effort = "max" }, &msgs, "[]", null);
+    defer gpa.free(on);
+    try std.testing.expectEqualStrings(
+        \\{"model":"m","messages":[{"role":"assistant","content":"a","reasoning_content":"r"}],"thinking":{"type":"enabled"},"reasoning_effort":"max","stream":true,"stream_options":{"include_usage":true}}
+    , on);
+    const off = try requestBody(gpa, .{ .base_url = "", .api_key = "", .model = "m", .thinking = false, .reasoning_effort = "max" }, &msgs, "[]", null);
+    defer gpa.free(off);
+    try std.testing.expect(std.mem.indexOf(u8, off, "\"thinking\":{\"type\":\"disabled\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, off, "reasoning_effort") == null);
+}
+
 test "summary request limits output and omits tools" {
     const t = std.testing;
-    const body = try requestBody(t.allocator, "m", &.{.{ .role = "user", .content = "summary" }}, "[]", 512);
+    const body = try requestBody(t.allocator, .{ .base_url = "", .api_key = "", .model = "m" }, &.{.{ .role = "user", .content = "summary" }}, "[]", 512);
     defer t.allocator.free(body);
     const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, body, .{});
     defer parsed.deinit();

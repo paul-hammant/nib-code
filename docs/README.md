@@ -35,7 +35,7 @@
   - [0005 一个 Session 一个进程](adr/0005-process-per-session.md)
   - [0006 不审批，宿主侧拒绝危险命令](adr/0006-deny-dangerous-commands.md)
   - [0007 保持 system 稳定，按完整 Step 压缩上下文](adr/0007-context-compaction.md)
-  - [0008 支持 thinking 模型，默认 deepseek-flash](adr/0008-thinking-models.md)（提议中）
+  - [0008 支持 thinking 模型，默认 deepseek-flash](adr/0008-thinking-models.md)
   - [0009 Run 内工具调用真正并发，顺序按 JS 语义](adr/0009-concurrent-tools.md)（提议中）
   - [0010 子 agent：tools.agent 派生独立 nib 子进程](adr/0010-subagents.md)（提议中）
 
@@ -53,7 +53,7 @@
 
 - **跨进程保存输入历史。** 现在只在本次会话内可翻阅。等实际使用中需要时再做。
 
-已决定但尚未实现的方向见 ADR 0008–0010（推进顺序：thinking → 工具并发 → `nib ask --json` → `tools.agent`）。其他被搁置的方案记在对应 ADR 里：系统层沙箱（[0004](adr/0004-two-layer-isolation.md)）、守护进程（[0005](adr/0005-process-per-session.md)）、跨 Run 的变量存储（[0003](adr/0003-stateless-runs.md)）、混合原生工具调用和 Python 运行时（[0002](adr/0002-run-code-only.md)）。
+已决定但尚未实现的方向见 ADR 0009–0010（推进顺序：工具并发 → `nib ask --json` → `tools.agent`）。其他被搁置的方案记在对应 ADR 里：系统层沙箱（[0004](adr/0004-two-layer-isolation.md)）、守护进程（[0005](adr/0005-process-per-session.md)）、跨 Run 的变量存储（[0003](adr/0003-stateless-runs.md)）、混合原生工具调用和 Python 运行时（[0002](adr/0002-run-code-only.md)）。
 
 ## 度量
 

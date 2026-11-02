@@ -6,7 +6,10 @@ A user message containing "bad" makes the script use TypeScript syntax;
 "fail2" makes the second request of the Turn return HTTP 500.
 Summary requests return a short fixed summary without tool calls.
 Set MOCK_PROMPT_TOKENS to override usage before compaction; summarized requests
-report a byte-based token estimate. "reject1"/"reject2" return HTTP 400 before
+report a byte-based token estimate. Thinking is on unless the request sends
+thinking.type "disabled": replies then stream reasoning_content, and like
+DeepSeek, a request with tools whose assistant messages lack reasoning_content
+gets HTTP 400. "reject1"/"reject2" return HTTP 400 before
 the first/second Step; "truncated" closes the stream without [DONE].
 Each request is logged to LOGFILE as one JSON line."""
 import http.server, json, os, sys, time
@@ -17,11 +20,15 @@ class H(http.server.BaseHTTPRequestHandler):
         body=json.loads(self.rfile.read(int(self.headers['content-length'])))
         msgs=body['messages']
         LOG.write(json.dumps({"n":len(msgs),"roles":[m['role'] for m in msgs],"has_tools":(body.get('tools') or [{}])[0].get('function',{}).get('name'),
-                              "messages":msgs,"system_has_tools_api":'const tools = {' in msgs[0].get('content','')})+"\n"); LOG.flush()
+                              "messages":msgs,"thinking":body.get('thinking'),"system_has_tools_api":'const tools = {' in msgs[0].get('content','')})+"\n"); LOG.flush()
         summary = 'max_tokens' in body and not body.get('tools')
         lastuser=[m for m in msgs if m['role']=='user'][-1]['content']
         if ('reject1' in lastuser or (msgs[-1]['role']=='tool' and 'reject2' in lastuser)) and not summary:
             self.send_response(400); self.send_header('content-type','application/json'); self.end_headers(); self.wfile.write(b'{"error":"rejected"}'); return
+        thinking = (body.get('thinking') or {}).get('type') != 'disabled'
+        if thinking and body.get('tools') and any(m['role']=='assistant' and not m.get('reasoning_content') for m in msgs):
+            self.send_response(400); self.send_header('content-type','application/json'); self.end_headers()
+            self.wfile.write(b'{"error":{"message":"The reasoning_content in the thinking mode must be passed back to the API."}}'); return
         if msgs[-1]['role']=='tool' and 'fail2' in lastuser:
             self.send_response(500); self.send_header('content-type','application/json'); self.end_headers(); self.wfile.write(b'{"error":"boom"}'); return
         self.send_response(200); self.send_header('content-type','text/event-stream'); self.send_header('transfer-encoding','chunked'); self.end_headers()
@@ -38,6 +45,7 @@ class H(http.server.BaseHTTPRequestHandler):
             code = 'const r = await tools.bash({command: "echo hello from bash; printf \'a\\\\nb\\\\nc\\\\n\' | wc -l"});\nconsole.log("exit", r.exit_code);\nr.output.trim().split("\\n")'
             if 'bad' in last['content']: code='const x: number = 1; x'
             args=json.dumps({"code":code})
+            if thinking: ev({"choices":[{"delta":{"reasoning_content":"先用 bash 看看。"}}]})
             ev({"choices":[{"delta":{"content":"我先跑一下。"}}]})
             # stream the arguments in fragments, as real providers do
             ev({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"run","arguments":""}}]}}]})
@@ -45,6 +53,7 @@ class H(http.server.BaseHTTPRequestHandler):
                 ev({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":args[i:i+7]}}]}}]})
             ev({"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":prompt_tokens(100),"completion_tokens":20,"prompt_cache_hit_tokens":64}})
         else:
+            if thinking: ev({"choices":[{"delta":{"reasoning_content":"结果出来了。"}}]})
             ev({"choices":[{"delta":{"content":"工具返回：" + last['content'].replace('\n',' | ')}}]})
             ev({"choices":[],"usage":{"prompt_tokens":prompt_tokens(150),"completion_tokens":10,"prompt_cache_hit_tokens":128}})
         if 'truncated' in lastuser:

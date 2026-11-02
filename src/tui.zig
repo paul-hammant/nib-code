@@ -229,7 +229,7 @@ pub fn run(init: std.process.Init, session: *agent.Session) !void {
                         t.thread = try std.Thread.spawn(.{}, struct {
                             fn work(task: *Turn) void {
                                 var detail: ?[]u8 = null;
-                                task.session.compact(.{ .ctx = task, .emit = Turn.emit }, &task.cancel, &detail) catch |err| {
+                                _ = task.session.compact(.{ .ctx = task, .emit = Turn.emit }, &task.cancel, &detail) catch |err| {
                                     const msg = detail orelse (task.gpa.dupe(u8, @errorName(err)) catch return);
                                     task.loop.postEvent(.{ .failed = msg }) catch task.gpa.free(msg);
                                     return;
@@ -322,6 +322,7 @@ fn addHistory(gpa: std.mem.Allocator, entries: *std.ArrayList(Entry), history: [
         if (std.mem.eql(u8, m.role, "user")) {
             try addEntry(gpa, entries, .user, content);
         } else if (std.mem.eql(u8, m.role, "assistant")) {
+            if (m.reasoning_content) |r| try addEntry(gpa, entries, .reasoning, r);
             if (content.len > 0) try addEntry(gpa, entries, .assistant, content);
             for (m.tool_calls orelse &.{}) |call| {
                 const Args = struct { code: []const u8 = "" };

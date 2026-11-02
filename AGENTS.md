@@ -5,7 +5,7 @@
 - 构建：`zig build`；测试：`zig build test --summary all`
 - 运行：`./zig-out/bin/nib`（TUI）、`nib ask '<prompt>'`、`nib js '<code>'`；TUI 用 `/compact` 手动压缩上下文。
 - 恢复：`nib -c` / `nib --continue` 继续当前目录最近的会话；`nib --resume <32位小写十六进制ID>` 指定会话；`ask` 也支持这些选项，放在 prompt 前后均可。
-- 环境变量：`DEEPSEEK_API_KEY`（或 `NIB_API_KEY`）、`NIB_BASE_URL`、`NIB_MODEL`、`NIB_CONTEXT_WINDOW`（默认 128000）
+- 环境变量：`DEEPSEEK_API_KEY`（或 `NIB_API_KEY`）、`NIB_BASE_URL`、`NIB_MODEL`、`NIB_CONTEXT_WINDOW`（默认 1000000）、`NIB_THINKING`（`on`/`off`，不设则用服务端默认）、`NIB_REASONING_EFFORT`（如 `low`/`high`/`max`）。默认模型 `deepseek-flash`
 
 **代码的读者是 agent。** 不写复述代码、解释思路或记录改动历史的注释；过时的注释比没有注释更容易误导模型。只在代码表达不了、不知道就会改错的地方写一行：外部限制、协议怪癖、内存归属、并发不变量。含义靠命名、类型和测试承载；给人看的解释写进 `docs/`。
 
