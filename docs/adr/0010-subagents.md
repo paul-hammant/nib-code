@@ -28,6 +28,12 @@ Run 里可以调用 `await tools.agent({ prompt })`。每个子 agent 是一个�
 
 子进程启动至 start 事件（10 次，含 Session 日志同步，不含模型请求/TLS）：Debug 中位数 11.82 ms，范围 8.82–19.83 ms；ReleaseFast 中位数 1.30 ms，范围 0.85–1.48 ms。测量脚本采用相同的当前可执行文件、stdin 和深度环境变量。路径锁、深度及取消均不提供系统层隔离；父进程直接被 SIGKILL 时无法执行清理。真实 HTTPS 握手尚未测量，不能把本地 HTTP 测量当成真实模型延迟。
 
+**真实 API 验证（2026-11-01，`deepseek-flash`，ReleaseFast）：** 任务是"派两个子 agent 并行：一个总结 src/js.zig 的并发设计，一个总结 src/tools.zig 的工具表设计，最后合并成一段话"。
+- 模型自己在一段脚本里写出 `Promise.all([tools.agent(...), tools.agent(...)])`，并把两个结果整理成结构化对象返回，父会话只用 2 个 Step。
+- 用量：整个 Turn 输入 46,283 token（缓存命中 25,216，约 54%），输出 2,472。两个子 agent 输入 19,607 + 21,349，约占 89%，主要花在读入 18–28 KB 的源文件并在多个 Step 中重复携带。按 flash 价格不到 1 美分。
+- 结果质量：抽查代码确认了 20 ms 等待、`root_only` 与 `makeApi(depth)` 过滤、16 KB 截断、5 分钟超时等说法；有一处错误（把 "still awaiting something that can never settle" 说成"仍在校验中"类错误），父会话没有发现。子 agent 的结果可用，但不是不会错。
+- 观察到的缺口：`nib ask` 在子 agent 运行期间没有进度显示（开始/结束、步数、token），长任务时用户无法知道发生了什么。
+
 **何时重新考虑：**
 - 出现子 agent 需要在中途与父会话交流的真实任务：考虑常驻子 agent 加消息；
 - 子进程的启动加握手开销在实测中占比明显：考虑同进程方案或连接复用。

@@ -16,6 +16,8 @@ date: 2026-11-01
 
 **验证（2026-11-01，本地 mock，未连真实 API）：** `scripts/mock_llm.py` 按官方规则实现：带 tools 的请求里只要有 assistant 消息缺 `reasoning_content` 就返回 400。nib 的多步 Turn、恢复、压缩（`scripts/test_session.py`）都在这条规则下通过；手工构造缺失推理的请求确认 mock 会拒绝；摘要请求实际发出 `thinking: disabled`。
 
+**真实 API 验证（2026-11-01，`deepseek-flash`，thinking 默认开启，未设 `NIB_THINKING`）：** 一个派两个子 agent 的任务，父会话 2 个 Step、两个子会话各多个 Step，每个请求都带 tools 并回传 `reasoning_content`，全程没有 400。这是回传规则的第一份真实证据；`deepseek-chat` 的现状仍未查证。
+
 **已知局限：** 这次改动之前写下的 Session log 里，assistant 消息没有 `reasoning_content`。用 thinking 模型 `--continue` 这类旧会话，预计会被 API 以 400 拒绝，需要开新会话（或 `NIB_THINKING=off`）。
 
 **何时重新考虑：**
