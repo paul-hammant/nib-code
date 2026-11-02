@@ -4,6 +4,7 @@ const js = @import("js.zig");
 const agent = @import("agent.zig");
 const openai = @import("provider/openai.zig");
 const Editor = @import("editor.zig").Editor;
+const markdown = @import("markdown.zig");
 
 const Event = union(enum) {
     key_press: vaxis.Key,
@@ -26,6 +27,7 @@ const Entry = struct {
     cached: ?struct { width: u16, len: usize, rows: u16 } = null,
 
     fn print(e: *const Entry, win: vaxis.Window, commit: bool) u16 {
+        if (e.kind == .assistant) return markdown.print(win, e.text.items, commit);
         var segs: [2]vaxis.Segment = undefined;
         const r = win.print(segmentsFor(e, &segs), .{ .wrap = .word, .commit = commit });
         return @max(1, r.row +| @intFromBool(r.col > 0));
