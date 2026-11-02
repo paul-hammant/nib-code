@@ -760,14 +760,16 @@ fn draw(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewport, 
     const status_buf = &text.status;
     const activity_buf = &text.activity;
     const doing: []const u8 = if (busy) |b|
-        std.fmt.bufPrint(activity_buf, "{s} {s} {d}s · esc to cancel", .{ spinner[(b.ms / 100) % spinner.len], @tagName(b.phase), b.ms / 1000 }) catch ""
+        std.fmt.bufPrint(activity_buf, "{s} {s} {d}s", .{ spinner[(b.ms / 100) % spinner.len], @tagName(b.phase), b.ms / 1000 }) catch ""
     else
-        "shift+enter newline · ctrl+o expand runs · ctrl-c quit";
+        "";
+    const separator: []const u8 = if (doing.len > 0) " · " else "";
     const status = if (scroll.top != null)
-        std.fmt.bufPrint(status_buf, "{s} · ↑ history · PgDn / wheel to return", .{if (busy != null) doing else "idle"}) catch ""
+        std.fmt.bufPrint(status_buf, "{s}{s}↑ history", .{ doing, separator }) catch ""
     else
-        std.fmt.bufPrint(status_buf, "{s} · {s} · effort {s} · ctx {d}% · last turn: {d} steps, in {d} (cache {d}), out {d}", .{
+        std.fmt.bufPrint(status_buf, "{s}{s}{s} · effort {s} · ctx {d}% · last turn: {d} steps, in {d} (cache {d}), out {d}", .{
             doing,
+            separator,
             cfg.model,
             cfg.effectiveEffort(),
             context * 100 / @max(cfg.context_window, 1),
