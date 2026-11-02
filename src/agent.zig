@@ -4,6 +4,8 @@ const std = @import("std");
 const js = @import("js.zig");
 const tools = @import("tools.zig");
 const openai = @import("provider/openai.zig");
+const session_log = @import("log.zig");
+const instructions = @import("instructions.zig");
 
 pub const Event = union(enum) {
     /// Slices are valid only during the callback.
@@ -59,57 +61,87 @@ pub const Session = struct {
     /// Prompt + completion tokens of the latest Step: what the next request starts from.
     context_tokens: u64 = 0,
     tools: tools.Tools,
+    log: session_log.Log = undefined,
 
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, client: *std.http.Client, cfg: openai.Config, home: []const u8) !Session {
+    pub const Options = struct { home: []const u8, data_home: []const u8, config_home: []const u8, resume_id: ?[]const u8 = null, continue_latest: bool = false };
+
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, client: *std.http.Client, cfg: openai.Config, options: Options) !Session {
         var s: Session = .{
             .gpa = gpa,
             .io = io,
             .client = client,
             .cfg = cfg,
             .arena = .init(gpa),
-            .tools = .{ .io = io, .home = home },
+            .tools = .{ .io = io, .home = options.home },
         };
         errdefer s.arena.deinit();
+        errdefer s.history.deinit(gpa);
         const a = s.arena.allocator();
         const cwd = try std.process.currentPathAlloc(io, a);
-        const system = try std.fmt.allocPrint(a, system_template, .{ cwd, tools.docs });
-        try s.history.append(gpa, .{ .role = "system", .content = system });
+        const directory = try std.fs.path.join(a, &.{ options.data_home, "nib/sessions" });
+        try std.Io.Dir.cwd().createDirPath(io, directory);
+        if (options.resume_id != null or options.continue_latest) {
+            const path = if (options.resume_id) |id| blk: {
+                if (id.len != 32 or std.mem.indexOfNone(u8, id, "0123456789abcdef") != null) return error.InvalidSessionId;
+                break :blk try std.fmt.allocPrint(a, "{s}/{s}.jsonl", .{ directory, id });
+            } else try session_log.latest(io, a, directory, cwd);
+            s.log = try session_log.Log.restore(io, gpa, a, path, &s.history, &s.context_tokens);
+        } else {
+            var random: [16]u8 = undefined;
+            io.random(&random);
+            const path = try std.fmt.allocPrint(a, "{s}/{s}.jsonl", .{ directory, std.fmt.bytesToHex(random, .lower) });
+            s.log = try session_log.Log.create(io, path);
+            errdefer s.log.close(io);
+            const base = try std.fmt.allocPrint(a, system_template, .{ cwd, tools.docs });
+            const global = try std.fs.path.join(a, &.{ options.config_home, "nib/AGENTS.md" });
+            const project = try std.fs.path.join(a, &.{ try instructions.projectRoot(io, a, cwd), "AGENTS.md" });
+            const system = try instructions.append(io, a, base, global, project);
+            try s.commit(0, &.{.{ .role = "system", .content = system }}, 0, cwd);
+        }
         return s;
     }
 
     pub fn deinit(s: *Session) void {
+        s.log.close(s.io);
         s.history.deinit(s.gpa);
         s.arena.deinit();
     }
 
-    /// On failure, history is rolled back to the end of the last complete Step,
-    /// or to before the user message if none completed.
+    fn commit(s: *Session, from: usize, messages: []const openai.Message, tokens: u64, cwd: ?[]const u8) !void {
+        try s.log.commit(s.io, s.gpa, &s.history, &s.context_tokens, .{ .from = from, .messages = messages, .context_tokens = tokens, .cwd = cwd });
+    }
+
     pub fn turn(s: *Session, user_text: []const u8, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
         const a = s.arena.allocator();
-        const before = s.history.items.len;
-        try s.history.append(s.gpa, .{ .role = "user", .content = try a.dupe(u8, user_text) });
-        var safe = before;
+        var pending: std.ArrayList(openai.Message) = .empty;
+        defer pending.deinit(s.gpa);
+        try pending.append(s.gpa, .{ .role = "user", .content = try a.dupe(u8, user_text) });
         s.usage = .{};
         s.steps = 0;
-        errdefer s.history.shrinkRetainingCapacity(safe);
 
         for (0..max_steps) |_| {
-            const reply = try s.complete(sink, cancel, detail);
+            var request: std.ArrayList(openai.Message) = .empty;
+            defer request.deinit(s.gpa);
+            try request.appendSlice(s.gpa, s.history.items);
+            try request.appendSlice(s.gpa, pending.items);
+            const reply = try s.complete(request.items, sink, cancel, detail);
             s.usage.add(reply.usage);
             s.steps += 1;
-            s.context_tokens = reply.usage.prompt_tokens + reply.usage.completion_tokens;
-            try s.history.append(s.gpa, .{
+            try pending.append(s.gpa, .{
                 .role = "assistant",
                 .content = reply.text,
                 .tool_calls = if (reply.tool_calls.len > 0) reply.tool_calls else null,
             });
-            if (reply.tool_calls.len == 0) return;
-
+            var output_tokens: u64 = 0;
             for (reply.tool_calls) |call| {
                 const result = try s.execute(call, sink, cancel);
-                try s.history.append(s.gpa, .{ .role = "tool", .content = result, .tool_call_id = call.id });
+                try pending.append(s.gpa, .{ .role = "tool", .content = result, .tool_call_id = call.id });
+                output_tokens += result.len / 3 + 1;
             }
-            safe = s.history.items.len;
+            const tokens = reply.usage.prompt_tokens + reply.usage.completion_tokens + output_tokens;
+            try s.commit(s.history.items.len, pending.items, tokens, null);
+            pending.clearRetainingCapacity();
+            if (reply.tool_calls.len == 0) return;
             if (cancel.load(.acquire)) return error.Canceled;
         }
         detail.* = try std.fmt.allocPrint(s.gpa, "stopped after {d} steps", .{max_steps});
@@ -118,7 +150,7 @@ pub const Session = struct {
 
     /// Retries transient failures, but only while nothing has been streamed:
     /// a retry after partial output would duplicate it in the frontend.
-    fn complete(s: *Session, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !openai.Reply {
+    fn complete(s: *Session, messages: []const openai.Message, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !openai.Reply {
         const Forward = struct {
             sink: Sink,
             emitted: bool = false,
@@ -132,7 +164,7 @@ pub const Session = struct {
         while (true) : (attempt += 1) {
             var fwd: Forward = .{ .sink = sink };
             const provider_sink: openai.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta };
-            return openai.stream(s.gpa, s.arena.allocator(), s.client, s.cfg, s.history.items, tools_json, provider_sink, cancel, detail) catch |err| {
+            return openai.stream(s.gpa, s.arena.allocator(), s.client, s.cfg, messages, tools_json, null, provider_sink, cancel, detail) catch |err| {
                 if (fwd.emitted or attempt == max_attempts or !transient(err) or cancel.load(.acquire)) return err;
                 const delay_ms = @as(u64, 1000) << @intCast(attempt - 1);
                 try sink.emit(sink.ctx, .{ .retry = .{ .attempt = attempt, .delay_ms = delay_ms, .reason = detail.* orelse @errorName(err) } });
@@ -226,4 +258,37 @@ test "system prompt documents every tool in JavaScript" {
         defer gpa.free(call);
         try std.testing.expect(std.mem.indexOf(u8, prompt, call) != null);
     }
+}
+
+test "failed Turn leaves replay equal to in-memory safe history" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var client: std.http.Client = .{ .allocator = t.allocator, .io = t.io };
+    defer client.deinit();
+    const cfg: openai.Config = .{ .base_url = "invalid://local", .api_key = "mock", .model = "mock" };
+    var session = try Session.init(t.allocator, t.io, &client, cfg, .{ .home = root, .data_home = root, .config_home = root });
+    defer session.deinit();
+    var cancel: std.atomic.Value(bool) = .init(true);
+    var detail: ?[]u8 = null;
+    defer if (detail) |d| t.allocator.free(d);
+    const Quiet = struct {
+        fn emit(_: *anyopaque, _: Event) !void {}
+    };
+    var ctx: u8 = 0;
+    const result = session.turn("not committed", .{ .ctx = &ctx, .emit = Quiet.emit }, &cancel, &detail);
+    try t.expectError(error.UnsupportedUriScheme, result);
+    const directory = try std.fs.path.join(a, &.{ root, "nib/sessions" });
+    const cwd = try std.process.currentPathAlloc(t.io, a);
+    const path = try session_log.latest(t.io, a, directory, cwd);
+    const data = try std.Io.Dir.cwd().readFileAlloc(t.io, path, a, .unlimited);
+    var restored: std.ArrayList(openai.Message) = .empty;
+    var tokens: u64 = 0;
+    try session_log.replay(a, a, data, &restored, &tokens);
+    try t.expectEqualDeep(session.history.items, restored.items);
+    try t.expectEqual(session.context_tokens, tokens);
 }

@@ -90,6 +90,7 @@ pub fn stream(
     cfg: Config,
     messages: []const Message,
     tools_json: []const u8,
+    max_tokens: ?u32,
     sink: Sink,
     cancel: *const std.atomic.Value(bool),
     detail: *?[]u8,
@@ -98,7 +99,7 @@ pub fn stream(
     defer gpa.free(url);
     const auth = try std.fmt.allocPrint(gpa, "Bearer {s}", .{cfg.api_key});
     defer gpa.free(auth);
-    const body = try requestBody(gpa, cfg.model, messages, tools_json);
+    const body = try requestBody(gpa, cfg.model, messages, tools_json, max_tokens);
     defer gpa.free(body);
 
     var req = try client.request(.POST, try std.Uri.parse(url), .{
@@ -125,7 +126,7 @@ pub fn stream(
     const reader = response.reader(buf);
 
     if (response.head.status.class() != .success) {
-        const status = @intFromEnum(response.head.status);
+        const status = @backingInt(response.head.status);
         const text = reader.allocRemaining(gpa, .limited(64 * 1024)) catch "";
         defer if (text.len > 0) gpa.free(text);
         detail.* = try std.fmt.allocPrint(gpa, "HTTP {d}: {s}", .{ status, text });
@@ -186,11 +187,15 @@ pub fn stream(
     return .{ .text = try out.dupe(u8, text.items), .tool_calls = tool_calls, .usage = usage };
 }
 
-fn requestBody(gpa: std.mem.Allocator, model: []const u8, messages: []const Message, tools_json: []const u8) ![]u8 {
+fn requestBody(gpa: std.mem.Allocator, model: []const u8, messages: []const Message, tools_json: []const u8, max_tokens: ?u32) ![]u8 {
     const opts: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
+    const limit = if (max_tokens) |n| try std.fmt.allocPrint(gpa, ",\"max_tokens\":{d}", .{n}) else try gpa.dupe(u8, "");
+    defer gpa.free(limit);
+    const tool_field = if (std.mem.eql(u8, tools_json, "[]")) try gpa.dupe(u8, "") else try std.fmt.allocPrint(gpa, ",\"tools\":{s}", .{tools_json});
+    defer gpa.free(tool_field);
     return std.fmt.allocPrint(gpa,
-        \\{{"model":{f},"messages":{f},"tools":{s},"stream":true,"stream_options":{{"include_usage":true}}}}
-    , .{ std.json.fmt(model, opts), std.json.fmt(messages, opts), tools_json });
+        \\{{"model":{f},"messages":{f}{s}{s},"stream":true,"stream_options":{{"include_usage":true}}}}
+    , .{ std.json.fmt(model, opts), std.json.fmt(messages, opts), tool_field, limit });
 }
 
 test "chunk decodes deepseek deltas, tool call fragments and usage" {
@@ -213,9 +218,9 @@ test "request body omits null fields and embeds tools verbatim" {
         .{ .role = "assistant", .content = "", .tool_calls = &.{.{ .id = "c1", .function = .{ .name = "run", .arguments = "{}" } }} },
         .{ .role = "tool", .content = "ok", .tool_call_id = "c1" },
     };
-    const body = try requestBody(gpa, "m", &msgs, "[]");
+    const body = try requestBody(gpa, "m", &msgs, "[]", null);
     defer gpa.free(body);
     try std.testing.expectEqualStrings(
-        \\{"model":"m","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"run","arguments":"{}"}}]},{"role":"tool","content":"ok","tool_call_id":"c1"}],"tools":[],"stream":true,"stream_options":{"include_usage":true}}
+        \\{"model":"m","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"run","arguments":"{}"}}]},{"role":"tool","content":"ok","tool_call_id":"c1"}],"stream":true,"stream_options":{"include_usage":true}}
     , body);
 }

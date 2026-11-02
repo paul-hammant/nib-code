@@ -13,7 +13,7 @@ class H(http.server.BaseHTTPRequestHandler):
         body=json.loads(self.rfile.read(int(self.headers['content-length'])))
         msgs=body['messages']
         LOG.write(json.dumps({"n":len(msgs),"roles":[m['role'] for m in msgs],"has_tools":body.get('tools',[{}])[0].get('function',{}).get('name'),
-                              "system_has_tools_api":'const tools = {' in msgs[0].get('content','')})+"\n"); LOG.flush()
+                              "messages":msgs,"system_has_tools_api":'const tools = {' in msgs[0].get('content','')})+"\n"); LOG.flush()
         lastuser=[m for m in msgs if m['role']=='user'][-1]['content']
         if msgs[-1]['role']=='tool' and 'fail2' in lastuser:
             self.send_response(500); self.send_header('content-type','application/json'); self.end_headers(); self.wfile.write(b'{"error":"boom"}'); return
