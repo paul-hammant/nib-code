@@ -38,12 +38,14 @@
   - [0008 支持 thinking 模型，默认 deepseek-flash](adr/0008-thinking-models.md)
   - [0009 Run 内工具调用真正并发，顺序按 JS 语义](adr/0009-concurrent-tools.md)
   - [0010 子 agent：tools.agent 派生独立 nib 子进程](adr/0010-subagents.md)
+  - [0011 一个 Provider 接口，两种线路协议](adr/0011-provider-wire-protocols.md)
+- [codex.md](codex.md)：使用本机 Codex 登录、配置与凭证边界
 
 ## 没写成 ADR 的选择
 
 这些容易撤回，记一笔即可：
 
-- Provider 先只做 OpenAI 兼容的 Chat Completions，测试用 DeepSeek（用户偏好，不用 Claude 测试）。接 Anthropic 原生协议时，`sse.zig` 可复用。
+- Provider 支持 Chat Completions（默认 DeepSeek）与 Codex Responses，见 [0011](adr/0011-provider-wire-protocols.md)。
 - TUI 用 libvaxis。操作：PgUp/PgDn 翻半屏，shift+↑↓ 滚 3 行；向上翻看时视口按顶部条目锚定，新内容到达不推移画面，回到底部后恢复跟随。输入框中 shift+enter / alt+enter / ctrl+j 换行，粘贴内容中的回车不会提交；光标在首行按 ↑、末行按 ↓ 翻阅本次会话的输入历史（不跨进程保存）。assistant 文本渲染基础 Markdown：代码围栏（含未闭合的）、行内代码、粗体、标题。
 - 会话持久化、恢复和项目指令已实现（2026-11-01，一手源码：`src/agent.zig`、`src/log.zig`、`src/instructions.zig`、`src/main.zig`）。日志按完整 Step 同步落盘；详细行为见根目录 [AGENTS.md](../AGENTS.md)，端到端检查可运行 `zig build` 后执行 `python3 scripts/test_session.py`。
 

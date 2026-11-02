@@ -5,7 +5,7 @@ date: 2026-11-01
 
 # 支持 thinking 模型，默认模型改为 deepseek-flash
 
-默认模型从 `deepseek-chat` 改为 `deepseek-flash`，`context_window` 默认改为 1M。assistant 消息保存 `reasoning_content`，此后每次请求原样回传。thinking 开关和 `reasoning_effort` 做成配置（`NIB_THINKING=on|off`、`NIB_REASONING_EFFORT`）；不配置时请求里不出现这两个字段，由服务端用默认值，其他 OpenAI 兼容服务也不会收到不认识的参数。压缩的摘要请求固定关闭 thinking，否则推理会占掉很小的摘要输出预算。
+默认模型从 `deepseek-chat` 改为 `deepseek-flash`，`context_window` 默认改为 1M。assistant 消息保存带 provider 标记的 reasoning 数据（Chat Completions 对应 `reasoning_content`），此后每次请求原样回传。thinking 开关和 `reasoning_effort` 做成配置（`NIB_THINKING=on|off`、`NIB_REASONING_EFFORT`）；不配置时请求里不出现这两个字段，由服务端用默认值，其他 OpenAI 兼容服务也不会收到不认识的参数。压缩的摘要请求固定关闭 thinking，否则推理会占掉很小的摘要输出预算。
 
 **为什么：** DeepSeek 当前的模型是 `deepseek-flash` 和 `deepseek-v4-pro`，thinking 默认开启。官方文档要求：请求带 `tools` 时，`reasoning_content` 必须在之后**所有**请求中完整回传（包括没有调用工具的轮次、跨用户轮次），否则返回 400。nib 每次请求都带 tools，而现在推理内容只用于显示、不进 history，切到新模型后会出错。
 

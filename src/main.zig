@@ -1,22 +1,15 @@
 const std = @import("std");
 const js = @import("js.zig");
-const openai = @import("provider/openai.zig");
+const provider = @import("provider.zig");
 const tui = @import("tui.zig");
 const JsonEvent = @import("events.zig").JsonEvent;
 const agent = @import("agent.zig");
 
 pub const Config = struct {
-    llm: openai.Config,
+    llm: provider.Config,
 
-    fn fromEnv(env: *const std.process.Environ.Map) !Config {
-        return .{ .llm = .{
-            .api_key = env.get("NIB_API_KEY") orelse env.get("DEEPSEEK_API_KEY") orelse "",
-            .base_url = env.get("NIB_BASE_URL") orelse "https://api.deepseek.com",
-            .model = env.get("NIB_MODEL") orelse "deepseek-flash",
-            .context_window = if (env.get("NIB_CONTEXT_WINDOW")) |v| std.fmt.parseInt(u64, v, 10) catch return error.InvalidContextWindow else 1_000_000,
-            .thinking = if (env.get("NIB_THINKING")) |v| parseSwitch(v) orelse return error.InvalidThinking else null,
-            .reasoning_effort = env.get("NIB_REASONING_EFFORT"),
-        } };
+    fn fromEnv(a: std.mem.Allocator, env: *const std.process.Environ.Map) !Config {
+        return .{ .llm = try provider.Config.fromEnv(a, env) };
     }
 };
 
@@ -34,16 +27,16 @@ pub fn main(init: std.process.Init) void {
     } else false;
     run(init, args, &out.interface, json, &detail, &failure) catch |err| {
         if (json) {
-            failure.message = detail orelse @errorName(err);
+            failure.message = detail orelse errorMessage(err);
             JsonEvent.write(.{ .@"error" = failure }, &out.interface) catch {};
-        } else std.debug.print("nib: {s}\n", .{detail orelse @errorName(err)});
+        } else std.debug.print("nib: {s}\n", .{detail orelse errorMessage(err)});
         std.process.exit(1);
     };
 }
 
 fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer, json: bool, detail: *?[]u8, failure: *JsonEvent.Failure) !void {
     const gpa = init.gpa;
-    const cfg = try Config.fromEnv(init.environ_map);
+    var cfg = try Config.fromEnv(init.arena.allocator(), init.environ_map);
     if (args.len >= 3 and std.mem.eql(u8, args[1], "js")) {
         const r = try js.eval(gpa, init.io, args[2], .{}, null, null);
         defer r.deinit(gpa);
@@ -61,6 +54,7 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
         .data_home = init.environ_map.get("XDG_DATA_HOME") orelse try std.fs.path.join(init.arena.allocator(), &.{ init.environ_map.get("HOME") orelse "", ".local/share" }),
         .config_home = init.environ_map.get("XDG_CONFIG_HOME") orelse try std.fs.path.join(init.arena.allocator(), &.{ init.environ_map.get("HOME") orelse "", ".config" }),
     };
+    var agent_input = false;
     var ask = false;
     var prompt: ?[]const u8 = null;
     var i: usize = 1;
@@ -68,6 +62,8 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
         const arg = args[i];
         if (!ask and std.mem.eql(u8, arg, "ask")) {
             ask = true;
+        } else if (ask and std.mem.eql(u8, arg, "--agent-input")) {
+            agent_input = true;
         } else if (ask and std.mem.eql(u8, arg, "--json")) {} else if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--continue")) {
             options.continue_latest = true;
         } else if (std.mem.eql(u8, arg, "--resume")) {
@@ -85,7 +81,14 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
     defer client.deinit();
     try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
 
-    if (ask and cfg.llm.api_key.len == 0) return error.MissingApiKey;
+    if (agent_input) {
+        var input = std.Io.File.stdin().reader(init.io, &.{});
+        const data = try input.interface.allocRemaining(init.arena.allocator(), .unlimited);
+        const envelope = try std.json.parseFromSliceLeaky(struct { prompt: []const u8, config: provider.Config }, init.arena.allocator(), data, .{});
+        cfg.llm = envelope.config;
+        prompt = envelope.prompt;
+    }
+    if (ask and cfg.llm.missingKey()) return error.MissingApiKey;
     var session = try agent.Session.init(gpa, init.io, &client, cfg.llm, options);
     defer session.deinit();
     defer {
@@ -113,7 +116,7 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
                 }
             }
         };
-        if (std.mem.eql(u8, prompt.?, "-")) {
+        if (!agent_input and std.mem.eql(u8, prompt.?, "-")) {
             var input = std.Io.File.stdin().reader(init.io, &.{});
             prompt = try input.interface.allocRemaining(init.arena.allocator(), .unlimited);
         }
@@ -149,15 +152,18 @@ fn onSignal(_: std.posix.SIG) callconv(.c) void {
     ask_cancel.store(true, .release);
 }
 
-fn parseSwitch(v: []const u8) ?bool {
-    if (std.mem.eql(u8, v, "on")) return true;
-    if (std.mem.eql(u8, v, "off")) return false;
-    return null;
+fn errorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.SessionProviderMismatch => "Cannot resume this session with a different provider; use its original NIB_PROVIDER or start a new session.",
+        error.SessionModelMismatch => "Cannot resume this Codex session with a different model; set NIB_MODEL to its original model or start a new session.",
+        error.UnknownCodexModelContextWindow => "Unknown Codex model context window; set NIB_CONTEXT_WINDOW explicitly (see pi model catalog).",
+        else => @errorName(err),
+    };
 }
 
 test {
     _ = js;
-    _ = openai;
+    _ = provider;
     _ = @import("sse.zig");
     _ = @import("tools.zig");
     _ = @import("policy.zig");

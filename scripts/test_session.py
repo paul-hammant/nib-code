@@ -28,7 +28,13 @@ def replay(path):
             continue
         if record.get("repair"):
             continue
-        history[record["from"]:] = record["messages"]
+        messages = [dict(message) for message in record["messages"]]
+        for message in messages:
+            if "reasoning" in message:
+                reasoning = message.pop("reasoning")
+                assert reasoning["provider"] == "chat_completions"
+                message["reasoning_content"] = reasoning["data"]
+        history[record["from"]:] = messages
         records.append(record)
     return history, records
 
@@ -52,9 +58,9 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-    env = dict(os.environ, NIB_API_KEY="mock", NIB_BASE_URL=f"http://127.0.0.1:{port}",
+    env = dict(os.environ, NIB_PROVIDER="chat_completions", NIB_API_KEY="mock", NIB_BASE_URL=f"http://127.0.0.1:{port}",
                NIB_CONTEXT_WINDOW="128000", XDG_DATA_HOME=str(tmp / "data"),
-               XDG_CONFIG_HOME=str(tmp / "config"), HOME=str(tmp))
+               XDG_CONFIG_HOME=str(tmp / "config"), CODEX_HOME=str(tmp / "codex"), HOME=str(tmp))
     server = subprocess.Popen(["python3", str(ROOT / "scripts/mock_llm.py"), str(port), str(requests_path)],
                               env=dict(env, MOCK_PROMPT_TOKENS="3300"), stdout=subprocess.DEVNULL)
     try:

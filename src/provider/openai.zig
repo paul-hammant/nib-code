@@ -1,64 +1,12 @@
 const std = @import("std");
 const sse = @import("../sse.zig");
 
-pub const Config = struct {
-    base_url: []const u8,
-    api_key: []const u8,
-    model: []const u8,
-    context_window: u64 = 1_000_000,
-    /// null leaves the provider default and sends nothing, so other
-    /// OpenAI-compatible servers never see the DeepSeek-specific fields.
-    thinking: ?bool = null,
-    reasoning_effort: ?[]const u8 = null,
-};
-
-pub const ToolCall = struct {
-    id: []const u8,
-    type: []const u8 = "function",
-    function: struct {
-        name: []const u8,
-        arguments: []const u8,
-    },
-};
-
-pub const Message = struct {
-    role: []const u8,
-    content: ?[]const u8 = null,
-    tool_calls: ?[]const ToolCall = null,
-    tool_call_id: ?[]const u8 = null,
-    /// DeepSeek thinking mode: with `tools` in the request, every earlier
-    /// assistant message must carry its reasoning back or the API returns 400.
-    reasoning_content: ?[]const u8 = null,
-};
-
-pub const Usage = struct {
-    prompt_tokens: u64 = 0,
-    completion_tokens: u64 = 0,
-    /// DeepSeek reports prompt-cache hits under this name.
-    prompt_cache_hit_tokens: u64 = 0,
-
-    pub fn add(u: *Usage, other: Usage) void {
-        u.prompt_tokens += other.prompt_tokens;
-        u.completion_tokens += other.completion_tokens;
-        u.prompt_cache_hit_tokens += other.prompt_cache_hit_tokens;
-    }
-};
-
-/// Allocated with the `out` allocator passed to `stream`.
-pub const Reply = struct {
-    text: []const u8,
-    reasoning: []const u8,
-    tool_calls: []const ToolCall,
-    usage: Usage,
-};
-
-pub const Kind = enum { text, reasoning };
-
-pub const Sink = struct {
-    ctx: *anyopaque,
-    onDelta: *const fn (ctx: *anyopaque, kind: Kind, text: []const u8) anyerror!void,
-};
-
+const Config = @import("../provider.zig").Config;
+const Message = @import("../provider.zig").Message;
+const ToolCall = @import("../provider.zig").ToolCall;
+const Usage = @import("../provider.zig").Usage;
+const Reply = @import("../provider.zig").Reply;
+const Sink = @import("../provider.zig").Sink;
 const Chunk = struct {
     choices: []const struct {
         delta: struct {
@@ -74,7 +22,12 @@ const Chunk = struct {
             } = &.{},
         } = .{},
     } = &.{},
-    usage: ?Usage = null,
+    usage: ?struct {
+        prompt_tokens: u64 = 0,
+        completion_tokens: u64 = 0,
+        prompt_cache_hit_tokens: u64 = 0,
+        prompt_tokens_details: ?struct { cached_tokens: u64 = 0 } = null,
+    } = null,
 };
 
 const PartialCall = struct {
@@ -174,7 +127,7 @@ pub fn stream(
         const chunk = std.json.parseFromSliceLeaky(Chunk, arena.allocator(), data, .{
             .ignore_unknown_fields = true,
         }) catch return error.InvalidResponse;
-        if (chunk.usage) |u| usage = u;
+        if (chunk.usage) |u| usage = .{ .prompt_tokens = u.prompt_tokens, .completion_tokens = u.completion_tokens, .prompt_cache_hit_tokens = if (u.prompt_tokens_details) |d| d.cached_tokens else u.prompt_cache_hit_tokens };
         for (chunk.choices) |choice| {
             const d = choice.delta;
             if (d.reasoning_content) |t| if (t.len > 0) {
@@ -205,10 +158,26 @@ pub fn stream(
         .id = try out.dupe(u8, p.id.items),
         .function = .{ .name = try out.dupe(u8, p.name.items), .arguments = try out.dupe(u8, p.args.items) },
     };
-    return .{ .text = try out.dupe(u8, text.items), .reasoning = try out.dupe(u8, reasoning.items), .tool_calls = tool_calls, .usage = usage };
+    return .{ .text = try out.dupe(u8, text.items), .reasoning = if (reasoning.items.len > 0) .{ .provider = .chat_completions, .data = try out.dupe(u8, reasoning.items) } else null, .tool_calls = tool_calls, .usage = usage };
 }
 
 fn requestBody(gpa: std.mem.Allocator, cfg: Config, messages: []const Message, tools_json: []const u8, max_tokens: ?u32) ![]u8 {
+    const WireMessage = struct {
+        role: []const u8,
+        content: ?[]const u8,
+        tool_calls: ?[]const ToolCall,
+        tool_call_id: ?[]const u8,
+        reasoning_content: ?[]const u8,
+    };
+    const wire = try gpa.alloc(WireMessage, messages.len);
+    defer gpa.free(wire);
+    for (messages, wire) |m, *w| w.* = .{
+        .role = m.role,
+        .content = m.content,
+        .tool_calls = m.tool_calls,
+        .tool_call_id = m.tool_call_id,
+        .reasoning_content = if (m.reasoning) |r| if (r.provider == .chat_completions) r.data else null else null,
+    };
     const opts: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
     const limit = if (max_tokens) |n| try std.fmt.allocPrint(gpa, ",\"max_tokens\":{d}", .{n}) else try gpa.dupe(u8, "");
     defer gpa.free(limit);
@@ -226,7 +195,7 @@ fn requestBody(gpa: std.mem.Allocator, cfg: Config, messages: []const Message, t
     defer gpa.free(effort);
     return std.fmt.allocPrint(gpa,
         \\{{"model":{f},"messages":{f}{s}{s}{s}{s},"stream":true,"stream_options":{{"include_usage":true}}}}
-    , .{ std.json.fmt(cfg.model, opts), std.json.fmt(messages, opts), tool_field, limit, thinking, effort });
+    , .{ std.json.fmt(cfg.model, opts), std.json.fmt(wire, opts), tool_field, limit, thinking, effort });
 }
 
 test "chunk decodes deepseek deltas, tool call fragments and usage" {
@@ -258,7 +227,7 @@ test "request body omits null fields and absent tools" {
 
 test "request body passes reasoning back and sends thinking only when configured" {
     const gpa = std.testing.allocator;
-    const msgs = [_]Message{.{ .role = "assistant", .content = "a", .reasoning_content = "r" }};
+    const msgs = [_]Message{.{ .role = "assistant", .content = "a", .reasoning = .{ .provider = .chat_completions, .data = "r" } }};
     const on = try requestBody(gpa, .{ .base_url = "", .api_key = "", .model = "m", .thinking = true, .reasoning_effort = "max" }, &msgs, "[]", null);
     defer gpa.free(on);
     try std.testing.expectEqualStrings(

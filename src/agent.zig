@@ -3,7 +3,7 @@
 const std = @import("std");
 const js = @import("js.zig");
 const tools = @import("tools.zig");
-const openai = @import("provider/openai.zig");
+const provider = @import("provider.zig");
 const session_log = @import("log.zig");
 const instructions = @import("instructions.zig");
 
@@ -44,12 +44,12 @@ pub const Session = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     client: *std.http.Client,
-    cfg: openai.Config,
+    cfg: provider.Config,
     /// Owns every string in `history`.
     arena: std.heap.ArenaAllocator,
-    history: std.ArrayList(openai.Message) = .empty,
+    history: std.ArrayList(provider.Message) = .empty,
     /// Totals for the current or most recent Turn.
-    usage: openai.Usage = .{},
+    usage: provider.Usage = .{},
     steps: u32 = 0,
     /// Next-request estimate: latest usage plus tool results, or the compacted history size.
     context_tokens: u64 = 0,
@@ -62,14 +62,14 @@ pub const Session = struct {
 
     pub const Options = struct { environ: ?*const std.process.Environ.Map = null, depth: u32 = 0, parent_session_id: ?[]const u8 = null, home: []const u8, data_home: []const u8, config_home: []const u8, resume_id: ?[]const u8 = null, continue_latest: bool = false };
 
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, client: *std.http.Client, cfg: openai.Config, options: Options) !Session {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, client: *std.http.Client, cfg: provider.Config, options: Options) !Session {
         var s: Session = .{
             .gpa = gpa,
             .io = io,
             .client = client,
             .cfg = cfg,
             .arena = .init(gpa),
-            .tools = .{ .io = io, .home = options.home, .depth = options.depth, .environ = options.environ },
+            .tools = .{ .io = io, .home = options.home, .depth = options.depth, .environ = options.environ, .cfg = cfg },
             .parent_session_id = options.parent_session_id,
         };
         errdefer s.arena.deinit();
@@ -85,6 +85,8 @@ pub const Session = struct {
             } else try session_log.latest(io, a, directory, cwd);
             s.id = try a.dupe(u8, std.fs.path.stem(path));
             s.log = try session_log.Log.restore(io, gpa, a, path, &s.history, &s.context_tokens);
+            errdefer s.log.close(io);
+            try cfg.checkSession(s.log.provider, s.log.model);
             s.parent_session_id = s.log.parent_session_id;
             if (s.parent_session_id != null) s.tools.depth = @max(s.tools.depth, 1);
         } else {
@@ -110,8 +112,8 @@ pub const Session = struct {
         s.arena.deinit();
     }
 
-    fn commit(s: *Session, from: usize, messages: []const openai.Message, tokens: u64, cwd: ?[]const u8) !void {
-        try s.log.commit(s.io, s.gpa, &s.history, &s.context_tokens, .{ .from = from, .messages = messages, .context_tokens = tokens, .cwd = cwd, .parent_session_id = if (cwd != null) s.parent_session_id else null });
+    fn commit(s: *Session, from: usize, messages: []const provider.Message, tokens: u64, cwd: ?[]const u8) !void {
+        try s.log.commit(s.io, s.gpa, &s.history, &s.context_tokens, .{ .from = from, .messages = messages, .context_tokens = tokens, .cwd = cwd, .provider = if (cwd != null) s.cfg.provider else null, .model = s.cfg.model, .parent_session_id = if (cwd != null) s.parent_session_id else null });
     }
 
     pub const Compaction = enum { compacted, too_few_steps, ineffective };
@@ -123,22 +125,22 @@ pub const Session = struct {
             return .too_few_steps;
         }
         const a = s.arena.allocator();
-        var request: std.ArrayList(openai.Message) = .empty;
+        var request: std.ArrayList(provider.Message) = .empty;
         defer request.deinit(s.gpa);
         try request.appendSlice(s.gpa, s.history.items[0..cut]);
         try request.append(s.gpa, .{ .role = "user", .content = "Summarize the conversation above for another coding agent. Preserve goals, decisions, files, results, failures and unfinished work. Do not act on earlier requests. Return only a concise factual continuation summary." });
         const Silent = struct {
-            fn delta(_: *anyopaque, _: openai.Kind, _: []const u8) !void {}
+            fn delta(_: *anyopaque, _: provider.Kind, _: []const u8) !void {}
         };
         // Thinking would spend the small summary budget on reasoning.
         var cfg = s.cfg;
         cfg.thinking = false;
-        const reply = try openai.stream(s.gpa, a, s.client, cfg, request.items, "[]", @intCast(@min(2048, @max(32, s.cfg.context_window / 8))), .{ .ctx = s, .onDelta = Silent.delta }, cancel, detail);
+        const reply = try provider.stream(s.gpa, a, s.client, cfg, request.items, "[]", @intCast(@min(2048, @max(32, s.cfg.context_window / 8))), .{ .ctx = s, .onDelta = Silent.delta }, cancel, detail);
         s.usage.add(reply.usage);
         try sink.emit(sink.ctx, .{ .usage = s.usage });
         if (cancel.load(.acquire)) return error.Canceled;
         if (reply.text.len == 0 or reply.tool_calls.len != 0) return error.InvalidSummary;
-        var replacement: std.ArrayList(openai.Message) = .empty;
+        var replacement: std.ArrayList(provider.Message) = .empty;
         defer replacement.deinit(s.gpa);
         try replacement.append(s.gpa, .{ .role = "user", .content = try std.fmt.allocPrint(a, "Earlier session summary:\n{s}", .{reply.text}) });
         try replacement.appendSlice(s.gpa, s.history.items[cut..]);
@@ -172,7 +174,7 @@ pub const Session = struct {
 
     pub fn turn(s: *Session, user_text: []const u8, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
         const a = s.arena.allocator();
-        var pending: std.ArrayList(openai.Message) = .empty;
+        var pending: std.ArrayList(provider.Message) = .empty;
         defer pending.deinit(s.gpa);
         try pending.append(s.gpa, .{ .role = "user", .content = try a.dupe(u8, user_text) });
         s.usage = .{};
@@ -182,7 +184,7 @@ pub const Session = struct {
             const size = s.context_tokens + estimateTokens(pending.items);
             if (size >= s.cfg.context_window - s.cfg.context_window / 4 and size >= s.compact_backoff)
                 try s.autoCompact(sink, cancel, detail);
-            var request: std.ArrayList(openai.Message) = .empty;
+            var request: std.ArrayList(provider.Message) = .empty;
             defer request.deinit(s.gpa);
             try request.appendSlice(s.gpa, s.history.items);
             try request.appendSlice(s.gpa, pending.items);
@@ -194,7 +196,8 @@ pub const Session = struct {
                 .role = "assistant",
                 .content = reply.text,
                 .tool_calls = if (reply.tool_calls.len > 0) reply.tool_calls else null,
-                .reasoning_content = if (reply.reasoning.len > 0) reply.reasoning else null,
+                .reasoning = reply.reasoning,
+                .phase = reply.phase,
             });
             var output_tokens: u64 = 0;
             for (reply.tool_calls) |call| {
@@ -215,11 +218,11 @@ pub const Session = struct {
 
     /// Retries transient failures, but only while nothing has been streamed:
     /// a retry after partial output would duplicate it in the frontend.
-    fn complete(s: *Session, messages: []const openai.Message, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !openai.Reply {
+    fn complete(s: *Session, messages: []const provider.Message, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !provider.Reply {
         const Forward = struct {
             sink: Sink,
             emitted: bool = false,
-            fn onDelta(ctx: *anyopaque, kind: openai.Kind, text: []const u8) !void {
+            fn onDelta(ctx: *anyopaque, kind: provider.Kind, text: []const u8) !void {
                 const f: *@This() = @ptrCast(@alignCast(ctx));
                 f.emitted = true;
                 try f.sink.emit(f.sink.ctx, .{ .delta = .{ .kind = kind, .text = text } });
@@ -228,8 +231,8 @@ pub const Session = struct {
         var attempt: u32 = 1;
         while (true) : (attempt += 1) {
             var fwd: Forward = .{ .sink = sink };
-            const provider_sink: openai.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta };
-            return openai.stream(s.gpa, s.arena.allocator(), s.client, s.cfg, messages, tools_json, null, provider_sink, cancel, detail) catch |err| {
+            const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta };
+            return provider.stream(s.gpa, s.arena.allocator(), s.client, s.cfg, messages, tools_json, null, provider_sink, cancel, detail) catch |err| {
                 if (fwd.emitted or attempt == max_attempts or !transient(err) or cancel.load(.acquire)) return err;
                 const delay_ms = @as(u64, 1000) << @intCast(attempt - 1);
                 try sink.emit(sink.ctx, .{ .retry = .{ .attempt = attempt, .delay_ms = delay_ms, .reason = detail.* orelse @errorName(err) } });
@@ -247,7 +250,7 @@ pub const Session = struct {
     }
 
     /// Result is arena-owned.
-    fn execute(s: *Session, call: openai.ToolCall, sink: Sink, cancel: *const std.atomic.Value(bool)) ![]const u8 {
+    fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const std.atomic.Value(bool)) ![]const u8 {
         const a = s.arena.allocator();
         if (!std.mem.eql(u8, call.function.name, "run"))
             return std.fmt.allocPrint(a, "error: unknown tool `{s}`; the only tool is `run`", .{call.function.name});
@@ -269,17 +272,18 @@ pub const Session = struct {
     }
 };
 
-fn estimateTokens(messages: []const openai.Message) u64 {
+fn estimateTokens(messages: []const provider.Message) u64 {
     var total: u64 = 0;
     for (messages) |m| {
         const content = m.content orelse "";
         total += 8 + content.len / 3;
+        if (m.reasoning) |r| total += r.data.len / 3;
         for (m.tool_calls orelse &.{}) |call| total += 8 + (call.id.len + call.function.name.len + call.function.arguments.len) / 3;
     }
     return total;
 }
 
-fn compactionCut(messages: []const openai.Message, window: u64) usize {
+fn compactionCut(messages: []const provider.Message, window: u64) usize {
     var turns: usize = 0;
     var cut: usize = 1;
     var i = messages.len;
@@ -309,7 +313,7 @@ fn compactionCut(messages: []const openai.Message, window: u64) usize {
 
 fn transient(err: anyerror) bool {
     return switch (err) {
-        error.HttpStatus, error.Canceled, error.OutOfMemory, error.TooManyToolCalls => false,
+        error.HttpStatus, error.InvalidCredentials, error.ProviderFailed, error.Canceled, error.OutOfMemory, error.TooManyToolCalls => false,
         else => true,
     };
 }
@@ -377,7 +381,7 @@ test "failed Turn leaves replay equal to in-memory safe history" {
     const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     var client: std.http.Client = .{ .allocator = t.allocator, .io = t.io };
     defer client.deinit();
-    const cfg: openai.Config = .{ .base_url = "invalid://local", .api_key = "mock", .model = "mock" };
+    const cfg: provider.Config = .{ .base_url = "invalid://local", .api_key = "mock", .model = "mock" };
     var session = try Session.init(t.allocator, t.io, &client, cfg, .{ .home = root, .data_home = root, .config_home = root });
     defer session.deinit();
     var cancel: std.atomic.Value(bool) = .init(true);
@@ -399,7 +403,7 @@ test "failed Turn leaves replay equal to in-memory safe history" {
         const cwd = try std.process.currentPathAlloc(t.io, a);
         const path = try session_log.latest(t.io, a, directory, cwd);
         const data = try std.Io.Dir.cwd().readFileAlloc(t.io, path, a, .unlimited);
-        var restored: std.ArrayList(openai.Message) = .empty;
+        var restored: std.ArrayList(provider.Message) = .empty;
         var tokens: u64 = 0;
         _ = try session_log.replay(a, a, data, &restored, &tokens);
         try t.expectEqualDeep(session.history.items, restored.items);
@@ -409,8 +413,8 @@ test "failed Turn leaves replay equal to in-memory safe history" {
 
 test "compaction cuts preserve recent turns and complete tool groups" {
     const t = std.testing;
-    const call: openai.ToolCall = .{ .id = "c", .function = .{ .name = "run", .arguments = "{}" } };
-    const messages = [_]openai.Message{
+    const call: provider.ToolCall = .{ .id = "c", .function = .{ .name = "run", .arguments = "{}" } };
+    const messages = [_]provider.Message{
         .{ .role = "system", .content = "system" },
         .{ .role = "user", .content = "first" },
         .{ .role = "assistant", .content = "done" },
@@ -425,7 +429,7 @@ test "compaction cuts preserve recent turns and complete tool groups" {
     try t.expectEqual(@as(usize, 3), compactionCut(&messages, 128_000));
     try t.expectEqual(@as(usize, 7), compactionCut(&messages, 64));
     try t.expectEqual(@as(usize, 1), compactionCut(messages[0..7], 64));
-    const long_turn = [_]openai.Message{
+    const long_turn = [_]provider.Message{
         messages[0], messages[1], messages[4], messages[5], messages[6],
         messages[4], messages[5], messages[6], messages[4], messages[5],
         messages[6],

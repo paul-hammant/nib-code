@@ -1,6 +1,6 @@
 const std = @import("std");
 const js = @import("js.zig");
-const openai = @import("provider/openai.zig");
+const provider = @import("provider.zig");
 const JsonEvent = @import("events.zig").JsonEvent;
 const process = @import("process.zig");
 const policy = @import("policy.zig");
@@ -89,12 +89,13 @@ pub const Tools = struct {
     io: std.Io,
     home: []const u8,
     environ: ?*const std.process.Environ.Map = null,
+    cfg: ?provider.Config = null,
     depth: u32 = 0,
     session_id: ?[]const u8 = null,
     agents_mutex: std.Io.Mutex = .init,
     agents_changed: std.Io.Condition = .init,
     agents_active: usize = 0,
-    agent_usage: openai.Usage = .{},
+    agent_usage: provider.Usage = .{},
     cancel: std.atomic.Value(bool) = .init(false),
     paths_mutex: std.Io.Mutex = .init,
     paths_changed: std.Io.Condition = .init,
@@ -128,7 +129,7 @@ pub const Tools = struct {
         return if (t.depth == 0) root_api else child_api;
     }
 
-    pub fn takeUsage(t: *Tools) openai.Usage {
+    pub fn takeUsage(t: *Tools) provider.Usage {
         t.agents_mutex.lockUncancelable(t.io);
         defer t.agents_mutex.unlock(t.io);
         const usage = t.agent_usage;
@@ -150,13 +151,36 @@ pub const Tools = struct {
         return r catch |err| fail(gpa, "{s}", .{@errorName(err)}) catch .{ .err = &.{} };
     }
 
+    fn codexHome(t: *const Tools) ?[]const u8 {
+        if (t.cfg) |cfg| if (cfg.codex_home) |home| return home;
+        return if (t.environ) |env| env.get("CODEX_HOME") else null;
+    }
+
+    fn checkCredentialPath(t: *Tools, gpa: std.mem.Allocator, path: []const u8) !void {
+        const default_path = try std.fs.path.join(gpa, &.{ t.home, ".codex", "auth.json" });
+        defer gpa.free(default_path);
+        const canonical_default = try normalizedPath(t.io, gpa, default_path);
+        defer gpa.free(canonical_default);
+        if (std.mem.eql(u8, path, canonical_default)) return error.CredentialAccessDenied;
+        if (t.codexHome()) |home| {
+            const custom_path = try std.fs.path.join(gpa, &.{ home, "auth.json" });
+            defer gpa.free(custom_path);
+            const canonical_custom = try normalizedPath(t.io, gpa, custom_path);
+            defer gpa.free(canonical_custom);
+            if (std.mem.eql(u8, path, canonical_custom)) return error.CredentialAccessDenied;
+        }
+    }
+
     fn read(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !js.ToolResult {
         const A = struct { path: []const u8, offset: usize = 1, limit: usize = 2000 };
         const a = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch
             return fail(gpa, "expected {{ path: string, offset?: number, limit?: number }}", .{});
         defer a.deinit();
 
-        const data = std.Io.Dir.cwd().readFileAlloc(t.io, a.value.path, gpa, .limited(16 * 1024 * 1024)) catch |err|
+        const path = try normalizedPath(t.io, gpa, a.value.path);
+        defer gpa.free(path);
+        try t.checkCredentialPath(gpa, path);
+        const data = std.Io.Dir.cwd().readFileAlloc(t.io, path, gpa, .limited(16 * 1024 * 1024)) catch |err|
             return fail(gpa, "{s}: {s}", .{ a.value.path, @errorName(err) });
         defer gpa.free(data);
 
@@ -189,6 +213,7 @@ pub const Tools = struct {
         const v = a.value;
         const path = try normalizedPath(t.io, gpa, v.path);
         defer gpa.free(path);
+        try t.checkCredentialPath(gpa, path);
         var lock: PathLock = .{ .path = path };
         t.lockPath(&lock);
         defer t.unlockPath(&lock);
@@ -220,6 +245,7 @@ pub const Tools = struct {
         const v = a.value;
         const path = try normalizedPath(t.io, gpa, v.path);
         defer gpa.free(path);
+        try t.checkCredentialPath(gpa, path);
         var lock: PathLock = .{ .path = path };
         t.lockPath(&lock);
         defer t.unlockPath(&lock);
@@ -258,15 +284,17 @@ pub const Tools = struct {
         try env.put("NIB_PARENT_SESSION_ID", t.session_id orelse return error.MissingSessionId);
         const executable = try std.process.executablePathAlloc(t.io, gpa);
         defer gpa.free(executable);
+        const input = try std.json.Stringify.valueAlloc(gpa, .{ .prompt = a.value.prompt, .config = t.cfg orelse return error.AgentConfigUnavailable }, .{});
+        defer gpa.free(input);
         const result = try process.run(gpa, t.io, .{
-            .spawn = .{ .argv = &.{ executable, "ask", "--json", "-" }, .environ_map = &env, .stdout = .pipe, .stderr = .ignore },
-            .input = a.value.prompt,
+            .spawn = .{ .argv = &.{ executable, "ask", "--json", "--agent-input", "-" }, .environ_map = &env, .stdout = .pipe, .stderr = .ignore },
+            .input = input,
             .cancel = &t.cancel,
             .timeout_ms = 5 * 60 * 1000,
             .termination_grace_ms = 500,
         });
         defer gpa.free(result.output);
-        var usage: openai.Usage = .{};
+        var usage: provider.Usage = .{};
         defer {
             t.agents_mutex.lockUncancelable(t.io);
             t.agent_usage.add(usage);
@@ -281,7 +309,7 @@ pub const Tools = struct {
             defer parsed.deinit();
             if (parsed.value != .object) return error.InvalidAgentOutput;
             if (parsed.value.object.get("usage")) |snapshot| {
-                const u = try std.json.parseFromValue(openai.Usage, gpa, snapshot, .{ .ignore_unknown_fields = true });
+                const u = try std.json.parseFromValue(provider.Usage, gpa, snapshot, .{ .ignore_unknown_fields = true });
                 defer u.deinit();
                 usage = u.value;
             }
@@ -309,6 +337,10 @@ pub const Tools = struct {
             return fail(gpa, "expected {{ command: string, timeout_ms?: number }}", .{});
         defer a.deinit();
 
+        switch (policy.checkCredentials(a.value.command, t.codexHome())) {
+            .allow => {},
+            .deny => |why| return fail(gpa, "refused by nib: {s}", .{why}),
+        }
         switch (policy.check(a.value.command, t.home)) {
             .allow => {},
             .deny => |why| return fail(gpa, "refused by nib: {s}. If it is really needed, ask the user to run it.", .{why}),
@@ -320,6 +352,7 @@ pub const Tools = struct {
 
         const result = try process.run(gpa, t.io, .{ .spawn = .{
             .argv = &.{ "bash", "-c", script },
+            .environ_map = t.environ,
             .stdin = .ignore,
             .stdout = .pipe,
             .stderr = .ignore,
@@ -640,4 +673,47 @@ test "process deadline covers a blocked stdin writer" {
     defer testing.allocator.free(result.output);
     try testing.expectEqual(error.TimedOut, result.stop.?);
     try testing.expect(start.durationTo(std.Io.Clock.awake.now(testing.io)).toMilliseconds() < 1000);
+}
+
+test "credential file tools deny default custom and symlink paths" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, ".codex");
+    try tmp.dir.createDirPath(testing.io, "custom");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = ".codex/auth.json", .data = "fictional-default" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "custom/auth.json", .data = "fictional-custom" });
+    try tmp.dir.symLink(testing.io, "custom/auth.json", "alias", .{});
+    const root = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer testing.allocator.free(root);
+    const custom = try std.fs.path.join(testing.allocator, &.{ root, "custom" });
+    defer testing.allocator.free(custom);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("CODEX_HOME", custom);
+    var t: Tools = .{ .io = testing.io, .home = root, .environ = &env };
+    for ([_][]const u8{ ".codex/auth.json", "custom/auth.json", "alias" }) |relative| {
+        const path = try std.fs.path.join(testing.allocator, &.{ root, relative });
+        defer testing.allocator.free(path);
+        const args = try std.json.Stringify.valueAlloc(testing.allocator, .{ .path = path, .old_text = "fictional", .new_text = "changed", .content = "changed" }, .{});
+        defer testing.allocator.free(args);
+        for ([_][]const u8{ "read", "edit", "write" }) |name| {
+            const result = Tools.call(&t, testing.allocator, name, args);
+            defer freeResult(result);
+            try testing.expectEqualStrings("CredentialAccessDenied", result.err);
+        }
+    }
+    const data = try tmp.dir.readFileAlloc(testing.io, "custom/auth.json", testing.allocator, .limited(100));
+    defer testing.allocator.free(data);
+    try testing.expectEqualStrings("fictional-custom", data);
+}
+
+test "bash receives ordinary environment without API keys" {
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("NIB_API_KEY", "fictional-secret");
+    try env.put("NIB_TEST_ORDINARY", "kept");
+    var t: Tools = .{ .io = testing.io, .home = "/home/nobody", .environ = &env };
+    const result = Tools.call(&t, testing.allocator, "bash", "{\"command\":\"printf '%s:%s' \\\"${NIB_API_KEY-unset}\\\" \\\"$NIB_TEST_ORDINARY\\\"\"}");
+    defer freeResult(result);
+    try testing.expectEqualStrings("{\"exit_code\":0,\"output\":\"unset:kept\"}", result.ok);
 }

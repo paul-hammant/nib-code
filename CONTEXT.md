@@ -45,7 +45,7 @@ _Avoid_: function, programmatic tool, native tool
 _Avoid_: backend, API（太宽泛）
 
 **Reasoning**（推理内容）：
-模型输出的思考过程；展示给用户，但不进入发给模型的历史。
+模型输出的思考摘要与后续请求需要的推理数据。按 provider 保存并回传；可读内容展示给用户，加密条目只用于延续会话。
 _Avoid_: thinking（在本项目中两者同义，统一用 Reasoning）
 
 **Context compaction**（上下文压缩）：

@@ -2,7 +2,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const js = @import("js.zig");
 const agent = @import("agent.zig");
-const openai = @import("provider/openai.zig");
+const provider = @import("provider.zig");
 const Editor = @import("editor.zig").Editor;
 const markdown = @import("markdown.zig");
 
@@ -12,13 +12,13 @@ const Event = union(enum) {
     paste_start,
     paste_end,
     /// Slices are owned by the receiver.
-    delta: struct { kind: openai.Kind, text: []u8 },
+    delta: struct { kind: provider.Kind, text: []u8 },
     run_start: []u8,
     run_end: struct { ok: bool, output: []u8 },
     retry: []u8,
     notice: []u8,
     done,
-    usage: openai.Usage,
+    usage: provider.Usage,
     failed: []u8,
 };
 
@@ -177,7 +177,7 @@ pub fn run(init: std.process.Init, session: *agent.Session) !void {
         entries.deinit(gpa);
     }
 
-    var usage: openai.Usage = .{};
+    var usage: provider.Usage = .{};
     var steps: u32 = 0;
     var context: u64 = session.context_tokens;
     var turn: ?*Turn = null;
@@ -190,7 +190,7 @@ pub fn run(init: std.process.Init, session: *agent.Session) !void {
     for (session.history.items) |m| {
         if (std.mem.eql(u8, m.role, "user")) try input.remember(gpa, m.content orelse "");
     }
-    if (cfg.api_key.len == 0) try addEntry(gpa, &entries, .err, "no API key: set DEEPSEEK_API_KEY (or NIB_API_KEY). /js <code> still works.");
+    if (cfg.missingKey()) try addEntry(gpa, &entries, .err, "no API key: set DEEPSEEK_API_KEY (or NIB_API_KEY). /js <code> still works.");
 
     while (true) {
         switch (try loop.nextEvent()) {
@@ -241,7 +241,7 @@ pub fn run(init: std.process.Init, session: *agent.Session) !void {
                             }
                         }.work, .{t});
                         turn = t;
-                    } else if (cfg.api_key.len == 0) {
+                    } else if (cfg.missingKey()) {
                         gpa.free(line);
                         try addEntry(gpa, &entries, .err, "no API key");
                     } else {
@@ -320,13 +320,17 @@ fn appendHead(gpa: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8,
     }
 }
 
-fn addHistory(gpa: std.mem.Allocator, entries: *std.ArrayList(Entry), history: []const openai.Message) !void {
+fn addHistory(gpa: std.mem.Allocator, entries: *std.ArrayList(Entry), history: []const provider.Message) !void {
     for (history) |m| {
         const content = m.content orelse "";
         if (std.mem.eql(u8, m.role, "user")) {
             try addEntry(gpa, entries, .user, content);
         } else if (std.mem.eql(u8, m.role, "assistant")) {
-            if (m.reasoning_content) |r| try addEntry(gpa, entries, .reasoning, r);
+            if (m.reasoning) |r| {
+                const text = try r.display(gpa);
+                defer gpa.free(text);
+                if (text.len > 0) try addEntry(gpa, entries, .reasoning, text);
+            }
             if (content.len > 0) try addEntry(gpa, entries, .assistant, content);
             for (m.tool_calls orelse &.{}) |call| {
                 const Args = struct { code: []const u8 = "" };
@@ -376,7 +380,7 @@ fn isNewline(key: vaxis.Key, pasting: bool) bool {
         key.matches(enter, .{ .alt = true }) or key.matches('j', .{ .ctrl = true });
 }
 
-fn draw(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewport, cfg: openai.Config, usage: openai.Usage, steps: u32, context: u64, busy: bool) void {
+fn draw(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewport, cfg: provider.Config, usage: provider.Usage, steps: u32, context: u64, busy: bool) void {
     win.clear();
     win.hideCursor();
     if (win.height < 6 or win.width < 8) return;
@@ -426,7 +430,7 @@ test "draw benchmark: 5000 entries" {
     const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 100, .height = 24, .screen = &screen };
     var input: Editor = .{};
     defer input.deinit(gpa);
-    const cfg: openai.Config = .{ .base_url = "", .api_key = "", .model = "mock" };
+    const cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "mock" };
     for ([_]u32{ 0, 1200 }) |offset| {
         var samples: [5]i96 = undefined;
         for (&samples) |*sample_ns| {
@@ -523,7 +527,7 @@ test "draw keeps scrolled body fixed while output arrives and caps input height"
     var input: Editor = .{};
     defer input.deinit(gpa);
     var view: Viewport = .{ .pending = -30 };
-    const cfg: openai.Config = .{ .base_url = "", .api_key = "", .model = "mock" };
+    const cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "mock" };
     draw(win, entries.items, &input, &view, cfg, .{}, 0, 0, true);
     const body_before = try gpa.dupe(vaxis.Cell, screen.buf[0 .. 22 * 100]);
     defer gpa.free(body_before);

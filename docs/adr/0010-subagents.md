@@ -9,7 +9,7 @@ Run 里可以调用 `await tools.agent({ prompt })`。每个子 agent 是一个�
 
 **为什么：** 代码驱动最有价值的能力之一是把工作分出去并行做，例如 `Promise.all(tasks.map(t => tools.agent({ prompt: t })))`。用子进程而不是线程，和 [0005](0005-process-per-session.md) 一致：故障隔离、退出即回收内存、取消复用进程组终止；Zig 进程启动只要毫秒级。返回最终结果而不是常驻加消息，概念最少，并且与 JS 的 `await` / `Promise.all` 天然契合。
 
-**实现选择：** 深度上限 1，`NIB_AGENT_DEPTH` 传给子进程；工具表按深度同时生成说明和 JS API，子会话完全不暴露 agent。同时最多运行 4 个子 agent，超出排队（全部工具上限 8）。用当前可执行文件启动 `nib ask --json -`，prompt 通过 stdin 发送，避免命令行长度限制；共用 `src/process.zig` 的进程组、20 ms 轮询、超时和回收，stdin 写入也受取消/超时约束。
+**实现选择：** 深度上限 1，`NIB_AGENT_DEPTH` 传给子进程；工具表按深度同时生成说明和 JS API，子会话完全不暴露 agent。同时最多运行 4 个子 agent，超出排队（全部工具上限 8）。用当前可执行文件启动 `nib ask --json -`，prompt 与有效 provider 配置通过 stdin JSON 发送，避免命令行长度限制和密钥环境继承（见 [0011](0011-provider-wire-protocols.md)）；共用 `src/process.zig` 的进程组、20 ms 轮询、超时和回收，stdin 写入也受取消/超时约束。
 
 **实施时的调整与理由：**
 - 嵌套进程组不会随外层组自动被杀。父进程先给子 nib 的组发 SIGTERM，子 nib 取消自己的工具组；500 ms 后再 SIGKILL。仍在阻塞 HTTP 的子 nib 也能被强制回收。

@@ -20,12 +20,26 @@ const fetchers = [_][]const u8{ "curl", "wget" };
 const wrappers = [_][]const u8{ "env", "command", "builtin", "exec", "nohup", "time", "nice", "ionice", "timeout", "xargs", "stdbuf" };
 
 const protected_paths = [_][]const u8{
-    "/",     "/bin",  "/boot", "/dev",  "/etc", "/home", "/lib", "/lib64", "/opt", "/proc",
-    "/root", "/sbin", "/snap", "/srv",  "/sys", "/usr",  "/var", "~",      "$HOME", "${HOME}",
+    "/",     "/bin",  "/boot", "/dev", "/etc", "/home", "/lib", "/lib64", "/opt",  "/proc",
+    "/root", "/sbin", "/snap", "/srv", "/sys", "/usr",  "/var", "~",      "$HOME", "${HOME}",
 };
 
 pub fn check(command: []const u8, home: []const u8) Verdict {
+    switch (checkCredentials(command, null)) {
+        .allow => {},
+        .deny => |why| return .{ .deny = why },
+    }
     return checkDepth(command, home, 0);
+}
+
+pub fn checkCredentials(command: []const u8, codex_home: ?[]const u8) Verdict {
+    if (std.mem.indexOf(u8, command, ".codex") != null or
+        std.mem.indexOf(u8, command, "$CODEX_HOME") != null or
+        std.mem.indexOf(u8, command, "${CODEX_HOME}") != null)
+        return .{ .deny = "access to Codex credentials" };
+    if (codex_home) |dir| if (dir.len > 0 and std.mem.indexOf(u8, command, dir) != null)
+        return .{ .deny = "access to Codex credentials" };
+    return .allow;
 }
 
 fn checkDepth(command: []const u8, home: []const u8, depth: u8) Verdict {
@@ -287,4 +301,20 @@ test "ordinary development commands are allowed" {
     try expectAllowed("bash -c 'ls -la'");
     try expectAllowed("dd if=/dev/zero of=disk.img bs=1M count=10");
     try expectAllowed("git init && npm init -y");
+}
+
+test "Codex credential commands are denied for default and custom homes" {
+    try expectDenied("cat ~/.codex/auth.json");
+    for ([_][]const u8{
+        "cat ~/.codex/auth.json",                                        "jq . /home/u/.codex/auth.json",
+        "cat \"$CODEX_HOME/auth.json\"",                                 "cat ${CODEX_HOME}/auth.json",
+        "python -c 'print(open(\"/tmp/codex-home/auth.json\").read())'",
+    }) |command| try testing.expect(checkCredentials(command, "/tmp/codex-home") == .deny);
+    try testing.expect(checkCredentials("cat project/auth.json", "/tmp/codex-home") == .allow);
+}
+
+test "credential directory globs and recursive searches are denied" {
+    try testing.expect(checkCredentials("cat ~/.codex/*", null) == .deny);
+    try testing.expect(checkCredentials("rg . \"$CODEX_HOME\"", null) == .deny);
+    try testing.expect(checkCredentials("rg . /tmp/custom-codex", "/tmp/custom-codex") == .deny);
 }

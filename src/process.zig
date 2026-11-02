@@ -1,4 +1,5 @@
 const std = @import("std");
+const secrets = @import("secrets.zig");
 
 pub const Result = struct {
     term: std.process.Child.Term,
@@ -35,6 +36,10 @@ const Group = struct {
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Result {
     var opts = options.spawn;
+    var env = if (opts.environ_map) |map| try map.clone(gpa) else try inheritedEnvironment(gpa);
+    defer env.deinit();
+    secrets.removeFrom(&env);
+    opts.environ_map = &env;
     if (options.input != null) opts.stdin = .pipe;
     opts.pgid = 0;
     var child = try std.process.spawn(io, opts);
@@ -119,4 +124,27 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Result {
 fn check(io: std.Io, cancel: *const std.atomic.Value(bool), deadline: std.Io.Clock.Timestamp) Stop!void {
     if (cancel.load(.acquire)) return error.Canceled;
     if (std.Io.Clock.Timestamp.now(io, .awake).compare(.gte, deadline)) return error.TimedOut;
+}
+
+fn inheritedEnvironment(gpa: std.mem.Allocator) !std.process.Environ.Map {
+    const environ: std.process.Environ = .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    return environ.createMap(gpa);
+}
+
+test "process strips credentials and preserves ordinary environment" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    for (secrets.environment_names) |name| try env.put(name, "fictional-secret");
+    try env.put("NIB_TEST_ORDINARY", "kept");
+    var cancel: std.atomic.Value(bool) = .init(false);
+    const result = try run(std.testing.allocator, std.testing.io, .{
+        .spawn = .{ .argv = &.{"env"}, .environ_map = &env, .stdout = .pipe, .stderr = .ignore },
+        .cancel = &cancel,
+        .timeout_ms = 1000,
+    });
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.term.success());
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "fictional-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "NIB_TEST_ORDINARY=kept") != null);
+    try std.testing.expect(env.contains("NIB_API_KEY"));
 }

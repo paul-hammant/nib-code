@@ -1,11 +1,13 @@
 const std = @import("std");
-const openai = @import("provider/openai.zig");
+const provider = @import("provider.zig");
 
 pub const Record = struct {
     cwd: ?[]const u8 = null,
+    provider: ?provider.Id = null,
+    model: ?[]const u8 = null,
     parent_session_id: ?[]const u8 = null,
     from: usize = 0,
-    messages: []const openai.Message = &.{},
+    messages: []const provider.Message = &.{},
     context_tokens: u64 = 0,
     repair: bool = false,
 };
@@ -14,6 +16,8 @@ pub const Log = struct {
     file: std.Io.File,
     offset: u64,
     poisoned: bool = false,
+    provider: provider.Id = .chat_completions,
+    model: ?[]const u8 = null,
     parent_session_id: ?[]const u8 = null,
 
     pub fn create(io: std.Io, path: []const u8) !Log {
@@ -26,13 +30,13 @@ pub const Log = struct {
         }), .offset = 0 };
     }
 
-    pub fn restore(io: std.Io, gpa: std.mem.Allocator, a: std.mem.Allocator, path: []const u8, history: *std.ArrayList(openai.Message), tokens: *u64) !Log {
+    pub fn restore(io: std.Io, gpa: std.mem.Allocator, a: std.mem.Allocator, path: []const u8, history: *std.ArrayList(provider.Message), tokens: *u64) !Log {
         const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write, .lock = .exclusive, .lock_nonblocking = true });
         errdefer file.close(io);
         var reader = file.reader(io, &.{});
         const data = try reader.interface.allocRemaining(a, .unlimited);
         const restored = try replay(gpa, a, data, history, tokens);
-        var log: Log = .{ .file = file, .offset = data.len, .parent_session_id = restored.parent_session_id };
+        var log: Log = .{ .file = file, .offset = data.len, .parent_session_id = restored.parent_session_id, .provider = restored.provider, .model = restored.model };
         if (restored.needs_repair) {
             try log.append(io, a, .{ .repair = true });
             try log.file.sync(io);
@@ -53,7 +57,7 @@ pub const Log = struct {
         log.offset += bytes.len;
     }
 
-    pub fn commit(log: *Log, io: std.Io, a: std.mem.Allocator, history: *std.ArrayList(openai.Message), tokens: *u64, record: Record) !void {
+    pub fn commit(log: *Log, io: std.Io, a: std.mem.Allocator, history: *std.ArrayList(provider.Message), tokens: *u64, record: Record) !void {
         if (record.from > history.items.len) return error.InvalidSessionLog;
         try history.ensureTotalCapacity(a, record.from + record.messages.len);
         try log.append(io, a, record);
@@ -64,23 +68,29 @@ pub const Log = struct {
     }
 };
 
-fn apply(history: *std.ArrayList(openai.Message), record: Record) void {
+fn apply(history: *std.ArrayList(provider.Message), record: Record) void {
     history.shrinkRetainingCapacity(record.from);
     history.appendSliceAssumeCapacity(record.messages);
 }
 
-pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, history: *std.ArrayList(openai.Message), tokens: *u64) !struct { needs_repair: bool, parent_session_id: ?[]const u8 } {
+pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, history: *std.ArrayList(provider.Message), tokens: *u64) !struct { needs_repair: bool, parent_session_id: ?[]const u8, provider: provider.Id, model: ?[]const u8 } {
     var parent_session_id: ?[]const u8 = null;
+    var id: provider.Id = .chat_completions;
+    var model: ?[]const u8 = null;
     var lines = std.mem.splitScalar(u8, data, '\n');
     var torn = false;
     while (lines.next()) |line| {
         if (lines.peek() == null) break;
         if (line.len == 0) continue;
-        const r = std.json.parseFromSliceLeaky(Record, a, line, .{ .allocate = .alloc_always }) catch {
+        const r = parseRecord(a, line) catch {
             torn = true;
             continue;
         };
-        if (history.items.len == 0) parent_session_id = r.parent_session_id;
+        if (history.items.len == 0) {
+            parent_session_id = r.parent_session_id;
+            id = r.provider orelse .chat_completions;
+        }
+        if (r.model) |m| model = m;
         if (r.repair) {
             torn = false;
             continue;
@@ -92,10 +102,28 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
         tokens.* = r.context_tokens;
     }
     if (history.items.len == 0) return error.InvalidSessionLog;
-    return .{ .needs_repair = torn or data[data.len - 1] != '\n', .parent_session_id = parent_session_id };
+    return .{ .needs_repair = torn or data[data.len - 1] != '\n', .parent_session_id = parent_session_id, .provider = id, .model = model };
 }
 
-fn validate(messages: []const openai.Message) !void {
+fn parseRecord(a: std.mem.Allocator, line: []const u8) !Record {
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, a, line, .{ .allocate = .alloc_always });
+    if (value == .object) if (value.object.get("messages")) |messages| {
+        if (messages == .array) for (messages.array.items) |*m| {
+            if (m.* != .object) continue;
+            if (m.object.get("reasoning_content")) |legacy| {
+                _ = m.object.swapRemove("reasoning_content");
+                if (legacy != .string) continue;
+                var reasoning: std.json.ObjectMap = .{};
+                try reasoning.put(a, "provider", .{ .string = "chat_completions" });
+                try reasoning.put(a, "data", legacy);
+                try m.object.put(a, "reasoning", .{ .object = reasoning });
+            }
+        };
+    };
+    return std.json.parseFromValueLeaky(Record, a, value, .{});
+}
+
+fn validate(messages: []const provider.Message) !void {
     if (messages.len == 0 or !std.mem.eql(u8, messages[0].role, "system")) return error.InvalidSessionLog;
     var i: usize = 1;
     while (i < messages.len) : (i += 1) {
@@ -150,7 +178,7 @@ test "commit and replay preserve safe history, compaction and torn tail" {
     const a = arena.allocator();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/s.jsonl", .{tmp.sub_path});
     var log = try Log.create(t.io, path);
-    var history: std.ArrayList(openai.Message) = .empty;
+    var history: std.ArrayList(provider.Message) = .empty;
     const records = [_]Record{
         .{ .cwd = "/work", .messages = &.{.{ .role = "system", .content = "base" }} },
         .{ .from = 1, .messages = &.{ .{ .role = "user", .content = "hi" }, .{ .role = "assistant", .tool_calls = &.{.{ .id = "c", .function = .{ .name = "run", .arguments = "{}" } }} }, .{ .role = "tool", .content = "ok", .tool_call_id = "c" } }, .context_tokens = 100 },
@@ -160,7 +188,7 @@ test "commit and replay preserve safe history, compaction and torn tail" {
     for (records) |r| {
         try log.commit(t.io, a, &history, &committed_tokens, r);
         const data = try tmp.dir.readFileAlloc(t.io, "s.jsonl", a, .unlimited);
-        var restored: std.ArrayList(openai.Message) = .empty;
+        var restored: std.ArrayList(provider.Message) = .empty;
         var tokens: u64 = 0;
         _ = try replay(a, a, data, &restored, &tokens);
         try t.expectEqualDeep(history.items, restored.items);
@@ -168,13 +196,13 @@ test "commit and replay preserve safe history, compaction and torn tail" {
     }
     try log.file.writePositionalAll(t.io, "{\"from\":\n{\"repair\":", log.offset);
     log.close(t.io);
-    var restored: std.ArrayList(openai.Message) = .empty;
+    var restored: std.ArrayList(provider.Message) = .empty;
     var tokens: u64 = 0;
     log = try Log.restore(t.io, a, a, path, &restored, &tokens);
     defer log.close(t.io);
     try t.expectEqualDeep(history.items, restored.items);
     try log.commit(t.io, a, &restored, &tokens, .{ .from = restored.items.len, .messages = &.{.{ .role = "assistant", .content = "next" }} });
-    var again: std.ArrayList(openai.Message) = .empty;
+    var again: std.ArrayList(provider.Message) = .empty;
     _ = try replay(a, a, try tmp.dir.readFileAlloc(t.io, "s.jsonl", a, .unlimited), &again, &tokens);
     try t.expectEqualDeep(restored.items, again.items);
 }
@@ -184,7 +212,7 @@ test "replay rejects dangling tool calls and unrepaired interior corruption" {
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var history: std.ArrayList(openai.Message) = .empty;
+    var history: std.ArrayList(provider.Message) = .empty;
     var tokens: u64 = 0;
     const header = "{\"messages\":[{\"role\":\"system\",\"content\":\"base\"}]}\n";
     const dangling = header ++ "{\"from\":1,\"messages\":[{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"c\",\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}]}\n";
@@ -192,4 +220,20 @@ test "replay rejects dangling tool calls and unrepaired interior corruption" {
     history.clearRetainingCapacity();
     const corrupt = header ++ "broken\n{\"from\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}\n";
     try t.expectError(error.InvalidSessionLog, replay(a, a, corrupt, &history, &tokens));
+}
+
+test "legacy chat reasoning is migrated without changing provider identity" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    var history: std.ArrayList(provider.Message) = .empty;
+    defer history.deinit(t.allocator);
+    var tokens: u64 = 0;
+    const result = try replay(t.allocator, arena.allocator(),
+        \\{"from":0,"messages":[{"role":"system","content":"s"}]}
+        \\{"from":1,"messages":[{"role":"user","content":"u"},{"role":"assistant","content":"a","reasoning_content":"legacy"}]}
+        \\
+    , &history, &tokens);
+    try t.expectEqual(provider.Id.chat_completions, result.provider);
+    try t.expectEqualDeep(provider.Reasoning{ .provider = .chat_completions, .data = "legacy" }, history.items[2].reasoning.?);
 }
