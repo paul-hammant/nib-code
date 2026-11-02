@@ -80,7 +80,8 @@ const PartialCall = struct {
     }
 };
 
-/// On `error.HttpStatus`, `detail` holds the response body (caller frees).
+/// On `error.HttpStatus` or `error.HttpTransient` (429, 5xx), `detail` holds
+/// the response body (caller frees).
 pub fn stream(
     gpa: std.mem.Allocator,
     out: std.mem.Allocator,
@@ -127,7 +128,7 @@ pub fn stream(
         const text = reader.allocRemaining(gpa, .limited(64 * 1024)) catch "";
         defer if (text.len > 0) gpa.free(text);
         detail.* = try std.fmt.allocPrint(gpa, "HTTP {d}: {s}", .{ status, text });
-        return error.HttpStatus;
+        return if (status == 429 or status >= 500) error.HttpTransient else error.HttpStatus;
     }
 
     var parser: sse.Parser = .{};

@@ -10,6 +10,7 @@ pub const Event = union(enum) {
     delta: struct { kind: openai.Kind, text: []const u8 },
     run_start: []const u8,
     run_end: struct { ok: bool, output: []const u8 },
+    retry: struct { attempt: u32, delay_ms: u64, reason: []const u8 },
 };
 
 pub const Sink = struct {
@@ -18,6 +19,7 @@ pub const Sink = struct {
 };
 
 const max_steps = 50;
+const max_attempts = 5;
 
 const tools_json =
     \\[{"type":"function","function":{"name":"run",
@@ -55,14 +57,14 @@ pub const Session = struct {
     steps: u32 = 0,
     tools: tools.Tools,
 
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, client: *std.http.Client, cfg: openai.Config) !Session {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, client: *std.http.Client, cfg: openai.Config, home: []const u8) !Session {
         var s: Session = .{
             .gpa = gpa,
             .io = io,
             .client = client,
             .cfg = cfg,
             .arena = .init(gpa),
-            .tools = .{ .io = io },
+            .tools = .{ .io = io, .home = home },
         };
         errdefer s.arena.deinit();
         const a = s.arena.allocator();
@@ -88,17 +90,8 @@ pub const Session = struct {
         s.steps = 0;
         errdefer s.history.shrinkRetainingCapacity(safe);
 
-        const Fwd = struct {
-            fn onDelta(ctx: *anyopaque, kind: openai.Kind, text: []const u8) !void {
-                const k: *const Sink = @ptrCast(@alignCast(ctx));
-                try k.emit(k.ctx, .{ .delta = .{ .kind = kind, .text = text } });
-            }
-        };
-        var fwd = sink;
-        const provider_sink: openai.Sink = .{ .ctx = &fwd, .onDelta = Fwd.onDelta };
-
         for (0..max_steps) |_| {
-            const reply = try openai.stream(s.gpa, a, s.client, s.cfg, s.history.items, tools_json, provider_sink, cancel, detail);
+            const reply = try s.complete(sink, cancel, detail);
             s.usage.add(reply.usage);
             s.steps += 1;
             try s.history.append(s.gpa, .{
@@ -119,6 +112,34 @@ pub const Session = struct {
         return error.TooManySteps;
     }
 
+    /// Retries transient failures, but only while nothing has been streamed:
+    /// a retry after partial output would duplicate it in the frontend.
+    fn complete(s: *Session, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !openai.Reply {
+        const Forward = struct {
+            sink: Sink,
+            emitted: bool = false,
+            fn onDelta(ctx: *anyopaque, kind: openai.Kind, text: []const u8) !void {
+                const f: *@This() = @ptrCast(@alignCast(ctx));
+                f.emitted = true;
+                try f.sink.emit(f.sink.ctx, .{ .delta = .{ .kind = kind, .text = text } });
+            }
+        };
+        var attempt: u32 = 1;
+        while (true) : (attempt += 1) {
+            var fwd: Forward = .{ .sink = sink };
+            const provider_sink: openai.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta };
+            return openai.stream(s.gpa, s.arena.allocator(), s.client, s.cfg, s.history.items, tools_json, provider_sink, cancel, detail) catch |err| {
+                if (fwd.emitted or attempt == max_attempts or !transient(err) or cancel.load(.acquire)) return err;
+                const delay_ms = @as(u64, 1000) << @intCast(attempt - 1);
+                try sink.emit(sink.ctx, .{ .retry = .{ .attempt = attempt, .delay_ms = delay_ms, .reason = detail.* orelse @errorName(err) } });
+                if (detail.*) |d| s.gpa.free(d);
+                detail.* = null;
+                try sleep(s.io, delay_ms, cancel);
+                continue;
+            };
+        }
+    }
+
     /// Result is arena-owned.
     fn execute(s: *Session, call: openai.ToolCall, sink: Sink, cancel: *const std.atomic.Value(bool)) ![]const u8 {
         const a = s.arena.allocator();
@@ -131,6 +152,7 @@ pub const Session = struct {
         defer args.deinit();
 
         try sink.emit(sink.ctx, .{ .run_start = args.value.code });
+        s.tools.cancel = cancel;
         const o = try js.eval(s.gpa, s.io, args.value.code, .{}, s.tools.host(), cancel);
         defer o.deinit(s.gpa);
 
@@ -141,6 +163,23 @@ pub const Session = struct {
         return output;
     }
 };
+
+fn transient(err: anyerror) bool {
+    return switch (err) {
+        error.HttpStatus, error.Canceled, error.OutOfMemory, error.TooManyToolCalls => false,
+        else => true,
+    };
+}
+
+fn sleep(io: std.Io, ms: u64, cancel: *const std.atomic.Value(bool)) !void {
+    var left = ms;
+    while (left > 0) {
+        if (cancel.load(.acquire)) return error.Canceled;
+        const step = @min(left, 100);
+        try std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(@intCast(step)), .clock = .awake }, io);
+        left -= step;
+    }
+}
 
 fn formatOutcome(gpa: std.mem.Allocator, o: js.Outcome) ![]u8 {
     const logs = std.mem.trimEnd(u8, o.logs, "\n");

@@ -31,8 +31,9 @@
   - [0001 Zig，从零开始](adr/0001-zig-from-scratch.md)
   - [0002 只暴露 run(code)：模型写 JS，跑在 QuickJS 里](adr/0002-run-code-only.md)
   - [0003 每次 Run 都是全新的沙箱](adr/0003-stateless-runs.md)
-  - [0004 两层隔离](adr/0004-two-layer-isolation.md)（提议中，未实现）
+  - [0004 两层隔离](adr/0004-two-layer-isolation.md)（暂缓：系统层沙箱不做，语言层已实现）
   - [0005 一个 Session 一个进程](adr/0005-process-per-session.md)
+  - [0006 不审批，宿主侧拒绝危险命令](adr/0006-deny-dangerous-commands.md)
 
 ## 没写成 ADR 的选择
 
@@ -47,10 +48,8 @@
 
 - **读取项目指令文件。** 启动时把仓库根目录和 `~/.config/nib/` 下的 `AGENTS.md` 拼进 system prompt（项目的覆盖全局的）。"nib 写的代码是给 agent 读的"这类立场应该写在这些文件里，而不是写死在 nib 内部，因为 nib 也会进入人类团队维护的仓库。待定：是否兼容 `CLAUDE.md`，倾向只认 `AGENTS.md`。暂缓原因：先用真实模型把基础流程验证完（2026-11-01 搁置）。
 - **工具真正并发。** 现在 Run 里的工具调用同步执行，`Promise.all` 结果正确但不并发。等出现明显需要并行的任务（比如同时读很多文件、同时跑多个命令）再接入 `std.Io` 的并发。
-- **Esc 中断 bash。** 现在 Esc 只能中断 JS，正在跑的 bash 要等它结束或超时（默认 120 秒）。等实际使用中被这个卡住时再做。
-- **write / edit 工具。** 现在模型只能通过 bash 改文件。等观察到模型用 bash 改文件容易出错（比如 heredoc 转义、大段替换）时再加。
 
-其他被搁置的方案记在对应 ADR 的"何时重新考虑"里：守护进程（[0005](adr/0005-process-per-session.md)）、跨 Run 的变量存储（[0003](adr/0003-stateless-runs.md)）、混合原生工具调用和 Python 运行时（[0002](adr/0002-run-code-only.md)）。
+其他被搁置的方案记在对应 ADR 里：系统层沙箱（[0004](adr/0004-two-layer-isolation.md)）、守护进程（[0005](adr/0005-process-per-session.md)）、跨 Run 的变量存储（[0003](adr/0003-stateless-runs.md)）、混合原生工具调用和 Python 运行时（[0002](adr/0002-run-code-only.md)）。
 
 ## 度量
 
@@ -58,7 +57,7 @@
 
 | 项目 | 实测值 | 警报线 | 测量方式 |
 |---|---|---|---|
-| 源码行数（`src/` + `build.zig`，含测试） | 1399（2026-11-01，run(code) 接通后） | — | `wc -l build.zig src/**/*.zig`（zsh） |
+| 源码行数（`src/` + `build.zig`，含测试） | 2123（2026-11-01，阶段一完成后） | — | `wc -l build.zig src/**/*.zig`（zsh） |
 | `nib js '1+1'` 平均耗时（含进程启动） | 1.6 ms（2026-11-01，ReleaseFast） | — | 循环 100 次取平均 |
 | 上述命令峰值 RSS | 3.7 MB（2026-11-01） | — | `/usr/bin/time -f %M` |
 | 二进制体积（ReleaseFast，strip 后） | 1.9 MB（2026-11-01） | — | `strip` 后 `ls -l` |

@@ -31,7 +31,7 @@ _Avoid_: eval, cell, code-mode call, PTC call
 _Avoid_: VM, REPL, kernel（这些词暗示跨 Run 的持久状态）
 
 **Tool**（工具）：
-宿主暴露给 Run 内脚本的一项能力，如 `tools.read`；每次调用都经过校验、审批并写入 Session log。`run` 本身不叫 Tool。
+宿主暴露给 Run 内脚本的一项能力，如 `tools.read`；每次调用都经过参数校验并写入 Session log。`run` 本身不叫 Tool。
 _Avoid_: function, programmatic tool, native tool
 
 ## 模型

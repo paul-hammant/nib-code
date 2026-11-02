@@ -3,14 +3,18 @@ const vaxis = @import("vaxis");
 const js = @import("js.zig");
 const agent = @import("agent.zig");
 const openai = @import("provider/openai.zig");
+const Editor = @import("editor.zig").Editor;
 
 const Event = union(enum) {
     key_press: vaxis.Key,
     winsize: vaxis.Winsize,
+    paste_start,
+    paste_end,
     /// Slices are owned by the receiver.
     delta: struct { kind: openai.Kind, text: []u8 },
     run_start: []u8,
     run_end: struct { ok: bool, output: []u8 },
+    retry: []u8,
     done,
     failed: []u8,
 };
@@ -48,6 +52,7 @@ const Turn = struct {
             .delta => |d| .{ .delta = .{ .kind = d.kind, .text = try gpa.dupe(u8, d.text) } },
             .run_start => |code| .{ .run_start = try gpa.dupe(u8, code) },
             .run_end => |r| .{ .run_end = .{ .ok = r.ok, .output = try gpa.dupe(u8, r.output) } },
+            .retry => |r| .{ .retry = try std.fmt.allocPrint(gpa, "retry {d} in {d}s: {s}", .{ r.attempt, r.delay_ms / 1000, r.reason }) },
         });
     }
 
@@ -62,7 +67,7 @@ pub fn run(init: std.process.Init, client: *std.http.Client, cfg: openai.Config)
     const io = init.io;
     const gpa = init.gpa;
 
-    var session = try agent.Session.init(gpa, io, client, cfg);
+    var session = try agent.Session.init(gpa, io, client, cfg, init.environ_map.get("HOME") orelse "");
     defer session.deinit();
 
     var tty_buf: [4096]u8 = undefined;
@@ -81,8 +86,11 @@ pub fn run(init: std.process.Init, client: *std.http.Client, cfg: openai.Config)
     try w.flush();
     try vx.queryTerminal(w, .fromSeconds(1));
 
-    var input = vaxis.widgets.TextInput.init(gpa);
-    defer input.deinit();
+    try vx.setBracketedPaste(w, true);
+    var input: Editor = .{};
+    defer input.deinit(gpa);
+    var pasting = false;
+    var scroll: u32 = 0;
 
     var entries: std.ArrayList(Entry) = .empty;
     defer {
@@ -103,12 +111,25 @@ pub fn run(init: std.process.Init, client: *std.http.Client, cfg: openai.Config)
     while (true) {
         switch (try loop.nextEvent()) {
             .key_press => |key| {
-                if (key.matches('c', .{ .ctrl = true }) or key.matches('d', .{ .ctrl = true })) break;
+                const page = @max(vx.window().height / 2, 1);
+                if (key.matches('c', .{ .ctrl = true })) break;
+                if (key.matches('d', .{ .ctrl = true }) and input.text().len == 0) break;
                 if (key.matches(vaxis.Key.escape, .{})) {
                     if (turn) |t| t.cancel.store(true, .release);
+                } else if (key.matches(vaxis.Key.page_up, .{})) {
+                    scroll +|= page;
+                } else if (key.matches(vaxis.Key.page_down, .{})) {
+                    scroll -|= page;
+                } else if (key.matches(vaxis.Key.up, .{ .shift = true })) {
+                    scroll +|= 3;
+                } else if (key.matches(vaxis.Key.down, .{ .shift = true })) {
+                    scroll -|= 3;
+                } else if (isNewline(key, pasting)) {
+                    try input.insert(gpa, "\n");
                 } else if (key.matches(vaxis.Key.enter, .{})) {
                     if (turn != null) continue; // one Turn at a time
-                    const line = try input.toOwnedSlice();
+                    scroll = 0;
+                    const line = try input.take(gpa);
                     if (line.len == 0) {
                         gpa.free(line);
                         continue;
@@ -131,9 +152,11 @@ pub fn run(init: std.process.Init, client: *std.http.Client, cfg: openai.Config)
                         turn = t;
                     }
                 } else {
-                    try input.update(.{ .key_press = key });
+                    _ = try input.key(gpa, key);
                 }
             },
+            .paste_start => pasting = true,
+            .paste_end => pasting = false,
             .winsize => |ws| try vx.resize(gpa, w, ws),
             .delta => |d| {
                 defer gpa.free(d.text);
@@ -152,6 +175,10 @@ pub fn run(init: std.process.Init, client: *std.http.Client, cfg: openai.Config)
                 try appendHead(gpa, &e.text, r.output, run_output_lines);
                 try entries.append(gpa, e);
             },
+            .retry => |msg| {
+                defer gpa.free(msg);
+                try addEntry(gpa, &entries, .info, msg);
+            },
             .done => {
                 turn.?.finish();
                 turn = null;
@@ -169,7 +196,7 @@ pub fn run(init: std.process.Init, client: *std.http.Client, cfg: openai.Config)
             },
         }
 
-        draw(vx.window(), entries.items, &input, cfg.model, usage, steps, turn != null);
+        draw(vx.window(), entries.items, &input, &scroll, cfg.model, usage, steps, turn != null);
         try vx.render(w);
         try w.flush();
     }
@@ -218,46 +245,64 @@ fn segmentsFor(e: *const Entry, buf: *[2]vaxis.Segment) []const vaxis.Segment {
     return buf[0..1];
 }
 
-fn draw(win: vaxis.Window, entries: []const Entry, input: *vaxis.widgets.TextInput, model: []const u8, usage: openai.Usage, steps: u32, busy: bool) void {
-    win.clear();
-    if (win.height < 4 or win.width < 4) return;
+fn isNewline(key: vaxis.Key, pasting: bool) bool {
+    const enter = vaxis.Key.enter;
+    return (pasting and key.matches(enter, .{})) or key.matches(enter, .{ .shift = true }) or
+        key.matches(enter, .{ .alt = true }) or key.matches('j', .{ .ctrl = true });
+}
 
-    const body = win.child(.{ .x_off = 1, .width = win.width - 2, .height = win.height - 3 });
+/// `scroll` counts rows above the bottom and is clamped to the transcript.
+fn draw(win: vaxis.Window, entries: []const Entry, input: *const Editor, scroll: *u32, model: []const u8, usage: openai.Usage, steps: u32, busy: bool) void {
+    win.clear();
+    win.hideCursor();
+    if (win.height < 6 or win.width < 8) return;
+
     // Measuring needs a window taller than the content, or print() clips.
+    const input_rows = input.rows(win.child(.{ .x_off = 3, .y_off = -10_000 }));
+    const input_h: u16 = @min(input_rows, win.height / 3);
+    const body_h: u16 = win.height - 1 - input_h;
+    const body = win.child(.{ .x_off = 1, .width = win.width - 2, .height = body_h });
     const tall = body.child(.{ .y_off = -10_000 });
 
-    var heights: [256]u16 = undefined;
-    var total: i32 = 0;
+    var heights: [1024]u16 = undefined;
+    const want: i64 = @as(i64, body_h) + scroll.*;
+    var content: i64 = -1;
     var start = entries.len;
-    while (start > 0 and entries.len - start < heights.len and total < body.height) {
+    while (start > 0 and entries.len - start < heights.len and content < want) {
         start -= 1;
         var segs: [2]vaxis.Segment = undefined;
         const r = tall.print(segmentsFor(&entries[start], &segs), .{ .wrap = .word, .commit = false });
         const h: u16 = if (r.col == 0 and r.row > 0) r.row else r.row + 1;
         heights[entries.len - 1 - start] = h;
-        total += h + 1;
+        content += h + 1;
     }
+    content = @max(content, 0);
+    if (content < want) scroll.* = @intCast(@max(content - body_h, 0));
 
-    var y: i32 = if (total > body.height) body.height - total + 1 else 0;
+    var y: i64 = if (content > body_h) @as(i64, body_h) + scroll.* - content else 0;
     for (entries[start..], start..) |*e, i| {
         const h = heights[entries.len - 1 - i];
-        var segs: [2]vaxis.Segment = undefined;
-        _ = body.child(.{ .y_off = @intCast(y), .height = h }).print(segmentsFor(e, &segs), .{ .wrap = .word });
+        if (y < body_h and y + h > 0) {
+            var segs: [2]vaxis.Segment = undefined;
+            _ = body.child(.{ .y_off = @intCast(y), .height = h }).print(segmentsFor(e, &segs), .{ .wrap = .word });
+        }
         y += h + 1;
     }
 
     var status_buf: [256]u8 = undefined;
-    const status = std.fmt.bufPrint(&status_buf, "{s} · last turn: {d} steps, in {d} (cache {d}), out {d} · {s}", .{
-        model,
-        steps,
-        usage.prompt_tokens,
-        usage.prompt_cache_hit_tokens,
-        usage.completion_tokens,
-        if (busy) "streaming… esc to cancel" else "ctrl-c to quit",
-    }) catch "";
-    _ = win.child(.{ .x_off = 1, .y_off = win.height - 2, .height = 1 }).printSegment(.{ .text = status, .style = .{ .dim = true } }, .{ .wrap = .none });
+    const status = if (scroll.* > 0)
+        std.fmt.bufPrint(&status_buf, "↑ {d} rows up · PgDn / shift+↓ to return", .{scroll.*}) catch ""
+    else
+        std.fmt.bufPrint(&status_buf, "{s} · last turn: {d} steps, in {d} (cache {d}), out {d} · {s}", .{
+            model,
+            steps,
+            usage.prompt_tokens,
+            usage.prompt_cache_hit_tokens,
+            usage.completion_tokens,
+            if (busy) "working… esc to cancel" else "shift+enter newline · ctrl-c quit",
+        }) catch "";
+    _ = win.child(.{ .x_off = 1, .y_off = body_h, .height = 1 }).printSegment(.{ .text = status, .style = .{ .dim = true } }, .{ .wrap = .none });
 
-    const prompt = win.child(.{ .x_off = 1, .y_off = win.height - 1, .height = 1 });
-    _ = prompt.printSegment(.{ .text = "› ", .style = .{ .fg = .{ .index = 4 } } }, .{});
-    input.draw(prompt.child(.{ .x_off = 2 }));
+    _ = win.child(.{ .x_off = 1, .y_off = body_h + 1, .height = 1 }).printSegment(.{ .text = "› ", .style = .{ .fg = .{ .index = 4 } } }, .{});
+    input.draw(win.child(.{ .x_off = 3, .y_off = body_h + 1, .height = input_h }));
 }

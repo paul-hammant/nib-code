@@ -40,7 +40,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (args.len >= 3 and std.mem.eql(u8, args[1], "ask")) {
         if (cfg.llm.api_key.len == 0) fatal("set DEEPSEEK_API_KEY (or NIB_API_KEY)");
-        var session = try agent.Session.init(gpa, init.io, &client, cfg.llm);
+        var session = try agent.Session.init(gpa, init.io, &client, cfg.llm, init.environ_map.get("HOME") orelse "");
         defer session.deinit();
 
         const Print = struct {
@@ -54,6 +54,7 @@ pub fn main(init: std.process.Init) !void {
                     },
                     .run_start => |code| std.debug.print("\n\x1b[33mrun ▸\x1b[0m {s}\n", .{code}),
                     .run_end => |r| std.debug.print("\x1b[2m{s}\x1b[0m\n", .{r.output}),
+                    .retry => |r| std.debug.print("\x1b[2mretry {d} in {d}s: {s}\x1b[0m\n", .{ r.attempt, r.delay_ms / 1000, r.reason }),
                 }
             }
         };
@@ -86,5 +87,7 @@ test {
     _ = openai;
     _ = @import("sse.zig");
     _ = @import("tools.zig");
+    _ = @import("policy.zig");
+    _ = @import("editor.zig");
     _ = agent;
 }
