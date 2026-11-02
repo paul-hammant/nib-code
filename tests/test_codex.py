@@ -41,7 +41,7 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("NIB_", "DEEPSEEK_", "OPENAI_", "CODEX_"))}
     env.update(NIB_PROVIDER="codex", NIB_BASE_URL=f"http://127.0.0.1:{port}",
-               CODEX_HOME=str(auth_path.parent), HOME=str(tmp), XDG_DATA_HOME=str(tmp / "data"),
+               CODEX_HOME=str(auth_path.parent), HOME=str(tmp), NIB_HOME=str(tmp / "nib"), XDG_DATA_HOME=str(tmp / "data"),
                XDG_CONFIG_HOME=str(tmp / "config"))
     cwd = tmp / "project"
     cwd.mkdir()
@@ -69,8 +69,10 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
                 assert headers["x-client-request-id"] == session_id, headers
 
         def ask(prompt, *args, ok=True, overrides=None, workdir=cwd):
+            child_env = dict(env, **(overrides or {}))
+            child_env = {key: value for key, value in child_env.items() if value is not None}
             result = subprocess.run([str(BIN), "ask", "--json", prompt, *args], cwd=workdir,
-                                    env=dict(env, **(overrides or {})), capture_output=True, timeout=20)
+                                    env=child_env, capture_output=True, timeout=20)
             assert result.stderr == b"", result.stderr
             events = [json.loads(line) for line in result.stdout.splitlines()]
             assert events and all(len(event) == 1 for event in events), result.stdout
@@ -107,7 +109,7 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
         assert "description" in tool and "parameters" in tool and "function" not in tool
         session = plain[0]["start"]["session_id"]
         assert_cache_key([request], session)
-        history, records = replay(tmp / f"data/nib/sessions/{session}.jsonl")
+        history, records = replay(tmp / f"nib/sessions/{session}.jsonl")
         assert records[0]["provider"] == "codex" and records[0]["model"] == "gpt-6.1-sol"
         reasoning = history[-1]["reasoning"]
         assert reasoning["provider"] == "codex"
@@ -127,7 +129,7 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
         assert requests()[-1]["body"]["reasoning"]["effort"] == "low"
         large = ask("large reasoning")
         large_id = large[0]["start"]["session_id"]
-        large_history, _ = replay(tmp / f"data/nib/sessions/{large_id}.jsonl")
+        large_history, _ = replay(tmp / f"nib/sessions/{large_id}.jsonl")
         assert len(json.loads(large_history[-1]["reasoning"]["data"])[0]["encrypted_content"]) > 100000
         ask("plain text", "--resume", large_id)
         assert json.loads(large_history[-1]["reasoning"]["data"])[0] in requests()[-1]["body"]["input"]
@@ -158,7 +160,7 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
             assert {k.lower(): v for k, v in request["headers"].items()}["authorization"] == "Bearer fake-access-initial"
         assert sum("async agent({" not in r["body"]["instructions"] for r in steps) == 1
         parent_id = delegated[0]["start"]["session_id"]
-        child_logs = [p for p in (tmp / "data/nib/sessions").glob("*.jsonl")
+        child_logs = [p for p in (tmp / "nib/sessions").glob("*.jsonl")
                       if json.loads(p.read_text().splitlines()[0]).get("parent_session_id") == parent_id]
         assert len(child_logs) == 1
         child_id = child_logs[0].stem
@@ -223,7 +225,7 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
         cross = ask("plain text", "--resume", session, ok=False, overrides={"NIB_PROVIDER": "chat_completions", "NIB_API_KEY": "mock"})
         message = cross[-1]["error"]["message"]
         assert "SessionProviderMismatch" in message or "different provider" in message, cross
-        log = tmp / f"data/nib/sessions/{session}.jsonl"
+        log = tmp / f"nib/sessions/{session}.jsonl"
         committed = log.read_bytes()
         for prompt in ("stream incomplete", "stream failed", "stream truncated"):
             failed = ask(prompt, "--resume", session, ok=False)
@@ -234,6 +236,27 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
         assert "different model" in changed_model[-1]["error"]["message"]
         assert len(requests()) == before
         print("Codex 401 reread, repeated-401 login guidance, credentials and tool isolation passed")
+
+        config_path = tmp / "nib/config.toml"
+        config_text = ('# Keep this comment and both provider sections.\n'
+                       'provider = "codex"\neffort = "high"\n'
+                       '[codex]\nmodel = "gpt-6-sol"\n'
+                       f'base_url = "http://127.0.0.1:{port}"\ncontext_window = 272000\n'
+                       '[chat_completions]\nmodel = "unused-chat-model"\n')
+        config_path.write_text(config_text)
+        file_env = {key: None for key in ("NIB_PROVIDER", "NIB_MODEL", "NIB_BASE_URL", "NIB_CONTEXT_WINDOW")}
+        ask("plain text", overrides=file_env)
+        body = requests()[-1]["body"]
+        assert body["model"] == "gpt-6-sol" and body["reasoning"]["effort"] == "high", body
+        ask("plain text", overrides=dict(file_env, NIB_MODEL="gpt-6.1-terra", NIB_REASONING_EFFORT="low"))
+        body = requests()[-1]["body"]
+        assert body["model"] == "gpt-6.1-terra" and body["reasoning"]["effort"] == "low", body
+        ask("plain text", "--effort", "high", overrides=dict(file_env, NIB_REASONING_EFFORT="low"))
+        assert requests()[-1]["body"]["reasoning"]["effort"] == "high"
+        assert config_path.read_text() == config_text
+        assert not (tmp / "data/nib").exists() and not (tmp / "config/nib").exists()
+        assert not (tmp / ".nib").exists()
+        print("Codex configuration E2E passed: NIB_HOME, file model, env/CLI precedence and ephemeral CLI effort")
     finally:
         server.terminate()
         server.wait(timeout=5)

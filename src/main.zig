@@ -1,18 +1,11 @@
 const std = @import("std");
 const sandbox = @import("sandbox.zig");
 const provider = @import("provider.zig");
+const config = @import("config.zig");
 const tui = @import("tui.zig");
 const JsonEvent = @import("session/events.zig").JsonEvent;
 const Session = @import("session.zig").Session;
 const Event = @import("session.zig").Event;
-
-pub const Config = struct {
-    llm: provider.Config,
-
-    fn fromEnv(a: std.mem.Allocator, env: *const std.process.Environ.Map) !Config {
-        return .{ .llm = try provider.Config.fromEnv(a, env) };
-    }
-};
 
 pub fn main(init: std.process.Init) void {
     var out_buf: [4096]u8 = undefined;
@@ -41,28 +34,20 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
         try stdout.print("nib {s}\n", .{@import("build_options").version});
         return stdout.flush();
     }
-    var cfg = try Config.fromEnv(init.arena.allocator(), init.environ_map);
-    if (args.len >= 3 and std.mem.eql(u8, args[1], "js")) {
-        const r = try sandbox.eval(gpa, init.io, args[2], .{}, null, null);
-        defer r.deinit(gpa);
-        try stdout.print("{s}{s}{s}\n", .{ r.logs, if (r.ok) "" else "error: ", r.text });
-        try stdout.flush();
-        if (!r.ok) return error.ScriptFailed;
-        return;
-    }
+    const js = args.len >= 3 and std.mem.eql(u8, args[1], "js");
 
     var options: Session.Options = .{
         .environ = init.environ_map,
         .depth = if (init.environ_map.get("NIB_AGENT_DEPTH")) |v| try std.fmt.parseInt(u32, v, 10) else 0,
         .parent_session_id = init.environ_map.get("NIB_PARENT_SESSION_ID"),
-        .home = init.environ_map.get("HOME") orelse "",
-        .data_home = init.environ_map.get("XDG_DATA_HOME") orelse try std.fs.path.join(init.arena.allocator(), &.{ init.environ_map.get("HOME") orelse "", ".local/share" }),
-        .config_home = init.environ_map.get("XDG_CONFIG_HOME") orelse try std.fs.path.join(init.arena.allocator(), &.{ init.environ_map.get("HOME") orelse "", ".config" }),
+        .home = try config.home(init.arena.allocator(), init.environ_map),
+        .user_home = init.environ_map.get("HOME") orelse "",
     };
+    var effort: ?[]const u8 = null;
     var agent_input = false;
     var ask = false;
     var prompt: ?[]const u8 = null;
-    var i: usize = 1;
+    var i: usize = if (js) args.len else 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (!ask and std.mem.eql(u8, arg, "ask")) {
@@ -74,7 +59,7 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
         } else if (std.mem.eql(u8, arg, "--effort")) {
             i += 1;
             if (i == args.len) return error.MissingReasoningEffort;
-            try cfg.llm.setEffort(args[i]);
+            effort = args[i];
         } else if (std.mem.eql(u8, arg, "--resume")) {
             i += 1;
             if (i == args.len) return error.MissingSessionId;
@@ -90,15 +75,31 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
     defer client.deinit();
     try client.initDefaultProxies(init.arena.allocator(), init.environ_map);
 
+    var cfg: provider.Config = undefined;
     if (agent_input) {
         var input = std.Io.File.stdin().reader(init.io, &.{});
         const data = try input.interface.allocRemaining(init.arena.allocator(), .unlimited);
         const envelope = try std.json.parseFromSliceLeaky(struct { prompt: []const u8, config: provider.Config }, init.arena.allocator(), data, .{});
-        cfg.llm = envelope.config;
+        cfg = envelope.config;
         prompt = envelope.prompt;
+    } else {
+        var config_detail: ?[]u8 = null;
+        cfg = config.load(init.arena.allocator(), init.io, init.environ_map, options.home, &config_detail) catch |err| {
+            if (config_detail) |message| detail.* = try gpa.dupe(u8, message);
+            return err;
+        };
     }
-    if (ask and cfg.llm.missingKey()) return error.MissingApiKey;
-    var session = try Session.init(gpa, init.io, &client, cfg.llm, options);
+    if (js) {
+        const r = try sandbox.eval(gpa, init.io, args[2], .{}, null, null);
+        defer r.deinit(gpa);
+        try stdout.print("{s}{s}{s}\n", .{ r.logs, if (r.ok) "" else "error: ", r.text });
+        try stdout.flush();
+        if (!r.ok) return error.ScriptFailed;
+        return;
+    }
+    if (effort) |value| try cfg.setEffort(value);
+    if (ask and cfg.missingKey()) return error.MissingApiKey;
+    var session = try Session.init(gpa, init.io, &client, cfg, options);
     defer session.deinit();
     defer {
         failure.usage = session.usage;
@@ -135,6 +136,7 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
         if (json) try JsonEvent.write(.{ .start = .{ .session_id = session.id } }, stdout);
         var p: Print = .{ .w = stdout, .json = json };
         const action: std.posix.Sigaction = .{ .handler = .{ .handler = onSignal }, .mask = std.posix.sigemptyset(), .flags = 0 };
+        session.interrupt_signal = &ask_signal;
         std.posix.sigaction(.TERM, &action, null);
         std.posix.sigaction(.INT, &action, null);
         try session.turn(prompt.?, .{ .ctx = &p, .emit = Print.emit }, &ask_cancel, detail);
@@ -150,7 +152,7 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
         try stdout.flush();
         const u = session.usage;
         std.debug.print("[{s}] turn: {d} steps, in={d} (cache hit {d}) out={d}\n", .{
-            cfg.llm.model, session.steps, u.prompt_tokens, u.prompt_cache_hit_tokens, u.completion_tokens,
+            cfg.model, session.steps, u.prompt_tokens, u.prompt_cache_hit_tokens, u.completion_tokens,
         });
         return;
     }
@@ -160,7 +162,10 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
 
 var ask_cancel: std.atomic.Value(bool) = .init(false);
 
-fn onSignal(_: std.posix.SIG) callconv(.c) void {
+var ask_signal: std.atomic.Value(std.posix.SIG) = .init(.INT);
+
+fn onSignal(signal: std.posix.SIG) callconv(.c) void {
+    ask_signal.store(signal, .release);
     ask_cancel.store(true, .release);
 }
 
@@ -177,6 +182,7 @@ fn errorMessage(err: anyerror) []const u8 {
 test {
     _ = sandbox;
     _ = provider;
+    _ = config;
     _ = @import("provider/sse.zig");
     _ = @import("tools.zig");
     _ = @import("tools/policy.zig");

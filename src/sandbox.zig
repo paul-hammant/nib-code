@@ -44,7 +44,8 @@ const State = struct {
     logs: std.ArrayList(u8) = .empty,
     max_log: usize,
     log_truncated: bool = false,
-    deadline: std.Io.Clock.Timestamp,
+    js_remaining_ns: i96,
+    js_started: ?std.Io.Clock.Timestamp = null,
     cancel: ?*const std.atomic.Value(bool),
     oom: bool = false,
     calls: std.ArrayList(?*Call) = .empty,
@@ -87,6 +88,17 @@ const State = struct {
         }
     };
 
+    fn beginJs(st: *State) void {
+        std.debug.assert(st.js_started == null);
+        st.js_started = .now(st.io, .awake);
+    }
+
+    fn endJs(st: *State) void {
+        const started = st.js_started.?;
+        st.js_remaining_ns -= started.durationTo(.now(st.io, .awake)).raw.toNanoseconds();
+        st.js_started = null;
+    }
+
     fn stop(st: *State) void {
         if (st.host) |h| if (h.cancel) |flag| flag.store(true, .release);
     }
@@ -111,7 +123,9 @@ const State = struct {
                 return;
             }
             var pctx: ?*c.JSContext = null;
+            st.beginJs();
             const n = c.JS_ExecutePendingJob(rt, &pctx);
+            st.endJs();
             if (n < 0) return;
             if (n > 0) continue;
             st.mutex.lockUncancelable(st.io);
@@ -124,6 +138,8 @@ const State = struct {
                 call.thread.?.join();
                 call.thread = null;
                 active -= 1;
+                st.beginJs();
+                defer st.endJs();
                 const result = call.result.?;
                 const value = switch (result) {
                     .ok => |json| blk: {
@@ -192,7 +208,7 @@ pub fn eval(
         .io = io,
         .host = host,
         .max_log = limits.max_log_bytes,
-        .deadline = .fromNow(io, .{ .raw = .fromMilliseconds(limits.timeout_ms), .clock = .awake }),
+        .js_remaining_ns = std.Io.Duration.fromMilliseconds(limits.timeout_ms).toNanoseconds(),
         .cancel = cancel,
     };
     defer st.logs.deinit(gpa);
@@ -218,15 +234,21 @@ pub fn eval(
     const src = try gpa.dupeSentinel(u8, code, 0);
     defer gpa.free(src);
 
+    st.beginJs();
     const promise = c.JS_Eval(ctx, src.ptr, code.len, "<run>", c.JS_EVAL_TYPE_GLOBAL | c.JS_EVAL_FLAG_ASYNC);
+    st.endJs();
     defer c.JS_FreeValue(ctx, promise);
 
     var ok = false;
     var text: []u8 = undefined;
     if (c.JS_IsException(promise)) {
+        st.beginJs();
+        defer st.endJs();
         text = try takeException(gpa, ctx);
     } else {
         try st.jobs(ctx, rt, promise);
+        st.beginJs();
+        defer st.endJs();
         switch (c.JS_PromiseState(ctx, promise)) {
             c.JS_PROMISE_FULFILLED => {
                 const res = c.JS_PromiseResult(ctx, promise);
@@ -272,7 +294,8 @@ fn state(ctx: ?*c.JSContext) *State {
 
 fn isInterrupted(st: *State) bool {
     if (st.cancel) |flag| if (flag.load(.acquire)) return true;
-    return std.Io.Clock.Timestamp.now(st.io, .awake).compare(.gte, st.deadline);
+    const elapsed = if (st.js_started) |started| started.durationTo(.now(st.io, .awake)).raw.toNanoseconds() else 0;
+    return elapsed >= st.js_remaining_ns;
 }
 
 fn interrupt(_: ?*c.JSContext, opaque_ptr: ?*anyopaque) callconv(.c) c_int {
@@ -405,6 +428,19 @@ test "timeout interrupts an infinite loop" {
     defer r.deinit(testing.allocator);
     try testing.expect(!r.ok);
     try testing.expectEqualStrings("Error: run timed out", r.text);
+}
+
+test "timeout also covers JS invoked by result and error conversion" {
+    for ([_][]const u8{
+        "({ get x() { for (;;) {} } })",
+        "throw { toString() { for (;;) {} } }",
+        "throw { toString() { return 'bad' }, get stack() { for (;;) {} } }",
+    }) |code| {
+        const r = try run(code, .{ .timeout_ms = 50 }, null);
+        defer r.deinit(testing.allocator);
+        try testing.expect(!r.ok);
+        try testing.expectEqualStrings("Error: run timed out", r.text);
+    }
 }
 
 const EchoHost = struct {

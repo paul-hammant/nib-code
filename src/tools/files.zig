@@ -27,15 +27,8 @@ pub fn read(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
     while (n < a.value.limit and end < data.len) : (n += 1) {
         end = if (std.mem.indexOfScalarPos(u8, data, end, '\n')) |nl| nl + 1 else data.len;
     }
-    const body = try tools.truncateMiddle(gpa, data[start..end]);
-    defer gpa.free(body);
-    const more = end < data.len;
-    const text = if (more)
-        try std.fmt.allocPrint(gpa, "{s}\n[more lines follow; continue with offset {d}]", .{ body, a.value.offset + n })
-    else
-        try gpa.dupe(u8, body);
-    defer gpa.free(text);
-    return .{ .ok = try std.json.Stringify.valueAlloc(gpa, text, .{}) };
+    const next_offset: ?usize = if (end < data.len) line + n else null;
+    return .{ .ok = try std.json.Stringify.valueAlloc(gpa, .{ .text = data[start..end], .next_offset = next_offset }, .{}) };
 }
 
 pub fn edit(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolResult {
@@ -156,7 +149,7 @@ test "read slices lines and reports errors" {
 
     const r = try callTool("read", args);
     defer freeResult(r);
-    try testing.expectEqualStrings("\"b\\nc\\n\\n[more lines follow; continue with offset 4]\"", r.ok);
+    try testing.expectEqualStrings("{\"text\":\"b\\nc\\n\",\"next_offset\":4}", r.ok);
 
     const missing = try callTool("read", "{\"path\":\"/nonexistent/x\"}");
     defer freeResult(missing);
@@ -216,4 +209,87 @@ test "credential file tools deny default custom and symlink paths" {
     const data = try tmp.dir.readFileAlloc(testing.io, "custom/auth.json", testing.allocator, .limited(100));
     defer testing.allocator.free(data);
     try testing.expectEqualStrings("fictional-custom", data);
+}
+
+test "read and write round trip more than 16 KiB inside JS" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(testing.allocator);
+    for (0..3000) |_| try bytes.appendSlice(testing.allocator, "中文\t\"\\0123456789");
+    try bytes.appendSlice(testing.allocator, "\r\nlast line without newline");
+    const content = bytes.items;
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "f", .data = content });
+    const code = try std.fmt.allocPrint(testing.allocator,
+        \\const path = '.zig-cache/tmp/{s}/f';
+        \\const page = await tools.read({{path}});
+        \\if (page.next_offset !== null) throw new Error('unexpected page');
+        \\await tools.write({{path, content: page.text}});
+    , .{tmp.sub_path});
+    defer testing.allocator.free(code);
+    var t: Tools = .{ .io = testing.io, .home = "/home/nobody" };
+    const result = try sandbox.eval(testing.allocator, testing.io, code, .{}, t.host(), null);
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.ok);
+    const actual = try tmp.dir.readFileAlloc(testing.io, "f", testing.allocator, .limited(content.len + 1));
+    defer testing.allocator.free(actual);
+    try testing.expectEqualStrings(content, actual);
+}
+
+test "read default pagination reconstructs every byte in JS" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(testing.allocator);
+    for (0..1100) |_| try bytes.appendSlice(testing.allocator, "中文\r\n\nthird\nfourth\n");
+    try bytes.appendSlice(testing.allocator, "last without newline");
+    const content = bytes.items;
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "f", .data = content });
+    const code = try std.fmt.allocPrint(testing.allocator,
+        \\const path = '.zig-cache/tmp/{s}/f';
+        \\let offset = 1, text = '', pages = 0;
+        \\do {{
+        \\  const page = await tools.read({{path, offset}});
+        \\  text += page.text;
+        \\  offset = page.next_offset;
+        \\  if (++pages > 3) throw new Error('pagination did not finish');
+        \\  if (pages < 3 && offset !== 1 + pages * 2000) throw new Error('wrong offset');
+        \\}} while (offset !== null);
+        \\if (pages !== 3) throw new Error('wrong default limit');
+        \\await tools.write({{path, content: text}});
+    , .{tmp.sub_path});
+    defer testing.allocator.free(code);
+    var t: Tools = .{ .io = testing.io, .home = "/home/nobody" };
+    const result = try sandbox.eval(testing.allocator, testing.io, code, .{}, t.host(), null);
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.ok);
+    const actual = try tmp.dir.readFileAlloc(testing.io, "f", testing.allocator, .limited(content.len + 1));
+    defer testing.allocator.free(actual);
+    try testing.expectEqualStrings(content, actual);
+}
+
+test "read pagination boundaries do not add text" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/f", .{tmp.sub_path});
+    defer testing.allocator.free(path);
+    const Case = struct { data: []const u8, offset: usize = 1, limit: usize = 2000, text: []const u8, next_offset: ?usize = null };
+    for ([_]Case{
+        .{ .data = "", .text = "" },
+        .{ .data = "a\n", .limit = 1, .text = "a\n" },
+        .{ .data = "a\nb", .limit = 1, .text = "a\n", .next_offset = 2 },
+        .{ .data = "a\nb", .offset = 2, .limit = 1, .text = "b" },
+        .{ .data = "a\n", .offset = 2, .text = "" },
+        .{ .data = "a\n", .offset = 100, .text = "" },
+        .{ .data = "a", .limit = 0, .text = "", .next_offset = 1 },
+    }) |c| {
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "f", .data = c.data });
+        const args = try std.json.Stringify.valueAlloc(testing.allocator, .{ .path = path, .offset = c.offset, .limit = c.limit }, .{});
+        defer testing.allocator.free(args);
+        const result = try callTool("read", args);
+        defer freeResult(result);
+        const expected = try std.json.Stringify.valueAlloc(testing.allocator, .{ .text = c.text, .next_offset = c.next_offset }, .{});
+        defer testing.allocator.free(expected);
+        try testing.expectEqualStrings(expected, result.ok);
+    }
 }

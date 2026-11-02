@@ -9,6 +9,12 @@ date: 2026-11-01
 
 **为什么：** 代码驱动的主要收益在一次 Run 内部：读、搜、过滤、汇总的中间数据留在 Sandbox 里，只把结果交给模型，上下文不膨胀。选 JS 而非 Python，是因为 QuickJS 是纯 C 库，可以在进程内嵌入，开销很小，默认没有任何宿主能力；`async/await` 和 JSON 原生契合"编排 Tool 调用"。说明和代码用同一种语言：最初用 TS 类型声明描述签名（pi 的做法），但那样一边给 TS、一边要求"别写 TS"，信号自相矛盾，2026-11-01 改为 JS 方法签名。实测（字节数，2026-11-01）：旧 TS 声明 468 字节；JS 签名 441 字节，还多带了默认值等信息。中间试过"每个工具配一行完整调用示例"的写法，589 字节，偏长，弃用。说明是否合法由测试用 QuickJS 解析来保证。
 
+**数据与展示的边界：** 工具返回给 JS 的是完整数据，保护模型上下文的截断只发生在 Session 把 Run 输出交给模型的那一步：`tools.truncateMiddle` 保留首尾合计约 16 KiB。不能在 read/bash 返回值里做中间截断或加入提示文本；JS 会把这些返回值用于替换和写回，展示用的省略标记会变成文件内容，造成不可逆的数据损坏。
+
+- `read({ path, offset = 1, limit = 2000 })` 返回 `{ text, next_offset }`，text 是所请求行的原文，保留换行；有后续行时 next_offset 是下一页的 1-based 行号，否则为 null。16 MiB 文件大小上限不变，分页信息不进入 text。
+- `bash` 仍返回 `{ exit_code, output }`，output 完整返回；超过 16 MiB 则终止进程组并报错，要求把输出重定向到文件，不返回部分成功结果。
+- 明确约定的有界结果不等于完整正文：grep 的 500 字节行限制保留，grep/glob 的结果数量限制由 truncated 标明；fetch 保留 1 MiB 文本上限，返回独立的 `truncated` 布尔值，不往 text 里插标记。下载超过 5 MiB 报错。脚本应检查完整性再使用这些结果。
+
 **参考（来源与把握）：**
 - pi codemode：QuickJS（wasm），签名用 TS 声明（一手：本地源码 `pi/packages/codemode`）
 - jcode codemode：rquickjs 内嵌（一手：本地源码 `jcode/crates/jcode-codemode`）

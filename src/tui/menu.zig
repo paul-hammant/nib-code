@@ -72,7 +72,7 @@ pub const Menu = struct {
 };
 
 fn sessionChoices(io: std.Io, a: std.mem.Allocator, session: *const Session) ![]const commands.Choice {
-    const directory = try std.fs.path.join(a, &.{ session.options.data_home, "nib/sessions" });
+    const directory = try std.fs.path.join(a, &.{ session.options.home, "sessions" });
     const cwd = try std.process.currentPathAlloc(io, a);
     const found = try session_log.list(io, a, directory, cwd);
     const now = std.Io.Clock.real.now(io).nanoseconds;

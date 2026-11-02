@@ -4,6 +4,7 @@ const Session = @import("session.zig").Session;
 const SessionEvent = @import("session.zig").Event;
 const Sink = @import("session.zig").Sink;
 const provider = @import("provider.zig");
+const config = @import("config.zig");
 const Editor = @import("tui/editor.zig").Editor;
 const commands = @import("tui/commands.zig");
 const Transcript = @import("tui/transcript.zig").Transcript;
@@ -365,6 +366,12 @@ const App = struct {
                     app.cfg.setEffort(arg) catch return app.transcript.add(gpa, .err, "usage: /effort [default|off|none|minimal|low|medium|high|xhigh|max]");
                     session.cfg = app.cfg;
                     session.tools.cfg = app.cfg;
+                    config.saveEffort(gpa, app.io, session.options.home, arg) catch |err| {
+                        try app.report(.err, "effort applied, but could not save {s}/config.toml: {s}", .{ session.options.home, @errorName(err) });
+                        return;
+                    };
+                    try app.report(.info, "effort: {s} · saved to {s}/config.toml (environment and --effort override saved preferences)", .{ app.cfg.effectiveEffort(), session.options.home });
+                    return;
                 }
                 try app.report(.info, "effort: {s} · thinking: {s} · configured: {s} (model support varies)", .{
                     app.cfg.effectiveEffort(),

@@ -27,6 +27,12 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/redirect':
             self.send_response(302); self.send_header('location','/page'); self.send_header('content-length','0'); self.end_headers(); return
+        if self.path == '/large':
+            body = b'x' * (1024 * 1024 + 10)
+            self.send_response(200); self.send_header('content-type','text/plain'); self.send_header('content-length',str(len(body))); self.end_headers()
+            try: self.wfile.write(body)
+            except OSError: pass
+            return
         if self.path == '/slow':
             time.sleep(3)
         body = '<html><head><title>t</title></head><body><nav>menu</nav><main><h1>Mock page</h1><p>Accept: ' + self.headers.get('accept','') + '</p></main></body></html>'
@@ -75,6 +81,11 @@ class H(http.server.BaseHTTPRequestHandler):
             code = 'const r = await tools.bash({command: "echo hello from bash; printf \'a\\\\nb\\\\nc\\\\n\' | wc -l"});\nconsole.log("exit", r.exit_code);\nr.output.trim().split("\\n")'
             if lastuser.startswith('delegate_cancel '):
                 code = 'await tools.agent({prompt: ' + json.dumps('child cancel ' + lastuser.split(' ', 1)[1]) + '})'
+            elif lastuser.startswith('delegate_timeout '):
+                code = ('await tools.agent({prompt: ' + json.dumps('child timeout ' + lastuser.split(' ', 1)[1]) +
+                        ', timeout_ms: 1600}).catch(e => e.message)')
+            elif lastuser == 'delegate_timeout_stall':
+                code = 'await tools.agent({prompt: "child stall2", timeout_ms: 1600}).catch(e => e.message)'
             elif lastuser == 'delegate_stall':
                 code = 'await tools.agent({prompt: "child stall2"})'
             elif lastuser == 'delegate_failure':
@@ -87,15 +98,23 @@ class H(http.server.BaseHTTPRequestHandler):
                 code = ('await tools.write({path: "notes.txt", content: "a\\nb\\n"});\n'
                         'await tools.edit({path: "notes.txt", old_text: "b", new_text: "B"});\n'
                         'await tools.write({path: "same.txt", content: "x\\n"}); "done"')
+            elif lastuser == 'output_limit_test':
+                code = ('const r = await tools.bash({command: "head -c 32768 /dev/zero | tr \'\\\\0\' x"});'
+                        'if (r.output.length !== 32768) throw new Error("tool data was truncated"); r.output')
             elif lastuser == 'fetch_test':
                 base = 'http://127.0.0.1:' + sys.argv[1]
                 code = ('const page = await tools.fetch({url: "' + base + '/redirect"});\n'
                         'const slow = await tools.fetch({url: "' + base + '/slow", timeout_ms: 300}).catch(e => e.message);\n'
-                        '({url: page.url, status: page.status, text: page.text, slow})')
+                        'const large = await tools.fetch({url: "' + base + '/large", raw: true});\n'
+                        '({url: page.url, status: page.status, text: page.text, truncated: page.truncated, '
+                        'large: {length: large.text.length, truncated: large.truncated, clean: /^x+$/.test(large.text)}, slow})')
             elif lastuser == 'delegate':
                 code = 'await Promise.all([tools.agent({prompt: "child alpha"}), tools.agent({prompt: "child beta"})])'
             elif lastuser.startswith('child '):
                 command = 'sleep 0.3'
+                if lastuser.startswith('child timeout '):
+                    path = lastuser.split(' ', 2)[2]
+                    command = 'printf partial > ' + shlex.quote(path) + '; echo $$ > ' + shlex.quote(path + '.pid') + '; exec sleep 30'
                 if lastuser.startswith('child cancel '):
                     command = 'echo $$ > ' + shlex.quote(lastuser.split(' ', 2)[2]) + '; exec sleep 30'
                 code = 'await tools.bash({command: ' + json.dumps(command) + '}); ({prompt: ' + json.dumps(lastuser) + ', agent: typeof tools.agent, keys: Object.keys(tools)})'

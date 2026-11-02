@@ -28,7 +28,7 @@ date: 2026-11-01
 - **fetch**：
   - 请求头 `Accept` 优先要 `text/markdown`（借鉴 oh-my-pi）。越来越多文档站会直接返回 Markdown，比如 DeepSeek 文档。
   - 拿到 HTML 时由 `src/tools/html.zig` 转成 Markdown。页面有 `<main>`（其次 `<article>`）时只转换这部分；去掉 script、style、nav、aside、form 等非正文内容（这份清单借鉴自 jcode）；相对链接补全成绝对地址。
-  - 下载上限 5 MB，返回给 JS 的文本上限 1 MB，模型最终只看到 Run 输出的 16 KiB。
+  - 下载上限 5 MiB，超限报错；返回给 JS 的文本上限 1 MiB，独立的 `truncated` 布尔字段标明正文是否完整，text 不含截断提示。模型上下文保护只在 Session 交付 Run 输出时截断至首尾约 16 KiB，不改变 JS 内的数据（见 [0002](0002-run-code-only.md)）。
   - 最多跟随 5 次重定向；二进制内容直接报错。
   - 请求在 `std.Io` 的并发任务里执行，超时或 Esc 会取消这个任务，连卡住的读取也能打断。实测服务端卡住 3 秒、`timeout_ms: 300` 时，整轮 0.78 秒结束。
 

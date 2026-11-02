@@ -37,6 +37,8 @@ const system_template =
     \\Writing scripts:
     \\- Top-level `await` works. Combine related steps in one script (read several files, run a command, filter the output) and return only what you need.
     \\- The value of the last expression comes back to you, together with anything passed to console.log. Large output is truncated, so filter before returning it.
+    \\- Search with tools.grep/tools.glob, not shell rg/find/grep.
+    \\- For file/shell text with backticks, ${{ or backslashes, use JSON-escaped double-quoted strings, not template literals.
     \\
     \\When the task is done, answer the user directly without calling the tool.
 ;
@@ -52,6 +54,7 @@ pub const Session = struct {
     /// Totals for the current or most recent Turn.
     usage: provider.Usage = .{},
     steps: u32 = 0,
+    interrupt_signal: ?*const std.atomic.Value(std.posix.SIG) = null,
     /// Next-request estimate: latest usage plus tool results, or the compacted history size.
     context_tokens: u64 = 0,
     /// Automatic compaction is not retried until the context reaches this size.
@@ -62,7 +65,7 @@ pub const Session = struct {
     parent_session_id: ?[]const u8 = null,
     options: Options = undefined,
 
-    pub const Options = struct { environ: ?*const std.process.Environ.Map = null, depth: u32 = 0, parent_session_id: ?[]const u8 = null, home: []const u8, data_home: []const u8, config_home: []const u8, resume_id: ?[]const u8 = null, continue_latest: bool = false };
+    pub const Options = struct { environ: ?*const std.process.Environ.Map = null, depth: u32 = 0, parent_session_id: ?[]const u8 = null, home: []const u8, user_home: []const u8, resume_id: ?[]const u8 = null, continue_latest: bool = false };
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, client: *std.http.Client, cfg: provider.Config, options: Options) !Session {
         var s: Session = .{
@@ -71,7 +74,7 @@ pub const Session = struct {
             .client = client,
             .cfg = cfg,
             .arena = .init(gpa),
-            .tools = .{ .io = io, .home = options.home, .depth = options.depth, .environ = options.environ, .cfg = cfg, .track_changes = true },
+            .tools = .{ .io = io, .home = options.user_home, .depth = options.depth, .environ = options.environ, .cfg = cfg, .track_changes = true },
             .parent_session_id = options.parent_session_id,
             .options = options,
         };
@@ -79,7 +82,7 @@ pub const Session = struct {
         errdefer s.history.deinit(gpa);
         const a = s.arena.allocator();
         const cwd = try std.process.currentPathAlloc(io, a);
-        const directory = try std.fs.path.join(a, &.{ options.data_home, "nib/sessions" });
+        const directory = try std.fs.path.join(a, &.{ options.home, "sessions" });
         try std.Io.Dir.cwd().createDirPath(io, directory);
         if (options.resume_id != null or options.continue_latest) {
             const path = if (options.resume_id) |id| blk: {
@@ -100,7 +103,7 @@ pub const Session = struct {
             s.log = try session_log.Log.create(io, path);
             errdefer s.log.close(io);
             const base = try std.fmt.allocPrint(a, system_template, .{ cwd, s.tools.api().docs });
-            const global = try std.fs.path.join(a, &.{ options.config_home, "nib/AGENTS.md" });
+            const global = try std.fs.path.join(a, &.{ options.home, "AGENTS.md" });
             const project = try std.fs.path.join(a, &.{ try instructions.projectRoot(io, a, cwd), "AGENTS.md" });
             const system = try instructions.append(io, a, base, global, project);
             try s.commit(0, &.{.{ .role = "system", .content = system }}, 0, cwd);
@@ -217,11 +220,11 @@ pub const Session = struct {
         }
     };
 
-    /// Keeps the log in line with the screen: the user message and whatever streamed before Esc.
     /// An unfinished Step is dropped, since its tool calls would need results.
     fn commitInterrupted(s: *Session, pending: []const provider.Message, partial: *const Partial) !void {
         const a = s.arena.allocator();
-        const marker = "[interrupted by user]";
+        const terminated = if (s.interrupt_signal) |signal| signal.load(.acquire) == .TERM else false;
+        const marker = if (terminated) "[interrupted: process terminated]" else "[interrupted by user]";
         const text = if (partial.text.items.len == 0) marker else try std.fmt.allocPrint(a, "{s}\n\n{s}", .{ partial.text.items, marker });
         var reasoning: ?provider.Reasoning = null;
         if (s.cfg.provider == .chat_completions and s.cfg.thinking != false) {
@@ -437,6 +440,7 @@ test "system prompt documents every tool in JavaScript" {
     defer gpa.free(prompt);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "```js\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "TypeScript") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "backticks, ${ or backslashes") != null);
     for (tools.names) |name| {
         const call = try std.fmt.allocPrint(gpa, "async {s}({{", .{name});
         defer gpa.free(call);
@@ -455,7 +459,7 @@ test "failed Turn leaves replay equal to in-memory safe history" {
     var client: std.http.Client = .{ .allocator = t.allocator, .io = t.io };
     defer client.deinit();
     const cfg: provider.Config = .{ .base_url = "invalid://local", .api_key = "mock", .model = "mock" };
-    var session = try Session.init(t.allocator, t.io, &client, cfg, .{ .home = root, .data_home = root, .config_home = root });
+    var session = try Session.init(t.allocator, t.io, &client, cfg, .{ .home = root, .user_home = root });
     defer session.deinit();
     var cancel: std.atomic.Value(bool) = .init(true);
     var detail: ?[]u8 = null;
@@ -472,7 +476,7 @@ test "failed Turn leaves replay equal to in-memory safe history" {
         }, 100, null);
         const result = session.turn("not committed", .{ .ctx = &ctx, .emit = Quiet.emit }, &cancel, &detail);
         try t.expectError(error.UnsupportedUriScheme, result);
-        const directory = try std.fs.path.join(a, &.{ root, "nib/sessions" });
+        const directory = try std.fs.path.join(a, &.{ root, "sessions" });
         const path = try std.fmt.allocPrint(a, "{s}/{s}.jsonl", .{ directory, session.id });
         const data = try std.Io.Dir.cwd().readFileAlloc(t.io, path, a, .unlimited);
         var restored: std.ArrayList(provider.Message) = .empty;

@@ -25,26 +25,27 @@ pub fn bash(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
     const script = try std.fmt.allocPrint(gpa, "exec 2>&1\n{s}", .{a.value.command});
     defer gpa.free(script);
 
-    const result = try process.run(gpa, t.io, .{ .spawn = .{
+    const result = process.run(gpa, t.io, .{ .spawn = .{
         .argv = &.{ "bash", "-c", script },
         .environ_map = t.environ,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .ignore,
-    }, .cancel = &t.cancel, .timeout_ms = a.value.timeout_ms });
+    }, .cancel = &t.cancel, .timeout_ms = a.value.timeout_ms, .max_output_bytes = 16 * 1024 * 1024 }) catch |err| return switch (err) {
+        error.OutputLimit => fail(gpa, "output exceeds 16 MiB; redirect output to a file", .{}),
+        else => err,
+    };
     const stdout = result.output;
     defer gpa.free(stdout);
     if (result.stop) |err| return switch (err) {
         error.TimedOut => fail(gpa, "timed out after {d} ms", .{a.value.timeout_ms}),
         error.Canceled => fail(gpa, "canceled", .{}),
     };
-    const output = try tools.truncateMiddle(gpa, stdout);
-    defer gpa.free(output);
     const code: ?u8 = switch (result.term) {
         .exited => |e| e,
         else => null,
     };
-    return .{ .ok = try std.json.Stringify.valueAlloc(gpa, .{ .exit_code = code, .output = output }, .{}) };
+    return .{ .ok = try std.json.Stringify.valueAlloc(gpa, .{ .exit_code = code, .output = stdout }, .{}) };
 }
 
 const testing = std.testing;
@@ -106,4 +107,22 @@ test "bash receives ordinary environment without API keys" {
     const result = Tools.call(&t, testing.allocator, "bash", "{\"command\":\"printf '%s:%s' \\\"${NIB_API_KEY-unset}\\\" \\\"$NIB_TEST_ORDINARY\\\"\"}");
     defer freeResult(result);
     try testing.expectEqualStrings("{\"exit_code\":0,\"output\":\"unset:kept\"}", result.ok);
+}
+
+test "bash returns output up to 16 MiB verbatim" {
+    const r = try callTool("bash", "{\"command\":\"head -c 16777216 /dev/zero | tr '\\\\0' x\"}");
+    defer freeResult(r);
+    const parsed = try std.json.parseFromSlice(struct { exit_code: u8, output: []const u8 }, testing.allocator, r.ok, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(0, parsed.value.exit_code);
+    try testing.expectEqual(16 * 1024 * 1024, parsed.value.output.len);
+    for (parsed.value.output) |byte| try testing.expectEqual(@as(u8, 'x'), byte);
+}
+
+test "bash rejects output over 16 MiB and kills the process group" {
+    const start = std.Io.Clock.awake.now(testing.io);
+    const r = try callTool("bash", "{\"command\":\"head -c 16777217 /dev/zero; sleep 30\"}");
+    defer freeResult(r);
+    try testing.expectEqualStrings("output exceeds 16 MiB; redirect output to a file", r.err);
+    try testing.expect(start.durationTo(std.Io.Clock.awake.now(testing.io)).toMilliseconds() < 5000);
 }

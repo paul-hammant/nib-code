@@ -34,6 +34,7 @@ pub const Page = struct {
     status: u16,
     content_type: []const u8,
     text: []const u8,
+    truncated: bool,
 };
 
 const max_body = 5 * 1024 * 1024;
@@ -98,11 +99,13 @@ fn request(io: std.Io, gpa: std.mem.Allocator, a: std.mem.Allocator, environ: ?*
         error.StreamTooLong => error.ResponseTooLarge,
         else => err,
     };
+    const text = try render(a, body, content_type.*, url, options.raw);
     return .{
         .url = url,
         .status = @backingInt(response.head.status),
         .content_type = content_type.*,
-        .text = try cap(a, try render(a, body, content_type.*, url, options.raw)),
+        .text = cap(text),
+        .truncated = text.len > max_text,
     };
 }
 
@@ -115,11 +118,11 @@ fn render(a: std.mem.Allocator, body: []const u8, content_type: []const u8, url:
     return body;
 }
 
-fn cap(a: std.mem.Allocator, text: []const u8) ![]const u8 {
+fn cap(text: []const u8) []const u8 {
     if (text.len <= max_text) return text;
     var end: usize = max_text;
     while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
-    return std.fmt.allocPrint(a, "{s}\n[truncated: {d} of {d} bytes shown]", .{ text[0..end], end, text.len });
+    return text[0..end];
 }
 
 const testing = std.testing;
@@ -135,7 +138,19 @@ test "render converts HTML, passes text through and rejects binary" {
     try testing.expectError(error.BinaryContent, render(a, "PNG\x00\x01", "image/png", "https://x.dev/", false));
     const long = try a.alloc(u8, max_text + 10);
     @memset(long, 'x');
-    try testing.expect(std.mem.endsWith(u8, try cap(a, long), "[truncated: 1048576 of 1048586 bytes shown]"));
+    try testing.expectEqualStrings(long[0..max_text], cap(long));
+}
+
+test "fetch text cap preserves UTF-8 and adds no marker" {
+    const text = try testing.allocator.alloc(u8, max_text + 5);
+    defer testing.allocator.free(text);
+    @memset(text, 'x');
+    try testing.expectEqual(max_text, cap(text[0..max_text]).len);
+    @memcpy(text[max_text - 1 ..], "中文");
+    const capped = cap(text);
+    try testing.expectEqual(max_text - 1, capped.len);
+    try testing.expect(std.unicode.utf8ValidateSlice(capped));
+    try testing.expectEqualStrings("short", cap("short"));
 }
 
 test "unsupported schemes are refused before any request" {

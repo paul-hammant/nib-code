@@ -15,6 +15,7 @@ pub const Options = struct {
     timeout_ms: i64,
     input: ?[]const u8 = null,
     termination_grace_ms: u32 = 0,
+    max_output_bytes: usize = 8 * 1024 * 1024,
 };
 
 const Group = struct {
@@ -85,7 +86,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Result {
             error.Timeout => {},
             else => return err,
         };
-        if (mr.reader(0).buffered().len > 8 * 1024 * 1024) return error.OutputLimit;
+        if (mr.reader(0).buffered().len > options.max_output_bytes) return error.OutputLimit;
     }
     try mr.checkAnyError();
     const Wait = struct {

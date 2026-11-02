@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import socket
+import signal
+import re
 import subprocess
 import tempfile
 import time
@@ -58,8 +60,10 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-    env = dict(os.environ, NIB_PROVIDER="chat_completions", NIB_API_KEY="mock", NIB_BASE_URL=f"http://127.0.0.1:{port}",
-               NIB_CONTEXT_WINDOW="128000", XDG_DATA_HOME=str(tmp / "data"),
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith(("NIB_", "DEEPSEEK_", "OPENAI_", "CODEX_"))}
+    env.update(NIB_PROVIDER="chat_completions", NIB_API_KEY="mock", NIB_BASE_URL=f"http://127.0.0.1:{port}",
+               NIB_CONTEXT_WINDOW="128000", NIB_HOME=str(tmp / "nib"), XDG_DATA_HOME=str(tmp / "data"),
                XDG_CONFIG_HOME=str(tmp / "config"), CODEX_HOME=str(tmp / "codex"), HOME=str(tmp))
     server = subprocess.Popen(["python3", str(ROOT / "tests/mock_llm.py"), str(port), str(requests_path)],
                               env=dict(env, MOCK_PROMPT_TOKENS="3300"), stdout=subprocess.DEVNULL)
@@ -79,23 +83,32 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         (project / "AGENTS.md").write_text("PROJECT_MARKER")
         cwd = project / "sub"
         cwd.mkdir()
-        global_agents = tmp / "config/nib/AGENTS.md"
+        global_agents = tmp / "nib/AGENTS.md"
         global_agents.parent.mkdir(parents=True)
         global_agents.write_text("GLOBAL_MARKER")
 
-        def ask(*args, workdir=cwd, window="128000", ok=True, input=None):
+        def ask(*args, workdir=cwd, window="128000", ok=True, input=None, overrides=None):
+            child_env = dict(env, NIB_CONTEXT_WINDOW=window)
+            child_env.update(overrides or {})
+            child_env = {key: value for key, value in child_env.items() if value is not None}
             result = subprocess.run([str(BIN), "ask", *args], cwd=workdir,
-                                    env=dict(env, NIB_CONTEXT_WINDOW=window), capture_output=True, timeout=10, input=input)
+                                    env=child_env, capture_output=True, timeout=10, input=input)
             assert (result.returncode == 0) == ok, result.stderr.decode()
             return result
 
+        legacy_agents = tmp / "config/nib/AGENTS.md"
+        legacy_agents.parent.mkdir(parents=True)
+        legacy_agents.write_text("IGNORED_XDG_MARKER")
+        (legacy_agents.parent / "config.toml").write_text("not valid TOML")
+
         ask("first")
-        paths = list((tmp / "data/nib/sessions").glob("*.jsonl"))
+        paths = list((tmp / "nib/sessions").glob("*.jsonl"))
         assert len(paths) == 1
         log = paths[0]
         first, _ = replay(log)
         system = first[0]["content"]
         assert system.index("You are nib") < system.index("GLOBAL_MARKER") < system.index("PROJECT_MARKER")
+        assert "IGNORED_XDG_MARKER" not in system
         global_agents.write_text("CHANGED_GLOBAL")
         ask("--continue", "second")
         req = read_requests(requests_path)[-2]["messages"]
@@ -127,7 +140,7 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         ask("one", workdir=other, window="4096")
         result = ask("two", "--continue", workdir=other, window="4096")
         assert b"compacted context:" in result.stderr
-        compact_log = next(p for p in (tmp / "data/nib/sessions").glob("*.jsonl") if p != log)
+        compact_log = next(p for p in (tmp / "nib/sessions").glob("*.jsonl") if p != log)
         compacted, records = replay(compact_log)
         replacements = [r for r in records[1:] if r["messages"][0].get("content", "").startswith("Earlier session summary:")]
         assert len(replacements) == 1
@@ -153,7 +166,7 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         assert any("run_start" in e for e in streamed)
         assert any(e.get("run_end", {}).get("ok") for e in streamed)
         assert read_requests(requests_path)[-2]["messages"][-1]["content"] == "stdin prompt\nsecond line"
-        assert (tmp / "data/nib/sessions" / (session_id + ".jsonl")).exists()
+        assert (tmp / "nib/sessions" / (session_id + ".jsonl")).exists()
         resumed = events(ask("--resume", session_id, "--json", "json resume"))
         assert resumed[0]["start"]["session_id"] == session_id
         failed = events(ask("reject1", "--json", ok=False))
@@ -193,7 +206,7 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
             result = json.loads(child["text"].split("result: ", 1)[1])
             assert result["agent"] == "undefined" and "agent" not in result["keys"]
             assert child["usage"]["prompt_tokens"] == 6600
-        child_logs = [p for p in (tmp / "data/nib/sessions").glob("*.jsonl")
+        child_logs = [p for p in (tmp / "nib/sessions").glob("*.jsonl")
                       if replay(p)[1][0].get("parent_session_id") == parent_id]
         assert len(child_logs) == 2
         before = len(read_requests(requests_path))
@@ -210,6 +223,31 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         human = ask("delegate")
         assert b"in=19800" in human.stderr and b"out=90" in human.stderr
         print("Subagent E2E passed: concurrent results, usage including failure, parent log, hidden API and four-child cap")
+
+        partial_path = cwd / "child-partial.txt"
+        timeout_events = events(ask("--json", "delegate_timeout " + str(partial_path)))
+        timeout_run = next(e["run_end"] for e in timeout_events if "run_end" in e)
+        assert timeout_run["ok"], timeout_run
+        timeout_message = json.loads(timeout_run["output"].removeprefix("result: "))
+        match = re.search(r"stopped due to timeout after (\d+) ms \(limit 1600 ms\); child session id: ([0-9a-f]{32})", timeout_message)
+        assert match and 1600 <= int(match[1]) < 4500, timeout_message
+        assert "Files it changed may be incomplete; inspect them" in timeout_message, timeout_message
+        assert partial_path.read_bytes() == b"partial"
+        timed_pid = int(Path(str(partial_path) + ".pid").read_text())
+        status = Path(f"/proc/{timed_pid}/stat")
+        assert not status.exists() or status.read_text().split()[2] == "Z", status.read_text()
+        child_log = tmp / "nib/sessions" / f"{match[2]}.jsonl"
+        child_history, _ = replay(child_log)
+        assert child_history[-1]["content"].endswith("[interrupted: process terminated]"), child_history[-1]
+        assert timeout_events[-1]["end"]["usage"]["prompt_tokens"] == 9900, timeout_events[-1]
+
+        forced_timeout = events(ask("--json", "delegate_timeout_stall"))
+        forced_run = next(e["run_end"] for e in forced_timeout if "run_end" in e)
+        forced_message = json.loads(forced_run["output"].removeprefix("result: "))
+        assert re.search(r"child session id: [0-9a-f]{32}", forced_message), forced_message
+        assert "stopped due to timeout" in forced_message and "may be incomplete" in forced_message, forced_message
+        assert forced_timeout[-1]["end"]["usage"]["prompt_tokens"] == 9900, forced_timeout[-1]
+        print("Subagent timeout E2E passed: explicit limit, elapsed time/id, incomplete-file warning, process cleanup and usage after forced termination")
 
         pidfile = tmp / "child-bash.pid"
         parent = subprocess.Popen([str(BIN), "ask", "--json", "delegate_cancel " + str(pidfile)],
@@ -268,27 +306,29 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
                 stalled.kill()
                 stalled.wait()
 
-        interrupted = subprocess.Popen([str(BIN), "ask", "--json", "interrupt me"],
-                                       cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        try:
-            session_id = json.loads(interrupted.stdout.readline())["start"]["session_id"]
-            while "partial answer" not in interrupted.stdout.readline().decode():
-                assert interrupted.poll() is None
-            interrupted.terminate()
-            interrupted.communicate(timeout=5)
-            assert interrupted.returncode != 0
-        finally:
-            if interrupted.poll() is None:
-                interrupted.kill()
-                interrupted.wait()
-        interrupted_log = tmp / "data/nib/sessions" / f"{session_id}.jsonl"
-        kept, _ = replay(interrupted_log)
-        assert kept[-2] == {"role": "user", "content": "interrupt me"}, kept
-        assert kept[-1]["content"] == "partial answer\n\n[interrupted by user]", kept[-1]
-        assert kept[-1]["reasoning_content"] == "想一想。", kept[-1]
-        ask("after interrupt", "--resume", session_id)
-        assert read_requests(requests_path)[-2]["messages"] == kept + [{"role": "user", "content": "after interrupt"}]
-        print("Interrupted Turn E2E passed: user message and streamed text are kept, and the session continues")
+        for sig, marker in ((signal.SIGINT, "[interrupted by user]"),
+                            (signal.SIGTERM, "[interrupted: process terminated]")):
+            interrupted = subprocess.Popen([str(BIN), "ask", "--json", "interrupt me"],
+                                           cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                session_id = json.loads(interrupted.stdout.readline())["start"]["session_id"]
+                while "partial answer" not in interrupted.stdout.readline().decode():
+                    assert interrupted.poll() is None
+                interrupted.send_signal(sig)
+                _, errors = interrupted.communicate(timeout=5)
+                assert interrupted.returncode != 0 and errors == b"", errors
+            finally:
+                if interrupted.poll() is None:
+                    interrupted.kill()
+                    interrupted.wait()
+            interrupted_log = tmp / "nib/sessions" / f"{session_id}.jsonl"
+            kept, _ = replay(interrupted_log)
+            assert kept[-2] == {"role": "user", "content": "interrupt me"}, kept
+            assert kept[-1]["content"] == "partial answer\n\n" + marker, kept[-1]
+            assert kept[-1]["reasoning_content"] == "想一想。", kept[-1]
+            ask("after interrupt", "--resume", session_id)
+            assert read_requests(requests_path)[-2]["messages"] == kept + [{"role": "user", "content": "after interrupt"}]
+        print("Interrupted Turn E2E passed: SIGINT/SIGTERM keep partial text with distinct markers and resume safely")
 
         (cwd / "same.txt").write_text("x\n")
         edited = events(ask("--json", "edit_test"))
@@ -299,6 +339,16 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         assert b"changed notes.txt +1 \xe2\x88\x921" in human.stderr, human.stderr
         print("Change E2E passed: edit/write changes per Run, diffed against the files before the Run, unchanged files omitted")
 
+        limited = events(ask("--json", "output_limit_test"))
+        run_end = next(e["run_end"] for e in limited if "run_end" in e)
+        assert run_end["ok"], run_end
+        output = run_end["output"]
+        assert "bytes omitted" in output and len(output) < 17000, output[:100]
+        assert output.startswith('result: "' + 'x' * 100) and output.endswith('x' * 100 + '"'), output[-110:]
+        requests = read_requests(requests_path)
+        assert requests[-1]["messages"][-1]["content"] == output
+        print("Run output E2E passed: JS receives complete bash data; only model-facing output is truncated")
+
         started = time.monotonic()
         fetched = events(ask("--json", "fetch_test"))
         elapsed = time.monotonic() - started
@@ -306,6 +356,8 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         assert output["url"] == f"http://127.0.0.1:{port}/page" and output["status"] == 200, output
         assert output["text"].startswith("# Mock page\n\nAccept: text/markdown") and "menu" not in output["text"], output
         assert output["slow"] == "fetch: timed out after 300 ms" and elapsed < 2.5, (output, elapsed)
+        assert output["truncated"] is False, output
+        assert output["large"] == {"length": 1048576, "truncated": True, "clean": True}, output
         print(f"Fetch E2E passed: redirect, HTML to Markdown, Accept header and timeout of a stalled read ({elapsed:.2f} s)")
 
         startup = []
@@ -327,7 +379,7 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
                     probe.kill()
                     probe.wait()
         print(f"Child startup to start event (10 runs, includes log sync; no TLS): median={sorted(startup)[5]:.2f} ms, range={min(startup):.2f}–{max(startup):.2f} ms")
-        root_logs = [p for p in (tmp / "data/nib/sessions").glob("*.jsonl")
+        root_logs = [p for p in (tmp / "nib/sessions").glob("*.jsonl")
                      if replay(p)[1][0].get("cwd") == str(cwd) and
                      replay(p)[1][0].get("parent_session_id") is None]
         latest_root = max(root_logs, key=lambda p: p.stat().st_mtime_ns)
@@ -337,9 +389,50 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         child_output = next(e["run_end"]["output"] for e in resumed_child if "run_end" in e)
         assert json.loads(child_output.removeprefix("result: "))["agent"] == "undefined"
         print("Subagent resume E2E passed: --continue skips children, explicit child resume retains depth")
+        config_path = tmp / "nib/config.toml"
+        config_text = ('# Keep this comment and both provider sections.\n'
+                       'provider = "chat_completions"\neffort = "high"\n'
+                       '[codex]\nmodel = "gpt-6.1-sol"\n'
+                       '[chat_completions]\nmodel = "file-chat-model"\n'
+                       f'base_url = "http://127.0.0.1:{port}"\ncontext_window = 128000\n')
+        config_path.write_text(config_text)
+        file_env = {key: None for key in ("NIB_PROVIDER", "NIB_MODEL", "NIB_BASE_URL", "NIB_CONTEXT_WINDOW")}
+        configured = events(ask("--json", "model from file", overrides=file_env))
+        configured_id = configured[0]["start"]["session_id"]
+        assert replay(tmp / "nib/sessions" / f"{configured_id}.jsonl")[1][0]["model"] == "file-chat-model"
+        assert read_requests(requests_path)[-1]["thinking"] == {"type": "enabled"}
+        overridden = events(ask("--json", "env overrides file",
+                                overrides=dict(file_env, NIB_MODEL="env-chat-model", NIB_THINKING="off")))
+        overridden_id = overridden[0]["start"]["session_id"]
+        assert replay(tmp / "nib/sessions" / f"{overridden_id}.jsonl")[1][0]["model"] == "env-chat-model"
+        assert read_requests(requests_path)[-1]["thinking"] == {"type": "disabled"}
+        ask("CLI overrides env", "--effort", "high", overrides=dict(file_env, NIB_THINKING="off"))
+        assert read_requests(requests_path)[-1]["thinking"] == {"type": "enabled"}
+        assert config_path.read_text() == config_text
+        assert not (tmp / "data/nib").exists()
+        assert (legacy_agents.parent / "config.toml").read_text() == "not valid TOML"
+        assert not (tmp / ".nib").exists()
+        print("Configuration E2E passed: NIB_HOME, ignored XDG paths, file model, env/CLI precedence and ephemeral CLI effort")
+        config_path.write_text('# header\napi_key = "not-a-real-key"\n')
+        failed = events(ask("--json", "invalid config", ok=False))
+        message = failed[-1]["error"]["message"]
+        assert f"{config_path}:2:" in message and "NIB_API_KEY" in message, failed
+        assert "not-a-real-key" not in message
+        envelope = {"prompt": "inherited configuration", "config": {
+            "provider": "chat_completions", "base_url": f"http://127.0.0.1:{port}",
+            "api_key": "mock", "model": "inherited-model", "context_window": 128000,
+            "thinking": True, "reasoning_effort": "high"}}
+        inherited = events(ask("--json", "--agent-input", "-", input=json.dumps(envelope).encode(),
+                               overrides={"NIB_AGENT_DEPTH": "1", "NIB_PROVIDER": "invalid-env-provider"}))
+        inherited_id = inherited[0]["start"]["session_id"]
+        assert replay(tmp / "nib/sessions" / f"{inherited_id}.jsonl")[1][0]["model"] == "inherited-model"
+        config_path.write_text(config_text)
+        fallback = events(ask("--json", "default home", overrides={"NIB_HOME": None}))
+        assert (tmp / ".nib/sessions" / (fallback[0]["start"]["session_id"] + ".jsonl")).exists()
+        print("Configuration boundaries passed: path/line diagnostics, child stdin bypass and HOME/.nib fallback")
         for request in read_requests(requests_path):
             valid_messages(request["messages"])
-        for path in (tmp / "data/nib/sessions").glob("*.jsonl"):
+        for path in (tmp / "nib/sessions").glob("*.jsonl"):
             valid_messages(replay(path)[0])
         print("Session E2E passed: resume/id/cwd, frozen AGENTS, failed Steps, truncated stream, crash repair, lock, automatic compaction and replay")
     finally:
