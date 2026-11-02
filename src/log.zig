@@ -138,35 +138,100 @@ fn validate(messages: []const provider.Message) !void {
     }
 }
 
-pub fn latest(io: std.Io, a: std.mem.Allocator, directory: []const u8, cwd: []const u8) ![]const u8 {
+pub const Summary = struct {
+    id: []const u8,
+    path: []const u8,
+    modified_ns: i96,
+    /// First line of the first user message, at most ~60 bytes.
+    preview: []const u8,
+};
+
+/// Top-level Sessions started in `cwd` that have a user message, newest first.
+pub fn list(io: std.Io, a: std.mem.Allocator, directory: []const u8, cwd: []const u8) ![]Summary {
     var dir = std.Io.Dir.cwd().openDir(io, directory, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return error.NoSession,
+        error.FileNotFound => return &.{},
         else => return err,
     };
     defer dir.close(io);
+    var found: std.ArrayList(Summary) = .empty;
     var it = dir.iterate();
-    var best: ?[]const u8 = null;
-    var newest: i96 = std.math.minInt(i96);
     while (try it.next(io)) |entry| {
         if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
         const file = try dir.openFile(io, entry.name, .{});
         defer file.close(io);
         const stat = try file.stat(io);
-        if (stat.mtime.nanoseconds < newest) continue;
         var buffer: [4096]u8 = undefined;
         var reader = file.reader(io, &buffer);
-        var header: std.Io.Writer.Allocating = .init(a);
-        defer header.deinit();
-        _ = reader.interface.streamDelimiter(&header.writer, '\n') catch |err| switch (err) {
-            error.EndOfStream => continue,
-            else => return err,
-        };
-        const r = std.json.parseFromSliceLeaky(Record, a, header.written(), .{ .allocate = .alloc_always }) catch continue;
-        if (r.parent_session_id != null or !std.mem.eql(u8, r.cwd orelse "", cwd)) continue;
-        newest = stat.mtime.nanoseconds;
-        best = try std.fs.path.join(a, &.{ directory, entry.name });
+        var line_no: usize = 0;
+        while (line_no < 8) : (line_no += 1) {
+            var line: std.Io.Writer.Allocating = .init(a);
+            defer line.deinit();
+            _ = reader.interface.streamDelimiter(&line.writer, '\n') catch break;
+            reader.interface.toss(1);
+            const r = std.json.parseFromSliceLeaky(Record, a, line.written(), .{ .allocate = .alloc_always }) catch {
+                if (line_no == 0) break;
+                continue;
+            };
+            if (line_no == 0) {
+                if (r.parent_session_id != null or !std.mem.eql(u8, r.cwd orelse "", cwd)) break;
+                continue;
+            }
+            const user = for (r.messages) |m| {
+                if (std.mem.eql(u8, m.role, "user")) break m.content orelse "";
+            } else continue;
+            try found.append(a, .{
+                .id = try a.dupe(u8, std.fs.path.stem(entry.name)),
+                .path = try std.fs.path.join(a, &.{ directory, entry.name }),
+                .modified_ns = stat.mtime.nanoseconds,
+                .preview = firstLine(user, 60),
+            });
+            break;
+        }
     }
-    return best orelse error.NoSession;
+    std.mem.sort(Summary, found.items, {}, struct {
+        fn newer(_: void, l: Summary, r: Summary) bool {
+            return l.modified_ns > r.modified_ns;
+        }
+    }.newer);
+    return found.items;
+}
+
+fn firstLine(text: []const u8, max: usize) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    const line = trimmed[0 .. std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len];
+    if (line.len <= max) return line;
+    var end = max;
+    while (end > 0 and (line[end] & 0xC0) == 0x80) end -= 1;
+    return line[0..end];
+}
+
+pub fn latest(io: std.Io, a: std.mem.Allocator, directory: []const u8, cwd: []const u8) ![]const u8 {
+    const all = try list(io, a, directory, cwd);
+    if (all.len == 0) return error.NoSession;
+    return all[0].path;
+}
+
+test "list finds top-level sessions with messages for a directory, newest first" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "aaaa.jsonl", .data = "{\"cwd\":\"/w\",\"messages\":[{\"role\":\"system\",\"content\":\"s\"}]}\n{\"from\":1,\"messages\":[{\"role\":\"user\",\"content\":\"first question\\nmore\"}]}\n" });
+    try std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(20), .clock = .awake }, t.io);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "bbbb.jsonl", .data = "{\"cwd\":\"/w\",\"messages\":[{\"role\":\"system\",\"content\":\"s\"}]}\n{\"from\":1,\"messages\":[{\"role\":\"user\",\"content\":\"second\"}]}\n" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "empty.jsonl", .data = "{\"cwd\":\"/w\",\"messages\":[{\"role\":\"system\",\"content\":\"s\"}]}\n" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "child.jsonl", .data = "{\"cwd\":\"/w\",\"parent_session_id\":\"aaaa\",\"messages\":[]}\n" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "other.jsonl", .data = "{\"cwd\":\"/elsewhere\",\"messages\":[]}\n" });
+    const all = try list(t.io, a, dir, "/w");
+    try t.expectEqual(@as(usize, 2), all.len);
+    try t.expectEqualStrings("bbbb", all[0].id);
+    try t.expectEqualStrings("second", all[0].preview);
+    try t.expectEqualStrings("aaaa", all[1].id);
+    try t.expectEqualStrings("first question", all[1].preview);
+    try t.expectEqualStrings(all[0].path, try latest(t.io, a, dir, "/w"));
 }
 
 test "commit and replay preserve safe history, compaction and torn tail" {

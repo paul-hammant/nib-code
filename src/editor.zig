@@ -33,6 +33,14 @@ pub const Editor = struct {
         return e.buf.toOwnedSlice(gpa);
     }
 
+    pub fn replace(e: *Editor, gpa: std.mem.Allocator, value: []const u8) !void {
+        e.buf.clearRetainingCapacity();
+        try e.buf.appendSlice(gpa, value);
+        e.cursor = value.len;
+        e.history_index = null;
+        e.draft.clearRetainingCapacity();
+    }
+
     pub fn remember(e: *Editor, gpa: std.mem.Allocator, value: []const u8) !void {
         const copy = try gpa.dupe(u8, value);
         errdefer gpa.free(copy);

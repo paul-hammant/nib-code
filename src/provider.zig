@@ -37,18 +37,22 @@ pub const Config = struct {
         };
     }
 
+    /// Values `setEffort` accepts; `default` and `off` first, then levels.
+    pub const effort_values = [_][]const u8{ "default", "off", "none", "minimal", "low", "medium", "high", "xhigh", "max" };
+
     pub fn setEffort(cfg: *Config, value: []const u8) !void {
-        if (std.mem.eql(u8, value, "default")) {
+        const known = for (effort_values) |v| {
+            if (std.mem.eql(u8, v, value)) break v;
+        } else return error.InvalidReasoningEffort;
+        if (std.mem.eql(u8, known, "default")) {
             cfg.thinking = null;
             cfg.reasoning_effort = null;
-        } else if (std.mem.eql(u8, value, "off")) {
+        } else if (std.mem.eql(u8, known, "off")) {
             cfg.thinking = false;
             cfg.reasoning_effort = null;
         } else {
-            const Effort = enum { none, minimal, low, medium, high, xhigh, max };
-            const effort = std.meta.stringToEnum(Effort, value) orelse return error.InvalidReasoningEffort;
             cfg.thinking = true;
-            cfg.reasoning_effort = @tagName(effort);
+            cfg.reasoning_effort = known;
         }
     }
 

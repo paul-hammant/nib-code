@@ -173,5 +173,6 @@ test {
     _ = @import("tools.zig");
     _ = @import("policy.zig");
     _ = @import("editor.zig");
+    _ = @import("commands.zig");
     _ = agent;
 }

@@ -59,6 +59,7 @@ pub const Session = struct {
     log: session_log.Log = undefined,
     id: []const u8 = undefined,
     parent_session_id: ?[]const u8 = null,
+    options: Options = undefined,
 
     pub const Options = struct { environ: ?*const std.process.Environ.Map = null, depth: u32 = 0, parent_session_id: ?[]const u8 = null, home: []const u8, data_home: []const u8, config_home: []const u8, resume_id: ?[]const u8 = null, continue_latest: bool = false };
 
@@ -71,6 +72,7 @@ pub const Session = struct {
             .arena = .init(gpa),
             .tools = .{ .io = io, .home = options.home, .depth = options.depth, .environ = options.environ, .cfg = cfg },
             .parent_session_id = options.parent_session_id,
+            .options = options,
         };
         errdefer s.arena.deinit();
         errdefer s.history.deinit(gpa);
@@ -104,6 +106,17 @@ pub const Session = struct {
         }
         s.tools.session_id = s.id;
         return s;
+    }
+
+    /// Replaces this Session with a new one (`id == null`) or a logged one.
+    /// On failure the current Session is left untouched.
+    pub fn reopen(s: *Session, id: ?[]const u8) !void {
+        var options = s.options;
+        options.resume_id = id;
+        options.continue_latest = false;
+        const next = try Session.init(s.gpa, s.io, s.client, s.cfg, options);
+        s.deinit();
+        s.* = next;
     }
 
     pub fn deinit(s: *Session) void {
@@ -400,8 +413,7 @@ test "failed Turn leaves replay equal to in-memory safe history" {
         const result = session.turn("not committed", .{ .ctx = &ctx, .emit = Quiet.emit }, &cancel, &detail);
         try t.expectError(error.UnsupportedUriScheme, result);
         const directory = try std.fs.path.join(a, &.{ root, "nib/sessions" });
-        const cwd = try std.process.currentPathAlloc(t.io, a);
-        const path = try session_log.latest(t.io, a, directory, cwd);
+        const path = try std.fmt.allocPrint(a, "{s}/{s}.jsonl", .{ directory, session.id });
         const data = try std.Io.Dir.cwd().readFileAlloc(t.io, path, a, .unlimited);
         var restored: std.ArrayList(provider.Message) = .empty;
         var tokens: u64 = 0;

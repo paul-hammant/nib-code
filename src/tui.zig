@@ -5,6 +5,8 @@ const agent = @import("agent.zig");
 const provider = @import("provider.zig");
 const Editor = @import("editor.zig").Editor;
 const markdown = @import("markdown.zig");
+const commands = @import("commands.zig");
+const session_log = @import("log.zig");
 
 const Event = union(enum) {
     key_press: vaxis.Key,
@@ -190,6 +192,7 @@ const Viewport = struct {
 };
 
 const run_output_lines = 12;
+const max_menu_rows = 8;
 
 /// The UI thread must not touch the Session while a Turn is running.
 const Turn = struct {
@@ -266,6 +269,13 @@ pub fn run(init: std.process.Init, session: *agent.Session) !void {
     }
     var expanded = false;
     var status_text: StatusText = .{};
+    var menu_buf: [16]commands.Candidate = undefined;
+    var menu_sel: usize = 0;
+    var menu_closed = false;
+    var choices_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer choices_arena.deinit();
+    var session_choices: []const commands.Choice = &.{};
+    var session_choices_loaded = false;
     var activity: Activity = .{ .since = .now(io, .awake) };
     var ticker: Ticker = .{ .io = io, .loop = &loop };
     const ticker_thread = try std.Thread.spawn(.{}, Ticker.work, .{&ticker});
@@ -295,7 +305,27 @@ pub fn run(init: std.process.Init, session: *agent.Session) !void {
                 const page = @max(vx.window().height / 2, 1);
                 if (key.matches('c', .{ .ctrl = true })) break;
                 if (key.matches('d', .{ .ctrl = true }) and input.text().len == 0) break;
-                if (key.matches(vaxis.Key.escape, .{})) {
+                const menu = if (menu_closed) menu_buf[0..0] else commands.candidates(input.text(), session_choices, &menu_buf);
+                const selected: ?commands.Candidate = if (menu.len > 0) menu[@min(menu_sel, menu.len - 1)] else null;
+                const before = std.hash.Wyhash.hash(0, input.text());
+                var submitted: ?[]u8 = null;
+
+                if (selected != null and key.matches(vaxis.Key.escape, .{})) {
+                    menu_closed = true;
+                } else if (selected != null and key.matches(vaxis.Key.up, .{})) {
+                    menu_sel = (@min(menu_sel, menu.len - 1) + menu.len - 1) % menu.len;
+                } else if (selected != null and key.matches(vaxis.Key.down, .{})) {
+                    menu_sel = (@min(menu_sel, menu.len - 1) + 1) % menu.len;
+                } else if (selected != null and (key.matches(vaxis.Key.tab, .{}) or (key.matches(vaxis.Key.enter, .{}) and !pasting and !selected.?.runs()))) {
+                    const completion = try selected.?.completion(gpa);
+                    defer gpa.free(completion);
+                    try input.replace(gpa, completion);
+                } else if (selected != null and key.matches(vaxis.Key.enter, .{}) and !pasting) {
+                    const line = try selected.?.line(gpa);
+                    defer gpa.free(line);
+                    try input.replace(gpa, line);
+                    if (turn == null or busyCommand(line)) submitted = try input.take(gpa);
+                } else if (key.matches(vaxis.Key.escape, .{})) {
                     if (turn) |t| t.cancel.store(true, .release);
                 } else if (key.matches(vaxis.Key.page_up, .{})) {
                     scroll.pending -= page;
@@ -313,54 +343,126 @@ pub fn run(init: std.process.Init, session: *agent.Session) !void {
                 } else if (isNewline(key, pasting)) {
                     try input.insert(gpa, "\n");
                 } else if (key.matches(vaxis.Key.enter, .{})) {
-                    if (turn != null) continue; // one Turn at a time
+                    if (turn == null or busyCommand(input.text())) submitted = try input.take(gpa);
+                } else {
+                    _ = try input.key(gpa, key);
+                }
+                if (std.hash.Wyhash.hash(0, input.text()) != before) {
+                    menu_sel = 0;
+                    menu_closed = false;
+                    if (!std.mem.startsWith(u8, input.text(), "/resume ")) session_choices_loaded = false;
+                }
+
+                if (submitted) |line| dispatch: {
                     scroll = .{};
-                    const line = try input.take(gpa);
+                    session_choices_loaded = false;
                     if (line.len == 0) {
                         gpa.free(line);
-                        continue;
-                    }
-                    if (std.mem.eql(u8, line, "/effort") or std.mem.startsWith(u8, line, "/effort ")) {
+                    } else if (commands.parse(line)) |parsed| {
                         defer gpa.free(line);
-                        if (line.len > 7) {
-                            cfg.setEffort(std.mem.trim(u8, line[8..], " \t")) catch {
-                                try addEntry(gpa, &entries, .err, "usage: /effort [default|off|none|minimal|low|medium|high|xhigh|max]");
-                                continue;
-                            };
-                            session.cfg = cfg;
-                            session.tools.cfg = cfg;
+                        switch (parsed) {
+                            .unknown => |name| {
+                                const message = try std.fmt.allocPrint(gpa, "unknown command /{s} · /help lists commands", .{name});
+                                defer gpa.free(message);
+                                try addEntry(gpa, &entries, .err, message);
+                            },
+                            .known => |c| switch (c.command) {
+                                .help => {
+                                    const text = try commands.helpText(gpa);
+                                    defer gpa.free(text);
+                                    try addEntry(gpa, &entries, .info, text);
+                                },
+                                .new, .@"resume" => {
+                                    const id = if (c.command == .new) null else resolveSession(io, choices_arena.allocator(), session, c.arg) catch |err| {
+                                        try addEntry(gpa, &entries, .err, switch (err) {
+                                            error.MissingSessionId => "usage: /resume <id> · type /resume and a space to pick one",
+                                            error.UnknownSession => "no session here starts with that id",
+                                            error.AmbiguousSession => "several sessions start with that id; type more of it",
+                                            else => @errorName(err),
+                                        });
+                                        break :dispatch;
+                                    };
+                                    if (id != null and std.mem.eql(u8, id.?, session.id)) {
+                                        try addEntry(gpa, &entries, .info, "already in this session");
+                                        break :dispatch;
+                                    }
+                                    session.reopen(id) catch |err| {
+                                        const message = try std.fmt.allocPrint(gpa, "could not open session: {s}", .{@errorName(err)});
+                                        defer gpa.free(message);
+                                        try addEntry(gpa, &entries, .err, message);
+                                        break :dispatch;
+                                    };
+                                    for (entries.items) |*e| e.deinit(gpa);
+                                    entries.clearRetainingCapacity();
+                                    try addHistory(gpa, &entries, session.history.items);
+                                    usage = .{};
+                                    steps = 0;
+                                    context = session.context_tokens;
+                                    const message = try std.fmt.allocPrint(gpa, "{s} session {s}", .{ if (c.command == .new) "new" else "resumed", session.id[0..8] });
+                                    defer gpa.free(message);
+                                    try addEntry(gpa, &entries, .info, message);
+                                },
+                                .copy => {
+                                    const answer = for (0..entries.items.len) |i| {
+                                        const e = &entries.items[entries.items.len - 1 - i];
+                                        if (e.kind == .assistant) break e.text.items;
+                                    } else {
+                                        try addEntry(gpa, &entries, .err, "no answer to copy yet");
+                                        break :dispatch;
+                                    };
+                                    try vx.copyToSystemClipboard(w, answer, gpa);
+                                    const message = try std.fmt.allocPrint(gpa, "copied {d} bytes (needs a terminal with OSC 52 clipboard support)", .{answer.len});
+                                    defer gpa.free(message);
+                                    try addEntry(gpa, &entries, .info, message);
+                                },
+                                .effort => {
+                                    if (c.arg.len > 0) {
+                                        cfg.setEffort(c.arg) catch {
+                                            try addEntry(gpa, &entries, .err, "usage: /effort [default|off|none|minimal|low|medium|high|xhigh|max]");
+                                            break :dispatch;
+                                        };
+                                        session.cfg = cfg;
+                                        session.tools.cfg = cfg;
+                                    }
+                                    const message = try std.fmt.allocPrint(gpa, "effort: {s} · thinking: {s} · configured: {s} (model support varies)", .{
+                                        cfg.effectiveEffort(),
+                                        if (cfg.thinking) |on| (if (on) "on" else "off") else "default",
+                                        cfg.reasoning_effort orelse "default",
+                                    });
+                                    defer gpa.free(message);
+                                    try addEntry(gpa, &entries, .info, message);
+                                },
+                                .js => {
+                                    if (c.arg.len == 0) {
+                                        try addEntry(gpa, &entries, .err, "usage: /js <code>");
+                                        break :dispatch;
+                                    }
+                                    try addEntry(gpa, &entries, .user, line);
+                                    const r = try session.run(c.arg, null);
+                                    usage = session.usage;
+                                    defer r.deinit(gpa);
+                                    if (r.logs.len > 0) try addEntry(gpa, &entries, .info, std.mem.trimEnd(u8, r.logs, "\n"));
+                                    try addEntry(gpa, &entries, if (r.ok) .info else .err, r.text);
+                                },
+                                .compact => {
+                                    const t = try gpa.create(Turn);
+                                    t.* = .{ .gpa = gpa, .session = session, .text = try gpa.dupe(u8, line), .loop = &loop };
+                                    t.thread = try std.Thread.spawn(.{}, struct {
+                                        fn work(task: *Turn) void {
+                                            var detail: ?[]u8 = null;
+                                            _ = task.session.compact(.{ .ctx = task, .emit = Turn.emit }, &task.cancel, &detail) catch |err| {
+                                                const msg = detail orelse (task.gpa.dupe(u8, @errorName(err)) catch return);
+                                                task.loop.postEvent(.{ .failed = msg }) catch task.gpa.free(msg);
+                                                return;
+                                            };
+                                            task.loop.postEvent(.done) catch {};
+                                        }
+                                    }.work, .{t});
+                                    turn = t;
+                                    activity = .{ .phase = .compacting, .since = .now(io, .awake) };
+                                },
+                            },
                         }
-                        const message = try std.fmt.allocPrint(gpa, "effort: {s} · thinking: {s} · configured: {s} (model support varies)", .{
-                            cfg.effectiveEffort(),
-                            if (cfg.thinking) |on| (if (on) "on" else "off") else "default",
-                            cfg.reasoning_effort orelse "default",
-                        });
-                        defer gpa.free(message);
-                        try addEntry(gpa, &entries, .info, message);
-                    } else if (std.mem.startsWith(u8, line, "/js ")) {
-                        defer gpa.free(line);
-                        try addEntry(gpa, &entries, .user, line);
-                        const r = try session.run(line[4..], null);
-                        usage = session.usage;
-                        defer r.deinit(gpa);
-                        if (r.logs.len > 0) try addEntry(gpa, &entries, .info, std.mem.trimEnd(u8, r.logs, "\n"));
-                        try addEntry(gpa, &entries, if (r.ok) .info else .err, r.text);
-                    } else if (std.mem.eql(u8, line, "/compact")) {
-                        const t = try gpa.create(Turn);
-                        t.* = .{ .gpa = gpa, .session = session, .text = line, .loop = &loop };
-                        t.thread = try std.Thread.spawn(.{}, struct {
-                            fn work(task: *Turn) void {
-                                var detail: ?[]u8 = null;
-                                _ = task.session.compact(.{ .ctx = task, .emit = Turn.emit }, &task.cancel, &detail) catch |err| {
-                                    const msg = detail orelse (task.gpa.dupe(u8, @errorName(err)) catch return);
-                                    task.loop.postEvent(.{ .failed = msg }) catch task.gpa.free(msg);
-                                    return;
-                                };
-                                task.loop.postEvent(.done) catch {};
-                            }
-                        }.work, .{t});
-                        turn = t;
-                        activity = .{ .phase = .compacting, .since = .now(io, .awake) };
                     } else if (cfg.missingKey()) {
                         gpa.free(line);
                         try addEntry(gpa, &entries, .err, "no API key");
@@ -372,8 +474,6 @@ pub fn run(init: std.process.Init, session: *agent.Session) !void {
                         turn = t;
                         activity = .{ .since = .now(io, .awake) };
                     }
-                } else {
-                    _ = try input.key(gpa, key);
                 }
             },
             .paste_start => pasting = true,
@@ -441,7 +541,13 @@ pub fn run(init: std.process.Init, session: *agent.Session) !void {
         }
 
         ticker.busy.store(turn != null, .release);
-        draw(vx.window(), entries.items, &input, &scroll, cfg, usage, steps, context, if (turn != null) activity.label(io) else null, &status_text);
+        if (!session_choices_loaded and std.mem.startsWith(u8, input.text(), "/resume ")) {
+            _ = choices_arena.reset(.retain_capacity);
+            session_choices = try sessionChoices(io, choices_arena.allocator(), session);
+            session_choices_loaded = true;
+        }
+        const menu = if (menu_closed) menu_buf[0..0] else commands.candidates(input.text(), session_choices, &menu_buf);
+        draw(vx.window(), entries.items, &input, &scroll, menu, @min(menu_sel, menu.len -| 1), cfg, usage, steps, context, if (turn != null) activity.label(io) else null, &status_text);
         try vx.render(w);
         try w.flush();
     }
@@ -494,6 +600,54 @@ fn addHistory(gpa: std.mem.Allocator, entries: *std.ArrayList(Entry), history: [
             }
         }
     }
+}
+
+/// Commands marked `while_busy` may run while a Turn is in progress.
+fn busyCommand(line: []const u8) bool {
+    const parsed = commands.parse(line) orelse return false;
+    return switch (parsed) {
+        .known => |c| commands.specs.get(c.command).while_busy,
+        .unknown => false,
+    };
+}
+
+fn sessionChoices(io: std.Io, a: std.mem.Allocator, session: *const agent.Session) ![]const commands.Choice {
+    const directory = try std.fs.path.join(a, &.{ session.options.data_home, "nib/sessions" });
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const found = try session_log.list(io, a, directory, cwd);
+    const now = std.Io.Clock.real.now(io).nanoseconds;
+    const choices = try a.alloc(commands.Choice, found.len);
+    for (found, choices) |f, *c| {
+        const seconds: u64 = @intCast(@max(@divTrunc(now - f.modified_ns, std.time.ns_per_s), 0));
+        var ago_buf: [16]u8 = undefined;
+        const ago = if (seconds < 60)
+            "now"
+        else if (seconds < 3600)
+            try std.fmt.bufPrint(&ago_buf, "{d}m ago", .{seconds / 60})
+        else if (seconds < 86400)
+            try std.fmt.bufPrint(&ago_buf, "{d}h ago", .{seconds / 3600})
+        else
+            try std.fmt.bufPrint(&ago_buf, "{d}d ago", .{seconds / 86400});
+        const current = std.mem.eql(u8, f.id, session.id);
+        c.* = .{
+            .value = f.id,
+            .label = f.id[0..@min(8, f.id.len)],
+            .detail = try std.fmt.allocPrint(a, "{s}{s} · {s}", .{ ago, if (current) " (current)" else "", if (f.preview.len > 0) f.preview else "(no messages)" }),
+        };
+    }
+    return choices;
+}
+
+fn resolveSession(io: std.Io, a: std.mem.Allocator, session: *const agent.Session, arg: []const u8) ![]const u8 {
+    if (arg.len == 0) return error.MissingSessionId;
+    if (arg.len == 32) return arg;
+    var match: ?[]const u8 = null;
+    for (try sessionChoices(io, a, session)) |c| {
+        if (!std.mem.startsWith(u8, c.value, arg)) continue;
+        if (match != null) return error.AmbiguousSession;
+        match = c.value;
+    }
+    return match orelse error.UnknownSession;
 }
 
 fn lastRunning(entries: []Entry) ?*Entry {
@@ -584,14 +738,15 @@ fn isNewline(key: vaxis.Key, pasting: bool) bool {
         key.matches(enter, .{ .alt = true }) or key.matches('j', .{ .ctrl = true });
 }
 
-fn draw(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewport, cfg: provider.Config, usage: provider.Usage, steps: u32, context: u64, busy: ?Activity.Label, text: *StatusText) void {
+fn draw(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewport, menu: []const commands.Candidate, menu_sel: usize, cfg: provider.Config, usage: provider.Usage, steps: u32, context: u64, busy: ?Activity.Label, text: *StatusText) void {
     win.clear();
     win.hideCursor();
     if (win.height < 6 or win.width < 8) return;
 
     const input_rows = input.rows(win.child(.{ .x_off = 3 }));
     const input_h: u16 = @min(input_rows, win.height / 3);
-    const body_h: u16 = win.height - 1 - input_h;
+    const menu_h: u16 = @intCast(@min(menu.len, max_menu_rows, (win.height - 1 - input_h) / 2));
+    const body_h: u16 = win.height - 1 - input_h - menu_h;
     const body = win.child(.{ .x_off = 1, .width = win.width - 2, .height = body_h });
     const top = scroll.layout(entries, body);
     var y: i32 = -@as(i32, top.row);
@@ -622,10 +777,19 @@ fn draw(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewport, 
             usage.completion_tokens,
         }) catch "";
     const status_style: vaxis.Style = if (busy != null) .{ .fg = .{ .index = 3 } } else .{ .dim = true };
-    _ = win.child(.{ .x_off = 1, .y_off = body_h, .height = 1 }).printSegment(.{ .text = status, .style = status_style }, .{ .wrap = .none });
+    const first = if (menu_sel >= menu_h) menu_sel + 1 - menu_h else 0;
+    for (0..menu_h) |i| {
+        const c = menu[first + i];
+        const chosen = first + i == menu_sel;
+        const row = win.child(.{ .x_off = 1, .y_off = @intCast(body_h + i), .height = 1 });
+        const name_style: vaxis.Style = if (chosen) .{ .reverse = true, .bold = true } else .{ .bold = true };
+        _ = row.printSegment(.{ .text = c.label, .style = name_style }, .{ .wrap = .none });
+        _ = row.child(.{ .x_off = 14 }).printSegment(.{ .text = c.detail, .style = .{ .dim = true } }, .{ .wrap = .none });
+    }
+    _ = win.child(.{ .x_off = 1, .y_off = body_h + menu_h, .height = 1 }).printSegment(.{ .text = status, .style = status_style }, .{ .wrap = .none });
 
-    _ = win.child(.{ .x_off = 1, .y_off = body_h + 1, .height = 1 }).printSegment(.{ .text = "› ", .style = .{ .fg = .{ .index = 4 } } }, .{});
-    input.draw(win.child(.{ .x_off = 3, .y_off = body_h + 1, .height = input_h }));
+    _ = win.child(.{ .x_off = 1, .y_off = body_h + menu_h + 1, .height = 1 }).printSegment(.{ .text = "› ", .style = .{ .fg = .{ .index = 4 } } }, .{});
+    input.draw(win.child(.{ .x_off = 3, .y_off = body_h + menu_h + 1, .height = input_h }));
 }
 
 test "runs fold to one line until expanded" {
@@ -669,10 +833,10 @@ test "draw benchmark: 5000 entries" {
         var samples: [5]i96 = undefined;
         for (&samples) |*sample_ns| {
             var scroll: Viewport = .{ .pending = -@as(i64, offset) };
-            draw(win, entries, &input, &scroll, cfg, .{}, 0, 0, null, &status_text);
+            draw(win, entries, &input, &scroll, &.{}, 0, cfg, .{}, 0, 0, null, &status_text);
             const before = std.Io.Clock.awake.now(std.testing.io);
             for (0..frames) |_| {
-                draw(win, entries, &input, &scroll, cfg, .{}, 0, 0, null, &status_text);
+                draw(win, entries, &input, &scroll, &.{}, 0, cfg, .{}, 0, 0, null, &status_text);
             }
             sample_ns.* = @divTrunc(before.untilNow(std.testing.io, .awake).nanoseconds, frames);
         }
@@ -763,16 +927,16 @@ test "draw keeps scrolled body fixed while output arrives and caps input height"
     var status_text: StatusText = .{};
     var view: Viewport = .{ .pending = -30 };
     const cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "mock" };
-    draw(win, entries.items, &input, &view, cfg, .{}, 0, 0, .{ .phase = .thinking, .ms = 0 }, &status_text);
+    draw(win, entries.items, &input, &view, &.{}, 0, cfg, .{}, 0, 0, .{ .phase = .thinking, .ms = 0 }, &status_text);
     const body_before = try gpa.dupe(vaxis.Cell, screen.buf[0 .. 22 * 100]);
     defer gpa.free(body_before);
     try entries.items[1].text.appendSlice(gpa, "\nmore streamed text");
     try addEntry(gpa, &entries, .info, "Run output");
-    draw(win, entries.items, &input, &view, cfg, .{}, 0, 0, .{ .phase = .thinking, .ms = 0 }, &status_text);
+    draw(win, entries.items, &input, &view, &.{}, 0, cfg, .{}, 0, 0, .{ .phase = .thinking, .ms = 0 }, &status_text);
     try std.testing.expectEqualDeep(body_before, screen.buf[0 .. 22 * 100]);
     for (0..16) |i| try input.buf.print(gpa, "input {d}\n", .{i});
     input.cursor = input.buf.items.len;
-    draw(win, entries.items, &input, &view, cfg, .{}, 0, 0, .{ .phase = .thinking, .ms = 0 }, &status_text);
+    draw(win, entries.items, &input, &view, &.{}, 0, cfg, .{}, 0, 0, .{ .phase = .thinking, .ms = 0 }, &status_text);
     try std.testing.expectEqual(@as(u16, 9), input.top_row);
     try std.testing.expectEqual(@as(u16, 23), screen.cursor.row);
     try std.testing.expect(screen.cursor_vis);
