@@ -17,7 +17,7 @@
 极简指优雅的设计和架构，不是死守代码行数。我们用这几条来判断：
 
 - **概念少，而且各管一件事。** Session、Turn、Step、Run、Tool 各有明确边界（见 [CONTEXT.md](../CONTEXT.md)）。要加新概念时，先问能不能用已有概念表达。
-- **模块深。** 接口简单，复杂性藏在内部。例如界面只需要 `Session.turn` 和一个事件 `Sink`。
+- **模块深。** 接口简单，复杂性藏在内部。例如界面只需要 `Session.turn`、`Session.compact` 和一个事件 `Sink`。
 - **同一件事只在一处定义。** 例如每个 Tool 的名字、给模型看的说明和实现在 `tools.zig` 的同一张表里，说明由表生成。
 - **说法前后一致。** 例如要模型写 JS，给它看的接口说明也用 JS。
 - **不为还没出现的需求设计，没有证据不加特例。**
@@ -34,6 +34,7 @@
   - [0004 两层隔离](adr/0004-two-layer-isolation.md)（暂缓：系统层沙箱不做，语言层已实现）
   - [0005 一个 Session 一个进程](adr/0005-process-per-session.md)
   - [0006 不审批，宿主侧拒绝危险命令](adr/0006-deny-dangerous-commands.md)
+  - [0007 保持 system 稳定，按完整 Step 压缩上下文](adr/0007-context-compaction.md)
 
 ## 没写成 ADR 的选择
 
@@ -41,12 +42,12 @@
 
 - Provider 先只做 OpenAI 兼容的 Chat Completions，测试用 DeepSeek（用户偏好，不用 Claude 测试）。接 Anthropic 原生协议时，`sse.zig` 可复用。
 - TUI 用 libvaxis。
+- 会话持久化、恢复和项目指令已实现（2026-11-01，一手源码：`src/agent.zig`、`src/log.zig`、`src/instructions.zig`、`src/main.zig`）。日志按完整 Step 同步落盘；详细行为见根目录 [AGENTS.md](../AGENTS.md)，端到端检查可运行 `zig build` 后执行 `python3 scripts/test_session.py`。
 
 ## 暂缓的想法
 
 想到了、但现在不做的事。每条写清楚为什么暂缓、什么时候再考虑，避免遗忘，也避免被误当成已定的计划。
 
-- **读取项目指令文件。** 启动时把仓库根目录和 `~/.config/nib/` 下的 `AGENTS.md` 拼进 system prompt（项目的覆盖全局的）。"nib 写的代码是给 agent 读的"这类立场应该写在这些文件里，而不是写死在 nib 内部，因为 nib 也会进入人类团队维护的仓库。待定：是否兼容 `CLAUDE.md`，倾向只认 `AGENTS.md`。暂缓原因：先用真实模型把基础流程验证完（2026-11-01 搁置）。
 - **工具真正并发。** 现在 Run 里的工具调用同步执行，`Promise.all` 结果正确但不并发。等出现明显需要并行的任务（比如同时读很多文件、同时跑多个命令）再接入 `std.Io` 的并发。
 
 其他被搁置的方案记在对应 ADR 里：系统层沙箱（[0004](adr/0004-two-layer-isolation.md)）、守护进程（[0005](adr/0005-process-per-session.md)）、跨 Run 的变量存储（[0003](adr/0003-stateless-runs.md)）、混合原生工具调用和 Python 运行时（[0002](adr/0002-run-code-only.md)）。
@@ -57,7 +58,7 @@
 
 | 项目 | 实测值 | 警报线 | 测量方式 |
 |---|---|---|---|
-| 源码行数（`src/` + `build.zig`，含测试） | 2123（2026-11-01，阶段一完成后） | — | `wc -l build.zig src/**/*.zig`（zsh） |
+| 源码行数（`src/` + `build.zig`，含测试） | 2632（2026-11-01，Session 持久化与压缩后） | — | `wc -l build.zig src/**/*.zig`（zsh） |
 | `nib js '1+1'` 平均耗时（含进程启动） | 1.6 ms（2026-11-01，ReleaseFast） | — | 循环 100 次取平均 |
 | 上述命令峰值 RSS | 3.7 MB（2026-11-01） | — | `/usr/bin/time -f %M` |
 | 二进制体积（ReleaseFast，strip 后） | 1.9 MB（2026-11-01） | — | `strip` 后 `ls -l` |
