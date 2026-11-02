@@ -67,8 +67,8 @@ pub fn main(init: std.process.Init) !void {
         try stdout.print("\n", .{});
         try stdout.flush();
         const u = session.usage;
-        std.debug.print("[{s}] last step: in={d} (cache hit {d}) out={d}\n", .{
-            cfg.llm.model, u.prompt_tokens, u.prompt_cache_hit_tokens, u.completion_tokens,
+        std.debug.print("[{s}] turn: {d} steps, in={d} (cache hit {d}) out={d}\n", .{
+            cfg.llm.model, session.steps, u.prompt_tokens, u.prompt_cache_hit_tokens, u.completion_tokens,
         });
         return;
     }

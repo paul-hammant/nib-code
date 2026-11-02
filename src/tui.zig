@@ -91,6 +91,7 @@ pub fn run(init: std.process.Init, client: *std.http.Client, cfg: openai.Config)
     }
 
     var usage: openai.Usage = .{};
+    var steps: u32 = 0;
     var turn: ?*Turn = null;
     defer if (turn) |t| {
         t.cancel.store(true, .release);
@@ -155,6 +156,7 @@ pub fn run(init: std.process.Init, client: *std.http.Client, cfg: openai.Config)
                 turn.?.finish();
                 turn = null;
                 usage = session.usage;
+                steps = session.steps;
             },
             .failed => |msg| {
                 defer gpa.free(msg);
@@ -163,10 +165,11 @@ pub fn run(init: std.process.Init, client: *std.http.Client, cfg: openai.Config)
                 turn.?.finish();
                 turn = null;
                 usage = session.usage;
+                steps = session.steps;
             },
         }
 
-        draw(vx.window(), entries.items, &input, cfg.model, usage, turn != null);
+        draw(vx.window(), entries.items, &input, cfg.model, usage, steps, turn != null);
         try vx.render(w);
         try w.flush();
     }
@@ -215,7 +218,7 @@ fn segmentsFor(e: *const Entry, buf: *[2]vaxis.Segment) []const vaxis.Segment {
     return buf[0..1];
 }
 
-fn draw(win: vaxis.Window, entries: []const Entry, input: *vaxis.widgets.TextInput, model: []const u8, usage: openai.Usage, busy: bool) void {
+fn draw(win: vaxis.Window, entries: []const Entry, input: *vaxis.widgets.TextInput, model: []const u8, usage: openai.Usage, steps: u32, busy: bool) void {
     win.clear();
     if (win.height < 4 or win.width < 4) return;
 
@@ -244,8 +247,9 @@ fn draw(win: vaxis.Window, entries: []const Entry, input: *vaxis.widgets.TextInp
     }
 
     var status_buf: [256]u8 = undefined;
-    const status = std.fmt.bufPrint(&status_buf, "{s} · in {d} (cache {d}) · out {d} · {s}", .{
+    const status = std.fmt.bufPrint(&status_buf, "{s} · last turn: {d} steps, in {d} (cache {d}), out {d} · {s}", .{
         model,
+        steps,
         usage.prompt_tokens,
         usage.prompt_cache_hit_tokens,
         usage.completion_tokens,

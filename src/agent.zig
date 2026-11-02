@@ -50,7 +50,9 @@ pub const Session = struct {
     /// Owns every string in `history`.
     arena: std.heap.ArenaAllocator,
     history: std.ArrayList(openai.Message) = .empty,
+    /// Totals for the current or most recent Turn.
     usage: openai.Usage = .{},
+    steps: u32 = 0,
     tools: tools.Tools,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, client: *std.http.Client, cfg: openai.Config) !Session {
@@ -82,6 +84,8 @@ pub const Session = struct {
         const before = s.history.items.len;
         try s.history.append(s.gpa, .{ .role = "user", .content = try a.dupe(u8, user_text) });
         var safe = before;
+        s.usage = .{};
+        s.steps = 0;
         errdefer s.history.shrinkRetainingCapacity(safe);
 
         const Fwd = struct {
@@ -95,7 +99,8 @@ pub const Session = struct {
 
         for (0..max_steps) |_| {
             const reply = try openai.stream(s.gpa, a, s.client, s.cfg, s.history.items, tools_json, provider_sink, cancel, detail);
-            s.usage = reply.usage;
+            s.usage.add(reply.usage);
+            s.steps += 1;
             try s.history.append(s.gpa, .{
                 .role = "assistant",
                 .content = reply.text,
@@ -139,9 +144,11 @@ pub const Session = struct {
 
 fn formatOutcome(gpa: std.mem.Allocator, o: js.Outcome) ![]u8 {
     const logs = std.mem.trimEnd(u8, o.logs, "\n");
-    const sep: []const u8 = if (logs.len > 0) "\n" else "";
-    if (o.ok) return std.fmt.allocPrint(gpa, "{s}{s}result: {s}", .{ logs, sep, o.text });
-    return std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ logs, sep, o.text });
+    const value: []const u8 = if (o.ok and std.mem.eql(u8, o.text, "undefined")) "" else o.text;
+    if (logs.len == 0 and value.len == 0) return gpa.dupe(u8, "(no output)");
+    const sep: []const u8 = if (logs.len > 0 and value.len > 0) "\n" else "";
+    const label: []const u8 = if (o.ok and value.len > 0) "result: " else "";
+    return std.fmt.allocPrint(gpa, "{s}{s}{s}{s}", .{ logs, sep, label, value });
 }
 
 test "formatOutcome" {
@@ -156,6 +163,13 @@ test "formatOutcome" {
     const bad = try formatOutcome(gpa, .{ .ok = false, .text = &err, .logs = &none });
     defer gpa.free(bad);
     try std.testing.expectEqualStrings("Error: x", bad);
+    var undef = "undefined".*;
+    const logged = try formatOutcome(gpa, .{ .ok = true, .text = &undef, .logs = &logs });
+    defer gpa.free(logged);
+    try std.testing.expectEqualStrings("a\nb", logged);
+    const silent = try formatOutcome(gpa, .{ .ok = true, .text = &undef, .logs = &none });
+    defer gpa.free(silent);
+    try std.testing.expectEqualStrings("(no output)", silent);
 }
 
 test "system prompt documents every tool in JavaScript" {

@@ -28,6 +28,12 @@ pub const Usage = struct {
     completion_tokens: u64 = 0,
     /// DeepSeek reports prompt-cache hits under this name.
     prompt_cache_hit_tokens: u64 = 0,
+
+    pub fn add(u: *Usage, other: Usage) void {
+        u.prompt_tokens += other.prompt_tokens;
+        u.completion_tokens += other.completion_tokens;
+        u.prompt_cache_hit_tokens += other.prompt_cache_hit_tokens;
+    }
 };
 
 /// Allocated with the `out` allocator passed to `stream`.
