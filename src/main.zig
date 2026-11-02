@@ -37,6 +37,10 @@ pub fn main(init: std.process.Init) void {
 
 fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer, json: bool, detail: *?[]u8, failure: *JsonEvent.Failure) !void {
     const gpa = init.gpa;
+    if (args.len == 2 and (std.mem.eql(u8, args[1], "--version") or std.mem.eql(u8, args[1], "-V"))) {
+        try stdout.print("nib {s}\n", .{@import("build_options").version});
+        return stdout.flush();
+    }
     var cfg = try Config.fromEnv(init.arena.allocator(), init.environ_map);
     if (args.len >= 3 and std.mem.eql(u8, args[1], "js")) {
         const r = try sandbox.eval(gpa, init.io, args[2], .{}, null, null);

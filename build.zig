@@ -31,6 +31,9 @@ pub fn build(b: *std.Build) void {
 
     const vaxis_dep = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
 
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", @import("build.zig.zon").version);
+
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -38,6 +41,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
             .{ .name = "qjs", .module = qjs_c.createModule() },
+            .{ .name = "build_options", .module = options.createModule() },
         },
     });
     mod.linkLibrary(qjs);

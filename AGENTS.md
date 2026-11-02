@@ -3,6 +3,7 @@
 用 Zig 0.17 写的编码 agent，命令名 `nib`。
 
 - 构建：`zig build`；测试：`zig build test --summary all`；端到端（本地 mock，无真实 key）：`zig build` 后 `python3 tests/test_session.py`、`python3 tests/test_codex.py`
+- 安装到 `~/.local/bin/nib`：`zig build -Doptimize=ReleaseFast --prefix ~/.local`；版本号在 `build.zig.zon`，`nib --version` 查看。
 - 运行：`./zig-out/bin/nib`（TUI）、`nib ask '<prompt>'`、`nib js '<code>'`；TUI 用 `/compact` 手动压缩上下文。
 - 推理强度：`nib --effort high` / `nib ask --effort high '<prompt>'`；TUI `/effort` 查询、`/effort high` 切换。支持 `default|off|none|minimal|low|medium|high|xhigh|max`（服务端支持因模型而异）；显式设置覆盖 thinking/effort 环境配置，`default` 清除覆盖。只影响当前进程，子会话继承。
 - 恢复：`nib -c` / `nib --continue` 继续当前目录最近的根会话（跳过子会话）；`nib --resume <32位小写十六进制ID>` 指定会话；`ask` 也支持这些选项，放在 prompt 前后均可。
