@@ -20,6 +20,7 @@
   - [0002 只暴露 run(code)：模型写 JS，跑在 QuickJS 里](adr/0002-run-code-only.md)
   - [0003 每次 Run 都是全新的沙箱](adr/0003-stateless-runs.md)
   - [0004 两层隔离](adr/0004-two-layer-isolation.md)（提议中，未实现）
+  - [0005 一个 Session 一个进程](adr/0005-process-per-session.md)
 
 ## 没写成 ADR 的选择
 
@@ -38,5 +39,7 @@
 | `nib js '1+1'` 平均耗时（含进程启动） | 1.6 ms（2026-11-01，ReleaseFast） | — | 循环 100 次取平均 |
 | 上述命令峰值 RSS | 3.7 MB（2026-11-01） | — | `/usr/bin/time -f %M` |
 | 二进制体积（ReleaseFast，strip 后） | 1.9 MB（2026-11-01） | — | `strip` 后 `ls -l` |
+| TUI 进程空闲 PSS（一轮对话后，无 TLS） | 3.08 MB/进程，10 个合计 30.8 MB（2026-11-01，ReleaseFast） | — | 10 个 TUI 对本地模拟服务器各聊一轮，读 `/proc/<pid>/smaps_rollup` 的 `Pss` |
+| 一次 HTTPS 请求峰值 RSS（含 TLS） | 7.6 MB（2026-11-01，ReleaseFast） | — | `/usr/bin/time -f %M nib ask hi`（无效 key，收到 401） |
 
 **行数警报线为什么是 5000：** 参考项目里 pi 的整个 agent 循环包约 2.5k 行 TS，而 jcode 长到约 93 万行。5000 是一个"内核还能被一个人完整读懂"的粗略估计，没有更硬的依据。超过时应该问：是该精简，还是这个数字本身定错了。
