@@ -15,6 +15,7 @@ const Event = union(enum) {
     run_start: []u8,
     run_end: struct { ok: bool, output: []u8 },
     retry: []u8,
+    notice: []u8,
     done,
     failed: []u8,
 };
@@ -53,6 +54,7 @@ const Turn = struct {
             .run_start => |code| .{ .run_start = try gpa.dupe(u8, code) },
             .run_end => |r| .{ .run_end = .{ .ok = r.ok, .output = try gpa.dupe(u8, r.output) } },
             .retry => |r| .{ .retry = try std.fmt.allocPrint(gpa, "retry {d} in {d}s: {s}", .{ r.attempt, r.delay_ms / 1000, r.reason }) },
+            .notice => |m| .{ .notice = try gpa.dupe(u8, m) },
         });
     }
 
@@ -63,12 +65,11 @@ const Turn = struct {
     }
 };
 
-pub fn run(init: std.process.Init, client: *std.http.Client, cfg: openai.Config) !void {
+/// `session` may already hold history (a resumed Session); it is shown first.
+pub fn run(init: std.process.Init, session: *agent.Session) !void {
     const io = init.io;
     const gpa = init.gpa;
-
-    var session = try agent.Session.init(gpa, io, client, cfg, init.environ_map.get("HOME") orelse "");
-    defer session.deinit();
+    const cfg = session.cfg;
 
     var tty_buf: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &tty_buf);
@@ -100,12 +101,14 @@ pub fn run(init: std.process.Init, client: *std.http.Client, cfg: openai.Config)
 
     var usage: openai.Usage = .{};
     var steps: u32 = 0;
+    var context: u64 = session.context_tokens;
     var turn: ?*Turn = null;
     defer if (turn) |t| {
         t.cancel.store(true, .release);
         t.finish();
     };
 
+    try addHistory(gpa, &entries, session.history.items);
     if (cfg.api_key.len == 0) try addEntry(gpa, &entries, .err, "no API key: set DEEPSEEK_API_KEY (or NIB_API_KEY). /js <code> still works.");
 
     while (true) {
@@ -147,7 +150,7 @@ pub fn run(init: std.process.Init, client: *std.http.Client, cfg: openai.Config)
                     } else {
                         try addEntry(gpa, &entries, .user, line);
                         const t = try gpa.create(Turn);
-                        t.* = .{ .gpa = gpa, .session = &session, .text = line, .loop = &loop };
+                        t.* = .{ .gpa = gpa, .session = session, .text = line, .loop = &loop };
                         t.thread = try std.Thread.spawn(.{}, Turn.work, .{t});
                         turn = t;
                     }
@@ -175,7 +178,7 @@ pub fn run(init: std.process.Init, client: *std.http.Client, cfg: openai.Config)
                 try appendHead(gpa, &e.text, r.output, run_output_lines);
                 try entries.append(gpa, e);
             },
-            .retry => |msg| {
+            .retry, .notice => |msg| {
                 defer gpa.free(msg);
                 try addEntry(gpa, &entries, .info, msg);
             },
@@ -184,6 +187,7 @@ pub fn run(init: std.process.Init, client: *std.http.Client, cfg: openai.Config)
                 turn = null;
                 usage = session.usage;
                 steps = session.steps;
+                context = session.context_tokens;
             },
             .failed => |msg| {
                 defer gpa.free(msg);
@@ -193,10 +197,11 @@ pub fn run(init: std.process.Init, client: *std.http.Client, cfg: openai.Config)
                 turn = null;
                 usage = session.usage;
                 steps = session.steps;
+                context = session.context_tokens;
             },
         }
 
-        draw(vx.window(), entries.items, &input, &scroll, cfg.model, usage, steps, turn != null);
+        draw(vx.window(), entries.items, &input, &scroll, cfg, usage, steps, context, turn != null);
         try vx.render(w);
         try w.flush();
     }
@@ -214,6 +219,27 @@ fn appendHead(gpa: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8,
         }
         if (n > 0) try out.append(gpa, '\n');
         try out.appendSlice(gpa, line);
+    }
+}
+
+fn addHistory(gpa: std.mem.Allocator, entries: *std.ArrayList(Entry), history: []const openai.Message) !void {
+    for (history) |m| {
+        const content = m.content orelse "";
+        if (std.mem.eql(u8, m.role, "user")) {
+            try addEntry(gpa, entries, .user, content);
+        } else if (std.mem.eql(u8, m.role, "assistant")) {
+            if (content.len > 0) try addEntry(gpa, entries, .assistant, content);
+            for (m.tool_calls orelse &.{}) |call| {
+                const Args = struct { code: []const u8 = "" };
+                const args = std.json.parseFromSlice(Args, gpa, call.function.arguments, .{ .ignore_unknown_fields = true }) catch continue;
+                defer args.deinit();
+                try addEntry(gpa, entries, .run_code, std.mem.trim(u8, args.value.code, "\n"));
+            }
+        } else if (std.mem.eql(u8, m.role, "tool")) {
+            var e: Entry = .{ .kind = .run_output };
+            try appendHead(gpa, &e.text, content, run_output_lines);
+            try entries.append(gpa, e);
+        }
     }
 }
 
@@ -252,7 +278,7 @@ fn isNewline(key: vaxis.Key, pasting: bool) bool {
 }
 
 /// `scroll` counts rows above the bottom and is clamped to the transcript.
-fn draw(win: vaxis.Window, entries: []const Entry, input: *const Editor, scroll: *u32, model: []const u8, usage: openai.Usage, steps: u32, busy: bool) void {
+fn draw(win: vaxis.Window, entries: []const Entry, input: *const Editor, scroll: *u32, cfg: openai.Config, usage: openai.Usage, steps: u32, context: u64, busy: bool) void {
     win.clear();
     win.hideCursor();
     if (win.height < 6 or win.width < 8) return;
@@ -293,8 +319,9 @@ fn draw(win: vaxis.Window, entries: []const Entry, input: *const Editor, scroll:
     const status = if (scroll.* > 0)
         std.fmt.bufPrint(&status_buf, "↑ {d} rows up · PgDn / shift+↓ to return", .{scroll.*}) catch ""
     else
-        std.fmt.bufPrint(&status_buf, "{s} · last turn: {d} steps, in {d} (cache {d}), out {d} · {s}", .{
-            model,
+        std.fmt.bufPrint(&status_buf, "{s} · ctx {d}% · last turn: {d} steps, in {d} (cache {d}), out {d} · {s}", .{
+            cfg.model,
+            context * 100 / @max(cfg.context_window, 1),
             steps,
             usage.prompt_tokens,
             usage.prompt_cache_hit_tokens,

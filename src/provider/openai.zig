@@ -5,6 +5,7 @@ pub const Config = struct {
     base_url: []const u8,
     api_key: []const u8,
     model: []const u8,
+    context_window: u64 = 128_000,
 };
 
 pub const ToolCall = struct {

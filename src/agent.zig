@@ -11,6 +11,7 @@ pub const Event = union(enum) {
     run_start: []const u8,
     run_end: struct { ok: bool, output: []const u8 },
     retry: struct { attempt: u32, delay_ms: u64, reason: []const u8 },
+    notice: []const u8,
 };
 
 pub const Sink = struct {
@@ -55,6 +56,8 @@ pub const Session = struct {
     /// Totals for the current or most recent Turn.
     usage: openai.Usage = .{},
     steps: u32 = 0,
+    /// Prompt + completion tokens of the latest Step: what the next request starts from.
+    context_tokens: u64 = 0,
     tools: tools.Tools,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, client: *std.http.Client, cfg: openai.Config, home: []const u8) !Session {
@@ -94,6 +97,7 @@ pub const Session = struct {
             const reply = try s.complete(sink, cancel, detail);
             s.usage.add(reply.usage);
             s.steps += 1;
+            s.context_tokens = reply.usage.prompt_tokens + reply.usage.completion_tokens;
             try s.history.append(s.gpa, .{
                 .role = "assistant",
                 .content = reply.text,
