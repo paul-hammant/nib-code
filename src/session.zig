@@ -16,6 +16,7 @@ pub const Sink = struct {
     ctx: *anyopaque,
     emit: *const fn (ctx: *anyopaque, event: Event) anyerror!void,
     onModelActivity: ?*const fn (ctx: *anyopaque, activity: ModelActivity) anyerror!void = null,
+    onUserInserted: ?*const fn (ctx: *anyopaque, id: u64) anyerror!void = null,
 
     fn modelActivity(sink: Sink, activity: ModelActivity) !void {
         if (sink.onModelActivity) |notify| try notify(sink.ctx, activity);
@@ -71,6 +72,17 @@ pub const Session = struct {
     id: []const u8 = undefined,
     parent_session_id: ?[]const u8 = null,
     options: Options = undefined,
+    inbox: @import("session/inbox.zig").Inbox = .{},
+
+    /// Thread-safe while a Turn runs; other Session mutation is exclusive.
+    pub fn enqueue(s: *Session, text: []const u8) !u64 {
+        return s.inbox.enqueue(s.gpa, s.io, text);
+    }
+
+    /// The caller owns the batch. Take leftovers only after joining the Turn.
+    pub fn takeQueued(s: *Session) @import("session/inbox.zig").Batch {
+        return s.inbox.take(s.io);
+    }
 
     pub const Options = struct { environ: ?*const std.process.Environ.Map = null, depth: u32 = 0, parent_session_id: ?[]const u8 = null, home: []const u8, user_home: []const u8, resume_id: ?[]const u8 = null, continue_latest: bool = false };
 
@@ -131,6 +143,7 @@ pub const Session = struct {
     }
 
     pub fn deinit(s: *Session) void {
+        s.inbox.batch.deinit(s.gpa);
         s.tools.discardChanges(s.gpa);
         s.log.close(s.io);
         s.history.deinit(s.gpa);
@@ -264,6 +277,12 @@ pub const Session = struct {
             const size = s.context_tokens + estimateTokens(pending.items);
             if (size >= s.cfg.context_window - s.cfg.context_window / 4 and size >= s.compact_backoff)
                 try s.autoCompact(sink, cancel, detail);
+            if (cancel.load(.acquire)) return error.Canceled;
+            var inserted = try s.inbox.insert(s.gpa, s.io, s.arena.allocator(), pending);
+            defer inserted.deinit(s.gpa);
+            if (sink.onUserInserted) |notify| {
+                for (inserted.items.items) |item| try notify(sink.ctx, item.id);
+            }
             var request: std.ArrayList(provider.Message) = .empty;
             defer request.deinit(s.gpa);
             try request.appendSlice(s.gpa, s.history.items);
@@ -558,7 +577,7 @@ test "failed Turn leaves replay equal to in-memory safe history" {
             cancel.store(canceled, .release);
             ctx.activities.clearRetainingCapacity();
             const result = session.turn("failed turn", .{ .ctx = &ctx, .emit = Quiet.emit, .onModelActivity = Quiet.activity }, &cancel, &detail);
-            try t.expectEqual(@as(usize, if (canceled) 2 else max_attempts * 2), ctx.activities.items.len);
+            try t.expectEqual(@as(usize, if (canceled) 0 else max_attempts * 2), ctx.activities.items.len);
             var i: usize = 0;
             while (i < ctx.activities.items.len) : (i += 2) {
                 try t.expectEqualSlices(ModelActivity, &.{ .started, .finished }, ctx.activities.items[i..][0..2]);

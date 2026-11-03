@@ -32,6 +32,7 @@ const Event = union(enum) {
     run_end: struct { ok: bool, output: []u8, changes: ChangeText },
     retry: []u8,
     notice: []u8,
+    user_inserted: u64,
     done,
     usage: struct { tokens: provider.Usage, context: u64, steps: u32 },
     progress: @import("session/events.zig").Progress,
@@ -56,7 +57,7 @@ const Ticker = struct {
     }
 };
 
-/// A Turn or `/compact` on its own thread. The UI thread must not touch the Session meanwhile.
+/// A Turn or `/compact` on its own thread. Only Session.enqueue is shared with the UI.
 const Turn = struct {
     gpa: std.mem.Allocator,
     session: *Session,
@@ -85,10 +86,15 @@ const Turn = struct {
     }
 
     fn execute(t: *Turn, compact: bool, detail: *?[]u8) !void {
-        const sink: Sink = .{ .ctx = t, .emit = emit, .onModelActivity = modelActivity };
+        const sink: Sink = .{ .ctx = t, .emit = emit, .onModelActivity = modelActivity, .onUserInserted = userInserted };
         if (compact) {
             _ = try t.session.compact(sink, &t.cancel, detail);
         } else try t.session.turn(t.text, sink, &t.cancel, detail);
+    }
+
+    fn userInserted(ctx: *anyopaque, id: u64) !void {
+        const t: *Turn = @ptrCast(@alignCast(ctx));
+        try t.loop.postEvent(.{ .user_inserted = id });
     }
 
     fn modelActivity(ctx: *anyopaque, state: ModelActivity) !void {
@@ -350,9 +356,12 @@ const App = struct {
                 defer owned.deinit(gpa);
                 try app.transcript.progress(gpa, p);
             },
+            .user_inserted => |id| app.transcript.userInserted(id),
             .done => {
+                const canceled = app.turn.?.cancel.load(.acquire);
                 app.finishTurn();
                 try app.saveReflection();
+                try app.finishQueued(!canceled);
             },
             .issue => |msg| {
                 defer gpa.free(msg);
@@ -368,6 +377,7 @@ const App = struct {
                 const canceled = app.turn.?.cancel.load(.acquire);
                 try app.transcript.add(gpa, if (canceled) .info else .err, if (canceled) "canceled" else msg);
                 app.finishTurn();
+                try app.finishQueued(false);
             },
         }
         return true;
@@ -424,7 +434,7 @@ const App = struct {
         } else if (isNewline(k, app.pasting)) {
             try input.insert(gpa, "\n");
         } else if (k.matches(vaxis.Key.enter, .{})) {
-            if (app.turn == null or commands.allowedWhileBusy(input.text())) submitted = try input.take(gpa);
+            if (app.turn == null or commands.parse(input.text()) == null or commands.allowedWhileBusy(input.text())) submitted = try input.take(gpa);
         } else {
             _ = try input.key(gpa, k);
         }
@@ -450,8 +460,21 @@ const App = struct {
             gpa.free(line);
             return app.transcript.add(gpa, .err, "no API key");
         }
-        try app.transcript.add(gpa, .user, line);
-        app.turn = try Turn.spawn(gpa, app.session, app.loop, line, false);
+        if (app.turn != null) {
+            defer gpa.free(line);
+            const id = try app.session.enqueue(line);
+            try app.transcript.add(gpa, .user, line);
+            app.transcript.entries.items[app.transcript.entries.items.len - 1].queued = id;
+            return;
+        }
+        try app.startTurn(line);
+    }
+
+    /// Takes ownership of text without interpreting slash commands.
+    fn startTurn(app: *App, text: []u8) !void {
+        errdefer app.gpa.free(text);
+        try app.transcript.add(app.gpa, .user, text);
+        app.turn = try Turn.spawn(app.gpa, app.session, app.loop, text, false);
         app.live_steps = 0;
         app.activity = .start(app.io, .thinking);
     }
@@ -618,6 +641,25 @@ const App = struct {
         app.context = app.session.context_tokens;
     }
 
+    fn finishQueued(app: *App, send: bool) !void {
+        var batch = app.session.takeQueued();
+        defer batch.deinit(app.gpa);
+        if (batch.items.items.len == 0) return;
+        const text = try batch.joined(app.gpa);
+        app.transcript.removeQueued(app.gpa);
+        if (send) {
+            try app.startTurn(text);
+        } else {
+            defer app.gpa.free(text);
+            const draft = try app.input.expanded(app.gpa);
+            defer app.gpa.free(draft);
+            const restored = if (draft.len == 0) try app.gpa.dupe(u8, text) else try std.fmt.allocPrint(app.gpa, "{s}\n\n{s}", .{ text, draft });
+            defer app.gpa.free(restored);
+            try app.input.replace(app.gpa, restored);
+            app.menu.inputChanged(app.input.text());
+        }
+    }
+
     fn render(app: *App) !void {
         try app.menu.load(app.io, app.input.text(), app.session);
         const menu = app.menu.items(app.input.text());
@@ -733,4 +775,20 @@ test "Turn throttles model data events but sends request boundaries immediately"
     try t.expectEqual(ModelActivity.data, resumed.state);
     try t.expectEqualDeep(silence, resumed.at);
     try t.expectEqual(@as(?Event, null), try loop.tryEvent());
+}
+
+test "insertion notifications reach the queued user entry" {
+    const t = std.testing;
+    var loop: vaxis.Loop(Event) = .{ .io = t.io, .tty = undefined, .vaxis = undefined, .queue = .init(t.io) };
+    var turn: Turn = undefined;
+    turn.loop = &loop;
+    var app: App = undefined;
+    app.gpa = t.allocator;
+    app.transcript = .{};
+    defer app.transcript.deinit(t.allocator);
+    try app.transcript.add(t.allocator, .user, "interjection");
+    app.transcript.entries.items[0].queued = 42;
+    try Turn.userInserted(&turn, 42);
+    _ = try app.handle((try loop.tryEvent()).?);
+    try t.expectEqual(@as(?u64, null), app.transcript.entries.items[0].queued);
 }

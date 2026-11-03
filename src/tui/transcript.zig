@@ -14,6 +14,7 @@ pub const Kind = enum { user, assistant, run, info, err };
 
 pub const Entry = struct {
     kind: Kind,
+    queued: ?u64 = null,
     /// For `.run`: the script.
     text: std.ArrayList(u8) = .empty,
     /// For `.run`: the first lines of its output.
@@ -111,7 +112,7 @@ pub const Entry = struct {
         const wrap: @FieldType(vaxis.Window.PrintOptions, "wrap") = if (folded) .none else if (e.kind == .run) .grapheme else .word;
         const shown = segments(e, &segs);
         if (folded and e.kind == .user) {
-            const suffix_width = vaxis.gwidth.gwidth(e.label.items, win.screen.width_method);
+            const suffix_width = vaxis.gwidth.gwidth(e.label.items, win.screen.width_method) + @as(u16, if (e.queued != null) 9 else 0);
             const available = win.width -| (suffix_width +| 2);
             var end: usize = 0;
             while (end < segs[1].text.len) {
@@ -144,11 +145,16 @@ pub const Entry = struct {
                 segs[0] = .{ .text = "› ", .style = .{ .bold = true, .fg = .{ .index = 4 } } };
                 const folded = e.collapsible() and !e.open;
                 segs[1] = .{ .text = if (folded) e.text.items[0 .. std.mem.indexOfScalar(u8, e.text.items, '\n') orelse e.text.items.len] else e.text.items, .style = .{ .bold = true } };
+                var n: usize = 2;
                 if (folded) {
-                    segs[2] = .{ .text = e.label.items, .style = dim };
-                    return segs[0..3];
+                    segs[n] = .{ .text = e.label.items, .style = dim };
+                    n += 1;
                 }
-                return segs[0..2];
+                if (e.queued != null) {
+                    segs[n] = .{ .text = " · queued", .style = dim };
+                    n += 1;
+                }
+                return segs[0..n];
             },
             .assistant => segs[0] = .{ .text = e.text.items },
             .run => {
@@ -220,6 +226,27 @@ pub const Transcript = struct {
         try e.text.appendSlice(gpa, text);
         try e.refreshLabel(gpa);
         try t.entries.append(gpa, e);
+    }
+
+    pub fn userInserted(t: *Transcript, id: u64) void {
+        for (t.entries.items) |*e| {
+            if (e.queued == id) {
+                e.queued = null;
+                e.cached = null;
+                return;
+            }
+        }
+    }
+
+    pub fn removeQueued(t: *Transcript, gpa: std.mem.Allocator) void {
+        var i = t.entries.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (t.entries.items[i].queued != null) {
+                var entry = t.entries.orderedRemove(i);
+                entry.deinit(gpa);
+            }
+        }
     }
 
     pub fn toggleExpanded(t: *Transcript) void {
@@ -642,4 +669,28 @@ test "long user messages fold live and replayed, truncate the first line, and ex
     try testing.expectEqual(@as(u16, 1), t.entries.items[2].height(win));
     try t.add(gpa, .user, long[0..800]);
     try testing.expect(t.entries.items[3].height(win) > 1);
+}
+
+test "queued users have a dim marker until their insertion event" {
+    const gpa = testing.allocator;
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    try t.add(gpa, .user, "first");
+    t.entries.items[0].queued = 1;
+    try t.add(gpa, .user, "second");
+    t.entries.items[1].queued = 2;
+    var segs: [max_segments]vaxis.Segment = undefined;
+    const queued = t.entries.items[0].segments(&segs);
+    try testing.expectEqualStrings(" · queued", queued[2].text);
+    try testing.expect(queued[2].style.dim);
+    var screen: vaxis.Screen = .{};
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 10, .height = 24, .screen = &screen };
+    _ = t.entries.items[0].height(win);
+    t.userInserted(1);
+    try testing.expectEqual(@as(?u64, null), t.entries.items[0].queued);
+    try testing.expect(t.entries.items[0].cached == null);
+    try testing.expectEqual(@as(usize, 2), t.entries.items[0].segments(&segs).len);
+    t.removeQueued(gpa);
+    try testing.expectEqual(@as(usize, 1), t.entries.items.len);
+    try testing.expectEqualStrings("first", t.entries.items[0].text.items);
 }
