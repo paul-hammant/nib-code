@@ -33,6 +33,9 @@ const Event = union(enum) {
     done,
     usage: provider.Usage,
     failed: []u8,
+    /// One outcome line from automatic issue filing, owned by the receiver.
+    issue: []u8,
+    issues_done,
 };
 
 /// Posts `.tick` while `busy` so the spinner and timer advance without input.
@@ -101,6 +104,52 @@ const Turn = struct {
         t.thread.join();
         t.gpa.free(t.text);
         t.gpa.destroy(t);
+    }
+};
+
+/// Background filing of one reflection's issue drafts; owns copies of everything it needs.
+const Issues = struct {
+    const default_repo = "yyydddkkk/nib-code";
+
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    loop: *vaxis.Loop(Event),
+    environ: *const std.process.Environ.Map,
+    arena: std.heap.ArenaAllocator,
+    drafts: []const reflect.Draft = &.{},
+    repo: []const u8 = "",
+    reflections_path: []const u8 = "",
+    session: []const u8 = "",
+    home: []const u8 = "",
+    cwd: []const u8 = "",
+    footer: []const u8 = "",
+    thread: ?std.Thread = null,
+
+    fn work(job: *Issues) void {
+        for (job.drafts) |draft| job.report(draft) catch {};
+        job.loop.postEvent(.issues_done) catch {};
+    }
+
+    fn report(job: *Issues, draft: reflect.Draft) !void {
+        const gpa = job.gpa;
+        var scratch: std.heap.ArenaAllocator = .init(gpa);
+        defer scratch.deinit();
+        const outcome = if (try reflect.sanitize(scratch.allocator(), draft, job.home, job.cwd)) |clean|
+            reflect.fileIssue(job.io, gpa, job.environ, "gh", job.repo, clean, job.footer) catch |err| try std.fmt.allocPrint(gpa, "could not file the issue: {s}", .{@errorName(err)})
+        else
+            try gpa.dupe(u8, "not filed: the draft looks like it contains a credential");
+        defer gpa.free(outcome);
+        const line = try std.fmt.allocPrint(gpa, "issue · {s} · {s}", .{ draft.title, outcome });
+        const record = try std.fmt.allocPrint(scratch.allocator(), "- session {s} · {s}\n", .{ job.session, line });
+        reflect.appendText(job.io, job.reflections_path, record) catch {};
+        job.loop.postEvent(.{ .issue = line }) catch gpa.free(line);
+    }
+
+    /// Joins the filing thread; gh runs to completion first.
+    fn finish(job: *Issues) void {
+        if (job.thread) |t| t.join();
+        job.arena.deinit();
+        job.gpa.destroy(job);
     }
 };
 
@@ -177,6 +226,7 @@ const App = struct {
     notice_buf: [256]u8 = undefined,
     /// Set while a /reflect Turn runs: its focus, owned.
     reflecting: ?[]u8 = null,
+    issues: ?*Issues = null,
     transcript: Transcript = .{},
     input: Editor = .{},
     pasting: bool = false,
@@ -195,6 +245,7 @@ const App = struct {
             t.finish();
         }
         app.stopReflecting();
+        if (app.issues) |job| job.finish();
         app.menu.deinit();
         app.transcript.deinit(app.gpa);
         app.input.deinit(app.gpa);
@@ -253,6 +304,14 @@ const App = struct {
             .done => {
                 app.finishTurn();
                 try app.saveReflection();
+            },
+            .issue => |msg| {
+                defer gpa.free(msg);
+                try app.transcript.add(gpa, .info, msg);
+            },
+            .issues_done => {
+                if (app.issues) |job| job.finish();
+                app.issues = null;
             },
             .failed => |msg| {
                 defer gpa.free(msg);
@@ -451,6 +510,31 @@ const App = struct {
             return;
         };
         app.notice = std.fmt.bufPrint(&app.notice_buf, "reflection saved to {s}", .{path}) catch null;
+        try app.fileIssues(answer, path);
+    }
+
+    /// Publishes the reflection's issue drafts in the background; no confirmation by design.
+    fn fileIssues(app: *App, answer: []const u8, reflections_path: []const u8) !void {
+        const repo = app.environ.get("NIB_ISSUE_REPO") orelse Issues.default_repo;
+        if (std.mem.eql(u8, repo, "off") or app.issues != null) return;
+        const job = try app.gpa.create(Issues);
+        job.* = .{ .gpa = app.gpa, .io = app.io, .loop = app.loop, .environ = app.environ, .arena = .init(app.gpa) };
+        errdefer job.finish();
+        const a = job.arena.allocator();
+        job.drafts = try reflect.drafts(a, answer);
+        if (job.drafts.len == 0) {
+            job.finish();
+            return;
+        }
+        job.repo = try a.dupe(u8, repo);
+        job.reflections_path = try a.dupe(u8, reflections_path);
+        job.session = try a.dupe(u8, app.session.id[0..8]);
+        job.home = try a.dupe(u8, app.environ.get("HOME") orelse "");
+        job.cwd = try std.process.currentPathAlloc(app.io, a);
+        job.footer = try std.fmt.allocPrint(a, "_Filed automatically by nib /reflect · nib {s} · {s} · effort {s} · session {s}_", .{ @import("build_options").version, app.cfg.model, app.cfg.effectiveEffort(), job.session });
+        job.thread = try std.Thread.spawn(.{}, Issues.work, .{job});
+        app.issues = job;
+        try app.report(.info, "filing {d} issue draft{s} to {s}", .{ job.drafts.len, if (job.drafts.len == 1) "" else "s", repo });
     }
 
     fn stopReflecting(app: *App) void {
