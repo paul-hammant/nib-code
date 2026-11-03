@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("qjs");
+const console = @import("sandbox/console.zig");
 
 /// `JS_UNDEFINED` is a C compound-literal macro that translate-c cannot lower.
 const js_undefined: c.JSValue = .{ .u = .{ .uint64 = 0 }, .tag = c.JS_TAG_UNDEFINED };
@@ -26,18 +27,8 @@ pub const Host = struct {
     poll: ?*const fn (ctx: *anyopaque) anyerror!void = null,
 };
 
-pub const LogEntry = struct {
-    start: usize,
-    end: usize,
-    bytes: usize,
-};
-
-pub const OmittedLogs = struct {
-    count: usize = 0,
-    bytes: usize = 0,
-};
-
-pub const max_log_entries = 64;
+pub const LogEntry = console.Entry;
+pub const max_log_entries = console.max_entries;
 
 pub const Outcome = struct {
     ok: bool,
@@ -45,7 +36,9 @@ pub const Outcome = struct {
     text: []u8,
     logs: []u8,
     log_entries: []const LogEntry = &.{},
-    omitted_logs: OmittedLogs = .{},
+    log_bytes: usize = 0,
+    log_head_bytes: usize = 0,
+    log_tail_start: usize = 0,
     log_truncated: bool = false,
 
     pub fn deinit(o: Outcome, gpa: std.mem.Allocator) void {
@@ -59,11 +52,7 @@ const State = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     host: ?Host,
-    logs: std.ArrayList(u8) = .empty,
-    log_entries: std.ArrayList(LogEntry) = .empty,
-    omitted_logs: OmittedLogs = .{},
-    max_log: usize,
-    log_truncated: bool = false,
+    logs: console.Capture,
     js_remaining_ns: i96,
     js_started: ?std.Io.Clock.Timestamp = null,
     cancel: ?*const std.atomic.Value(bool),
@@ -228,12 +217,11 @@ pub fn eval(
         .gpa = gpa,
         .io = io,
         .host = host,
-        .max_log = limits.max_log_bytes,
+        .logs = .{ .limit = limits.max_log_bytes },
         .js_remaining_ns = std.Io.Duration.fromMilliseconds(limits.timeout_ms).toNanoseconds(),
         .cancel = cancel,
     };
     defer st.logs.deinit(gpa);
-    defer st.log_entries.deinit(gpa);
 
     const rt = c.JS_NewRuntime() orelse return error.OutOfMemory;
     defer c.JS_FreeRuntime(rt);
@@ -297,16 +285,16 @@ pub fn eval(
         gpa.free(text);
         text = try gpa.dupe(u8, if (st.cancel != null and st.cancel.?.load(.acquire)) "Error: run canceled" else "Error: run timed out");
     }
-    if (st.log_truncated) try st.logs.appendSlice(gpa, "\n[console output truncated]\n");
-    const logs = try st.logs.toOwnedSlice(gpa);
-    errdefer gpa.free(logs);
+    const captured = try st.logs.snapshot(gpa);
     return .{
         .ok = ok,
         .text = text,
-        .logs = logs,
-        .log_entries = try st.log_entries.toOwnedSlice(gpa),
-        .omitted_logs = st.omitted_logs,
-        .log_truncated = st.log_truncated,
+        .logs = captured.logs,
+        .log_entries = captured.entries,
+        .log_bytes = st.logs.bytes,
+        .log_head_bytes = captured.head_bytes,
+        .log_tail_start = captured.tail_start,
+        .log_truncated = st.logs.bytes > limits.max_log_bytes,
     };
 }
 
@@ -340,20 +328,9 @@ fn nativeLog(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue)
     var len: usize = 0;
     const p = c.JS_ToCStringLen2(ctx, &len, argv[0], false) orelse return js_undefined;
     defer c.JS_FreeCString(ctx, p);
-    const start = st.logs.items.len;
-    const room = st.max_log -| start;
-    if (len > room) st.log_truncated = true;
-    st.logs.appendSlice(st.gpa, p[0..@min(len, room)]) catch {
+    st.logs.append(st.gpa, p[0..len]) catch {
         st.oom = true;
     };
-    if (st.log_entries.items.len < max_log_entries) {
-        st.log_entries.append(st.gpa, .{ .start = start, .end = st.logs.items.len, .bytes = len }) catch {
-            st.oom = true;
-        };
-    } else {
-        st.omitted_logs.count +|= 1;
-        st.omitted_logs.bytes +|= len;
-    }
     return js_undefined;
 }
 
