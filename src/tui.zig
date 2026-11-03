@@ -31,7 +31,7 @@ const Event = union(enum) {
     retry: []u8,
     notice: []u8,
     done,
-    usage: provider.Usage,
+    usage: struct { tokens: provider.Usage, context: u64, steps: u32 },
     progress: @import("session/events.zig").Progress,
     failed: []u8,
     /// One outcome line from automatic issue filing, owned by the receiver.
@@ -97,7 +97,7 @@ const Turn = struct {
             .run_end => |r| .{ .run_end = .{ .ok = r.ok, .output = try gpa.dupe(u8, r.output), .changes = try .init(gpa, r.changes) } },
             .retry => |r| .{ .retry = try std.fmt.allocPrint(gpa, "retry {d} in {d}s: {s}", .{ r.attempt, r.delay_ms / 1000, r.reason }) },
             .notice => |m| .{ .notice = try gpa.dupe(u8, m) },
-            .usage => |u| .{ .usage = u },
+            .usage => |u| .{ .usage = .{ .tokens = u, .context = t.session.context_tokens, .steps = t.session.steps } },
             .progress => |p| .{ .progress = try p.clone(gpa) },
         };
         errdefer if (event == .progress) {
@@ -320,7 +320,11 @@ const App = struct {
                 if (std.mem.startsWith(u8, msg, "retry")) app.activity.set(app.io, .retrying);
                 try app.transcript.add(gpa, .info, msg);
             },
-            .usage => {},
+            .usage => |u| {
+                app.usage = u.tokens;
+                app.context = u.context;
+                app.steps = u.steps;
+            },
             .progress => |p| {
                 var owned = p;
                 defer owned.deinit(gpa);
@@ -636,4 +640,24 @@ test "bracketed paste buffers newline and slash keys without executing them" {
     const expanded = try app.input.expanded(gpa);
     defer gpa.free(expanded);
     try std.testing.expectEqualStrings("/help\nx\nx\nx\nx\nx", expanded);
+}
+
+test "usage snapshots refresh the footer without reading the running Session" {
+    const t = std.testing;
+    var app: App = undefined;
+    app.gpa = t.allocator;
+    app.usage = .{ .prompt_tokens = 99999, .completion_tokens = 999 };
+    app.context = 800;
+    app.steps = 9;
+    _ = try app.handle(.{ .usage = .{ .tokens = .{}, .context = 800, .steps = 0 } });
+    try t.expectEqualDeep(provider.Usage{}, app.usage);
+    try t.expectEqual(@as(u32, 0), app.steps);
+    const usage: provider.Usage = .{ .prompt_tokens = 1200, .completion_tokens = 50, .prompt_cache_hit_tokens = 600 };
+    _ = try app.handle(.{ .usage = .{ .tokens = usage, .context = 1250, .steps = 1 } });
+    try t.expectEqualDeep(usage, app.usage);
+    try t.expectEqual(@as(u64, 1250), app.context);
+    try t.expectEqual(@as(u32, 1), app.steps);
+    _ = try app.handle(.{ .usage = .{ .tokens = usage, .context = 200, .steps = 1 } });
+    try t.expectEqual(@as(u64, 200), app.context);
+    try t.expectEqualDeep(usage, app.usage);
 }

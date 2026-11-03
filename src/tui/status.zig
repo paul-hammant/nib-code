@@ -60,10 +60,10 @@ pub const Text = struct {
     pub fn footer(text: *Text, s: Status, width: u16) []const u8 {
         var input: [32]u8 = undefined;
         var output: [32]u8 = undefined;
-        var line = std.fmt.bufPrint(&text.status, "{s} · effort {s} · ctx {d}% · in {s} ({d}% cached) · out {s} · last turn: {d} steps", .{
-            s.cfg.model,                           s.cfg.effectiveEffort(),                                                s.context * 100 / @max(s.cfg.context_window, 1),
-            tokens(&input, s.usage.prompt_tokens), s.usage.prompt_cache_hit_tokens * 100 / @max(s.usage.prompt_tokens, 1), tokens(&output, s.usage.completion_tokens),
-            s.steps,
+        var line = std.fmt.bufPrint(&text.status, "{s} · effort {s} · ctx {d}% · in {s} ({d}% cached) · out {s} · {s}: {d} steps", .{
+            s.cfg.model,                                 s.cfg.effectiveEffort(),                                                s.context * 100 / @max(s.cfg.context_window, 1),
+            tokens(&input, s.usage.prompt_tokens),       s.usage.prompt_cache_hit_tokens * 100 / @max(s.usage.prompt_tokens, 1), tokens(&output, s.usage.completion_tokens),
+            if (s.busy != null) "turn" else "last turn", s.steps,
         }) catch "";
         while (std.mem.lastIndexOf(u8, line, " · ")) |separator| {
             if (@import("vaxis").gwidth.gwidth(line, .unicode) <= width) break;
@@ -82,7 +82,7 @@ fn tokens(buf: []u8, n: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{d}.{d}{s}", .{ n / unit, tenths, suffix }) catch "";
 }
 
-test "activity is optional and footer keeps previous turn usage" {
+test "activity is optional and footer shows latest reported usage" {
     var text: Text = .{};
     const cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "m", .context_window = 1000 };
     try std.testing.expectEqualStrings("", text.format(.{ .cfg = cfg }, false));
@@ -90,4 +90,6 @@ test "activity is optional and footer keeps previous turn usage" {
     try std.testing.expectEqualStrings("⠙ running 0s · step 2 · esc to cancel · copied 3 chars", text.format(.{ .cfg = cfg, .current_step = 2, .busy = .{ .phase = .running, .ms = 150 }, .notice = "copied 3 chars" }, false));
     const line = text.footer(.{ .cfg = cfg, .context = 250, .steps = 2, .usage = .{ .prompt_tokens = 1_800_000, .prompt_cache_hit_tokens = 1_692_000, .completion_tokens = 18_000 } }, 200);
     try std.testing.expectEqualStrings("m · effort server default · ctx 25% · in 1.8M (94% cached) · out 18k · last turn: 2 steps", line);
+    const busy = text.footer(.{ .cfg = cfg, .context = 400, .steps = 1, .usage = .{ .prompt_tokens = 1200, .completion_tokens = 50, .prompt_cache_hit_tokens = 600 }, .busy = .{ .phase = .running, .ms = 100 } }, 200);
+    try std.testing.expectEqualStrings("m · effort server default · ctx 40% · in 1.2k (50% cached) · out 50 · turn: 1 steps", busy);
 }

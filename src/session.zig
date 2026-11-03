@@ -170,6 +170,7 @@ pub const Session = struct {
         }
         const old_len = s.history.items.len;
         try s.commit(1, replacement.items, after, null);
+        try sink.emit(sink.ctx, .{ .usage = s.usage });
         const message = try std.fmt.allocPrint(a, "compacted context: {d} → {d} messages, ~{d} → ~{d} tokens", .{ old_len, s.history.items.len, before, after });
         try sink.emit(sink.ctx, .{ .notice = message });
         return .compacted;
@@ -198,6 +199,7 @@ pub const Session = struct {
         try pending.append(s.gpa, .{ .role = "user", .content = try s.arena.allocator().dupe(u8, user_text) });
         s.usage = .{};
         s.steps = 0;
+        try sink.emit(sink.ctx, .{ .usage = s.usage });
         s.runSteps(&pending, &partial, sink, cancel, detail) catch |err| {
             // A signal can surface as a read error instead of error.Canceled.
             if (err == error.Canceled or cancel.load(.acquire)) try s.commitInterrupted(pending.items, &partial);
@@ -285,6 +287,7 @@ pub const Session = struct {
                 .run_results = run_results.items,
             });
             pending.clearRetainingCapacity();
+            try sink.emit(sink.ctx, .{ .usage = s.usage });
             if (reply.tool_calls.len == 0) return;
             if (cancel.load(.acquire)) return error.Canceled;
         }
