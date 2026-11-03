@@ -7,6 +7,7 @@ const web = @import("tools/web.zig");
 const bash = @import("tools/bash.zig");
 const diff = @import("tools/diff.zig");
 const subagent = @import("tools/agent.zig");
+const model_function = @import("tools/llm.zig");
 
 const Tool = struct {
     root_only: bool = false,
@@ -16,6 +17,17 @@ const Tool = struct {
 };
 
 const all = [_]Tool{
+    .{
+        .name = "llm",
+        .run = model_function.llm,
+        .doc =
+        \\  // Pure single-step model call for batch judgments, classification and extraction; no tools. For actions or multi-step investigation use tools.agent. Usage counts toward this Turn.
+        \\  // Limits: 4 concurrent per process (others queue), 100 calls per Run, 256 KiB prompt + input; schema returns parsed JSON data, otherwise data is null.
+        \\  // input is a string or JSON-serializable data, separate from prompt. model/effort default to the current config.
+        \\  // Example: await Promise.all(["yes", "no"].map(input => tools.llm({prompt: "Classify the input", input})))
+        \\  async llm({ prompt, input, schema, model, effort }) {}, // → { text, data, usage }
+        ,
+    },
     .{
         .name = "read",
         .run = files.read,
@@ -132,6 +144,8 @@ pub const Tools = struct {
     agents_active: usize = 0,
     progress: @import("tools/progress.zig").Queue = .{},
     agent_usage: provider.Usage = .{},
+    llm_calls: std.atomic.Value(usize) = .init(0),
+    usage_sink: ?struct { ctx: *anyopaque, emit: *const fn (*anyopaque, provider.Usage) anyerror!void } = null,
     cancel: std.atomic.Value(bool) = .init(false),
     paths_mutex: std.Io.Mutex = .init,
     paths_changed: std.Io.Condition = .init,
@@ -214,6 +228,12 @@ pub const Tools = struct {
         return if (t.depth == 0) root_api else child_api;
     }
 
+    pub fn addUsage(t: *Tools, usage: provider.Usage) void {
+        t.agents_mutex.lockUncancelable(t.io);
+        defer t.agents_mutex.unlock(t.io);
+        t.agent_usage.add(usage);
+    }
+
     pub fn takeUsage(t: *Tools) provider.Usage {
         t.agents_mutex.lockUncancelable(t.io);
         defer t.agents_mutex.unlock(t.io);
@@ -224,11 +244,24 @@ pub const Tools = struct {
 
     pub fn host(t: *Tools) sandbox.Host {
         t.cancel.store(false, .release);
-        return .{ .ctx = t, .names = t.api().names, .call = call, .cancel = &t.cancel, .poll = poll };
+        t.llm_calls.store(0, .monotonic);
+        return .{ .ctx = t, .names = t.api().names, .call = call, .cancel = &t.cancel, .poll = poll, .admit = admit };
+    }
+
+    fn admit(ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8) !?[]u8 {
+        const t: *Tools = @ptrCast(@alignCast(ctx));
+        if (std.mem.eql(u8, name, "llm") and t.llm_calls.fetchAdd(1, .monotonic) >= model_function.max_calls)
+            return try std.fmt.allocPrint(gpa, "llm limit is {d} calls per Run; split into batches or filter in JavaScript first", .{model_function.max_calls});
+        return null;
     }
 
     fn poll(ctx: *anyopaque) !void {
         const t: *Tools = @ptrCast(@alignCast(ctx));
+        if (t.usage_sink) |sink| {
+            const usage = t.takeUsage();
+            if (usage.prompt_tokens != 0 or usage.completion_tokens != 0 or usage.prompt_cache_hit_tokens != 0)
+                try sink.emit(sink.ctx, usage);
+        }
         try t.progress.drain(t.io);
     }
 
@@ -390,7 +423,7 @@ test "child API filters agent from both docs and sandbox" {
     try testing.expect(std.mem.indexOf(u8, t.api().docs, "async agent({") == null);
     const result = try sandbox.eval(testing.allocator, testing.io, "[typeof tools.agent, Object.keys(tools)]", .{}, t.host(), null);
     defer result.deinit(testing.allocator);
-    try testing.expectEqualStrings("[\"undefined\",[\"read\",\"edit\",\"write\",\"grep\",\"glob\",\"fetch\",\"bash\"]]", result.text);
+    try testing.expectEqualStrings("[\"undefined\",[\"llm\",\"read\",\"edit\",\"write\",\"grep\",\"glob\",\"fetch\",\"bash\"]]", result.text);
 }
 
 test "Run excludes tool waits without resetting the JS budget" {
@@ -430,4 +463,43 @@ test "write documentation string example survives JS parsing verbatim" {
     const content = try tmp.dir.readFileAlloc(testing.io, "f", testing.allocator, .limited(100));
     defer testing.allocator.free(content);
     try testing.expectEqualStrings("` ${x} \\path \"quoted\"\n", content);
+}
+
+const EchoLlm = struct {
+    fn call(_: *anyopaque, gpa: std.mem.Allocator, _: []const u8, args: []const u8) sandbox.ToolResult {
+        return .{ .ok = gpa.dupe(u8, args) catch unreachable };
+    }
+};
+
+test "llm map documentation example reaches the host byte for byte" {
+    const marker = "// Example: ";
+    const start = std.mem.indexOf(u8, docs, marker).? + marker.len;
+    const end = std.mem.indexOfScalarPos(u8, docs, start, '\n').?;
+    var dummy: u8 = 0;
+    const result = try sandbox.eval(testing.allocator, testing.io, docs[start..end], .{}, .{ .ctx = &dummy, .names = &.{"llm"}, .call = EchoLlm.call }, null);
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.ok);
+    try testing.expectEqualStrings("[{\"prompt\":\"Classify the input\",\"input\":\"yes\"},{\"prompt\":\"Classify the input\",\"input\":\"no\"}]", result.text);
+}
+
+test "llm admission rejects call 101 before dispatch and resets on each Run" {
+    var t: Tools = .{ .io = testing.io, .home = "/unused" };
+    var host = t.host();
+    host.call = EchoLlm.call;
+    const full = try sandbox.eval(testing.allocator, testing.io, "(await Promise.all(Array.from({length: 100}, () => tools.llm({prompt: 'x'})))).length", .{}, host, null);
+    defer full.deinit(testing.allocator);
+    try testing.expect(full.ok);
+    try testing.expectEqualStrings("100", full.text);
+    host = t.host();
+    host.call = EchoLlm.call;
+    const rejected = try sandbox.eval(testing.allocator, testing.io, "const a = Array.from({length: 101}, () => tools.llm({prompt: 'x'})); await a[100].catch(e => e.message)", .{}, host, null);
+    defer rejected.deinit(testing.allocator);
+    try testing.expect(rejected.ok);
+    try testing.expect(std.mem.indexOf(u8, rejected.text, "100 calls per Run") != null);
+    try testing.expect(std.mem.indexOf(u8, rejected.text, "filter") != null);
+    host = t.host();
+    host.call = EchoLlm.call;
+    const fresh = try sandbox.eval(testing.allocator, testing.io, "await tools.llm({prompt: 'fresh'})", .{}, host, null);
+    defer fresh.deinit(testing.allocator);
+    try testing.expect(fresh.ok);
 }

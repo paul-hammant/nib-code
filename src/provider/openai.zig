@@ -206,9 +206,12 @@ fn requestBody(gpa: std.mem.Allocator, cfg: Config, messages: []const Message, t
     else
         try gpa.dupe(u8, "");
     defer gpa.free(effort);
+    const format: []const u8 = if (cfg.output_schema != null) ",\"response_format\":{\"type\":\"json_object\"}" else "";
+    const cache = if (cfg.prompt_cache_key) |key| try std.fmt.allocPrint(gpa, ",\"prompt_cache_key\":{f}", .{std.json.fmt(key, opts)}) else try gpa.dupe(u8, "");
+    defer gpa.free(cache);
     return std.fmt.allocPrint(gpa,
-        \\{{"model":{f},"messages":{f}{s}{s}{s}{s},"stream":true,"stream_options":{{"include_usage":true}}}}
-    , .{ std.json.fmt(cfg.model, opts), std.json.fmt(wire, opts), tool_field, limit, thinking, effort });
+        \\{{"model":{f},"messages":{f}{s}{s}{s}{s}{s}{s},"stream":true,"stream_options":{{"include_usage":true}}}}
+    , .{ std.json.fmt(cfg.model, opts), std.json.fmt(wire, opts), tool_field, limit, thinking, effort, format, cache });
 }
 
 test "chunk decodes deepseek deltas, tool call fragments and usage" {
@@ -284,4 +287,34 @@ test "chat timing collects argument chunks without emitted text" {
     try t.expectEqual(@as(usize, 2), codes[0].progress.len);
     try t.expectEqual(@as(u64, 1), codes[0].progress[0][1]);
     try t.expectEqual(@as(u64, 2), codes[0].progress[1][1]);
+}
+
+test "tool-free JSON requests retain system and use json_object without leaking schema" {
+    const t = std.testing;
+    const schema = try std.json.parseFromSlice(std.json.Value, t.allocator, "{\"type\":\"object\",\"properties\":{\"answer\":{\"type\":\"string\"}},\"required\":[\"answer\"],\"additionalProperties\":false}", .{});
+    defer schema.deinit();
+    const system = "Return JSON.\nUse the \"answer\" field.";
+    const messages = [_]Message{
+        .{ .role = "system", .content = system },
+        .{ .role = "user", .content = "question" },
+    };
+    for ([_]?std.json.Value{ null, schema.value }) |output_schema| {
+        const body = try requestBody(t.allocator, .{ .base_url = "", .api_key = "", .model = "m", .output_schema = output_schema }, &messages, "[]", null);
+        defer t.allocator.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, body, .{});
+        defer parsed.deinit();
+        const object = parsed.value.object;
+        try t.expect(!object.contains("tools"));
+        const wire_messages = object.get("messages").?.array.items;
+        try t.expectEqual(@as(usize, 2), wire_messages.len);
+        try t.expectEqualStrings("system", wire_messages[0].object.get("role").?.string);
+        try t.expectEqualStrings(system, wire_messages[0].object.get("content").?.string);
+        if (output_schema != null) {
+            const format = object.get("response_format").?.object;
+            try t.expectEqual(@as(usize, 1), format.count());
+            try t.expectEqualStrings("json_object", format.get("type").?.string);
+        } else {
+            try t.expect(!object.contains("response_format"));
+        }
+    }
 }

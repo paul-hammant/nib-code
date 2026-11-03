@@ -23,7 +23,7 @@ pub const Sink = struct {
 };
 
 const max_steps = 50;
-const max_attempts = 5;
+const max_attempts = provider.max_attempts;
 
 const tools_json =
     \\[{"type":"function","function":{"name":"run",
@@ -334,7 +334,7 @@ pub const Session = struct {
             io: std.Io,
             started: std.Io.Clock.Timestamp,
             first_data_ms: *?u64,
-            emitted: bool = false,
+            session: *Session,
             fn onData(ctx: *anyopaque) !void {
                 const f: *@This() = @ptrCast(@alignCast(ctx));
                 if (f.first_data_ms.* == null) f.first_data_ms.* = @intCast(@max(f.started.untilNow(f.io).raw.toMilliseconds(), 0));
@@ -342,45 +342,33 @@ pub const Session = struct {
             }
             fn onDelta(ctx: *anyopaque, kind: provider.Kind, text: []const u8) !void {
                 const f: *@This() = @ptrCast(@alignCast(ctx));
-                f.emitted = true;
                 try (if (kind == .text) &f.partial.text else &f.partial.reasoning).appendSlice(f.gpa, text);
                 try f.sink.emit(f.sink.ctx, .{ .delta = .{ .kind = kind, .text = text } });
             }
-        };
-        var attempt: u32 = 1;
-        while (true) : (attempt += 1) {
-            var fwd: Forward = .{ .sink = sink, .gpa = s.gpa, .partial = partial, .io = s.io, .started = timing.started, .first_data_ms = first_data_ms };
-            attempts.* = attempt;
-            const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .timing = timing };
-            return request: {
-                try sink.modelActivity(.started);
-                defer sink.modelActivity(.finished) catch {};
-                break :request provider.stream(s.gpa, s.arena.allocator(), s.client, s.cfg, s.id, messages, tools_json, null, provider_sink, cancel, detail);
-            } catch |err| {
-                if (err == error.Canceled or cancel.load(.acquire)) return err;
-                const codex = s.cfg.provider == .codex;
-                if ((!codex and fwd.emitted) or attempt == max_attempts or !transient(err)) {
-                    if (codex) try s.log.diagnose(s.io, s.gpa, .{
-                        .error_name = @errorName(err),
-                        .message = detail.* orelse @errorName(err),
-                        .attempts = attempt,
-                        .step = s.steps + 1,
-                    });
-                    return err;
+            fn onRetry(ctx: *anyopaque, event: provider.RetryEvent) !void {
+                const f: *@This() = @ptrCast(@alignCast(ctx));
+                switch (event) {
+                    .started => try f.sink.modelActivity(.started),
+                    .finished => try f.sink.modelActivity(.finished),
+                    .retry => |retry| {
+                        try f.sink.emit(f.sink.ctx, .{ .retry = .{ .attempt = retry.attempt, .delay_ms = retry.delay_ms, .reason = retry.reason } });
+                        // Visible failed-attempt deltas must not be committed on later cancellation.
+                        f.partial.clear();
+                    },
+                    .failed => |failure| if (f.session.cfg.provider == .codex) {
+                        try f.session.log.diagnose(f.io, f.gpa, .{
+                            .error_name = @errorName(failure.err),
+                            .message = failure.reason,
+                            .attempts = failure.attempt,
+                            .step = f.session.steps + 1,
+                        });
+                    },
                 }
-                var delay_ms = @as(u64, 1000) << @intCast(attempt - 1);
-                if (codex and err == error.RateLimited) if (detail.*) |message| {
-                    delay_ms = @import("provider/codex.zig").retryDelayMs(message) orelse delay_ms;
-                };
-                try sink.emit(sink.ctx, .{ .retry = .{ .attempt = attempt, .delay_ms = delay_ms, .reason = detail.* orelse @errorName(err) } });
-                if (detail.*) |d| s.gpa.free(d);
-                detail.* = null;
-                // Failed-attempt deltas stay visible, but must never be committed on later cancellation.
-                partial.clear();
-                try sleep(s.io, delay_ms, cancel);
-                continue;
-            };
-        }
+            }
+        };
+        var fwd: Forward = .{ .sink = sink, .gpa = s.gpa, .partial = partial, .io = s.io, .started = timing.started, .first_data_ms = first_data_ms, .session = s };
+        const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .timing = timing };
+        return provider.complete(s.gpa, s.arena.allocator(), s.client, s.cfg, s.id, messages, tools_json, null, provider_sink, cancel, detail, attempts, .{ .ctx = &fwd, .onEvent = Forward.onRetry });
     }
 
     pub const Ran = struct {
@@ -421,11 +409,22 @@ pub const Session = struct {
 
         try sink.emit(sink.ctx, .{ .run_start = args.value.code });
         const Forward = struct {
+            const UsageTarget = struct { session: *Session, sink: Sink };
+
+            fn usage(ctx: *anyopaque, value: provider.Usage) !void {
+                const target: *UsageTarget = @ptrCast(@alignCast(ctx));
+                target.session.usage.add(value);
+                try target.sink.emit(target.sink.ctx, .{ .usage = target.session.usage });
+            }
+
             fn progress(ctx: *anyopaque, value: @import("session/events.zig").Progress) !void {
                 const target: *const Sink = @ptrCast(@alignCast(ctx));
                 try target.emit(target.ctx, .{ .progress = value });
             }
         };
+        var usage_target: Forward.UsageTarget = .{ .session = s, .sink = sink };
+        s.tools.usage_sink = .{ .ctx = &usage_target, .emit = Forward.usage };
+        defer s.tools.usage_sink = null;
         var progress_sink = sink;
         s.tools.progress.sink = .{ .ctx = &progress_sink, .emit = Forward.progress };
         defer s.tools.progress.sink = null;
@@ -477,23 +476,6 @@ fn compactionCut(messages: []const provider.Message, window: u64) usize {
         if (steps == 3) return i + 1 + calls.len;
     }
     return 1;
-}
-
-fn transient(err: anyerror) bool {
-    return switch (err) {
-        error.HttpStatus, error.InvalidCredentials, error.ProviderFailed, error.Canceled, error.OutOfMemory, error.TooManyToolCalls => false,
-        else => true,
-    };
-}
-
-fn sleep(io: std.Io, ms: u64, cancel: *const std.atomic.Value(bool)) !void {
-    var left = ms;
-    while (left > 0) {
-        if (cancel.load(.acquire)) return error.Canceled;
-        const step = @min(left, 100);
-        try std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(@intCast(step)), .clock = .awake }, io);
-        left -= step;
-    }
 }
 
 test "formatOutcome" {

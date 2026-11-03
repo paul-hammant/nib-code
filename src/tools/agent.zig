@@ -62,11 +62,7 @@ pub fn agent(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolR
     });
     defer gpa.free(result.output);
     var usage: provider.Usage = .{};
-    defer {
-        t.agents_mutex.lockUncancelable(t.io);
-        t.agent_usage.add(usage);
-        t.agents_mutex.unlock(t.io);
-    }
+    defer t.addUsage(usage);
     const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(t.io)).toMilliseconds();
     var child_id: ?[]u8 = null;
     defer if (child_id) |id| gpa.free(id);
