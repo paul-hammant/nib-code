@@ -81,16 +81,23 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
             assert ("end" if ok else "error") in events[-1], events
             return events
 
-        ask("plain text", "--effort", "high", overrides={"NIB_THINKING": "off"})
-        assert requests()[-1]["body"]["reasoning"]["effort"] == "high"
+        summaries = ask("plain text", "--effort", "high", overrides={"NIB_THINKING": "off"})
+        assert requests()[-1]["body"]["reasoning"] == {"effort": "high", "summary": "auto"}
+        reasoning_deltas = [e["delta"]["text"] for e in summaries if e.get("delta", {}).get("kind") == "reasoning"]
+        assert reasoning_deltas == ["Mock ", "reaso", "ning."] * 2, summaries
+        text_deltas = [e["delta"]["text"] for e in summaries if e.get("delta", {}).get("kind") == "text"]
+        assert "".join(text_deltas) == "Mock text complete.", summaries
+        assert summaries[-1]["end"]["text"] == "Mock text complete.", summaries
         ask("plain text", "--effort", "off")
         assert requests()[-1]["body"]["reasoning"]["effort"] == "low"
-        ask("plain text", "--effort", "default", overrides={"NIB_REASONING_EFFORT": "high"})
+        defaults = ask("plain text", "--effort", "default", overrides={"NIB_REASONING_EFFORT": "high"})
         assert "reasoning" not in requests()[-1]["body"]
+        assert "summary" not in requests()[-1]["body"]
+        assert not any(e.get("delta", {}).get("kind") == "reasoning" for e in defaults), defaults
         invalid = ask("plain text", "--effort", "hgh", ok=False)
         assert "--effort" in invalid[-1]["error"]["message"]
 
-        plain = ask("plain text")
+        plain = ask("plain text", "--effort", "high")
         assert plain[-1]["end"]["text"] == "Mock text complete."
         assert "".join(e["delta"]["text"] for e in plain if e.get("delta", {}).get("kind") == "text") == "Mock text complete."
         assert plain[-1]["end"]["usage"] == {"prompt_tokens": 3300, "completion_tokens": 20, "prompt_cache_hit_tokens": 64}
@@ -122,7 +129,7 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
         assert all(item in requests()[-1]["body"]["input"] for item in items)
         assert next(item for item in requests()[-1]["body"]["input"] if item.get("role") == "assistant")["phase"] == "final_answer"
         disabled = ask("plain text", overrides={"NIB_MODEL": "gpt-6.1-terra", "NIB_THINKING": "off"})
-        assert requests()[-1]["body"]["reasoning"]["effort"] == "none"
+        assert requests()[-1]["body"]["reasoning"] == {"effort": "none", "summary": "auto"}
         assert not any(e.get("delta", {}).get("kind") == "reasoning" for e in disabled)
 
         before = len(requests())

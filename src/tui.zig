@@ -2,6 +2,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const Session = @import("session.zig").Session;
 const SessionEvent = @import("session.zig").Event;
+const ModelActivity = @import("session.zig").ModelActivity;
 const Sink = @import("session.zig").Sink;
 const provider = @import("provider.zig");
 const config = @import("config.zig");
@@ -24,6 +25,7 @@ const Event = union(enum) {
     paste_end,
     mouse: vaxis.Mouse,
     tick,
+    model_activity: struct { state: ModelActivity, at: std.Io.Clock.Timestamp },
     /// Slices are owned by the receiver.
     delta: struct { kind: provider.Kind, text: []u8, step: u32 },
     run_start: struct { code: []u8, step: u32 },
@@ -82,10 +84,15 @@ const Turn = struct {
     }
 
     fn execute(t: *Turn, compact: bool, detail: *?[]u8) !void {
-        const sink: Sink = .{ .ctx = t, .emit = emit };
+        const sink: Sink = .{ .ctx = t, .emit = emit, .onModelActivity = modelActivity };
         if (compact) {
             _ = try t.session.compact(sink, &t.cancel, detail);
         } else try t.session.turn(t.text, sink, &t.cancel, detail);
+    }
+
+    fn modelActivity(ctx: *anyopaque, state: ModelActivity) !void {
+        const t: *Turn = @ptrCast(@alignCast(ctx));
+        try t.loop.postEvent(.{ .model_activity = .{ .state = state, .at = .now(t.session.io, .awake) } });
     }
 
     fn emit(ctx: *anyopaque, ev: SessionEvent) !void {
@@ -293,6 +300,10 @@ const App = struct {
                 }
             },
             .tick => {},
+            .model_activity => |activity| {
+                if (activity.state == .started and app.activity.phase != .compacting) app.activity.set(app.io, .thinking);
+                app.activity.modelActivity(activity.state, activity.at);
+            },
             .winsize => |ws| {
                 app.selection.clear();
                 try app.vx.resize(gpa, app.w, ws);

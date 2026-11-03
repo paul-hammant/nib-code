@@ -164,7 +164,7 @@ fn requestBody(gpa: std.mem.Allocator, cfg: p.Config, cache_key: []const u8, mes
     for (tools, 0..) |tool, i| try tool_writer.writer.print("{s}{f}", .{ if (i == 0) @as([]const u8, "") else ",", std.json.fmt(.{ .type = "function", .name = tool.function.name, .description = tool.function.description, .parameters = tool.function.parameters, .strict = false }, .{}) });
     try tool_writer.writer.writeByte(']');
     const effort = reasoningEffort(cfg);
-    const reasoning = if (effort) |value| try std.fmt.allocPrint(a, ",\"reasoning\":{{\"effort\":{f}}}", .{std.json.fmt(value, .{})}) else "";
+    const reasoning = if (effort) |value| try std.fmt.allocPrint(a, ",\"reasoning\":{{\"effort\":{f},\"summary\":\"auto\"}}", .{std.json.fmt(value, .{})}) else "";
     return std.fmt.allocPrint(gpa,
         \\{{"model":{f},"prompt_cache_key":{f},"store":false,"stream":true,"instructions":{f},"input":{s},"include":["reasoning.encrypted_content"]{s}{s}}}
     , .{ std.json.fmt(cfg.model, .{}), std.json.fmt(cache_key, .{}), std.json.fmt(instructions, .{}), input.written(), if (tools.len == 0) "" else try std.fmt.allocPrint(a, ",\"tools\":{s}", .{tool_writer.written()}), reasoning });
@@ -228,6 +228,7 @@ fn readStream(gpa: std.mem.Allocator, out: std.mem.Allocator, reader: *std.Io.Re
             else => return err,
         };
         reader.toss(1);
+        try sink.received();
         const data = (try parser.feed(gpa, line.written())) orelse continue;
         const ev = std.json.parseFromSliceLeaky(ResponseEvent, a, data, .{ .ignore_unknown_fields = true }) catch return error.InvalidResponse;
         if (std.mem.eql(u8, ev.type, "response.output_text.delta") or std.mem.eql(u8, ev.type, "response.refusal.delta")) {
@@ -376,6 +377,47 @@ test "Codex reasoning mapping and readable summaries" {
     try t.expectEqualStrings("readable", text);
 }
 
+test "Codex request body requests summaries exactly when reasoning is sent" {
+    const t = std.testing;
+    const cases = [_]struct {
+        model: []const u8 = default_model,
+        thinking: ?bool = null,
+        effort: ?[]const u8 = null,
+        expected_effort: ?[]const u8 = null,
+    }{
+        .{},
+        .{ .thinking = true, .expected_effort = "medium" },
+        .{ .effort = "high", .expected_effort = "high" },
+        .{ .thinking = false, .expected_effort = "low" },
+        .{ .model = "gpt-6.1-terra", .thinking = false, .expected_effort = "none" },
+        .{ .effort = "none", .expected_effort = "none" },
+    };
+    for (cases) |case| {
+        const cfg: p.Config = .{
+            .provider = .codex,
+            .model = case.model,
+            .api_key = "",
+            .base_url = "",
+            .thinking = case.thinking,
+            .reasoning_effort = case.effort,
+        };
+        const body = try requestBody(t.allocator, cfg, "cache-key", &.{}, "[]", null);
+        defer t.allocator.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, body, .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        try t.expect(!root.contains("summary"));
+        if (case.expected_effort) |effort| {
+            const reasoning = root.get("reasoning").?.object;
+            try t.expectEqual(@as(usize, 2), reasoning.count());
+            try t.expectEqualStrings(effort, reasoning.get("effort").?.string);
+            try t.expectEqualStrings("auto", reasoning.get("summary").?.string);
+        } else {
+            try t.expect(!root.contains("reasoning"));
+        }
+    }
+}
+
 test "Codex request body carries the session cache key" {
     const t = std.testing;
     const cfg: p.Config = .{ .provider = .codex, .model = default_model, .api_key = "", .base_url = "" };
@@ -445,4 +487,35 @@ test "Codex retry hints accept seconds and milliseconds without overflow" {
     try t.expectEqual(@as(?u64, 1), retryDelayMs("try again in 0.1ms"));
     try t.expectEqual(@as(?u64, 0), retryDelayMs("try again in 0s"));
     for ([_][]const u8{ "try again later", "try again in -1s", "try again in 1minute", "try again in 1.2.3s", "try again in 999999999999999999999999999999s" }) |message| try t.expectEqual(@as(?u64, null), retryDelayMs(message));
+}
+
+test "Codex stream activity covers non-text events and SSE heartbeats" {
+    const t = std.testing;
+    const State = struct {
+        received: usize = 0,
+        fn data(ctx: *anyopaque) !void {
+            const state: *@This() = @ptrCast(@alignCast(ctx));
+            state.received += 1;
+        }
+        fn delta(_: *anyopaque, _: p.Kind, _: []const u8) !void {}
+    };
+    const prefixes = [_][]const u8{
+        ": ping\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"text\"}\n\n",
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"reasoning\"}\n\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"args\"}\n\n",
+        "data: {\"type\":\"response.output_item.added\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[]}}\n\n",
+    };
+    for (prefixes) |prefix| {
+        var arena: std.heap.ArenaAllocator = .init(t.allocator);
+        defer arena.deinit();
+        const input = try std.fmt.allocPrint(arena.allocator(), "{s}data: {{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\"}}}}\n\n", .{prefix});
+        var reader: std.Io.Reader = .fixed(input);
+        var state: State = .{};
+        var cancel: std.atomic.Value(bool) = .init(false);
+        var detail: ?[]u8 = null;
+        defer if (detail) |d| t.allocator.free(d);
+        _ = try readStream(t.allocator, arena.allocator(), &reader, .{ .ctx = &state, .onDelta = State.delta, .onData = State.data }, &cancel, &detail);
+        try t.expectEqual(std.mem.count(u8, prefix, "\n") + 2, state.received);
+    }
 }

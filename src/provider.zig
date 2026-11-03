@@ -107,6 +107,11 @@ pub const Kind = enum { text, reasoning };
 pub const Sink = struct {
     ctx: *anyopaque,
     onDelta: *const fn (ctx: *anyopaque, kind: Kind, text: []const u8) anyerror!void,
+    onData: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+
+    pub fn received(s: Sink) !void {
+        if (s.onData) |notify| try notify(s.ctx);
+    }
 };
 
 pub fn stream(
