@@ -9,6 +9,7 @@ const Entry = struct {
     kind: enum { console, result, @"error" },
     text: []const u8,
     bytes: usize,
+    tail: []const u8 = "",
     keep: ?usize = null,
 
     fn heading(e: Entry, w: *std.Io.Writer, total: usize) !void {
@@ -20,7 +21,7 @@ const Entry = struct {
     }
 
     fn omitted(e: Entry, w: *std.Io.Writer, bytes: usize) !void {
-        try w.print("[{d} of {d} bytes omitted{s}]\n", .{ bytes, e.bytes, if (e.text.len < e.bytes and bytes < e.bytes) "; only prefix captured" else "" });
+        try w.print("[{d} of {d} bytes omitted]\n", .{ bytes, e.bytes });
     }
 };
 
@@ -37,16 +38,24 @@ pub fn format(gpa: std.mem.Allocator, o: sandbox.Outcome) ![]u8 {
     var storage: [sandbox.max_log_entries + 2]Entry = undefined;
     var count: usize = 0;
     var total: usize = 0;
+    const tail_bytes = if (o.log_entries.len > 0) o.logs.len - o.log_tail_start else 0;
+    const tail_offset = o.log_bytes - tail_bytes;
     for (o.log_entries) |log| {
-        total += 1;
-        storage[count] = .{ .first = total, .last = total, .kind = .console, .text = o.logs[log.start..log.end], .bytes = log.bytes };
+        const head = o.logs[@min(log.start, o.log_head_bytes)..@min(log.end, o.log_head_bytes)];
+        const tail = o.logs[o.log_tail_start + (log.start -| tail_offset) .. o.log_tail_start + (log.end -| tail_offset)];
+        const bytes = log.end - log.start;
+        storage[count] = .{
+            .first = log.first,
+            .last = log.last,
+            .kind = .console,
+            .text = if (tail.len == bytes) tail else head,
+            .tail = if (tail.len == bytes) "" else tail,
+            .bytes = bytes,
+        };
+        total = log.last;
         count += 1;
     }
-    if (o.omitted_logs.count > 0) {
-        storage[count] = .{ .first = total + 1, .last = total + o.omitted_logs.count, .kind = .console, .text = "", .bytes = o.omitted_logs.bytes };
-        total += o.omitted_logs.count;
-        count += 1;
-    } else if (count == 0 and logs.len > 0) {
+    if (count == 0 and logs.len > 0) {
         total = 1;
         storage[count] = .{ .first = 1, .last = 1, .kind = .console, .text = logs, .bytes = logs.len };
         count += 1;
@@ -65,7 +74,6 @@ pub fn format(gpa: std.mem.Allocator, o: sandbox.Outcome) ![]u8 {
         const before = out.written().len;
         try e.heading(&out.writer, total);
         try e.omitted(&out.writer, e.bytes);
-        if (e.text.len < e.bytes) try out.writer.writeAll("; only prefix captured");
         available -= out.written().len - before + 2;
     }
     out.clearRetainingCapacity();
@@ -75,9 +83,9 @@ pub fn format(gpa: std.mem.Allocator, o: sandbox.Outcome) ![]u8 {
         const share = available / remaining;
         var progress = false;
         for (entries) |*e| {
-            if (e.keep == null and e.text.len <= share) {
-                e.keep = e.text.len;
-                available -= e.text.len;
+            if (e.keep == null and e.text.len + e.tail.len <= share) {
+                e.keep = e.text.len + e.tail.len;
+                available -= e.text.len + e.tail.len;
                 remaining -= 1;
                 progress = true;
             }
@@ -95,10 +103,14 @@ pub fn format(gpa: std.mem.Allocator, o: sandbox.Outcome) ![]u8 {
         const keep = e.keep.?;
         if (keep == e.bytes) {
             try out.writer.writeAll(e.text);
+            try out.writer.writeAll(e.tail);
         } else {
             const complete = e.text.len == e.bytes;
-            const head = trimEnd(e.text[0..if (complete) (keep + 1) / 2 else keep]);
-            const tail = if (complete) trimStart(e.text[e.text.len - keep / 2 ..]) else "";
+            const head_keep = if (complete) (keep + 1) / 2 else @min(e.text.len, keep - @min(e.tail.len, keep / 2));
+            const tail_keep = if (complete) keep / 2 else @min(e.tail.len, keep - head_keep);
+            const head = trimEnd(e.text[0..head_keep]);
+            const suffix = if (complete) e.text else e.tail;
+            const tail = trimStart(suffix[suffix.len - tail_keep ..]);
             try out.writer.writeAll(head);
             if (head.len > 0 and head[head.len - 1] != '\n') try out.writer.writeByte('\n');
             try e.omitted(&out.writer, e.bytes - head.len - tail.len);
@@ -110,20 +122,8 @@ pub fn format(gpa: std.mem.Allocator, o: sandbox.Outcome) ![]u8 {
     return out.toOwnedSlice();
 }
 
-fn trimEnd(s: []const u8) []const u8 {
-    var j = s.len;
-    while (j > 0 and s.len - j < 3 and (s[j - 1] & 0xC0) == 0x80) j -= 1;
-    if (j == 0) return s[0..0];
-    const lead = j - 1;
-    const len = std.unicode.utf8ByteSequenceLength(s[lead]) catch return s[0..lead];
-    return if (lead + len <= s.len) s else s[0..lead];
-}
-
-fn trimStart(s: []const u8) []const u8 {
-    var i: usize = 0;
-    while (i < s.len and i < 3 and (s[i] & 0xC0) == 0x80) i += 1;
-    return s[i..];
-}
+const trimEnd = @import("../sandbox/console.zig").trimEnd;
+const trimStart = @import("../sandbox/console.zig").trimStart;
 
 const testing = std.testing;
 
@@ -142,24 +142,24 @@ test "three console entries retain labels and exact omission bytes" {
     try testing.expect(std.mem.indexOf(u8, out, "[entry 2 of 3 (console)]\nmiddle:") != null);
     try testing.expect(std.mem.endsWith(u8, out, ":middle-end\n[entry 3 of 3 (console)]\nlast\n"));
     const shown = std.mem.count(u8, out, "z") + "middle::middle-end\n".len;
-    const marker = try std.fmt.allocPrint(testing.allocator, "[{d} of {d} bytes omitted]", .{ o.log_entries[1].bytes - shown, o.log_entries[1].bytes });
+    const marker = try std.fmt.allocPrint(testing.allocator, "[{d} of {d} bytes omitted]", .{ (o.log_entries[1].end - o.log_entries[1].start) - shown, (o.log_entries[1].end - o.log_entries[1].start) });
     defer testing.allocator.free(marker);
     try testing.expect(std.mem.indexOf(u8, out, marker) != null);
 }
 
-test "console capture limit reports partial and wholly omitted entries" {
+test "console capture limit preserves later entries and exact omission counts" {
     const o = try evaluate("console.log('first'); console.log('middle:' + 'z'.repeat(90000)); console.log('last');", .{});
     defer o.deinit(testing.allocator);
     const out = try format(testing.allocator, o);
     defer testing.allocator.free(out);
     try testing.expect(out.len <= max_bytes);
     try testing.expect(o.log_truncated);
-    try testing.expectEqual(@as(usize, 90008), o.log_entries[1].bytes);
-    const shown = std.mem.count(u8, out, "z") + "middle:".len;
-    const marker = try std.fmt.allocPrint(testing.allocator, "[{d} of 90008 bytes omitted; only prefix captured]", .{90008 - shown});
+    try testing.expectEqual(@as(usize, 90008), (o.log_entries[1].end - o.log_entries[1].start));
+    const shown = std.mem.count(u8, out, "z") + "middle:\n".len;
+    const marker = try std.fmt.allocPrint(testing.allocator, "[{d} of 90008 bytes omitted]", .{90008 - shown});
     defer testing.allocator.free(marker);
     try testing.expect(std.mem.indexOf(u8, out, marker) != null);
-    try testing.expect(std.mem.endsWith(u8, out, "[entry 3 of 3 (console)]\n[5 of 5 bytes omitted]\n"));
+    try testing.expect(std.mem.endsWith(u8, out, "[entry 3 of 3 (console)]\nlast\n"));
     try testing.expect(std.mem.indexOf(u8, out, "[console output truncated]") == null);
 }
 
@@ -169,9 +169,9 @@ test "many console entries have bounded metadata and a numbered omission range" 
     const out = try format(testing.allocator, o);
     defer testing.allocator.free(out);
     try testing.expect(out.len <= max_bytes);
-    try testing.expectEqual(sandbox.max_log_entries, o.log_entries.len);
-    try testing.expectEqual(@as(usize, 9936), o.omitted_logs.count);
-    try testing.expect(std.mem.endsWith(u8, out, "[entries 65-10000 of 10000 (console)]\n[19872 of 19872 bytes omitted]\n"));
+    try testing.expectEqual(sandbox.max_log_entries + 1, o.log_entries.len);
+    try testing.expect(std.mem.indexOf(u8, out, "[entries 33-9968 of 10000 (console)]") != null);
+    try testing.expect(std.mem.endsWith(u8, out, "[entry 10000 of 10000 (console)]\nx\n"));
 }
 
 test "small outputs remain unchanged even with more than 64 console calls" {
@@ -190,7 +190,7 @@ test "UTF-8 cuts count all omitted bytes including capture loss" {
         defer testing.allocator.free(out);
         try testing.expect(out.len <= max_bytes);
         try testing.expect(std.unicode.utf8ValidateSlice(out));
-        const shown = std.mem.count(u8, out, "你") * 3;
+        const shown = std.mem.count(u8, out, "你") * 3 + @intFromBool(capture >= 2);
         const marker = try std.fmt.allocPrint(testing.allocator, "[{d} of 90001 bytes omitted", .{90001 - shown});
         defer testing.allocator.free(marker);
         try testing.expect(std.mem.indexOf(u8, out, marker) != null);
@@ -253,7 +253,7 @@ test "four-byte UTF-8 capture boundaries" {
         defer testing.allocator.free(out);
         try testing.expect(out.len <= max_bytes);
         try testing.expect(std.unicode.utf8ValidateSlice(out));
-        const shown = std.mem.count(u8, out, "😀") * 4;
+        const shown = std.mem.count(u8, out, "😀") * 4 + @intFromBool(capture >= 2);
         const marker = try std.fmt.allocPrint(testing.allocator, "[{d} of 120001 bytes omitted", .{120001 - shown});
         defer testing.allocator.free(marker);
         try testing.expect(std.mem.indexOf(u8, out, marker) != null);
@@ -267,4 +267,48 @@ test "console entry boundaries are calls rather than arguments or lines" {
     defer testing.allocator.free(out);
     try testing.expect(std.mem.startsWith(u8, out, "[entry 1 of 3 (console)]\nleft {\"n\":1} a\nb\n[entry 2 of 3 (console)]\n"));
     try testing.expect(std.mem.endsWith(u8, out, "[entry 3 of 3 (console)]\nright\n"));
+}
+
+test "oversized single call and cumulative calls preserve real head and tail" {
+    const codes = [_][]const u8{
+        "console.log('BEGIN-' + '你😀'.repeat(30000) + '-FINAL-SENTINEL');",
+        "console.log('BEGIN-'); for (let i = 0; i < 10000; i++) console.log('你😀'.repeat(10)); console.log('-FINAL-SENTINEL');",
+    };
+    for (codes) |code| {
+        const o = try evaluate(code, .{});
+        defer o.deinit(testing.allocator);
+        try testing.expect(o.log_truncated);
+        try testing.expect(std.unicode.utf8ValidateSlice(o.logs));
+        try testing.expect(std.mem.startsWith(u8, o.logs, "BEGIN-"));
+        try testing.expect(std.mem.endsWith(u8, o.logs, "-FINAL-SENTINEL\n"));
+        try testing.expect(o.log_head_bytes + o.logs.len - o.log_tail_start <= 65536);
+        try testing.expect(o.log_entries.len <= sandbox.max_log_entries + 1);
+        const out = try format(testing.allocator, o);
+        defer testing.allocator.free(out);
+        try testing.expect(out.len <= max_bytes);
+        try testing.expect(std.unicode.utf8ValidateSlice(out));
+        try testing.expect(std.mem.indexOf(u8, out, "BEGIN-") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "bytes omitted]") != null);
+        try testing.expect(std.mem.endsWith(u8, out, "-FINAL-SENTINEL\n"));
+    }
+}
+
+test "bounded call metadata plus completion preserves original numbering" {
+    for ([_]usize{ 64, 65, 66 }) |calls| {
+        const code = try std.fmt.allocPrint(testing.allocator, "for (let i = 0; i < {d}; i++) console.log('call-' + i + ':' + '😀'.repeat(600 + i)); 'RESULT-SENTINEL'", .{calls});
+        defer testing.allocator.free(code);
+        const o = try evaluate(code, .{});
+        defer o.deinit(testing.allocator);
+        const out = try format(testing.allocator, o);
+        defer testing.allocator.free(out);
+        try testing.expect(out.len <= max_bytes);
+        try testing.expect(std.unicode.utf8ValidateSlice(out));
+        try testing.expect(std.mem.indexOf(u8, out, "call-0:") != null);
+        const last = try std.fmt.allocPrint(testing.allocator, "call-{d}:", .{calls - 1});
+        defer testing.allocator.free(last);
+        try testing.expect(std.mem.indexOf(u8, out, last) != null);
+        const result = try std.fmt.allocPrint(testing.allocator, "[entry {d} of {d} (result)]\n\"RESULT-SENTINEL\"\n", .{ calls + 1, calls + 1 });
+        defer testing.allocator.free(result);
+        try testing.expect(std.mem.endsWith(u8, out, result));
+    }
 }
