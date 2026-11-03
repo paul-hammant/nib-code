@@ -38,7 +38,6 @@ const all = [_]Tool{
         .run = files.write,
         .doc =
         \\  // Create or overwrite a file, creating parent directories.
-        \\  // Example content: "` ${x} \\path \"quoted\"\n"
         \\  async write({ path, content }) {}, // → { bytes }
         ,
     },
@@ -82,7 +81,7 @@ const all = [_]Tool{
         .name = "llm",
         .run = model_function.llm,
         .doc =
-        \\  // Pure single-step model call: bulk judgments, classification, extraction on supplied data; no tools/side effects, usually seconds. Limits: 4 concurrent/process, 100/Run, 256 KiB prompt+input.
+        \\  // Pure single-step model call: judgments, classification, extraction on supplied data; no tools/side effects, usually seconds. Limits: 4 concurrent/process, 100/Run, 256 KiB prompt+input.
         \\  // {{llm_options}}
         \\  // Example: await Promise.all(["yes", "no"].map(input => tools.llm({prompt: "Classify the input", input})))
         \\  async llm({ prompt, input, schema, model, effort }) {}, // → { text, data, usage }
@@ -93,7 +92,7 @@ const all = [_]Tool{
         .root_only = true,
         .run = subagent.agent,
         .doc =
-        \\  // Independent multi-step work or read-only pre-commit review; use read or llm for simpler tasks. Each child starts from scratch: thousands of tokens, tens of seconds or more. Only prompt is shared; stopped children may leave incomplete files.
+        \\  // Independent multi-step worker with the same tools except agent. Each child starts from scratch and reads code itself: thousands of tokens, tens of seconds or more. Only prompt is shared; stopped children may leave incomplete files.
         \\  async agent({ prompt, timeout_ms = 1800000 }) {}, // → { text, usage }
         ,
     },
@@ -237,7 +236,7 @@ pub const Tools = struct {
             if (std.mem.eql(u8, cfg.model, model)) break true;
         } else false;
         if (!known) try models.append(a, cfg.model);
-        const options = try std.fmt.allocPrint(a, "model: {f}; current: {f}; effort low/medium/high (else inherit); bulk: cheap/low; schema→parsed JSON data.", .{ std.json.fmt(models.items, .{}), std.json.fmt(cfg.model, .{}) });
+        const options = try std.fmt.allocPrint(a, "model: {f}; current: {f}; effort low/medium/high (else inherit); smaller model/lower effort: faster, cheaper; schema→parsed JSON data.", .{ std.json.fmt(models.items, .{}), std.json.fmt(cfg.model, .{}) });
         defer a.free(options);
         return std.mem.replaceOwned(u8, a, t.api().docs, "{{llm_options}}", options);
     }
@@ -456,27 +455,6 @@ test "Run excludes tool waits without resetting the JS budget" {
     , .{ .timeout_ms = 100 }, t.host(), null);
     defer timed.deinit(testing.allocator);
     try testing.expectEqualStrings("Error: run timed out", timed.text);
-}
-
-test "write documentation string example survives JS parsing verbatim" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const marker = "// Example content: ";
-    const start = std.mem.indexOf(u8, docs, marker).? + marker.len;
-    const end = std.mem.indexOfScalarPos(u8, docs, start, '\n').?;
-    const code = try std.fmt.allocPrint(
-        testing.allocator,
-        "await tools.write({{path: '.zig-cache/tmp/{s}/f', content: {s}}})",
-        .{ tmp.sub_path, docs[start..end] },
-    );
-    defer testing.allocator.free(code);
-    var t: Tools = .{ .io = testing.io, .home = "/home/nobody" };
-    const result = try sandbox.eval(testing.allocator, testing.io, code, .{}, t.host(), null);
-    defer result.deinit(testing.allocator);
-    try testing.expect(result.ok);
-    const content = try tmp.dir.readFileAlloc(testing.io, "f", testing.allocator, .limited(100));
-    defer testing.allocator.free(content);
-    try testing.expectEqualStrings("` ${x} \\path \"quoted\"\n", content);
 }
 
 const EchoLlm = struct {

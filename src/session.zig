@@ -37,6 +37,37 @@ const tools_json =
     \\"required":["code"]}}}]
 ;
 
+/// Prompt lines that compensate for current models instead of stating facts. Each id is registered in
+/// docs/compromises.md; NIB_PATCHES_OFF=<id,...|all> drops them so their effect can be measured.
+pub const patches = [_]struct { id: []const u8, text: []const u8 }{
+    .{
+        .id = "json-escape",
+        .text =
+        \\For file/shell text with backticks, ${ or backslashes, use JSON-escaped double-quoted strings, not template literals, e.g. content: "` ${x} \\path \"quoted\"\n"
+        ,
+    },
+    .{ .id = "no-shell-search", .text = "Search with tools.grep/tools.glob, not shell rg/find/grep." },
+};
+
+fn patchLines(a: std.mem.Allocator, environ: ?*const std.process.Environ.Map) ![]const u8 {
+    const off = if (environ) |e| e.get("NIB_PATCHES_OFF") orelse "" else "";
+    var out: std.ArrayList(u8) = .empty;
+    for (patches) |patch| {
+        if (patchDisabled(off, patch.id)) continue;
+        try out.print(a, "- {s}\n", .{patch.text});
+    }
+    return out.toOwnedSlice(a);
+}
+
+fn patchDisabled(off: []const u8, id: []const u8) bool {
+    var ids = std.mem.splitScalar(u8, off, ',');
+    while (ids.next()) |raw| {
+        const item = std.mem.trim(u8, raw, " ");
+        if (std.mem.eql(u8, item, "all") or std.mem.eql(u8, item, id)) return true;
+    }
+    return false;
+}
+
 const system_template =
     \\You are nib, a coding agent working in {s}.
     \\
@@ -48,10 +79,8 @@ const system_template =
     \\Writing scripts:
     \\- Top-level `await` works. Combine related steps in one script (read several files, run a command, filter the output) and return only what you need.
     \\- The last expression and console.log output share 16 KiB per Run, truncated by console call and final result with markers; filter in JS first; tool results inside JS remain complete.
-    \\- Search with tools.grep/tools.glob, not shell rg/find/grep.
-    \\- Set run effort: "low" for mechanical next steps (test results, file checks, simple edits); don't lower it for redesign or hard debugging.
-    \\- For file/shell text with backticks, ${{ or backslashes, use JSON-escaped double-quoted strings, not template literals.
-    \\
+    \\- run's effort sets reasoning for only the next model request; lower effort answers faster but reasons less.
+    \\{s}
     \\When the task is done, answer the user directly without calling the tool.
 ;
 
@@ -126,7 +155,7 @@ pub const Session = struct {
             s.id = try a.dupe(u8, std.fs.path.stem(path));
             s.log = try session_log.Log.create(io, path);
             errdefer s.log.close(io);
-            const base = try std.fmt.allocPrint(a, system_template, .{ cwd, try s.tools.documentation(a) });
+            const base = try std.fmt.allocPrint(a, system_template, .{ cwd, try s.tools.documentation(a), try patchLines(a, options.environ) });
             const global = try std.fs.path.join(a, &.{ options.home, "AGENTS.md" });
             const project = try std.fs.path.join(a, &.{ try instructions.projectRoot(io, a, cwd), "AGENTS.md" });
             const system = try instructions.append(io, a, base, global, project);
@@ -557,7 +586,9 @@ test "system prompt documents every tool in JavaScript" {
     var host: tools.Tools = .{ .io = std.testing.io, .home = "/unused", .cfg = .{ .provider = .codex, .base_url = "", .api_key = "", .model = @import("provider/codex.zig").default_model } };
     const docs = try host.documentation(gpa);
     defer gpa.free(docs);
-    const prompt = try std.fmt.allocPrint(gpa, system_template, .{ "/work", docs });
+    const lines = try patchLines(gpa, null);
+    defer gpa.free(lines);
+    const prompt = try std.fmt.allocPrint(gpa, system_template, .{ "/work", docs, lines });
     defer gpa.free(prompt);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "```js\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "{{llm_options}}") == null);
@@ -570,6 +601,41 @@ test "system prompt documents every tool in JavaScript" {
         defer gpa.free(call);
         try std.testing.expect(std.mem.indexOf(u8, prompt, call) != null);
     }
+}
+
+test "prompt patches can be disabled individually or all at once" {
+    const gpa = std.testing.allocator;
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+    const all_on = try patchLines(gpa, &env);
+    defer gpa.free(all_on);
+    for (patches) |patch| try std.testing.expect(std.mem.indexOf(u8, all_on, patch.text) != null);
+    try env.put("NIB_PATCHES_OFF", "json-escape");
+    const one_off = try patchLines(gpa, &env);
+    defer gpa.free(one_off);
+    try std.testing.expect(std.mem.indexOf(u8, one_off, "backticks") == null);
+    try std.testing.expect(std.mem.indexOf(u8, one_off, "rg/find/grep") != null);
+    try env.put("NIB_PATCHES_OFF", "no-shell-search, all");
+    const none = try patchLines(gpa, &env);
+    defer gpa.free(none);
+    try std.testing.expectEqualStrings("", none);
+}
+
+test "json-escape patch example survives JS parsing verbatim" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const marker = "e.g. content: ";
+    const text = patches[0].text;
+    const example = text[std.mem.indexOf(u8, text, marker).? + marker.len ..];
+    const code = try std.fmt.allocPrint(std.testing.allocator, "await tools.write({{path: '.zig-cache/tmp/{s}/f', content: {s}}})", .{ tmp.sub_path, example });
+    defer std.testing.allocator.free(code);
+    var t: tools.Tools = .{ .io = std.testing.io, .home = "/home/nobody" };
+    const result = try sandbox.eval(std.testing.allocator, std.testing.io, code, .{}, t.host(), null);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.ok);
+    const content = try tmp.dir.readFileAlloc(std.testing.io, "f", std.testing.allocator, .limited(100));
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings("` ${x} \\path \"quoted\"\n", content);
 }
 
 test "failed Turn leaves replay equal to in-memory safe history" {

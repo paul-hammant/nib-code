@@ -66,6 +66,7 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 | `NIB_REASONING_EFFORT` | 推理档位，如 `low` / `high` / `max` |
 | `CODEX_HOME` | Codex 登录目录，凭证为其中的 `auth.json`，默认 `~/.codex/auth.json` |
 | `NIB_API_KEY` / `DEEPSEEK_API_KEY` | Chat Completions 的凭证，仅从环境读取 |
+| `NIB_PATCHES_OFF` | 关闭提示词中的模型补丁：`all` 或逗号分隔的 id，见 [compromises.md](compromises.md) |
 | `NIB_ISSUE_REPO` | `/reflect` 自动发布的目标仓库或 `off`，见 [reflect.md](reflect.md) |
 
 ## 逐 Step effort 调度

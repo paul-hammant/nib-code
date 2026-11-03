@@ -132,7 +132,7 @@ class LlmTests:
         self.assertIn("model: [", system)
         self.assertIn("current: \"mock-parent-model\"", system)
         self.assertNotIn("off may map", system)
-        self.assertIn("bulk: cheap/low", system)
+        self.assertIn("smaller model/lower effort: faster, cheaper", system)
         self.assertNotIn("Read a few files yourself (cheapest)", system)
         self.assertIn("async llm({", system)
         self.assertEqual("async agent({" in system, not child)
