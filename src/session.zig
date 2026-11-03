@@ -77,7 +77,7 @@ const system_template =
     \\{s}```
     \\
     \\Writing scripts:
-    \\- Top-level `await` works. Combine related steps in one script (read several files, run a command, filter the output) and return only what you need.
+    \\- Top-level `await` works. Each Step is a full model round trip, usually 10 s or more; one Run can read several files, make all independent edits, then build and test, returning only what you need (such as failures).
     \\- The last expression and console.log output share 16 KiB per Run, truncated by console call and final result with markers; filter in JS first; tool results inside JS remain complete.
     \\- run's effort sets reasoning for only the next model request; lower effort answers faster but reasons less.
     \\{s}
