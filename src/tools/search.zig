@@ -83,3 +83,28 @@ test "grep and glob never surface credential files" {
     defer freeResult(direct);
     try testing.expectEqualStrings("CredentialAccessDenied", direct.err);
 }
+
+test "grep serializes match and snippet byte columns" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var data: [6014]u8 = @splat('a');
+    @memcpy(data[6000..6014], "中SyntaxError");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "long.jsonl", .data = &data });
+    const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/long.jsonl", .{tmp.sub_path});
+    defer testing.allocator.free(path);
+    const args = try std.json.Stringify.valueAlloc(testing.allocator, .{ .pattern = "SyntaxError", .path = path }, .{});
+    defer testing.allocator.free(args);
+    var t: Tools = .{ .io = testing.io, .home = "/nonexistent" };
+    const result = Tools.call(&t, testing.allocator, "grep", args);
+    defer freeResult(result);
+    const parsed = try std.json.parseFromSlice(grep_engine.Result, testing.allocator, result.ok, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 1), parsed.value.matches.len);
+    const m = parsed.value.matches[0];
+    try testing.expectEqual(@as(usize, 6004), m.column);
+    try testing.expectEqual(@as(usize, 5518), m.text_column);
+    try testing.expectEqual(@as(usize, 500), m.text.len);
+    try testing.expect(std.unicode.utf8ValidateSlice(m.text));
+    try testing.expect(std.mem.endsWith(u8, m.text, "中SyntaxError"));
+    try testing.expect(std.mem.startsWith(u8, m.text, "…"));
+}
