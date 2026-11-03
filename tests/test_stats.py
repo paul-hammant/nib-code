@@ -265,7 +265,7 @@ class StatsTest(unittest.TestCase):
                             dict(role='assistant', tool_calls=[literal, dynamic]),
                             dict(role='tool', tool_call_id='literal', content='ok'),
                             dict(role='tool', tool_call_id='dynamic', content='ok')],
-                            ms=300, model_ms=150, run_ms=100, first_token_ms=10, attempts=2,
+                            ms=300, model_ms=150, run_ms=100, first_data_ms=10, attempts=2,
                             code=[dict(tool_call_id='literal', first_ms=40, last_ms=90, progress=[[40, 1], [90, 100]]),
                                   dict(tool_call_id='dynamic', first_ms=60, last_ms=111)],
                             run_results=[dict(tool_call_id='dynamic', ok=False, run_ms=20),
@@ -274,7 +274,7 @@ class StatsTest(unittest.TestCase):
                                    dict(name='bash', start_ms=5, end_ms=65, ok=True, run_index=1),
                                    dict(name='bash', start_ms=0, end_ms=10, ok=False, run_index=0)], calls_omitted=3),
                        dict({'from': 8}, messages=[dict(role='assistant', content='done')], ms=0, model_ms=0,
-                            run_ms=0, first_token_ms=0, attempts=1, code=[], calls=[], calls_omitted=0),
+                            run_ms=0, first_data_ms=0, attempts=1, code=[], calls=[], calls_omitted=0),
                        dict({'from': 9}, messages=[dict(role='user', content='no timing'), dict(role='assistant', content='ok')]) ]
             path.write_text('\n'.join(map(json.dumps, records)) + '\n')
             report = stats.summarize([path])
@@ -284,7 +284,7 @@ class StatsTest(unittest.TestCase):
             self.assertEqual(timing['model_ms'], dict(samples=2, median=75, p90=150))
             self.assertEqual(timing['run_ms'], dict(samples=2, median=50, p90=100))
             self.assertEqual(timing['run_result_ms'], dict(samples=2, median=50, p90=80))
-            self.assertEqual(timing['first_token_ms']['median'], 5)
+            self.assertEqual(timing['first_data_ms']['median'], 5)
             self.assertEqual(timing['code_first_ms'], dict(samples=2, median=50, p90=60))
             self.assertEqual(timing['code_span_ms'], dict(samples=2, median=50.5, p90=51))
             self.assertEqual(timing['attempts'], dict(samples=2, median=1.5, p90=2))
@@ -315,7 +315,7 @@ class StatsTest(unittest.TestCase):
 
             def step(start, duration, span, **extra):
                 return dict({'from': start}, ms=duration, model_ms=duration, run_ms=duration,
-                            first_token_ms=duration, attempts=1, calls_omitted=1,
+                            first_data_ms=duration, attempts=1, calls_omitted=1,
                             usage=dict(prompt_tokens=duration, completion_tokens=1, prompt_cache_hit_tokens=0),
                             code=[dict(tool_call_id='r', first_ms=duration, last_ms=duration + span)],
                             run_results=[dict(tool_call_id='r', ok=True, run_ms=duration)],
@@ -365,7 +365,7 @@ class StatsTest(unittest.TestCase):
                     expected = dict(samples=count, median=30 if legacy_selected else 25,
                                     p90=40 if legacy_selected else 30)
                     for key in ('step_ms', 'model_ms', 'run_ms', 'run_result_ms',
-                                'first_token_ms', 'code_first_ms'):
+                                'first_data_ms', 'code_first_ms'):
                         self.assertEqual(timing[key], expected, key)
                     self.assertEqual(timing['attempts'], dict(samples=count, median=1, p90=1))
                     self.assertEqual(timing['code_span_ms'], dict(samples=count,
@@ -384,7 +384,7 @@ class StatsTest(unittest.TestCase):
                     self.assertEqual(text, stats.text_report(report) + '\n')
                     for snippet in (f'Step {steps}；Run {count}', '计时 Timing',
                                     f'model_ms: samples={count}', f'median={expected["median"]:.2f}',
-                                    'first_token_ms is onData first stream activity',
+                                    'first_data_ms 是首次收到任何流数据',
                                     '--since 按记录 at', '缺失或无效 at 回退到文件修改时间'):
                         self.assertIn(snippet, text)
             excluded = stats.summarize([path], date(2025, 1, 2), cwd=ROOT)
@@ -400,14 +400,14 @@ class StatsTest(unittest.TestCase):
             report = stats.summarize([path])
             timing = report['timing']
             self.assertEqual(timing['step_ms'], dict(samples=1, median=42, p90=42))
-            for key in ('model_ms', 'run_ms', 'run_result_ms', 'first_token_ms', 'code_first_ms', 'code_span_ms', 'attempts'):
+            for key in ('model_ms', 'run_ms', 'run_result_ms', 'first_data_ms', 'code_first_ms', 'code_span_ms', 'attempts'):
                 self.assertEqual(timing[key], dict(samples=0, median=None, p90=None))
             self.assertEqual(timing['tools'], {})
             self.assertEqual(timing['streaming'], dict(samples=0, over_50_ms=0, ratio=None))
             self.assertIn('model_ms: samples=0 median=n/a p90=n/a', stats.text_report(report))
             self.assertEqual(stats.summarize([])['timing']['step_ms']['samples'], 0)
         timing = stats.Timing()
-        timing.add(dict(ms=True, model_ms=-1, run_ms='5', first_token_ms=1.2, attempts=None,
+        timing.add(dict(ms=True, model_ms=-1, run_ms='5', first_data_ms=1.2, attempts=None,
                         code=[None, {}, dict(first_ms=-1, last_ms=3), dict(first_ms=10, last_ms=9)],
                         run_results=[None, dict(run_ms=False)], calls_omitted=-1,
                         calls=[None, {}, dict(name='bash', start_ms=True, end_ms=10),

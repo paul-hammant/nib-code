@@ -271,8 +271,8 @@ pub const Session = struct {
             const started: std.Io.Clock.Timestamp = .now(s.io, .awake);
             var model_timing: provider.ModelTiming = .init(s.io, started);
             var attempts: u32 = 0;
-            var first_token_ms: ?u64 = null;
-            const reply = try s.complete(request.items, sink, cancel, detail, partial, &model_timing, &attempts, &first_token_ms);
+            var first_data_ms: ?u64 = null;
+            const reply = try s.complete(request.items, sink, cancel, detail, partial, &model_timing, &attempts, &first_data_ms);
             const model_ms: u64 = @intCast(@max(started.untilNow(s.io).raw.toMilliseconds(), 0));
             var run_timing: sandbox.RunTiming = .init(s.io, started);
             var run_ms: u64 = 0;
@@ -310,7 +310,7 @@ pub const Session = struct {
                 .ms = ms,
                 .model_ms = model_ms,
                 .attempts = attempts,
-                .first_token_ms = first_token_ms,
+                .first_data_ms = first_data_ms,
                 .code = try model_timing.finish(s.arena.allocator(), reply.tool_calls),
                 .run_ms = run_ms,
                 .calls = run_timing.entries[0..run_timing.count],
@@ -326,18 +326,18 @@ pub const Session = struct {
         return error.TooManySteps;
     }
 
-    fn complete(s: *Session, messages: []const provider.Message, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, partial: *Partial, timing: *provider.ModelTiming, attempts: *u32, first_token_ms: *?u64) !provider.Reply {
+    fn complete(s: *Session, messages: []const provider.Message, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, partial: *Partial, timing: *provider.ModelTiming, attempts: *u32, first_data_ms: *?u64) !provider.Reply {
         const Forward = struct {
             sink: Sink,
             gpa: std.mem.Allocator,
             partial: *Partial,
             io: std.Io,
             started: std.Io.Clock.Timestamp,
-            first_token_ms: *?u64,
+            first_data_ms: *?u64,
             emitted: bool = false,
             fn onData(ctx: *anyopaque) !void {
                 const f: *@This() = @ptrCast(@alignCast(ctx));
-                if (f.first_token_ms.* == null) f.first_token_ms.* = @intCast(@max(f.started.untilNow(f.io).raw.toMilliseconds(), 0));
+                if (f.first_data_ms.* == null) f.first_data_ms.* = @intCast(@max(f.started.untilNow(f.io).raw.toMilliseconds(), 0));
                 try f.sink.modelActivity(.data);
             }
             fn onDelta(ctx: *anyopaque, kind: provider.Kind, text: []const u8) !void {
@@ -349,7 +349,7 @@ pub const Session = struct {
         };
         var attempt: u32 = 1;
         while (true) : (attempt += 1) {
-            var fwd: Forward = .{ .sink = sink, .gpa = s.gpa, .partial = partial, .io = s.io, .started = timing.started, .first_token_ms = first_token_ms };
+            var fwd: Forward = .{ .sink = sink, .gpa = s.gpa, .partial = partial, .io = s.io, .started = timing.started, .first_data_ms = first_data_ms };
             attempts.* = attempt;
             const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .timing = timing };
             return request: {

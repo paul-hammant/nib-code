@@ -37,8 +37,8 @@ def assert_timing(records, *, final_only=False):
     for step in steps:
         assert isinstance(step["model_ms"], int) and 0 <= step["model_ms"] <= step["ms"], step
         assert step["attempts"] == 1, step
-        assert isinstance(step["first_token_ms"], int), step
-        assert 0 <= step["first_token_ms"] <= step["model_ms"], step
+        assert isinstance(step["first_data_ms"], int), step
+        assert 0 <= step["first_data_ms"] <= step["model_ms"], step
         assert step["run_ms"] == sum(run["run_ms"] for run in step["run_results"]), step
         assert 0 <= step["run_ms"] <= step["ms"], step
     run_step, text_step = steps
@@ -50,8 +50,8 @@ def assert_timing(records, *, final_only=False):
     assert len(run_step["code"]) == 1, run_step
     code = run_step["code"][0]
     assert code["tool_call_id"] == call["id"], code
-    assert run_step["first_token_ms"] <= code["first_ms"] <= code["last_ms"] <= run_step["model_ms"], code
-    assert code["first_ms"] - run_step["first_token_ms"] >= 80, run_step
+    assert run_step["first_data_ms"] <= code["first_ms"] <= code["last_ms"] <= run_step["model_ms"], code
+    assert code["first_ms"] - run_step["first_data_ms"] >= 80, run_step
     progress = code["progress"]
     assert progress and progress[0][0] == code["first_ms"] and progress[-1][0] == code["last_ms"], code
     assert progress[-1][1] == len(arguments.encode("utf-8")), code
@@ -255,7 +255,7 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
             measured = recovered_steps[0]
             assert measured["attempts"] == 2, measured
             assert delay <= measured["model_ms"] <= measured["ms"], measured
-            assert 0 <= measured["first_token_ms"] <= measured["model_ms"], measured
+            assert 0 <= measured["first_data_ms"] <= measured["model_ms"], measured
             assert measured["run_ms"] == 0 and not measured.get("code") and not measured.get("calls"), measured
             assert all("failed attempt prefix" not in m.get("content", "") for m in recovered_history)
 

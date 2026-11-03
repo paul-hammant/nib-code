@@ -143,13 +143,13 @@ def bash_timing_group(code):
 class Timing:
     def __init__(self):
         self.values = {key: [] for key in ('step_ms', 'model_ms', 'run_ms', 'run_result_ms',
-                                         'first_token_ms', 'code_first_ms', 'code_span_ms', 'attempts')}
+                                         'first_data_ms', 'code_first_ms', 'code_span_ms', 'attempts')}
         self.tools = {}
         self.bash = {}
         self.calls_steps = self.calls_omitted = self.bash_unmatched = 0
 
     def add(self, record, sources):
-        for key in ('model_ms', 'run_ms', 'first_token_ms', 'attempts'):
+        for key in ('model_ms', 'run_ms', 'first_data_ms', 'attempts'):
             if number(record.get(key)):
                 self.values[key].append(record[key])
         if number(record.get('ms')):
@@ -409,7 +409,7 @@ def summarize(paths, since=None, cwd=None):
                       '时间来源计数只含入选的非 header、非修复、非压缩替换记录（含诊断和打断）；步骤回退数只含完整 Step。',
                       f"时间来源：{time_filter['selected_records_with_at']} 条按 at，{time_filter['selected_records_using_mtime']} 条回退文件时间（其中 {time_filter['selected_steps_using_mtime']} 个完整 Step）。",
                       '计时各项 samples 只含有效的显式字段；缺失不补零。median 为中位数，p90 使用 nearest-rank。',
-                      'first_token_ms is onData first stream activity（可能为 SSE heartbeat），不是独立 token 通道。',
+                      'first_data_ms 是首次收到任何流数据（可能是 SSE 心跳），不是首个内容 token。',
                       'model_ms 含 provider 重试/退避；run_ms 是每 Step 的 Run 总耗时，run_result_ms 是单 Run 耗时。',
                       'code_first_ms 是 Step 开始至首段代码的等待；code_span_ms 是 last_ms-first_ms；streaming 比例为 span > 50 ms 的样本比例。',
                       '工具计时来自运行时 calls（含失败）；总耗时可能因并行重叠，calls_omitted 是日志上限丢弃数。',
@@ -438,7 +438,7 @@ def text_report(report):
         lines.append('  无计时记录')
     timing = report['timing']
     lines.append('耗时构成 / 计时 Timing（ms，attempts 为次数；缺失字段不补零）：')
-    for name in ('step_ms', 'model_ms', 'run_ms', 'run_result_ms', 'first_token_ms', 'code_first_ms', 'code_span_ms', 'attempts'):
+    for name in ('step_ms', 'model_ms', 'run_ms', 'run_result_ms', 'first_data_ms', 'code_first_ms', 'code_span_ms', 'attempts'):
         item = timing[name]
         lines.append(f"  {name}: samples={item['samples']} median={fmt(item['median'])} p90={fmt(item['p90'])}")
     streaming = timing['streaming']
