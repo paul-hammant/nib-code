@@ -194,7 +194,11 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
             "prompt_tokens": 6600, "completion_tokens": 30, "prompt_cache_hit_tokens": 192}
         assert "hello from bash" in final["text"], final
         assert any(e.get("delta", {}).get("kind") == "reasoning" for e in streamed)
-        assert any("run_start" in e for e in streamed)
+        run_start = next(i for i, event in enumerate(streamed) if "run_start" in event)
+        reported = [event["usage"] for event in streamed[:run_start] if "usage" in event]
+        assert reported[0] == dict(prompt_tokens=0, completion_tokens=0, prompt_cache_hit_tokens=0)
+        assert reported[-1] == dict(prompt_tokens=3300, completion_tokens=20, prompt_cache_hit_tokens=64)
+        assert streamed[-2]["usage"] == final["usage"]
         assert any(e.get("run_end", {}).get("ok") for e in streamed)
         assert read_requests(requests_path)[-2]["messages"][-1]["content"] == "stdin prompt\nsecond line"
         assert (tmp / "nib/sessions" / (session_id + ".jsonl")).exists()
@@ -284,7 +288,8 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
                     if len(updates) == 1:
                         assert not (progress_cwd / "progress-alpha.txt").exists() or p["step"] <= 1
                         active_child_logs = [p for p in (tmp / "nib/sessions").glob("*.jsonl")
-                                             if replay(p)[1][0].get("parent_session_id") == seen[0]["start"]["session_id"]]
+                                             if (records := replay(p)[1])
+                                             and records[0].get("parent_session_id") == seen[0]["start"]["session_id"]]
                         assert len(active_child_logs) <= 2
                         assert all(len(replay(p)[0]) < 8 for p in active_child_logs), "children already finished"
         assert not pending
