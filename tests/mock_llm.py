@@ -13,7 +13,8 @@ gets HTTP 400. "reject1"/"reject2" return HTTP 400 before
 the first/second Step; "truncated" closes the stream without [DONE].
 "delegate" runs two children; "delegate_many" runs six; "delegate_failure"
 catches a failed child's error. "delegate_cancel PATH" runs a child whose bash
-writes its pid to PATH and sleeps. "child probe" answers without a Run. "interrupt me" streams
+writes its pid to PATH and sleeps. "child probe" answers without a Run. A /reflect request answers with two
+issue drafts, one carrying a fake credential. "interrupt me" streams
 partial text, then stalls for a second; "interrupt stalled" stalls for 30 seconds. "edit_test" writes and
 edits files. "fetch_test" fetches GET /redirect (to /page) and
 /slow (3 s) with a short timeout; GET serves those pages.
@@ -70,6 +71,8 @@ class H(http.server.BaseHTTPRequestHandler):
         elif last['role']=='user' and lastuser == 'child probe':
             if thinking: ev({"choices":[{"delta":{"reasoning_content":"Probe."}}]})
             ev({"choices":[{"delta":{"content":"probe complete"}}], "usage":{"prompt_tokens":prompt_tokens(100),"completion_tokens":10}})
+        elif last['role']=='user' and lastuser.startswith('这是一次反思'):
+            ev({"choices":[{"delta":{"content":"### 摘要\n反思完成。\n\n### Issue 草稿\n```json\n[{\"title\": \"write: escaping friction\", \"body\": \"seen in " + os.getcwd() + "/x.py\"}, {\"title\": \"leaky\", \"body\": \"ghp_secret\"}]\n```"}}]})
         elif last['role']=='user' and lastuser in ('interrupt me', 'interrupt stalled'):
             if thinking: ev({"choices":[{"delta":{"reasoning_content":"想一想。"}}]})
             ev({"choices":[{"delta":{"content":"partial answer"}}]})
