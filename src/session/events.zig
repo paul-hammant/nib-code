@@ -47,6 +47,21 @@ pub const Progress = struct {
     }
 };
 
+pub const Timing = struct {
+    wall_ms: u64 = 0,
+    model_ms: u64 = 0,
+    run_ms: u64 = 0,
+    llm_calls: u64 = 0,
+    agent_calls: u64 = 0,
+};
+
+pub const TurnSummary = struct {
+    status: enum { completed, canceled, failed } = .completed,
+    steps: u32 = 0,
+    usage: provider.Usage = .{},
+    timing: Timing = .{},
+};
+
 pub const ModelActivity = enum { started, data, finished };
 
 pub const Event = union(enum) {
@@ -58,6 +73,7 @@ pub const Event = union(enum) {
     notice: []const u8,
     usage: provider.Usage,
     progress: Progress,
+    turn_end: TurnSummary,
 };
 
 pub const JsonEvent = union(enum) {
@@ -66,9 +82,9 @@ pub const JsonEvent = union(enum) {
     end: End,
     @"error": Failure,
 
-    pub const Failure = struct { message: []const u8 = "", usage: provider.Usage = .{}, steps: u32 = 0 };
+    pub const Failure = struct { message: []const u8 = "", usage: provider.Usage = .{}, steps: u32 = 0, timing: ?Timing = null };
 
-    pub const End = struct { text: []const u8, usage: provider.Usage, steps: u32 };
+    pub const End = struct { text: []const u8, usage: provider.Usage, steps: u32, timing: ?Timing = null };
 
     pub fn jsonStringify(value: JsonEvent, writer: *std.json.Stringify) !void {
         switch (value) {
@@ -83,7 +99,7 @@ pub const JsonEvent = union(enum) {
     }
 
     pub fn write(value: JsonEvent, writer: *std.Io.Writer) !void {
-        try writer.print("{f}\n", .{std.json.fmt(value, .{})});
+        try writer.print("{f}\n", .{std.json.fmt(value, .{ .emit_null_optional_fields = false })});
         try writer.flush();
     }
 };

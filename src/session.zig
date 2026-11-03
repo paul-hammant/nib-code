@@ -61,6 +61,7 @@ pub const Session = struct {
     /// Totals for the current or most recent Turn.
     usage: provider.Usage = .{},
     steps: u32 = 0,
+    summary: ?@import("session/events.zig").TurnSummary = null,
     interrupt_signal: ?*const std.atomic.Value(std.posix.SIG) = null,
     /// Next-request estimate: latest usage plus tool results, or the compacted history size.
     context_tokens: u64 = 0,
@@ -208,6 +209,15 @@ pub const Session = struct {
     }
 
     pub fn turn(s: *Session, user_text: []const u8, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
+        s.summary = .{};
+        const started: std.Io.Clock.Timestamp = .now(s.io, .awake);
+        defer {
+            s.summary.?.timing.wall_ms = @intCast(@max(started.untilNow(s.io).raw.toMilliseconds(), 0));
+            sink.emit(sink.ctx, .{ .turn_end = s.summary.? }) catch {};
+        }
+        errdefer {
+            if (s.summary.?.status != .canceled) s.summary.?.status = if (cancel.load(.acquire)) .canceled else .failed;
+        }
         var pending: std.ArrayList(provider.Message) = .empty;
         defer pending.deinit(s.gpa);
         var partial: Partial = .{};
@@ -218,7 +228,10 @@ pub const Session = struct {
         try sink.emit(sink.ctx, .{ .usage = s.usage });
         s.runSteps(&pending, &partial, sink, cancel, detail) catch |err| {
             // A signal can surface as a read error instead of error.Canceled.
-            if (err == error.Canceled or cancel.load(.acquire)) try s.commitInterrupted(pending.items, &partial);
+            if (err == error.Canceled or cancel.load(.acquire)) {
+                s.summary.?.status = .canceled;
+                try s.commitInterrupted(pending.items, &partial);
+            }
             return err;
         };
     }
@@ -317,6 +330,12 @@ pub const Session = struct {
                 .calls_omitted = run_timing.omitted,
                 .run_results = run_results.items,
             });
+            s.summary.?.steps += 1;
+            s.summary.?.usage = s.usage;
+            s.summary.?.timing.model_ms += model_ms;
+            s.summary.?.timing.run_ms += run_ms;
+            s.summary.?.timing.llm_calls += run_timing.llm_calls;
+            s.summary.?.timing.agent_calls += run_timing.agent_calls;
             pending.clearRetainingCapacity();
             try sink.emit(sink.ctx, .{ .usage = s.usage });
             if (reply.tool_calls.len == 0) return;

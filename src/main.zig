@@ -104,6 +104,7 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
     defer {
         failure.usage = session.usage;
         failure.steps = session.steps;
+        if (session.summary) |summary| failure.timing = summary.timing;
     }
 
     if (ask) {
@@ -112,6 +113,7 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
             json: bool,
             fn emit(ctx: *anyopaque, ev: Event) !void {
                 const self: *@This() = @ptrCast(@alignCast(ctx));
+                if (ev == .turn_end) return;
                 if (self.json) return JsonEvent.write(.{ .event = ev }, self.w);
                 switch (ev) {
                     .delta => |d| if (d.kind == .text) {
@@ -124,7 +126,7 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
                         for (r.changes) |c| std.debug.print("\x1b[2mchanged {s}{s} +{d} −{d}\x1b[0m\n", .{ c.path, if (c.created) " (new)" else "", c.added, c.removed });
                     },
                     .retry => |r| std.debug.print("\x1b[2mretry {d} in {d}s: {s}\x1b[0m\n", .{ r.attempt, r.delay_ms / 1000, r.reason }),
-                    .usage, .progress => {},
+                    .usage, .progress, .turn_end => {},
                     .notice => |m| std.debug.print("\x1b[2m{s}\x1b[0m\n", .{m}),
                 }
             }
@@ -145,6 +147,7 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
                 .text = session.history.items[session.history.items.len - 1].content orelse "",
                 .usage = session.usage,
                 .steps = session.steps,
+                .timing = session.summary.?.timing,
             } }, stdout);
             return;
         }
