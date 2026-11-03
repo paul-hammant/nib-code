@@ -92,8 +92,8 @@ const all = [_]Tool{
         .root_only = true,
         .run = subagent.agent,
         .doc =
-        \\  // Independent multi-step worker with the same tools except agent. Each child starts from scratch and reads code itself: thousands of tokens, tens of seconds or more. Only prompt is shared; stopped children may leave incomplete files.
-        \\  async agent({ prompt, timeout_ms = 1800000 }) {}, // → { text, usage }
+        \\  // Independent multi-step work: read-only pre-commit review for changes over a few dozen lines; parallel implementation (define interfaces and assign files first; check changes for scope/conflicts); code-heavy investigation. Starts from scratch, takes tens of seconds or more; use read/llm when sufficient. Failures resolve ok:false, not reject (except invalid args/user cancel); inspect partial files. changes: merged edit/write counts, not bash/diffs. model/effort: same as llm.
+        \\  async agent({ prompt, timeout_ms = 1800000, model, effort }) {}, // → { ok, text, usage, changes, error? }
         ,
     },
 };

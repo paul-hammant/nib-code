@@ -1,6 +1,6 @@
 # tools.llm 与 tools.agent：调用与实现
 
-少量文件直接 read 最便宜。大量数据的单步判断、分类、抽取适合 llm，通常几秒；批量简单判断优先低成本模型和低 effort，强模型留给少量难题。agent 用于独立多步任务或提交前只读审查；每个子会话从零读代码，常消耗几千到几万 token、几十秒以上，不代替 read 或 llm。延迟与成本是量级提示，不是保证。
+少量文件直接 read 最便宜。大量数据的单步判断、分类、抽取适合 llm，通常几秒；批量简单判断优先低成本模型和低 effort，强模型留给少量难题。agent 用于独立多步工作：几十行以上改动的提交前只读审查、先约定接口并划分负责文件的并行实现、需要大量读代码的调查；每个子会话从零读代码，常消耗几千到几万 token、几十秒以上，不代替 read 或 llm。延迟与成本是量级提示，不是保证。
 
 ## 接口与限额
 
@@ -8,7 +8,9 @@ Run 中可调用 `await tools.llm({ prompt, input, schema, model, effort })`，�
 
 llm 限额常量在 `src/tools/llm.zig`：同进程最多 4 个并发调用，超出排队（不计请求超时）；每 Run 最多 100 次，第 101 次在沙箱入队前 reject，建议分批或先用 JS 过滤；单次 prompt + 序列化 input 合计最多 256 KiB（UTF-8 字节），超出 reject，不截断。请求超时沿用 provider（当前无额外读超时），限流/临时错误复用 `src/provider/retry.zig` 的主会话重试、退避与服务端延迟提示。Esc/SIGINT/SIGTERM 同时取消在途和排队调用。各 Run 仍是无状态沙箱，中间结果用 JSON 文件传递，见 [ADR 0013](adr/0013-llm-functions.md)。
 
-根会话可调用 `await tools.agent({ prompt, timeout_ms: 1800000 })`，返回 `{ text, usage }`；timeout_ms 可省略，默认 30 分钟，不计排队时间。超时错误包含实际耗时（含终止宽限）、子会话 id（未收到 start 时明确标为不可用）和检查半成品文件的提醒。子会话适合独立调查或任务，不适合需要跨文件协调的修改；`Promise.all` 并行派生，最多同时运行 4 个子会话（全部工具最多同时运行 8 个）。子会话独立读取指令文件，沿用 cwd 和有效 provider/模型配置（通过 stdin 管道传递，子会话跳过配置文件读取；Codex 凭证各自读取），不继承父会话历史。内部环境变量 `NIB_AGENT_DEPTH` 从 0 递增，深度达到 1 时，工具说明与实际 JS API 都移除 agent。`NIB_PARENT_SESSION_ID` 写入子会话日志首条记录的 `parent_session_id`。显式 `--resume` 子会话仍保留深度限制；`--continue` 跳过子会话。
+根会话可调用 `await tools.agent({ prompt, timeout_ms: 1800000, model, effort })`，成功返回 `{ ok: true, text, usage, changes }`；子会话超时、崩溃、非零退出或 NDJSON error 返回 `{ ok: false, error, text, usage, changes }`，不会 reject，也不会取消同一 Run 中的其他子 agent。只有参数错误和用户取消（Esc/SIGINT/SIGTERM）仍 reject。text 成功时取 end.text；失败时保留已收到的最终文本（text delta，不含思考或工具代码），没有则为空串。error 保留原失败信息，并带实际耗时（含终止宽限）、子会话 id（未收到 start 时明确标为不可用）和检查半成品文件的提醒。timeout_ms 可省略，默认 30 分钟，不计排队时间。model/effort 同 llm：省略则继承，覆盖子会话有效配置，只在当前 provider 内选择，effort 沿用现有校验与映射，不影响父会话。并行实现前先写接口约定，告诉每个子 agent 负责哪些文件，收到结果后检查 changes 是否越界或冲突；`Promise.all` 并行派生，最多同时运行 4 个子会话（全部工具最多同时运行 8 个）。子会话独立读取指令文件，沿用 cwd 和有效 provider/模型配置（通过 stdin 管道传递，子会话跳过配置文件读取；Codex 凭证各自读取），不继承父会话历史。内部环境变量 `NIB_AGENT_DEPTH` 从 0 递增，深度达到 1 时，工具说明与实际 JS API 都移除 agent。`NIB_PARENT_SESSION_ID` 写入子会话日志首条记录的 `parent_session_id`。显式 `--resume` 子会话仍保留深度限制；`--continue` 跳过子会话。
+
+changes 汇总子会话所有 Run（包括失败 Run）已收到的 `run_end.changes`，按路径首次出现顺序返回 `[{ path, added, removed, created }]`：同路径 added/removed 累加，created 取逻辑或，不含 diff 正文。这是各 Run 的累计行改动量，不是起止文件的净 diff；只涵盖 edit/write，不包含 bash 或外部进程改动。中断时尚未发出 run_end 的改动也可能不在汇总中，失败后仍须检查半成品文件。
 
 ## 进度、用量与取消
 
