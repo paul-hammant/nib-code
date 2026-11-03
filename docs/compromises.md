@@ -9,7 +9,7 @@
 | id / 名称 | 位置 | 原因 | 观察信号 | 删除条件 |
 |---|---|---|---|---|
 | `json-escape` | 系统提示 Writing scripts | 模型在写含反引号、`${`、反斜杠的文本时，常用模板字符串导致 SyntaxError 或内容被改写 | stats 错误分类 `js_syntax` | 关闭后 `js_syntax` 没有明显上升 |
-| `no-shell-search` | 系统提示 Writing scripts | 模型习惯调用 rg，而 rg 不在用户环境中，exit 127 | stats 错误分类 `command_not_found` | 关闭后 `command_not_found` 没有明显上升 |
+| `no-shell-search` | 系统提示 Writing scripts | 最初因 rg 未安装、调用报 127 而加；2026-11-03 已安装 ripgrep，现在只剩"推荐结构化结果、跳过凭证文件"这层理由 | bash 中 rg/grep 的使用次数、Run 内解析文本出错的次数、tools.grep 使用量 | 关闭后模型能在 rg 与 tools.grep 间合理选择，且解析出错没有明显上升；删除时把 tools.grep 的优势作为事实写进说明 |
 | reflect 只报有证据的问题 | `src/tui/reflect.md` | 担心模型为完成反思而凑问题；草稿会自动公开发布 | 自动提交的 issue 中被关闭为无效或重复的比例 | 门槛措辞进一步精简后，误报率不上升（只能改模板验证，无开关） |
 
 ## 实现妥协
