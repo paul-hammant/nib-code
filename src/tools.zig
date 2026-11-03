@@ -46,12 +46,9 @@ const all = [_]Tool{
         .name = "grep",
         .run = search.grep,
         .doc =
-        \\  // Search file contents with a JS RegExp (multiline: ^ and $ match per line); literal searches for the exact text.
-        \\  // Skips .git, .gitignore'd, binary and symlinked files. glob filters files below path, as in the glob tool.
-        \\  // Each match's path is path joined with the file below it; line is 1-based, column is the first match's 1-based UTF-8 byte column.
-        \\  // text centers on the match; text_column is its first source byte's 1-based column (excluding a leading …).
-        \\  // text and context lines are at most 500 bytes including … on omitted sides, without splitting UTF-8; context keeps line prefixes.
-        \\  async grep({ pattern, path = ".", glob, ignore_case = false, literal = false, context = 0, limit = 100 }) {}, // → { matches: [{ path, line, column, text, text_column, before?, after? }], truncated }
+        \\  // Search with JS RegExp (multiline ^/$) or literal text. Skips .git, .gitignore'd, binary and symlinked files; glob filters paths. path joins the input path and file; line is 1-based; column is the hit's 1-based UTF-8 byte column.
+        \\  // text is the matching line clipped around the hit to 500 bytes, with … for omissions; context lines keep prefixes, also capped at 500 bytes; neither splits UTF-8.
+        \\  async grep({ pattern, path = ".", glob, ignore_case = false, literal = false, context = 0, limit = 100 }) {}, // → { matches: [{ path, line, column, text, before?, after? }], truncated }
         ,
     },
     .{
@@ -85,9 +82,10 @@ const all = [_]Tool{
         .name = "llm",
         .run = model_function.llm,
         .doc =
-        \\  // Bulk judgments, classification, extraction: pure, no side effects/tools, one step, typically seconds. input: string or JSON data; schema: parsed data (else null). Limits: 4 concurrent/process, 100 calls/Run, 256 KiB prompt+input. {{llm_options}}
+        \\  // Pure single-step model call: bulk judgments, classification, extraction on supplied data; no tools/side effects, usually seconds. Limits: 4 concurrent/process, 100/Run, 256 KiB prompt+input.
+        \\  // {{llm_options}}
         \\  // Example: await Promise.all(["yes", "no"].map(input => tools.llm({prompt: "Classify the input", input})))
-        \\  async llm({ prompt, input, schema, model, effort }) {}, // → { text, data, usage }; usage counts toward this Turn.
+        \\  async llm({ prompt, input, schema, model, effort }) {}, // → { text, data, usage }
         ,
     },
     .{
@@ -95,8 +93,7 @@ const all = [_]Tool{
         .root_only = true,
         .run = subagent.agent,
         .doc =
-        \\  // Independent multi-step work or read-only pre-commit review, not tasks that direct read or llm can handle.
-        \\  // Each child reads code from scratch: thousands to tens of thousands of tokens, tens of seconds or more. Only prompt is shared; usage counts toward this Turn. Stopped children may leave incomplete files.
+        \\  // Independent multi-step work or read-only pre-commit review; use read or llm for simpler tasks. Each child starts from scratch: thousands of tokens, tens of seconds or more. Only prompt is shared; stopped children may leave incomplete files.
         \\  async agent({ prompt, timeout_ms = 1800000 }) {}, // → { text, usage }
         ,
     },
@@ -110,7 +107,7 @@ fn enabled(tool: Tool, depth: u32) bool {
 
 fn makeApi(comptime depth: u32) Api {
     var n: []const []const u8 = &.{};
-    var d: []const u8 = "// Read a few files yourself (cheapest). For bulk simple judgments use a cheap model and low effort; reserve strong models for a few hard problems.\nconst tools = {\n";
+    var d: []const u8 = "const tools = {\n";
     for (all) |tool| {
         if (!enabled(tool, depth)) continue;
         n = n ++ .{tool.name};
@@ -240,7 +237,7 @@ pub const Tools = struct {
             if (std.mem.eql(u8, cfg.model, model)) break true;
         } else false;
         if (!known) try models.append(a, cfg.model);
-        const options = try std.fmt.allocPrint(a, "Provider: {s}; same-provider models: {f}; current model: {f}. effort: {f} (server/model support varies). Omit model/effort to inherit; effort=default resets to server defaults; off may map to low on reasoning-only Codex models. No provider switching.", .{ @tagName(cfg.provider), std.json.fmt(models.items, .{}), std.json.fmt(cfg.model, .{}), std.json.fmt(provider.Config.effort_values, .{}) });
+        const options = try std.fmt.allocPrint(a, "model: {f}; current: {f}; effort low/medium/high (else inherit); bulk: cheap/low; schema→parsed JSON data.", .{ std.json.fmt(models.items, .{}), std.json.fmt(cfg.model, .{}) });
         defer a.free(options);
         return std.mem.replaceOwned(u8, a, t.api().docs, "{{llm_options}}", options);
     }
@@ -524,29 +521,40 @@ test "llm admission rejects call 101 before dispatch and resets on each Run" {
     try testing.expect(fresh.ok);
 }
 
-test "delegation descriptions stay adjacent and at most three lines each" {
+test "tool descriptions stay concise and delegation stays adjacent" {
     for (all, 0..) |tool, index| {
-        if (std.mem.eql(u8, tool.name, "llm") or std.mem.eql(u8, tool.name, "agent"))
-            try testing.expect(std.mem.count(u8, tool.doc, "\n") < 3);
+        try expectConciseComments(tool.doc);
         if (std.mem.eql(u8, tool.name, "llm"))
             try testing.expectEqualStrings("agent", all[index + 1].name);
     }
 }
 
-test "generated llm options follow provider catalog and effort validation for both depths" {
+fn expectConciseComments(doc: []const u8) !void {
+    var chars: usize = 0;
+    var lines = std.mem.splitScalar(u8, doc, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "//")) |at|
+            chars += try std.unicode.utf8CountCodepoints(line[at + 2 ..]);
+    }
+    try testing.expect(chars <= 600);
+}
+
+test "generated llm options stay concise and follow provider catalog for both depths" {
     const codex = @import("provider/codex.zig");
     const chat = @import("provider/openai.zig");
-    const efforts = try std.json.Stringify.valueAlloc(testing.allocator, provider.Config.effort_values, .{});
-    defer testing.allocator.free(efforts);
     for ([_]provider.Id{ .codex, .chat_completions }) |id| {
         for ([_]u32{ 0, 1 }) |depth| {
             var t: Tools = .{ .io = testing.io, .home = "/unused", .depth = depth, .cfg = .{ .provider = id, .base_url = "", .api_key = "", .model = "custom\"model\n", .reasoning_effort = "high" } };
             const rendered = try t.documentation(testing.allocator);
             defer testing.allocator.free(rendered);
             try testing.expect(std.mem.indexOf(u8, rendered, "{{llm_options}}") == null);
-            try testing.expect(std.mem.indexOf(u8, rendered, efforts) != null);
-            try testing.expect(std.mem.indexOf(u8, rendered, "Omit model/effort to inherit") != null);
-            try testing.expect(std.mem.indexOf(u8, rendered, "No provider switching") != null);
+            try testing.expect(std.mem.indexOf(u8, rendered, "effort low/medium/high (else inherit)") != null);
+            try testing.expect(std.mem.indexOf(u8, rendered, "off may map") == null);
+            try testing.expect(std.mem.indexOf(u8, rendered, "usage counts toward") == null);
+            const llm_start = std.mem.indexOf(u8, rendered, "  // Pure single-step").?;
+            const signature = std.mem.indexOfPos(u8, rendered, llm_start, "  async llm(").?;
+            const llm_end = std.mem.indexOfScalarPos(u8, rendered, signature, '\n').?;
+            try expectConciseComments(rendered[llm_start..llm_end]);
             try testing.expect(std.mem.indexOf(u8, rendered, "custom\\\"model\\n") != null);
             try testing.expectEqual(depth == 0, std.mem.indexOf(u8, rendered, "async agent({") != null);
             for (codex.models) |model| {

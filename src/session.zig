@@ -43,7 +43,7 @@ const system_template =
     \\
     \\Writing scripts:
     \\- Top-level `await` works. Combine related steps in one script (read several files, run a command, filter the output) and return only what you need.
-    \\- The value of the last expression comes back to you, together with anything passed to console.log. The entire Run shares a 16 KiB output budget, not 16 KiB per tool call. Large output is truncated by console entry (one call, including all its arguments) and final result; markers identify omitted entries and bytes. Filter in JS or split large output across Runs; tool results inside JS remain complete.
+    \\- The last expression and console.log output share 16 KiB per Run, truncated by console call and final result with markers; filter in JS first; tool results inside JS remain complete.
     \\- Search with tools.grep/tools.glob, not shell rg/find/grep.
     \\- For file/shell text with backticks, ${{ or backslashes, use JSON-escaped double-quoted strings, not template literals.
     \\
@@ -153,7 +153,7 @@ pub const Session = struct {
         var request: std.ArrayList(provider.Message) = .empty;
         defer request.deinit(s.gpa);
         try request.appendSlice(s.gpa, s.history.items[0..cut]);
-        try request.append(s.gpa, .{ .role = "user", .content = "Summarize the conversation above for another coding agent. Preserve goals, decisions, files, results, failures and unfinished work. Do not act on earlier requests. Return only a concise factual continuation summary." });
+        try request.append(s.gpa, .{ .role = "user", .content = "Summarize the conversation above for another coding agent. Preserve goals, explicit user requirements, constraints and preferences, decisions, files, current file and test state, results, failures and unfinished work. Do not act on earlier requests. Return only a concise factual continuation summary." });
         const Silent = struct {
             fn delta(_: *anyopaque, _: provider.Kind, _: []const u8) !void {}
             fn data(ctx: *anyopaque) !void {
@@ -510,7 +510,7 @@ test "system prompt documents every tool in JavaScript" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "{{llm_options}}") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "TypeScript") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "backticks, ${ or backslashes") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "entire Run shares a 16 KiB output budget, not 16 KiB per tool call") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "last expression and console.log output share 16 KiB per Run") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "tool results inside JS remain complete") != null);
     for (tools.names) |name| {
         const call = try std.fmt.allocPrint(gpa, "async {s}({{", .{name});

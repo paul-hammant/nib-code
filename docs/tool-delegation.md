@@ -12,12 +12,14 @@ llm 限额常量在 `src/tools/llm.zig`：同进程最多 4 个并发调用，�
 
 ## 进度、用量与取消
 
+llm 与 agent 的 usage 都计入本轮累计用量；Esc/SIGINT/SIGTERM 取消在途及排队调用。
+
 子进程 NDJSON 在运行途中按完整行观察；最终输出仍按原路径解析和统计。进度使用受互斥锁保护、每个子 agent 仅保留最新快照的队列；工具线程只更新队列，不调用 Session sink。Run 线程在 sandbox 的 Promise/工具等待循环里约每 20 ms 尝试转发，转发不计入 JS 执行预算；eval 返回前已停止并 join 所有工具线程，之后清空队列。TUI 收到事件后复制数据到自身事件循环，正在运行的 agent Run 折叠显示进度汇总，ctrl+o 展开显示各子任务（prompt 前 40 个 Unicode 字符）；Run 结束恢复工具/耗时/改动摘要。
 
 bash 与子会话复用进程组执行器，取消和超时会清理整组；子 nib 先收到 SIGTERM，有 500 ms 取消自身工具，之后强制终止。用量按已收到的累计快照统计，无法推知服务端尚未报告的 token。路径写锁只协调当前进程内的 edit/write，不协调独立子会话或 bash 的写入。
 
 ## 工具说明的生成
 
-新会话构建 system 时，`src/tools.zig` 根据有效 provider 配置生成 llm 的 model / effort 列表：Codex 模型取自 `src/provider/codex.zig` 的目录；Chat Completions 至少提供 `src/provider/openai.zig` 的默认模型，另加入当前配置模型并去重。effort 取自 `provider.Config.effort_values`，服务端与各模型的实际支持仍可能不同。省略参数继承当前配置，显式 default 清除 effort 覆盖并使用服务端默认；off 在不能关闭推理的 Codex 模型上会映射成 low。选择只在当前 provider 内进行，不隐式切换 provider。
+新会话构建 system 时，`src/tools.zig` 根据有效 provider 配置生成 llm 的模型列表：Codex 模型取自 `src/provider/codex.zig` 的目录；Chat Completions 至少提供 `src/provider/openai.zig` 的默认模型，另加入当前配置模型并去重。effort 说明只列常用的 low/medium/high，省略 model/effort 仍继承当前配置；完整档位与映射见 [config.md](config.md) 和 [codex.md](codex.md)。选择只在当前 provider 内进行，不隐式切换 provider。
 
 工具说明中的模型名按 JSON 字符串编码，不直接插入原始配置文本。根会话与子会话使用同一生成路径，但子会话隐藏 agent；恢复会话仍沿用日志原始 system，不改写历史。架构理由见 [ADR 0010](adr/0010-subagents.md) 与 [ADR 0013](adr/0013-llm-functions.md)。
