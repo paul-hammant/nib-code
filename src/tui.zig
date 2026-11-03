@@ -15,6 +15,7 @@ const Menu = @import("tui/menu.zig").Menu;
 const status = @import("tui/status.zig");
 const view = @import("tui/view.zig");
 const selection = @import("tui/selection.zig");
+const reflect = @import("tui/reflect.zig");
 
 const Event = union(enum) {
     key_press: vaxis.Key,
@@ -173,7 +174,9 @@ const App = struct {
     selection: selection.Selection = .{},
     /// Shown on the status line until the next key or click; not part of the transcript.
     notice: ?[]const u8 = null,
-    notice_buf: [64]u8 = undefined,
+    notice_buf: [256]u8 = undefined,
+    /// Set while a /reflect Turn runs: its focus, owned.
+    reflecting: ?[]u8 = null,
     transcript: Transcript = .{},
     input: Editor = .{},
     pasting: bool = false,
@@ -191,6 +194,7 @@ const App = struct {
             t.cancel.store(true, .release);
             t.finish();
         }
+        app.stopReflecting();
         app.menu.deinit();
         app.transcript.deinit(app.gpa);
         app.input.deinit(app.gpa);
@@ -246,9 +250,13 @@ const App = struct {
                 try app.transcript.add(gpa, .info, msg);
             },
             .usage => |u| app.usage = u,
-            .done => app.finishTurn(),
+            .done => {
+                app.finishTurn();
+                try app.saveReflection();
+            },
             .failed => |msg| {
                 defer gpa.free(msg);
+                app.stopReflecting();
                 const canceled = app.turn.?.cancel.load(.acquire);
                 try app.transcript.add(gpa, if (canceled) .info else .err, if (canceled) "canceled" else msg);
                 app.finishTurn();
@@ -396,6 +404,19 @@ const App = struct {
                 app.turn = try Turn.spawn(gpa, session, app.loop, try gpa.dupe(u8, line), true);
                 app.activity = .start(app.io, .compacting);
             },
+            .reflect => {
+                if (app.cfg.missingKey()) return app.transcript.add(gpa, .err, "no API key");
+                const log_path = try std.fmt.allocPrint(gpa, "{s}/sessions/{s}.jsonl", .{ session.options.home, session.id });
+                defer gpa.free(log_path);
+                const text = try reflect.prompt(gpa, session.id, log_path, arg);
+                errdefer gpa.free(text);
+                const focus = try gpa.dupe(u8, arg);
+                errdefer gpa.free(focus);
+                try app.transcript.add(gpa, .user, line);
+                app.turn = try Turn.spawn(gpa, session, app.loop, text, false);
+                app.activity = .start(app.io, .thinking);
+                app.reflecting = focus;
+            },
         }
     }
 
@@ -403,6 +424,38 @@ const App = struct {
         const message = try std.fmt.allocPrint(app.gpa, fmt, args);
         defer app.gpa.free(message);
         try app.transcript.add(app.gpa, kind, message);
+    }
+
+    /// Appends the answer of a finished /reflect Turn to NIB_HOME/reflections.md.
+    fn saveReflection(app: *App) !void {
+        const focus = app.reflecting orelse return;
+        defer app.stopReflecting();
+        const history = app.session.history.items;
+        const last = if (history.len > 0) history[history.len - 1] else return;
+        const answer = if (std.mem.eql(u8, last.role, "assistant")) last.content orelse "" else "";
+        if (answer.len == 0) return;
+        const path = try std.fs.path.join(app.gpa, &.{ app.session.options.home, "reflections.md" });
+        defer app.gpa.free(path);
+        const cwd = try std.process.currentPathAlloc(app.io, app.gpa);
+        defer app.gpa.free(cwd);
+        reflect.append(app.io, app.gpa, path, .{
+            .unix_seconds = @intCast(@divFloor(std.Io.Clock.real.now(app.io).nanoseconds, std.time.ns_per_s)),
+            .session_id = app.session.id,
+            .cwd = cwd,
+            .model = app.cfg.model,
+            .effort = app.cfg.effectiveEffort(),
+            .focus = focus,
+            .answer = answer,
+        }) catch |err| {
+            app.notice = std.fmt.bufPrint(&app.notice_buf, "could not save reflection to {s}: {s}", .{ path, @errorName(err) }) catch null;
+            return;
+        };
+        app.notice = std.fmt.bufPrint(&app.notice_buf, "reflection saved to {s}", .{path}) catch null;
+    }
+
+    fn stopReflecting(app: *App) void {
+        if (app.reflecting) |focus| app.gpa.free(focus);
+        app.reflecting = null;
     }
 
     fn finishTurn(app: *App) void {

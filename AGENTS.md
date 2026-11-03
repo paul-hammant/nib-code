@@ -5,6 +5,7 @@
 - 构建：`zig build`；测试：`zig build test --summary all`；端到端（本地 mock，无真实 key）：`zig build` 后 `python3 tests/test_session.py`、`python3 tests/test_codex.py`
 - 安装到 `~/.local/bin/nib`：`zig build -Doptimize=ReleaseFast --prefix ~/.local`；版本号在 `build.zig.zon`，`nib --version` 查看。
 - 运行：`./zig-out/bin/nib`（TUI）、`nib ask '<prompt>'`、`nib js '<code>'`；TUI 用 `/compact` 手动压缩上下文。
+- 反思：TUI `/reflect [focus]` 让模型对照本会话日志（含子会话）只读地复盘 harness 的摩擦、建议和任务描述问题；正常结束的回答追加到 `$NIB_HOME/reflections.md`（每条带 UTC 时间、会话、cwd、模型、effort 表头），供批量分析后迭代。提示词模板是 `src/tui/reflect.md`（编译时嵌入，改措辞改这个文件），占位符 `{{session_id}}`、`{{log_path}}`、`{{focus}}`。
 - 推理强度：`nib --effort high` / `nib ask --effort high '<prompt>'`；TUI `/effort` 查询、`/effort high` 切换。支持 `default|off|none|minimal|low|medium|high|xhigh|max`（服务端支持因模型而异）；显式设置覆盖 thinking/effort 环境配置，`default` 清除覆盖。CLI 只影响当前进程；TUI `/effort <level>` 原子保存到 `$NIB_HOME/config.toml` 的顶层 `effort`，保留其他行，`default` 删除该键；保存失败不影响当前设置，只在对话区提示。子会话继承当前有效配置。
 - 恢复：`nib -c` / `nib --continue` 继续当前目录最近的根会话（跳过子会话）；`nib --resume <32位小写十六进制ID>` 指定会话；`ask` 也支持这些选项，放在 prompt 前后均可。
 - 默认 provider 是 Codex（环境和配置文件均未指定时为 `codex`）：读取 `$CODEX_HOME/auth.json`，默认 `~/.codex/auth.json`，无需 API key。默认 `gpt-6.1-sol` / 500000 tokens。模型、推理配置、恢复和凭证边界见 [docs/codex.md](docs/codex.md) 与 [ADR 0011](docs/adr/0011-provider-wire-protocols.md)。
@@ -22,7 +23,7 @@
 - `src/provider.zig`：Provider 接口与配置；`provider/` 下是各线路协议和 SSE 解析。
 - `src/sandbox.zig`：QuickJS Run 与宿主桥接。
 - `src/tools.zig`：工具表（给模型看的 JS 说明集中在这里）、`Tools` 共享状态与调度。`tools/` 下每个工具族一个入口文件，函数名即工具名：`files.zig`（read/edit/write）、`search.zig`（grep/glob）、`web.zig`（fetch）、`bash.zig`、`agent.zig`；其余是它们的辅助模块。加工具：在 `tools/` 写入口函数，再在表里加一行。
-- `src/tui.zig`：TUI 事件循环（按键、`/` 指令分派、Session 事件、后台 Turn）；`tui/` 下：`transcript.zig`（对话条目与折叠）、`viewport.zig`（滚动锚定）、`view.zig`（一帧的布局绘制）、`status.zig`（阶段与状态栏）、`menu.zig`（`/` 候选菜单）、`commands.zig`（指令表）、`editor.zig`（输入框）、`markdown.zig`、`selection.zig`（鼠标选区、高亮与剪贴板复制）。
+- `src/tui.zig`：TUI 事件循环（按键、`/` 指令分派、Session 事件、后台 Turn）；`tui/` 下：`transcript.zig`（对话条目与折叠）、`viewport.zig`（滚动锚定）、`view.zig`（一帧的布局绘制）、`status.zig`（阶段与状态栏）、`menu.zig`（`/` 候选菜单）、`commands.zig`（指令表）、`reflect.zig` + `reflect.md`（/reflect 的提示词与 reflections.md 追加）、`editor.zig`（输入框）、`markdown.zig`、`selection.zig`（鼠标选区、高亮与剪贴板复制）。
 - `tests/`：端到端测试和 mock 服务器；`scripts/`：辅助脚本。
 
 工具返回给 JS 的是完整数据，不能为保护模型上下文而悄悄截断或往正文里添加提示；否则 `read → JS 替换 → write` 会把截断标记写回文件，造成数据损坏。上下文截断只发生在 Session 把 Run 输出交给模型时（`tools.truncateMiddle`，保留首尾约 16 KiB），不改变 Run 内的数据。`read` 返回 `{ text, next_offset }`：按 offset/limit 原样返回请求的行，默认 2000 行，后续行起点单独放在 next_offset，EOF 时为 null；文件上限仍为 16 MiB。`bash` 的 `{ exit_code, output }` 中 output 原样返回，超过 16 MiB 报错并提示重定向到文件。工具自身明确约定的有界结果除外：grep 的文本/上下文行最多 500 字节，grep/glob 用 truncated 标记结果数量上限；fetch 的文本最多 1 MiB，返回 `{ url, status, content_type, text, truncated }`，truncated 明确表示正文不完整，提示不混入 text，下载超过 5 MiB 则报错。
