@@ -2,6 +2,8 @@ const std = @import("std");
 const chat = @import("provider/openai.zig");
 const codex = @import("provider/codex.zig");
 const cancelable = @import("provider/cancel.zig");
+const model_timing = @import("provider/timing.zig");
+pub const ModelTiming = model_timing.Model;
 
 pub const Id = enum { chat_completions, codex };
 
@@ -105,6 +107,7 @@ pub const Reply = struct {
 pub const Kind = enum { text, reasoning };
 
 pub const Sink = struct {
+    timing: ?*model_timing.Model = null,
     ctx: *anyopaque,
     onDelta: *const fn (ctx: *anyopaque, kind: Kind, text: []const u8) anyerror!void,
     onData: ?*const fn (ctx: *anyopaque) anyerror!void = null,
@@ -127,6 +130,8 @@ pub fn stream(
     cancel: *const std.atomic.Value(bool),
     detail: *?[]u8,
 ) !Reply {
+    if (sink.timing) |timing| timing.resetAttempt();
+    errdefer if (sink.timing) |timing| timing.resetAttempt();
     return switch (cfg.provider) {
         .chat_completions => cancelable.run(client.io, cancel, chat.stream, .{ gpa, out, client, cfg, messages, tools_json, max_tokens, sink, cancel, detail }),
         .codex => cancelable.run(client.io, cancel, codex.stream, .{ gpa, out, client, cfg, cache_key, messages, tools_json, max_tokens, sink, cancel, detail }),

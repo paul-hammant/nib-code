@@ -4,6 +4,7 @@ const provider = @import("../provider.zig");
 pub const RunResult = struct {
     tool_call_id: []const u8,
     ok: bool,
+    run_ms: ?u64 = null,
 };
 
 pub const Diagnostic = struct {
@@ -18,6 +19,13 @@ pub const Record = struct {
     diagnostic: ?Diagnostic = null,
     usage: ?provider.Usage = null,
     ms: ?u64 = null,
+    model_ms: ?u64 = null,
+    attempts: ?u32 = null,
+    first_token_ms: ?u64 = null,
+    code: ?[]const @import("../provider/timing.zig").Code = null,
+    run_ms: ?u64 = null,
+    calls: ?[]const @import("../sandbox/timing.zig").Call = null,
+    calls_omitted: ?u64 = null,
     run_results: ?[]const RunResult = null,
     cwd: ?[]const u8 = null,
     provider: ?provider.Id = null,
@@ -399,4 +407,54 @@ test "diagnostic append and replay do not commit messages or replace context tok
     const summaries = try list(t.io, a, std.fs.path.dirname(path).?, "/work");
     try t.expectEqual(@as(usize, 1), summaries.len);
     try t.expectEqualStrings("next", summaries[0].preview);
+}
+
+test "timing fields are optional and replay preserves mixed old and measured Steps" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const legacy = try parseRecord(a,
+        \\{"from":1,"messages":[{"role":"assistant","content":"old"}],"ms":10,"run_results":[]}
+    );
+    try t.expectEqual(@as(?u64, null), legacy.model_ms);
+    try t.expectEqual(@as(?u32, null), legacy.attempts);
+    try t.expectEqual(@as(?u64, null), legacy.first_token_ms);
+    try t.expect(legacy.code == null and legacy.calls == null and legacy.run_ms == null and legacy.calls_omitted == null);
+    const measured: Record = .{
+        .from = 2,
+        .messages = &.{.{ .role = "assistant", .content = "new" }},
+        .context_tokens = 99,
+        .ms = 80,
+        .model_ms = 60,
+        .attempts = 2,
+        .first_token_ms = 3,
+        .code = &.{.{ .tool_call_id = "c", .first_ms = 5, .last_ms = 55, .progress = &.{ .{ 5, 1 }, .{ 55, 20 } } }},
+        .run_ms = 20,
+        .calls = &.{.{ .name = "read", .start_ms = 1, .end_ms = 19, .ok = true, .run_index = 0 }},
+        .calls_omitted = 4,
+        .run_results = &.{.{ .tool_call_id = "c", .ok = true, .run_ms = 20 }},
+    };
+    const encoded = try std.json.Stringify.valueAlloc(a, measured, .{ .emit_null_optional_fields = false });
+    const restored = try parseRecord(a, encoded);
+    try t.expectEqual(@as(?u64, 60), restored.model_ms);
+    try t.expectEqual(@as(?u32, 2), restored.attempts);
+    try t.expectEqual([2]u64{ 55, 20 }, restored.code.?[0].progress[1]);
+    try t.expectEqualStrings("read", restored.calls.?[0].name);
+    try t.expectEqual(@as(?u64, 4), restored.calls_omitted);
+    try t.expectEqual(@as(?u64, 20), restored.run_results.?[0].run_ms);
+    const data = try std.fmt.allocPrint(a,
+        \\{{"from":0,"messages":[{{"role":"system","content":"base"}}]}}
+        \\{f}
+        \\{s}
+        \\
+    , .{ std.json.fmt(legacy, .{ .emit_null_optional_fields = false }), encoded });
+    var history: std.ArrayList(provider.Message) = .empty;
+    defer history.deinit(t.allocator);
+    var tokens: u64 = 0;
+    _ = try replay(t.allocator, a, data, &history, &tokens);
+    try t.expectEqual(@as(usize, 3), history.items.len);
+    try t.expectEqualStrings("old", history.items[1].content.?);
+    try t.expectEqualStrings("new", history.items[2].content.?);
+    try t.expectEqual(@as(u64, 99), tokens);
 }
