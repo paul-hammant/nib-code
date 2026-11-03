@@ -46,8 +46,8 @@ const all = [_]Tool{
         .name = "grep",
         .run = search.grep,
         .doc =
-        \\  // Search with JS RegExp (multiline ^/$) or literal text. Skips .git, .gitignore'd, binary and symlinked files; glob filters paths. path joins the input path and file; line is 1-based; column is the hit's 1-based UTF-8 byte column.
-        \\  // text is the matching line clipped around the hit to 500 bytes, with … for omissions; context lines keep prefixes, also capped at 500 bytes; neither splits UTF-8.
+        \\  // pattern: RegExp literal (recommended: no string escaping), e.g. /\.reserve\(/, or string; multiline ^/$; /i sets ignore_case unless explicit; other flags ignored. literal: plain text. Skips .git, ignored/binary/symlink files; glob filters paths.
+        \\  // path joins input path and file; line/UTF-8 byte column are 1-based. text: matching line clipped around hit to 500 bytes; context also capped at 500; … marks omissions; no split UTF-8. Example: await tools.grep({ pattern: /\.reserve\(/ })
         \\  async grep({ pattern, path = ".", glob, ignore_case = false, literal = false, context = 0, limit = 100 }) {}, // → { matches: [{ path, line, column, text, before?, after? }], truncated }
         ,
     },
@@ -497,6 +497,20 @@ test "llm map documentation example reaches the host byte for byte" {
     defer result.deinit(testing.allocator);
     try testing.expect(result.ok);
     try testing.expectEqualStrings("[{\"prompt\":\"Classify the input\",\"input\":\"yes\"},{\"prompt\":\"Classify the input\",\"input\":\"no\"}]", result.text);
+}
+
+test "grep documentation RegExp example reaches the host byte for byte" {
+    const grep_doc = for (all) |tool| {
+        if (std.mem.eql(u8, tool.name, "grep")) break tool.doc;
+    } else unreachable;
+    const marker = "Example: ";
+    const start = std.mem.indexOf(u8, grep_doc, marker).? + marker.len;
+    const end = std.mem.indexOfScalarPos(u8, grep_doc, start, '\n').?;
+    var dummy: u8 = 0;
+    const result = try sandbox.eval(testing.allocator, testing.io, grep_doc[start..end], .{}, .{ .ctx = &dummy, .names = &.{"grep"}, .call = EchoLlm.call }, null);
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.ok);
+    try testing.expectEqualStrings("{\"pattern\":\"\\\\.reserve\\\\(\"}", result.text);
 }
 
 test "llm admission rejects call 101 before dispatch and resets on each Run" {
