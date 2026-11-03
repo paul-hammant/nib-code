@@ -7,7 +7,7 @@ const Change = @import("tools/diff.zig").Change;
 const provider = @import("provider.zig");
 const session_log = @import("session/log.zig");
 const instructions = @import("session/instructions.zig");
-const formatOutcome = @import("session/output.zig").format;
+const output_format = @import("session/output.zig");
 
 pub const Event = @import("session/events.zig").Event;
 pub const ModelActivity = @import("session/events.zig").ModelActivity;
@@ -268,8 +268,14 @@ pub const Session = struct {
             defer request.deinit(s.gpa);
             try request.appendSlice(s.gpa, s.history.items);
             try request.appendSlice(s.gpa, pending.items);
-            const started = std.Io.Clock.awake.now(s.io);
-            const reply = try s.complete(request.items, sink, cancel, detail, partial);
+            const started: std.Io.Clock.Timestamp = .now(s.io, .awake);
+            var model_timing: provider.ModelTiming = .init(s.io, started);
+            var attempts: u32 = 0;
+            var first_data_ms: ?u64 = null;
+            const reply = try s.complete(request.items, sink, cancel, detail, partial, &model_timing, &attempts, &first_data_ms);
+            const model_ms: u64 = @intCast(@max(started.untilNow(s.io).raw.toMilliseconds(), 0));
+            var run_timing: sandbox.RunTiming = .init(s.io, started);
+            var run_ms: u64 = 0;
             partial.clear();
             s.usage.add(reply.usage);
             try sink.emit(sink.ctx, .{ .usage = s.usage });
@@ -284,15 +290,17 @@ pub const Session = struct {
             var run_results: std.ArrayList(session_log.RunResult) = .empty;
             defer run_results.deinit(s.gpa);
             var output_tokens: u64 = 0;
-            for (reply.tool_calls) |call| {
-                const result = try s.execute(call, sink, cancel);
+            for (reply.tool_calls, 0..) |call, run_index| {
+                run_timing.run_index = run_index;
+                const result = try s.execute(call, sink, cancel, &run_timing);
+                run_ms += result.run_ms orelse 0;
                 try sink.emit(sink.ctx, .{ .usage = s.usage });
                 try pending.append(s.gpa, .{ .role = "tool", .content = result.output, .tool_call_id = call.id });
-                try run_results.append(s.gpa, .{ .tool_call_id = call.id, .ok = result.ok });
+                try run_results.append(s.gpa, .{ .tool_call_id = call.id, .ok = result.ok, .run_ms = result.run_ms });
                 output_tokens += result.output.len / 3 + 1;
             }
             const tokens = reply.usage.prompt_tokens + reply.usage.completion_tokens + output_tokens;
-            const ms: u64 = @intCast(@max(started.durationTo(std.Io.Clock.awake.now(s.io)).toMilliseconds(), 0));
+            const ms: u64 = @intCast(@max(started.untilNow(s.io).raw.toMilliseconds(), 0));
             try s.log.commit(s.io, s.gpa, &s.history, &s.context_tokens, .{
                 .from = s.history.items.len,
                 .messages = pending.items,
@@ -300,6 +308,13 @@ pub const Session = struct {
                 .model = s.cfg.model,
                 .usage = reply.usage,
                 .ms = ms,
+                .model_ms = model_ms,
+                .attempts = attempts,
+                .first_data_ms = first_data_ms,
+                .code = try model_timing.finish(s.arena.allocator(), reply.tool_calls),
+                .run_ms = run_ms,
+                .calls = run_timing.entries[0..run_timing.count],
+                .calls_omitted = run_timing.omitted,
                 .run_results = run_results.items,
             });
             pending.clearRetainingCapacity();
@@ -311,14 +326,18 @@ pub const Session = struct {
         return error.TooManySteps;
     }
 
-    fn complete(s: *Session, messages: []const provider.Message, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, partial: *Partial) !provider.Reply {
+    fn complete(s: *Session, messages: []const provider.Message, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, partial: *Partial, timing: *provider.ModelTiming, attempts: *u32, first_data_ms: *?u64) !provider.Reply {
         const Forward = struct {
             sink: Sink,
             gpa: std.mem.Allocator,
             partial: *Partial,
+            io: std.Io,
+            started: std.Io.Clock.Timestamp,
+            first_data_ms: *?u64,
             emitted: bool = false,
             fn onData(ctx: *anyopaque) !void {
                 const f: *@This() = @ptrCast(@alignCast(ctx));
+                if (f.first_data_ms.* == null) f.first_data_ms.* = @intCast(@max(f.started.untilNow(f.io).raw.toMilliseconds(), 0));
                 try f.sink.modelActivity(.data);
             }
             fn onDelta(ctx: *anyopaque, kind: provider.Kind, text: []const u8) !void {
@@ -330,8 +349,9 @@ pub const Session = struct {
         };
         var attempt: u32 = 1;
         while (true) : (attempt += 1) {
-            var fwd: Forward = .{ .sink = sink, .gpa = s.gpa, .partial = partial };
-            const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData };
+            var fwd: Forward = .{ .sink = sink, .gpa = s.gpa, .partial = partial, .io = s.io, .started = timing.started, .first_data_ms = first_data_ms };
+            attempts.* = attempt;
+            const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .timing = timing };
             return request: {
                 try sink.modelActivity(.started);
                 defer sink.modelActivity(.finished) catch {};
@@ -370,19 +390,26 @@ pub const Session = struct {
     };
 
     pub fn run(s: *Session, code: []const u8, cancel: ?*const std.atomic.Value(bool)) !Ran {
+        return s.runTimed(code, cancel, null);
+    }
+
+    fn runTimed(s: *Session, code: []const u8, cancel: ?*const std.atomic.Value(bool), timing: ?*sandbox.RunTiming) !Ran {
         defer s.usage.add(s.tools.takeUsage());
         s.tools.progress.clear(s.gpa);
         defer s.tools.progress.clear(s.gpa);
         s.tools.discardChanges(s.gpa);
-        const outcome = try sandbox.eval(s.gpa, s.io, code, .{}, s.tools.host(), cancel);
+        var host = s.tools.host();
+        host.timing = timing;
+        if (timing) |t| t.started = .now(s.io, .awake);
+        const outcome = try sandbox.eval(s.gpa, s.io, code, .{}, host, cancel);
         errdefer outcome.deinit(s.gpa);
         return .{ .outcome = outcome, .changes = try s.tools.takeChanges(s.gpa, s.arena.allocator()) };
     }
 
-    const Executed = struct { output: []const u8, ok: bool };
+    const Executed = struct { output: []const u8, ok: bool, run_ms: ?u64 = null };
 
     /// Output is arena-owned.
-    fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const std.atomic.Value(bool)) !Executed {
+    fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const std.atomic.Value(bool), timing: *sandbox.RunTiming) !Executed {
         const a = s.arena.allocator();
         if (!std.mem.eql(u8, call.function.name, "run"))
             return .{ .ok = false, .output = try std.fmt.allocPrint(a, "error: unknown tool `{s}`; the only tool is `run`", .{call.function.name}) };
@@ -402,13 +429,14 @@ pub const Session = struct {
         var progress_sink = sink;
         s.tools.progress.sink = .{ .ctx = &progress_sink, .emit = Forward.progress };
         defer s.tools.progress.sink = null;
-        const ran = try s.run(args.value.code, cancel);
+        const ran = try s.runTimed(args.value.code, cancel, timing);
         const o = ran.outcome;
         defer o.deinit(s.gpa);
 
-        const output = try formatOutcome(a, o);
+        const output = try output_format.format(a, o);
+        const run_ms = timing.elapsed();
         try sink.emit(sink.ctx, .{ .run_end = .{ .ok = o.ok, .output = output, .changes = ran.changes } });
-        return .{ .output = output, .ok = o.ok };
+        return .{ .output = output, .ok = o.ok, .run_ms = run_ms };
     }
 };
 
@@ -472,19 +500,19 @@ test "formatOutcome" {
     const gpa = std.testing.allocator;
     var logs = "a\nb\n".*;
     var text = "1".*;
-    const ok = try formatOutcome(gpa, .{ .ok = true, .text = &text, .logs = &logs });
+    const ok = try output_format.format(gpa, .{ .ok = true, .text = &text, .logs = &logs });
     defer gpa.free(ok);
     try std.testing.expectEqualStrings("a\nb\nresult: 1", ok);
     var err = "Error: x".*;
     var none = "".*;
-    const bad = try formatOutcome(gpa, .{ .ok = false, .text = &err, .logs = &none });
+    const bad = try output_format.format(gpa, .{ .ok = false, .text = &err, .logs = &none });
     defer gpa.free(bad);
     try std.testing.expectEqualStrings("Error: x", bad);
     var undef = "undefined".*;
-    const logged = try formatOutcome(gpa, .{ .ok = true, .text = &undef, .logs = &logs });
+    const logged = try output_format.format(gpa, .{ .ok = true, .text = &undef, .logs = &logs });
     defer gpa.free(logged);
     try std.testing.expectEqualStrings("a\nb", logged);
-    const silent = try formatOutcome(gpa, .{ .ok = true, .text = &undef, .logs = &none });
+    const silent = try output_format.format(gpa, .{ .ok = true, .text = &undef, .logs = &none });
     defer gpa.free(silent);
     try std.testing.expectEqualStrings("(no output)", silent);
 }

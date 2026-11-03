@@ -55,6 +55,49 @@ def valid_messages(messages):
         i += 1
 
 
+def assert_timing(records, *, final_only=False):
+    steps = [record for record in records if record["from"] > 0]
+    assert len(steps) == 2, steps
+    for step in steps:
+        assert isinstance(step["model_ms"], int) and 0 <= step["model_ms"] <= step["ms"], step
+        assert step["attempts"] == 1, step
+        assert isinstance(step["first_data_ms"], int), step
+        assert 0 <= step["first_data_ms"] <= step["model_ms"], step
+        assert step["run_ms"] == sum(run["run_ms"] for run in step["run_results"]), step
+        assert 0 <= step["run_ms"] <= step["ms"], step
+    run_step, text_step = steps
+    assert len(run_step["run_results"]) == 1, run_step
+    call = next(call for message in run_step["messages"] for call in message.get("tool_calls", []))
+    arguments = call["function"]["arguments"]
+    assert "计时🙂" in json.loads(arguments)["code"]
+    assert len(arguments.encode("utf-8")) > len(arguments)
+    assert len(run_step["code"]) == 1, run_step
+    code = run_step["code"][0]
+    assert code["tool_call_id"] == call["id"], code
+    assert run_step["first_data_ms"] <= code["first_ms"] <= code["last_ms"] <= run_step["model_ms"], code
+    assert code["first_ms"] - run_step["first_data_ms"] >= 80, run_step
+    progress = code["progress"]
+    assert progress and progress[0][0] == code["first_ms"] and progress[-1][0] == code["last_ms"], code
+    assert progress[-1][1] == len(arguments.encode("utf-8")), code
+    assert all(a[0] <= b[0] and a[1] < b[1] for a, b in zip(progress, progress[1:])), code
+    if final_only:
+        assert code["first_ms"] == code["last_ms"] and len(progress) == 1, code
+    else:
+        assert code["first_ms"] < code["last_ms"] and code["last_ms"] - code["first_ms"] >= 50, code
+        assert len(progress) >= 2, code
+    assert [call["name"] for call in run_step["calls"]] == ["bash", "write", "read"], run_step
+    for call in run_step["calls"]:
+        assert call["ok"] is True and call["run_index"] == 0, call
+        duration = call["end_ms"] - call["start_ms"]
+        run_ms = run_step["run_results"][call["run_index"]]["run_ms"]
+        assert 0 <= call["start_ms"] <= call["end_ms"] <= run_ms, call
+        assert run_step["run_ms"] >= duration >= 0, call
+        if call["name"] == "bash":
+            assert duration >= 50, call
+    assert run_step.get("calls_omitted", 0) == 0, run_step
+    assert text_step["run_ms"] == 0 and not text_step.get("calls") and not text_step.get("code"), text_step
+
+
 with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
     tmp = Path(directory)
     requests_path = tmp / "requests.jsonl"
@@ -217,6 +260,13 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         compact_json = events(ask("json compact", "--json", workdir=json_cwd, window="4096"))
         assert any("notice" in e for e in compact_json)
         print("JSON E2E passed: NDJSON events, stdin, final text/usage/steps, resume, errors and notices")
+        timing_home = tmp / "timing-home"
+        timed = events(ask("--json", "timing", overrides={"NIB_HOME": str(timing_home)}))
+        timed_id = timed[0]["start"]["session_id"]
+        _, timed_records = replay(timing_home / "sessions" / f"{timed_id}.jsonl")
+        assert_timing(timed_records)
+        print("Chat Completions timing E2E passed: streamed UTF-8 arguments, model latency and per-tool Run timing")
+
         before = len(read_requests(requests_path))
         delegated = events(ask("--json", "delegate"))
         parent_id = delegated[0]["start"]["session_id"]

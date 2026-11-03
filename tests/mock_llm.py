@@ -5,6 +5,7 @@ request (last message is a tool result) gets a text answer quoting it.
 A user message containing "bad" makes the script use TypeScript syntax;
 "fail2" makes the second request of the Turn return HTTP 500.
 Summary requests return a short fixed summary without tool calls.
+"timing" streams UTF-8 Run arguments and invokes bash, write, then read.
 Set MOCK_PROMPT_TOKENS to override usage before compaction; summarized requests
 report a byte-based token estimate. Thinking is on unless the request sends
 thinking.type "disabled": replies then stream reasoning_content, and like
@@ -67,6 +68,11 @@ class H(http.server.BaseHTTPRequestHandler):
             d=('data: '+json.dumps(obj)+'\n\n').encode()
             self.wfile.write(b'%x\r\n'%len(d)+d+b'\r\n'); self.wfile.flush(); time.sleep(0.01)
         last=msgs[-1]
+        if lastuser == 'timing':
+            heartbeat = b': ping\n\n'
+            self.wfile.write(b'%x\r\n' % len(heartbeat) + heartbeat + b'\r\n')
+            self.wfile.flush()
+            time.sleep(.1)
         compacted = any(m.get('content','').startswith('Earlier session summary:') for m in msgs)
         def prompt_tokens(default):
             return sum(len(m.get('content') or '') for m in msgs)//3 if compacted else int(os.environ.get('MOCK_PROMPT_TOKENS',default))
@@ -144,7 +150,11 @@ class H(http.server.BaseHTTPRequestHandler):
                     command = 'echo $$ > ' + shlex.quote(lastuser.split(' ', 2)[2]) + '; exec sleep 30'
                 code = 'await tools.bash({command: ' + json.dumps(command) + '}); ({prompt: ' + json.dumps(lastuser) + ', agent: typeof tools.agent, keys: Object.keys(tools)})'
             if 'bad' in last['content']: code='const x: number = 1; x'
-            args=json.dumps({"code":code})
+            if lastuser == "timing":
+                code = ('await tools.bash({command: "sleep 0.08; printf 计时🙂"}); '
+                        'await tools.write({path: "timing.txt", content: "计时🙂"}); '
+                        'await tools.read({path: "timing.txt"})')
+            args=json.dumps({"code":code}, ensure_ascii=lastuser != "timing")
             if thinking: ev({"choices":[{"delta":{"reasoning_content":"先用 bash 看看。"}}]})
             ev({"choices":[{"delta":{"content":"我先跑一下。"}}]})
             # stream the arguments in fragments, as real providers do

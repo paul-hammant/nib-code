@@ -1,6 +1,8 @@
 """Local Codex Responses SSE mock. Usage: mock_codex.py PORT LOGFILE.
 
 Only use fabricated credentials: requests (including headers) are logged verbatim.
+"timing" streams UTF-8 Run arguments with delays; "timing final only" puts
+the same arguments only in response.output_item.done, without argument deltas.
 MOCK_CODEX_AUTH names the temporary auth.json rotated by the 'rotate auth' probe.
 """
 import http.server
@@ -60,6 +62,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"%x\r\n" % len(data) + data + b"\r\n")
             self.wfile.flush()
         output = []
+        if prompt in ("timing", "timing final only"):
+            heartbeat = b": ping\n\n"
+            self.wfile.write(b"%x\r\n" % len(heartbeat) + heartbeat + b"\r\n")
+            self.wfile.flush()
+            time.sleep(.1)
         event("response.created", response={"id": f"resp_{number}", "status": "in_progress", "output": []})
         failure = None
         if prompt == "stream retry server" and attempt == 0:
@@ -116,14 +123,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 code = 'await tools.bash({command: "env | cut -d= -f1 | sort"})'
             elif prompt.startswith("read auth "):
                 code = 'try { await tools.read({path: ' + json.dumps(prompt[len("read auth "):]) + '}) } catch (e) { e.message }'
-            arguments = json.dumps({"code": code})
+            if prompt in ("timing", "timing final only"):
+                code = ('await tools.bash({command: "sleep 0.08; printf 计时🙂"}); '
+                        'await tools.write({path: "timing.txt", content: "计时🙂"}); '
+                        'await tools.read({path: "timing.txt"})')
+            arguments = json.dumps({"code": code}, ensure_ascii=prompt not in ("timing", "timing final only"))
             index = len(output)
             item = {"id": f"fc_{number}", "type": "function_call", "call_id": f"call_{number}",
                     "name": "run", "arguments": arguments, "status": "completed"}
-            event("response.output_item.added", output_index=index, item={**item, "arguments": "", "status": "in_progress"})
-            for offset in range(0, len(arguments), 7):
-                event("response.function_call_arguments.delta", item_id=item["id"], output_index=index, delta=arguments[offset:offset + 7])
-            event("response.function_call_arguments.done", item_id=item["id"], output_index=index, arguments=arguments)
+            if prompt != "timing final only":
+                event("response.output_item.added", output_index=index, item={**item, "arguments": "", "status": "in_progress"})
+                for offset in range(0, len(arguments), 7):
+                    event("response.function_call_arguments.delta", item_id=item["id"], output_index=index, delta=arguments[offset:offset + 7])
+                    if prompt == "timing":
+                        time.sleep(.01)
+                event("response.function_call_arguments.done", item_id=item["id"], output_index=index, arguments=arguments)
             event("response.output_item.done", output_index=index, item=item)
             output.append(item)
             text = None

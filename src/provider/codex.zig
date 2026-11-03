@@ -231,6 +231,7 @@ fn readStream(gpa: std.mem.Allocator, out: std.mem.Allocator, reader: *std.Io.Re
         try sink.received();
         const data = (try parser.feed(gpa, line.written())) orelse continue;
         const ev = std.json.parseFromSliceLeaky(ResponseEvent, a, data, .{ .ignore_unknown_fields = true }) catch return error.InvalidResponse;
+        if (sink.timing) |timing| observeTiming(timing, ev);
         if (std.mem.eql(u8, ev.type, "response.output_text.delta") or std.mem.eql(u8, ev.type, "response.refusal.delta")) {
             const delta = ev.delta orelse return error.InvalidResponse;
             try text.appendSlice(gpa, delta);
@@ -262,7 +263,7 @@ fn readStream(gpa: std.mem.Allocator, out: std.mem.Allocator, reader: *std.Io.Re
     var reasoning: std.ArrayList(std.json.Value) = .empty;
     defer reasoning.deinit(gpa);
     var phase: ?[]const u8 = null;
-    for (items.items) |maybe| {
+    for (items.items, 0..) |maybe, index| {
         const item = maybe orelse return error.InvalidResponse;
         const value = try std.json.parseFromValueLeaky(Output, a, item, .{ .ignore_unknown_fields = true });
         if (std.mem.eql(u8, value.type, "message")) {
@@ -271,10 +272,29 @@ fn readStream(gpa: std.mem.Allocator, out: std.mem.Allocator, reader: *std.Io.Re
             try reasoning.append(gpa, item);
         } else if (std.mem.eql(u8, value.type, "function_call")) {
             if (calls.items.len >= 64) return error.TooManyToolCalls;
+            if (sink.timing) |timing| timing.bind(index, calls.items.len);
             try calls.append(gpa, .{ .id = try out.dupe(u8, value.call_id orelse return error.InvalidResponse), .function = .{ .name = try out.dupe(u8, value.name orelse return error.InvalidResponse), .arguments = try out.dupe(u8, value.arguments orelse return error.InvalidResponse) } });
         }
     }
     return .{ .text = try out.dupe(u8, text.items), .phase = phase, .reasoning = if (reasoning.items.len > 0) .{ .provider = .codex, .data = try std.json.Stringify.valueAlloc(out, reasoning.items, .{}) } else null, .tool_calls = try out.dupe(p.ToolCall, calls.items), .usage = usage };
+}
+
+fn observeTiming(timing: *p.ModelTiming, ev: ResponseEvent) void {
+    if (std.mem.eql(u8, ev.type, "response.function_call_arguments.delta")) {
+        if (ev.delta) |delta| timing.arguments(ev.output_index, delta.len);
+    } else if (std.mem.eql(u8, ev.type, "response.output_item.added") or std.mem.eql(u8, ev.type, "response.output_item.done")) {
+        const item = ev.item orelse return;
+        if (item != .object) return;
+        const kind = item.object.get("type") orelse return;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "function_call")) return;
+        const args = item.object.get("arguments") orelse return;
+        if (args != .string) return;
+        if (std.mem.eql(u8, ev.type, "response.output_item.added")) {
+            timing.arguments(ev.output_index, args.string.len);
+        } else {
+            timing.finalArguments(ev.output_index, args.string.len);
+        }
+    }
 }
 
 fn incompleteResponse(gpa: std.mem.Allocator, detail: *?[]u8) anyerror {
@@ -518,4 +538,53 @@ test "Codex stream activity covers non-text events and SSE heartbeats" {
         _ = try readStream(t.allocator, arena.allocator(), &reader, .{ .ctx = &state, .onDelta = State.delta, .onData = State.data }, &cancel, &detail);
         try t.expectEqual(std.mem.count(u8, prefix, "\n") + 2, state.received);
     }
+}
+
+test "Codex parser times argument deltas and final-only calls at sparse output indices" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var bytes: std.Io.Writer.Allocating = .init(t.allocator);
+    defer bytes.deinit();
+    for (0..70) |index| {
+        try bytes.writer.print("data: {{\"type\":\"response.output_item.done\",\"output_index\":{d},\"item\":{{\"type\":\"reasoning\"}}}}\n\n", .{index});
+    }
+    try bytes.writer.writeAll(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":70,\"item\":{\"type\":\"function_call\",\"call_id\":\"streamed\",\"name\":\"run\",\"arguments\":\"\"}}\n\n" ++
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":70,\"delta\":\"{\"}\n\n" ++
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":70,\"delta\":\"}\"}\n\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":70,\"item\":{\"type\":\"function_call\",\"call_id\":\"streamed\",\"name\":\"run\",\"arguments\":\"{}\"}}\n\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":71,\"item\":{\"type\":\"function_call\",\"call_id\":\"final\",\"name\":\"run\",\"arguments\":\"{ }\"}}\n\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":72,\"item\":{\"type\":\"function_call\",\"call_id\":\"other\",\"name\":\"search\",\"arguments\":\"{}\"}}\n\n" ++
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+    );
+    const Counter = struct {
+        fn delta(ctx: *anyopaque, _: p.Kind, _: []const u8) !void {
+            const count: *usize = @ptrCast(@alignCast(ctx));
+            count.* += 1;
+        }
+    };
+    var count: usize = 0;
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var detail: ?[]u8 = null;
+    defer if (detail) |text| t.allocator.free(text);
+    var timing: p.ModelTiming = .init(t.io, .now(t.io, .awake));
+    var reader: std.Io.Reader = .fixed(bytes.written());
+    const reply = try readStream(t.allocator, out, &reader, .{ .ctx = &count, .onDelta = Counter.delta, .timing = &timing }, &cancel, &detail);
+    try t.expectEqual(@as(usize, 0), count);
+    try t.expectEqual(@as(usize, 3), reply.tool_calls.len);
+    const codes = try timing.finish(out, reply.tool_calls);
+    try t.expectEqual(@as(usize, 2), codes.len);
+    try t.expectEqualStrings("streamed", codes[0].tool_call_id);
+    try t.expectEqual(@as(usize, 2), codes[0].progress.len);
+    try t.expectEqual(@as(u64, 1), codes[0].progress[0][1]);
+    try t.expectEqual(@as(u64, 2), codes[0].progress[1][1]);
+    try t.expectEqualStrings("final", codes[1].tool_call_id);
+    try t.expectEqual(@as(usize, 1), codes[1].progress.len);
+    try t.expectEqual(codes[1].first_ms, codes[1].last_ms);
+    try t.expectEqual(@as(u64, 3), codes[1].progress[0][1]);
+    reader = .fixed(bytes.written());
+    const untimed = try readStream(t.allocator, out, &reader, .{ .ctx = &count, .onDelta = Counter.delta }, &cancel, &detail);
+    try t.expectEqualStrings(try std.json.Stringify.valueAlloc(out, untimed, .{}), try std.json.Stringify.valueAlloc(out, reply, .{}));
 }

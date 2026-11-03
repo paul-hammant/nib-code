@@ -128,6 +128,7 @@ pub fn stream(
         const chunk = std.json.parseFromSliceLeaky(Chunk, arena.allocator(), data, .{
             .ignore_unknown_fields = true,
         }) catch return error.InvalidResponse;
+        if (sink.timing) |timing| observeTiming(timing, chunk);
         if (chunk.usage) |u| usage = .{ .prompt_tokens = u.prompt_tokens, .completion_tokens = u.completion_tokens, .prompt_cache_hit_tokens = if (u.prompt_tokens_details) |d| d.cached_tokens else u.prompt_cache_hit_tokens };
         for (chunk.choices) |choice| {
             const d = choice.delta;
@@ -159,7 +160,18 @@ pub fn stream(
         .id = try out.dupe(u8, p.id.items),
         .function = .{ .name = try out.dupe(u8, p.name.items), .arguments = try out.dupe(u8, p.args.items) },
     };
+    if (sink.timing) |timing| {
+        for (tool_calls, 0..) |_, index| timing.bind(index, index);
+    }
     return .{ .text = try out.dupe(u8, text.items), .reasoning = if (reasoning.items.len > 0) .{ .provider = .chat_completions, .data = try out.dupe(u8, reasoning.items) } else null, .tool_calls = tool_calls, .usage = usage };
+}
+
+fn observeTiming(timing: *@import("../provider.zig").ModelTiming, chunk: Chunk) void {
+    for (chunk.choices) |choice| {
+        for (choice.delta.tool_calls) |call| {
+            if (call.function.arguments) |args| timing.arguments(call.index, args.len);
+        }
+    }
 }
 
 fn requestBody(gpa: std.mem.Allocator, cfg: Config, messages: []const Message, tools_json: []const u8, max_tokens: ?u32) ![]u8 {
@@ -248,4 +260,28 @@ test "summary request limits output and omits tools" {
     defer parsed.deinit();
     try t.expect(!parsed.value.object.contains("tools"));
     try t.expectEqual(@as(i64, 512), parsed.value.object.get("max_tokens").?.integer);
+}
+
+test "chat timing collects argument chunks without emitted text" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var timing: @import("../provider.zig").ModelTiming = .init(t.io, .now(t.io, .awake));
+    const chunks = [_][]const u8{
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call\",\"function\":{\"name\":\"run\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"}\"}}]}}]}",
+    };
+    for (chunks) |data| {
+        const chunk = try std.json.parseFromSliceLeaky(Chunk, out, data, .{});
+        observeTiming(&timing, chunk);
+    }
+    timing.bind(0, 0);
+    const calls = [_]ToolCall{.{ .id = "call", .function = .{ .name = "run", .arguments = "{}" } }};
+    const codes = try timing.finish(out, &calls);
+    try t.expectEqual(@as(usize, 1), codes.len);
+    try t.expectEqual(@as(usize, 2), codes[0].progress.len);
+    try t.expectEqual(@as(u64, 1), codes[0].progress[0][1]);
+    try t.expectEqual(@as(u64, 2), codes[0].progress[1][1]);
 }

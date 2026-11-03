@@ -1,6 +1,8 @@
 const std = @import("std");
 const c = @import("qjs");
 const console = @import("sandbox/console.zig");
+const run_timing = @import("sandbox/timing.zig");
+pub const RunTiming = run_timing.Run;
 
 /// `JS_UNDEFINED` is a C compound-literal macro that translate-c cannot lower.
 const js_undefined: c.JSValue = .{ .u = .{ .uint64 = 0 }, .tag = c.JS_TAG_UNDEFINED };
@@ -25,6 +27,8 @@ pub const Host = struct {
     cancel: ?*std.atomic.Value(bool) = null,
     call: *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8, args_json: []const u8) ToolResult,
     poll: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+    /// Borrowed until eval returns; inspect entries or change started/run_index only between evals.
+    timing: ?*RunTiming = null,
 };
 
 pub const LogEntry = console.Entry;
@@ -71,6 +75,7 @@ const State = struct {
         settle: [2]c.JSValue,
         thread: ?std.Thread = null,
         result: ?ToolResult = null,
+        timing_index: ?usize = null,
         next: ?*Call = null,
 
         fn deinit(call: *Call, ctx: *c.JSContext) void {
@@ -87,9 +92,13 @@ const State = struct {
         fn work(call: *Call) void {
             const st = call.state;
             const h = st.host.?;
+            const timing = if (call.timing_index != null) h.timing else null;
+            const start_ms = if (timing) |t| t.elapsed() else 0;
             const result = h.call(h.ctx, st.gpa, call.name, call.args);
+            const end_ms = if (timing) |t| t.elapsed() else 0;
             st.mutex.lockUncancelable(st.io);
             defer st.mutex.unlock(st.io);
+            if (timing) |t| t.complete(call.timing_index.?, start_ms, end_ms, result == .ok);
             call.result = result;
             if (st.ready_tail) |tail| tail.next = call else st.ready = call;
             st.ready_tail = call;
@@ -175,7 +184,12 @@ const State = struct {
             if (c.JS_IsJobPending(rt)) continue;
             while (next < st.calls.items.len and active < 8) : (next += 1) {
                 const call = st.calls.items[next].?;
-                call.thread = try std.Thread.spawn(.{}, Call.work, .{call});
+                const timing = st.host.?.timing;
+                if (timing) |t| call.timing_index = t.reserve(call.name);
+                call.thread = std.Thread.spawn(.{}, Call.work, .{call}) catch |err| {
+                    if (timing) |t| t.undoReservation(call.timing_index);
+                    return err;
+                };
                 active += 1;
             }
             if (active == 0) return;
@@ -505,4 +519,86 @@ test "tool concurrency is bounded while excess calls queue" {
     try testing.expectEqualStrings("24", result.text);
     try testing.expect(slow.peak.load(.monotonic) > 1 and slow.peak.load(.monotonic) <= 8);
     try testing.expectEqual(0, slow.active.load(.monotonic));
+}
+
+const TimingHost = struct {
+    fetched: std.atomic.Value(bool) = .init(false),
+    fail_fetch: bool = false,
+
+    fn call(ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8, _: []const u8) ToolResult {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (std.mem.eql(u8, name, "read")) {
+            while (!self.fetched.load(.acquire)) std.Thread.yield() catch {};
+            std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(40), .clock = .awake }, testing.io) catch unreachable;
+        } else if (std.mem.eql(u8, name, "fetch")) {
+            self.fetched.store(true, .release);
+            std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(10), .clock = .awake }, testing.io) catch unreachable;
+            if (self.fail_fetch) return .{ .err = gpa.dupe(u8, "fetch failed") catch unreachable };
+        }
+        return .{ .ok = gpa.dupe(u8, "{\"exit_code\":7}") catch unreachable };
+    }
+};
+
+test "native timings span evals and count omitted calls without treating exit codes as errors" {
+    var timing: RunTiming = .init(testing.io, .now(testing.io, .awake));
+    var dummy: TimingHost = .{};
+    const host: Host = .{ .ctx = &dummy, .names = &.{"bash"}, .call = TimingHost.call, .timing = &timing };
+    const first = try run("await tools.bash()", .{}, host);
+    defer first.deinit(testing.allocator);
+    try testing.expect(first.ok);
+    timing.started = .now(testing.io, .awake);
+    timing.run_index = 1;
+    const second = try run("await Promise.all(Array.from({length: 204}, () => tools.bash()))", .{}, host);
+    defer second.deinit(testing.allocator);
+    try testing.expect(second.ok);
+    try testing.expectEqual(@as(usize, 200), timing.count);
+    try testing.expectEqual(@as(u64, 5), timing.omitted);
+    try testing.expectEqual(@as(usize, 0), timing.entries[0].run_index);
+    for (timing.entries[1..timing.count]) |entry| {
+        try testing.expectEqual(@as(usize, 1), entry.run_index);
+        try testing.expectEqualStrings("bash", entry.name);
+        try testing.expect(entry.end_ms >= entry.start_ms);
+        try testing.expect(entry.ok);
+    }
+}
+
+test "parallel native timings retain dispatch order and survive rejected JS with outstanding workers" {
+    for ([_]bool{ false, true }) |fail_fetch| {
+        var timing: RunTiming = .init(testing.io, .now(testing.io, .awake));
+        var host_ctx: TimingHost = .{ .fail_fetch = fail_fetch };
+        const result = try run("await Promise.all([tools.read(), tools.fetch()])", .{}, .{
+            .ctx = &host_ctx,
+            .names = &.{ "read", "fetch" },
+            .call = TimingHost.call,
+            .timing = &timing,
+        });
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual(!fail_fetch, result.ok);
+        try testing.expectEqual(@as(usize, 2), timing.count);
+        try testing.expectEqual(@as(u64, 0), timing.omitted);
+        const read = timing.entries[0];
+        const fetch = timing.entries[1];
+        try testing.expectEqualStrings("read", read.name);
+        try testing.expectEqualStrings("fetch", fetch.name);
+        try testing.expect(read.ok);
+        try testing.expectEqual(!fail_fetch, fetch.ok);
+        try testing.expect(read.end_ms - read.start_ms >= 40);
+        try testing.expect(fetch.end_ms - fetch.start_ms >= 10);
+        try testing.expect(read.start_ms <= fetch.end_ms);
+        try testing.expect(fetch.start_ms <= read.end_ms);
+    }
+}
+
+test "undispatched tools do not produce native timings" {
+    var timing: RunTiming = .init(testing.io, .now(testing.io, .awake));
+    var dummy: TimingHost = .{};
+    const result = try run("tools.bash(); throw new Error('before dispatch')", .{}, .{
+        .ctx = &dummy,
+        .names = &.{"bash"},
+        .call = TimingHost.call,
+        .timing = &timing,
+    });
+    defer result.deinit(testing.allocator);
+    try testing.expect(!result.ok);
+    try testing.expectEqual(@as(usize, 0), timing.count);
 }
