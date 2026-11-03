@@ -504,7 +504,7 @@ const App = struct {
                 if (app.cfg.missingKey()) return app.transcript.add(gpa, .err, "no API key");
                 const log_path = try std.fmt.allocPrint(gpa, "{s}/sessions/{s}.jsonl", .{ session.options.home, session.id });
                 defer gpa.free(log_path);
-                const text = try reflect.prompt(gpa, session.id, log_path, arg);
+                const text = try reflect.prompt(gpa, session.id, log_path, app.issueRepo() orelse Issues.default_repo, arg);
                 errdefer gpa.free(text);
                 const focus = try gpa.dupe(u8, arg);
                 errdefer gpa.free(focus);
@@ -551,10 +551,16 @@ const App = struct {
         try app.fileIssues(answer, path);
     }
 
+    /// Null when `NIB_ISSUE_REPO=off`.
+    fn issueRepo(app: *const App) ?[]const u8 {
+        const repo = app.environ.get("NIB_ISSUE_REPO") orelse Issues.default_repo;
+        return if (std.mem.eql(u8, repo, "off")) null else repo;
+    }
+
     /// Publishes the reflection's issue drafts in the background; no confirmation by design.
     fn fileIssues(app: *App, answer: []const u8, reflections_path: []const u8) !void {
-        const repo = app.environ.get("NIB_ISSUE_REPO") orelse Issues.default_repo;
-        if (std.mem.eql(u8, repo, "off") or app.issues != null) return;
+        const repo = app.issueRepo() orelse return;
+        if (app.issues != null) return;
         const job = try app.gpa.create(Issues);
         job.* = .{ .gpa = app.gpa, .io = app.io, .loop = app.loop, .environ = app.environ, .arena = .init(app.gpa) };
         errdefer job.finish();

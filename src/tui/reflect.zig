@@ -1,17 +1,19 @@
 const std = @import("std");
 
-/// Edit the wording in reflect.md; `{{session_id}}`, `{{log_path}}` and `{{focus}}` are filled in here.
+/// Edit the wording in reflect.md; `{{session_id}}`, `{{log_path}}`, `{{issue_repo}}` and `{{focus}}` are filled in here.
 const template = @embedFile("reflect.md");
 
 /// The reflection request sent to the model as the user message. Caller owns it.
-pub fn prompt(gpa: std.mem.Allocator, session_id: []const u8, log_path: []const u8, focus: []const u8) ![]u8 {
+pub fn prompt(gpa: std.mem.Allocator, session_id: []const u8, log_path: []const u8, issue_repo: []const u8, focus: []const u8) ![]u8 {
     const focus_text = if (focus.len == 0) try gpa.dupe(u8, "") else try std.fmt.allocPrint(gpa, "\n用户特别想了解：{s}", .{focus});
     defer gpa.free(focus_text);
     const with_id = try std.mem.replaceOwned(u8, gpa, template, "{{session_id}}", session_id);
     defer gpa.free(with_id);
     const with_log = try std.mem.replaceOwned(u8, gpa, with_id, "{{log_path}}", log_path);
     defer gpa.free(with_log);
-    return std.mem.replaceOwned(u8, gpa, with_log, "{{focus}}", focus_text);
+    const with_repo = try std.mem.replaceOwned(u8, gpa, with_log, "{{issue_repo}}", issue_repo);
+    defer gpa.free(with_repo);
+    return std.mem.replaceOwned(u8, gpa, with_repo, "{{focus}}", focus_text);
 }
 
 pub const Entry = struct {
@@ -150,15 +152,16 @@ fn firstLine(text: []const u8) []const u8 {
 
 const testing = std.testing;
 
-test "prompt fills the session, log path and optional focus" {
-    const plain = try prompt(testing.allocator, "abc123", "/h/.nib/sessions/abc123.jsonl", "");
+test "prompt fills the session, log path, issue repo and optional focus" {
+    const plain = try prompt(testing.allocator, "abc123", "/h/.nib/sessions/abc123.jsonl", "o/r", "");
     defer testing.allocator.free(plain);
     try testing.expect(std.mem.indexOf(u8, plain, "本会话日志是 /h/.nib/sessions/abc123.jsonl") != null);
     try testing.expect(std.mem.indexOf(u8, plain, "parent_session_id 是 abc123") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "gh issue list --repo o/r ") != null);
     try testing.expect(std.mem.indexOf(u8, plain, "{{") == null);
     try testing.expect(std.mem.indexOf(u8, plain, "用户特别想了解") == null);
 
-    const focused = try prompt(testing.allocator, "abc123", "/l", "子 agent");
+    const focused = try prompt(testing.allocator, "abc123", "/l", "o/r", "子 agent");
     defer testing.allocator.free(focused);
     try testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, focused, "\n"), "用户特别想了解：子 agent"));
 }
