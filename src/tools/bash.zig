@@ -18,7 +18,10 @@ pub fn bash(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
     }
     switch (policy.check(a.value.command, t.home)) {
         .allow => {},
-        .deny => |why| return fail(gpa, "refused by nib: {s}. If it is really needed, ask the user to run it.", .{why}),
+        .deny => |why| return if (std.mem.eql(u8, why, policy.too_long))
+            fail(gpa, "refused by nib: {s}", .{why})
+        else
+            fail(gpa, "refused by nib: {s}. If it is really needed, ask the user to run it.", .{why}),
     }
 
     // In-shell redirect keeps stdout/stderr interleaving order.
@@ -62,6 +65,21 @@ test "bash refuses commands denied by policy" {
     const r = try callTool("bash", "{\"command\":\"sudo true\"}");
     defer freeResult(r);
     try testing.expect(std.mem.startsWith(u8, r.err, "refused by nib: privileged"));
+}
+
+test "bash explains the shell-word limit for long heredocs" {
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(testing.allocator);
+    try script.appendSlice(testing.allocator, "python3 - <<'EOF'\n");
+    for (0..300) |_| try script.appendSlice(testing.allocator, "x = 1\n");
+    try script.appendSlice(testing.allocator, "EOF\n");
+    try testing.expect(script.items.len < 2048);
+    const args = try std.json.Stringify.valueAlloc(testing.allocator, .{ .command = script.items }, .{});
+    defer testing.allocator.free(args);
+    const r = try callTool("bash", args);
+    defer freeResult(r);
+    try testing.expectEqualStrings("refused by nib: " ++ policy.too_long, r.err);
+    try testing.expect(std.mem.indexOf(u8, r.err, "256 shell words") != null);
 }
 
 test "bash timeout kills the whole process group" {

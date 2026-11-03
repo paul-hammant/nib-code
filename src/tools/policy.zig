@@ -9,6 +9,7 @@ pub const Verdict = union(enum) {
 };
 
 const max_words = 256;
+pub const too_long = std.fmt.comptimePrint("command has more than {d} shell words (heredoc bodies count); write long scripts to a file with tools.write and run that file", .{max_words});
 
 const always_denied = [_][]const u8{
     "sudo",    "su",        "doas",  "pkexec", "shutdown", "reboot", "poweroff", "halt",
@@ -47,7 +48,7 @@ fn checkDepth(command: []const u8, home: []const u8, depth: u8) Verdict {
     if (std.mem.indexOf(u8, command, "--no-preserve-root") != null) return .{ .deny = "rm --no-preserve-root" };
 
     var buf: [max_words]Word = undefined;
-    const words = split(command, &buf) orelse return .{ .deny = "command is too long to check" };
+    const words = split(command, &buf) orelse return .{ .deny = too_long };
 
     var fetched = false;
     var start: usize = 0;
