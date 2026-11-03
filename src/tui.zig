@@ -2,6 +2,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const Session = @import("session.zig").Session;
 const SessionEvent = @import("session.zig").Event;
+const ModelActivity = @import("session.zig").ModelActivity;
 const Sink = @import("session.zig").Sink;
 const provider = @import("provider.zig");
 const config = @import("config.zig");
@@ -24,6 +25,7 @@ const Event = union(enum) {
     paste_end,
     mouse: vaxis.Mouse,
     tick,
+    model_activity: struct { state: ModelActivity, at: std.Io.Clock.Timestamp },
     /// Slices are owned by the receiver.
     delta: struct { kind: provider.Kind, text: []u8, step: u32 },
     run_start: struct { code: []u8, step: u32 },
@@ -62,6 +64,7 @@ const Turn = struct {
     loop: *vaxis.Loop(Event),
     cancel: std.atomic.Value(bool) = .init(false),
     thread: std.Thread = undefined,
+    last_model_activity: ?std.Io.Clock.Timestamp = null,
 
     fn spawn(gpa: std.mem.Allocator, session: *Session, loop: *vaxis.Loop(Event), text: []const u8, compact: bool) !*Turn {
         const t = try gpa.create(Turn);
@@ -82,10 +85,23 @@ const Turn = struct {
     }
 
     fn execute(t: *Turn, compact: bool, detail: *?[]u8) !void {
-        const sink: Sink = .{ .ctx = t, .emit = emit };
+        const sink: Sink = .{ .ctx = t, .emit = emit, .onModelActivity = modelActivity };
         if (compact) {
             _ = try t.session.compact(sink, &t.cancel, detail);
         } else try t.session.turn(t.text, sink, &t.cancel, detail);
+    }
+
+    fn modelActivity(ctx: *anyopaque, state: ModelActivity) !void {
+        const t: *Turn = @ptrCast(@alignCast(ctx));
+        try t.modelActivityAt(state, .now(t.session.io, .awake));
+    }
+
+    fn modelActivityAt(t: *Turn, state: ModelActivity, at: std.Io.Clock.Timestamp) !void {
+        if (state == .data) if (t.last_model_activity) |last| {
+            if (last.durationTo(at).raw.toMilliseconds() < 1000) return;
+        };
+        try t.loop.postEvent(.{ .model_activity = .{ .state = state, .at = at } });
+        t.last_model_activity = if (state == .finished) null else at;
     }
 
     fn emit(ctx: *anyopaque, ev: SessionEvent) !void {
@@ -293,6 +309,10 @@ const App = struct {
                 }
             },
             .tick => {},
+            .model_activity => |activity| {
+                if (activity.state == .started and app.activity.phase != .compacting) app.activity.set(app.io, .thinking);
+                app.activity.modelActivity(activity.state, activity.at);
+            },
             .winsize => |ws| {
                 app.selection.clear();
                 try app.vx.resize(gpa, app.w, ws);
@@ -666,4 +686,51 @@ test "usage snapshots refresh the footer without reading the running Session" {
     _ = try app.handle(.{ .usage = .{ .tokens = usage, .context = 200, .steps = 1 } });
     try t.expectEqual(@as(u64, 200), app.context);
     try t.expectEqualDeep(usage, app.usage);
+}
+
+test "Turn throttles model data events but sends request boundaries immediately" {
+    const t = std.testing;
+    var loop: vaxis.Loop(Event) = .{ .io = t.io, .tty = undefined, .vaxis = undefined, .queue = .init(t.io) };
+    var turn: Turn = undefined;
+    turn.loop = &loop;
+    turn.last_model_activity = null;
+    const start: std.Io.Clock.Timestamp = .now(t.io, .awake);
+    for (0..100) |i| {
+        try turn.modelActivityAt(.data, start.addDuration(.{ .raw = .fromMilliseconds(@intCast(i * 10)), .clock = .awake }));
+    }
+    const first = (try loop.tryEvent()).?.model_activity;
+    try t.expectEqual(ModelActivity.data, first.state);
+    try t.expectEqualDeep(start, first.at);
+    try t.expectEqual(@as(?Event, null), try loop.tryEvent());
+    const before = start.addDuration(.{ .raw = .fromMilliseconds(999), .clock = .awake });
+    try turn.modelActivityAt(.data, before);
+    try t.expectEqual(@as(?Event, null), try loop.tryEvent());
+    const next = start.addDuration(.{ .raw = .fromMilliseconds(1000), .clock = .awake });
+    try turn.modelActivityAt(.data, next);
+    const second = (try loop.tryEvent()).?.model_activity;
+    try t.expectEqual(ModelActivity.data, second.state);
+    try t.expectEqualDeep(next, second.at);
+    try t.expectEqual(@as(?Event, null), try loop.tryEvent());
+
+    try turn.modelActivityAt(.started, next);
+    const before_next = next.addDuration(.{ .raw = .fromMilliseconds(999), .clock = .awake });
+    for (0..100) |_| try turn.modelActivityAt(.data, before_next);
+    try t.expectEqual(ModelActivity.started, (try loop.tryEvent()).?.model_activity.state);
+    try t.expectEqual(@as(?Event, null), try loop.tryEvent());
+    const after_start = next.addDuration(.{ .raw = .fromMilliseconds(1000), .clock = .awake });
+    try turn.modelActivityAt(.data, after_start);
+    try turn.modelActivityAt(.finished, after_start);
+    try turn.modelActivityAt(.started, after_start);
+    try turn.modelActivityAt(.data, after_start);
+    for ([_]ModelActivity{ .data, .finished, .started }) |state| {
+        try t.expectEqual(state, (try loop.tryEvent()).?.model_activity.state);
+    }
+    try t.expectEqual(@as(?Event, null), try loop.tryEvent());
+
+    const silence = after_start.addDuration(.{ .raw = .fromMilliseconds(30_000), .clock = .awake });
+    try turn.modelActivityAt(.data, silence);
+    const resumed = (try loop.tryEvent()).?.model_activity;
+    try t.expectEqual(ModelActivity.data, resumed.state);
+    try t.expectEqualDeep(silence, resumed.at);
+    try t.expectEqual(@as(?Event, null), try loop.tryEvent());
 }

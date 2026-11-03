@@ -47,6 +47,8 @@ pub const Progress = struct {
     }
 };
 
+pub const ModelActivity = enum { started, data, finished };
+
 pub const Event = union(enum) {
     /// Slices are valid only during the callback.
     delta: struct { kind: provider.Kind, text: []const u8 },

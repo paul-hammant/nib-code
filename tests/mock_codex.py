@@ -90,11 +90,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if not summary and body.get("reasoning", {}).get("effort") != "none":
             for part in range(2):
-                item = {"id": f"rs_{number}_{part}", "type": "reasoning", "summary": [{"type": "summary_text", "text": "Mock reasoning."}],
+                summary_text = "Mock reasoning." if body.get("reasoning", {}).get("summary") == "auto" else ""
+                item = {"id": f"rs_{number}_{part}", "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": summary_text}] if summary_text else [],
                         "encrypted_content": f"fake-encrypted-{number}-{part}" + ("x" * 100000 if prompt == "large reasoning" else "")}
                 index = len(output)
                 event("response.output_item.added", output_index=index, item={"id": item["id"], "type": "reasoning", "summary": []})
-                event("response.reasoning_summary_text.delta", item_id=item["id"], output_index=index, summary_index=0, delta="Mock reasoning.")
+                for offset in range(0, len(summary_text), 5):
+                    event("response.reasoning_summary_text.delta", item_id=item["id"], output_index=index,
+                          summary_index=0, delta=summary_text[offset:offset + 5])
                 event("response.output_item.done", output_index=index, item=item)
                 output.append(item)
         last = inputs[-1] if inputs else {}

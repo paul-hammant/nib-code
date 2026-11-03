@@ -10,10 +10,16 @@ const instructions = @import("session/instructions.zig");
 const formatOutcome = @import("session/output.zig").format;
 
 pub const Event = @import("session/events.zig").Event;
+pub const ModelActivity = @import("session/events.zig").ModelActivity;
 
 pub const Sink = struct {
     ctx: *anyopaque,
     emit: *const fn (ctx: *anyopaque, event: Event) anyerror!void,
+    onModelActivity: ?*const fn (ctx: *anyopaque, activity: ModelActivity) anyerror!void = null,
+
+    fn modelActivity(sink: Sink, activity: ModelActivity) !void {
+        if (sink.onModelActivity) |notify| try notify(sink.ctx, activity);
+    }
 };
 
 const max_steps = 50;
@@ -150,11 +156,20 @@ pub const Session = struct {
         try request.append(s.gpa, .{ .role = "user", .content = "Summarize the conversation above for another coding agent. Preserve goals, decisions, files, results, failures and unfinished work. Do not act on earlier requests. Return only a concise factual continuation summary." });
         const Silent = struct {
             fn delta(_: *anyopaque, _: provider.Kind, _: []const u8) !void {}
+            fn data(ctx: *anyopaque) !void {
+                const target: *Sink = @ptrCast(@alignCast(ctx));
+                try target.modelActivity(.data);
+            }
         };
+        var observer = sink;
         // Thinking would spend the small summary budget on reasoning.
         var cfg = s.cfg;
         cfg.thinking = false;
-        const reply = try provider.stream(s.gpa, a, s.client, cfg, s.id, request.items, "[]", @intCast(@min(2048, @max(32, s.cfg.context_window / 8))), .{ .ctx = s, .onDelta = Silent.delta }, cancel, detail);
+        const reply = request_model: {
+            try sink.modelActivity(.started);
+            defer sink.modelActivity(.finished) catch {};
+            break :request_model try provider.stream(s.gpa, a, s.client, cfg, s.id, request.items, "[]", @intCast(@min(2048, @max(32, s.cfg.context_window / 8))), .{ .ctx = &observer, .onDelta = Silent.delta, .onData = Silent.data }, cancel, detail);
+        };
         s.usage.add(reply.usage);
         try sink.emit(sink.ctx, .{ .usage = s.usage });
         if (cancel.load(.acquire)) return error.Canceled;
@@ -302,6 +317,10 @@ pub const Session = struct {
             gpa: std.mem.Allocator,
             partial: *Partial,
             emitted: bool = false,
+            fn onData(ctx: *anyopaque) !void {
+                const f: *@This() = @ptrCast(@alignCast(ctx));
+                try f.sink.modelActivity(.data);
+            }
             fn onDelta(ctx: *anyopaque, kind: provider.Kind, text: []const u8) !void {
                 const f: *@This() = @ptrCast(@alignCast(ctx));
                 f.emitted = true;
@@ -312,8 +331,12 @@ pub const Session = struct {
         var attempt: u32 = 1;
         while (true) : (attempt += 1) {
             var fwd: Forward = .{ .sink = sink, .gpa = s.gpa, .partial = partial };
-            const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta };
-            return provider.stream(s.gpa, s.arena.allocator(), s.client, s.cfg, s.id, messages, tools_json, null, provider_sink, cancel, detail) catch |err| {
+            const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData };
+            return request: {
+                try sink.modelActivity(.started);
+                defer sink.modelActivity(.finished) catch {};
+                break :request provider.stream(s.gpa, s.arena.allocator(), s.client, s.cfg, s.id, messages, tools_json, null, provider_sink, cancel, detail);
+            } catch |err| {
                 if (err == error.Canceled or cancel.load(.acquire)) return err;
                 const codex = s.cfg.provider == .codex;
                 if ((!codex and fwd.emitted) or attempt == max_attempts or !transient(err)) {
@@ -499,9 +522,18 @@ test "failed Turn leaves replay equal to in-memory safe history" {
     var detail: ?[]u8 = null;
     defer if (detail) |d| t.allocator.free(d);
     const Quiet = struct {
-        fn emit(_: *anyopaque, _: Event) !void {}
+        activities: std.ArrayList(ModelActivity) = .empty,
+        fn emit(ctx: *anyopaque, event: Event) !void {
+            const quiet: *@This() = @ptrCast(@alignCast(ctx));
+            if (event == .retry) try std.testing.expectEqual(ModelActivity.finished, quiet.activities.items[quiet.activities.items.len - 1]);
+        }
+        fn activity(ctx: *anyopaque, state: ModelActivity) !void {
+            const quiet: *@This() = @ptrCast(@alignCast(ctx));
+            try quiet.activities.append(std.testing.allocator, state);
+        }
     };
-    var ctx: u8 = 0;
+    var ctx: Quiet = .{};
+    defer ctx.activities.deinit(t.allocator);
     for (0..2) |completed| {
         if (completed == 1) try session.commit(session.history.items.len, &.{
             .{ .role = "user", .content = "saved" },
@@ -510,7 +542,13 @@ test "failed Turn leaves replay equal to in-memory safe history" {
         }, 100, null);
         for ([_]bool{ false, true }) |canceled| {
             cancel.store(canceled, .release);
-            const result = session.turn("failed turn", .{ .ctx = &ctx, .emit = Quiet.emit }, &cancel, &detail);
+            ctx.activities.clearRetainingCapacity();
+            const result = session.turn("failed turn", .{ .ctx = &ctx, .emit = Quiet.emit, .onModelActivity = Quiet.activity }, &cancel, &detail);
+            try t.expectEqual(@as(usize, if (canceled) 2 else max_attempts * 2), ctx.activities.items.len);
+            var i: usize = 0;
+            while (i < ctx.activities.items.len) : (i += 2) {
+                try t.expectEqualSlices(ModelActivity, &.{ .started, .finished }, ctx.activities.items[i..][0..2]);
+            }
             try t.expectError(if (canceled) error.Canceled else error.UnsupportedUriScheme, result);
             const directory = try std.fs.path.join(a, &.{ root, "sessions" });
             const path = try std.fmt.allocPrint(a, "{s}/{s}.jsonl", .{ directory, session.id });
@@ -521,6 +559,12 @@ test "failed Turn leaves replay equal to in-memory safe history" {
             try t.expectEqualDeep(session.history.items, restored.items);
             try t.expectEqual(session.context_tokens, tokens);
         }
+    }
+    for ([_]bool{ false, true }) |canceled| {
+        cancel.store(canceled, .release);
+        ctx.activities.clearRetainingCapacity();
+        try t.expectError(if (canceled) error.Canceled else error.UnsupportedUriScheme, session.compact(.{ .ctx = &ctx, .emit = Quiet.emit, .onModelActivity = Quiet.activity }, &cancel, &detail));
+        try t.expectEqualSlices(ModelActivity, &.{ .started, .finished }, ctx.activities.items);
     }
 }
 

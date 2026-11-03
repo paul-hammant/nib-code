@@ -117,6 +117,7 @@ pub fn stream(
             error.ReadFailed => return response.bodyErr() orelse err,
             else => return err,
         } orelse break;
+        try sink.received();
         const data = (try parser.feed(gpa, line)) orelse continue;
         if (std.mem.eql(u8, data, "[DONE]")) {
             done = true;

@@ -1,5 +1,6 @@
 const std = @import("std");
 const provider = @import("../provider.zig");
+const ModelActivity = @import("../session/events.zig").ModelActivity;
 
 pub const Phase = enum { thinking, writing, running, retrying, compacting };
 
@@ -9,8 +10,9 @@ const spinner = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", 
 pub const Activity = struct {
     phase: Phase = .thinking,
     since: std.Io.Clock.Timestamp,
+    last_data: ?std.Io.Clock.Timestamp = null,
 
-    pub const Label = struct { phase: Phase, ms: u64 };
+    pub const Label = struct { phase: Phase, ms: u64, no_data_ms: ?u64 = null };
 
     pub fn start(io: std.Io, phase: Phase) Activity {
         return .{ .phase = phase, .since = .now(io, .awake) };
@@ -18,11 +20,27 @@ pub const Activity = struct {
 
     pub fn set(a: *Activity, io: std.Io, phase: Phase) void {
         if (a.phase == phase) return;
-        a.* = start(io, phase);
+        a.phase = phase;
+        a.since = .now(io, .awake);
+    }
+
+    pub fn modelActivity(a: *Activity, activity: ModelActivity, at: std.Io.Clock.Timestamp) void {
+        a.last_data = switch (activity) {
+            .started, .data => at,
+            .finished => null,
+        };
     }
 
     pub fn label(a: Activity, io: std.Io) Label {
-        return .{ .phase = a.phase, .ms = @intCast(@max(a.since.untilNow(io).raw.toMilliseconds(), 0)) };
+        return a.labelAt(.now(io, .awake));
+    }
+
+    fn labelAt(a: Activity, now: std.Io.Clock.Timestamp) Label {
+        return .{
+            .phase = a.phase,
+            .ms = @intCast(@max(a.since.durationTo(now).raw.toMilliseconds(), 0)),
+            .no_data_ms = if (a.last_data) |at| @intCast(@max(at.durationTo(now).raw.toMilliseconds(), 0)) else null,
+        };
     }
 };
 
@@ -45,7 +63,13 @@ pub const Text = struct {
 
     pub fn format(text: *Text, s: Status, scrolled: bool) []const u8 {
         var w: std.Io.Writer = .fixed(&text.activity);
-        if (s.busy) |b| w.print("{s} {s} {d}s · step {d} · esc to cancel", .{ spinner[(b.ms / 100) % spinner.len], @tagName(b.phase), b.ms / 1000, s.current_step }) catch {};
+        if (s.busy) |b| {
+            w.print("{s} {s} {d}s", .{ spinner[(b.ms / 100) % spinner.len], @tagName(b.phase), b.ms / 1000 }) catch {};
+            if (b.no_data_ms) |ms| if (ms >= 30_000) {
+                w.print(" · no data {d}s", .{ms / 1000}) catch {};
+            };
+            w.print(" · step {d} · esc to cancel", .{s.current_step}) catch {};
+        }
         if (scrolled) {
             if (w.end > 0) w.writeAll(" · ") catch {};
             w.writeAll("↑ history · PgDn to return") catch {};
@@ -92,4 +116,33 @@ test "activity is optional and footer shows latest reported usage" {
     try std.testing.expectEqualStrings("m · effort server default · ctx 25% · in 1.8M (94% cached) · out 18k · last turn: 2 steps", line);
     const busy = text.footer(.{ .cfg = cfg, .context = 400, .steps = 1, .usage = .{ .prompt_tokens = 1200, .completion_tokens = 50, .prompt_cache_hit_tokens = 600 }, .busy = .{ .phase = .running, .ms = 100 } }, 200);
     try std.testing.expectEqualStrings("m · effort server default · ctx 40% · in 1.2k (50% cached) · out 50 · turn: 1 steps", busy);
+}
+
+test "model silence threshold, data reset, and request boundaries" {
+    const t = std.testing;
+    const cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "m" };
+    var text: Text = .{};
+    var activity = Activity.start(t.io, .thinking);
+    const start = activity.since;
+    const before = start.addDuration(.{ .raw = .fromMilliseconds(29_999), .clock = .awake });
+    const threshold = start.addDuration(.{ .raw = .fromMilliseconds(30_000), .clock = .awake });
+    const later = start.addDuration(.{ .raw = .fromMilliseconds(45_000), .clock = .awake });
+    activity.modelActivity(.started, start);
+    try t.expect(std.mem.indexOf(u8, text.format(.{ .cfg = cfg, .busy = activity.labelAt(before) }, false), "no data") == null);
+    try t.expect(std.mem.indexOf(u8, text.format(.{ .cfg = cfg, .busy = activity.labelAt(threshold) }, false), " · no data 30s") != null);
+    try t.expectEqualStrings("⠋ thinking 45s · no data 45s · step 1 · esc to cancel", text.format(.{ .cfg = cfg, .busy = activity.labelAt(later) }, false));
+    activity.modelActivity(.data, later);
+    try t.expectEqualStrings("⠋ thinking 45s · step 1 · esc to cancel", text.format(.{ .cfg = cfg, .busy = activity.labelAt(later) }, false));
+    activity.set(t.io, .writing);
+    try t.expectEqual(@as(?u64, 0), activity.labelAt(later).no_data_ms);
+    activity.modelActivity(.finished, later);
+    for ([_]Phase{ .running, .retrying, .thinking }) |phase| {
+        activity.set(t.io, phase);
+        try t.expectEqual(@as(?u64, null), activity.labelAt(later).no_data_ms);
+        try t.expect(std.mem.indexOf(u8, text.format(.{ .cfg = cfg, .busy = activity.labelAt(later) }, false), "no data") == null);
+    }
+    activity.set(t.io, .compacting);
+    activity.modelActivity(.started, later);
+    try t.expectEqual(@as(?u64, 0), activity.labelAt(later).no_data_ms);
+    try t.expectEqual(Phase.compacting, activity.phase);
 }

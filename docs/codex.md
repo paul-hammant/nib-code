@@ -61,6 +61,12 @@ NIB_THINKING=on 默认用 medium；NIB_REASONING_EFFORT 可显式指定服务端
 
 凭证缺失、格式错误或 401 会给出登录提示。401 只重新读取文件并重试一次，让 Codex CLI 已刷新的凭证生效；仍失败请运行 `codex` 重新登录。nib 不使用 refresh_token。凭证不进入会话日志、argv 或子进程环境。tools.agent 从 stdin 接收有效配置，跳过配置文件读取，各自读取 auth.json；bash 不继承常见密钥环境变量。read/edit/write 拒绝凭证文件，bash 拒绝引用凭证目录；这些是防误操作保护，不是系统沙箱，详见 [ADR 0006](adr/0006-deny-dangerous-commands.md)。
 
+## 推理摘要与流活动
+
+发送 `reasoning` 配置时同时请求 `summary: auto`，服务端提供的推理摘要沿用 reasoning delta 展示；未显式配置推理时不额外发送 reasoning。加密推理条目的日志存储与上下文回传保持不变。
+
+TUI 在模型请求期间记录最后收到 SSE 行的时间，包括文本、推理摘要、工具参数、output_item 事件和心跳。连续 30 秒没有数据时，活动行追加 `· no data Ns`，收到新数据后清除。Turn 对连续数据的 TUI 活动通知按 1 秒节流，请求开始和结束仍立即通知；静默后收到数据会立即清除提示。这个计时独立于 thinking/writing 的阶段时长；Run 执行和重试等待不计入，每次请求重新计时，压缩请求同样显示。静默提示不表示连接已经断开，也不触发读超时或重试；仍可按 Esc 取消。活动通知仅用于 TUI，不新增 ask NDJSON 事件或日志内容。
+
 ## 流失败与重试
 
 流中的 `error`、`response.failed`、`response.incomplete` 保留服务端 code/message 或 incomplete reason，报错格式为 `Codex stream failed: <code>: <message>; the Step was not committed.`；message 按 UTF-8 边界截到约 300 字节。
