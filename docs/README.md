@@ -48,6 +48,7 @@
 - [codex.md](codex.md)：使用本机 Codex 登录、配置与凭证边界
 - [run-output.md](run-output.md)：工具数据完整性、显式上限、Run 输出预算与执行超时
 - [tool-delegation.md](tool-delegation.md)：read / llm / agent 的选择、接口与委派实现
+- [releases/](releases/)：版本发布说明（[0.2.0](releases/0.2.0.md)）
 
 ## 没写成 ADR 的选择
 
