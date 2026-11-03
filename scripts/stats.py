@@ -141,6 +141,165 @@ def bash_timing_group(code):
         return None
 
 
+JS_TOKEN = re.compile(r'''\s+|//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|[A-Za-z_$][\w$]*|[^\s]''', re.S)
+
+
+def literal_string(token):
+    if len(token) < 2 or token[0] not in ("'", '"', '`') or token[-1] != token[0]:
+        return None
+    try:
+        if token.startswith('`'):
+            return token[1:-1] if '${' not in token and '\\' not in token else None
+        if token.startswith("'"):
+            encoded, index = ['"'], 1
+            while index < len(token) - 1:
+                char = token[index]
+                if char == '\\':
+                    index += 1
+                    escape = token[index]
+                    if escape == "'":
+                        encoded.append("'")
+                    elif escape in '"/\\bfnrtu':
+                        encoded.extend(('\\', escape))
+                    else:
+                        return None
+                elif char == '"':
+                    encoded.append('\\"')
+                else:
+                    encoded.append(char)
+                index += 1
+            token = ''.join(encoded) + '"'
+        return json.loads(token)
+    except (ValueError, IndexError):
+        return None
+
+
+def literal_properties(tokens, start):
+    if tokens[start:start + 1] != ['{']:
+        return None
+    stack, parts, part = ['}'], [], []
+    closing = {'{': '}', '[': ']', '(': ')'}
+    for index in range(start + 1, len(tokens)):
+        token = tokens[index]
+        if token in closing:
+            stack.append(closing[token])
+        elif token in ('}', ']', ')'):
+            if not stack or stack.pop() != token:
+                return None
+            if not stack:
+                if tokens[index + 1:index + 2] != [')']:
+                    return None
+                if part:
+                    parts.append(part)
+                break
+        if token == ',' and len(stack) == 1:
+            parts.append(part)
+            part = []
+        else:
+            part.append(token)
+    else:
+        return None
+    properties = {}
+    for part in parts:
+        if len(part) < 3 or part[1] != ':':
+            return None
+        key = literal_string(part[0]) if part[0].startswith(('"', "'", '`')) else part[0]
+        if key is None or key in properties or not re.fullmatch(r'[A-Za-z_$][\w$]*', key):
+            return None
+        properties[key] = literal_string(part[2]) if len(part) == 3 else None
+    return properties
+
+
+def validation_command(command):
+    if not command or re.search(r'[$`<>\\\n]', command):
+        return False
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|()')
+        lexer.whitespace_split = True
+        if any(token and all(c in ';&|()' for c in token) for token in lexer):
+            return False
+    except ValueError:
+        return False
+    group = bash_timing_group('tools.bash({command: ' + json.dumps(command) + '})')
+    if not group:
+        return False
+    words = group.split()
+    executable = words[0]
+    subcommand = words[1] if len(words) > 1 else ''
+    families = {'zig': {'build', 'test', 'fmt', 'ast-check'},
+                'cargo': {'build', 'test', 'fmt', 'check', 'clippy'},
+                'git': {'diff'}, 'go': {'build', 'test', 'fmt', 'vet'},
+                'npm': {'test'}, 'npx': {'tsc'},
+                'make': {'test', 'check', 'build', 'lint', 'fmt'}}
+    if executable in {'diff', 'pytest', 'py.test', 'mypy', 'tsc', 'check', 'fmt'}:
+        return True
+    if executable == 'ruff':
+        return subcommand in {'check', 'format'}
+    if executable in {'python', 'python3'}:
+        return bool(re.match(r'^\s*(?:python3?|/[^ ]*/python3?)\s+(?:-m\s+(?:unittest|pytest)\b|tests/test_[\w.-]+\.py(?:\s|$))', command))
+    return subcommand in families.get(executable, set())
+
+
+def step_structure(codes, cwd=None):
+    writes, complete, validation, calls = False, True, True, 0
+    paths = set()
+    for code in codes:
+        if not isinstance(code, str):
+            complete = validation = False
+            continue
+        tokens = [m[0] for m in JS_TOKEN.finditer(code)
+                  if not m[0].isspace() and not m[0].startswith(('//', '/*'))]
+        safe_calls = {('console', '.', 'log'), ('JSON', '.', 'stringify'), ('JSON', '.', 'parse'),
+                      ('Promise', '.', 'all'), ('Promise', '.', 'allSettled')}
+        for index, token in enumerate(tokens):
+            if token.startswith('`') and '${' in token:
+                complete = validation = False
+            if token == '(' and index:
+                direct_tool = index >= 3 and tokens[index - 3:index - 1] == ['tools', '.']
+                safe_call = tuple(tokens[max(0, index - 3):index]) in safe_calls
+                grouping = tokens[index - 1] in ('=', '(', '[', ',', ':', '!', '&&', '||', 'await', 'return')
+                if not direct_tool and not safe_call and not grouping:
+                    complete = validation = False
+            if token == '/' or (token == 'tools' and tokens[index + 1:index + 2] != ['.']):
+                complete = validation = False
+            if token != 'tools' or tokens[index + 1:index + 2] != ['.']:
+                continue
+            name = tokens[index + 2] if index + 2 < len(tokens) else ''
+            if tokens[index + 3:index + 4] != ['(']:
+                complete = validation = False
+                continue
+            calls += 1
+            properties = literal_properties(tokens, index + 4)
+            if name in ('edit', 'write'):
+                writes = True
+                path = properties.get('path') if properties is not None else None
+                if not path:
+                    complete = False
+                else:
+                    paths.add(os.path.normpath(os.path.join(cwd or '', path)))
+            elif name not in ('read', 'grep', 'glob', 'bash', 'fetch'):
+                complete = False
+            if name != 'bash' or properties is None or not validation_command(properties.get('command')):
+                validation = False
+    return dict(writes=writes, paths=paths if writes and complete else None,
+                validation=bool(calls) and validation)
+
+
+def header_group(header, group_by):
+    field = {'version': 'nib_version', 'system': 'system_sha', 'patches': 'patches_off'}[group_by]
+    value = header.get(field)
+    if group_by != 'patches':
+        return value if isinstance(value, str) and value.strip() else 'unknown'
+    if field not in header:
+        return 'none' if any(isinstance(header.get(k), str) and header[k].strip()
+                             for k in ('nib_version', 'system_sha')) else 'unknown'
+    if value == [] or value == '':
+        return 'none'
+    if isinstance(value, list) and all(isinstance(v, str) and v for v in value):
+        return json.dumps(sorted(set(value)), ensure_ascii=False)
+    return value if isinstance(value, str) and value.strip() else 'unknown'
+
+
 class EffortStats:
     def __init__(self):
         self.groups = {}
@@ -289,7 +448,11 @@ def records(path):
         return
 
 
-def summarize(paths, since=None, cwd=None):
+def summarize(paths, since=None, cwd=None, group_by=None):
+    if group_by not in (None, 'version', 'system', 'patches'):
+        raise ValueError('invalid group_by')
+    group_paths = {}
+    adjacent_pairs = write_validation_pairs = file_pairs = disjoint_pairs = 0
     totals = dict(sessions=0, root_sessions=0, child_sessions=0, turns=0, steps=0, runs=0,
                   runs_failed=0, runs_with_status=0, runs_unknown=0, steps_with_usage=0,
                   steps_with_ms=0, timed_turns=0)
@@ -321,6 +484,9 @@ def summarize(paths, since=None, cwd=None):
         if cwd is not None and (not isinstance(header.get('cwd'), str) or
                                 Path(header['cwd']).expanduser().resolve() != cwd):
             continue
+        if group_by is not None:
+            group_paths.setdefault(header_group(header, group_by), []).append(path)
+
         def selected(record):
             at = record.get('at')
             return cutoff_ms is None or (at if number(at) else mtime_ms) >= cutoff_ms
@@ -355,9 +521,12 @@ def summarize(paths, since=None, cwd=None):
                 if include:
                     error('provider_failure', record['diagnostic']['message'], path.stem)
                 continue
-            if any(m['role'] == 'user' for m in messages):
+            turn_step = record.get('turn_step')
+            explicit_turn = number(turn_step) and turn_step > 0
+            new_turn = (turn_step == 1 if explicit_turn else any(m['role'] == 'user' for m in messages))
+            if new_turn or (explicit_turn and current is None):
                 finish_turn()
-                current = dict(steps=0, full_steps=0, timed=0, ms=0, complete=False, selected=False)
+                current = dict(steps=0, full_steps=0, timed=0, ms=0, complete=False, selected=False, previous=None)
             if current is not None and include:
                 current['selected'] = True
             interrupted = False
@@ -366,6 +535,8 @@ def summarize(paths, since=None, cwd=None):
                     if include:
                         error('interrupted', m['content'], path.stem)
                     interrupted = True
+                    if current is not None:
+                        current['previous'] = None
             if not any(m['role'] == 'assistant' for m in messages) or interrupted:
                 continue
             session_step += 1
@@ -373,6 +544,8 @@ def summarize(paths, since=None, cwd=None):
                 current['full_steps'] += 1
                 current['complete'] = any(m['role'] == 'assistant' and not m.get('tool_calls') for m in messages)
             if not include:
+                if current is not None:
+                    current['previous'] = None
                 continue
             totals['steps'] += 1
             if not has_at:
@@ -399,13 +572,15 @@ def summarize(paths, since=None, cwd=None):
                         and type(r.get('ok')) is bool} if isinstance(statuses, list) else {}
             outputs = {m['tool_call_id']: m.get('content') or '' for m in messages
                        if m['role'] == 'tool' and isinstance(m.get('tool_call_id'), str)}
-            sources, run_statuses = {}, []
+            sources, run_statuses, step_codes = {}, [], []
             for m in messages:
                 for call in m.get('tool_calls') or []:
                     if not isinstance(call, dict) or not isinstance(call.get('function'), dict):
+                        step_codes.append(None)
                         continue
                     function = call['function']
                     if function.get('name') != 'run':
+                        step_codes.append(None)
                         continue
                     totals['runs'] += 1
                     call_id = call.get('id')
@@ -419,6 +594,7 @@ def summarize(paths, since=None, cwd=None):
                     except (ValueError, TypeError, RecursionError):
                         args = None
                     code = args.get('code') if isinstance(args, dict) else None
+                    step_codes.append(code)
                     if isinstance(code, str):
                         if isinstance(call_id, str):
                             sources[call_id] = code
@@ -435,6 +611,16 @@ def summarize(paths, since=None, cwd=None):
                     if not matched and (ok is False or candidates):
                         error('other_failure', candidates[0] if candidates else text, path.stem)
             timing.add(record, sources, run_statuses)
+            if current is not None:
+                structure = step_structure(step_codes, header.get('cwd') if isinstance(header.get('cwd'), str) else None)
+                previous = current['previous']
+                if previous is not None:
+                    adjacent_pairs += 1
+                    write_validation_pairs += previous['writes'] and structure['validation']
+                    if previous['paths'] is not None and structure['paths'] is not None:
+                        file_pairs += 1
+                        disjoint_pairs += previous['paths'].isdisjoint(structure['paths'])
+                current['previous'] = structure
         finish_turn()
         if session_selected:
             totals['sessions'] += 1
@@ -446,13 +632,33 @@ def summarize(paths, since=None, cwd=None):
     totals['avg_turn_ms'] = sum(turn_times) / len(turn_times) if turn_times else None
     usage['total_tokens'] = usage['prompt_tokens'] + usage['completion_tokens']
     usage['cache_hit_rate'] = usage['prompt_cache_hit_tokens'] / usage['prompt_tokens'] if usage['prompt_tokens'] else None
-    return {'overall': totals, 'usage': usage, 'time_filter': time_filter, 'tools': dict(sorted(tool_counts.items())),
+    def pair_summary(count, pairs):
+        return dict(count=count, pairs=pairs, ratio=count / pairs if pairs else None)
+
+    report = {'overall': totals, 'usage': usage, 'time_filter': time_filter, 'tools': dict(sorted(tool_counts.items())),
             'bash_top10': [{'command': k, 'count': v} for k, v in sorted(bash_counts.items(), key=lambda p: (-p[1], p[0]))[:10]],
             'errors': errors, 'slowest_steps': slowest, 'timing': timing.report(),
+            'round_trips': dict(steps_per_turn=distribution(turn_steps),
+                               write_to_validation=pair_summary(write_validation_pairs, adjacent_pairs),
+                               disjoint_write_files=pair_summary(disjoint_pairs, file_pairs),
+                               notes=["Step 分布按入选 Turn（含零步；旧日志按 user 估算边界）；相邻对限同 Turn、不跨过滤/取消断点。写→验证分母为全部相邻对，后步仅含静态验证 bash，沿用首两词启发式。",
+                                      "连续写以双方直接 edit/write 的完整字面量路径为样本（按 cwd 规范化）；文件集合不相交才计不同文件。动态/未知调用跳过；不推断 bash 副作用，fmt 也归验证。"]),
             'notes': ["仅统计入选记录；失败率只用显式 run_results；token=prompt+completion（不重复加缓存），缓存率以 prompt 为分母；错误可重叠，工具/命令数为静态估计。",
-                      "Turn 平均步数只计入选 Step；平均耗时只含已结束、全部 Step 入选且有 ms 的 Turn；--since 按记录 at（本地日期），缺失或无效 at 回退到文件修改时间。",
+                      "Turn 平均耗时只含已结束、全部 Step 入选且有 ms 的 Turn；--since 按记录 at（本地日期），缺失或无效 at 回退到文件修改时间。",
                       f"时间来源：{time_filter['selected_records_with_at']} 条按 at，{time_filter['selected_records_using_mtime']} 条回退文件时间（其中 {time_filter['selected_steps_using_mtime']} 个完整 Step）；计时仅有效字段、缺失不补零；p90=nearest-rank；first_data_ms 是首次收到任何流数据，非内容 token；model_ms 含重试/退避。",
                       "run_ms 为 Step 内 Run 总耗时，run_result_ms 为单 Run；code_first_ms 为首段代码等待，code_span_ms=last-first，streaming 为 >50 ms 比例；calls 含失败、并行耗时可重叠；bash 计时按字面量首两词启发式分组，无法关联列 unmatched，非 shell 子命令耗时。timing.effort.by_effort 按完整 Step 顶层 effort 分组，缺 effort 跳过、缺计时仍计 Step；缓存率为有效 prompt/cache 成对字段的总和之比。各组及 timing.effort.downgraded：effort_source=model 且（effort_downgraded=true 或缺失/null）视为降档（已知等档应记录 false）；run_failure_rate=steps_with_failed_run/steps_with_runs，仅关联本 Step 模型响应产生的 Run，任一显式 ok=false 即失败；未知状态仍入分母，并列 steps_with_unknown_run_status；无 Run 不入分母。"]}
+
+    if group_by is not None:
+        report['group_by'] = group_by
+        report['groups'] = {}
+        for key, members in sorted(group_paths.items()):
+            group = summarize(members, since, cwd)
+            if group['overall']['sessions']:
+                report['groups'][key] = group
+        report['notes'][0] += (' --group-by 按 header nib_version/system_sha/patches_off 分组，'
+            '缺失/无效值为 unknown；patches_off 缺失但 nib_version 或 system_sha 有效时为 none，'
+            '显式空补丁集也为 none；补丁数组按去重排序的集合分组，每组重新汇总完整核心报告。')
+    return report
 
 
 def text_report(report):
@@ -468,6 +674,14 @@ def text_report(report):
              f"每 Turn 平均 {fmt(t['avg_steps_per_turn'])} Step；平均耗时 {fmt(t['avg_turn_ms'], ' ms')}（完整计时 {t['timed_turns']}/{t['turns']} Turn，{t['steps_with_ms']} Step）",
              '工具（静态调用点）：' + (', '.join(f'{k} {v}' for k, v in report['tools'].items()) or '无'),
              'bash 命令 Top 10：' + (', '.join(f"{v['command']} {v['count']}" for v in report['bash_top10']) or '无'), '错误分类：']
+    structure = report['round_trips']
+    steps = structure['steps_per_turn']
+    section = ["往返结构：", f"  每 Turn Step: samples={steps['samples']} median={fmt(steps['median'])} p90={fmt(steps['p90'])}"]
+    for name, label in (('write_to_validation', '写→仅验证'), ('disjoint_write_files', '连续写不同文件（不相交）')):
+        item = structure[name]
+        section.append(f"  {label}: {item['count']}/{item['pairs']} = {pct(item['ratio'])}（samples={item['pairs']}）")
+    section.extend("  " + note for note in structure['notes'])
+    lines[4:4] = section
     for name, item in report['errors'].items():
         lines.append(f"  {name}: {item['count']}")
         lines.extend(f"    [{e['session_id']}] {e['text']}" for e in item['examples'])
@@ -504,6 +718,13 @@ def text_report(report):
     if not bash['top10']:
         lines.append('    无可匹配计时记录')
     lines.extend(['口径：'] + ['  ' + note for note in report['notes']])
+    if 'groups' in report:
+        lines.append(f"分组 group_by={report['group_by']}：")
+        for key, group in report['groups'].items():
+            lines.append(f"=== {report['group_by']}={key} ===")
+            lines.append(text_report(group))
+        if not report['groups']:
+            lines.append('  无入选分组')
     return '\n'.join(lines)
 
 
@@ -512,6 +733,7 @@ def main():
     parser.add_argument('paths', nargs='*', type=Path, help='session JSONL files or directories')
     parser.add_argument('--since', type=date.fromisoformat, metavar='YYYY-MM-DD', help='record date, inclusive, local time; legacy records fall back to file modification time')
     parser.add_argument('--cwd', type=Path, help='exact session working directory')
+    parser.add_argument('--group-by', choices=('version', 'system', 'patches'), help='group core reports by session header metadata')
     parser.add_argument('--json', action='store_true', help='emit JSON instead of text')
     args = parser.parse_args()
     inputs = args.paths or [Path(os.environ.get('NIB_HOME', '~/.nib')).expanduser() / 'sessions']
@@ -522,7 +744,7 @@ def main():
             paths.update(p.resolve() for p in path.glob('*.jsonl') if p.is_file())
         elif path.is_file():
             paths.add(path.resolve())
-    report = summarize(sorted(paths), args.since, args.cwd.expanduser().resolve() if args.cwd else None)
+    report = summarize(sorted(paths), args.since, args.cwd.expanduser().resolve() if args.cwd else None, args.group_by)
     print(json.dumps(report, ensure_ascii=False, indent=2) if args.json else text_report(report))
 
 

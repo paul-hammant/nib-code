@@ -68,6 +68,27 @@ fn patchDisabled(off: []const u8, id: []const u8) bool {
     return false;
 }
 
+fn disabledPatches(a: std.mem.Allocator, environ: ?*const std.process.Environ.Map) !?[]const []const u8 {
+    const off = if (environ) |e| e.get("NIB_PATCHES_OFF") orelse "" else "";
+    var ids: std.ArrayList([]const u8) = .empty;
+    for (patches) |patch| {
+        if (patchDisabled(off, patch.id)) try ids.append(a, patch.id);
+    }
+    if (ids.items.len == 0) return null;
+    std.mem.sort([]const u8, ids.items, {}, struct {
+        fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+            return std.mem.lessThan(u8, lhs, rhs);
+        }
+    }.lessThan);
+    return try ids.toOwnedSlice(a);
+}
+
+fn systemSha(base: []const u8) [12]u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(base, &digest, .{});
+    return std.fmt.bytesToHex(digest[0..6].*, .lower);
+}
+
 const system_template =
     \\You are nib, a coding agent working in {s}.
     \\
@@ -159,7 +180,17 @@ pub const Session = struct {
             const global = try std.fs.path.join(a, &.{ options.home, "AGENTS.md" });
             const project = try std.fs.path.join(a, &.{ try instructions.projectRoot(io, a, cwd), "AGENTS.md" });
             const system = try instructions.append(io, a, base, global, project);
-            try s.commit(0, &.{.{ .role = "system", .content = system }}, 0, cwd);
+            const sha = systemSha(base);
+            try s.log.commit(io, gpa, &s.history, &s.context_tokens, .{
+                .messages = &.{.{ .role = "system", .content = system }},
+                .cwd = cwd,
+                .provider = cfg.provider,
+                .model = cfg.model,
+                .parent_session_id = s.parent_session_id,
+                .nib_version = @import("build_options").nib_version,
+                .system_sha = &sha,
+                .patches_off = try disabledPatches(a, options.environ),
+            });
         }
         s.tools.session_id = s.id;
         return s;
@@ -378,6 +409,7 @@ pub const Session = struct {
                 .context_tokens = tokens,
                 .model = s.cfg.model,
                 .usage = reply.usage,
+                .turn_step = @intCast(step_index + 1),
                 .ms = ms,
                 .model_ms = model_ms,
                 .effort = decision.metadata.effort,
@@ -619,6 +651,32 @@ test "prompt patches can be disabled individually or all at once" {
     const none = try patchLines(gpa, &env);
     defer gpa.free(none);
     try std.testing.expectEqualStrings("", none);
+}
+
+test "experiment labels hash exact base text and normalize actual disabled patches" {
+    const t = std.testing;
+    try t.expectEqualStrings("cae662172fd4", &systemSha("base"));
+    try t.expect(!std.mem.eql(u8, &systemSha("base"), &systemSha("base changed")));
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: std.process.Environ.Map = .init(a);
+    try t.expectEqual(null, try disabledPatches(a, &env));
+    try env.put("NIB_PATCHES_OFF", "unknown, no-shell-search, json-escape, json-escape");
+    const normalized = (try disabledPatches(a, &env)).?;
+    try t.expectEqual(@as(usize, 2), normalized.len);
+    try t.expectEqualStrings("json-escape", normalized[0]);
+    try t.expectEqualStrings("no-shell-search", normalized[1]);
+    try env.put("NIB_PATCHES_OFF", "all");
+    const all = (try disabledPatches(a, &env)).?;
+    try t.expectEqual(patches.len, all.len);
+    for (patches) |patch| {
+        var found = false;
+        for (all) |id| found = found or std.mem.eql(u8, id, patch.id);
+        try t.expect(found);
+    }
+    try env.put("NIB_PATCHES_OFF", "unknown");
+    try t.expectEqual(null, try disabledPatches(a, &env));
 }
 
 test "json-escape patch example survives JS parsing verbatim" {

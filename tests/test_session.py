@@ -1,6 +1,7 @@
 """Session E2E checks against mock_llm.py. Run after `zig build`. No API key needed."""
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -200,8 +201,21 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         paths = list((tmp / "nib/sessions").glob("*.jsonl"))
         assert len(paths) == 1
         log = paths[0]
-        first, _ = replay(log)
+        first, initial_records = replay(log)
+        header = initial_records[0]
+        original_header = log.read_bytes().splitlines()[0]
         system = first[0]["content"]
+        base = system.split("\n\nInstructions below apply in order; later instructions take priority.\n", 1)[0]
+        version = re.search(r'\.version = "([^"]+)"', (ROOT / "build.zig.zon").read_text())[1]
+        assert re.fullmatch(re.escape(version) + r"(?:\+[0-9a-f]+)?", header["nib_version"]), header
+        git_commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
+                                    capture_output=True, text=True)
+        if git_commit.returncode == 0:
+            assert header["nib_version"] == version + "+" + git_commit.stdout.strip(), header
+        assert header["system_sha"] == hashlib.sha256(base.encode()).hexdigest()[:12], header
+        assert "patches_off" not in header
+        assert all(not any(key in record for key in ("nib_version", "system_sha", "patches_off"))
+                   for record in initial_records[1:])
         assert system.index("You are nib") < system.index("GLOBAL_MARKER") < system.index("PROJECT_MARKER")
         assert "IGNORED_XDG_MARKER" not in system
         global_agents.write_text("CHANGED_GLOBAL")
@@ -209,7 +223,8 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         req = read_requests(requests_path)[-2]["messages"]
         assert req == first + [{"role": "user", "content": "second"}]
         assert req[0]["content"] == system
-        ask("third", "--resume", log.stem)
+        ask("third", "--resume", log.stem, overrides={"NIB_PATCHES_OFF": "all"})
+        assert log.read_bytes().splitlines()[0] == original_header
         safe, _ = replay(log)
         ask("reject1", "-c", ok=False)
         assert replay(log)[0] == safe
@@ -608,6 +623,37 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         resumed_child = events(ask("--json", "--resume", child_logs[0].stem, "child resumed"))
         child_output = next(e["run_end"]["output"] for e in resumed_child if "run_end" in e)
         assert json.loads(child_output.removeprefix("result: "))["agent"] == "undefined"
+        for child_log in child_logs:
+            child_header = replay(child_log)[1][0]
+            child_base = child_header["messages"][0]["content"].split(
+                "\n\nInstructions below apply in order; later instructions take priority.\n", 1)[0]
+            assert child_header["nib_version"] == header["nib_version"]
+            assert child_header["system_sha"] == hashlib.sha256(child_base.encode()).hexdigest()[:12]
+        patches_home = tmp / "patches-home"
+        ask("patch labels", overrides={"NIB_HOME": str(patches_home), "NIB_PATCHES_OFF": "all"})
+        patches_header = replay(next((patches_home / "sessions").glob("*.jsonl")))[1][0]
+        patch_ids = re.findall(r'\.id = "([^"]+)"', (ROOT / "src/session.zig").read_text().split("fn patchLines", 1)[0])
+        assert patches_header["patches_off"] == sorted(patch_ids), patches_header
+        assert patches_header["system_sha"] != header["system_sha"]
+        changed_base = patches_header["messages"][0]["content"].split(
+            "\n\nInstructions below apply in order; later instructions take priority.\n", 1)[0]
+        assert patches_header["system_sha"] == hashlib.sha256(changed_base.encode()).hexdigest()[:12]
+        child_patches = events(ask("--json", "child patches", overrides={
+            "NIB_HOME": str(patches_home), "NIB_PATCHES_OFF": "all",
+            "NIB_AGENT_DEPTH": "1", "NIB_PARENT_SESSION_ID": log.stem}))
+        child_patch_log = patches_home / "sessions" / (child_patches[0]["start"]["session_id"] + ".jsonl")
+        child_patch_header = replay(child_patch_log)[1][0]
+        assert child_patch_header["parent_session_id"] == log.stem
+        assert child_patch_header["patches_off"] == sorted(patch_ids)
+        assert child_patch_header["nib_version"] == header["nib_version"]
+        legacy_records = replay(child_patch_log)[1]
+        for key in ("nib_version", "system_sha", "patches_off"):
+            legacy_records[0].pop(key)
+        child_patch_log.write_text("\n".join(map(json.dumps, legacy_records)) + "\n")
+        legacy_header = child_patch_log.read_bytes().splitlines()[0]
+        ask("--resume", child_patch_log.stem, "legacy resume", overrides={"NIB_HOME": str(patches_home)})
+        assert child_patch_log.read_bytes().splitlines()[0] == legacy_header
+        print("Experiment header E2E passed: version/base hash, all patches, children and frozen/legacy resume header")
         print("Subagent resume E2E passed: --continue skips children, explicit child resume retains depth")
         config_path = tmp / "nib/config.toml"
         config_text = ('# Keep this comment and both provider sections.\n'
