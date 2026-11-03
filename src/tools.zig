@@ -73,7 +73,7 @@ const all = [_]Tool{
         .run = bash.bash,
         .doc =
         \\  // Run bash in the working directory; stderr is merged into output. exit_code is null if killed.
-        \\  // Output is returned verbatim; over 16 MiB errors (redirect output to a file). Commands over 256 shell words, heredocs included, are refused: write the script to a file and run it.
+        \\  // Output is returned verbatim; over 16 MiB errors (redirect output to a file). Commands over 256 shell words, excluding heredoc bodies, are refused: write long scripts to a file with tools.write and run that file.
         \\  async bash({ command, timeout_ms = 120000 }) {}, // → { exit_code, output }
         ,
     },
