@@ -10,7 +10,7 @@ const run_output_lines = 12;
 const max_diff_lines = 60;
 const max_segments = 8 + max_diff_lines + 2;
 
-pub const Kind = enum { user, assistant, reasoning, run, info, err };
+pub const Kind = enum { user, assistant, run, info, err };
 
 pub const Entry = struct {
     kind: Kind,
@@ -84,10 +84,6 @@ pub const Entry = struct {
             .user => {
                 try e.label.print(gpa, " … +{d} lines", .{long_text.lines(e.text.items) - 1});
             },
-            .reasoning => {
-                const lines = std.mem.count(u8, std.mem.trimEnd(u8, e.text.items, "\n"), "\n") + 1;
-                try e.label.print(gpa, "∴ thinking · {d} line{s} · ctrl+o to expand", .{ lines, if (lines == 1) "" else "s" });
-            },
             else => {},
         }
     }
@@ -105,7 +101,7 @@ pub const Entry = struct {
     }
 
     fn collapsible(e: *const Entry) bool {
-        return e.kind == .run or e.kind == .reasoning or (e.kind == .user and long_text.isLong(e.text.items));
+        return e.kind == .run or (e.kind == .user and long_text.isLong(e.text.items));
     }
 
     pub fn print(e: *const Entry, win: vaxis.Window, commit: bool) u16 {
@@ -155,9 +151,6 @@ pub const Entry = struct {
                 return segs[0..2];
             },
             .assistant => segs[0] = .{ .text = e.text.items },
-            .reasoning => {
-                segs[0] = .{ .text = if (e.open) e.text.items else e.label.items, .style = .{ .dim = true, .italic = true } };
-            },
             .run => {
                 segs[0] = switch (e.run) {
                     .running => .{ .text = "◌ ", .style = .{ .fg = .{ .index = 3 } } },
@@ -246,12 +239,12 @@ pub const Transcript = struct {
     }
 
     pub fn appendDelta(t: *Transcript, gpa: std.mem.Allocator, kind: provider.Kind, text: []const u8) !void {
-        const entry_kind: Kind = if (kind == .reasoning) .reasoning else .assistant;
+        if (kind == .reasoning) return;
+        const entry_kind: Kind = .assistant;
         const items = t.entries.items;
         if (items.len == 0 or items[items.len - 1].kind != entry_kind) try t.entries.append(gpa, .{ .kind = entry_kind, .open = t.expanded });
         const current = &t.entries.items[t.entries.items.len - 1];
         try current.text.appendSlice(gpa, text);
-        if (entry_kind == .reasoning) try current.refreshLabel(gpa);
     }
 
     pub fn startRun(t: *Transcript, gpa: std.mem.Allocator, code: []const u8) !void {
@@ -300,14 +293,6 @@ pub const Transcript = struct {
             if (std.mem.eql(u8, m.role, "user")) {
                 try t.add(gpa, .user, content);
             } else if (std.mem.eql(u8, m.role, "assistant")) {
-                if (m.reasoning) |r| {
-                    const text = try r.display(gpa);
-                    defer gpa.free(text);
-                    if (text.len > 0) {
-                        try t.add(gpa, .reasoning, text);
-                        try t.entries.items[t.entries.items.len - 1].refreshLabel(gpa);
-                    }
-                }
                 if (content.len > 0) try t.add(gpa, .assistant, content);
                 for (m.tool_calls orelse &.{}) |call| {
                     const Args = struct { code: []const u8 = "" };
@@ -485,23 +470,27 @@ test "entry height cache reuses measurements and invalidates on width or append"
     try testing.expectEqual(@as(u16, 3), e.height(win));
 }
 
-test "streamed deltas group by kind and history replays runs with results" {
+test "thinking stays hidden in streamed and restored transcripts" {
     const gpa = testing.allocator;
     var t: Transcript = .{};
     defer t.deinit(gpa);
     try t.appendDelta(gpa, .reasoning, "think");
+    try testing.expectEqual(@as(usize, 0), t.entries.items.len);
     try t.appendDelta(gpa, .text, "an");
+    try t.appendDelta(gpa, .reasoning, "more thinking");
     try t.appendDelta(gpa, .text, "swer");
-    try testing.expectEqual(@as(usize, 2), t.entries.items.len);
+    try testing.expectEqual(@as(usize, 1), t.entries.items.len);
     try testing.expectEqualStrings("answer", t.lastAnswer().?);
 
     t.clear(gpa);
     try t.addHistory(gpa, &.{
         .{ .role = "user", .content = "hi" },
-        .{ .role = "assistant", .tool_calls = &.{.{ .id = "1", .function = .{ .name = "run", .arguments = "{\"code\":\"tools.bash({})\"}" } }} },
+        .{ .role = "assistant", .reasoning = .{ .provider = .chat_completions, .data = "hidden thinking" }, .tool_calls = &.{.{ .id = "1", .function = .{ .name = "run", .arguments = "{\"code\":\"tools.bash({})\"}" } }} },
         .{ .role = "tool", .tool_call_id = "1", .content = "out" },
+        .{ .role = "assistant", .content = "answer", .reasoning = .{ .provider = .codex, .data = "[{\"summary\":[{\"text\":\"hidden summary\"}]}]" } },
     });
-    try testing.expectEqual(@as(usize, 2), t.entries.items.len);
+    try testing.expectEqual(@as(usize, 3), t.entries.items.len);
+    try testing.expectEqualStrings("answer", t.lastAnswer().?);
     try testing.expectEqualStrings("out", t.entries.items[1].output.items);
     try testing.expect(t.entries.items[1].run == .ok);
 }
