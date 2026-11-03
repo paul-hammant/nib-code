@@ -47,8 +47,10 @@ const all = [_]Tool{
         .doc =
         \\  // Search file contents with a JS RegExp (multiline: ^ and $ match per line); literal searches for the exact text.
         \\  // Skips .git, .gitignore'd, binary and symlinked files. glob filters files below path, as in the glob tool.
-        \\  // Each match's path is path joined with the file below it; text and context lines are cut at 500 bytes.
-        \\  async grep({ pattern, path = ".", glob, ignore_case = false, literal = false, context = 0, limit = 100 }) {}, // → { matches: [{ path, line, text, before?, after? }], truncated }
+        \\  // Each match's path is path joined with the file below it; line is 1-based, column is the first match's 1-based UTF-8 byte column.
+        \\  // text centers on the match; text_column is its first source byte's 1-based column (excluding a leading …).
+        \\  // text and context lines are at most 500 bytes including … on omitted sides, without splitting UTF-8; context keeps line prefixes.
+        \\  async grep({ pattern, path = ".", glob, ignore_case = false, literal = false, context = 0, limit = 100 }) {}, // → { matches: [{ path, line, column, text, text_column, before?, after? }], truncated }
         ,
     },
     .{
