@@ -5,12 +5,13 @@ const long_text = @import("long_text.zig");
 const markdown = @import("markdown.zig");
 const Change = @import("../tools/diff.zig").Change;
 const Progress = @import("../session/events.zig").Progress;
+const bill = @import("bill.zig");
 
 const run_output_lines = 12;
 const max_diff_lines = 60;
 const max_segments = 8 + max_diff_lines + 2;
 
-pub const Kind = enum { user, assistant, run, info, err };
+pub const Kind = enum { user, assistant, run, info, err, bill };
 
 pub const Entry = struct {
     kind: Kind,
@@ -106,6 +107,10 @@ pub const Entry = struct {
 
     pub fn print(e: *const Entry, win: vaxis.Window, commit: bool) u16 {
         if (e.kind == .assistant) return markdown.print(win, e.text.items, commit);
+        if (e.kind == .bill) {
+            _ = win.print(&.{.{ .text = bill.fit(e.text.items, win.width), .style = .{ .dim = true } }}, .{ .wrap = .none, .commit = commit });
+            return 1;
+        }
         var segs: [max_segments]vaxis.Segment = undefined;
         const folded = e.collapsible() and !e.open;
         const wrap: @FieldType(vaxis.Window.PrintOptions, "wrap") = if (folded) .none else if (e.kind == .run) .grapheme else .word;
@@ -191,7 +196,7 @@ pub const Entry = struct {
                 }
                 return segs[0..n];
             },
-            .info => segs[0] = .{ .text = e.text.items, .style = dim },
+            .info, .bill => segs[0] = .{ .text = e.text.items, .style = dim },
             .err => segs[0] = .{ .text = e.text.items, .style = .{ .fg = .{ .index = 1 } } },
         }
         return segs[0..1];
@@ -642,4 +647,33 @@ test "long user messages fold live and replayed, truncate the first line, and ex
     try testing.expectEqual(@as(u16, 1), t.entries.items[2].height(win));
     try t.add(gpa, .user, long[0..800]);
     try testing.expect(t.entries.items[3].height(win) > 1);
+}
+
+test "bills stay dim and one row when resized or expanded" {
+    const gpa = testing.allocator;
+    var screen = try vaxis.Screen.init(gpa, .{ .cols = 120, .rows = 3, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(gpa);
+    var win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 120, .height = 3, .screen = &screen };
+    var transcript: Transcript = .{};
+    defer transcript.deinit(gpa);
+    var text: bill.Text = .{};
+    const full = text.format(.{ .steps = 12, .timing = .{ .wall_ms = 190_000, .llm_calls = 8, .agent_calls = 1 } }, 120);
+    try transcript.add(gpa, .bill, full);
+    const entry = &transcript.entries.items[0];
+    for ([_]u16{ 120, 40, 8, 1, 0, 120 }) |width| {
+        win.width = width;
+        win.clear();
+        transcript.toggleExpanded();
+        try testing.expectEqual(@as(u16, 1), entry.height(win));
+        try testing.expectEqual(@as(u16, 1), entry.print(win, true));
+        const expected = bill.fit(full, width);
+        var col: u16 = 0;
+        var it = std.unicode.Utf8View.initUnchecked(expected).iterator();
+        while (it.nextCodepointSlice()) |cp| : (col += 1) {
+            const cell = screen.readCell(col, 0).?;
+            try testing.expectEqualStrings(cp, cell.char.grapheme);
+            try testing.expect(cell.style.dim);
+        }
+        for (0..120) |x| try testing.expectEqualStrings(" ", screen.readCell(@intCast(x), 1).?.char.grapheme);
+    }
 }

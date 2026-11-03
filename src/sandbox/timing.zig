@@ -15,6 +15,8 @@ pub const Run = struct {
     entries: [200]Call = undefined,
     count: usize = 0,
     omitted: u64 = 0,
+    llm_calls: u64 = 0,
+    agent_calls: u64 = 0,
 
     pub fn init(io: std.Io, started: std.Io.Clock.Timestamp) Run {
         return .{ .io = io, .started = started };
@@ -26,6 +28,8 @@ pub const Run = struct {
 
     // Dispatch owns reservations; workers complete distinct slots under the sandbox queue mutex.
     pub fn reserve(r: *Run, name: []const u8) ?usize {
+        if (std.mem.eql(u8, name, "llm")) r.llm_calls += 1;
+        if (std.mem.eql(u8, name, "agent")) r.agent_calls += 1;
         if (r.count == r.entries.len) {
             r.omitted +|= 1;
             return null;
@@ -42,7 +46,9 @@ pub const Run = struct {
         return index;
     }
 
-    pub fn undoReservation(r: *Run, index: ?usize) void {
+    pub fn undoReservation(r: *Run, index: ?usize, name: []const u8) void {
+        if (std.mem.eql(u8, name, "llm")) r.llm_calls -= 1;
+        if (std.mem.eql(u8, name, "agent")) r.agent_calls -= 1;
         if (index) |i| {
             std.debug.assert(i + 1 == r.count);
             r.count -= 1;
@@ -97,10 +103,23 @@ test "names survive source mutation and collector copies" {
 test "failed dispatch releases its reservation including overflow" {
     const t = std.testing;
     var r: Run = .init(t.io, .now(t.io, .awake));
-    r.undoReservation(r.reserve("read"));
+    r.undoReservation(r.reserve("read"), "read");
     try t.expectEqual(@as(usize, 0), r.count);
     for (0..200) |_| _ = r.reserve("read");
-    r.undoReservation(r.reserve("read"));
+    r.undoReservation(r.reserve("read"), "read");
     try t.expectEqual(@as(usize, 200), r.count);
     try t.expectEqual(@as(u64, 0), r.omitted);
+}
+
+test "delegation counts include overflow and exclude failed dispatch" {
+    const t = std.testing;
+    var r: Run = .init(t.io, .now(t.io, .awake));
+    r.undoReservation(r.reserve("agent"), "agent");
+    try t.expectEqual(@as(u64, 0), r.agent_calls);
+    for (0..205) |_| _ = r.reserve("agent");
+    _ = r.reserve("llm");
+    r.undoReservation(r.reserve("llm"), "llm");
+    try t.expectEqual(@as(u64, 205), r.agent_calls);
+    try t.expectEqual(@as(u64, 1), r.llm_calls);
+    try t.expectEqual(@as(u64, 6), r.omitted);
 }

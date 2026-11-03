@@ -17,6 +17,8 @@ const status = @import("tui/status.zig");
 const view = @import("tui/view.zig");
 const selection = @import("tui/selection.zig");
 const reflect = @import("tui/reflect.zig");
+const bill = @import("tui/bill.zig");
+const TurnSummary = @import("session/events.zig").TurnSummary;
 
 const Event = union(enum) {
     key_press: vaxis.Key,
@@ -33,6 +35,7 @@ const Event = union(enum) {
     retry: []u8,
     notice: []u8,
     done,
+    turn_end: TurnSummary,
     usage: struct { tokens: provider.Usage, context: u64, steps: u32 },
     progress: @import("session/events.zig").Progress,
     failed: []u8,
@@ -115,6 +118,7 @@ const Turn = struct {
             .notice => |m| .{ .notice = try gpa.dupe(u8, m) },
             .usage => |u| .{ .usage = .{ .tokens = u, .context = t.session.context_tokens, .steps = t.session.steps } },
             .progress => |p| .{ .progress = try p.clone(gpa) },
+            .turn_end => |summary| .{ .turn_end = summary },
         };
         errdefer if (event == .progress) {
             var owned = event.progress;
@@ -263,6 +267,8 @@ const App = struct {
     steps: u32 = 0,
     context: u64 = 0,
     turn: ?*Turn = null,
+    // turn_end precedes done/failed; append only after their terminal content.
+    pending_bill: ?TurnSummary = null,
 
     fn deinit(app: *App) void {
         if (app.turn) |t| {
@@ -350,9 +356,11 @@ const App = struct {
                 defer owned.deinit(gpa);
                 try app.transcript.progress(gpa, p);
             },
+            .turn_end => |summary| app.pending_bill = summary,
             .done => {
                 app.finishTurn();
                 try app.saveReflection();
+                try app.appendBill();
             },
             .issue => |msg| {
                 defer gpa.free(msg);
@@ -368,6 +376,7 @@ const App = struct {
                 const canceled = app.turn.?.cancel.load(.acquire);
                 try app.transcript.add(gpa, if (canceled) .info else .err, if (canceled) "canceled" else msg);
                 app.finishTurn();
+                try app.appendBill();
             },
         }
         return true;
@@ -610,6 +619,13 @@ const App = struct {
         app.reflecting = null;
     }
 
+    fn appendBill(app: *App) !void {
+        const summary = app.pending_bill orelse return;
+        var text: bill.Text = .{};
+        try app.transcript.add(app.gpa, .bill, text.format(summary, std.math.maxInt(u16)));
+        app.pending_bill = null;
+    }
+
     fn finishTurn(app: *App) void {
         app.turn.?.finish();
         app.turn = null;
@@ -733,4 +749,37 @@ test "Turn throttles model data events but sends request boundaries immediately"
     try t.expectEqual(ModelActivity.data, resumed.state);
     try t.expectEqualDeep(silence, resumed.at);
     try t.expectEqual(@as(?Event, null), try loop.tryEvent());
+}
+
+test "turn_end forwards by value and defers bills until terminal content" {
+    const t = std.testing;
+    var loop: vaxis.Loop(Event) = .{ .io = t.io, .tty = undefined, .vaxis = undefined, .queue = .init(t.io) };
+    var turn: Turn = undefined;
+    turn.gpa = t.allocator;
+    turn.loop = &loop;
+    var app: App = undefined;
+    app.gpa = t.allocator;
+    app.transcript = .{};
+    defer app.transcript.deinit(t.allocator);
+    app.pending_bill = null;
+    inline for (.{ .completed, .canceled, .failed }) |status_value| {
+        const summary: TurnSummary = .{ .status = status_value, .steps = 2, .timing = .{ .wall_ms = 1000 } };
+        try app.transcript.add(t.allocator, .assistant, "answer");
+        const before = app.transcript.entries.items.len;
+        try Turn.emit(&turn, .{ .turn_end = summary });
+        const event = (try loop.tryEvent()).?;
+        try t.expectEqualDeep(summary, event.turn_end);
+        _ = try app.handle(event);
+        try t.expectEqual(before, app.transcript.entries.items.len);
+        try t.expectEqualDeep(summary, app.pending_bill.?);
+        if (status_value != .completed) try app.transcript.add(t.allocator, .err, @tagName(status_value));
+        try app.appendBill();
+        const entries = app.transcript.entries.items;
+        try t.expectEqual(EntryKind.bill, entries[entries.len - 1].kind);
+        try t.expectEqualStrings(if (status_value == .completed) "answer" else @tagName(status_value), entries[entries.len - 2].text.items);
+        try t.expect(app.pending_bill == null);
+        const count = entries.len;
+        try app.appendBill();
+        try t.expectEqual(count, app.transcript.entries.items.len);
+    }
 }

@@ -189,7 +189,7 @@ const State = struct {
                 const timing = st.host.?.timing;
                 if (timing) |t| call.timing_index = t.reserve(call.name);
                 call.thread = std.Thread.spawn(.{}, Call.work, .{call}) catch |err| {
-                    if (timing) |t| t.undoReservation(call.timing_index);
+                    if (timing) |t| t.undoReservation(call.timing_index, call.name);
                     return err;
                 };
                 active += 1;

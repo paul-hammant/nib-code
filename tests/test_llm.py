@@ -113,7 +113,16 @@ class LlmTests:
         events = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertIn("start", events[0], events)
         self.assertIn("end", events[-1], events)
-        self.assert_tool_docs(events[0]["start"]["session_id"])
+        session_id = events[0]["start"]["session_id"]
+        self.assert_tool_docs(session_id)
+        steps = [record for record in records(Path(self.env["NIB_HOME"]) / "sessions" / (session_id + ".jsonl"))
+                 if "model_ms" in record]
+        timing = events[-1]["end"]["timing"]
+        for name in ("llm", "agent"):
+            self.assertEqual(timing[name + "_calls"], sum(
+                call["name"] == name for step in steps for call in step.get("calls", [])))
+        for key in ("model_ms", "run_ms"):
+            self.assertEqual(timing[key], sum(step[key] for step in steps))
         return events
 
     def assert_tool_docs(self, session_id, child=False):

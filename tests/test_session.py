@@ -98,6 +98,22 @@ def assert_timing(records, *, final_only=False):
     assert text_step["run_ms"] == 0 and not text_step.get("calls") and not text_step.get("code"), text_step
 
 
+def assert_turn_timing(terminal, records, *, completed_steps=None):
+    timing = terminal["timing"]
+    assert set(timing) == {"wall_ms", "model_ms", "run_ms", "llm_calls", "agent_calls"}, timing
+    assert all(type(value) is int and value >= 0 for value in timing.values()), timing
+    steps = [record for record in records if "model_ms" in record]
+    count = terminal["steps"] if completed_steps is None else completed_steps
+    steps = steps[-count:] if count else []
+    assert len(steps) == count, (terminal, steps)
+    for key in ("model_ms", "run_ms"):
+        assert timing[key] == sum(step[key] for step in steps), (timing, steps)
+    assert timing["wall_ms"] >= sum(step["ms"] for step in steps), (timing, steps)
+    for name in ("llm", "agent"):
+        assert timing[name + "_calls"] == sum(
+            call["name"] == name for step in steps for call in step.get("calls", [])), (timing, steps)
+
+
 with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
     tmp = Path(directory)
     requests_path = tmp / "requests.jsonl"
@@ -249,12 +265,19 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         assert any(e.get("run_end", {}).get("ok") for e in streamed)
         assert read_requests(requests_path)[-2]["messages"][-1]["content"] == "stdin prompt\nsecond line"
         assert (tmp / "nib/sessions" / (session_id + ".jsonl")).exists()
+        assert_turn_timing(final, replay(tmp / "nib/sessions" / f"{session_id}.jsonl")[1])
         resumed = events(ask("--resume", session_id, "--json", "json resume"))
         assert resumed[0]["start"]["session_id"] == session_id
+        assert_turn_timing(resumed[-1]["end"], replay(tmp / "nib/sessions" / f"{session_id}.jsonl")[1])
         failed = events(ask("reject1", "--json", ok=False))
         assert "start" in failed[0] and "error" in failed[-1]
         assert not any("end" in e for e in failed)
-        assert events(ask("--json", ok=False))[0]["error"]["message"] == "MissingPrompt"
+        assert_turn_timing(failed[-1]["error"], [])
+        failed_step = events(ask("reject2", "--json", ok=False))
+        failed_id = failed_step[0]["start"]["session_id"]
+        assert_turn_timing(failed_step[-1]["error"], replay(tmp / "nib/sessions" / f"{failed_id}.jsonl")[1])
+        missing = events(ask("--json", ok=False))[0]["error"]
+        assert missing["message"] == "MissingPrompt" and "timing" not in missing
         json_cwd = tmp / "json"
         json_cwd.mkdir()
         compact_json = events(ask("json compact", "--json", workdir=json_cwd, window="4096"))
@@ -265,6 +288,7 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         timed_id = timed[0]["start"]["session_id"]
         _, timed_records = replay(timing_home / "sessions" / f"{timed_id}.jsonl")
         assert_timing(timed_records)
+        assert_turn_timing(timed[-1]["end"], timed_records)
         print("Chat Completions timing E2E passed: streamed UTF-8 arguments, model latency and per-tool Run timing")
 
         before = len(read_requests(requests_path))
@@ -273,6 +297,8 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         final = delegated[-1]["end"]
         assert final["usage"] == {"prompt_tokens": 19800, "completion_tokens": 90, "prompt_cache_hit_tokens": 576}, final
         assert final["steps"] == 2
+        assert_turn_timing(final, replay(tmp / "nib/sessions" / f"{parent_id}.jsonl")[1])
+        assert final["timing"]["agent_calls"] == 2
         assert "child alpha" in final["text"] and "child beta" in final["text"]
         children = [r for r in read_requests(requests_path)[before:] if r["messages"][-1].get("content", "").startswith("child ")]
         assert len(children) == 2
@@ -460,7 +486,9 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
                     assert interrupted.poll() is None
                 started = time.monotonic()
                 interrupted.send_signal(sig)
-                _, errors = interrupted.communicate(timeout=2)
+                remaining, errors = interrupted.communicate(timeout=2)
+                terminal = json.loads(remaining.splitlines()[-1])["error"]
+                assert_turn_timing(terminal, [], completed_steps=0)
                 elapsed = time.monotonic() - started
                 assert elapsed < 2, elapsed
                 assert interrupted.returncode != 0 and errors == b"", errors
