@@ -9,16 +9,20 @@ const process = @import("process.zig");
 const Progress = @import("../session/events.zig").Progress;
 
 pub fn agent(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolResult {
-    const a = std.json.parseFromSlice(struct { prompt: []const u8, timeout_ms: i64 = 1_800_000 }, gpa, args, .{ .ignore_unknown_fields = true }) catch
-        return fail(gpa, "expected {{ prompt: string, timeout_ms?: number }}", .{});
+    const a = std.json.parseFromSlice(struct { prompt: []const u8, timeout_ms: i64 = 1_800_000, model: ?[]const u8 = null, effort: ?[]const u8 = null }, gpa, args, .{ .ignore_unknown_fields = true }) catch
+        return fail(gpa, "expected {{ prompt: string, timeout_ms?: number, model?: string, effort?: string }}", .{});
     defer a.deinit();
     if (a.value.timeout_ms <= 0) return fail(gpa, "timeout_ms must be positive", .{});
+    var cfg = t.cfg orelse return error.AgentConfigUnavailable;
+    if (a.value.model) |model| cfg.model = model;
+    if (a.value.effort) |effort| try cfg.setEffort(effort);
     var tracker: Tracker = .{
         .t = t,
         .arena = .init(gpa),
         .value = .{ .agent = try t.progress.add(gpa, t.io, a.value.prompt), .prompt = a.value.prompt },
     };
     defer tracker.arena.deinit();
+    defer t.addUsage(tracker.output.usage);
     var state: @FieldType(Progress, "state") = .failed;
     defer {
         tracker.value.state = state;
@@ -49,73 +53,123 @@ pub fn agent(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolR
     try env.put("NIB_PARENT_SESSION_ID", t.session_id orelse return error.MissingSessionId);
     const executable = try std.process.executablePathAlloc(t.io, gpa);
     defer gpa.free(executable);
-    const input = try std.json.Stringify.valueAlloc(gpa, .{ .prompt = a.value.prompt, .config = t.cfg orelse return error.AgentConfigUnavailable }, .{});
+    const input = try std.json.Stringify.valueAlloc(gpa, .{ .prompt = a.value.prompt, .config = cfg }, .{});
     defer gpa.free(input);
     const started = std.Io.Clock.awake.now(t.io);
-    const result = try process.run(gpa, t.io, .{
+    const result = process.run(gpa, t.io, .{
         .spawn = .{ .argv = &.{ executable, "ask", "--json", "--agent-input", "-" }, .environ_map = &env, .stdout = .pipe, .stderr = .ignore },
         .input = input,
         .cancel = &t.cancel,
         .timeout_ms = a.value.timeout_ms,
         .termination_grace_ms = 500,
         .on_line = .{ .ctx = &tracker, .emit = Tracker.line },
-    });
+    }) catch |err| {
+        if (t.cancel.load(.acquire)) {
+            state = .canceled;
+            return error.Canceled;
+        }
+        return tracker.output.result(gpa, started.durationTo(std.Io.Clock.awake.now(t.io)).toMilliseconds(), @errorName(err), null);
+    };
     defer gpa.free(result.output);
-    var usage: provider.Usage = .{};
-    defer t.addUsage(usage);
+    if (result.stop == null) {
+        const tail = if (std.mem.lastIndexOfScalar(u8, result.output, '\n')) |last| result.output[last + 1 ..] else result.output;
+        if (tail.len > 0) tracker.capture(tail);
+    }
+    const output = &tracker.output;
+    tracker.value.usage = output.usage;
+    if (output.steps) |steps| tracker.value.step = steps;
+    if (t.cancel.load(.acquire) or (if (result.stop) |stop| stop == error.Canceled else false)) {
+        state = .canceled;
+        return error.Canceled;
+    }
     const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(t.io)).toMilliseconds();
-    var child_id: ?[]u8 = null;
-    defer if (child_id) |id| gpa.free(id);
-    var terminal: ?std.json.Parsed(JsonEvent) = null;
-    defer if (terminal) |parsed| parsed.deinit();
-    var lines = std.mem.splitScalar(u8, result.output, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        if (result.stop != null and lines.rest().len == 0 and !std.mem.endsWith(u8, result.output, "\n")) break;
-        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, line, .{});
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidAgentOutput;
-        if (parsed.value.object.contains("start")) {
-            if (child_id != null) return error.InvalidAgentOutput;
-            const start = try std.json.parseFromSlice(JsonEvent, gpa, line, .{});
-            defer start.deinit();
-            child_id = try gpa.dupe(u8, start.value.start.session_id);
-        }
-        if (parsed.value.object.get("usage")) |snapshot| {
-            const u = try std.json.parseFromValue(provider.Usage, gpa, snapshot, .{ .ignore_unknown_fields = true });
-            defer u.deinit();
-            usage = u.value;
-        }
-        if (!parsed.value.object.contains("end") and !parsed.value.object.contains("error")) continue;
-        if (terminal != null) return error.InvalidAgentOutput;
-        terminal = try std.json.parseFromSlice(JsonEvent, gpa, line, .{ .ignore_unknown_fields = true });
-    }
-    if (terminal) |parsed| usage = switch (parsed.value) {
-        .end => |end| end.usage,
-        .@"error" => |err| err.usage,
-        else => return error.InvalidAgentOutput,
-    };
-    tracker.value.usage = usage;
-    if (terminal) |parsed| tracker.value.step = switch (parsed.value) {
-        .end => |end| end.steps,
-        .@"error" => |err| err.steps,
-        else => tracker.value.step,
-    };
-    if (result.stop) |err| {
-        state = if (err == error.TimedOut) .timed_out else .canceled;
-        return switch (err) {
-            error.TimedOut => fail(gpa, "subagent stopped due to timeout after {d} ms (limit {d} ms); child session id: {s}. Files it changed may be incomplete; inspect them before continuing.", .{ elapsed_ms, a.value.timeout_ms, child_id orelse "unavailable (no start event)" }),
-            error.Canceled => error.Canceled,
-        };
-    }
-    const event = (terminal orelse return error.MissingAgentResult).value;
-    if (event == .end and result.term.success()) state = .done;
-    return switch (event) {
-        .end => |end| if (result.term.success()) .{ .ok = try std.json.Stringify.valueAlloc(gpa, .{ .text = end.text, .usage = end.usage }, .{}) } else error.AgentFailed,
-        .@"error" => |err| fail(gpa, "subagent: {s}", .{err.message}),
-        else => error.InvalidAgentOutput,
-    };
+    const reason: ?[]const u8 = if (if (result.stop) |stop| stop == error.TimedOut else false) reason: {
+        state = .timed_out;
+        break :reason "stopped due to timeout";
+    } else if (!result.term.success())
+        output.failure orelse "AgentFailed (process crashed or exited nonzero)"
+    else if (output.failure) |failure| failure else if (!output.ended) "MissingAgentResult" else null;
+    if (reason == null) state = .done;
+    return output.result(gpa, elapsed_ms, reason, if (state == .timed_out) a.value.timeout_ms else null);
 }
+
+const Change = struct { path: []const u8, added: usize, removed: usize, created: bool = false };
+
+const Output = struct {
+    text: std.ArrayList(u8) = .empty,
+    usage: provider.Usage = .{},
+    changes: std.ArrayList(Change) = .empty,
+    child_id: ?[]const u8 = null,
+    steps: ?u32 = null,
+    ended: bool = false,
+    failure: ?[]const u8 = null,
+
+    fn observe(out: *Output, gpa: std.mem.Allocator, a: std.mem.Allocator, bytes: []const u8) !void {
+        var scratch: std.heap.ArenaAllocator = .init(gpa);
+        defer scratch.deinit();
+        const temp = scratch.allocator();
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, temp, bytes, .{});
+        if (value != .object) return error.InvalidAgentOutput;
+        const obj = value.object;
+        if (obj.contains("start")) {
+            if (out.child_id != null) return error.InvalidAgentOutput;
+            const event = try std.json.parseFromValueLeaky(JsonEvent, temp, value, .{});
+            out.child_id = try a.dupe(u8, event.start.session_id);
+        }
+        if (obj.get("delta")) |delta| {
+            const d = try std.json.parseFromValueLeaky(struct { kind: provider.Kind, text: []const u8 }, temp, delta, .{ .ignore_unknown_fields = true });
+            if (d.kind == .text) try out.text.appendSlice(a, d.text);
+        }
+        if (obj.get("usage")) |usage| out.usage = try std.json.parseFromValueLeaky(provider.Usage, temp, usage, .{ .ignore_unknown_fields = true });
+        if (obj.get("run_end")) |run| {
+            const r = try std.json.parseFromValueLeaky(struct { changes: []const Change = &.{} }, temp, run, .{ .ignore_unknown_fields = true });
+            for (r.changes) |change| {
+                for (out.changes.items) |*known| {
+                    if (!std.mem.eql(u8, known.path, change.path)) continue;
+                    known.added += change.added;
+                    known.removed += change.removed;
+                    known.created = known.created or change.created;
+                    break;
+                } else {
+                    var summary = change;
+                    summary.path = try a.dupe(u8, change.path);
+                    try out.changes.append(a, summary);
+                }
+            }
+        }
+        if (obj.contains("end") or obj.contains("error")) {
+            if (out.ended) return error.InvalidAgentOutput;
+            const event = try std.json.parseFromValueLeaky(JsonEvent, temp, value, .{ .ignore_unknown_fields = true });
+            out.ended = true;
+            switch (event) {
+                .end => |end| {
+                    out.text.clearRetainingCapacity();
+                    try out.text.appendSlice(a, end.text);
+                    out.usage = end.usage;
+                    out.steps = end.steps;
+                },
+                .@"error" => |err| {
+                    out.failure = try a.dupe(u8, err.message);
+                    out.usage = err.usage;
+                    out.steps = err.steps;
+                },
+                else => return error.InvalidAgentOutput,
+            }
+        }
+    }
+
+    fn result(out: *const Output, gpa: std.mem.Allocator, elapsed_ms: i64, reason: ?[]const u8, timeout_ms: ?i64) !sandbox.ToolResult {
+        if (reason) |message| {
+            const detail = if (timeout_ms) |limit|
+                try std.fmt.allocPrint(gpa, "subagent stopped due to timeout after {d} ms (limit {d} ms); child session id: {s}. Files it changed may be incomplete; inspect them before continuing.", .{ elapsed_ms, limit, out.child_id orelse "unavailable (no start event)" })
+            else
+                try std.fmt.allocPrint(gpa, "subagent: {s} after {d} ms; child session id: {s}. Files it changed may be incomplete; inspect them before continuing.", .{ message, elapsed_ms, out.child_id orelse "unavailable (no start event)" });
+            defer gpa.free(detail);
+            return .{ .ok = try std.json.Stringify.valueAlloc(gpa, .{ .ok = false, .@"error" = detail, .text = out.text.items, .usage = out.usage, .changes = out.changes.items }, .{}) };
+        }
+        return .{ .ok = try std.json.Stringify.valueAlloc(gpa, .{ .ok = true, .text = out.text.items, .usage = out.usage, .changes = out.changes.items }, .{}) };
+    }
+};
 
 const Tracker = struct {
     t: *Tools,
@@ -125,6 +179,7 @@ const Tracker = struct {
     reply_started: bool = false,
     pending_reply: bool = false,
     post_run_usage: bool = false,
+    output: Output = .{},
 
     fn publish(tr: *Tracker) void {
         tr.t.progress.update(tr.arena.child_allocator, tr.t.io, tr.value) catch {};
@@ -132,7 +187,14 @@ const Tracker = struct {
 
     fn line(ctx: *anyopaque, bytes: []const u8) void {
         const tr: *Tracker = @ptrCast(@alignCast(ctx));
+        tr.capture(bytes);
         tr.observe(bytes) catch {};
+    }
+
+    fn capture(tr: *Tracker, bytes: []const u8) void {
+        tr.output.observe(tr.arena.child_allocator, tr.arena.allocator(), bytes) catch |err| {
+            tr.output.failure = @errorName(err);
+        };
     }
 
     fn observe(tr: *Tracker, bytes: []const u8) !void {
@@ -237,4 +299,39 @@ test "child progress counts Steps rather than Runs and ignores compaction snapsh
     try tr.observe("{\"run_start\":\"tools.read({})\"}");
     try testing.expectEqual(@as(u32, 3), tr.value.step);
     try testing.expectEqual(@as(u64, 350), tr.value.usage.prompt_tokens);
+}
+
+test "agent output retains only returned data and terminal text overrides deltas" {
+    const testing = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var out: Output = .{};
+    for (0..500) |_| try out.observe(testing.allocator, arena.allocator(), "{\"delta\":{\"kind\":\"reasoning\",\"text\":\"ignored reasoning\"}}");
+    try testing.expectEqual(@as(usize, 0), arena.queryCapacity());
+    try out.observe(testing.allocator, arena.allocator(), "{\"delta\":{\"kind\":\"text\",\"text\":\"partial\"}}");
+    try testing.expectEqualStrings("partial", out.text.items);
+    try out.observe(testing.allocator, arena.allocator(), "{\"run_end\":{\"changes\":[{\"path\":\"a\",\"added\":2,\"removed\":1,\"created\":true,\"diff\":\"not retained\"}]}}");
+    try testing.expectEqualStrings("a", out.changes.items[0].path);
+    try out.observe(testing.allocator, arena.allocator(), "{\"end\":{\"text\":\"final\",\"usage\":{\"prompt_tokens\":10},\"steps\":2}}");
+    try testing.expectEqualStrings("final", out.text.items);
+    try testing.expectEqual(@as(u64, 10), out.usage.prompt_tokens);
+}
+
+test "agent failure without output is data and queued user cancellation rejects" {
+    const testing = std.testing;
+    const out: Output = .{};
+    const result = try out.result(testing.allocator, 12, "AgentFailed", null);
+    defer tools.freeResult(result);
+    try testing.expect(result == .ok);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, result.ok, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try testing.expect(!obj.get("ok").?.bool);
+    try testing.expectEqualStrings("", obj.get("text").?.string);
+    try testing.expect(std.mem.indexOf(u8, obj.get("error").?.string, "unavailable (no start event)") != null);
+    var t: Tools = .{ .io = testing.io, .home = "/unused", .cfg = .{ .model = "m", .base_url = "", .api_key = "" }, .agents_active = 4 };
+    defer t.progress.clear(testing.allocator);
+    t.cancel.store(true, .release);
+    try testing.expectError(error.Canceled, agent(&t, testing.allocator, "{\"prompt\":\"cancelled\"}"));
+    try testing.expectEqual(@as(usize, 4), t.agents_active);
 }

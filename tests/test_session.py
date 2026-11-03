@@ -344,7 +344,13 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         assert len(children) == 6
         starts = sorted(r["received"] for r in children)
         assert starts[3] - starts[0] < .25 and starts[4] - starts[0] >= .3, starts
-        failed_child = events(ask("--json", "delegate_failure"))[-1]["end"]
+        failed_events = events(ask("--json", "delegate_failure"))
+        failed_run = next(e["run_end"] for e in failed_events if "run_end" in e)
+        assert failed_run["ok"], failed_run
+        failed_result = json.loads(failed_run["output"].removeprefix("result: "))
+        assert isinstance(failed_result, dict), failed_result
+        assert failed_result["ok"] is False and "HTTP 400" in failed_result["error"], failed_result
+        failed_child = failed_events[-1]["end"]
         assert "HTTP 400" in failed_child["text"]
         assert failed_child["usage"] == {"prompt_tokens": 9900, "completion_tokens": 50, "prompt_cache_hit_tokens": 256}
         human = ask("delegate")
@@ -410,7 +416,10 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         timeout_events = events(ask("--json", "delegate_timeout " + str(partial_path)))
         timeout_run = next(e["run_end"] for e in timeout_events if "run_end" in e)
         assert timeout_run["ok"], timeout_run
-        timeout_message = json.loads(timeout_run["output"].removeprefix("result: "))
+        timeout_result = json.loads(timeout_run["output"].removeprefix("result: "))
+        assert timeout_result["ok"] is False, timeout_result
+        assert set(timeout_result) == {"ok", "error", "text", "usage", "changes"}, timeout_result
+        timeout_message = timeout_result["error"]
         match = re.search(r"stopped due to timeout after (\d+) ms \(limit 1600 ms\); child session id: ([0-9a-f]{32})", timeout_message)
         assert match and 1600 <= int(match[1]) < 4500, timeout_message
         assert "Files it changed may be incomplete; inspect them" in timeout_message, timeout_message
@@ -425,7 +434,10 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
 
         forced_timeout = events(ask("--json", "delegate_timeout_stall"))
         forced_run = next(e["run_end"] for e in forced_timeout if "run_end" in e)
-        forced_message = json.loads(forced_run["output"].removeprefix("result: "))
+        assert forced_run["ok"], forced_run
+        forced_result = json.loads(forced_run["output"].removeprefix("result: "))
+        assert forced_result["ok"] is False, forced_result
+        forced_message = forced_result["error"]
         assert re.search(r"child session id: [0-9a-f]{32}", forced_message), forced_message
         assert "stopped due to timeout" in forced_message and "may be incomplete" in forced_message, forced_message
         assert forced_timeout[-1]["end"]["usage"]["prompt_tokens"] == 9900, forced_timeout[-1]
