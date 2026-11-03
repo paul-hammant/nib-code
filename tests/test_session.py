@@ -308,27 +308,31 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
 
         for sig, marker in ((signal.SIGINT, "[interrupted by user]"),
                             (signal.SIGTERM, "[interrupted: process terminated]")):
-            interrupted = subprocess.Popen([str(BIN), "ask", "--json", "interrupt me"],
+            interrupted = subprocess.Popen([str(BIN), "ask", "--json", "interrupt stalled"],
                                            cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
                 session_id = json.loads(interrupted.stdout.readline())["start"]["session_id"]
                 while "partial answer" not in interrupted.stdout.readline().decode():
                     assert interrupted.poll() is None
+                started = time.monotonic()
                 interrupted.send_signal(sig)
-                _, errors = interrupted.communicate(timeout=5)
+                _, errors = interrupted.communicate(timeout=2)
+                elapsed = time.monotonic() - started
+                assert elapsed < 2, elapsed
                 assert interrupted.returncode != 0 and errors == b"", errors
+                print(f"Stalled stream cancellation: {sig.name} exited in {elapsed:.3f} s")
             finally:
                 if interrupted.poll() is None:
                     interrupted.kill()
                     interrupted.wait()
             interrupted_log = tmp / "nib/sessions" / f"{session_id}.jsonl"
             kept, _ = replay(interrupted_log)
-            assert kept[-2] == {"role": "user", "content": "interrupt me"}, kept
+            assert kept[-2] == {"role": "user", "content": "interrupt stalled"}, kept
             assert kept[-1]["content"] == "partial answer\n\n" + marker, kept[-1]
             assert kept[-1]["reasoning_content"] == "想一想。", kept[-1]
             ask("after interrupt", "--resume", session_id)
             assert read_requests(requests_path)[-2]["messages"] == kept + [{"role": "user", "content": "after interrupt"}]
-        print("Interrupted Turn E2E passed: SIGINT/SIGTERM keep partial text with distinct markers and resume safely")
+        print("Interrupted Turn E2E passed: SIGINT/SIGTERM exit within 2 s during a 30 s stalled read, keep partial text and resume safely")
 
         (cwd / "same.txt").write_text("x\n")
         edited = events(ask("--json", "edit_test"))

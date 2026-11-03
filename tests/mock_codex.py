@@ -61,6 +61,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.flush()
         output = []
         event("response.created", response={"id": f"resp_{number}", "status": "in_progress", "output": []})
+        if prompt == "interrupt stalled":
+            event("response.output_text.delta", item_id=f"msg_{number}", output_index=0, content_index=0, delta="partial answer")
+            time.sleep(30)
+            return
         if not summary and body.get("reasoning", {}).get("effort") != "none":
             for part in range(2):
                 item = {"id": f"rs_{number}_{part}", "type": "reasoning", "summary": [{"type": "summary_text", "text": "Mock reasoning."}],

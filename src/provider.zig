@@ -1,6 +1,7 @@
 const std = @import("std");
 const chat = @import("provider/openai.zig");
 const codex = @import("provider/codex.zig");
+const cancelable = @import("provider/cancel.zig");
 
 pub const Id = enum { chat_completions, codex };
 
@@ -122,8 +123,8 @@ pub fn stream(
     detail: *?[]u8,
 ) !Reply {
     return switch (cfg.provider) {
-        .chat_completions => chat.stream(gpa, out, client, cfg, messages, tools_json, max_tokens, sink, cancel, detail),
-        .codex => codex.stream(gpa, out, client, cfg, cache_key, messages, tools_json, max_tokens, sink, cancel, detail),
+        .chat_completions => cancelable.run(client.io, cancel, chat.stream, .{ gpa, out, client, cfg, messages, tools_json, max_tokens, sink, cancel, detail }),
+        .codex => cancelable.run(client.io, cancel, codex.stream, .{ gpa, out, client, cfg, cache_key, messages, tools_json, max_tokens, sink, cancel, detail }),
     };
 }
 

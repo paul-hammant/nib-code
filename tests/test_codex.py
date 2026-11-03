@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import signal
 import subprocess
 import tempfile
 import time
@@ -149,6 +150,30 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
         assert result["call_id"] == call["call_id"] and json.loads(call["arguments"])["code"]
         assert any(item.get("encrypted_content") for item in second_input)
         print("Codex stream, request headers/schema, tools, encrypted reasoning resume and cache usage passed")
+
+        before = len(requests())
+        interrupted = subprocess.Popen([str(BIN), "ask", "--json", "interrupt stalled"],
+                                       cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            interrupted_id = json.loads(interrupted.stdout.readline())["start"]["session_id"]
+            while "partial answer" not in interrupted.stdout.readline().decode():
+                assert interrupted.poll() is None
+            started = time.monotonic()
+            interrupted.send_signal(signal.SIGTERM)
+            output, errors = interrupted.communicate(timeout=2)
+            elapsed = time.monotonic() - started
+            assert elapsed < 2, elapsed
+            assert interrupted.returncode != 0 and errors == b"", errors
+            assert "error" in json.loads(output.splitlines()[-1]), output
+        finally:
+            if interrupted.poll() is None:
+                interrupted.kill()
+                interrupted.wait()
+        kept, _ = replay(tmp / f"nib/sessions/{interrupted_id}.jsonl")
+        assert kept[-2] == {"role": "user", "content": "interrupt stalled"}, kept
+        assert kept[-1]["content"] == "partial answer\n\n[interrupted: process terminated]", kept[-1]
+        assert len(requests()) == before + 1
+        print(f"Codex stalled stream cancellation passed: SIGTERM exited in {elapsed:.3f} s and kept partial text")
 
         before = len(requests())
         delegated = ask("delegate", overrides={"NIB_MODEL": "gpt-6-sol", "NIB_REASONING_EFFORT": "high"})

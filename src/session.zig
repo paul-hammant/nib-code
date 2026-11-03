@@ -474,16 +474,19 @@ test "failed Turn leaves replay equal to in-memory safe history" {
             .{ .role = "assistant", .tool_calls = &.{.{ .id = "safe", .function = .{ .name = "run", .arguments = "{}" } }} },
             .{ .role = "tool", .tool_call_id = "safe", .content = "saved result" },
         }, 100, null);
-        const result = session.turn("not committed", .{ .ctx = &ctx, .emit = Quiet.emit }, &cancel, &detail);
-        try t.expectError(error.UnsupportedUriScheme, result);
-        const directory = try std.fs.path.join(a, &.{ root, "sessions" });
-        const path = try std.fmt.allocPrint(a, "{s}/{s}.jsonl", .{ directory, session.id });
-        const data = try std.Io.Dir.cwd().readFileAlloc(t.io, path, a, .unlimited);
-        var restored: std.ArrayList(provider.Message) = .empty;
-        var tokens: u64 = 0;
-        _ = try session_log.replay(a, a, data, &restored, &tokens);
-        try t.expectEqualDeep(session.history.items, restored.items);
-        try t.expectEqual(session.context_tokens, tokens);
+        for ([_]bool{ false, true }) |canceled| {
+            cancel.store(canceled, .release);
+            const result = session.turn("failed turn", .{ .ctx = &ctx, .emit = Quiet.emit }, &cancel, &detail);
+            try t.expectError(if (canceled) error.Canceled else error.UnsupportedUriScheme, result);
+            const directory = try std.fs.path.join(a, &.{ root, "sessions" });
+            const path = try std.fmt.allocPrint(a, "{s}/{s}.jsonl", .{ directory, session.id });
+            const data = try std.Io.Dir.cwd().readFileAlloc(t.io, path, a, .unlimited);
+            var restored: std.ArrayList(provider.Message) = .empty;
+            var tokens: u64 = 0;
+            _ = try session_log.replay(a, a, data, &restored, &tokens);
+            try t.expectEqualDeep(session.history.items, restored.items);
+            try t.expectEqual(session.context_tokens, tokens);
+        }
     }
 }
 
