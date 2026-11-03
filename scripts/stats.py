@@ -21,6 +21,7 @@ ERRORS = {
     'tool_arguments': r'expected \{|arguments must be a JSON object',
     'denied': r'refused by nib|CredentialAccessDenied',
     'interrupted': r'\[interrupted(?: by user|: process terminated)\]|Error: run canceled',
+    'provider_failure': None,
     'other_failure': None,
 }
 TOOL_CALL = re.compile(r'\btools\.([A-Za-z_$][\w$]*)\s*\(')
@@ -105,6 +106,10 @@ def records(path):
                     continue
                 if not isinstance(record, dict) or record.get('repair'):
                     continue
+                diagnostic = record.get('diagnostic')
+                if isinstance(diagnostic, dict) and isinstance(diagnostic.get('message'), str):
+                    yield record
+                    continue
                 messages = record.get('messages')
                 if not number(record.get('from')) or not isinstance(messages, list) or not messages:
                     continue
@@ -141,7 +146,7 @@ def summarize(paths, since=None, cwd=None):
             continue
         log = iter(records(path))
         header = next(log, None)
-        if header is None or header['messages'][0]['role'] != 'system':
+        if header is None or not header.get('messages') or header['messages'][0]['role'] != 'system':
             continue
         if cwd is not None and (not isinstance(header.get('cwd'), str) or
                                 Path(header['cwd']).expanduser().resolve() != cwd):
@@ -159,6 +164,9 @@ def summarize(paths, since=None, cwd=None):
                     turn_times.append(current['ms'])
 
         for record in log:
+            if isinstance(record.get('diagnostic'), dict):
+                error('provider_failure', record['diagnostic']['message'], path.stem)
+                continue
             messages = record['messages']
             replacement = record['from'] < length
             length = record['from'] + len(messages)
@@ -243,7 +251,7 @@ def summarize(paths, since=None, cwd=None):
             'bash_top10': [{'command': k, 'count': v} for k, v in sorted(bash_counts.items(), key=lambda p: (-p[1], p[0]))[:10]],
             'errors': errors, 'slowest_steps': slowest,
             'notes': ['失败率仅统计显式 run_results；旧日志的状态为未知。',
-                      '错误按 Run 的诊断特征计数，类别可重叠；另计打断记录；忽略源码/read 正文，被捕获的工具错误不一定导致 Run 失败。',
+                      '错误按 Run 的诊断特征计数，类别可重叠；另计打断记录和未提交的 provider 失败诊断；忽略源码/read 正文，被捕获的工具错误不一定导致 Run 失败。',
                       '工具和 bash 命令数是静态估计，不是运行时调用次数；动态 JS/shell 可能漏计。',
                       'Turn 耗时只统计已结束且所有 Step 都有 ms 的 Turn，不含压缩、未完成请求和用户停顿。',
                       '--since 按会话文件修改日期（本地时间）筛选，不是逐 Step 日期。']}

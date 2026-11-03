@@ -32,6 +32,7 @@ const Event = union(enum) {
     notice: []u8,
     done,
     usage: provider.Usage,
+    progress: @import("session/events.zig").Progress,
     failed: []u8,
     /// One outcome line from automatic issue filing, owned by the receiver.
     issue: []u8,
@@ -90,14 +91,20 @@ const Turn = struct {
     fn emit(ctx: *anyopaque, ev: SessionEvent) !void {
         const t: *Turn = @ptrCast(@alignCast(ctx));
         const gpa = t.gpa;
-        try t.loop.postEvent(switch (ev) {
+        const event: Event = switch (ev) {
             .delta => |d| .{ .delta = .{ .kind = d.kind, .text = try gpa.dupe(u8, d.text) } },
             .run_start => |code| .{ .run_start = try gpa.dupe(u8, code) },
             .run_end => |r| .{ .run_end = .{ .ok = r.ok, .output = try gpa.dupe(u8, r.output), .changes = try .init(gpa, r.changes) } },
             .retry => |r| .{ .retry = try std.fmt.allocPrint(gpa, "retry {d} in {d}s: {s}", .{ r.attempt, r.delay_ms / 1000, r.reason }) },
             .notice => |m| .{ .notice = try gpa.dupe(u8, m) },
             .usage => |u| .{ .usage = u },
-        });
+            .progress => |p| .{ .progress = try p.clone(gpa) },
+        };
+        errdefer if (event == .progress) {
+            var owned = event.progress;
+            owned.deinit(gpa);
+        };
+        try t.loop.postEvent(event);
     }
 
     fn finish(t: *Turn) void {
@@ -301,6 +308,11 @@ const App = struct {
                 try app.transcript.add(gpa, .info, msg);
             },
             .usage => |u| app.usage = u,
+            .progress => |p| {
+                var owned = p;
+                defer owned.deinit(gpa);
+                try app.transcript.progress(gpa, p);
+            },
             .done => {
                 app.finishTurn();
                 try app.saveReflection();

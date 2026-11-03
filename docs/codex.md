@@ -61,6 +61,16 @@ NIB_THINKING=on 默认用 medium；NIB_REASONING_EFFORT 可显式指定服务端
 
 凭证缺失、格式错误或 401 会给出登录提示。401 只重新读取文件并重试一次，让 Codex CLI 已刷新的凭证生效；仍失败请运行 `codex` 重新登录。nib 不使用 refresh_token。凭证不进入会话日志、argv 或子进程环境。tools.agent 从 stdin 接收有效配置，跳过配置文件读取，各自读取 auth.json；bash 不继承常见密钥环境变量。read/edit/write 拒绝凭证文件，bash 拒绝引用凭证目录；这些是防误操作保护，不是系统沙箱，详见 [ADR 0006](adr/0006-deny-dangerous-commands.md)。
 
+## 流失败与重试
+
+流中的 `error`、`response.failed`、`response.incomplete` 保留服务端 code/message 或 incomplete reason，报错格式为 `Codex stream failed: <code>: <message>; the Step was not committed.`；message 按 UTF-8 边界截到约 300 字节。
+
+`context_length_exceeded`、`insufficient_quota`、`usage_not_included`、`invalid_prompt` 和请求类 4xx（429 除外）不重试。`server_error`、限流、过载/服务不可用、未知 code 和 `IncompleteResponse` 断流最多尝试 5 次，默认等待 1、2、4、8 秒；限流消息里的 `try again in Xs` / `Xms` 可覆盖本次等待，支持小数。沿用既有 retry 事件和 TUI 提示。
+
+Codex 即使已经流出文本或推理也可重试；失败尝试的 delta 已显示，不回滚，因此界面可能出现重复片段。重试使用相同请求，清空用于取消提交的失败 partial；成功时只提交成功尝试的完整 Step，最终回答取 `end.text`，不要拼接所有 delta。Chat Completions 仍只在没有流出 delta 时重试。
+
+不重试或重试耗尽后，日志另追加 `diagnostic`（`error_name`、含 code/message 的 `message`、`attempts`、失败的 `step`）。诊断不进入模型上下文，不改变已提交消息或 context_tokens；恢复忽略它，`scripts/stats.py` 将其单独计入 `errors.provider_failure`，不增加 Step 或 token。取消仍走原有中断提交路径。
+
 本地验证（全为临时虚构凭证）：
 
 ```sh

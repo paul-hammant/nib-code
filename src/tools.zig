@@ -130,6 +130,7 @@ pub const Tools = struct {
     agents_mutex: std.Io.Mutex = .init,
     agents_changed: std.Io.Condition = .init,
     agents_active: usize = 0,
+    progress: @import("tools/progress.zig").Queue = .{},
     agent_usage: provider.Usage = .{},
     cancel: std.atomic.Value(bool) = .init(false),
     paths_mutex: std.Io.Mutex = .init,
@@ -223,7 +224,12 @@ pub const Tools = struct {
 
     pub fn host(t: *Tools) sandbox.Host {
         t.cancel.store(false, .release);
-        return .{ .ctx = t, .names = t.api().names, .call = call, .cancel = &t.cancel };
+        return .{ .ctx = t, .names = t.api().names, .call = call, .cancel = &t.cancel, .poll = poll };
+    }
+
+    fn poll(ctx: *anyopaque) !void {
+        const t: *Tools = @ptrCast(@alignCast(ctx));
+        try t.progress.drain(t.io);
     }
 
     pub fn call(ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8, args: []const u8) sandbox.ToolResult {

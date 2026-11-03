@@ -26,7 +26,7 @@ def replay(path):
     for line in path.read_text().splitlines():
         record = json.loads(line)
         records.append(record)
-        if not record.get("repair"):
+        if not record.get("repair") and not record.get("diagnostic"):
             history[record["from"]:] = record["messages"]
     return history, records
 
@@ -175,6 +175,71 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
         assert len(requests()) == before + 1
         print(f"Codex stalled stream cancellation passed: SIGTERM exited in {elapsed:.3f} s and kept partial text")
 
+        for prompt, delay in (("stream retry server", 1000), ("stream retry disconnect", 1000), ("stream rate retry", 30)):
+            before = len(requests())
+            recovered = ask(prompt)
+            assert len(requests()) == before + 2, recovered
+            retry_index = next(i for i, event in enumerate(recovered) if "retry" in event)
+            assert sum("delta" in event for event in recovered[:retry_index]) >= 2, recovered
+            retries = [event["retry"] for event in recovered if "retry" in event]
+            assert len(retries) == 1 and retries[0]["attempt"] == 1 and retries[0]["delay_ms"] == delay, recovered
+            expected_code = "server_error" if prompt == "stream retry server" else "IncompleteResponse" if prompt == "stream retry disconnect" else "rate_limit_exceeded"
+            assert expected_code in retries[0]["reason"]
+            assert recovered[-1]["end"]["text"] == "Mock text complete.", recovered
+            assert recovered[-1]["end"]["steps"] == 1
+            assert recovered[-1]["end"]["usage"] == dict(prompt_tokens=3300, completion_tokens=20, prompt_cache_hit_tokens=64)
+            assert requests()[-1]["body"] == requests()[-2]["body"]
+            recovered_log = tmp / ("nib/sessions/" + recovered[0]["start"]["session_id"] + ".jsonl")
+            recovered_history, recovered_records = replay(recovered_log)
+            assert not any(r.get("diagnostic") for r in recovered_records)
+            assert all("failed attempt prefix" not in m.get("content", "") for m in recovered_history)
+
+        for prompt, code, message, count in (("stream context fatal", "context_length_exceeded", "mock context budget exceeded", 1),
+                                             ("stream rate exhausted", "rate_limit_exceeded", "mock limit; try again in 20ms", 5)):
+            before = len(requests())
+            failed = ask(prompt, ok=False)
+            assert len(requests()) == before + count, failed
+            retries = [event["retry"] for event in failed if "retry" in event]
+            assert len(retries) == count - 1, failed
+            if retries:
+                assert all(event["delay_ms"] == 20 for event in retries), failed
+            detail = f"Codex stream failed: {code}: {message}; the Step was not committed."
+            assert failed[-1]["error"]["message"] == detail, failed
+            assert failed[-1]["error"]["steps"] == 0
+            failed_id = failed[0]["start"]["session_id"]
+            failed_log = tmp / f"nib/sessions/{failed_id}.jsonl"
+            failed_history, failed_records = replay(failed_log)
+            assert len(failed_history) == 1 and failed_history[0]["role"] == "system"
+            diagnostic = failed_records[-1]["diagnostic"]
+            assert diagnostic["message"] == detail and diagnostic["attempts"] == count and diagnostic["step"] == 1
+            report = json.loads(subprocess.check_output(["python3", str(ROOT / "scripts/stats.py"), str(failed_log), "--json"]))
+            assert report["errors"]["provider_failure"]["count"] == 1, report
+            assert report["overall"]["steps"] == 0 and report["usage"]["total_tokens"] == 0, report
+            ask("plain text", "--resume", failed_id)
+            assert requests()[-1]["body"]["input"] == [{"role": "user", "content": "plain text"}], requests()[-1]
+        retrying = subprocess.Popen([str(BIN), "ask", "--json", "stream retry cancel"], cwd=cwd, env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            retry_id = json.loads(retrying.stdout.readline())["start"]["session_id"]
+            while True:
+                event = json.loads(retrying.stdout.readline())
+                if "retry" in event:
+                    assert event["retry"]["delay_ms"] == 10000
+                    break
+            retrying.send_signal(signal.SIGTERM)
+            output, errors = retrying.communicate(timeout=2)
+            assert retrying.returncode != 0 and errors == b"", errors
+            assert "error" in json.loads(output.splitlines()[-1]), output
+        finally:
+            if retrying.poll() is None:
+                retrying.kill()
+                retrying.wait()
+        retry_history, retry_records = replay(tmp / f"nib/sessions/{retry_id}.jsonl")
+        assert retry_history[-2] == {"role": "user", "content": "stream retry cancel"}, retry_history
+        assert retry_history[-1]["content"] == "[interrupted: process terminated]", retry_history[-1]
+        assert not any(record.get("diagnostic") for record in retry_records)
+        print("Codex mid-stream recovery passed: partial deltas, server errors/disconnects, rate-limit hints, fatal context errors and diagnostic-only logs/stats")
+
         before = len(requests())
         delegated = ask("delegate", overrides={"NIB_MODEL": "gpt-6-sol", "NIB_REASONING_EFFORT": "high"})
         assert delegated[-1]["end"]["usage"]["prompt_tokens"] == 9900
@@ -251,11 +316,19 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
         message = cross[-1]["error"]["message"]
         assert "SessionProviderMismatch" in message or "different provider" in message, cross
         log = tmp / f"nib/sessions/{session}.jsonl"
-        committed = log.read_bytes()
+        committed_history, _ = replay(log)
         for prompt in ("stream incomplete", "stream failed", "stream truncated"):
+            committed = log.read_bytes()
+            before = len(requests())
             failed = ask(prompt, "--resume", session, ok=False)
             assert not any("end" in event for event in failed), failed
-            assert log.read_bytes() == committed, prompt
+            assert log.read_bytes().startswith(committed), prompt
+            history, records = replay(log)
+            assert history == committed_history, prompt
+            expected = 5 if prompt == "stream truncated" else 1
+            assert len(requests()) == before + expected, failed
+            assert records[-1]["diagnostic"]["message"] == failed[-1]["error"]["message"]
+            assert records[-1]["diagnostic"]["attempts"] == expected
         before = len(requests())
         changed_model = ask("plain text", "--resume", session, ok=False, overrides={"NIB_MODEL": "gpt-6-sol"})
         assert "different model" in changed_model[-1]["error"]["message"]

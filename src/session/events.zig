@@ -2,6 +2,51 @@ const std = @import("std");
 const provider = @import("../provider.zig");
 const Change = @import("../tools/diff.zig").Change;
 
+pub const Progress = struct {
+    agent: usize,
+    prompt: []const u8,
+    state: enum { queued, working, done, failed, canceled, timed_out } = .working,
+    step: u32 = 0,
+    tools: []const []const u8 = &.{},
+    files: []const []const u8 = &.{},
+    usage: provider.Usage = .{},
+
+    pub fn clone(p: Progress, gpa: std.mem.Allocator) !Progress {
+        const prompt = try gpa.dupe(u8, p.prompt);
+        errdefer gpa.free(prompt);
+        const used = try cloneStrings(gpa, p.tools);
+        errdefer freeStrings(gpa, used);
+        const files = try cloneStrings(gpa, p.files);
+        return .{ .agent = p.agent, .prompt = prompt, .state = p.state, .step = p.step, .tools = used, .files = files, .usage = p.usage };
+    }
+
+    pub fn deinit(p: *Progress, gpa: std.mem.Allocator) void {
+        gpa.free(p.prompt);
+        freeStrings(gpa, p.tools);
+        freeStrings(gpa, p.files);
+        p.* = undefined;
+    }
+
+    fn cloneStrings(gpa: std.mem.Allocator, items: []const []const u8) ![]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (out.items) |s| gpa.free(s);
+            out.deinit(gpa);
+        }
+        for (items) |s| {
+            const copy = try gpa.dupe(u8, s);
+            errdefer gpa.free(copy);
+            try out.append(gpa, copy);
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    fn freeStrings(gpa: std.mem.Allocator, items: []const []const u8) void {
+        for (items) |s| gpa.free(s);
+        gpa.free(items);
+    }
+};
+
 pub const Event = union(enum) {
     /// Slices are valid only during the callback.
     delta: struct { kind: provider.Kind, text: []const u8 },
@@ -10,6 +55,7 @@ pub const Event = union(enum) {
     retry: struct { attempt: u32, delay_ms: u64, reason: []const u8 },
     notice: []const u8,
     usage: provider.Usage,
+    progress: Progress,
 };
 
 pub const JsonEvent = union(enum) {

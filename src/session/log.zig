@@ -6,7 +6,15 @@ pub const RunResult = struct {
     ok: bool,
 };
 
+pub const Diagnostic = struct {
+    error_name: []const u8,
+    message: []const u8,
+    attempts: u32,
+    step: u32,
+};
+
 pub const Record = struct {
+    diagnostic: ?Diagnostic = null,
     usage: ?provider.Usage = null,
     ms: ?u64 = null,
     run_results: ?[]const RunResult = null,
@@ -65,6 +73,12 @@ pub const Log = struct {
         log.offset += bytes.len;
     }
 
+    pub fn diagnose(log: *Log, io: std.Io, a: std.mem.Allocator, diagnostic: Diagnostic) !void {
+        try log.append(io, a, .{ .diagnostic = diagnostic });
+        errdefer log.poisoned = true;
+        try log.file.sync(io);
+    }
+
     pub fn commit(log: *Log, io: std.Io, a: std.mem.Allocator, history: *std.ArrayList(provider.Message), tokens: *u64, record: Record) !void {
         if (record.from > history.items.len) return error.InvalidSessionLog;
         try history.ensureTotalCapacity(a, record.from + record.messages.len);
@@ -103,7 +117,9 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
             torn = false;
             continue;
         }
-        if (torn or r.from > history.items.len) return error.InvalidSessionLog;
+        if (torn) return error.InvalidSessionLog;
+        if (r.diagnostic != null) continue;
+        if (r.from > history.items.len) return error.InvalidSessionLog;
         try history.ensureTotalCapacity(gpa, r.from + r.messages.len);
         apply(history, r);
         try validate(history.items);
@@ -171,16 +187,20 @@ pub fn list(io: std.Io, a: std.mem.Allocator, directory: []const u8, cwd: []cons
         var buffer: [4096]u8 = undefined;
         var reader = file.reader(io, &buffer);
         var line_no: usize = 0;
-        while (line_no < 8) : (line_no += 1) {
+        while (line_no < 8) {
             var line: std.Io.Writer.Allocating = .init(a);
             defer line.deinit();
             _ = reader.interface.streamDelimiter(&line.writer, '\n') catch break;
             reader.interface.toss(1);
             const r = std.json.parseFromSliceLeaky(Record, a, line.written(), .{ .allocate = .alloc_always }) catch {
                 if (line_no == 0) break;
+                line_no += 1;
                 continue;
             };
-            if (line_no == 0) {
+            if (r.diagnostic != null) continue;
+            const header = line_no == 0;
+            line_no += 1;
+            if (header) {
                 if (r.parent_session_id != null or !std.mem.eql(u8, r.cwd orelse "", cwd)) break;
                 continue;
             }
@@ -309,4 +329,35 @@ test "legacy chat reasoning is migrated without changing provider identity" {
     , &history, &tokens);
     try t.expectEqual(provider.Id.chat_completions, result.provider);
     try t.expectEqualDeep(provider.Reasoning{ .provider = .chat_completions, .data = "legacy" }, history.items[2].reasoning.?);
+}
+
+test "diagnostic append and replay do not commit messages or replace context tokens" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/s.jsonl", .{tmp.sub_path});
+    var log = try Log.create(t.io, path);
+    defer log.close(t.io);
+    var history: std.ArrayList(provider.Message) = .empty;
+    var tokens: u64 = 0;
+    try log.commit(t.io, a, &history, &tokens, .{ .cwd = "/work", .messages = &.{.{ .role = "system", .content = "base" }}, .context_tokens = 123 });
+    for (0..10) |_| try log.diagnose(t.io, a, .{ .error_name = "ProviderTransient", .message = "server_error: mock failure", .attempts = 5, .step = 1 });
+    try t.expectEqual(@as(usize, 1), history.items.len);
+    try t.expectEqual(@as(u64, 123), tokens);
+    var restored: std.ArrayList(provider.Message) = .empty;
+    var restored_tokens: u64 = 0;
+    _ = try replay(a, a, try tmp.dir.readFileAlloc(t.io, "s.jsonl", a, .unlimited), &restored, &restored_tokens);
+    try t.expectEqualDeep(history.items, restored.items);
+    try t.expectEqual(tokens, restored_tokens);
+    try log.commit(t.io, a, &history, &tokens, .{ .from = 1, .messages = &.{ .{ .role = "user", .content = "next" }, .{ .role = "assistant", .content = "ok" } }, .context_tokens = 200 });
+    restored.clearRetainingCapacity();
+    _ = try replay(a, a, try tmp.dir.readFileAlloc(t.io, "s.jsonl", a, .unlimited), &restored, &restored_tokens);
+    try t.expectEqualDeep(history.items, restored.items);
+    try t.expectEqual(tokens, restored_tokens);
+    const summaries = try list(t.io, a, std.fs.path.dirname(path).?, "/work");
+    try t.expectEqual(@as(usize, 1), summaries.len);
+    try t.expectEqualStrings("next", summaries[0].preview);
 }

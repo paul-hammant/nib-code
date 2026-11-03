@@ -23,6 +23,7 @@ pub const Host = struct {
     /// Returned slices are allocated with `gpa` and owned by the caller.
     cancel: ?*std.atomic.Value(bool) = null,
     call: *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8, args_json: []const u8) ToolResult,
+    poll: ?*const fn (ctx: *anyopaque) anyerror!void = null,
 };
 
 pub const Outcome = struct {
@@ -114,6 +115,7 @@ const State = struct {
         var active: usize = 0;
         var next: usize = 0;
         while (true) {
+            if (st.host) |h| if (h.poll) |poll| try poll(h.ctx);
             if (active == 0 and next == st.calls.items.len) {
                 st.calls.clearRetainingCapacity();
                 next = 0;

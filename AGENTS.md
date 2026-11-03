@@ -41,13 +41,14 @@ Run 的默认 5 分钟超时只累计 QuickJS 执行片段（初始脚本、Prom
 
 模型请求的两条线路共用 `src/provider/cancel.zig` 的 `std.Io.Select` 取消封装：请求任务实时写入 sink，另一个任务每 20 ms 检查 cancel 标志；取消时中断连接、发送或读取中的阻塞 I/O，并等待请求任务清理后返回 `error.Canceled`，无需等下一块数据。TUI Esc 与 ask SIGINT/SIGTERM 均走此路径，不设读超时，不改变重试策略；已流出的文本继续由原有 `commitInterrupted` 提交。
 
-会话日志位于 `$NIB_HOME/sessions/<ID>.jsonl`（默认 `~/.nib/sessions/`）。日志只在完整 Step 后提交；取消（TUI 的 Esc、ask 收到 SIGTERM/SIGINT）时额外提交本轮用户消息和已流出的文本，TUI Esc / ask SIGINT 在末尾标记 `[interrupted by user]`，ask SIGTERM 标记 `[interrupted: process terminated]`，未完成的工具调用丢弃；恢复不重执行已提交的 Run；未完成 Step 可能已产生外部副作用，日志不回滚这些变化。
+会话日志位于 `$NIB_HOME/sessions/<ID>.jsonl`（默认 `~/.nib/sessions/`）。日志只在完整 Step 后提交；Codex 请求最终失败时另追加 `diagnostic: {error_name, message, attempts, step}` 诊断记录（message 保留服务端 code/reason），不提交用户消息或失败输出，不改变模型历史和 context_tokens，恢复时跳过；`scripts/stats.py` 将其计入 `errors.provider_failure`，不算 Step/token。取消（TUI 的 Esc、ask 收到 SIGTERM/SIGINT）时额外提交本轮用户消息和已流出的文本，TUI Esc / ask SIGINT 在末尾标记 `[interrupted by user]`，ask SIGTERM 标记 `[interrupted: process terminated]`，未完成的工具调用丢弃；恢复不重执行已提交的 Run；未完成 Step 可能已产生外部副作用，日志不回滚这些变化。
 
 `nib ask --json '<prompt>'` 的 stdout 是 NDJSON：每行一个单键对象，按产生顺序输出并立即 flush；stderr 没有人类可读进度或颜色。prompt 为 `-` 时从 stdin 读到 EOF（普通 ask 也支持）。退出码成功 0，失败非 0。
 
 - `{"start":{"session_id":"<32位小写十六进制>"}}`：Session 已初始化；恢复时沿用原 id。
 - `{"delta":{"kind":"text|reasoning","text":"..."}}`：模型流式片段，包含中间 Step 的文本。
 - `{"run_start":"<JS代码>"}`、`{"run_end":{"ok":true,"output":"...","changes":[...]}}`：一次 Run 的开始和结果；Run 失败可由模型继续处理。`changes` 列出这次 Run 里 edit/write 改动的文件：`{"path","added","removed","created","diff"}`，与 Run 开始前的内容比较（改了又改回的文件不列出）；`diff` 是带一行上下文的 `+`/`-`/` ` 行，超过 200 行截断。bash 和子会话的改动不在其中。
+- `{"progress":{"agent":1,"prompt":"检查测试","state":"working","step":3,"tools":["edit"],"files":["src/x.zig"],"usage":{"prompt_tokens":41000,"completion_tokens":200,"prompt_cache_hit_tokens":32000}}}`：当前 Run 内一个子 agent 的最新进度快照。`agent` 是本次 Run 内从 1 开始的注册编号（下次 Run 重置）；`prompt` 是完整子任务提示词；`state` 为 `queued|working|done|failed|canceled|timed_out`；`step` 从 1 开始，尚未收到模型活动时为 0；`tools` 是最近一次 `run_start` 代码中识别出的去重 `tools.<name>(...)` 调用名称，`files` 是该次 `run_end.changes` 的文件路径（新 Run 开始时清空）；`usage` 是这个子 agent 已报告的累计用量，显示 token 时取 prompt + completion，不重复加缓存 token。不是 token 增量，也不额外计入父会话用量。同一子 agent 的事件至少间隔一秒，中间状态合并为最新快照；整个 Run 结束时会丢弃尚未到发送时间的进度，因此不保证收到终态 progress，最终结果/用量仍以 `run_end` 和 `end/error` 为准。普通 ask 不显示此事件。
 - `{"usage":{"prompt_tokens":0,"completion_tokens":0,"prompt_cache_hit_tokens":0}}`：本轮累计用量快照（含已报告的子会话用量），不是增量；用于中途显示与强制终止后的统计。
 - `{"retry":{"attempt":1,"delay_ms":1000,"reason":"..."}}`、`{"notice":"..."}`：重试与通知。
 - `{"end":{"text":"<最终回答>","usage":{"prompt_tokens":0,"completion_tokens":0,"prompt_cache_hit_tokens":0},"steps":1}}`：Turn 成功结束；usage 只统计本轮，含自动压缩和子会话。最终回答取这里的 text，不拼接所有 delta。
@@ -56,5 +57,7 @@ Run 的默认 5 分钟超时只累计 QuickJS 执行片段（初始脚本、Prom
 事件结构与序列化定义在 `src/session/events.zig`。字符串中的换行经过 JSON 转义，每个物理行都是完整 JSON。
 
 根会话可调用 `await tools.agent({ prompt, timeout_ms: 1800000 })`，返回 `{ text, usage }`；timeout_ms 可省略，默认 30 分钟，不计排队时间。超时错误包含实际耗时（含终止宽限）、子会话 id（未收到 start 时明确标为不可用）和检查半成品文件的提醒。子会话适合独立调查或任务，不适合需要跨文件协调的修改；`Promise.all` 并行派生，最多同时运行 4 个子会话（全部工具最多同时运行 8 个）。子会话独立读取指令文件，沿用 cwd 和有效 provider/模型配置（通过 stdin 管道传递，子会话跳过配置文件读取；Codex 凭证各自读取），不继承父会话历史。内部环境变量 `NIB_AGENT_DEPTH` 从 0 递增，深度达到 1 时，工具说明与实际 JS API 都移除 agent。`NIB_PARENT_SESSION_ID` 写入子会话日志首条记录的 `parent_session_id`。显式 `--resume` 子会话仍保留深度限制；`--continue` 跳过子会话。
+
+子进程 NDJSON 在运行途中按完整行观察；最终输出仍按原路径解析和统计。进度使用受互斥锁保护、每个子 agent 仅保留最新快照的队列；工具线程只更新队列，不调用 Session sink。Run 线程在 sandbox 的 Promise/工具等待循环里约每 20 ms 尝试转发，转发不计入 JS 执行预算；eval 返回前已停止并 join 所有工具线程，之后清空队列。TUI 收到事件后复制数据到自身事件循环，正在运行的 agent Run 折叠显示进度汇总，ctrl+o 展开显示各子任务（prompt 前 40 个 Unicode 字符）；Run 结束恢复工具/耗时/改动摘要。
 
 bash 与子会话复用进程组执行器，取消和超时会清理整组；子 nib 先收到 SIGTERM，有 500 ms 取消自身工具，之后强制终止。用量按已收到的累计快照统计，无法推知服务端尚未报告的 token。路径写锁只协调当前进程内的 edit/write，不协调独立子会话或 bash 的写入。

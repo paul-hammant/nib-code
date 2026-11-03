@@ -61,6 +61,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.flush()
         output = []
         event("response.created", response={"id": f"resp_{number}", "status": "in_progress", "output": []})
+        failure = None
+        if prompt == "stream retry server" and attempt == 0:
+            failure = ("error", "server_error", "mock transient after deltas")
+        elif prompt == "stream context fatal":
+            failure = ("response.failed", "context_length_exceeded", "mock context budget exceeded")
+        elif prompt == "stream rate exhausted":
+            failure = ("response.failed", "rate_limit_exceeded", "mock limit; try again in 20ms")
+        elif prompt == "stream rate retry" and attempt == 0:
+            failure = ("error", "rate_limit_exceeded", "mock limit; try again in 0.03s")
+        elif prompt == "stream retry cancel":
+            failure = ("error", "rate_limit_exceeded", "mock limit; try again in 10s")
+        if failure or (prompt == "stream retry disconnect" and attempt == 0):
+            for text in ("failed attempt prefix", " must not be committed"):
+                event("response.output_text.delta", delta=text)
+            if failure:
+                kind, code, message = failure
+                if kind == "error":
+                    event(kind, code=code, message=message)
+                else:
+                    event(kind, response={"status": "failed", "error": {"code": code, "message": message}})
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+            return
         if prompt == "interrupt stalled":
             event("response.output_text.delta", item_id=f"msg_{number}", output_index=0, content_index=0, delta="partial answer")
             time.sleep(30)
@@ -79,7 +102,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             text = "" if summary_empty else "Earlier work: completed mock tools. Continue the current user request."
         elif last.get("type") == "function_call_output":
             text = "Tool returned: " + last["output"]
-        elif prompt in ("plain text", "large reasoning", "child probe", "rotate auth", "reject auth", "stream incomplete", "stream failed", "stream truncated"):
+        elif prompt.startswith("stream ") or prompt in ("plain text", "large reasoning", "child probe", "rotate auth", "reject auth", "stream incomplete", "stream failed", "stream truncated"):
             text = "Mock text complete."
         else:
             code = 'await tools.bash({command: "echo hello from codex mock"})'
@@ -119,8 +142,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.flush()
             return
         status = "incomplete" if prompt == "stream incomplete" or summary_truncated else "failed" if prompt == "stream failed" else "completed"
-        event("response." + status, response={"id": f"resp_{number}", "status": status, "output": output,
-              "usage": {"input_tokens": tokens, "output_tokens": 20, "input_tokens_details": {"cached_tokens": 64}}})
+        response = {"id": f"resp_{number}", "status": status, "output": output,
+                    "usage": {"input_tokens": tokens, "output_tokens": 20, "input_tokens_details": {"cached_tokens": 64}}}
+        if status == "failed":
+            response["error"] = {"code": "invalid_prompt", "message": "mock rejected prompt"}
+        elif status == "incomplete":
+            response["incomplete_details"] = {"reason": "max_output_tokens" if summary_truncated else "usage_not_included"}
+        event("response." + status, response=response)
         self.wfile.write(b"0\r\n\r\n")
         self.wfile.flush()
 

@@ -16,6 +16,7 @@ pub const Options = struct {
     input: ?[]const u8 = null,
     termination_grace_ms: u32 = 0,
     max_output_bytes: usize = 8 * 1024 * 1024,
+    on_line: ?struct { ctx: *anyopaque, emit: *const fn (*anyopaque, []const u8) void } = null,
 };
 
 const Group = struct {
@@ -76,6 +77,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Result {
     defer mr.deinit();
     const deadline: std.Io.Clock.Timestamp = .fromNow(io, .{ .raw = .fromMilliseconds(options.timeout_ms), .clock = .awake });
     var stop: ?Stop = null;
+    var line_start: usize = 0;
+    var scanned: usize = 0;
     while (true) {
         if (stop == null) check(io, options.cancel, deadline) catch |err| {
             stop = err;
@@ -86,7 +89,16 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Result {
             error.Timeout => {},
             else => return err,
         };
-        if (mr.reader(0).buffered().len > options.max_output_bytes) return error.OutputLimit;
+        const buffered = mr.reader(0).buffered();
+        if (buffered.len > options.max_output_bytes) return error.OutputLimit;
+        if (options.on_line) |observer| {
+            while (std.mem.indexOfScalarPos(u8, buffered, scanned, '\n')) |end| {
+                observer.emit(observer.ctx, buffered[line_start..end]);
+                line_start = end + 1;
+                scanned = line_start;
+            }
+            scanned = buffered.len;
+        }
     }
     try mr.checkAnyError();
     const Wait = struct {
@@ -167,4 +179,31 @@ test "process deadline covers a blocked stdin writer" {
     defer testing.allocator.free(result.output);
     try testing.expectEqual(error.TimedOut, result.stop.?);
     try testing.expect(start.durationTo(std.Io.Clock.awake.now(testing.io)).toMilliseconds() < 1000);
+}
+
+test "process observes complete lines before exit without changing collected output" {
+    const Capture = struct {
+        first: ?std.Io.Timestamp = null,
+        output: std.ArrayList(u8) = .empty,
+        fn line(ctx: *anyopaque, bytes: []const u8) void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            if (c.first == null) c.first = std.Io.Clock.awake.now(testing.io);
+            c.output.appendSlice(testing.allocator, bytes) catch unreachable;
+            c.output.append(testing.allocator, '|') catch unreachable;
+        }
+    };
+    var capture: Capture = .{};
+    defer capture.output.deinit(testing.allocator);
+    var cancel: std.atomic.Value(bool) = .init(false);
+    const result = try run(testing.allocator, testing.io, .{
+        .spawn = .{ .argv = &.{ "bash", "-c", "printf fir; sleep 0.05; printf 'st\nsec'; sleep 0.25; printf 'ond\ntrailing'" }, .stdout = .pipe, .stderr = .ignore },
+        .cancel = &cancel,
+        .timeout_ms = 2000,
+        .on_line = .{ .ctx = &capture, .emit = Capture.line },
+    });
+    defer testing.allocator.free(result.output);
+    try testing.expect(result.term.success());
+    try testing.expectEqualStrings("first|second|", capture.output.items);
+    try testing.expectEqualStrings("first\nsecond\ntrailing", result.output);
+    try testing.expect(capture.first.?.durationTo(std.Io.Clock.awake.now(testing.io)).toMilliseconds() >= 200);
 }

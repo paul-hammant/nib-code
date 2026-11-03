@@ -177,13 +177,26 @@ const Output = struct {
     name: ?[]const u8 = null,
     arguments: ?[]const u8 = null,
 };
+const StreamError = struct {
+    code: ?std.json.Value = null,
+    message: ?[]const u8 = null,
+    type: ?[]const u8 = null,
+    status: ?u16 = null,
+    status_code: ?u16 = null,
+};
 const ResponseEvent = struct {
     type: []const u8,
+    code: ?std.json.Value = null,
+    message: ?[]const u8 = null,
+    status: ?u16 = null,
+    status_code: ?u16 = null,
     delta: ?[]const u8 = null,
     output_index: usize = 0,
     item: ?std.json.Value = null,
     response: ?struct {
         status: ?[]const u8 = null,
+        @"error": ?StreamError = null,
+        incomplete_details: ?struct { reason: ?[]const u8 = null } = null,
         usage: ?struct {
             input_tokens: u64 = 0,
             output_tokens: u64 = 0,
@@ -210,7 +223,7 @@ fn readStream(gpa: std.mem.Allocator, out: std.mem.Allocator, reader: *std.Io.Re
         if (cancel.load(.acquire)) return error.Canceled;
         line.clearRetainingCapacity();
         _ = reader.streamDelimiter(&line.writer, '\n') catch |err| switch (err) {
-            error.EndOfStream => return error.IncompleteResponse,
+            error.EndOfStream => return incompleteResponse(gpa, detail),
             error.WriteFailed => return error.OutOfMemory,
             else => return err,
         };
@@ -232,15 +245,13 @@ fn readStream(gpa: std.mem.Allocator, out: std.mem.Allocator, reader: *std.Io.Re
             items.items[ev.output_index] = ev.item orelse return error.InvalidResponse;
             pending -|= 1;
         } else if (std.mem.eql(u8, ev.type, "response.failed") or std.mem.eql(u8, ev.type, "error") or std.mem.eql(u8, ev.type, "response.incomplete")) {
-            detail.* = try std.fmt.allocPrint(gpa, "Codex stream ended with {s}; the Step was not committed.", .{ev.type});
-            return error.ProviderFailed;
+            return streamFailure(gpa, ev, detail);
         } else if (std.mem.eql(u8, ev.type, "response.completed") or std.mem.eql(u8, ev.type, "response.done")) {
             const response = ev.response orelse return error.InvalidResponse;
             if (response.status) |status| if (!std.mem.eql(u8, status, "completed")) {
-                detail.* = try gpa.dupe(u8, "Codex response did not complete; the Step was not committed.");
-                return error.ProviderFailed;
+                return streamFailure(gpa, ev, detail);
             };
-            if (pending != 0) return error.IncompleteResponse;
+            if (pending != 0) return incompleteResponse(gpa, detail);
             if (response.usage) |u| usage = .{ .prompt_tokens = u.input_tokens, .completion_tokens = u.output_tokens, .prompt_cache_hit_tokens = if (u.input_tokens_details) |d| d.cached_tokens else 0 };
             break;
         }
@@ -263,6 +274,82 @@ fn readStream(gpa: std.mem.Allocator, out: std.mem.Allocator, reader: *std.Io.Re
         }
     }
     return .{ .text = try out.dupe(u8, text.items), .phase = phase, .reasoning = if (reasoning.items.len > 0) .{ .provider = .codex, .data = try std.json.Stringify.valueAlloc(out, reasoning.items, .{}) } else null, .tool_calls = try out.dupe(p.ToolCall, calls.items), .usage = usage };
+}
+
+fn incompleteResponse(gpa: std.mem.Allocator, detail: *?[]u8) anyerror {
+    detail.* = std.fmt.allocPrint(gpa, "Codex stream failed: IncompleteResponse: the stream ended before a complete response; the Step was not committed.", .{}) catch return error.OutOfMemory;
+    return error.IncompleteResponse;
+}
+
+fn streamFailure(gpa: std.mem.Allocator, ev: ResponseEvent, detail: *?[]u8) anyerror {
+    var failure: StreamError = .{ .code = ev.code, .message = ev.message, .status = ev.status, .status_code = ev.status_code };
+    var reason: ?[]const u8 = null;
+    if (ev.response) |response| {
+        if (response.@"error") |err| failure = err;
+        if (response.incomplete_details) |incomplete| reason = incomplete.reason;
+    }
+    var number: [32]u8 = undefined;
+    const code = if (reason) |r| r else if (failure.code) |value| switch (value) {
+        .string => value.string,
+        .integer => std.fmt.bufPrint(&number, "{d}", .{value.integer}) catch "unknown",
+        else => failure.type orelse "unknown",
+    } else failure.type orelse "unknown";
+    const message = failure.message orelse reason orelse "No error message was provided";
+    const status = failure.status_code orelse failure.status orelse statusFromCode(code);
+    const fatal = fatalStreamCode(code) or (status >= 400 and status < 500 and status != 429);
+    const limited = !fatal and (std.mem.eql(u8, code, "rate_limit_exceeded") or status == 429);
+    var hint: ?[]u8 = null;
+    defer if (hint) |s| gpa.free(s);
+    var shown = clipMessage(message, 300);
+    if (limited and shown.len < message.len and retryDelayMs(shown) == null) {
+        if (retryDelayMs(message)) |ms| {
+            hint = std.fmt.allocPrint(gpa, "{s}… try again in {d}ms", .{ clipMessage(message, 260), ms }) catch return error.OutOfMemory;
+            shown = hint.?;
+        }
+    }
+    detail.* = std.fmt.allocPrint(gpa, "Codex stream failed: {s}: {s}; the Step was not committed.", .{ code, shown }) catch return error.OutOfMemory;
+    return if (fatal) error.ProviderFailed else if (limited) error.RateLimited else error.ProviderTransient;
+}
+
+fn clipMessage(message: []const u8, limit: usize) []const u8 {
+    var end = @min(message.len, limit);
+    while (end > 0 and end < message.len and (message[end] & 0xc0) == 0x80) end -= 1;
+    return message[0..end];
+}
+
+fn statusFromCode(code: []const u8) u16 {
+    const digits = if (std.mem.startsWith(u8, code, "http_") or std.mem.startsWith(u8, code, "HTTP ")) code[5..] else code;
+    if (digits.len != 3) return 0;
+    return std.fmt.parseInt(u16, digits, 10) catch 0;
+}
+
+fn fatalStreamCode(code: []const u8) bool {
+    for ([_][]const u8{
+        "context_length_exceeded", "insufficient_quota", "usage_not_included", "invalid_prompt",
+        "invalid_request_error",   "invalid_request",    "bad_request",        "unauthorized",
+        "authentication_error",    "invalid_api_key",    "permission_denied",  "forbidden",
+        "not_found",               "method_not_allowed", "request_too_large",  "unsupported_media_type",
+        "unprocessable_entity",
+    }) |known| if (std.mem.eql(u8, code, known)) return true;
+    return false;
+}
+
+pub fn retryDelayMs(message: []const u8) ?u64 {
+    const needle = "try again in ";
+    if (message.len < needle.len) return null;
+    for (0..message.len - needle.len + 1) |start| {
+        if (!std.ascii.eqlIgnoreCase(message[start..][0..needle.len], needle)) continue;
+        const rest = std.mem.trimStart(u8, message[start + needle.len ..], " \t");
+        var end: usize = 0;
+        while (end < rest.len and (std.ascii.isDigit(rest[end]) or rest[end] == '.')) end += 1;
+        if (end == 0) continue;
+        const duration = std.fmt.parseFloat(f64, rest[0..end]) catch continue;
+        const unit = std.mem.trimStart(u8, rest[end..], " \t");
+        const ms = duration * @as(f64, if (std.mem.startsWith(u8, unit, "ms")) 1 else if (std.mem.startsWith(u8, unit, "s")) 1000 else continue);
+        if (!std.math.isFinite(ms) or ms < 0 or ms >= @as(f64, @floatFromInt(std.math.maxInt(u64)))) continue;
+        return @intFromFloat(@ceil(ms));
+    }
+    return null;
 }
 
 test "Codex catalog context windows" {
@@ -298,4 +385,64 @@ test "Codex request body carries the session cache key" {
     const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, body, .{});
     defer parsed.deinit();
     try t.expectEqualStrings(cache_key, parsed.value.object.get("prompt_cache_key").?.string);
+}
+
+fn expectStreamFailure(json: []const u8, expected: anyerror, code: []const u8, message: []const u8) !void {
+    const t = std.testing;
+    const Sink = struct {
+        fn delta(_: *anyopaque, _: p.Kind, _: []const u8) !void {}
+    };
+    const bytes = try std.fmt.allocPrint(t.allocator, "data: {s}\n\n", .{json});
+    defer t.allocator.free(bytes);
+    var reader: std.Io.Reader = .fixed(bytes);
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var detail: ?[]u8 = null;
+    defer if (detail) |text| t.allocator.free(text);
+    try t.expectError(expected, readStream(t.allocator, t.allocator, &reader, .{ .ctx = &cancel, .onDelta = Sink.delta }, &cancel, &detail));
+    try t.expect(std.mem.indexOf(u8, detail.?, code) != null);
+    try t.expect(std.mem.indexOf(u8, detail.?, message) != null);
+    try t.expect(std.mem.endsWith(u8, detail.?, "; the Step was not committed."));
+}
+
+test "Codex stream errors preserve reasons and distinguish retryable failures" {
+    try expectStreamFailure("{\"type\":\"error\",\"code\":\"server_error\",\"message\":\"service broke\"}", error.ProviderTransient, "server_error", "service broke");
+    try expectStreamFailure("{\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"too much context\"}}}", error.ProviderFailed, "context_length_exceeded", "too much context");
+    try expectStreamFailure("{\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"usage_not_included\"}}}", error.ProviderFailed, "usage_not_included", "usage_not_included");
+    try expectStreamFailure("{\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}", error.ProviderTransient, "max_output_tokens", "max_output_tokens");
+    try expectStreamFailure("{\"type\":\"error\",\"code\":\"rate_limit_exceeded\",\"message\":\"try again in 30ms\"}", error.RateLimited, "rate_limit_exceeded", "try again in 30ms");
+    try expectStreamFailure("{\"type\":\"response.completed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"invalid_prompt\",\"message\":\"bad prompt\"}}}", error.ProviderFailed, "invalid_prompt", "bad prompt");
+    try expectStreamFailure("{\"type\":\"error\",\"code\":400,\"message\":\"bad request\"}", error.ProviderFailed, "400", "bad request");
+    try expectStreamFailure("{\"type\":\"error\",\"status_code\":403,\"message\":\"denied\"}", error.ProviderFailed, "unknown", "denied");
+    try expectStreamFailure("{\"type\":\"error\",\"code\":\"new_server_code\",\"message\":\"unknown issue\"}", error.ProviderTransient, "new_server_code", "unknown issue");
+    try expectStreamFailure("{\"type\":\"response.created\"}", error.IncompleteResponse, "IncompleteResponse", "stream ended");
+    const t = std.testing;
+    for ([_][]const u8{ "context_length_exceeded", "insufficient_quota", "usage_not_included", "invalid_prompt", "invalid_request_error" }) |code| try t.expect(fatalStreamCode(code));
+    for ([_][]const u8{ "server_error", "overloaded", "service_unavailable", "unknown" }) |code| try t.expect(!fatalStreamCode(code));
+}
+
+test "Codex errors bound UTF-8 messages and retain rate-limit hints beyond the cutoff" {
+    const t = std.testing;
+    var message: std.ArrayList(u8) = .empty;
+    defer message.deinit(t.allocator);
+    for (0..150) |_| try message.appendSlice(t.allocator, "中");
+    var detail: ?[]u8 = null;
+    defer if (detail) |d| t.allocator.free(d);
+    try t.expectEqual(error.ProviderTransient, streamFailure(t.allocator, .{ .type = "error", .code = .{ .string = "server_error" }, .message = message.items }, &detail));
+    try t.expect(std.unicode.utf8ValidateSlice(detail.?));
+    try t.expect(detail.?.len < 400);
+    t.allocator.free(detail.?);
+    detail = null;
+    try message.appendSlice(t.allocator, " try again in 0.25s");
+    try t.expectEqual(error.RateLimited, streamFailure(t.allocator, .{ .type = "error", .code = .{ .string = "rate_limit_exceeded" }, .message = message.items }, &detail));
+    try t.expectEqual(@as(?u64, 250), retryDelayMs(detail.?));
+    try t.expect(detail.?.len < 420);
+}
+
+test "Codex retry hints accept seconds and milliseconds without overflow" {
+    const t = std.testing;
+    try t.expectEqual(@as(?u64, 1200), retryDelayMs("Please try again in 1.2s."));
+    try t.expectEqual(@as(?u64, 25), retryDelayMs("Try again in 25ms"));
+    try t.expectEqual(@as(?u64, 1), retryDelayMs("try again in 0.1ms"));
+    try t.expectEqual(@as(?u64, 0), retryDelayMs("try again in 0s"));
+    for ([_][]const u8{ "try again later", "try again in -1s", "try again in 1minute", "try again in 1.2.3s", "try again in 999999999999999999999999999999s" }) |message| try t.expectEqual(@as(?u64, null), retryDelayMs(message));
 }

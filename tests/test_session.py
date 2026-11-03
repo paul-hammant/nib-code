@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import socket
 import signal
+import selectors
 import re
 import subprocess
 import tempfile
@@ -253,6 +254,60 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         human = ask("delegate")
         assert b"in=19800" in human.stderr and b"out=90" in human.stderr
         print("Subagent E2E passed: concurrent results, usage including failure, parent log, hidden API and four-child cap")
+
+        progress_cwd = cwd / "progress"
+        progress_cwd.mkdir()
+        live = subprocess.Popen([str(BIN), "ask", "--json", "delegate_progress"],
+                                cwd=progress_cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+        seen, updates, pending = [], [], b""
+        with selectors.DefaultSelector() as selector:
+            selector.register(live.stdout, selectors.EVENT_READ)
+            deadline = time.monotonic() + 25
+            while True:
+                assert time.monotonic() < deadline, seen
+                if not selector.select(timeout=.2):
+                    continue
+                chunk = os.read(live.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                pending += chunk
+                while b"\n" in pending:
+                    line, pending = pending.split(b"\n", 1)
+                    event = json.loads(line)
+                    seen.append(event)
+                    if "progress" not in event:
+                        continue
+                    p = event["progress"]
+                    updates.append((time.monotonic(), p))
+                    assert live.poll() is None, "progress was buffered until exit"
+                    assert not any("run_end" in e for e in seen), seen
+                    if len(updates) == 1:
+                        assert not (progress_cwd / "progress-alpha.txt").exists() or p["step"] <= 1
+                        active_child_logs = [p for p in (tmp / "nib/sessions").glob("*.jsonl")
+                                             if replay(p)[1][0].get("parent_session_id") == seen[0]["start"]["session_id"]]
+                        assert len(active_child_logs) <= 2
+                        assert all(len(replay(p)[0]) < 8 for p in active_child_logs), "children already finished"
+        assert not pending
+        assert live.wait(timeout=5) == 0, live.stderr.read()
+        assert len(updates) >= 6, updates
+        for agent in (1, 2):
+            samples = [(stamp, p) for stamp, p in updates if p["agent"] == agent]
+            assert samples and all(b[0] - a[0] >= .95 for a, b in zip(samples, samples[1:])), samples
+            assert {p["prompt"] for _, p in samples} <= {"child progress alpha", "child progress beta"}
+            assert any(p["step"] >= 3 for _, p in samples), samples
+            assert any("edit" in p["tools"] and p["files"] == ["progress-" + p["prompt"].split()[-1] + ".txt"]
+                       and p["usage"]["prompt_tokens"] == 6600 for _, p in samples), samples
+        assert any(p["state"] == "done" for _, p in updates), updates
+        final = seen[-1]["end"]
+        assert final["steps"] == 2
+        assert final["usage"] == dict(prompt_tokens=33000, completion_tokens=170, prompt_cache_hit_tokens=832), final
+        output = json.loads(next(e["run_end"]["output"] for e in seen if "run_end" in e).removeprefix("result: "))
+        assert len(output) == 2
+        for child in output:
+            assert child["usage"] == dict(prompt_tokens=13200, completion_tokens=70, prompt_cache_hit_tokens=320), child
+            assert "exit_code" in child["text"]
+        assert all((progress_cwd / ("progress-" + name + ".txt")).read_text() == "two" for name in ("alpha", "beta"))
+        print("Subagent progress E2E passed: live multi-step progress before completion, tools/files, per-child throttle, done state, unchanged result/usage accounting")
 
         partial_path = cwd / "child-partial.txt"
         timeout_events = events(ask("--json", "delegate_timeout " + str(partial_path)))

@@ -12,7 +12,7 @@ DeepSeek, a request with tools whose assistant messages lack reasoning_content
 gets HTTP 400. "reject1"/"reject2" return HTTP 400 before
 the first/second Step; "truncated" closes the stream without [DONE].
 "delegate" runs two children; "delegate_many" runs six; "delegate_failure"
-catches a failed child's error. "delegate_cancel PATH" runs a child whose bash
+catches a failed child's error. "delegate_progress" runs two children through three Runs each (write, edit, read), with pauses between Steps. "delegate_cancel PATH" runs a child whose bash
 writes its pid to PATH and sleeps. "child probe" answers without a Run. A /reflect request answers with two
 issue drafts, one carrying a fake credential. "interrupt me" streams
 partial text, then stalls for a second; "interrupt stalled" stalls for 30 seconds. "edit_test" writes and
@@ -54,6 +54,10 @@ class H(http.server.BaseHTTPRequestHandler):
         if thinking and body.get('tools') and any(m['role']=='assistant' and not m.get('reasoning_content') for m in msgs):
             self.send_response(400); self.send_header('content-type','application/json'); self.end_headers()
             self.wfile.write(b'{"error":{"message":"The reasoning_content in the thinking mode must be passed back to the API."}}'); return
+        progress_child = lastuser.startswith('child progress ')
+        completed_runs = sum(m['role'] == 'tool' for m in msgs)
+        if progress_child and completed_runs:
+            time.sleep(3 if lastuser.endswith('beta') and completed_runs == 3 else 1.25)
         if msgs[-1]['role']=='tool' and lastuser == 'child stall2':
             time.sleep(3)
         if msgs[-1]['role']=='tool' and 'fail2' in lastuser:
@@ -80,7 +84,7 @@ class H(http.server.BaseHTTPRequestHandler):
             try: ev({"choices":[{"delta":{"content":" never seen"}}]}); self.wfile.write(b'0\r\n\r\n')
             except OSError: pass
             return
-        elif last['role']=='user':
+        elif last['role']=='user' or (progress_child and completed_runs < 3):
             code = 'const r = await tools.bash({command: "echo hello from bash; printf \'a\\\\nb\\\\nc\\\\n\' | wc -l"});\nconsole.log("exit", r.exit_code);\nr.output.trim().split("\\n")'
             if lastuser.startswith('delegate_cancel '):
                 code = 'await tools.agent({prompt: ' + json.dumps('child cancel ' + lastuser.split(' ', 1)[1]) + '})'
@@ -93,6 +97,8 @@ class H(http.server.BaseHTTPRequestHandler):
                 code = 'await tools.agent({prompt: "child stall2"})'
             elif lastuser == 'delegate_failure':
                 code = 'try { await tools.agent({prompt: "child reject2"}); } catch (e) { e.message }'
+            elif lastuser == 'delegate_progress':
+                code = 'await Promise.all([tools.agent({prompt: "child progress alpha"}), tools.agent({prompt: "child progress beta"})])'
             elif lastuser == 'delegate_many':
                 code = 'await Promise.all(Array.from({length: 6}, (_, i) => tools.agent({prompt: "child " + i})))'
             elif lastuser == 'delegate_probe':
@@ -115,6 +121,15 @@ class H(http.server.BaseHTTPRequestHandler):
                         'large: {length: large.text.length, truncated: large.truncated, clean: /^x+$/.test(large.text)}, slow})')
             elif lastuser == 'delegate':
                 code = 'await Promise.all([tools.agent({prompt: "child alpha"}), tools.agent({prompt: "child beta"})])'
+            elif progress_child:
+                path = 'progress-' + lastuser.split()[-1] + '.txt'
+                if completed_runs == 0:
+                    code = 'await tools.write({path: ' + json.dumps(path) + ', content: "one"})'
+                elif completed_runs == 1:
+                    code = 'await tools.edit({path: ' + json.dumps(path) + ', old_text: "one", new_text: "two"})'
+                else:
+                    code = 'await tools.read({path: ' + json.dumps(path) + '})'
+                code += '; await tools.bash({command: "sleep 0.15"})'
             elif lastuser.startswith('child '):
                 command = 'sleep 0.3'
                 if lastuser.startswith('child timeout '):

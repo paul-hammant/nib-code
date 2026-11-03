@@ -292,8 +292,6 @@ pub const Session = struct {
         return error.TooManySteps;
     }
 
-    /// Retries transient failures, but only while nothing has been streamed:
-    /// a retry after partial output would duplicate it in the frontend.
     fn complete(s: *Session, messages: []const provider.Message, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, partial: *Partial) !provider.Reply {
         const Forward = struct {
             sink: Sink,
@@ -312,11 +310,26 @@ pub const Session = struct {
             var fwd: Forward = .{ .sink = sink, .gpa = s.gpa, .partial = partial };
             const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta };
             return provider.stream(s.gpa, s.arena.allocator(), s.client, s.cfg, s.id, messages, tools_json, null, provider_sink, cancel, detail) catch |err| {
-                if (fwd.emitted or attempt == max_attempts or !transient(err) or cancel.load(.acquire)) return err;
-                const delay_ms = @as(u64, 1000) << @intCast(attempt - 1);
+                if (err == error.Canceled or cancel.load(.acquire)) return err;
+                const codex = s.cfg.provider == .codex;
+                if ((!codex and fwd.emitted) or attempt == max_attempts or !transient(err)) {
+                    if (codex) try s.log.diagnose(s.io, s.gpa, .{
+                        .error_name = @errorName(err),
+                        .message = detail.* orelse @errorName(err),
+                        .attempts = attempt,
+                        .step = s.steps + 1,
+                    });
+                    return err;
+                }
+                var delay_ms = @as(u64, 1000) << @intCast(attempt - 1);
+                if (codex and err == error.RateLimited) if (detail.*) |message| {
+                    delay_ms = @import("provider/codex.zig").retryDelayMs(message) orelse delay_ms;
+                };
                 try sink.emit(sink.ctx, .{ .retry = .{ .attempt = attempt, .delay_ms = delay_ms, .reason = detail.* orelse @errorName(err) } });
                 if (detail.*) |d| s.gpa.free(d);
                 detail.* = null;
+                // Failed-attempt deltas stay visible, but must never be committed on later cancellation.
+                partial.clear();
                 try sleep(s.io, delay_ms, cancel);
                 continue;
             };
@@ -331,6 +344,8 @@ pub const Session = struct {
 
     pub fn run(s: *Session, code: []const u8, cancel: ?*const std.atomic.Value(bool)) !Ran {
         defer s.usage.add(s.tools.takeUsage());
+        s.tools.progress.clear(s.gpa);
+        defer s.tools.progress.clear(s.gpa);
         s.tools.discardChanges(s.gpa);
         const outcome = try sandbox.eval(s.gpa, s.io, code, .{}, s.tools.host(), cancel);
         errdefer outcome.deinit(s.gpa);
@@ -351,6 +366,15 @@ pub const Session = struct {
         defer args.deinit();
 
         try sink.emit(sink.ctx, .{ .run_start = args.value.code });
+        const Forward = struct {
+            fn progress(ctx: *anyopaque, value: @import("session/events.zig").Progress) !void {
+                const target: *const Sink = @ptrCast(@alignCast(ctx));
+                try target.emit(target.ctx, .{ .progress = value });
+            }
+        };
+        var progress_sink = sink;
+        s.tools.progress.sink = .{ .ctx = &progress_sink, .emit = Forward.progress };
+        defer s.tools.progress.sink = null;
         const ran = try s.run(args.value.code, cancel);
         const o = ran.outcome;
         defer o.deinit(s.gpa);

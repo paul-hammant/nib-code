@@ -69,6 +69,23 @@ class StatsTest(unittest.TestCase):
         self.assertIn('exit_code: 127', next(stats.diagnostics('{"exit_code":127,"output":"no command"}')))
         self.assertEqual(list(stats.diagnostics('result: "subagent: HTTP 400"')), ['subagent: HTTP 400'])
 
+    def test_provider_diagnostic_is_not_a_step_or_context_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'diagnostic.jsonl'
+            records = [dict(cwd=directory, **{'from': 0}, messages=[dict(role='system', content='base')]),
+                       dict(diagnostic=dict(error_name='ProviderFailed',
+                            message='Codex stream failed: invalid_prompt: bad request; the Step was not committed.',
+                            attempts=1, step=1), **{'from': 0}, messages=[]),
+                       dict({'from': 1}, messages=[dict(role='user', content='next'), dict(role='assistant', content='ok')],
+                            usage=dict(prompt_tokens=10, completion_tokens=2, prompt_cache_hit_tokens=0))]
+            path.write_text('\n'.join(map(json.dumps, records)) + '\n')
+            report = stats.summarize([path])
+            self.assertEqual(report['errors']['provider_failure']['count'], 1)
+            self.assertIn('invalid_prompt', report['errors']['provider_failure']['examples'][0]['text'])
+            self.assertEqual(report['overall']['steps'], 1)
+            self.assertEqual(report['overall']['turns'], 1)
+            self.assertEqual(report['usage']['total_tokens'], 12)
+
     def test_static_commands_skip_heredoc_and_redirects(self):
         command = "python3 - <<'PY'\nprint(1); not_a_command()\nPY\ngit status 2>&1; zig build"
         code = 'await tools.bash({timeout_ms: 100, command: ' + json.dumps(command) + '})'

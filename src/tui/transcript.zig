@@ -3,6 +3,7 @@ const vaxis = @import("vaxis");
 const provider = @import("../provider.zig");
 const markdown = @import("markdown.zig");
 const Change = @import("../tools/diff.zig").Change;
+const Progress = @import("../session/events.zig").Progress;
 
 const run_output_lines = 12;
 const max_diff_lines = 60;
@@ -18,6 +19,8 @@ pub const Entry = struct {
     output: std.ArrayList(u8) = .empty,
     /// For `.run`: see `ChangeText`.
     changes: ChangeText = .{},
+    agents: std.ArrayList(Progress) = .empty,
+    agent_lines: std.ArrayList(u8) = .empty,
     /// One-line summary of a collapsible entry. vaxis keeps printed slices
     /// until render, so this must outlive draw(); see `refreshLabel`.
     label: std.ArrayList(u8) = .empty,
@@ -32,6 +35,9 @@ pub const Entry = struct {
         e.output.deinit(gpa);
         e.label.deinit(gpa);
         e.changes.deinit(gpa);
+        for (e.agents.items) |*p| p.deinit(gpa);
+        e.agents.deinit(gpa);
+        e.agent_lines.deinit(gpa);
     }
 
     fn refreshLabel(e: *Entry, gpa: std.mem.Allocator) !void {
@@ -40,7 +46,34 @@ pub const Entry = struct {
             .run => {
                 var buf: [96]u8 = undefined;
                 const used = toolSummary(e.text.items, &buf);
-                if (e.run == .running) {
+                if (e.run == .running and e.agents.items.len > 0) {
+                    const agents = e.agents.items;
+                    if (agents.len == 1) {
+                        const p = agents[0];
+                        try e.label.print(gpa, "agent · running · step {d}", .{p.step});
+                        try appendAction(gpa, &e.label, p);
+                        try appendTokens(gpa, &e.label, p.usage.prompt_tokens + p.usage.completion_tokens);
+                    } else {
+                        var working: usize = 0;
+                        var queued: usize = 0;
+                        var done: usize = 0;
+                        var failed: usize = 0;
+                        var tokens: u64 = 0;
+                        for (agents) |p| {
+                            switch (p.state) {
+                                .working => working += 1,
+                                .queued => queued += 1,
+                                .done => done += 1,
+                                else => failed += 1,
+                            }
+                            tokens += p.usage.prompt_tokens + p.usage.completion_tokens;
+                        }
+                        try e.label.print(gpa, "agent ×{d} · running · {d} working, {d} done", .{ agents.len, working, done });
+                        if (queued > 0) try e.label.print(gpa, ", {d} queued", .{queued});
+                        if (failed > 0) try e.label.print(gpa, ", {d} failed", .{failed});
+                        try appendTokens(gpa, &e.label, tokens);
+                    }
+                } else if (e.run == .running) {
                     try e.label.print(gpa, "{s} · running", .{used});
                 } else {
                     try e.label.print(gpa, "{s} · {d}.{d}s", .{ used, e.elapsed_ms / 1000, e.elapsed_ms % 1000 / 100 });
@@ -52,6 +85,18 @@ pub const Entry = struct {
                 try e.label.print(gpa, "∴ thinking · {d} line{s} · ctrl+o to expand", .{ lines, if (lines == 1) "" else "s" });
             },
             else => {},
+        }
+    }
+
+    fn refreshAgents(e: *Entry, gpa: std.mem.Allocator) !void {
+        e.agent_lines.clearRetainingCapacity();
+        for (e.agents.items, 0..) |p, i| {
+            if (i > 0) try e.agent_lines.append(gpa, '\n');
+            try e.agent_lines.print(gpa, "#{d} ", .{p.agent});
+            const prefix = promptPrefix(p.prompt);
+            for (prefix) |byte| try e.agent_lines.append(gpa, if (byte == '\n' or byte == '\r' or byte == '\t') ' ' else byte);
+            try e.agent_lines.print(gpa, " · {s} · step {d}", .{ @tagName(p.state), p.step });
+            try appendAction(gpa, &e.agent_lines, p);
         }
     }
 
@@ -98,12 +143,17 @@ pub const Entry = struct {
                     .ok => .{ .text = "✓ ", .style = .{ .fg = .{ .index = 2 } } },
                     .failed => .{ .text = "✗ ", .style = .{ .fg = .{ .index = 1 } } },
                 };
-                segs[1] = .{ .text = "run ", .style = .{ .fg = .{ .index = 3 }, .bold = true } };
+                segs[1] = .{ .text = if (e.run == .running and e.agents.items.len > 0) "" else "run ", .style = .{ .fg = .{ .index = 3 }, .bold = true } };
                 segs[2] = .{ .text = e.label.items, .style = dim };
                 if (!e.open) return segs[0..3];
                 segs[3] = .{ .text = "\n" };
                 segs[4] = .{ .text = e.text.items, .style = .{ .fg = .{ .index = 3 } } };
                 var n: usize = 5;
+                if (e.run == .running and e.agent_lines.items.len > 0) {
+                    segs[n] = .{ .text = "\n" };
+                    segs[n + 1] = .{ .text = e.agent_lines.items, .style = dim };
+                    return segs[0 .. n + 2];
+                }
                 if (e.output.items.len > 0) {
                     segs[5] = .{ .text = "\n" };
                     segs[6] = .{ .text = e.output.items, .style = if (e.run == .failed) .{ .fg = .{ .index = 1 }, .dim = true } else dim };
@@ -185,6 +235,23 @@ pub const Transcript = struct {
         try t.addRun(gpa, code, t.expanded);
     }
 
+    pub fn progress(t: *Transcript, gpa: std.mem.Allocator, p: Progress) !void {
+        const e = t.lastRunning() orelse return;
+        var copy = try p.clone(gpa);
+        var transferred = false;
+        errdefer if (!transferred) copy.deinit(gpa);
+        var index: usize = 0;
+        while (index < e.agents.items.len and e.agents.items[index].agent < p.agent) : (index += 1) {}
+        if (index < e.agents.items.len and e.agents.items[index].agent == p.agent) {
+            e.agents.items[index].deinit(gpa);
+            e.agents.items[index] = copy;
+        } else try e.agents.insert(gpa, index, copy);
+        transferred = true;
+        try e.refreshAgents(gpa);
+        try e.refreshLabel(gpa);
+        e.cached = null;
+    }
+
     /// Takes ownership of `changes`.
     pub fn endRun(t: *Transcript, gpa: std.mem.Allocator, ok: bool, output: []const u8, elapsed_ms: u64, changes: ChangeText) !void {
         const e = t.lastRunning() orelse {
@@ -194,6 +261,9 @@ pub const Transcript = struct {
         };
         e.run = if (ok) .ok else .failed;
         e.elapsed_ms = elapsed_ms;
+        for (e.agents.items) |*p| p.deinit(gpa);
+        e.agents.clearAndFree(gpa);
+        e.agent_lines.clearAndFree(gpa);
         e.changes.deinit(gpa);
         e.changes = changes;
         try appendHead(gpa, &e.output, output, run_output_lines);
@@ -441,4 +511,87 @@ test "a Run shows changed files in its summary and a colored diff when open" {
     var text: ChangeText = try .init(gpa, &many);
     defer text.deinit(gpa);
     try testing.expectEqualStrings("3 files +6 −3", text.summary);
+}
+
+fn appendAction(gpa: std.mem.Allocator, out: *std.ArrayList(u8), p: Progress) !void {
+    if (p.tools.len == 0 and p.files.len == 0) return;
+    try out.appendSlice(gpa, " · ");
+    for (p.tools, 0..) |name, i| {
+        if (i > 0) try out.appendSlice(gpa, ", ");
+        try out.appendSlice(gpa, name);
+    }
+    for (p.files, 0..) |path, i| {
+        if (i > 0) try out.appendSlice(gpa, ", ") else if (p.tools.len > 0) try out.append(gpa, ' ');
+        try out.appendSlice(gpa, path);
+    }
+}
+
+fn appendTokens(gpa: std.mem.Allocator, out: *std.ArrayList(u8), tokens: u64) !void {
+    if (tokens >= 1000) {
+        try out.print(gpa, " · {d}k tok", .{tokens / 1000});
+    } else try out.print(gpa, " · {d} tok", .{tokens});
+}
+
+fn promptPrefix(prompt: []const u8) []const u8 {
+    var end: usize = 0;
+    var count: usize = 0;
+    while (end < prompt.len and count < 40) : (count += 1) {
+        const len = std.unicode.utf8ByteSequenceLength(prompt[end]) catch 1;
+        end = @min(prompt.len, end + len);
+    }
+    return prompt[0..end];
+}
+
+test "running agent folds to progress and expands to child details until Run ends" {
+    const gpa = testing.allocator;
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    try t.startRun(gpa, "await tools.agent({prompt: 'fix it'})");
+    try t.progress(gpa, .{ .agent = 1, .prompt = "fix it", .step = 3, .tools = &.{"edit"}, .files = &.{"src/x.zig"}, .usage = .{ .prompt_tokens = 41000 } });
+    const e = &t.entries.items[0];
+    var segs: [max_segments]vaxis.Segment = undefined;
+    try testing.expectEqualStrings("agent · running · step 3 · edit src/x.zig · 41k tok", e.segments(&segs)[2].text);
+    try testing.expectEqualStrings("", e.segments(&segs)[1].text);
+    t.toggleExpanded();
+    try testing.expectEqualStrings("#1 fix it · working · step 3 · edit src/x.zig", e.segments(&segs)[6].text);
+    try t.endRun(gpa, true, "done", 1234, .{});
+    try testing.expectEqualStrings("agent · 1.2s", e.segments(&segs)[2].text);
+    try testing.expectEqualStrings("run ", e.segments(&segs)[1].text);
+    try testing.expectEqualStrings("done", e.segments(&segs)[6].text);
+    try t.progress(gpa, .{ .agent = 1, .prompt = "late" });
+    try testing.expectEqualStrings("agent · 1.2s", e.label.items);
+}
+
+test "multiple child progress is sorted, replaced and summed without double counting cache" {
+    const gpa = testing.allocator;
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    try t.startRun(gpa, "await Promise.all([tools.agent({}), tools.agent({}), tools.agent({})])");
+    try t.progress(gpa, .{ .agent = 3, .prompt = "third", .step = 1, .usage = .{ .prompt_tokens = 40000 } });
+    try t.progress(gpa, .{ .agent = 1, .prompt = "first", .step = 2, .state = .done, .tools = &.{"read"}, .usage = .{ .prompt_tokens = 39000, .completion_tokens = 1000, .prompt_cache_hit_tokens = 39000 } });
+    try t.progress(gpa, .{ .agent = 2, .prompt = "second", .step = 3, .tools = &.{"edit"}, .files = &.{"a.zig"}, .usage = .{ .prompt_tokens = 40000 } });
+    const e = &t.entries.items[0];
+    var segs: [max_segments]vaxis.Segment = undefined;
+    try testing.expectEqualStrings("agent ×3 · running · 2 working, 1 done · 120k tok", e.segments(&segs)[2].text);
+    t.toggleExpanded();
+    try testing.expectEqualStrings("#1 first · done · step 2 · read\n#2 second · working · step 3 · edit a.zig\n#3 third · working · step 1", e.segments(&segs)[6].text);
+    try t.progress(gpa, .{ .agent = 3, .prompt = "third", .state = .timed_out, .step = 1, .usage = .{ .prompt_tokens = 40000 } });
+    try testing.expectEqual(@as(usize, 3), e.agents.items.len);
+    try testing.expectEqualStrings("agent ×3 · running · 1 working, 1 done, 1 failed · 120k tok", e.label.items);
+    try t.endRun(gpa, true, "out", 9000, .{});
+    try testing.expectEqualStrings("agent ×3 · 9.0s", e.label.items);
+}
+
+test "child prompt preview uses forty Unicode characters and one logical line" {
+    const gpa = testing.allocator;
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    try t.startRun(gpa, "tools.agent({})");
+    const prompt = "中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中" ++ "\nnot shown";
+    try t.progress(gpa, .{ .agent = 1, .prompt = prompt, .state = .queued });
+    const e = &t.entries.items[0];
+    try testing.expectEqualStrings("#1 " ++ "中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中" ++ "  · queued · step 0", e.agent_lines.items);
+    e.cached = .{ .width = 80, .len = e.text.items.len, .open = false, .rows = 10 };
+    try t.progress(gpa, .{ .agent = 1, .prompt = prompt, .state = .working });
+    try testing.expect(e.cached == null);
 }
