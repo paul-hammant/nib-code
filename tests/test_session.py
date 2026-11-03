@@ -437,11 +437,31 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         run_end = next(e["run_end"] for e in limited if "run_end" in e)
         assert run_end["ok"], run_end
         output = run_end["output"]
-        assert "bytes omitted" in output and len(output) < 17000, output[:100]
-        assert output.startswith('result: "' + 'x' * 100) and output.endswith('x' * 100 + '"'), output[-110:]
+        assert "bytes omitted" in output and len(output.encode("utf-8")) <= 16384, output[:100]
+        assert output.startswith('[entry 1 of 1 (result)]\n"' + 'x' * 100), output[:100]
+        assert output.endswith('x' * 100 + '"\n'), output[-110:]
         requests = read_requests(requests_path)
         assert requests[-1]["messages"][-1]["content"] == output
         print("Run output E2E passed: JS receives complete bash data; only model-facing output is truncated")
+
+        middle = "你" * 12000 + "-middle-tail"
+        for name, content in (("left", "short-left"), ("middle", middle), ("right", "short-right")):
+            (cwd / f"{name}.txt").write_text(content)
+        entries = events(ask("--json", "output_entries_test"))
+        run_end = next(e["run_end"] for e in entries if "run_end" in e)
+        assert run_end["ok"], run_end
+        output = run_end["output"]
+        assert len(output.encode("utf-8")) <= 16384
+        assert output.startswith("[entry 1 of 3 (console)]\nleft short-left\n")
+        assert "[entry 2 of 3 (console)]\nmiddle " in output
+        assert "-middle-tail\n[entry 3 of 3 (console)]\nright short-right\n" in output
+        omitted = re.search(r"\[(\d+) of (\d+) bytes omitted\]", output)
+        assert omitted and 0 < int(omitted[1]) < int(omitted[2]), output[:100]
+        assert int(omitted[2]) == len(("middle " + middle + "\n").encode("utf-8"))
+        assert (cwd / "middle-copy.txt").read_text() == middle
+        requests = read_requests(requests_path)
+        assert requests[-1]["messages"][-1]["content"] == output
+        print("Entry output E2E passed: concurrent reads stay complete in JS and round-trip losslessly; model sees numbered entries and omission bytes")
 
         started = time.monotonic()
         fetched = events(ask("--json", "fetch_test"))
