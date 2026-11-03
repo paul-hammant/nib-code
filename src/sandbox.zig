@@ -26,15 +26,32 @@ pub const Host = struct {
     poll: ?*const fn (ctx: *anyopaque) anyerror!void = null,
 };
 
+pub const LogEntry = struct {
+    start: usize,
+    end: usize,
+    bytes: usize,
+};
+
+pub const OmittedLogs = struct {
+    count: usize = 0,
+    bytes: usize = 0,
+};
+
+pub const max_log_entries = 64;
+
 pub const Outcome = struct {
     ok: bool,
     /// Completion value as JSON when `ok`, otherwise error message and stack.
     text: []u8,
     logs: []u8,
+    log_entries: []const LogEntry = &.{},
+    omitted_logs: OmittedLogs = .{},
+    log_truncated: bool = false,
 
     pub fn deinit(o: Outcome, gpa: std.mem.Allocator) void {
         gpa.free(o.text);
         gpa.free(o.logs);
+        gpa.free(o.log_entries);
     }
 };
 
@@ -43,6 +60,8 @@ const State = struct {
     io: std.Io,
     host: ?Host,
     logs: std.ArrayList(u8) = .empty,
+    log_entries: std.ArrayList(LogEntry) = .empty,
+    omitted_logs: OmittedLogs = .{},
     max_log: usize,
     log_truncated: bool = false,
     js_remaining_ns: i96,
@@ -214,6 +233,7 @@ pub fn eval(
         .cancel = cancel,
     };
     defer st.logs.deinit(gpa);
+    defer st.log_entries.deinit(gpa);
 
     const rt = c.JS_NewRuntime() orelse return error.OutOfMemory;
     defer c.JS_FreeRuntime(rt);
@@ -270,6 +290,7 @@ pub fn eval(
         }
     }
     errdefer gpa.free(text);
+    if (st.oom) return error.OutOfMemory;
 
     if (isInterrupted(&st)) {
         ok = false;
@@ -277,7 +298,16 @@ pub fn eval(
         text = try gpa.dupe(u8, if (st.cancel != null and st.cancel.?.load(.acquire)) "Error: run canceled" else "Error: run timed out");
     }
     if (st.log_truncated) try st.logs.appendSlice(gpa, "\n[console output truncated]\n");
-    return .{ .ok = ok, .text = text, .logs = try st.logs.toOwnedSlice(gpa) };
+    const logs = try st.logs.toOwnedSlice(gpa);
+    errdefer gpa.free(logs);
+    return .{
+        .ok = ok,
+        .text = text,
+        .logs = logs,
+        .log_entries = try st.log_entries.toOwnedSlice(gpa),
+        .omitted_logs = st.omitted_logs,
+        .log_truncated = st.log_truncated,
+    };
 }
 
 fn install(gpa: std.mem.Allocator, ctx: *c.JSContext, host: ?Host) !void {
@@ -310,11 +340,20 @@ fn nativeLog(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue)
     var len: usize = 0;
     const p = c.JS_ToCStringLen2(ctx, &len, argv[0], false) orelse return js_undefined;
     defer c.JS_FreeCString(ctx, p);
-    const room = st.max_log -| st.logs.items.len;
+    const start = st.logs.items.len;
+    const room = st.max_log -| start;
     if (len > room) st.log_truncated = true;
     st.logs.appendSlice(st.gpa, p[0..@min(len, room)]) catch {
         st.oom = true;
     };
+    if (st.log_entries.items.len < max_log_entries) {
+        st.log_entries.append(st.gpa, .{ .start = start, .end = st.logs.items.len, .bytes = len }) catch {
+            st.oom = true;
+        };
+    } else {
+        st.omitted_logs.count +|= 1;
+        st.omitted_logs.bytes +|= len;
+    }
     return js_undefined;
 }
 

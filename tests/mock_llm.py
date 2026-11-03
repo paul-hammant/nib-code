@@ -112,6 +112,11 @@ class H(http.server.BaseHTTPRequestHandler):
             elif lastuser == 'output_limit_test':
                 code = ('const r = await tools.bash({command: "head -c 32768 /dev/zero | tr \'\\\\0\' x"});'
                         'if (r.output.length !== 32768) throw new Error("tool data was truncated"); r.output')
+            elif lastuser == 'output_entries_test':
+                code = ('const pages = await Promise.all(["left.txt", "middle.txt", "right.txt"].map(path => tools.read({path})));'
+                        'pages.forEach((page, i) => console.log(["left", "middle", "right"][i], page.text));'
+                        'if (pages[1].text.length !== 12012 || !pages[1].text.endsWith("-middle-tail")) throw new Error("tool data was truncated");'
+                        'await tools.write({path: "middle-copy.txt", content: pages[1].text}); void 0;')
             elif lastuser == 'fetch_test':
                 base = 'http://127.0.0.1:' + sys.argv[1]
                 code = ('const page = await tools.fetch({url: "' + base + '/redirect"});\n'

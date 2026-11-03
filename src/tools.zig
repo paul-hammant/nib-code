@@ -117,8 +117,6 @@ const child_api = makeApi(1);
 pub const names = root_api.names;
 pub const docs = root_api.docs;
 
-const max_output = 16 * 1024;
-
 /// State shared by all tool calls of one Session; each tool lives in `tools/`.
 pub const Tools = struct {
     io: std.Io,
@@ -304,29 +302,6 @@ pub fn fail(gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !sa
     return .{ .err = try std.fmt.allocPrint(gpa, fmt, args) };
 }
 
-pub fn truncateMiddle(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
-    if (s.len <= max_output) return gpa.dupe(u8, s);
-    const keep = max_output / 2;
-    return std.fmt.allocPrint(gpa, "{s}\n[... {d} bytes omitted ...]\n{s}", .{
-        trimPartialUtf8End(s[0..keep]), s.len - 2 * keep, trimPartialUtf8Start(s[s.len - keep ..]),
-    });
-}
-
-fn trimPartialUtf8End(s: []const u8) []const u8 {
-    var j = s.len;
-    while (j > 0 and s.len - j < 3 and (s[j - 1] & 0xC0) == 0x80) j -= 1;
-    if (j == 0) return s;
-    const lead = j - 1;
-    const len = std.unicode.utf8ByteSequenceLength(s[lead]) catch return s[0..lead];
-    return if (lead + len <= s.len) s else s[0..lead];
-}
-
-fn trimPartialUtf8Start(s: []const u8) []const u8 {
-    var i: usize = 0;
-    while (i < s.len and i < 3 and (s[i] & 0xC0) == 0x80) i += 1;
-    return s[i..];
-}
-
 const testing = std.testing;
 
 /// Calls a tool on a fresh root Tools, for tests.
@@ -347,22 +322,6 @@ test "tool docs are valid JavaScript" {
     const r = try sandbox.eval(testing.allocator, testing.io, src, .{}, null, null);
     defer r.deinit(testing.allocator);
     try testing.expect(r.ok);
-}
-
-test "utf8 cut points" {
-    try testing.expectEqualStrings("ab", trimPartialUtf8End("ab\xe4\xbd"));
-    try testing.expectEqualStrings("ab\xe4\xbd\xa0", trimPartialUtf8End("ab\xe4\xbd\xa0"));
-    try testing.expectEqualStrings("cd", trimPartialUtf8Start("\xbd\xa0cd"));
-}
-
-test "truncateMiddle keeps head and tail" {
-    const big = try testing.allocator.alloc(u8, max_output * 2);
-    defer testing.allocator.free(big);
-    @memset(big, 'x');
-    const t = try truncateMiddle(testing.allocator, big);
-    defer testing.allocator.free(t);
-    try testing.expect(t.len < big.len);
-    try testing.expect(std.mem.indexOf(u8, t, "bytes omitted") != null);
 }
 
 test "Promise.all runs bash concurrently and await remains sequential" {

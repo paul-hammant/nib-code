@@ -7,6 +7,7 @@ const Change = @import("tools/diff.zig").Change;
 const provider = @import("provider.zig");
 const session_log = @import("session/log.zig");
 const instructions = @import("session/instructions.zig");
+const formatOutcome = @import("session/output.zig").format;
 
 pub const Event = @import("session/events.zig").Event;
 
@@ -36,7 +37,7 @@ const system_template =
     \\
     \\Writing scripts:
     \\- Top-level `await` works. Combine related steps in one script (read several files, run a command, filter the output) and return only what you need.
-    \\- The value of the last expression comes back to you, together with anything passed to console.log. Large output is truncated, so filter before returning it.
+    \\- The value of the last expression comes back to you, together with anything passed to console.log. The entire Run shares a 16 KiB output budget, not 16 KiB per tool call. Large output is truncated by console entry (one call, including all its arguments) and final result; markers identify omitted entries and bytes. Filter in JS or split large output across Runs; tool results inside JS remain complete.
     \\- Search with tools.grep/tools.glob, not shell rg/find/grep.
     \\- For file/shell text with backticks, ${{ or backslashes, use JSON-escaped double-quoted strings, not template literals.
     \\
@@ -379,9 +380,7 @@ pub const Session = struct {
         const o = ran.outcome;
         defer o.deinit(s.gpa);
 
-        const formatted = try formatOutcome(s.gpa, o);
-        defer s.gpa.free(formatted);
-        const output = try tools.truncateMiddle(a, formatted);
+        const output = try formatOutcome(a, o);
         try sink.emit(sink.ctx, .{ .run_end = .{ .ok = o.ok, .output = output, .changes = ran.changes } });
         return .{ .output = output, .ok = o.ok };
     }
@@ -443,15 +442,6 @@ fn sleep(io: std.Io, ms: u64, cancel: *const std.atomic.Value(bool)) !void {
     }
 }
 
-fn formatOutcome(gpa: std.mem.Allocator, o: sandbox.Outcome) ![]u8 {
-    const logs = std.mem.trimEnd(u8, o.logs, "\n");
-    const value: []const u8 = if (o.ok and std.mem.eql(u8, o.text, "undefined")) "" else o.text;
-    if (logs.len == 0 and value.len == 0) return gpa.dupe(u8, "(no output)");
-    const sep: []const u8 = if (logs.len > 0 and value.len > 0) "\n" else "";
-    const label: []const u8 = if (o.ok and value.len > 0) "result: " else "";
-    return std.fmt.allocPrint(gpa, "{s}{s}{s}{s}", .{ logs, sep, label, value });
-}
-
 test "formatOutcome" {
     const gpa = std.testing.allocator;
     var logs = "a\nb\n".*;
@@ -480,6 +470,8 @@ test "system prompt documents every tool in JavaScript" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "```js\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "TypeScript") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "backticks, ${ or backslashes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "entire Run shares a 16 KiB output budget, not 16 KiB per tool call") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "tool results inside JS remain complete") != null);
     for (tools.names) |name| {
         const call = try std.fmt.allocPrint(gpa, "async {s}({{", .{name});
         defer gpa.free(call);
