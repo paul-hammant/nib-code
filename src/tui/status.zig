@@ -30,6 +30,7 @@ pub const Status = struct {
     cfg: provider.Config,
     usage: provider.Usage = .{},
     steps: u32 = 0,
+    current_step: u32 = 1,
     context: u64 = 0,
     /// Set while a Turn runs.
     busy: ?Activity.Label = null,
@@ -37,40 +38,56 @@ pub const Status = struct {
     notice: ?[]const u8 = null,
 };
 
-/// Text the status line prints; owned by the caller because vaxis reads
-/// printed slices only at render time.
+/// Printed slices must survive until vaxis renders the frame.
 pub const Text = struct {
-    status: [320]u8 = undefined,
-    activity: [64]u8 = undefined,
+    status: [512]u8 = undefined,
+    activity: [512]u8 = undefined,
 
     pub fn format(text: *Text, s: Status, scrolled: bool) []const u8 {
-        const doing: []const u8 = if (s.busy) |b|
-            std.fmt.bufPrint(&text.activity, "{s} {s} {d}s", .{ spinner[(b.ms / 100) % spinner.len], @tagName(b.phase), b.ms / 1000 }) catch ""
-        else
-            "";
-        const separator: []const u8 = if (doing.len > 0) " · " else "";
-        if (s.notice) |notice| return std.fmt.bufPrint(&text.status, "{s}{s}{s}", .{ doing, separator, notice }) catch "";
-        if (scrolled) return std.fmt.bufPrint(&text.status, "{s}{s}↑ history", .{ doing, separator }) catch "";
-        return std.fmt.bufPrint(&text.status, "{s}{s}{s} · effort {s} · ctx {d}% · last turn: {d} steps, in {d} (cache {d}), out {d}", .{
-            doing,
-            separator,
-            s.cfg.model,
-            s.cfg.effectiveEffort(),
-            s.context * 100 / @max(s.cfg.context_window, 1),
+        var w: std.Io.Writer = .fixed(&text.activity);
+        if (s.busy) |b| w.print("{s} {s} {d}s · step {d} · esc to cancel", .{ spinner[(b.ms / 100) % spinner.len], @tagName(b.phase), b.ms / 1000, s.current_step }) catch {};
+        if (scrolled) {
+            if (w.end > 0) w.writeAll(" · ") catch {};
+            w.writeAll("↑ history · PgDn to return") catch {};
+        }
+        if (s.notice) |notice| {
+            if (w.end > 0) w.writeAll(" · ") catch {};
+            w.writeAll(notice) catch {};
+        }
+        return w.buffered();
+    }
+
+    pub fn footer(text: *Text, s: Status, width: u16) []const u8 {
+        var input: [32]u8 = undefined;
+        var output: [32]u8 = undefined;
+        var line = std.fmt.bufPrint(&text.status, "{s} · effort {s} · ctx {d}% · in {s} ({d}% cached) · out {s} · last turn: {d} steps", .{
+            s.cfg.model,                           s.cfg.effectiveEffort(),                                                s.context * 100 / @max(s.cfg.context_window, 1),
+            tokens(&input, s.usage.prompt_tokens), s.usage.prompt_cache_hit_tokens * 100 / @max(s.usage.prompt_tokens, 1), tokens(&output, s.usage.completion_tokens),
             s.steps,
-            s.usage.prompt_tokens,
-            s.usage.prompt_cache_hit_tokens,
-            s.usage.completion_tokens,
         }) catch "";
+        while (std.mem.lastIndexOf(u8, line, " · ")) |separator| {
+            if (@import("vaxis").gwidth.gwidth(line, .unicode) <= width) break;
+            line = line[0..separator];
+        }
+        return line;
     }
 };
 
-test "status line shows activity first, and only history hints while scrolled" {
+fn tokens(buf: []u8, n: u64) []const u8 {
+    const unit: u64 = if (n >= 1_000_000) 1_000_000 else if (n >= 1000) 1000 else 1;
+    if (unit == 1) return std.fmt.bufPrint(buf, "{d}", .{n}) catch "";
+    const suffix = if (unit == 1000) "k" else "M";
+    const tenths = n % unit * 10 / unit;
+    if (tenths == 0) return std.fmt.bufPrint(buf, "{d}{s}", .{ n / unit, suffix }) catch "";
+    return std.fmt.bufPrint(buf, "{d}.{d}{s}", .{ n / unit, tenths, suffix }) catch "";
+}
+
+test "activity is optional and footer keeps previous turn usage" {
     var text: Text = .{};
     const cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "m", .context_window = 1000 };
-    const idle = text.format(.{ .cfg = cfg, .context = 250, .steps = 2 }, false);
-    try std.testing.expect(std.mem.startsWith(u8, idle, "m · effort "));
-    try std.testing.expect(std.mem.indexOf(u8, idle, "ctx 25% · last turn: 2 steps") != null);
-    try std.testing.expectEqualStrings("⠙ running 0s · ↑ history", text.format(.{ .cfg = cfg, .busy = .{ .phase = .running, .ms = 150 } }, true));
-    try std.testing.expectEqualStrings("⠙ running 0s · copied 3 chars", text.format(.{ .cfg = cfg, .busy = .{ .phase = .running, .ms = 150 }, .notice = "copied 3 chars" }, true));
+    try std.testing.expectEqualStrings("", text.format(.{ .cfg = cfg }, false));
+    try std.testing.expectEqualStrings("↑ history · PgDn to return", text.format(.{ .cfg = cfg }, true));
+    try std.testing.expectEqualStrings("⠙ running 0s · step 2 · esc to cancel · copied 3 chars", text.format(.{ .cfg = cfg, .current_step = 2, .busy = .{ .phase = .running, .ms = 150 }, .notice = "copied 3 chars" }, false));
+    const line = text.footer(.{ .cfg = cfg, .context = 250, .steps = 2, .usage = .{ .prompt_tokens = 1_800_000, .prompt_cache_hit_tokens = 1_692_000, .completion_tokens = 18_000 } }, 200);
+    try std.testing.expectEqualStrings("m · effort server default · ctx 25% · in 1.8M (94% cached) · out 18k · last turn: 2 steps", line);
 }

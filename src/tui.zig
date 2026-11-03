@@ -25,8 +25,8 @@ const Event = union(enum) {
     mouse: vaxis.Mouse,
     tick,
     /// Slices are owned by the receiver.
-    delta: struct { kind: provider.Kind, text: []u8 },
-    run_start: []u8,
+    delta: struct { kind: provider.Kind, text: []u8, step: u32 },
+    run_start: struct { code: []u8, step: u32 },
     run_end: struct { ok: bool, output: []u8, changes: ChangeText },
     retry: []u8,
     notice: []u8,
@@ -92,8 +92,8 @@ const Turn = struct {
         const t: *Turn = @ptrCast(@alignCast(ctx));
         const gpa = t.gpa;
         const event: Event = switch (ev) {
-            .delta => |d| .{ .delta = .{ .kind = d.kind, .text = try gpa.dupe(u8, d.text) } },
-            .run_start => |code| .{ .run_start = try gpa.dupe(u8, code) },
+            .delta => |d| .{ .delta = .{ .kind = d.kind, .text = try gpa.dupe(u8, d.text), .step = t.session.steps + 1 } },
+            .run_start => |code| .{ .run_start = .{ .code = try gpa.dupe(u8, code), .step = t.session.steps } },
             .run_end => |r| .{ .run_end = .{ .ok = r.ok, .output = try gpa.dupe(u8, r.output), .changes = try .init(gpa, r.changes) } },
             .retry => |r| .{ .retry = try std.fmt.allocPrint(gpa, "retry {d} in {d}s: {s}", .{ r.attempt, r.delay_ms / 1000, r.reason }) },
             .notice => |m| .{ .notice = try gpa.dupe(u8, m) },
@@ -237,6 +237,8 @@ const App = struct {
     transcript: Transcript = .{},
     input: Editor = .{},
     pasting: bool = false,
+    paste_buf: std.ArrayList(u8) = .empty,
+    live_steps: u32 = 0,
     scroll: Viewport = .{},
     menu: Menu,
     status_text: status.Text = .{},
@@ -256,6 +258,7 @@ const App = struct {
         app.menu.deinit();
         app.transcript.deinit(app.gpa);
         app.input.deinit(app.gpa);
+        app.paste_buf.deinit(app.gpa);
     }
 
     /// False to quit.
@@ -263,8 +266,16 @@ const App = struct {
         const gpa = app.gpa;
         switch (event) {
             .key_press => |k| return app.onKey(k),
-            .paste_start => app.pasting = true,
-            .paste_end => app.pasting = false,
+            .paste_start => {
+                app.pasting = true;
+                app.paste_buf.clearRetainingCapacity();
+            },
+            .paste_end => {
+                app.pasting = false;
+                try app.input.paste(gpa, app.paste_buf.items);
+                app.menu.inputChanged(app.input.text());
+                app.paste_buf.clearRetainingCapacity();
+            },
             .mouse => |m| {
                 if (m.type == .press) app.notice = null;
                 if (m.button == .wheel_up or m.button == .wheel_down) {
@@ -288,13 +299,15 @@ const App = struct {
             },
             .delta => |d| {
                 defer gpa.free(d.text);
+                app.live_steps = d.step;
                 if (app.activity.phase != .compacting) app.activity.set(app.io, if (d.kind == .reasoning) .thinking else .writing);
                 try app.transcript.appendDelta(gpa, d.kind, d.text);
             },
-            .run_start => |code| {
-                defer gpa.free(code);
+            .run_start => |r| {
+                defer gpa.free(r.code);
+                app.live_steps = r.step;
                 app.activity.set(app.io, .running);
-                try app.transcript.startRun(gpa, code);
+                try app.transcript.startRun(gpa, r.code);
             },
             .run_end => |r| {
                 defer gpa.free(r.output);
@@ -307,7 +320,7 @@ const App = struct {
                 if (std.mem.startsWith(u8, msg, "retry")) app.activity.set(app.io, .retrying);
                 try app.transcript.add(gpa, .info, msg);
             },
-            .usage => |u| app.usage = u,
+            .usage => {},
             .progress => |p| {
                 var owned = p;
                 defer owned.deinit(gpa);
@@ -339,6 +352,16 @@ const App = struct {
     fn onKey(app: *App, k: vaxis.Key) !bool {
         app.notice = null;
         const gpa = app.gpa;
+        if (app.pasting) {
+            if (k.text) |t| {
+                try app.paste_buf.appendSlice(gpa, t);
+            } else if (isNewline(k, true)) {
+                try app.paste_buf.append(gpa, '\n');
+            } else if (k.matches(vaxis.Key.tab, .{})) {
+                try app.paste_buf.append(gpa, '\t');
+            }
+            return true;
+        }
         const input = &app.input;
         const page = @max(app.vx.window().height / 2, 1);
         if (k.matches('c', .{ .ctrl = true })) return false;
@@ -367,7 +390,7 @@ const App = struct {
         } else if (k.matches(vaxis.Key.page_up, .{})) {
             app.scroll.pending -= page;
         } else if (k.matches(vaxis.Key.page_down, .{})) {
-            app.scroll.pending += page;
+            app.scroll.pending = if (app.scroll.top != null) std.math.maxInt(i32) else page;
         } else if (k.matches('o', .{ .ctrl = true })) {
             app.transcript.toggleExpanded();
         } else if (k.matches(vaxis.Key.up, .{ .shift = true })) {
@@ -405,6 +428,7 @@ const App = struct {
         }
         try app.transcript.add(gpa, .user, line);
         app.turn = try Turn.spawn(gpa, app.session, app.loop, line, false);
+        app.live_steps = 0;
         app.activity = .start(app.io, .thinking);
     }
 
@@ -473,6 +497,7 @@ const App = struct {
             },
             .compact => {
                 app.turn = try Turn.spawn(gpa, session, app.loop, try gpa.dupe(u8, line), true);
+                app.live_steps = 0;
                 app.activity = .start(app.io, .compacting);
             },
             .reflect => {
@@ -485,6 +510,7 @@ const App = struct {
                 errdefer gpa.free(focus);
                 try app.transcript.add(gpa, .user, line);
                 app.turn = try Turn.spawn(gpa, session, app.loop, text, false);
+                app.live_steps = 0;
                 app.activity = .start(app.io, .thinking);
                 app.reflecting = focus;
             },
@@ -570,6 +596,7 @@ const App = struct {
             .cfg = app.cfg,
             .usage = app.usage,
             .steps = app.steps,
+            .current_step = @max(1, app.live_steps),
             .context = app.context,
             .busy = if (app.turn != null) app.activity.label(app.io) else null,
             .notice = app.notice,
@@ -584,4 +611,29 @@ fn isNewline(key: vaxis.Key, pasting: bool) bool {
     const enter = vaxis.Key.enter;
     return (pasting and key.matches(enter, .{})) or key.matches(enter, .{ .shift = true }) or
         key.matches(enter, .{ .alt = true }) or key.matches('j', .{ .ctrl = true });
+}
+
+test "bracketed paste buffers newline and slash keys without executing them" {
+    const gpa = std.testing.allocator;
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.input = .{};
+    defer app.input.deinit(gpa);
+    app.paste_buf = .empty;
+    defer app.paste_buf.deinit(gpa);
+    app.menu = .init(gpa);
+    defer app.menu.deinit();
+    app.notice = null;
+    _ = try app.handle(.paste_start);
+    _ = try app.onKey(.{ .codepoint = '/', .text = "/help" });
+    for (0..5) |_| {
+        _ = try app.onKey(.{ .codepoint = 'j', .mods = .{ .ctrl = true } });
+        _ = try app.onKey(.{ .codepoint = 'x', .text = "x" });
+    }
+    try std.testing.expectEqualStrings("", app.input.text());
+    _ = try app.handle(.paste_end);
+    try std.testing.expectEqualStrings("[Pasted #1 · 6 lines]", app.input.text());
+    const expanded = try app.input.expanded(gpa);
+    defer gpa.free(expanded);
+    try std.testing.expectEqualStrings("/help\nx\nx\nx\nx\nx", expanded);
 }

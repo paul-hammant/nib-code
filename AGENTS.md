@@ -24,7 +24,7 @@
 - `src/provider.zig`：Provider 接口与配置；`provider/` 下是各线路协议和 SSE 解析。
 - `src/sandbox.zig`：QuickJS Run 与宿主桥接。
 - `src/tools.zig`：工具表（给模型看的 JS 说明集中在这里）、`Tools` 共享状态与调度。`tools/` 下每个工具族一个入口文件，函数名即工具名：`files.zig`（read/edit/write）、`search.zig`（grep/glob）、`web.zig`（fetch）、`bash.zig`、`agent.zig`；其余是它们的辅助模块。加工具：在 `tools/` 写入口函数，再在表里加一行。
-- `src/tui.zig`：TUI 事件循环（按键、`/` 指令分派、Session 事件、后台 Turn）；`tui/` 下：`transcript.zig`（对话条目与折叠）、`viewport.zig`（滚动锚定）、`view.zig`（一帧的布局绘制）、`status.zig`（阶段与状态栏）、`menu.zig`（`/` 候选菜单）、`commands.zig`（指令表）、`reflect.zig` + `reflect.md`（/reflect 的提示词与 reflections.md 追加）、`editor.zig`（输入框）、`markdown.zig`、`selection.zig`（鼠标选区、高亮与剪贴板复制）。
+- `src/tui.zig`：TUI 事件循环（按键、`/` 指令分派、Session 事件、后台 Turn）；`tui/` 下：`transcript.zig`（对话条目与折叠）、`viewport.zig`（滚动锚定）、`view.zig`（一帧的布局绘制）、`status.zig`（活动行与下边框元数据）、`menu.zig`（`/` 候选菜单）、`commands.zig`（指令表）、`reflect.zig` + `reflect.md`（/reflect 的提示词与 reflections.md 追加）、`editor.zig`（输入框、原子粘贴块与进程内草稿历史）、`long_text.zig`（长文本阈值与计数）、`markdown.zig`、`selection.zig`（鼠标选区、高亮与剪贴板复制）。
 - `tests/`：端到端测试和 mock 服务器；`scripts/`：辅助脚本。
 
 工具返回给 JS 的是完整数据，不能为保护模型上下文而悄悄截断或往正文里添加提示；否则 `read → JS 替换 → write` 会把截断标记写回文件，造成数据损坏。上下文截断只发生在 Session 把 Run 输出交给模型时（`tools.truncateMiddle`，保留首尾约 16 KiB），不改变 Run 内的数据。`read` 返回 `{ text, next_offset }`：按 offset/limit 原样返回请求的行，默认 2000 行，后续行起点单独放在 next_offset，EOF 时为 null；文件上限仍为 16 MiB。`bash` 的 `{ exit_code, output }` 中 output 原样返回，超过 16 MiB 报错并提示重定向到文件。工具自身明确约定的有界结果除外：grep 的文本/上下文行最多 500 字节，grep/glob 用 truncated 标记结果数量上限；fetch 的文本最多 1 MiB，返回 `{ url, status, content_type, text, truncated }`，truncated 明确表示正文不完整，提示不混入 text，下载超过 5 MiB 则报错。

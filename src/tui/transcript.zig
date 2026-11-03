@@ -1,6 +1,7 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const provider = @import("../provider.zig");
+const long_text = @import("long_text.zig");
 const markdown = @import("markdown.zig");
 const Change = @import("../tools/diff.zig").Change;
 const Progress = @import("../session/events.zig").Progress;
@@ -26,7 +27,7 @@ pub const Entry = struct {
     label: std.ArrayList(u8) = .empty,
     run: enum { running, ok, failed } = .running,
     elapsed_ms: u64 = 0,
-    /// Collapsible kinds (`.run`, `.reasoning`) show one summary line unless open.
+    /// Collapsible entries share the transcript ctrl+o state.
     open: bool = false,
     cached: ?struct { width: u16, len: usize, open: bool, rows: u16 } = null,
 
@@ -80,6 +81,9 @@ pub const Entry = struct {
                 }
                 if (e.changes.summary.len > 0) try e.label.print(gpa, " · {s}", .{e.changes.summary});
             },
+            .user => {
+                try e.label.print(gpa, " … +{d} lines", .{long_text.lines(e.text.items) - 1});
+            },
             .reasoning => {
                 const lines = std.mem.count(u8, std.mem.trimEnd(u8, e.text.items, "\n"), "\n") + 1;
                 try e.label.print(gpa, "∴ thinking · {d} line{s} · ctrl+o to expand", .{ lines, if (lines == 1) "" else "s" });
@@ -101,7 +105,7 @@ pub const Entry = struct {
     }
 
     fn collapsible(e: *const Entry) bool {
-        return e.kind == .run or e.kind == .reasoning;
+        return e.kind == .run or e.kind == .reasoning or (e.kind == .user and long_text.isLong(e.text.items));
     }
 
     pub fn print(e: *const Entry, win: vaxis.Window, commit: bool) u16 {
@@ -109,7 +113,19 @@ pub const Entry = struct {
         var segs: [max_segments]vaxis.Segment = undefined;
         const folded = e.collapsible() and !e.open;
         const wrap: @FieldType(vaxis.Window.PrintOptions, "wrap") = if (folded) .none else if (e.kind == .run) .grapheme else .word;
-        const r = win.print(segments(e, &segs), .{ .wrap = wrap, .commit = commit });
+        const shown = segments(e, &segs);
+        if (folded and e.kind == .user) {
+            const suffix_width = vaxis.gwidth.gwidth(e.label.items, win.screen.width_method);
+            const available = win.width -| (suffix_width +| 2);
+            var end: usize = 0;
+            while (end < segs[1].text.len) {
+                const n = end + (std.unicode.utf8ByteSequenceLength(segs[1].text[end]) catch 1);
+                if (vaxis.gwidth.gwidth(segs[1].text[0..n], win.screen.width_method) > available) break;
+                end = n;
+            }
+            segs[1].text = segs[1].text[0..end];
+        }
+        const r = win.print(shown, .{ .wrap = wrap, .commit = commit });
         return if (folded) 1 else @max(1, r.row +| @intFromBool(r.col > 0));
     }
 
@@ -130,7 +146,12 @@ pub const Entry = struct {
         switch (e.kind) {
             .user => {
                 segs[0] = .{ .text = "› ", .style = .{ .bold = true, .fg = .{ .index = 4 } } };
-                segs[1] = .{ .text = e.text.items, .style = .{ .bold = true } };
+                const folded = e.collapsible() and !e.open;
+                segs[1] = .{ .text = if (folded) e.text.items[0 .. std.mem.indexOfScalar(u8, e.text.items, '\n') orelse e.text.items.len] else e.text.items, .style = .{ .bold = true } };
+                if (folded) {
+                    segs[2] = .{ .text = e.label.items, .style = dim };
+                    return segs[0..3];
+                }
                 return segs[0..2];
             },
             .assistant => segs[0] = .{ .text = e.text.items },
@@ -201,8 +222,10 @@ pub const Transcript = struct {
     }
 
     pub fn add(t: *Transcript, gpa: std.mem.Allocator, kind: Kind, text: []const u8) !void {
-        var e: Entry = .{ .kind = kind };
+        var e: Entry = .{ .kind = kind, .open = t.expanded };
+        errdefer e.deinit(gpa);
         try e.text.appendSlice(gpa, text);
+        try e.refreshLabel(gpa);
         try t.entries.append(gpa, e);
     }
 
@@ -594,4 +617,40 @@ test "child prompt preview uses forty Unicode characters and one logical line" {
     e.cached = .{ .width = 80, .len = e.text.items.len, .open = false, .rows = 10 };
     try t.progress(gpa, .{ .agent = 1, .prompt = prompt, .state = .working });
     try testing.expect(e.cached == null);
+}
+
+test "long user messages fold live and replayed, truncate the first line, and expand" {
+    const gpa = testing.allocator;
+    var screen = try vaxis.Screen.init(gpa, .{ .cols = 30, .rows = 12, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(gpa);
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 30, .height = 12, .screen = &screen };
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    const raw = "a very long first line that must be clipped\n2\n3\n4\n5\n6";
+    try t.add(gpa, .user, raw);
+    var e = &t.entries.items[0];
+    try testing.expectEqual(@as(u16, 1), e.height(win));
+    _ = e.print(win, true);
+    try testing.expectEqualStrings("s", screen.readCell(29, 0).?.char.grapheme);
+    try testing.expect(screen.readCell(29, 0).?.style.dim);
+    t.toggleExpanded();
+    try testing.expect(e.height(win) > 5);
+    t.clear(gpa);
+    t.expanded = false;
+    try t.addHistory(gpa, &.{.{ .role = "user", .content = raw }});
+    e = &t.entries.items[0];
+    try testing.expectEqual(@as(u16, 1), e.height(win));
+    t.toggleExpanded();
+    try testing.expect(e.height(win) > 5);
+    try t.add(gpa, .user, raw);
+    try testing.expect(t.entries.items[1].open);
+    t.toggleExpanded();
+    try testing.expectEqual(@as(u16, 1), t.entries.items[1].height(win));
+    const long = try gpa.alloc(u8, 801);
+    defer gpa.free(long);
+    @memset(long, 'x');
+    try t.add(gpa, .user, long);
+    try testing.expectEqual(@as(u16, 1), t.entries.items[2].height(win));
+    try t.add(gpa, .user, long[0..800]);
+    try testing.expect(t.entries.items[3].height(win) > 1);
 }

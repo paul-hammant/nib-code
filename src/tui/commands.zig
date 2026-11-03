@@ -26,7 +26,7 @@ pub const specs = std.enums.EnumArray(Command, Spec).init(.{
     .js = .{ .args = "<code>", .help = "run JavaScript in the sandbox", .needs_arg = true },
 });
 
-pub const keys = "enter send · shift+enter newline · esc cancel · ctrl+o expand runs · PgUp/PgDn, shift+↑↓ or wheel scroll · ↑ input history · ctrl+c quit";
+pub const keys = "enter send · shift+enter newline · esc cancel · ctrl+o expand folded entries · PgUp/PgDn, shift+↑↓ or wheel scroll · ↑ input history · ctrl+c quit";
 
 const slash_names = blk: {
     var names: [std.enums.values(Command).len][]const u8 = undefined;
@@ -36,7 +36,7 @@ const slash_names = blk: {
 };
 
 pub fn slashName(c: Command) []const u8 {
-    return slash_names[@intFromEnum(c)];
+    return slash_names[@backingInt(c)];
 }
 
 pub const Parsed = union(enum) {
