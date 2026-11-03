@@ -298,6 +298,8 @@ class StatsTest(unittest.TestCase):
             json_report = json.loads(subprocess.check_output(cli + ['--json']))
             self.assertEqual(json_report['timing'], timing)
             text = subprocess.check_output(cli).decode()
+            self.assertLessEqual(len(text.split('口径：\n', 1)[1].splitlines()) + 1, 5)
+            self.assertLessEqual(len(json_report['notes']), 4)
             for snippet in ('计时 Timing', 'step_ms: samples=3 median=100.00 p90=300.00',
                             'model_ms: samples=2', 'run_result_ms: samples=2',
                             'code_first_ms: samples=2', 'code_span_ms: samples=2',

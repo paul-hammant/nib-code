@@ -7,6 +7,7 @@
   AGENTS.md       全局指令
   config.toml     非秘密运行配置，可不创建
   sessions/       <32位小写十六进制ID>.jsonl 会话日志
+  reflections.md  /reflect 正常结束后的回答与 issue 发布结果
 ```
 
 不读取 XDG 配置或数据目录，也不搜索或自动迁移旧文件。需要保留旧指令、会话时，由用户自行放入新目录。`NIB_HOME` 不改变 Codex 凭证位置：仍读取 `$CODEX_HOME/auth.json`，默认 `~/.codex/auth.json`。
@@ -31,7 +32,9 @@ base_url = "https://api.deepseek.com"
 context_window = 1000000
 ```
 
-只使用当前 provider 的段落；切换 provider 不需要改写另一段。默认 provider 为 `codex`，其他默认值见上例；Codex 窗口随模型变化，未知模型需要显式提供 `context_window` 或 `NIB_CONTEXT_WINDOW`。
+只使用当前 provider 的段落；切换 provider 不需要改写另一段。环境和配置文件均未指定时，默认 provider 为 `codex`，默认模型 `gpt-6.1-sol`、窗口 500000 tokens；使用本机 Codex 登录，无需 API key。Codex 窗口随模型变化，未知模型需要显式提供 `context_window` 或 `NIB_CONTEXT_WINDOW`。模型、恢复和凭证边界见 [codex.md](codex.md) 与 [ADR 0011](adr/0011-provider-wire-protocols.md)。
+
+DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 `DEEPSEEK_API_KEY`（或 `NIB_API_KEY`），默认模型 `deepseek-flash`、窗口 1000000 tokens；其他默认值见上例。
 
 这是无额外依赖的 TOML 子集：支持空行、`#` 注释、单行双引号字符串（支持 `\"`、`\\`、`\n` 转义）、十进制整数（可带符号、下划线分组）和 true/false 布尔值；当前配置键只使用字符串和正整数，布尔值会报告类型错误。仅接受顶层 `provider`、`effort` 和 `[codex]` / `[chat_completions]` 下的 `model`、`base_url`、`context_window`。不支持数组、嵌套表、多行字符串等完整 TOML 语法；未知键、重复键/段落和格式错误会报配置文件路径与行号，不静默忽略。
 
@@ -49,6 +52,21 @@ context_window = 1000000
 环境中设置 thinking 或 effort 时，不采用文件 effort。`NIB_THINKING=off` 优先于环境 effort；显式 CLI effort 又覆盖两者。未指定任何推理配置时使用服务端默认。CLI `--effort default` 清除本进程的 thinking/effort 覆盖，不修改文件。
 
 子会话通过匿名 stdin 管道继承父会话的有效 provider/模型配置，跳过配置文件读取，不会因文件在中途变化而采用另一套配置；Codex 凭证仍由各进程独立读取。
+
+## 环境变量
+
+| 变量 | 含义 |
+|---|---|
+| `NIB_HOME` | 用户目录，默认 `~/.nib`；不改变 Codex 凭证位置 |
+| `NIB_PROVIDER` | `codex` / `chat_completions` |
+| `NIB_BASE_URL` | 当前 provider 的服务地址 |
+| `NIB_MODEL` | 当前 provider 的模型 |
+| `NIB_CONTEXT_WINDOW` | 上下文窗口 tokens，DeepSeek 默认 1000000 |
+| `NIB_THINKING` | `on` / `off`，不设时用服务端默认（若无其他推理配置） |
+| `NIB_REASONING_EFFORT` | 推理档位，如 `low` / `high` / `max` |
+| `CODEX_HOME` | Codex 登录目录，凭证为其中的 `auth.json`，默认 `~/.codex/auth.json` |
+| `NIB_API_KEY` / `DEEPSEEK_API_KEY` | Chat Completions 的凭证，仅从环境读取 |
+| `NIB_ISSUE_REPO` | `/reflect` 自动发布的目标仓库或 `off`，见 [reflect.md](reflect.md) |
 
 ## effort 持久化
 

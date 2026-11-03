@@ -84,7 +84,7 @@ test "grep and glob never surface credential files" {
     try testing.expectEqualStrings("CredentialAccessDenied", direct.err);
 }
 
-test "grep serializes match and snippet byte columns" {
+test "grep serializes match byte column and clipped text" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var data: [6014]u8 = @splat('a');
@@ -102,7 +102,8 @@ test "grep serializes match and snippet byte columns" {
     try testing.expectEqual(@as(usize, 1), parsed.value.matches.len);
     const m = parsed.value.matches[0];
     try testing.expectEqual(@as(usize, 6004), m.column);
-    try testing.expectEqual(@as(usize, 5518), m.text_column);
+    try testing.expectEqual(@as(usize, 1), m.line);
+    try testing.expect(std.mem.indexOf(u8, result.ok, "text_column") == null);
     try testing.expectEqual(@as(usize, 500), m.text.len);
     try testing.expect(std.unicode.utf8ValidateSlice(m.text));
     try testing.expect(std.mem.endsWith(u8, m.text, "中SyntaxError"));

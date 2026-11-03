@@ -8,7 +8,7 @@ date: 2026-11-01
 `tools` 新增三个方法：`grep`（按正则搜文件内容）、`glob`（按模式列文件）、`fetch`（GET 一个 http(s) 地址，HTML 转成 Markdown）。三者都返回结构化数据，脚本可以在 JS 里接着过滤、分组，再交给 `read`。
 
 **为什么加：**
-- **grep / glob**：bash 也能搜，但只能返回一段字符串，模型得自己解析；返回结构化匹配（`path`、`line`、`column`、`text`、`text_column`）才能在 Run 里直接组合，这是 PTC 特有的价值。另外，用户机器上没有 ripgrep，`rg` 只是 Claude Code 自带的 shell 函数，nib 的 bash 里跑不了。已有会话日志里模型就调用过一次 `rg`。
+- **grep / glob**：bash 也能搜，但只能返回一段字符串，模型得自己解析；返回结构化匹配（`path`、`line`、`column`、`text`）才能在 Run 里直接组合，这是 PTC 特有的价值。另外，用户机器上没有 ripgrep，`rg` 只是 Claude Code 自带的 shell 函数，nib 的 bash 里跑不了。已有会话日志里模型就调用过一次 `rg`。
 - **fetch**：查文档是真实开发的刚需，比如 Zig 0.17 改了很多 API，模型凭记忆容易写错。用 curl 拿到的是原始 HTML，太费 token。
 
 **怎么做（参考了 pi 的 grep.ts/find.ts、oh-my-pi 的 fetch.ts/grep.ts/glob.ts、jcode 的 webfetch.rs，没有复用代码）：**
@@ -21,7 +21,7 @@ date: 2026-11-01
   - 纯 ASCII 文件按字节匹配；含非 ASCII 的合法 UTF-8 文件先转成 UTF-16 再匹配，中文模式能命中。
   - 字面量搜索（`literal` 且不忽略大小写）走 `indexOf` 快路径。
   - 每行只报告首个命中；`line` 从 1 开始，`column` 是从 1 开始的 UTF-8 字节列（UTF-16 正则位置也转换成字节列）。
-  - `text` 围绕命中起点截取，`text_column` 是片段首个原文字节在行内从 1 开始的字节列，不计前置 `…`。省略侧用 `…` 标记；`text` 和上下文行都不超过 500 字节（含标记），不切断 UTF-8 字符。上下文仍取行首，短行原样保留。
+  - `text` 围绕命中起点截取，不提供片段起始列；`column` 始终是命中在原始行中的字节列，不是片段内的偏移。省略侧用 `…` 标记；`text` 和上下文行都不超过 500 字节（含标记），不切断 UTF-8 字符。上下文仍取行首，短行原样保留。
   - Esc 取消标志通过 QuickJS 的中断回调传进 libregexp，所以正则灾难性回溯也能被 Esc 打断。
 - **跳过规则**：
   - 跳过 `.git` 目录、.gitignore 匹配的文件、符号链接（不跟随）、二进制文件（前 8 KB 内出现 NUL）和超过 16 MB 的文件。

@@ -120,17 +120,16 @@ class LlmTests:
         log = Path(self.env["NIB_HOME"]) / "sessions" / (session_id + ".jsonl")
         system = records(log)[0]["messages"][0]["content"]
         self.assertNotIn("{{llm_options}}", system)
-        self.assertIn("same-provider models:", system)
-        self.assertIn("current model: \"mock-parent-model\"", system)
-        self.assertIn("No provider switching", system)
-        self.assertIn("cheap model and low effort", system)
-        self.assertIn("Read a few files yourself (cheapest)", system)
+        self.assertIn("model: [", system)
+        self.assertIn("current: \"mock-parent-model\"", system)
+        self.assertNotIn("off may map", system)
+        self.assertIn("bulk: cheap/low", system)
+        self.assertNotIn("Read a few files yourself (cheapest)", system)
         self.assertIn("async llm({", system)
         self.assertEqual("async agent({" in system, not child)
         self.assertEqual("gpt-6.1-terra" in system, self.provider == "codex")
         self.assertEqual("deepseek-flash" in system, self.provider == "chat_completions")
-        for effort in ("default", "off", "low", "high", "max"):
-            self.assertIn(json.dumps(effort), system)
+        self.assertIn("effort low/medium/high (else inherit)", system)
 
     def result(self, events):
         runs = [event["run_end"] for event in events if "run_end" in event]

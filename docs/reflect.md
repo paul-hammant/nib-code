@@ -1,0 +1,3 @@
+# 会话反思与自动发布 issue
+
+反思：TUI `/reflect [focus]` 让模型对照本会话日志（含子会话）只读地复盘 harness 的摩擦、建议和任务描述问题；正常结束的回答追加到 `$NIB_HOME/reflections.md`（每条带 UTC 时间、会话、cwd、模型、effort 表头），供批量分析后迭代。回答最后的 ```json 草稿（最多 3 个）随后**自动**发布为 GitHub issue，无需确认：目标仓库 `NIB_ISSUE_REPO`（默认 `yyydddkkk/nib-code`，设为 `off` 关闭），用用户自己的 `gh` 登录和环境；模型写草稿前先用 `gh issue list` 查看目标仓库的 open issue，同根因的不再起草（`off` 时仍对照默认仓库）；发布前再按标题查重（已有则跳过），把当前项目路径替换成 `<project>`、HOME 替换成 `~`，像凭证的草稿（`sk-`、`ghp_`、`Bearer ` 等）不发布；每条结果显示在对话区并追加到 reflections.md。脱敏只是兜底，主要靠提示词要求草稿不含项目内容。提示词模板是 `src/tui/reflect.md`（编译时嵌入，改措辞改这个文件），占位符 `{{session_id}}`、`{{log_path}}`、`{{issue_repo}}`、`{{focus}}`。

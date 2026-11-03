@@ -17,7 +17,6 @@ pub const Match = struct {
     line: usize,
     column: usize,
     text: []const u8,
-    text_column: usize,
     before: ?[]const []const u8 = null,
     after: ?[]const []const u8 = null,
 };
@@ -178,7 +177,7 @@ const Shared = struct {
         for (lines.items, out) |hit, *m| {
             const n = hit.line;
             const snippet = try clip(a, lineText(data, starts.items, n), hit.offset);
-            m.* = .{ .path = file.path, .line = n, .column = hit.offset + 1, .text = snippet.text, .text_column = snippet.start + 1 };
+            m.* = .{ .path = file.path, .line = n, .column = hit.offset + 1, .text = snippet.text };
             if (s.context == 0) continue;
             const first = if (n > s.context) n - s.context else 1;
             const last = @min(n + s.context, count);
@@ -413,10 +412,10 @@ test "grep centers long JSONL snippets on the first match in byte columns" {
             const m = s.result.matches[0];
             try testing.expectEqual(@as(usize, 2), m.line);
             try testing.expectEqual(prefix.len + 1, m.column);
-            try testing.expect(m.text_column > 1);
-            try testing.expect(m.text_column <= m.column);
             try testing.expect(std.mem.indexOf(u8, m.text, "SyntaxError") != null);
-            try expectSnippet(line, .{ .text = m.text, .start = m.text_column - 1 });
+            try testing.expect(m.text.len <= max_line);
+            try testing.expect(std.unicode.utf8ValidateSlice(m.text));
+            try testing.expect(std.mem.startsWith(u8, m.text, "…"));
             try testing.expectEqualStrings("前文", m.before.?[0]);
             try testing.expectEqualStrings("后文", m.after.?[0]);
             try testing.expect(!s.result.truncated);
@@ -437,7 +436,6 @@ test "grep reports byte columns for short, empty, zero-width and surrogate match
         try testing.expectEqual(@as(usize, 2), s.result.matches.len);
         try testing.expectEqual(@as(usize, 2), s.result.matches[0].line);
         try testing.expectEqual(@as(usize, 11), s.result.matches[0].column);
-        try testing.expectEqual(@as(usize, 1), s.result.matches[0].text_column);
         try testing.expectEqualStrings("😀中文SyntaxError SyntaxError", s.result.matches[0].text);
         try testing.expectEqual(@as(usize, 4), s.result.matches[1].line);
         try testing.expectEqual(@as(usize, 1), s.result.matches[1].column);
@@ -503,7 +501,9 @@ test "grep keeps final multibyte matches when the tail window needs UTF-8 alignm
             const m = s.result.matches[0];
             try testing.expectEqual(prefix.len + 1, m.column);
             try testing.expect(std.mem.endsWith(u8, m.text, "末"));
-            try expectSnippet(line, .{ .text = m.text, .start = m.text_column - 1 });
+            try testing.expect(m.text.len <= max_line);
+            try testing.expect(std.unicode.utf8ValidateSlice(m.text));
+            try testing.expect(std.mem.startsWith(u8, m.text, "…"));
         }
     }
 }

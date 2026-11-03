@@ -400,20 +400,10 @@ def summarize(paths, since=None, cwd=None):
     return {'overall': totals, 'usage': usage, 'time_filter': time_filter, 'tools': dict(sorted(tool_counts.items())),
             'bash_top10': [{'command': k, 'count': v} for k, v in sorted(bash_counts.items(), key=lambda p: (-p[1], p[0]))[:10]],
             'errors': errors, 'slowest_steps': slowest, 'timing': timing.report(),
-            'notes': ['失败率仅统计显式 run_results；旧日志的状态为未知。',
-                      'Step/Run、用量和错误只统计入选记录；token 为有效 usage 的 prompt + completion，不重复加缓存命中，缓存命中率以 prompt 为分母，缺失 usage 不补零。',
-                      '错误按 Run 的诊断特征计数，类别可重叠；另计打断记录和未提交的 provider 失败诊断；忽略源码/read 正文，被捕获的工具错误不一定导致 Run 失败。',
-                      '工具和 bash 命令数是静态估计，不是运行时调用次数；动态 JS/shell 可能漏计。',
-                      'Turn 数包含区间内有非诊断记录的 Turn，平均步数只计入选 Step；耗时只平均已结束、全部 Step 入选且都有 ms 的 Turn，不含压缩、未完成请求和用户停顿。',
-                      '--since 按记录 at（Unix 毫秒）筛选，含指定日期的本地午夜；缺失或无效 at 回退到文件修改时间。会话数包含 header 或非替换记录入选的会话。',
-                      '时间来源计数只含入选的非 header、非修复、非压缩替换记录（含诊断和打断）；步骤回退数只含完整 Step。',
-                      f"时间来源：{time_filter['selected_records_with_at']} 条按 at，{time_filter['selected_records_using_mtime']} 条回退文件时间（其中 {time_filter['selected_steps_using_mtime']} 个完整 Step）。",
-                      '计时各项 samples 只含有效的显式字段；缺失不补零。median 为中位数，p90 使用 nearest-rank。',
-                      'first_data_ms 是首次收到任何流数据（可能是 SSE 心跳），不是首个内容 token。',
-                      'model_ms 含 provider 重试/退避；run_ms 是每 Step 的 Run 总耗时，run_result_ms 是单 Run 耗时。',
-                      'code_first_ms 是 Step 开始至首段代码的等待；code_span_ms 是 last_ms-first_ms；streaming 比例为 span > 50 ms 的样本比例。',
-                      '工具计时来自运行时 calls（含失败）；总耗时可能因并行重叠，calls_omitted 是日志上限丢弃数。',
-                      'bash 计时 Top 10 按总耗时排序，只用保存的 JS 字面量首两个 shell 单词启发式分组；多调用/动态调用不强行关联，列为 unmatched；不是 shell 子命令耗时。']}
+            'notes': ["仅统计入选记录；失败率只用显式 run_results；token=prompt+completion（不重复加缓存），缓存率以 prompt 为分母；错误可重叠，工具/命令数为静态估计。",
+                      "Turn 平均步数只计入选 Step；平均耗时只含已结束、全部 Step 入选且有 ms 的 Turn；--since 按记录 at（本地日期），缺失或无效 at 回退到文件修改时间。",
+                      f"时间来源：{time_filter['selected_records_with_at']} 条按 at，{time_filter['selected_records_using_mtime']} 条回退文件时间（其中 {time_filter['selected_steps_using_mtime']} 个完整 Step）；计时仅有效字段、缺失不补零；p90=nearest-rank；first_data_ms 是首次收到任何流数据，非内容 token；model_ms 含重试/退避。",
+                      "run_ms 为 Step 内 Run 总耗时，run_result_ms 为单 Run；code_first_ms 为首段代码等待，code_span_ms=last-first，streaming 为 >50 ms 比例；calls 含失败、并行耗时可重叠；bash 计时按字面量首两词启发式分组，无法关联列 unmatched，非 shell 子命令耗时。"]}
 
 
 def text_report(report):
