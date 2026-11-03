@@ -65,6 +65,12 @@ Run 内工具并发、`nib ask --json` 和 `tools.agent` 均已实现，见 ADR 
 
 这些是观察值，不是目标或禁令。数字会变，以最新实测为准，每次更新请写日期。
 
+会话质量用 `python3 scripts/stats.py` 只读统计真实日志；可传一个或多个文件/目录，用 `--cwd` 精确匹配工作目录、`--since YYYY-MM-DD` 筛选会话文件的本地修改日期。日志没有逐 Step 的日期，恢复过的旧会话也会随文件进入筛选范围。修改提示词或工具前后，分别对日志快照运行 `python3 scripts/stats.py 快照目录 --json > before.json` / `after.json`，在相同 cwd、模型和任务类型下比较 Run 失败率、错误分类、平均步数/耗时、token 和缓存命中率，同时检查样本量及字段覆盖率。
+
+完整 Step 记录可选的 `usage`（仅本次模型请求的 prompt/completion/cache-hit token，不重复计入子会话）、`ms`（单调时钟，从请求开始含重试直到全部 Run 结束，不含压缩和日志落盘）及 `run_results: [{tool_call_id, ok}]`。旧记录照常 replay，缺失字段不补零；失败率仅以有显式状态的 Run 为分母，旧日志的未知状态单列。Turn 耗时只平均已结束且每步都有计时的 Turn；压缩替换记录不计为新 Turn/Step，历史工作量不会因压缩而消失。
+
+工具与 bash 命令统计是 JS/静态 shell 调用点估计，不代表循环、动态代码的实际执行次数。错误按每个 Run 的诊断特征计数（类别可能重叠），并另计 interrupted 标记；源码/read 正文不作故障匹配。被 JS 捕获的工具错误或 bash 的 exit_code 127 也会进入分类，但不一定导致 Run 失败。脚本的合成日志测试：`python3 tests/test_stats.py`；真实 Step 元数据和 mock 会话计数由 `tests/test_session.py` 覆盖。
+
 | 项目 | 实测值 | 警报线 | 测量方式 |
 |---|---|---|---|
 | 源码行数（`src/` + `build.zig`，含测试） | 3766（2026-11-01，实现工具并发、NDJSON 与子 agent 后） | — | `wc -l build.zig src/**/*.zig`（zsh） |

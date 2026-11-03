@@ -250,6 +250,7 @@ pub const Session = struct {
             defer request.deinit(s.gpa);
             try request.appendSlice(s.gpa, s.history.items);
             try request.appendSlice(s.gpa, pending.items);
+            const started = std.Io.Clock.awake.now(s.io);
             const reply = try s.complete(request.items, sink, cancel, detail, partial);
             partial.clear();
             s.usage.add(reply.usage);
@@ -262,15 +263,27 @@ pub const Session = struct {
                 .reasoning = reply.reasoning,
                 .phase = reply.phase,
             });
+            var run_results: std.ArrayList(session_log.RunResult) = .empty;
+            defer run_results.deinit(s.gpa);
             var output_tokens: u64 = 0;
             for (reply.tool_calls) |call| {
                 const result = try s.execute(call, sink, cancel);
                 try sink.emit(sink.ctx, .{ .usage = s.usage });
-                try pending.append(s.gpa, .{ .role = "tool", .content = result, .tool_call_id = call.id });
-                output_tokens += result.len / 3 + 1;
+                try pending.append(s.gpa, .{ .role = "tool", .content = result.output, .tool_call_id = call.id });
+                try run_results.append(s.gpa, .{ .tool_call_id = call.id, .ok = result.ok });
+                output_tokens += result.output.len / 3 + 1;
             }
             const tokens = reply.usage.prompt_tokens + reply.usage.completion_tokens + output_tokens;
-            try s.commit(s.history.items.len, pending.items, tokens, null);
+            const ms: u64 = @intCast(@max(started.durationTo(std.Io.Clock.awake.now(s.io)).toMilliseconds(), 0));
+            try s.log.commit(s.io, s.gpa, &s.history, &s.context_tokens, .{
+                .from = s.history.items.len,
+                .messages = pending.items,
+                .context_tokens = tokens,
+                .model = s.cfg.model,
+                .usage = reply.usage,
+                .ms = ms,
+                .run_results = run_results.items,
+            });
             pending.clearRetainingCapacity();
             if (reply.tool_calls.len == 0) return;
             if (cancel.load(.acquire)) return error.Canceled;
@@ -324,15 +337,17 @@ pub const Session = struct {
         return .{ .outcome = outcome, .changes = try s.tools.takeChanges(s.gpa, s.arena.allocator()) };
     }
 
-    /// Result is arena-owned.
-    fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const std.atomic.Value(bool)) ![]const u8 {
+    const Executed = struct { output: []const u8, ok: bool };
+
+    /// Output is arena-owned.
+    fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const std.atomic.Value(bool)) !Executed {
         const a = s.arena.allocator();
         if (!std.mem.eql(u8, call.function.name, "run"))
-            return std.fmt.allocPrint(a, "error: unknown tool `{s}`; the only tool is `run`", .{call.function.name});
+            return .{ .ok = false, .output = try std.fmt.allocPrint(a, "error: unknown tool `{s}`; the only tool is `run`", .{call.function.name}) };
 
         const Args = struct { code: []const u8 };
         const args = std.json.parseFromSlice(Args, s.gpa, call.function.arguments, .{ .ignore_unknown_fields = true }) catch
-            return a.dupe(u8, "error: arguments must be a JSON object { \"code\": string }");
+            return .{ .ok = false, .output = try a.dupe(u8, "error: arguments must be a JSON object { \"code\": string }") };
         defer args.deinit();
 
         try sink.emit(sink.ctx, .{ .run_start = args.value.code });
@@ -344,7 +359,7 @@ pub const Session = struct {
         defer s.gpa.free(formatted);
         const output = try tools.truncateMiddle(a, formatted);
         try sink.emit(sink.ctx, .{ .run_end = .{ .ok = o.ok, .output = output, .changes = ran.changes } });
-        return output;
+        return .{ .output = output, .ok = o.ok };
     }
 };
 

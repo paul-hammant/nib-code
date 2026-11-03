@@ -1,7 +1,15 @@
 const std = @import("std");
 const provider = @import("../provider.zig");
 
+pub const RunResult = struct {
+    tool_call_id: []const u8,
+    ok: bool,
+};
+
 pub const Record = struct {
+    usage: ?provider.Usage = null,
+    ms: ?u64 = null,
+    run_results: ?[]const RunResult = null,
     cwd: ?[]const u8 = null,
     provider: ?provider.Id = null,
     model: ?[]const u8 = null,
@@ -246,7 +254,7 @@ test "commit and replay preserve safe history, compaction and torn tail" {
     var history: std.ArrayList(provider.Message) = .empty;
     const records = [_]Record{
         .{ .cwd = "/work", .messages = &.{.{ .role = "system", .content = "base" }} },
-        .{ .from = 1, .messages = &.{ .{ .role = "user", .content = "hi" }, .{ .role = "assistant", .tool_calls = &.{.{ .id = "c", .function = .{ .name = "run", .arguments = "{}" } }} }, .{ .role = "tool", .content = "ok", .tool_call_id = "c" } }, .context_tokens = 100 },
+        .{ .from = 1, .messages = &.{ .{ .role = "user", .content = "hi" }, .{ .role = "assistant", .tool_calls = &.{.{ .id = "c", .function = .{ .name = "run", .arguments = "{}" } }} }, .{ .role = "tool", .content = "ok", .tool_call_id = "c" } }, .context_tokens = 100, .usage = .{ .prompt_tokens = 90, .completion_tokens = 10, .prompt_cache_hit_tokens = 20 }, .ms = 42, .run_results = &.{.{ .tool_call_id = "c", .ok = false }} },
         .{ .from = 1, .messages = &.{.{ .role = "user", .content = "summary" }}, .context_tokens = 10 },
     };
     var committed_tokens: u64 = 0;

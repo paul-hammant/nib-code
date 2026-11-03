@@ -96,6 +96,36 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
             assert (result.returncode == 0) == ok, result.stderr.decode()
             return result
 
+        stats_home = tmp / "stats-home"
+        for prompt in ("stats good", "stats bad", "stats_missing", "delegate_probe"):
+            ask(prompt, overrides={"NIB_HOME": str(stats_home)})
+        stats_paths = list((stats_home / "sessions").glob("*.jsonl"))
+        assert len(stats_paths) == 5
+        step_records = [r for p in stats_paths for r in replay(p)[1] if r["from"] > 0]
+        assert len(step_records) == 9
+        assert all(r["usage"]["prompt_tokens"] == 3300 and isinstance(r["ms"], int)
+                   and r["ms"] > 0 for r in step_records)
+        assert sum(not result["ok"] for r in step_records for result in r["run_results"]) == 1
+        report = json.loads(subprocess.check_output(
+            ["python3", str(ROOT / "scripts/stats.py"), "--json"],
+            env=dict(env, NIB_HOME=str(stats_home))))
+        counts = report["overall"]
+        for key, value in dict(sessions=5, root_sessions=4, child_sessions=1, turns=5, steps=9,
+                               runs=4, runs_failed=1, runs_with_status=4, runs_unknown=0,
+                               steps_with_usage=9, steps_with_ms=9, timed_turns=5).items():
+            assert counts[key] == value, (key, counts)
+        assert counts["run_failure_rate"] == .25
+        assert counts["avg_steps_per_turn"] == 1.8 and counts["avg_turn_ms"] > 0
+        assert report["usage"] == dict(prompt_tokens=29700, completion_tokens=130,
+                                        prompt_cache_hit_tokens=768, total_tokens=29830,
+                                        cache_hit_rate=768/29700), report
+        assert report["tools"] == dict(agent=1, bash=2)
+        assert report["errors"]["js_syntax"]["count"] == 1
+        assert report["errors"]["command_not_found"]["count"] == 1
+        assert sum(e["count"] for e in report["errors"].values()) == 2
+        assert len(report["slowest_steps"]) == 5
+        print("Stats E2E passed: Step usage/timing, failed Run status, root/child counts, tokens and diagnostics")
+
         legacy_agents = tmp / "config/nib/AGENTS.md"
         legacy_agents.parent.mkdir(parents=True)
         legacy_agents.write_text("IGNORED_XDG_MARKER")

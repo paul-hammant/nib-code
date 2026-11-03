@@ -94,6 +94,8 @@ class H(http.server.BaseHTTPRequestHandler):
                 code = 'await Promise.all(Array.from({length: 6}, (_, i) => tools.agent({prompt: "child " + i})))'
             elif lastuser == 'delegate_probe':
                 code = 'await tools.agent({prompt: "child probe"})'
+            elif lastuser == 'stats_missing':
+                code = 'await tools.bash({command: "nib_stats_nonexistent_command_42"})'
             elif lastuser == 'edit_test':
                 code = ('await tools.write({path: "notes.txt", content: "a\\nb\\n"});\n'
                         'await tools.edit({path: "notes.txt", old_text: "b", new_text: "B"});\n'
