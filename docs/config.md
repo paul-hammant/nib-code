@@ -30,13 +30,34 @@ context_window = 500000
 model = "deepseek-flash"
 base_url = "https://api.deepseek.com"
 context_window = 1000000
+
+[limits]
+llm_concurrency = 4
+llm_calls_per_run = 100
+llm_input_kib = 256
+agent_concurrency = 4
+max_steps = 50
 ```
 
 只使用当前 provider 的段落；切换 provider 不需要改写另一段。环境和配置文件均未指定时，默认 provider 为 `codex`，默认模型 `gpt-6.1-sol`、窗口 500000 tokens；使用本机 Codex 登录，无需 API key。Codex 窗口随模型变化，未知模型需要显式提供 `context_window` 或 `NIB_CONTEXT_WINDOW`。模型、恢复和凭证边界见 [codex.md](codex.md) 与 [ADR 0011](adr/0011-provider-wire-protocols.md)。
 
 DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 `DEEPSEEK_API_KEY`（或 `NIB_API_KEY`），默认模型 `deepseek-flash`、窗口 1000000 tokens；其他默认值见上例。
 
-这是无额外依赖的 TOML 子集：支持空行、`#` 注释、单行双引号字符串（支持 `\"`、`\\`、`\n` 转义）、十进制整数（可带符号、下划线分组）和 true/false 布尔值；当前配置键只使用字符串和正整数，布尔值会报告类型错误。仅接受顶层 `provider`、`effort` 和 `[codex]` / `[chat_completions]` 下的 `model`、`base_url`、`context_window`。不支持数组、嵌套表、多行字符串等完整 TOML 语法；未知键、重复键/段落和格式错误会报配置文件路径与行号，不静默忽略。
+这是无额外依赖的 TOML 子集：支持空行、`#` 注释、单行双引号字符串（支持 `\"`、`\\`、`\n` 转义）、十进制整数（可带符号、下划线分组）和 true/false 布尔值；当前配置键只使用字符串和正整数，布尔值会报告类型错误。仅接受顶层 `provider`、`effort`，`[codex]` / `[chat_completions]` 下的 `model`、`base_url`、`context_window`，以及下述 `[limits]` 键。不支持数组、嵌套表、多行字符串等完整 TOML 语法；未知键、重复键/段落和格式错误会报配置文件路径与行号，不静默忽略。
+
+## [limits]
+
+`[limits]` 适用于当前有效配置，与 provider 无关；各项可独立省略，默认值见示例。所有值必须为范围内的正整数：
+
+| 键 | 含义 | 默认值 | 范围 |
+| --- | --- | --- | --- |
+| `llm_concurrency` | `tools.llm` 每进程同时进行的请求数，超出排队 | 4 | 1–64 |
+| `llm_calls_per_run` | 每个 Run 的 `tools.llm` 调用上限，超出 reject | 100 | 1–10000 |
+| `llm_input_kib` | 单次 prompt + 序列化 input 的 UTF-8 字节上限（KiB），超出 reject，不截断 | 256 | 1–65536 |
+| `agent_concurrency` | 每进程同时运行的子 agent 数，超出排队 | 4 | 1–64 |
+| `max_steps` | 每个 Turn 的 Step 上限，耗尽时返回 `TooManySteps` | 50 | 1–1000 |
+
+这些限额没有环境变量或 CLI 覆盖；随有效配置经 stdin 传给子会话，子会话不读取配置文件。sandbox 内全部工具最多 8 并发是线程调度实现，不由此小节控制。
 
 配置文件不存秘密，也不接受 API key、token、密码或凭证字段。Chat Completions 的 key 使用 `NIB_API_KEY` / `DEEPSEEK_API_KEY`；Codex 使用现有登录文件。不要把秘密放进 URL。
 
@@ -51,7 +72,7 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 
 环境中设置 thinking 或 effort 时，不采用文件 effort。`NIB_THINKING=off` 优先于环境 effort；显式 CLI effort 又覆盖两者。未指定任何推理配置时使用服务端默认。CLI `--effort default` 清除本进程的 thinking/effort 覆盖，不修改文件。
 
-子会话通过匿名 stdin 管道继承父会话的有效 provider/模型配置，跳过配置文件读取，不会因文件在中途变化而采用另一套配置；Codex 凭证仍由各进程独立读取。
+子会话通过匿名 stdin 管道继承父会话的有效 provider/模型配置及限额，跳过配置文件读取，不会因文件在中途变化而采用另一套配置；Codex 凭证仍由各进程独立读取。
 
 ## 环境变量
 

@@ -24,7 +24,6 @@ pub const Sink = struct {
     }
 };
 
-const max_steps = 50;
 const max_attempts = provider.max_attempts;
 
 const tools_json =
@@ -320,7 +319,7 @@ pub const Session = struct {
 
     fn runSteps(s: *Session, pending: *std.ArrayList(provider.Message), partial: *Partial, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
         var next_effort: ?effort.Pending = null;
-        for (0..max_steps) |step_index| {
+        for (0..s.cfg.limits.max_steps) |step_index| {
             const size = s.context_tokens + estimateTokens(pending.items);
             if (size >= s.cfg.context_window - s.cfg.context_window / 4 and size >= s.compact_backoff)
                 try s.autoCompact(sink, cancel, detail);
@@ -402,7 +401,7 @@ pub const Session = struct {
             if (reply.tool_calls.len == 0) return;
             if (cancel.load(.acquire)) return error.Canceled;
         }
-        detail.* = try std.fmt.allocPrint(s.gpa, "stopped after {d} steps", .{max_steps});
+        detail.* = try std.fmt.allocPrint(s.gpa, "stopped after {d} steps", .{s.cfg.limits.max_steps});
         return error.TooManySteps;
     }
 

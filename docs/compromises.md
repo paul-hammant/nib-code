@@ -25,6 +25,5 @@
 
 | 名称 | 位置 | 当前值 | 删除条件 |
 |---|---|---|---|
-| llm 限额 | `src/tools/llm.zig` | 每进程 4 并发、每 Run 100 次、单次 256 KiB | 可在 config.toml 配置 |
-| agent 并发 | `src/tools/agent.zig` | 每进程 4 个，全部工具 8 并发 | 可配置 |
-| 每 Turn 最多 Step 数 | `src/session.zig` `max_steps` | 50 | 可配置 |
+
+已于 2026-11-03 改为可配置，见 [config.md](config.md#limits)。sandbox 内全部工具最多 8 并发仍属于线程调度实现。

@@ -30,6 +30,14 @@ def content(message):
 
 def run_code(prompt):
     call = 'tools.llm({prompt: "llm_mock:echo", input: "独立 input 🙂\\n第二行"})'
+    if prompt == "llm_limits_child":
+        return ('await tools.write(' + json.dumps({"path": os.path.join(os.environ["NIB_HOME"], "config.toml"),
+                "content": "[limits]\nllm_concurrency = 0\n"}) + '); '
+                'await tools.agent({prompt: "llm_limits"})')
+    if prompt == "llm_limits":
+        return ('await Promise.all(Array.from({length: 4}, (_, i) => '+
+                'tools.llm({prompt: "llm_mock:parallel", input: String(i)})'+
+                '.then(value => ({ok: true}), e => ({ok: false, error: e.message}))))')
     if prompt == "llm_plain":
         return "await " + call
     if prompt == "llm_transient":
