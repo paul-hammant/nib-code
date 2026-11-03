@@ -113,7 +113,24 @@ class LlmTests:
         events = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertIn("start", events[0], events)
         self.assertIn("end", events[-1], events)
+        self.assert_tool_docs(events[0]["start"]["session_id"])
         return events
+
+    def assert_tool_docs(self, session_id, child=False):
+        log = Path(self.env["NIB_HOME"]) / "sessions" / (session_id + ".jsonl")
+        system = records(log)[0]["messages"][0]["content"]
+        self.assertNotIn("{{llm_options}}", system)
+        self.assertIn("same-provider models:", system)
+        self.assertIn("current model: \"mock-parent-model\"", system)
+        self.assertIn("No provider switching", system)
+        self.assertIn("cheap model and low effort", system)
+        self.assertIn("Read a few files yourself (cheapest)", system)
+        self.assertIn("async llm({", system)
+        self.assertEqual("async agent({" in system, not child)
+        self.assertEqual("gpt-6.1-terra" in system, self.provider == "codex")
+        self.assertEqual("deepseek-flash" in system, self.provider == "chat_completions")
+        for effort in ("default", "off", "low", "high", "max"):
+            self.assertIn(json.dumps(effort), system)
 
     def result(self, events):
         runs = [event["run_end"] for event in events if "run_end" in event]
@@ -269,6 +286,11 @@ class LlmTests:
         probe = json.loads(child["text"].split("result: ", 1)[1])
         self.assertEqual(probe["llm"], "function")
         self.assertEqual(probe["agent"], "undefined")
+        root_id = events[0]["start"]["session_id"]
+        children = [path for path in (Path(self.env["NIB_HOME"]) / "sessions").glob("*.jsonl")
+                    if records(path)[0].get("parent_session_id") == root_id]
+        self.assertEqual(len(children), 1)
+        self.assert_tool_docs(children[0].stem, child=True)
         self.assert_result(probe["result"], "reply:" + INPUT)
         self.assertEqual(len(self.starts()), 1)
         self.assert_request(self.starts()[0])

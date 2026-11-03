@@ -3,7 +3,7 @@ const p = @import("../provider.zig");
 const sse = @import("sse.zig");
 
 const Model = struct { id: []const u8, context_window: u64, can_disable_reasoning: bool = true };
-const models = [_]Model{
+pub const models = [_]Model{
     .{ .id = "gpt-6.1-terra", .context_window = 500_000 },
     .{ .id = "gpt-6.1-sol", .context_window = 500_000, .can_disable_reasoning = false },
     .{ .id = "gpt-6-astra", .context_window = 272_000, .can_disable_reasoning = false },

@@ -44,6 +44,7 @@
 - [config.md](config.md)：NIB_HOME、配置文件、覆盖优先级与 effort 持久化
 - [codex.md](codex.md)：使用本机 Codex 登录、配置与凭证边界
 - [run-output.md](run-output.md)：Run 的共享输出预算、条目与省略标记
+- [tool-delegation.md](tool-delegation.md)：read / llm / agent 的选择、接口与委派实现
 
 ## 没写成 ADR 的选择
 

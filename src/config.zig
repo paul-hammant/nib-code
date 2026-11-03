@@ -226,7 +226,7 @@ pub fn resolve(a: Allocator, env: *const Env, text: []const u8, path: []const u8
         return error.InvalidProvider;
     } else file.provider_id orelse .codex;
     const settings = if (id == .codex) file.codex_settings else file.chat_settings;
-    const model = env.get("NIB_MODEL") orelse settings.model orelse if (id == .codex) codex.default_model else "deepseek-flash";
+    const model = env.get("NIB_MODEL") orelse settings.model orelse if (id == .codex) codex.default_model else @import("provider/openai.zig").default_model;
     const context_window = if (env.get("NIB_CONTEXT_WINDOW")) |v| blk: {
         const n = std.fmt.parseInt(u64, v, 10) catch {
             detail.* = try a.dupe(u8, "NIB_CONTEXT_WINDOW: expected a positive integer");

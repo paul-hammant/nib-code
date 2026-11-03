@@ -3,7 +3,7 @@
 用 Zig 0.17 写的编码 agent，命令名 `nib`。
 
 - 会话统计：`python3 scripts/stats.py [日志文件或目录] [--since YYYY-MM-DD] [--cwd 目录] [--json]`，默认只读 `$NIB_HOME/sessions`（默认 `~/.nib/sessions`），用于发现故障和比较改动前后效果。文本和 JSON 均包含“耗时构成”：Step/model/run 的中位数与 p90、首段代码前等待和参数生成跨度、运行时各工具调用次数/总耗时/中位耗时，以及参数到达跨度严格大于 50 ms 的 run 比例；每项列出有效样本数，旧日志缺字段不补零。bash 耗时 Top 10 按保存的 JS 命令字面量前两个 shell 单词启发式分组，无法可靠关联的动态/多调用列为 unmatched，不把整个 bash 耗时分摊给 shell 子命令。
-- 构建：`zig build`；测试：`zig build test --summary all`；端到端（本地 mock，无真实 key）：`zig build` 后 `python3 tests/test_session.py`、`python3 tests/test_codex.py`、`python3 tests/test_llm.py`
+- 构建：`zig build`；测试：`zig build test --summary all`；端到端（本地 mock，无真实 key）：`zig build` 后 `python3 tests/test_session.py`、`python3 tests/test_codex.py`、`python3 tests/test_llm.py`、`python3 tests/test_stats.py`
 - 安装到 `~/.local/bin/nib`：`zig build -Doptimize=ReleaseFast --prefix ~/.local`；版本号在 `build.zig.zon`，`nib --version` 查看。
 - 运行：`./zig-out/bin/nib`（TUI）、`nib ask '<prompt>'`、`nib js '<code>'`；TUI 用 `/compact` 手动压缩上下文。
 - 反思：TUI `/reflect [focus]` 让模型对照本会话日志（含子会话）只读地复盘 harness 的摩擦、建议和任务描述问题；正常结束的回答追加到 `$NIB_HOME/reflections.md`（每条带 UTC 时间、会话、cwd、模型、effort 表头），供批量分析后迭代。回答最后的 ```json 草稿（最多 3 个）随后**自动**发布为 GitHub issue，无需确认：目标仓库 `NIB_ISSUE_REPO`（默认 `yyydddkkk/nib-code`，设为 `off` 关闭），用用户自己的 `gh` 登录和环境；模型写草稿前先用 `gh issue list` 查看目标仓库的 open issue，同根因的不再起草（`off` 时仍对照默认仓库）；发布前再按标题查重（已有则跳过），把当前项目路径替换成 `<project>`、HOME 替换成 `~`，像凭证的草稿（`sk-`、`ghp_`、`Bearer ` 等）不发布；每条结果显示在对话区并追加到 reflections.md。脱敏只是兜底，主要靠提示词要求草稿不含项目内容。提示词模板是 `src/tui/reflect.md`（编译时嵌入，改措辞改这个文件），占位符 `{{session_id}}`、`{{log_path}}`、`{{issue_repo}}`、`{{focus}}`。
@@ -58,12 +58,6 @@ Run 的默认 5 分钟超时只累计 QuickJS 执行片段（初始脚本、Prom
 
 事件结构与序列化定义在 `src/session/events.zig`。字符串中的换行经过 JSON 转义，每个物理行都是完整 JSON。
 
-Run 中可调用 `await tools.llm({ prompt, input, schema, model, effort })`，返回 `{ text, data, usage }`，用于批量判断、分类和抽取；要执行操作或多步调查则用 `tools.agent`。prompt 必填，input 可省略；字符串原样传入，其他可 JSON 序列化值按 JSON 编码，与 prompt 分开，不继承会话历史、项目 AGENTS.md 或 nib system。model/effort 默认跟随有效配置，覆盖只影响本次调用。宿主在当前进程代发一次无工具请求，凭证不进入 JS；子 agent 也可用 llm。schema 可选对象：Codex 用 strict json_schema，Chat Completions 用 json_object 加提示约束；schema 仍受服务端支持的子集限制（如 Codex strict 对象的 additionalProperties:false / required）；宿主只验证合法 JSON，不做完整 schema 校验，返回解析后的 data（无 schema 时为 null）。JSON 解析失败附错误重试一次，仍失败 reject 并带有界原始输出片段；两次已报告 usage 都计入本轮累计用量，与 agent 共用归集路径，TUI/ask --json 更新 usage 快照，calls 记录名为 llm。缓存 key 使用 `<session_id>:llm`，与主会话隔离。
-
-llm 限额常量在 `src/tools/llm.zig`：同进程最多 4 个并发调用，超出排队（不计请求超时）；每 Run 最多 100 次，第 101 次在沙箱入队前 reject，建议分批或先用 JS 过滤；单次 prompt + 序列化 input 合计最多 256 KiB（UTF-8 字节），超出 reject，不截断。请求超时沿用 provider（当前无额外读超时），限流/临时错误复用 `src/provider/retry.zig` 的主会话重试、退避与服务端延迟提示。Esc/SIGINT/SIGTERM 同时取消在途和排队调用。各 Run 仍是无状态沙箱，中间结果用 JSON 文件传递，见 [ADR 0013](docs/adr/0013-llm-functions.md)。
-
-根会话可调用 `await tools.agent({ prompt, timeout_ms: 1800000 })`，返回 `{ text, usage }`；timeout_ms 可省略，默认 30 分钟，不计排队时间。超时错误包含实际耗时（含终止宽限）、子会话 id（未收到 start 时明确标为不可用）和检查半成品文件的提醒。子会话适合独立调查或任务，不适合需要跨文件协调的修改；`Promise.all` 并行派生，最多同时运行 4 个子会话（全部工具最多同时运行 8 个）。子会话独立读取指令文件，沿用 cwd 和有效 provider/模型配置（通过 stdin 管道传递，子会话跳过配置文件读取；Codex 凭证各自读取），不继承父会话历史。内部环境变量 `NIB_AGENT_DEPTH` 从 0 递增，深度达到 1 时，工具说明与实际 JS API 都移除 agent。`NIB_PARENT_SESSION_ID` 写入子会话日志首条记录的 `parent_session_id`。显式 `--resume` 子会话仍保留深度限制；`--continue` 跳过子会话。
-
-子进程 NDJSON 在运行途中按完整行观察；最终输出仍按原路径解析和统计。进度使用受互斥锁保护、每个子 agent 仅保留最新快照的队列；工具线程只更新队列，不调用 Session sink。Run 线程在 sandbox 的 Promise/工具等待循环里约每 20 ms 尝试转发，转发不计入 JS 执行预算；eval 返回前已停止并 join 所有工具线程，之后清空队列。TUI 收到事件后复制数据到自身事件循环，正在运行的 agent Run 折叠显示进度汇总，ctrl+o 展开显示各子任务（prompt 前 40 个 Unicode 字符）；Run 结束恢复工具/耗时/改动摘要。
-
-bash 与子会话复用进程组执行器，取消和超时会清理整组；子 nib 先收到 SIGTERM，有 500 ms 取消自身工具，之后强制终止。用量按已收到的累计快照统计，无法推知服务端尚未报告的 token。路径写锁只协调当前进程内的 edit/write，不协调独立子会话或 bash 的写入。
+- `await tools.llm({ prompt, input, schema, model, effort })` → `{ text, data, usage }`：prompt 必填；input 可省略，字符串原样传入，其他 JSON 可序列化值按 JSON 编码；schema 可选，返回合法 JSON 的 data（不做完整 schema 校验），不传时 data 为 null。model/effort 默认继承当前配置，只在当前 provider 内选择，覆盖仅影响本次调用。每进程最多 4 并发（超出排队），每 Run 最多 100 次，单次 prompt + 序列化 input 最多 256 KiB，超限 reject；子 agent 也可使用。
+- `await tools.agent({ prompt, timeout_ms: 1800000 })` → `{ text, usage }`：仅根会话可用，深度上限 1；每进程最多 4 个子会话（全部工具最多 8 并发），超出排队；默认超时 30 分钟，不含排队。只共享 prompt，继承 cwd 与有效 provider/模型配置，不继承父会话历史；超时或取消后留意半成品文件。显式恢复子会话仍保留深度限制。
+- 两者的 usage 都计入本轮累计用量，Esc/SIGINT/SIGTERM 取消在途及排队调用；跨 Run 中间结果写 JSON 文件。实现、进度、重试和进程清理见 [工具委派文档](docs/tool-delegation.md)。

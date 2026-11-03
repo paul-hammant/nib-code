@@ -1,4 +1,5 @@
 const std = @import("std");
+pub const default_model = "deepseek-flash";
 const sse = @import("sse.zig");
 
 const Config = @import("../provider.zig").Config;
