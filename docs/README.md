@@ -71,9 +71,9 @@ Run 内工具并发、`nib ask --json` 和 `tools.agent` 均已实现，见 ADR 
 
 这些是观察值，不是目标或禁令。数字会变，以最新实测为准，每次更新请写日期。
 
-会话质量用 `python3 scripts/stats.py` 只读统计真实日志；可传一个或多个文件/目录，用 `--cwd` 精确匹配工作目录、`--since YYYY-MM-DD` 筛选会话文件的本地修改日期。日志没有逐 Step 的日期，恢复过的旧会话也会随文件进入筛选范围。修改提示词或工具前后，分别对日志快照运行 `python3 scripts/stats.py 快照目录 --json > before.json` / `after.json`，在相同 cwd、模型和任务类型下比较 Run 失败率、错误分类、平均步数/耗时、token 和缓存命中率，同时检查样本量及字段覆盖率。
+会话质量用 `python3 scripts/stats.py` 只读统计真实日志；可传一个或多个文件/目录，用 `--cwd` 精确匹配工作目录、`--since YYYY-MM-DD` 按每条记录的 `at` 筛选，包含指定日期的本地午夜。恢复旧会话不会把带时间戳的历史 Step 算进新区间；旧记录缺失或无效的 `at` 回退到文件修改时间，仍可能混入历史数据。文本报告和 JSON 的 `time_filter` 分别列出入选记录的时间戳/回退数量及回退的完整 Step 数；计数不含 header、修复和压缩替换记录，但包含诊断和打断记录。修改提示词或工具前后，分别对日志快照运行 `python3 scripts/stats.py 快照目录 --json > before.json` / `after.json`，在相同 cwd、模型和任务类型下比较 Run 失败率、错误分类、平均步数/耗时、token 和缓存命中率，同时检查样本量及字段覆盖率。
 
-完整 Step 记录可选的 `usage`（仅本次模型请求的 prompt/completion/cache-hit token，不重复计入子会话）、`ms`（单调时钟，从请求开始含重试直到全部 Run 结束，不含压缩和日志落盘）及 `run_results: [{tool_call_id, ok}]`。旧记录照常 replay，缺失字段不补零；失败率仅以有显式状态的 Run 为分母，旧日志的未知状态单列。Turn 耗时只平均已结束且每步都有计时的 Turn；压缩替换记录不计为新 Turn/Step，历史工作量不会因压缩而消失。
+新写入的每条日志记录带 `at`（Unix 毫秒，记录追加时的墙上时钟时间，非请求开始时间），包括 header、完整 Step、诊断、打断与压缩替换；恢复时兼容没有 `at` 的旧日志。完整 Step 记录另有可选的 `usage`（仅本次模型请求的 prompt/completion/cache-hit token，不重复计入子会话）、`ms`（单调时钟，从请求开始含重试直到全部 Run 结束，不含压缩和日志落盘）及 `run_results: [{tool_call_id, ok}]`。旧记录照常 replay，缺失字段不补零；失败率仅以有显式状态的 Run 为分母，旧日志的未知状态单列。Turn 数包含区间内有非诊断记录的 Turn，平均步数只计入选的完整 Step；Turn 耗时只平均已结束、全部 Step 都入选且每步都有计时的 Turn，跨筛选边界的 Turn 不参与耗时平均。会话数包含 header 或非替换记录入选的会话；压缩替换记录不计为新 Turn/Step，历史工作量不会因压缩而消失。
 
 工具与 bash 命令统计是 JS/静态 shell 调用点估计，不代表循环、动态代码的实际执行次数。错误按每个 Run 的诊断特征计数（类别可能重叠），并另计 interrupted 标记；源码/read 正文不作故障匹配。被 JS 捕获的工具错误或 bash 的 exit_code 127 也会进入分类，但不一定导致 Run 失败。脚本的合成日志测试：`python3 tests/test_stats.py`；真实 Step 元数据和 mock 会话计数由 `tests/test_session.py` 覆盖。
 

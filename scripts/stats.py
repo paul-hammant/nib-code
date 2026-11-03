@@ -126,6 +126,9 @@ def summarize(paths, since=None, cwd=None):
     totals = dict(sessions=0, root_sessions=0, child_sessions=0, turns=0, steps=0, runs=0,
                   runs_failed=0, runs_with_status=0, runs_unknown=0, steps_with_usage=0,
                   steps_with_ms=0, timed_turns=0)
+    cutoff_ms = int(datetime.combine(since, datetime.min.time()).timestamp() * 1000) if since else None
+    time_filter = dict(selected_records_with_at=0, selected_records_using_mtime=0,
+                       selected_steps_using_mtime=0)
     usage = dict.fromkeys(TOKEN_KEYS, 0)
     tool_counts, bash_counts = Counter(), Counter()
     errors = {name: {'count': 0, 'examples': []} for name in ERRORS}
@@ -140,8 +143,7 @@ def summarize(paths, since=None, cwd=None):
 
     for path in paths:
         try:
-            if since and datetime.fromtimestamp(path.stat().st_mtime).date() < since:
-                continue
+            mtime_ms = path.stat().st_mtime * 1000
         except OSError:
             continue
         log = iter(records(path))
@@ -151,43 +153,64 @@ def summarize(paths, since=None, cwd=None):
         if cwd is not None and (not isinstance(header.get('cwd'), str) or
                                 Path(header['cwd']).expanduser().resolve() != cwd):
             continue
-        totals['sessions'] += 1
-        totals['child_sessions' if header.get('parent_session_id') else 'root_sessions'] += 1
+        def selected(record):
+            at = record.get('at')
+            return cutoff_ms is None or (at if number(at) else mtime_ms) >= cutoff_ms
+
+        session_selected = selected(header)
         length = header['from'] + len(header['messages'])
         current = None
         session_step = 0
 
         def finish_turn():
-            if current is not None:
+            if current is not None and current['selected']:
+                totals['turns'] += 1
                 turn_steps.append(current['steps'])
-                if current['complete'] and current['steps'] and current['timed'] == current['steps']:
+                if (current['complete'] and current['steps'] and
+                        current['steps'] == current['full_steps'] == current['timed']):
                     turn_times.append(current['ms'])
 
         for record in log:
-            if isinstance(record.get('diagnostic'), dict):
-                error('provider_failure', record['diagnostic']['message'], path.stem)
-                continue
-            messages = record['messages']
-            replacement = record['from'] < length
-            length = record['from'] + len(messages)
-            if replacement:
+            include = selected(record)
+            has_at = number(record.get('at'))
+            diagnostic = isinstance(record.get('diagnostic'), dict)
+            if not diagnostic:
+                messages = record['messages']
+                replacement = record['from'] < length
+                length = record['from'] + len(messages)
+                if replacement:
+                    continue
+            if include:
+                session_selected = True
+                time_filter['selected_records_with_at' if has_at else 'selected_records_using_mtime'] += 1
+            if diagnostic:
+                if include:
+                    error('provider_failure', record['diagnostic']['message'], path.stem)
                 continue
             if any(m['role'] == 'user' for m in messages):
                 finish_turn()
-                totals['turns'] += 1
-                current = dict(steps=0, timed=0, ms=0, complete=False)
+                current = dict(steps=0, full_steps=0, timed=0, ms=0, complete=False, selected=False)
+            if current is not None and include:
+                current['selected'] = True
             interrupted = False
             for m in messages:
                 if m['role'] == 'assistant' and re.search(r'\[interrupted(?: by user|: process terminated)\]\s*$', m.get('content') or ''):
-                    error('interrupted', m['content'], path.stem)
+                    if include:
+                        error('interrupted', m['content'], path.stem)
                     interrupted = True
             if not any(m['role'] == 'assistant' for m in messages) or interrupted:
                 continue
-            totals['steps'] += 1
             session_step += 1
             if current is not None:
-                current['steps'] += 1
+                current['full_steps'] += 1
                 current['complete'] = any(m['role'] == 'assistant' and not m.get('tool_calls') for m in messages)
+            if not include:
+                continue
+            totals['steps'] += 1
+            if not has_at:
+                time_filter['selected_steps_using_mtime'] += 1
+            if current is not None:
+                current['steps'] += 1
             u = record.get('usage')
             if isinstance(u, dict) and all(number(u.get(k)) for k in TOKEN_KEYS):
                 totals['steps_with_usage'] += 1
@@ -240,6 +263,9 @@ def summarize(paths, since=None, cwd=None):
                     if not matched and (ok is False or candidates):
                         error('other_failure', candidates[0] if candidates else text, path.stem)
         finish_turn()
+        if session_selected:
+            totals['sessions'] += 1
+            totals['child_sessions' if header.get('parent_session_id') else 'root_sessions'] += 1
     totals['runs_unknown'] = totals['runs'] - totals['runs_with_status']
     totals['run_failure_rate'] = totals['runs_failed'] / totals['runs_with_status'] if totals['runs_with_status'] else None
     totals['avg_steps_per_turn'] = sum(turn_steps) / len(turn_steps) if turn_steps else None
@@ -247,14 +273,17 @@ def summarize(paths, since=None, cwd=None):
     totals['avg_turn_ms'] = sum(turn_times) / len(turn_times) if turn_times else None
     usage['total_tokens'] = usage['prompt_tokens'] + usage['completion_tokens']
     usage['cache_hit_rate'] = usage['prompt_cache_hit_tokens'] / usage['prompt_tokens'] if usage['prompt_tokens'] else None
-    return {'overall': totals, 'usage': usage, 'tools': dict(sorted(tool_counts.items())),
+    return {'overall': totals, 'usage': usage, 'time_filter': time_filter, 'tools': dict(sorted(tool_counts.items())),
             'bash_top10': [{'command': k, 'count': v} for k, v in sorted(bash_counts.items(), key=lambda p: (-p[1], p[0]))[:10]],
             'errors': errors, 'slowest_steps': slowest,
             'notes': ['失败率仅统计显式 run_results；旧日志的状态为未知。',
+                      'Step/Run、用量和错误只统计入选记录；token 为有效 usage 的 prompt + completion，不重复加缓存命中，缓存命中率以 prompt 为分母，缺失 usage 不补零。',
                       '错误按 Run 的诊断特征计数，类别可重叠；另计打断记录和未提交的 provider 失败诊断；忽略源码/read 正文，被捕获的工具错误不一定导致 Run 失败。',
                       '工具和 bash 命令数是静态估计，不是运行时调用次数；动态 JS/shell 可能漏计。',
-                      'Turn 耗时只统计已结束且所有 Step 都有 ms 的 Turn，不含压缩、未完成请求和用户停顿。',
-                      '--since 按会话文件修改日期（本地时间）筛选，不是逐 Step 日期。']}
+                      'Turn 数包含区间内有非诊断记录的 Turn，平均步数只计入选 Step；耗时只平均已结束、全部 Step 入选且都有 ms 的 Turn，不含压缩、未完成请求和用户停顿。',
+                      '--since 按记录 at（Unix 毫秒）筛选，含指定日期的本地午夜；缺失或无效 at 回退到文件修改时间。会话数包含 header 或非替换记录入选的会话。',
+                      '时间来源计数只含入选的非 header、非修复、非压缩替换记录（含诊断和打断）；步骤回退数只含完整 Step。',
+                      f"时间来源：{time_filter['selected_records_with_at']} 条按 at，{time_filter['selected_records_using_mtime']} 条回退文件时间（其中 {time_filter['selected_steps_using_mtime']} 个完整 Step）。"]}
 
 
 def text_report(report):
@@ -284,7 +313,7 @@ def text_report(report):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('paths', nargs='*', type=Path, help='session JSONL files or directories')
-    parser.add_argument('--since', type=date.fromisoformat, metavar='YYYY-MM-DD', help='session file modification date, inclusive, local time')
+    parser.add_argument('--since', type=date.fromisoformat, metavar='YYYY-MM-DD', help='record date, inclusive, local time; legacy records fall back to file modification time')
     parser.add_argument('--cwd', type=Path, help='exact session working directory')
     parser.add_argument('--json', action='store_true', help='emit JSON instead of text')
     args = parser.parse_args()
