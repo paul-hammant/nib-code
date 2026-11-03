@@ -109,7 +109,7 @@ pub const Session = struct {
             s.id = try a.dupe(u8, std.fs.path.stem(path));
             s.log = try session_log.Log.create(io, path);
             errdefer s.log.close(io);
-            const base = try std.fmt.allocPrint(a, system_template, .{ cwd, s.tools.api().docs });
+            const base = try std.fmt.allocPrint(a, system_template, .{ cwd, try s.tools.documentation(a) });
             const global = try std.fs.path.join(a, &.{ options.home, "AGENTS.md" });
             const project = try std.fs.path.join(a, &.{ try instructions.projectRoot(io, a, cwd), "AGENTS.md" });
             const system = try instructions.append(io, a, base, global, project);
@@ -501,9 +501,13 @@ test "formatOutcome" {
 
 test "system prompt documents every tool in JavaScript" {
     const gpa = std.testing.allocator;
-    const prompt = try std.fmt.allocPrint(gpa, system_template, .{ "/work", tools.docs });
+    var host: tools.Tools = .{ .io = std.testing.io, .home = "/unused", .cfg = .{ .provider = .codex, .base_url = "", .api_key = "", .model = @import("provider/codex.zig").default_model } };
+    const docs = try host.documentation(gpa);
+    defer gpa.free(docs);
+    const prompt = try std.fmt.allocPrint(gpa, system_template, .{ "/work", docs });
     defer gpa.free(prompt);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "```js\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "{{llm_options}}") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "TypeScript") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "backticks, ${ or backslashes") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "entire Run shares a 16 KiB output budget, not 16 KiB per tool call") != null);

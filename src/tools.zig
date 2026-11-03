@@ -18,17 +18,6 @@ const Tool = struct {
 
 const all = [_]Tool{
     .{
-        .name = "llm",
-        .run = model_function.llm,
-        .doc =
-        \\  // Pure single-step model call for batch judgments, classification and extraction; no tools. For actions or multi-step investigation use tools.agent. Usage counts toward this Turn.
-        \\  // Limits: 4 concurrent per process (others queue), 100 calls per Run, 256 KiB prompt + input; schema returns parsed JSON data, otherwise data is null.
-        \\  // input is a string or JSON-serializable data, separate from prompt. model/effort default to the current config.
-        \\  // Example: await Promise.all(["yes", "no"].map(input => tools.llm({prompt: "Classify the input", input})))
-        \\  async llm({ prompt, input, schema, model, effort }) {}, // → { text, data, usage }
-        ,
-    },
-    .{
         .name = "read",
         .run = files.read,
         .doc =
@@ -93,12 +82,21 @@ const all = [_]Tool{
         ,
     },
     .{
+        .name = "llm",
+        .run = model_function.llm,
+        .doc =
+        \\  // Bulk judgments, classification, extraction: pure, no side effects/tools, one step, typically seconds. input: string or JSON data; schema: parsed data (else null). Limits: 4 concurrent/process, 100 calls/Run, 256 KiB prompt+input. {{llm_options}}
+        \\  // Example: await Promise.all(["yes", "no"].map(input => tools.llm({prompt: "Classify the input", input})))
+        \\  async llm({ prompt, input, schema, model, effort }) {}, // → { text, data, usage }; usage counts toward this Turn.
+        ,
+    },
+    .{
         .name = "agent",
         .root_only = true,
         .run = subagent.agent,
         .doc =
-        \\  // Delegate independent investigations/tasks, not cross-file coordinated edits. Only prompt is shared; usage counts toward this Turn.
-        \\  // Timeout defaults to 30 minutes; stopped children may leave incomplete files.
+        \\  // Independent multi-step work or read-only pre-commit review, not tasks that direct read or llm can handle.
+        \\  // Each child reads code from scratch: thousands to tens of thousands of tokens, tens of seconds or more. Only prompt is shared; usage counts toward this Turn. Stopped children may leave incomplete files.
         \\  async agent({ prompt, timeout_ms = 1800000 }) {}, // → { text, usage }
         ,
     },
@@ -112,7 +110,7 @@ fn enabled(tool: Tool, depth: u32) bool {
 
 fn makeApi(comptime depth: u32) Api {
     var n: []const []const u8 = &.{};
-    var d: []const u8 = "const tools = {\n";
+    var d: []const u8 = "// Read a few files yourself (cheapest). For bulk simple judgments use a cheap model and low effort; reserve strong models for a few hard problems.\nconst tools = {\n";
     for (all) |tool| {
         if (!enabled(tool, depth)) continue;
         n = n ++ .{tool.name};
@@ -226,6 +224,25 @@ pub const Tools = struct {
 
     pub fn api(t: *const Tools) Api {
         return if (t.depth == 0) root_api else child_api;
+    }
+
+    pub fn documentation(t: *const Tools, a: std.mem.Allocator) ![]u8 {
+        const cfg = t.cfg orelse return error.ToolConfigUnavailable;
+        var models: std.ArrayList([]const u8) = .empty;
+        defer models.deinit(a);
+        switch (cfg.provider) {
+            .codex => for (@import("provider/codex.zig").models) |model| {
+                try models.append(a, model.id);
+            },
+            .chat_completions => try models.append(a, @import("provider/openai.zig").default_model),
+        }
+        const known = for (models.items) |model| {
+            if (std.mem.eql(u8, cfg.model, model)) break true;
+        } else false;
+        if (!known) try models.append(a, cfg.model);
+        const options = try std.fmt.allocPrint(a, "Provider: {s}; same-provider models: {f}; current model: {f}. effort: {f} (server/model support varies). Omit model/effort to inherit; effort=default resets to server defaults; off may map to low on reasoning-only Codex models. No provider switching.", .{ @tagName(cfg.provider), std.json.fmt(models.items, .{}), std.json.fmt(cfg.model, .{}), std.json.fmt(provider.Config.effort_values, .{}) });
+        defer a.free(options);
+        return std.mem.replaceOwned(u8, a, t.api().docs, "{{llm_options}}", options);
     }
 
     pub fn addUsage(t: *Tools, usage: provider.Usage) void {
@@ -423,7 +440,7 @@ test "child API filters agent from both docs and sandbox" {
     try testing.expect(std.mem.indexOf(u8, t.api().docs, "async agent({") == null);
     const result = try sandbox.eval(testing.allocator, testing.io, "[typeof tools.agent, Object.keys(tools)]", .{}, t.host(), null);
     defer result.deinit(testing.allocator);
-    try testing.expectEqualStrings("[\"undefined\",[\"llm\",\"read\",\"edit\",\"write\",\"grep\",\"glob\",\"fetch\",\"bash\"]]", result.text);
+    try testing.expectEqualStrings("[\"undefined\",[\"read\",\"edit\",\"write\",\"grep\",\"glob\",\"fetch\",\"bash\",\"llm\"]]", result.text);
 }
 
 test "Run excludes tool waits without resetting the JS budget" {
@@ -472,11 +489,14 @@ const EchoLlm = struct {
 };
 
 test "llm map documentation example reaches the host byte for byte" {
+    var t: Tools = .{ .io = testing.io, .home = "/unused", .cfg = .{ .provider = .codex, .base_url = "", .api_key = "", .model = @import("provider/codex.zig").default_model } };
+    const rendered = try t.documentation(testing.allocator);
+    defer testing.allocator.free(rendered);
     const marker = "// Example: ";
-    const start = std.mem.indexOf(u8, docs, marker).? + marker.len;
-    const end = std.mem.indexOfScalarPos(u8, docs, start, '\n').?;
+    const start = std.mem.indexOf(u8, rendered, marker).? + marker.len;
+    const end = std.mem.indexOfScalarPos(u8, rendered, start, '\n').?;
     var dummy: u8 = 0;
-    const result = try sandbox.eval(testing.allocator, testing.io, docs[start..end], .{}, .{ .ctx = &dummy, .names = &.{"llm"}, .call = EchoLlm.call }, null);
+    const result = try sandbox.eval(testing.allocator, testing.io, rendered[start..end], .{}, .{ .ctx = &dummy, .names = &.{"llm"}, .call = EchoLlm.call }, null);
     defer result.deinit(testing.allocator);
     try testing.expect(result.ok);
     try testing.expectEqualStrings("[{\"prompt\":\"Classify the input\",\"input\":\"yes\"},{\"prompt\":\"Classify the input\",\"input\":\"no\"}]", result.text);
@@ -502,4 +522,52 @@ test "llm admission rejects call 101 before dispatch and resets on each Run" {
     const fresh = try sandbox.eval(testing.allocator, testing.io, "await tools.llm({prompt: 'fresh'})", .{}, host, null);
     defer fresh.deinit(testing.allocator);
     try testing.expect(fresh.ok);
+}
+
+test "delegation descriptions stay adjacent and at most three lines each" {
+    for (all, 0..) |tool, index| {
+        if (std.mem.eql(u8, tool.name, "llm") or std.mem.eql(u8, tool.name, "agent"))
+            try testing.expect(std.mem.count(u8, tool.doc, "\n") < 3);
+        if (std.mem.eql(u8, tool.name, "llm"))
+            try testing.expectEqualStrings("agent", all[index + 1].name);
+    }
+}
+
+test "generated llm options follow provider catalog and effort validation for both depths" {
+    const codex = @import("provider/codex.zig");
+    const chat = @import("provider/openai.zig");
+    const efforts = try std.json.Stringify.valueAlloc(testing.allocator, provider.Config.effort_values, .{});
+    defer testing.allocator.free(efforts);
+    for ([_]provider.Id{ .codex, .chat_completions }) |id| {
+        for ([_]u32{ 0, 1 }) |depth| {
+            var t: Tools = .{ .io = testing.io, .home = "/unused", .depth = depth, .cfg = .{ .provider = id, .base_url = "", .api_key = "", .model = "custom\"model\n", .reasoning_effort = "high" } };
+            const rendered = try t.documentation(testing.allocator);
+            defer testing.allocator.free(rendered);
+            try testing.expect(std.mem.indexOf(u8, rendered, "{{llm_options}}") == null);
+            try testing.expect(std.mem.indexOf(u8, rendered, efforts) != null);
+            try testing.expect(std.mem.indexOf(u8, rendered, "Omit model/effort to inherit") != null);
+            try testing.expect(std.mem.indexOf(u8, rendered, "No provider switching") != null);
+            try testing.expect(std.mem.indexOf(u8, rendered, "custom\\\"model\\n") != null);
+            try testing.expectEqual(depth == 0, std.mem.indexOf(u8, rendered, "async agent({") != null);
+            for (codex.models) |model| {
+                try testing.expectEqual(id == .codex, std.mem.indexOf(u8, rendered, model.id) != null);
+            }
+            try testing.expectEqual(id == .chat_completions, std.mem.indexOf(u8, rendered, chat.default_model) != null);
+            const source = try std.fmt.allocPrint(testing.allocator, "() => {{\n{s}}}", .{rendered});
+            defer testing.allocator.free(source);
+            const parsed = try sandbox.eval(testing.allocator, testing.io, source, .{}, null, null);
+            defer parsed.deinit(testing.allocator);
+            try testing.expect(parsed.ok);
+        }
+    }
+}
+
+test "configured default model is not duplicated in the model choices" {
+    for ([_]provider.Id{ .codex, .chat_completions }) |id| {
+        const model = if (id == .codex) @import("provider/codex.zig").default_model else @import("provider/openai.zig").default_model;
+        var t: Tools = .{ .io = testing.io, .home = "/unused", .cfg = .{ .provider = id, .base_url = "", .api_key = "", .model = model } };
+        const rendered = try t.documentation(testing.allocator);
+        defer testing.allocator.free(rendered);
+        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, rendered, model));
+    }
 }
