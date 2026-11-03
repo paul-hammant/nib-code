@@ -73,13 +73,6 @@ pub const ToolCall = struct {
 pub const Reasoning = struct {
     provider: Id,
     data: []const u8,
-
-    pub fn display(r: Reasoning, a: std.mem.Allocator) ![]const u8 {
-        return switch (r.provider) {
-            .chat_completions => a.dupe(u8, r.data),
-            .codex => codex.reasoningText(a, r.data),
-        };
-    }
 };
 
 pub const Message = struct {

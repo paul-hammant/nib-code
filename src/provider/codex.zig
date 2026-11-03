@@ -32,18 +32,6 @@ pub fn reasoningEffort(cfg: p.Config) ?[]const u8 {
     return cfg.reasoning_effort orelse if (cfg.thinking == true) @as(?[]const u8, "medium") else null;
 }
 
-pub fn reasoningText(a: std.mem.Allocator, data: []const u8) ![]const u8 {
-    const items = try std.json.parseFromSlice([]const struct { summary: []const struct { text: []const u8 } = &.{} }, a, data, .{ .ignore_unknown_fields = true });
-    defer items.deinit();
-    var text: std.ArrayList(u8) = .empty;
-    errdefer text.deinit(a);
-    for (items.value) |item| for (item.summary) |part| {
-        if (text.items.len > 0) try text.appendSlice(a, "\n\n");
-        try text.appendSlice(a, part.text);
-    };
-    return text.toOwnedSlice(a);
-}
-
 const Credentials = struct {
     tokens: struct { access_token: []const u8, account_id: []const u8 },
 };
@@ -396,9 +384,6 @@ test "Codex reasoning mapping and readable summaries" {
     cfg.model = "gpt-6.1-terra";
     try t.expectEqualStrings("none", reasoningEffort(cfg).?);
     try t.expect(!modelInfo("gpt-6.1-sol").?.can_disable_reasoning);
-    const text = try reasoningText(t.allocator, "[{\"encrypted_content\":\"fake-ciphertext\",\"summary\":[{\"text\":\"readable\"}]}]");
-    defer t.allocator.free(text);
-    try t.expectEqualStrings("readable", text);
 }
 
 test "Codex request body requests summaries exactly when reasoning is sent" {
