@@ -188,6 +188,13 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
         before = len(requests())
         tool_events = ask("tool roundtrip")
         assert tool_events[-1]["end"]["steps"] == 2
+        assert [e["step"] for e in tool_events if "step" in e] == [
+            {"n": 1, "effort": "default", "source": "default"},
+            {"n": 2, "effort": "default", "source": "default"},
+        ], tool_events
+        assert all(isinstance(e["run_start"], str) for e in tool_events if "run_start" in e), tool_events
+        assert next(i for i, e in enumerate(tool_events) if "step" in e) < next(
+            i for i, e in enumerate(tool_events) if "delta" in e), tool_events
         assert tool_events[-1]["end"]["usage"] == {"prompt_tokens": 6600, "completion_tokens": 40, "prompt_cache_hit_tokens": 128}
         assert "hello from codex mock" in tool_events[-1]["end"]["text"]
         steps = requests()[before:]
@@ -237,6 +244,8 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
             before = len(requests())
             recovered = ask(prompt)
             assert len(requests()) == before + 2, recovered
+            assert [e["step"] for e in recovered if "step" in e] == [
+                {"n": 1, "effort": "default", "source": "default"}], recovered
             retry_index = next(i for i, event in enumerate(recovered) if "retry" in event)
             assert sum("delta" in event for event in recovered[:retry_index]) >= 2, recovered
             retries = [event["retry"] for event in recovered if "retry" in event]

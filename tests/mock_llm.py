@@ -22,7 +22,7 @@ edits files. "fetch_test" fetches GET /redirect (to /page) and
 Child Runs report the exposed tools, allowing depth-limit checks.
 Each request is logged to LOGFILE as one JSON line, with a monotonic received time."""
 import http.server, json, os, shlex, sys, threading, time
-from mock_llm_tool import run_code as llm_run_code, serve as serve_llm
+from mock_llm_tool import run_code as llm_run_code, serve as serve_llm, serve_effort
 LOG=open(sys.argv[2],'a')
 LOG_LOCK = threading.Lock()
 class H(http.server.BaseHTTPRequestHandler):
@@ -47,7 +47,9 @@ class H(http.server.BaseHTTPRequestHandler):
         msgs=body['messages']
         with LOG_LOCK:
             LOG.write(json.dumps({"received":time.monotonic(),"n":len(msgs),"roles":[m['role'] for m in msgs],"has_tools":(body.get('tools') or [{}])[0].get('function',{}).get('name'),
-                              "messages":msgs,"thinking":body.get('thinking'),"system_has_tools_api":'const tools = {' in msgs[0].get('content','')})+"\n"); LOG.flush()
+                              "messages":msgs,"thinking":body.get('thinking'),"reasoning_effort":body.get('reasoning_effort'),"has_reasoning_effort":'reasoning_effort' in body,"system_has_tools_api":'const tools = {' in msgs[0].get('content','')})+"\n"); LOG.flush()
+        if serve_effort(self, body, "chat_completions"):
+            return
         if serve_llm(self, body, 'chat_completions'):
             return
         summary = 'max_tokens' in body and not body.get('tools')

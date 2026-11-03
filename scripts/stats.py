@@ -14,6 +14,7 @@ import warnings
 
 
 TOKEN_KEYS = ('prompt_tokens', 'completion_tokens', 'prompt_cache_hit_tokens')
+CACHE_TOKEN_KEYS = ('prompt_tokens', 'prompt_cache_hit_tokens')
 ERRORS = {
     'js_syntax': r'SyntaxError',
     'command_not_found': r'''["']?exit_code["']?\s*:\s*127\b''',
@@ -140,15 +141,61 @@ def bash_timing_group(code):
         return None
 
 
+class EffortStats:
+    def __init__(self):
+        self.groups = {}
+
+    def add(self, record, run_statuses):
+        effort = record.get('effort')
+        if not isinstance(effort, str) or not effort.strip():
+            return
+        group = self.groups.setdefault(effort, dict(steps=0, model_ms=[], steps_with_cache_usage=0,
+            prompt_tokens=0, prompt_cache_hit_tokens=0, downgraded=Counter()))
+        group['steps'] += 1
+        if number(record.get('model_ms')):
+            group['model_ms'].append(record['model_ms'])
+        usage = record.get('usage')
+        if isinstance(usage, dict) and all(number(usage.get(k)) for k in CACHE_TOKEN_KEYS):
+            group['steps_with_cache_usage'] += 1
+            for key in CACHE_TOKEN_KEYS:
+                group[key] += usage[key]
+        downgraded = record.get('effort_downgraded')
+        if record.get('effort_source') == 'model' and (downgraded is None or downgraded is True):
+            counts = group['downgraded']
+            counts['steps'] += 1
+            counts['steps_with_runs'] += bool(run_statuses)
+            counts['steps_with_failed_run'] += any(ok is False for ok in run_statuses)
+            counts['steps_with_unknown_run_status'] += any(ok is None for ok in run_statuses)
+
+    def report(self):
+        def downgrade_summary(counts):
+            result = {key: counts[key] for key in ('steps', 'steps_with_runs', 'steps_with_failed_run',
+                                                  'steps_with_unknown_run_status')}
+            result['run_failure_rate'] = (counts['steps_with_failed_run'] / counts['steps_with_runs']
+                                          if counts['steps_with_runs'] else None)
+            return result
+
+        groups, total = {}, Counter()
+        for effort, group in sorted(self.groups.items()):
+            total.update(group['downgraded'])
+            groups[effort] = dict(group, model_ms=distribution(group['model_ms']),
+                cache_hit_rate=group['prompt_cache_hit_tokens'] / group['prompt_tokens']
+                               if group['prompt_tokens'] else None,
+                downgraded=downgrade_summary(group['downgraded']))
+        return dict(by_effort=groups, downgraded=downgrade_summary(total))
+
+
 class Timing:
     def __init__(self):
         self.values = {key: [] for key in ('step_ms', 'model_ms', 'run_ms', 'run_result_ms',
                                          'first_data_ms', 'code_first_ms', 'code_span_ms', 'attempts')}
+        self.effort = EffortStats()
         self.tools = {}
         self.bash = {}
         self.calls_steps = self.calls_omitted = self.bash_unmatched = 0
 
-    def add(self, record, sources):
+    def add(self, record, sources, run_statuses=()):
+        self.effort.add(record, run_statuses)
         for key in ('model_ms', 'run_ms', 'first_data_ms', 'attempts'):
             if number(record.get(key)):
                 self.values[key].append(record[key])
@@ -205,6 +252,7 @@ class Timing:
         spans = self.values['code_span_ms']
         streamed = sum(span > 50 for span in spans)
         return dict({key: distribution(values) for key, values in self.values.items()},
+                    effort=self.effort.report(),
                     calls_steps=self.calls_steps, calls_omitted=self.calls_omitted,
                     tools={name: tool_summary(values) for name, values in sorted(self.tools.items())},
                     streaming=dict(samples=len(spans), over_50_ms=streamed,
@@ -351,7 +399,7 @@ def summarize(paths, since=None, cwd=None):
                         and type(r.get('ok')) is bool} if isinstance(statuses, list) else {}
             outputs = {m['tool_call_id']: m.get('content') or '' for m in messages
                        if m['role'] == 'tool' and isinstance(m.get('tool_call_id'), str)}
-            sources = {}
+            sources, run_statuses = {}, []
             for m in messages:
                 for call in m.get('tool_calls') or []:
                     if not isinstance(call, dict) or not isinstance(call.get('function'), dict):
@@ -362,6 +410,7 @@ def summarize(paths, since=None, cwd=None):
                     totals['runs'] += 1
                     call_id = call.get('id')
                     ok = statuses.get(call_id) if isinstance(call_id, str) else None
+                    run_statuses.append(ok)
                     if ok is not None:
                         totals['runs_with_status'] += 1
                         totals['runs_failed'] += not ok
@@ -385,7 +434,7 @@ def summarize(paths, since=None, cwd=None):
                             matched = True
                     if not matched and (ok is False or candidates):
                         error('other_failure', candidates[0] if candidates else text, path.stem)
-            timing.add(record, sources)
+            timing.add(record, sources, run_statuses)
         finish_turn()
         if session_selected:
             totals['sessions'] += 1
@@ -403,7 +452,7 @@ def summarize(paths, since=None, cwd=None):
             'notes': ["仅统计入选记录；失败率只用显式 run_results；token=prompt+completion（不重复加缓存），缓存率以 prompt 为分母；错误可重叠，工具/命令数为静态估计。",
                       "Turn 平均步数只计入选 Step；平均耗时只含已结束、全部 Step 入选且有 ms 的 Turn；--since 按记录 at（本地日期），缺失或无效 at 回退到文件修改时间。",
                       f"时间来源：{time_filter['selected_records_with_at']} 条按 at，{time_filter['selected_records_using_mtime']} 条回退文件时间（其中 {time_filter['selected_steps_using_mtime']} 个完整 Step）；计时仅有效字段、缺失不补零；p90=nearest-rank；first_data_ms 是首次收到任何流数据，非内容 token；model_ms 含重试/退避。",
-                      "run_ms 为 Step 内 Run 总耗时，run_result_ms 为单 Run；code_first_ms 为首段代码等待，code_span_ms=last-first，streaming 为 >50 ms 比例；calls 含失败、并行耗时可重叠；bash 计时按字面量首两词启发式分组，无法关联列 unmatched，非 shell 子命令耗时。"]}
+                      "run_ms 为 Step 内 Run 总耗时，run_result_ms 为单 Run；code_first_ms 为首段代码等待，code_span_ms=last-first，streaming 为 >50 ms 比例；calls 含失败、并行耗时可重叠；bash 计时按字面量首两词启发式分组，无法关联列 unmatched，非 shell 子命令耗时。timing.effort.by_effort 按完整 Step 顶层 effort 分组，缺 effort 跳过、缺计时仍计 Step；缓存率为有效 prompt/cache 成对字段的总和之比。各组及 timing.effort.downgraded：effort_source=model 且（effort_downgraded=true 或缺失/null）视为降档（已知等档应记录 false）；run_failure_rate=steps_with_failed_run/steps_with_runs，仅关联本 Step 模型响应产生的 Run，任一显式 ok=false 即失败；未知状态仍入分母，并列 steps_with_unknown_run_status；无 Run 不入分母。"]}
 
 
 def text_report(report):
@@ -431,6 +480,16 @@ def text_report(report):
     for name in ('step_ms', 'model_ms', 'run_ms', 'run_result_ms', 'first_data_ms', 'code_first_ms', 'code_span_ms', 'attempts'):
         item = timing[name]
         lines.append(f"  {name}: samples={item['samples']} median={fmt(item['median'])} p90={fmt(item['p90'])}")
+    effort = timing['effort']
+    lines.append('  Step effort（顶层元数据）：')
+    for level, item in effort['by_effort'].items():
+        down = item['downgraded']
+        lines.append(f"    {level}: steps={item['steps']} model_ms median={fmt(item['model_ms']['median'])} samples={item['model_ms']['samples']} cache_hit_rate={pct(item['cache_hit_rate'])}（{item['prompt_cache_hit_tokens']}/{item['prompt_tokens']}）")
+        lines.append(f"      downgraded steps={down['steps']}; 本 Step Run 失败 {down['steps_with_failed_run']}/{down['steps_with_runs']} = {pct(down['run_failure_rate'])}（状态未知 Step={down['steps_with_unknown_run_status']}）")
+    if not effort['by_effort']:
+        lines.append('    无 effort 记录')
+    down = effort['downgraded']
+    lines.append(f"  降档 Step 合计 {down['steps']}；本 Step Run 失败 {down['steps_with_failed_run']}/{down['steps_with_runs']} = {pct(down['run_failure_rate'])}（状态未知 Step={down['steps_with_unknown_run_status']}）")
     streaming = timing['streaming']
     lines.append(f"  code streaming (last-first > 50 ms): {streaming['over_50_ms']}/{streaming['samples']} = {pct(streaming['ratio'])}")
     lines.append(f"  工具运行时计时（calls Step={timing['calls_steps']}, omitted={timing['calls_omitted']}）：")

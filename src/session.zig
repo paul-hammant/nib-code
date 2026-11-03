@@ -8,6 +8,7 @@ const provider = @import("provider.zig");
 const session_log = @import("session/log.zig");
 const instructions = @import("session/instructions.zig");
 const output_format = @import("session/output.zig");
+const effort = @import("session/effort.zig");
 
 pub const Event = @import("session/events.zig").Event;
 pub const ModelActivity = @import("session/events.zig").ModelActivity;
@@ -29,7 +30,9 @@ const tools_json =
     \\[{"type":"function","function":{"name":"run",
     \\"description":"Run JavaScript in a fresh sandbox. The `tools` API it can call is described in the system prompt.",
     \\"parameters":{"type":"object","properties":{"code":{"type":"string",
-    \\"description":"JavaScript source. Top-level await is allowed; the last expression's value is returned."}},
+    \\"description":"JavaScript source. Top-level await is allowed; the last expression's value is returned."},
+    \\"effort":{"type":"string","enum":["low","medium","high","default"],
+    \\"description":"Reasoning effort for only the next model request after this Run; default restores the user setting."}},
     \\"required":["code"]}}}]
 ;
 
@@ -45,6 +48,7 @@ const system_template =
     \\- Top-level `await` works. Combine related steps in one script (read several files, run a command, filter the output) and return only what you need.
     \\- The last expression and console.log output share 16 KiB per Run, truncated by console call and final result with markers; filter in JS first; tool results inside JS remain complete.
     \\- Search with tools.grep/tools.glob, not shell rg/find/grep.
+    \\- Set run effort: "low" for mechanical next steps (test results, file checks, simple edits); don't lower it for redesign or hard debugging.
     \\- For file/shell text with backticks, ${{ or backslashes, use JSON-escaped double-quoted strings, not template literals.
     \\
     \\When the task is done, answer the user directly without calling the tool.
@@ -260,7 +264,8 @@ pub const Session = struct {
     }
 
     fn runSteps(s: *Session, pending: *std.ArrayList(provider.Message), partial: *Partial, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
-        for (0..max_steps) |_| {
+        var next_effort: ?effort.Pending = null;
+        for (0..max_steps) |step_index| {
             const size = s.context_tokens + estimateTokens(pending.items);
             if (size >= s.cfg.context_window - s.cfg.context_window / 4 and size >= s.compact_backoff)
                 try s.autoCompact(sink, cancel, detail);
@@ -268,11 +273,14 @@ pub const Session = struct {
             defer request.deinit(s.gpa);
             try request.appendSlice(s.gpa, s.history.items);
             try request.appendSlice(s.gpa, pending.items);
+            const decision = effort.decide(s.cfg, step_index == 0, next_effort);
+            next_effort = null;
+            try sink.emit(sink.ctx, .{ .step = .{ .n = s.steps + 1, .effort = decision.metadata.effort, .source = decision.metadata.source } });
             const started: std.Io.Clock.Timestamp = .now(s.io, .awake);
             var model_timing: provider.ModelTiming = .init(s.io, started);
             var attempts: u32 = 0;
             var first_data_ms: ?u64 = null;
-            const reply = try s.complete(request.items, sink, cancel, detail, partial, &model_timing, &attempts, &first_data_ms);
+            const reply = try s.complete(decision.cfg, request.items, sink, cancel, detail, partial, &model_timing, &attempts, &first_data_ms);
             const model_ms: u64 = @intCast(@max(started.untilNow(s.io).raw.toMilliseconds(), 0));
             var run_timing: sandbox.RunTiming = .init(s.io, started);
             var run_ms: u64 = 0;
@@ -286,6 +294,7 @@ pub const Session = struct {
                 .tool_calls = if (reply.tool_calls.len > 0) reply.tool_calls else null,
                 .reasoning = reply.reasoning,
                 .phase = reply.phase,
+                .step_effort = decision.metadata,
             });
             var run_results: std.ArrayList(session_log.RunResult) = .empty;
             defer run_results.deinit(s.gpa);
@@ -293,6 +302,7 @@ pub const Session = struct {
             for (reply.tool_calls, 0..) |call, run_index| {
                 run_timing.run_index = run_index;
                 const result = try s.execute(call, sink, cancel, &run_timing);
+                effort.Pending.record(&next_effort, result.effort, result.ok);
                 run_ms += result.run_ms orelse 0;
                 try sink.emit(sink.ctx, .{ .usage = s.usage });
                 try pending.append(s.gpa, .{ .role = "tool", .content = result.output, .tool_call_id = call.id });
@@ -309,6 +319,9 @@ pub const Session = struct {
                 .usage = reply.usage,
                 .ms = ms,
                 .model_ms = model_ms,
+                .effort = decision.metadata.effort,
+                .effort_source = decision.metadata.source,
+                .effort_downgraded = decision.downgraded,
                 .attempts = attempts,
                 .first_data_ms = first_data_ms,
                 .code = try model_timing.finish(s.arena.allocator(), reply.tool_calls),
@@ -326,7 +339,7 @@ pub const Session = struct {
         return error.TooManySteps;
     }
 
-    fn complete(s: *Session, messages: []const provider.Message, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, partial: *Partial, timing: *provider.ModelTiming, attempts: *u32, first_data_ms: *?u64) !provider.Reply {
+    fn complete(s: *Session, request_cfg: provider.Config, messages: []const provider.Message, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, partial: *Partial, timing: *provider.ModelTiming, attempts: *u32, first_data_ms: *?u64) !provider.Reply {
         const Forward = struct {
             sink: Sink,
             gpa: std.mem.Allocator,
@@ -368,7 +381,7 @@ pub const Session = struct {
         };
         var fwd: Forward = .{ .sink = sink, .gpa = s.gpa, .partial = partial, .io = s.io, .started = timing.started, .first_data_ms = first_data_ms, .session = s };
         const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .timing = timing };
-        return provider.complete(s.gpa, s.arena.allocator(), s.client, s.cfg, s.id, messages, tools_json, null, provider_sink, cancel, detail, attempts, .{ .ctx = &fwd, .onEvent = Forward.onRetry });
+        return provider.complete(s.gpa, s.arena.allocator(), s.client, request_cfg, s.id, messages, tools_json, null, provider_sink, cancel, detail, attempts, .{ .ctx = &fwd, .onEvent = Forward.onRetry });
     }
 
     pub const Ran = struct {
@@ -394,7 +407,7 @@ pub const Session = struct {
         return .{ .outcome = outcome, .changes = try s.tools.takeChanges(s.gpa, s.arena.allocator()) };
     }
 
-    const Executed = struct { output: []const u8, ok: bool, run_ms: ?u64 = null };
+    const Executed = struct { output: []const u8, ok: bool, run_ms: ?u64 = null, effort: ?effort.Declaration = null };
 
     /// Output is arena-owned.
     fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const std.atomic.Value(bool), timing: *sandbox.RunTiming) !Executed {
@@ -402,12 +415,14 @@ pub const Session = struct {
         if (!std.mem.eql(u8, call.function.name, "run"))
             return .{ .ok = false, .output = try std.fmt.allocPrint(a, "error: unknown tool `{s}`; the only tool is `run`", .{call.function.name}) };
 
-        const Args = struct { code: []const u8 };
+        const Args = struct { code: ?std.json.Value = null, effort: ?effort.Declaration = null };
         const args = std.json.parseFromSlice(Args, s.gpa, call.function.arguments, .{ .ignore_unknown_fields = true }) catch
             return .{ .ok = false, .output = try a.dupe(u8, "error: arguments must be a JSON object { \"code\": string }") };
         defer args.deinit();
 
-        try sink.emit(sink.ctx, .{ .run_start = args.value.code });
+        const code = if (args.value.code) |value| (if (value == .string) value.string else null) else null;
+        if (code == null) return .{ .ok = false, .output = try a.dupe(u8, "error: arguments must be a JSON object { \"code\": string }"), .effort = args.value.effort };
+        try sink.emit(sink.ctx, .{ .run_start = code.? });
         const Forward = struct {
             const UsageTarget = struct { session: *Session, sink: Sink };
 
@@ -428,14 +443,14 @@ pub const Session = struct {
         var progress_sink = sink;
         s.tools.progress.sink = .{ .ctx = &progress_sink, .emit = Forward.progress };
         defer s.tools.progress.sink = null;
-        const ran = try s.runTimed(args.value.code, cancel, timing);
+        const ran = try s.runTimed(code.?, cancel, timing);
         const o = ran.outcome;
         defer o.deinit(s.gpa);
 
         const output = try output_format.format(a, o);
         const run_ms = timing.elapsed();
         try sink.emit(sink.ctx, .{ .run_end = .{ .ok = o.ok, .output = output, .changes = ran.changes } });
-        return .{ .output = output, .ok = o.ok, .run_ms = run_ms };
+        return .{ .output = output, .ok = o.ok, .run_ms = run_ms, .effort = args.value.effort };
     }
 };
 
@@ -606,4 +621,17 @@ test "compaction cuts preserve recent turns and complete tool groups" {
         messages[6],
     };
     try t.expectEqual(@as(usize, 5), compactionCut(&long_turn, 128_000));
+}
+
+test "run schema exposes optional one-shot effort enum" {
+    const t = std.testing;
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, tools_json, .{});
+    defer parsed.deinit();
+    const parameters = parsed.value.array.items[0].object.get("function").?.object.get("parameters").?;
+    const required = parameters.object.get("required").?.array.items;
+    try t.expectEqual(@as(usize, 1), required.len);
+    try t.expectEqualStrings("code", required[0].string);
+    const values = parameters.object.get("properties").?.object.get("effort").?.object.get("enum").?.array.items;
+    try t.expectEqual(@as(usize, 4), values.len);
+    inline for (.{ "low", "medium", "high", "default" }, 0..) |value, index| try t.expectEqualStrings(value, values[index].string);
 }

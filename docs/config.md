@@ -68,6 +68,20 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 | `NIB_API_KEY` / `DEEPSEEK_API_KEY` | Chat Completions 的凭证，仅从环境读取 |
 | `NIB_ISSUE_REPO` | `/reflect` 自动发布的目标仓库或 `off`，见 [reflect.md](reflect.md) |
 
+## 逐 Step effort 调度
+
+主模型可调用 `run({code: "...", effort: "low"})`，可选值为 `low|medium|high|default`。声明针对看到本次 Run 结果之后的**下一次主模型 Step 请求**，仅生效一次；后续未再次声明则恢复用户设置。同一 Step 多个 Run 取最后一个声明，未声明的 Run 不覆盖它。`default` 显式恢复用户设置。机械性的下一步适合 low，重新设计或疑难排查不宜降档。
+
+护栏由 Session 统一决定：
+
+- 用户有效 effort 既是默认值也是上限；`low < medium < high < xhigh < max`，声明超过上限则回退用户设置。`off/none/minimal` 也不会被模型声明抬升。
+- 服务端 `default` 的实际档位未知，只放行最低档 `low` 或恢复 `default`；`medium/high` 回退默认，不猜测服务端档位。
+- 声明所在的 Run 返回 `ok=false` 时忽略该降档，下一次回退默认；其他未声明 Run 的失败不改变最后一个声明的选择。
+- Turn 首次请求始终用用户设置；压缩保持独立策略；`tools.llm` 保持用户配置及其自己的 effort 参数，不继承主模型的临时降档。
+- Codex 仍沿用现有映射，不能关闭推理的模型将 off 映射为 low。调度不修改用户配置、文件或子会话继承的配置。
+
+TUI 的 Run 摘要末尾显示**产生它的模型请求**实际 effort（不是该 Run 对下一步的声明），护栏来源加 `(guard)`；历史从日志恢复，旧日志无 effort 则不显示。下边框显式设置显示为 `effort ≤high`，服务端 default 显示保持原样。
+
 ## effort 持久化
 
 `default|off|none|minimal|low|medium|high|xhigh|max` 可用于 `--effort` 或 TUI `/effort`；具体支持档位由模型/服务端决定。

@@ -33,6 +33,7 @@ def replay(path):
             continue
         messages = [dict(message) for message in record["messages"]]
         for message in messages:
+            message.pop("step_effort", None)
             if "reasoning" in message:
                 reasoning = message.pop("reasoning")
                 assert reasoning["provider"] == "chat_completions"
@@ -241,6 +242,13 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
             "prompt_tokens": 6600, "completion_tokens": 30, "prompt_cache_hit_tokens": 192}
         assert "hello from bash" in final["text"], final
         assert any(e.get("delta", {}).get("kind") == "reasoning" for e in streamed)
+        assert [e["step"] for e in streamed if "step" in e] == [
+            {"n": 1, "effort": "default", "source": "default"},
+            {"n": 2, "effort": "default", "source": "default"},
+        ], streamed
+        assert all(isinstance(e["run_start"], str) for e in streamed if "run_start" in e), streamed
+        assert next(i for i, e in enumerate(streamed) if "step" in e) < next(
+            i for i, e in enumerate(streamed) if "delta" in e), streamed
         run_start = next(i for i, event in enumerate(streamed) if "run_start" in event)
         reported = [event["usage"] for event in streamed[:run_start] if "usage" in event]
         assert reported[0] == dict(prompt_tokens=0, completion_tokens=0, prompt_cache_hit_tokens=0)
@@ -254,11 +262,15 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         failed = events(ask("reject1", "--json", ok=False))
         assert "start" in failed[0] and "error" in failed[-1]
         assert not any("end" in e for e in failed)
+        assert [e["step"] for e in failed if "step" in e] == [
+            {"n": 1, "effort": "default", "source": "default"}], failed
         assert events(ask("--json", ok=False))[0]["error"]["message"] == "MissingPrompt"
         json_cwd = tmp / "json"
         json_cwd.mkdir()
         compact_json = events(ask("json compact", "--json", workdir=json_cwd, window="4096"))
         assert any("notice" in e for e in compact_json)
+        assert [e["step"]["n"] for e in compact_json if "step" in e] == list(
+            range(1, compact_json[-1]["end"]["steps"] + 1)), compact_json
         print("JSON E2E passed: NDJSON events, stdin, final text/usage/steps, resume, errors and notices")
         timing_home = tmp / "timing-home"
         timed = events(ask("--json", "timing", overrides={"NIB_HOME": str(timing_home)}))
