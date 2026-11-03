@@ -14,6 +14,7 @@ pub const Diagnostic = struct {
 };
 
 pub const Record = struct {
+    at: ?i64 = null,
     diagnostic: ?Diagnostic = null,
     usage: ?provider.Usage = null,
     ms: ?u64 = null,
@@ -66,7 +67,9 @@ pub const Log = struct {
 
     fn append(log: *Log, io: std.Io, a: std.mem.Allocator, record: Record) !void {
         if (log.poisoned) return error.SessionLogFailed;
-        const bytes = try std.fmt.allocPrint(a, "{s}{f}\n", .{ if (record.repair) "\n" else "", std.json.fmt(record, .{ .emit_null_optional_fields = false }) });
+        var stamped = record;
+        stamped.at = @intCast(@divFloor(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
+        const bytes = try std.fmt.allocPrint(a, "{s}{f}\n", .{ if (stamped.repair) "\n" else "", std.json.fmt(stamped, .{ .emit_null_optional_fields = false }) });
         defer a.free(bytes);
         errdefer log.poisoned = true;
         try log.file.writePositionalAll(io, bytes, log.offset);
@@ -272,10 +275,12 @@ test "commit and replay preserve safe history, compaction and torn tail" {
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/s.jsonl", .{tmp.sub_path});
     var log = try Log.create(t.io, path);
     var history: std.ArrayList(provider.Message) = .empty;
+    const before = @divFloor(std.Io.Clock.real.now(t.io).nanoseconds, std.time.ns_per_ms);
     const records = [_]Record{
-        .{ .cwd = "/work", .messages = &.{.{ .role = "system", .content = "base" }} },
+        .{ .at = 1, .cwd = "/work", .messages = &.{.{ .role = "system", .content = "base" }} },
         .{ .from = 1, .messages = &.{ .{ .role = "user", .content = "hi" }, .{ .role = "assistant", .tool_calls = &.{.{ .id = "c", .function = .{ .name = "run", .arguments = "{}" } }} }, .{ .role = "tool", .content = "ok", .tool_call_id = "c" } }, .context_tokens = 100, .usage = .{ .prompt_tokens = 90, .completion_tokens = 10, .prompt_cache_hit_tokens = 20 }, .ms = 42, .run_results = &.{.{ .tool_call_id = "c", .ok = false }} },
         .{ .from = 1, .messages = &.{.{ .role = "user", .content = "summary" }}, .context_tokens = 10 },
+        .{ .from = 2, .messages = &.{ .{ .role = "user", .content = "interrupted" }, .{ .role = "assistant", .content = "partial\n\n[interrupted by user]" } }, .context_tokens = 10 },
     };
     var committed_tokens: u64 = 0;
     for (records) |r| {
@@ -296,7 +301,24 @@ test "commit and replay preserve safe history, compaction and torn tail" {
     try t.expectEqualDeep(history.items, restored.items);
     try log.commit(t.io, a, &restored, &tokens, .{ .from = restored.items.len, .messages = &.{.{ .role = "assistant", .content = "next" }} });
     var again: std.ArrayList(provider.Message) = .empty;
-    _ = try replay(a, a, try tmp.dir.readFileAlloc(t.io, "s.jsonl", a, .unlimited), &again, &tokens);
+    const data = try tmp.dir.readFileAlloc(t.io, "s.jsonl", a, .unlimited);
+    const after = @divFloor(std.Io.Clock.real.now(t.io).nanoseconds, std.time.ns_per_ms);
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    var stamped_count: usize = 0;
+    var repairs: usize = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const record = parseRecord(a, line) catch continue;
+        try t.expect(record.at != null);
+        const at = record.at.?;
+        try t.expect(at >= before and at <= after);
+        stamped_count += 1;
+        if (record.repair) repairs += 1;
+    }
+    try t.expectEqual(records.len + 2, stamped_count);
+    try t.expectEqual(@as(usize, 1), repairs);
+    const result = try replay(a, a, data, &again, &tokens);
+    try t.expect(!result.needs_repair);
     try t.expectEqualDeep(restored.items, again.items);
 }
 
@@ -322,6 +344,8 @@ test "legacy chat reasoning is migrated without changing provider identity" {
     var history: std.ArrayList(provider.Message) = .empty;
     defer history.deinit(t.allocator);
     var tokens: u64 = 0;
+    try t.expectEqual(@as(?i64, null), (try parseRecord(arena.allocator(), "{}")).at);
+    try t.expectEqual(@as(?i64, null), (try parseRecord(arena.allocator(), "{\"at\":null}")).at);
     const result = try replay(t.allocator, arena.allocator(),
         \\{"from":0,"messages":[{"role":"system","content":"s"}]}
         \\{"from":1,"messages":[{"role":"user","content":"u"},{"role":"assistant","content":"a","reasoning_content":"legacy"}]}
@@ -344,7 +368,22 @@ test "diagnostic append and replay do not commit messages or replace context tok
     var history: std.ArrayList(provider.Message) = .empty;
     var tokens: u64 = 0;
     try log.commit(t.io, a, &history, &tokens, .{ .cwd = "/work", .messages = &.{.{ .role = "system", .content = "base" }}, .context_tokens = 123 });
+    const before = @divFloor(std.Io.Clock.real.now(t.io).nanoseconds, std.time.ns_per_ms);
     for (0..10) |_| try log.diagnose(t.io, a, .{ .error_name = "ProviderTransient", .message = "server_error: mock failure", .attempts = 5, .step = 1 });
+    const after = @divFloor(std.Io.Clock.real.now(t.io).nanoseconds, std.time.ns_per_ms);
+    const data = try tmp.dir.readFileAlloc(t.io, "s.jsonl", a, .unlimited);
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    var diagnostics: usize = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const record = try parseRecord(a, line);
+        if (record.diagnostic == null) continue;
+        try t.expect(record.at != null);
+        const at = record.at.?;
+        try t.expect(at >= before and at <= after);
+        diagnostics += 1;
+    }
+    try t.expectEqual(@as(usize, 10), diagnostics);
     try t.expectEqual(@as(usize, 1), history.items.len);
     try t.expectEqual(@as(u64, 123), tokens);
     var restored: std.ArrayList(provider.Message) = .empty;

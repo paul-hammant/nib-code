@@ -98,12 +98,16 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
             return result
 
         stats_home = tmp / "stats-home"
+        stats_started_ms = time.time_ns() // 1_000_000
         for prompt in ("stats good", "stats bad", "stats_missing", "delegate_probe"):
             ask(prompt, overrides={"NIB_HOME": str(stats_home)})
+        stats_finished_ms = time.time_ns() // 1_000_000
         stats_paths = list((stats_home / "sessions").glob("*.jsonl"))
         assert len(stats_paths) == 5
         step_records = [r for p in stats_paths for r in replay(p)[1] if r["from"] > 0]
         assert len(step_records) == 9
+        assert all(type(r.get("at")) is int and stats_started_ms <= r["at"] <= stats_finished_ms
+                   for r in step_records), step_records
         assert all(r["usage"]["prompt_tokens"] == 3300 and isinstance(r["ms"], int)
                    and r["ms"] > 0 for r in step_records)
         assert sum(not result["ok"] for r in step_records for result in r["run_results"]) == 1
