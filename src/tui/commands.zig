@@ -1,7 +1,7 @@
 const std = @import("std");
 const provider = @import("../provider.zig");
 
-pub const Command = enum { help, new, @"resume", compact, effort, copy, js };
+pub const Command = enum { help, new, @"resume", compact, effort, copy, reflect, js };
 
 pub const Choices = enum { none, efforts, sessions };
 
@@ -22,6 +22,7 @@ pub const specs = std.enums.EnumArray(Command, Spec).init(.{
     .compact = .{ .help = "summarize earlier history now" },
     .effort = .{ .args = "[level]", .help = "show or set reasoning effort", .choices = .efforts },
     .copy = .{ .help = "copy the last answer to the clipboard", .while_busy = true },
+    .reflect = .{ .args = "[focus]", .help = "review this session for harness problems; saved to reflections.md" },
     .js = .{ .args = "<code>", .help = "run JavaScript in the sandbox", .needs_arg = true },
 });
 

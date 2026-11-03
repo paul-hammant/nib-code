@@ -194,6 +194,7 @@ test {
     _ = @import("tools/diff.zig");
     _ = @import("tui/editor.zig");
     _ = @import("tui/commands.zig");
+    _ = @import("tui/reflect.zig");
     _ = @import("tui/transcript.zig");
     _ = @import("tui/viewport.zig");
     _ = @import("tui/menu.zig");
