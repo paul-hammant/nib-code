@@ -13,6 +13,8 @@ import sys
 import threading
 import time
 
+from mock_llm_tool import run_code as llm_run_code, serve as serve_llm
+
 LOG = open(sys.argv[2], "a")
 LOCK = threading.Lock()
 ATTEMPTS = {}
@@ -28,6 +30,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             LOG.write(json.dumps({"path": self.path, "headers": dict(self.headers), "body": body}) + "\n")
             LOG.flush()
             number = sum(ATTEMPTS.values())
+        if serve_llm(self, body, "codex"):
+            return
         inputs = body.get("input", [])
         users = [item for item in inputs if item.get("role") == "user"]
         def content(item):
@@ -127,6 +131,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 code = ('await tools.bash({command: "sleep 0.08; printf 计时🙂"}); '
                         'await tools.write({path: "timing.txt", content: "计时🙂"}); '
                         'await tools.read({path: "timing.txt"})')
+            code = llm_run_code(prompt) or code
             arguments = json.dumps({"code": code}, ensure_ascii=prompt not in ("timing", "timing final only"))
             index = len(output)
             item = {"id": f"fc_{number}", "type": "function_call", "call_id": f"call_{number}",

@@ -27,6 +27,8 @@ pub const Host = struct {
     cancel: ?*std.atomic.Value(bool) = null,
     call: *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8, args_json: []const u8) ToolResult,
     poll: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+    /// Runs before enqueue; rejection messages use `gpa` and are caller-owned.
+    admit: ?*const fn (ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8) anyerror!?[]u8 = null,
     /// Borrowed until eval returns; inspect entries or change started/run_index only between evals.
     timing: ?*RunTiming = null,
 };
@@ -366,6 +368,22 @@ fn enqueue(st: *State, ctx: *c.JSContext, argc: c_int, argv: [*c]c.JSValue) !c.J
     errdefer {
         c.JS_FreeValue(ctx, promise);
         for (settle) |v| c.JS_FreeValue(ctx, v);
+    }
+    if (st.host.?.admit) |admit| {
+        if (try admit(st.host.?.ctx, st.gpa, name)) |message| {
+            defer st.gpa.free(message);
+            const reason = c.JS_NewError(ctx);
+            _ = c.JS_SetPropertyStr(ctx, reason, "message", c.JS_NewStringLen(ctx, message.ptr, message.len));
+            defer c.JS_FreeValue(ctx, reason);
+            var values = [_]c.JSValue{reason};
+            const result = c.JS_Call(ctx, settle[1], js_undefined, 1, &values);
+            c.JS_FreeValue(ctx, result);
+            for (settle) |v| c.JS_FreeValue(ctx, v);
+            st.gpa.free(name);
+            st.gpa.free(args);
+            st.gpa.destroy(call);
+            return promise;
+        }
     }
     call.* = .{ .state = st, .index = st.calls.items.len, .name = name, .args = args, .settle = settle };
     try st.calls.append(st.gpa, call);

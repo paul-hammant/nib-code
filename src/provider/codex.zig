@@ -165,9 +165,13 @@ fn requestBody(gpa: std.mem.Allocator, cfg: p.Config, cache_key: []const u8, mes
     try tool_writer.writer.writeByte(']');
     const effort = reasoningEffort(cfg);
     const reasoning = if (effort) |value| try std.fmt.allocPrint(a, ",\"reasoning\":{{\"effort\":{f},\"summary\":\"auto\"}}", .{std.json.fmt(value, .{})}) else "";
+    const format = if (cfg.output_schema) |schema|
+        try std.fmt.allocPrint(a, ",\"text\":{f}", .{std.json.fmt(.{ .format = .{ .type = "json_schema", .name = "result", .strict = true, .schema = schema } }, .{})})
+    else
+        "";
     return std.fmt.allocPrint(gpa,
-        \\{{"model":{f},"prompt_cache_key":{f},"store":false,"stream":true,"instructions":{f},"input":{s},"include":["reasoning.encrypted_content"]{s}{s}}}
-    , .{ std.json.fmt(cfg.model, .{}), std.json.fmt(cache_key, .{}), std.json.fmt(instructions, .{}), input.written(), if (tools.len == 0) "" else try std.fmt.allocPrint(a, ",\"tools\":{s}", .{tool_writer.written()}), reasoning });
+        \\{{"model":{f},"prompt_cache_key":{f},"store":false,"stream":true,"instructions":{f},"input":{s},"include":["reasoning.encrypted_content"]{s}{s}{s}}}
+    , .{ std.json.fmt(cfg.model, .{}), std.json.fmt(cache_key, .{}), std.json.fmt(instructions, .{}), input.written(), if (tools.len == 0) "" else try std.fmt.allocPrint(a, ",\"tools\":{s}", .{tool_writer.written()}), reasoning, format });
 }
 
 const Output = struct {
@@ -587,4 +591,43 @@ test "Codex parser times argument deltas and final-only calls at sparse output i
     reader = .fixed(bytes.written());
     const untimed = try readStream(t.allocator, out, &reader, .{ .ctx = &count, .onDelta = Counter.delta }, &cancel, &detail);
     try t.expectEqualStrings(try std.json.Stringify.valueAlloc(out, untimed, .{}), try std.json.Stringify.valueAlloc(out, reply, .{}));
+}
+
+test "tool-free JSON requests move system to instructions and use strict named schema" {
+    const t = std.testing;
+    const schema = try std.json.parseFromSlice(std.json.Value, t.allocator, "{\"type\":\"object\",\"properties\":{\"answer\":{\"type\":\"string\"}},\"required\":[\"answer\"],\"additionalProperties\":false}", .{});
+    defer schema.deinit();
+    const system = "Return JSON.\nUse the \"answer\" field.";
+    const messages = [_]p.Message{
+        .{ .role = "system", .content = system },
+        .{ .role = "user", .content = "question" },
+    };
+    for ([_]?std.json.Value{ null, schema.value }) |output_schema| {
+        const body = try requestBody(t.allocator, .{ .base_url = "", .api_key = "", .model = "m", .output_schema = output_schema }, "cache", &messages, "[]", null);
+        defer t.allocator.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, body, .{});
+        defer parsed.deinit();
+        const object = parsed.value.object;
+        try t.expect(!object.contains("tools"));
+        try t.expect(!object.contains("response_format"));
+        try t.expectEqualStrings(system, object.get("instructions").?.string);
+        const input = object.get("input").?.array.items;
+        try t.expectEqual(@as(usize, 1), input.len);
+        try t.expectEqualStrings("user", input[0].object.get("role").?.string);
+        try t.expectEqualStrings("question", input[0].object.get("content").?.string);
+        if (output_schema != null) {
+            const text = object.get("text").?.object;
+            try t.expectEqual(@as(usize, 1), text.count());
+            const format = text.get("format").?.object;
+            try t.expectEqual(@as(usize, 4), format.count());
+            try t.expectEqualStrings("json_schema", format.get("type").?.string);
+            try t.expectEqualStrings("result", format.get("name").?.string);
+            try t.expect(format.get("strict").?.bool);
+            const actual = try std.json.Stringify.valueAlloc(t.allocator, format.get("schema").?, .{});
+            defer t.allocator.free(actual);
+            try t.expectEqualStrings("{\"type\":\"object\",\"properties\":{\"answer\":{\"type\":\"string\"}},\"required\":[\"answer\"],\"additionalProperties\":false}", actual);
+        } else {
+            try t.expect(!object.contains("text"));
+        }
+    }
 }

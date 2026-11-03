@@ -22,6 +22,7 @@ edits files. "fetch_test" fetches GET /redirect (to /page) and
 Child Runs report the exposed tools, allowing depth-limit checks.
 Each request is logged to LOGFILE as one JSON line, with a monotonic received time."""
 import http.server, json, os, shlex, sys, threading, time
+from mock_llm_tool import run_code as llm_run_code, serve as serve_llm
 LOG=open(sys.argv[2],'a')
 LOG_LOCK = threading.Lock()
 class H(http.server.BaseHTTPRequestHandler):
@@ -47,6 +48,8 @@ class H(http.server.BaseHTTPRequestHandler):
         with LOG_LOCK:
             LOG.write(json.dumps({"received":time.monotonic(),"n":len(msgs),"roles":[m['role'] for m in msgs],"has_tools":(body.get('tools') or [{}])[0].get('function',{}).get('name'),
                               "messages":msgs,"thinking":body.get('thinking'),"system_has_tools_api":'const tools = {' in msgs[0].get('content','')})+"\n"); LOG.flush()
+        if serve_llm(self, body, 'chat_completions'):
+            return
         summary = 'max_tokens' in body and not body.get('tools')
         lastuser=[m for m in msgs if m['role']=='user'][-1]['content']
         if ('reject1' in lastuser or (msgs[-1]['role']=='tool' and 'reject2' in lastuser)) and not summary:
@@ -154,6 +157,7 @@ class H(http.server.BaseHTTPRequestHandler):
                 code = ('await tools.bash({command: "sleep 0.08; printf 计时🙂"}); '
                         'await tools.write({path: "timing.txt", content: "计时🙂"}); '
                         'await tools.read({path: "timing.txt"})')
+            code = llm_run_code(lastuser) or code
             args=json.dumps({"code":code}, ensure_ascii=lastuser != "timing")
             if thinking: ev({"choices":[{"delta":{"reasoning_content":"先用 bash 看看。"}}]})
             ev({"choices":[{"delta":{"content":"我先跑一下。"}}]})

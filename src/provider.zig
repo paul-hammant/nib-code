@@ -3,6 +3,11 @@ const chat = @import("provider/openai.zig");
 const codex = @import("provider/codex.zig");
 const cancelable = @import("provider/cancel.zig");
 const model_timing = @import("provider/timing.zig");
+const retry = @import("provider/retry.zig");
+pub const complete = retry.complete;
+pub const RetryEvent = retry.Event;
+pub const RetrySink = retry.Sink;
+pub const max_attempts = retry.max_attempts;
 pub const ModelTiming = model_timing.Model;
 
 pub const Id = enum { chat_completions, codex };
@@ -16,6 +21,9 @@ pub const Config = struct {
     context_window: u64 = 1_000_000,
     thinking: ?bool = null,
     reasoning_effort: ?[]const u8 = null,
+    /// Borrowed for the duration of the request.
+    output_schema: ?std.json.Value = null,
+    prompt_cache_key: ?[]const u8 = null,
     /// Values `setEffort` accepts; `default` and `off` first, then levels.
     pub const effort_values = [_][]const u8{ "default", "off", "none", "minimal", "low", "medium", "high", "xhigh", "max" };
 
@@ -95,7 +103,7 @@ pub const Usage = struct {
     }
 };
 
-/// Allocated with the `out` allocator passed to `stream`.
+/// Allocated with the `out` allocator passed to `stream` or `complete`.
 pub const Reply = struct {
     text: []const u8,
     reasoning: ?Reasoning = null,
@@ -107,6 +115,8 @@ pub const Reply = struct {
 pub const Kind = enum { text, reasoning };
 
 pub const Sink = struct {
+    /// Only buffered callers may replay Chat deltas after a transient failure.
+    replay_safe: bool = false,
     timing: ?*model_timing.Model = null,
     ctx: *anyopaque,
     onDelta: *const fn (ctx: *anyopaque, kind: Kind, text: []const u8) anyerror!void,

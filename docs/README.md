@@ -40,6 +40,7 @@
   - [0010 子 agent：tools.agent 派生独立 nib 子进程](adr/0010-subagents.md)
   - [0011 一个 Provider 接口，两种线路协议](adr/0011-provider-wire-protocols.md)
   - [0012 新增 grep、glob、fetch，搜索用 Zig 原生实现](adr/0012-search-and-fetch-tools.md)
+  - [0013 tools.llm：轻量的单步 map 单元](adr/0013-llm-functions.md)
 - [config.md](config.md)：NIB_HOME、配置文件、覆盖优先级与 effort 持久化
 - [codex.md](codex.md)：使用本机 Codex 登录、配置与凭证边界
 - [run-output.md](run-output.md)：Run 的共享输出预算、条目与省略标记
