@@ -1,4 +1,4 @@
-"""Shared tools.llm probes for the Chat Completions and Codex mocks.
+"""Shared tools.llm and Run effort probes for both provider mocks.
 
 llm_* session prompts generate Runs; the exact SYSTEM identifies pure model
 requests, not summaries. MOCK_LLM_TOOL_LOG enables start/end JSONL observations
@@ -179,4 +179,92 @@ def serve(handler, body, provider):
                 ACTIVE -= 1
                 record({"event": "end", "id": request_id, "active": ACTIVE, "mode": mode,
                         "input": input_text, "outcome": outcome})
+    return True
+
+
+EFFORT_PLAN = [
+    [{"code": "1", "effort": "low"}],
+    [{"code": "2"}],
+    [{"code": "3", "effort": "medium"}],
+    [{"code": "4", "effort": "low"}, {"code": "5", "effort": "high"}, {"code": "6"}],
+    [{"code": "7", "effort": "default"}],
+    [{"code": 'throw new Error("effort failed low")', "effort": "low"}],
+    [{"code": "8", "effort": "low"}, {"code": 'throw new Error("effort failed high")', "effort": "high"}],
+    [{"code": 'throw new Error("effort failed first")', "effort": "high"}, {"code": "9", "effort": "medium"}],
+    [{"code": "10", "effort": "low"}, {"code": 'throw new Error("effort failed undeclared")'}],
+    [{"code": "11", "effort": "high"}],
+    [{"code": "12"}],
+]
+
+
+def serve_effort(handler, body, provider):
+    messages = body.get("input", []) if provider == "codex" else body.get("messages", [])
+    users = [i for i, message in enumerate(messages) if message.get("role") == "user"]
+    if not users or content(messages[users[-1]]) != "effort schedule":
+        return False
+    outputs = sum(message.get("type") == "function_call_output" or message.get("role") == "tool"
+                  for message in messages[users[-1] + 1:])
+    step = 0
+    while step < len(EFFORT_PLAN) and outputs >= len(EFFORT_PLAN[step]):
+        outputs -= len(EFFORT_PLAN[step])
+        step += 1
+    assert outputs == 0, messages
+    runs = EFFORT_PLAN[step] if step < len(EFFORT_PLAN) else []
+    handler.send_response(200)
+    handler.send_header("content-type", "text/event-stream")
+    handler.send_header("transfer-encoding", "chunked")
+    handler.end_headers()
+    sequence = 0
+
+    def chunk(data):
+        handler.wfile.write(b"%x\r\n" % len(data) + data + b"\r\n")
+
+    def event(kind=None, **fields):
+        nonlocal sequence
+        if kind is not None:
+            fields = {"type": kind, "sequence_number": sequence, **fields}
+        chunk((("event: " + kind + "\n" if kind else "") +
+               "data: " + json.dumps(fields) + "\n\n").encode())
+        sequence += 1
+
+    text = "Effort schedule complete."
+    if provider == "codex":
+        response_id = f"effort_response_{step}"
+        event("response.created", response={"id": response_id, "status": "in_progress", "output": []})
+        output = []
+        for index, arguments in enumerate(runs):
+            item = {"id": f"effort_fc_{step}_{index}", "type": "function_call",
+                    "call_id": f"effort_call_{step}_{index}", "name": "run",
+                    "arguments": json.dumps(arguments), "status": "completed"}
+            event("response.output_item.added", output_index=index, item={**item, "arguments": "", "status": "in_progress"})
+            event("response.function_call_arguments.delta", output_index=index, item_id=item["id"], delta=item["arguments"])
+            event("response.function_call_arguments.done", output_index=index, item_id=item["id"], arguments=item["arguments"])
+            event("response.output_item.done", output_index=index, item=item)
+            output.append(item)
+        if not runs:
+            item = {"id": f"effort_msg_{step}", "type": "message", "role": "assistant",
+                    "status": "completed", "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": text, "annotations": []}]}
+            event("response.output_item.added", output_index=0, item={**item, "content": [], "status": "in_progress"})
+            event("response.content_part.added", output_index=0, item_id=item["id"], content_index=0,
+                  part={"type": "output_text", "text": "", "annotations": []})
+            event("response.output_text.delta", output_index=0, item_id=item["id"], content_index=0, delta=text)
+            event("response.output_text.done", output_index=0, item_id=item["id"], content_index=0, text=text)
+            event("response.output_item.done", output_index=0, item=item)
+            output.append(item)
+        event("response.completed", response={"id": response_id, "status": "completed", "output": output,
+              "usage": {"input_tokens": 100, "output_tokens": 20}})
+    else:
+        if (body.get("thinking") or {}).get("type") != "disabled":
+            event(choices=[{"delta": {"reasoning_content": "Effort probe."}}])
+        for index, arguments in enumerate(runs):
+            event(choices=[{"delta": {"tool_calls": [{"index": index, "id": f"effort_call_{step}_{index}",
+                  "type": "function", "function": {"name": "run", "arguments": json.dumps(arguments)}}]}}])
+        if not runs:
+            event(choices=[{"delta": {"content": text}}])
+        event(choices=[{"delta": {}, "finish_reason": "tool_calls" if runs else "stop"}],
+              usage={"prompt_tokens": 100, "completion_tokens": 20})
+        chunk(b"data: [DONE]\n\n")
+    handler.wfile.write(b"0\r\n\r\n")
+    handler.wfile.flush()
     return True

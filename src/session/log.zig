@@ -18,6 +18,9 @@ pub const Record = struct {
     at: ?i64 = null,
     diagnostic: ?Diagnostic = null,
     usage: ?provider.Usage = null,
+    effort: ?[]const u8 = null,
+    effort_source: ?provider.EffortSource = null,
+    effort_downgraded: ?bool = null,
     ms: ?u64 = null,
     model_ms: ?u64 = null,
     attempts: ?u32 = null,
@@ -104,6 +107,12 @@ pub const Log = struct {
 fn apply(history: *std.ArrayList(provider.Message), record: Record) void {
     history.shrinkRetainingCapacity(record.from);
     history.appendSliceAssumeCapacity(record.messages);
+    if (record.effort) |effort| {
+        const source = record.effort_source orelse .default;
+        for (history.items[record.from..]) |*message| {
+            if (std.mem.eql(u8, message.role, "assistant")) message.step_effort = .{ .effort = effort, .source = source };
+        }
+    }
 }
 
 pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, history: *std.ArrayList(provider.Message), tokens: *u64) !struct { needs_repair: bool, parent_session_id: ?[]const u8, provider: provider.Id, model: ?[]const u8 } {
@@ -457,4 +466,35 @@ test "timing fields are optional and replay preserves mixed old and measured Ste
     try t.expectEqualStrings("old", history.items[1].content.?);
     try t.expectEqualStrings("new", history.items[2].content.?);
     try t.expectEqual(@as(u64, 99), tokens);
+}
+
+test "Step effort restores from Record and survives compacted message snapshots" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base: Record = .{ .messages = &.{
+        .{ .role = "system", .content = "base" },
+        .{ .role = "user", .content = "task" },
+        .{ .role = "assistant", .content = "legacy" },
+    } };
+    const step: Record = .{ .from = 3, .effort = "high", .effort_source = .guard, .context_tokens = 99, .messages = &.{
+        .{ .role = "assistant", .content = "new", .step_effort = .{ .effort = "low", .source = .model } },
+    } };
+    const data = try std.fmt.allocPrint(a, "{f}\n{f}\n", .{ std.json.fmt(base, .{ .emit_null_optional_fields = false }), std.json.fmt(step, .{ .emit_null_optional_fields = false }) });
+    var history: std.ArrayList(provider.Message) = .empty;
+    var tokens: u64 = 0;
+    _ = try replay(a, a, data, &history, &tokens);
+    try t.expect(history.items[2].step_effort == null);
+    try t.expectEqualStrings("high", history.items[3].step_effort.?.effort);
+    try t.expectEqual(provider.EffortSource.guard, history.items[3].step_effort.?.source);
+    const compacted: Record = .{ .from = 0, .messages = history.items, .context_tokens = 20 };
+    const compacted_data = try std.fmt.allocPrint(a, "{s}{f}\n", .{ data, std.json.fmt(compacted, .{ .emit_null_optional_fields = false }) });
+    var restored: std.ArrayList(provider.Message) = .empty;
+    _ = try replay(a, a, compacted_data, &restored, &tokens);
+    try t.expectEqualDeep(history.items, restored.items);
+    try t.expectEqual(@as(u64, 20), tokens);
+    const old = try parseRecord(a, "{\"messages\":[{\"role\":\"assistant\",\"content\":\"old\"}]}");
+    try t.expect(old.effort == null and old.effort_source == null);
+    try t.expect(old.messages[0].step_effort == null);
 }

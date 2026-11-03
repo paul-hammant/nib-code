@@ -29,6 +29,7 @@ const Event = union(enum) {
     tick,
     model_activity: struct { state: ModelActivity, at: std.Io.Clock.Timestamp },
     /// Slices are owned by the receiver.
+    step: struct { n: u32, effort: []u8, source: provider.EffortSource },
     delta: struct { kind: provider.Kind, text: []u8, step: u32 },
     run_start: struct { code: []u8, step: u32 },
     run_end: struct { ok: bool, output: []u8, changes: ChangeText },
@@ -117,6 +118,7 @@ const Turn = struct {
         const t: *Turn = @ptrCast(@alignCast(ctx));
         const gpa = t.gpa;
         const event: Event = switch (ev) {
+            .step => |s| .{ .step = .{ .n = s.n, .effort = try gpa.dupe(u8, s.effort), .source = s.source } },
             .delta => |d| .{ .delta = .{ .kind = d.kind, .text = try gpa.dupe(u8, d.text), .step = t.session.steps + 1 } },
             .run_start => |code| .{ .run_start = .{ .code = try gpa.dupe(u8, code), .step = t.session.steps } },
             .run_end => |r| .{ .run_end = .{ .ok = r.ok, .output = try gpa.dupe(u8, r.output), .changes = try .init(gpa, r.changes) } },
@@ -126,9 +128,13 @@ const Turn = struct {
             .progress => |p| .{ .progress = try p.clone(gpa) },
             .turn_end => |summary| .{ .turn_end = summary },
         };
-        errdefer if (event == .progress) {
-            var owned = event.progress;
-            owned.deinit(gpa);
+        errdefer switch (event) {
+            .step => |s| gpa.free(s.effort),
+            .progress => |p| {
+                var owned = p;
+                owned.deinit(gpa);
+            },
+            else => {},
         };
         try t.loop.postEvent(event);
     }
@@ -265,6 +271,7 @@ const App = struct {
     pasting: bool = false,
     paste_buf: std.ArrayList(u8) = .empty,
     live_steps: u32 = 0,
+    step_effort: ?provider.StepEffort = null,
     scroll: Viewport = .{},
     menu: Menu,
     status_text: status.Text = .{},
@@ -282,6 +289,7 @@ const App = struct {
             t.finish();
         }
         app.stopReflecting();
+        app.clearStepEffort();
         if (app.issues) |job| job.finish();
         app.menu.deinit();
         app.transcript.deinit(app.gpa);
@@ -329,6 +337,11 @@ const App = struct {
                 app.selection.clear();
                 try app.vx.resize(gpa, app.w, ws);
             },
+            .step => |s| {
+                app.clearStepEffort();
+                app.step_effort = .{ .effort = s.effort, .source = s.source };
+                app.live_steps = s.n;
+            },
             .delta => |d| {
                 defer gpa.free(d.text);
                 app.live_steps = d.step;
@@ -339,7 +352,7 @@ const App = struct {
                 defer gpa.free(r.code);
                 app.live_steps = r.step;
                 app.activity.set(app.io, .running);
-                try app.transcript.startRun(gpa, r.code);
+                try app.transcript.startRunWithEffort(gpa, r.code, app.step_effort);
             },
             .run_end => |r| {
                 defer gpa.free(r.output);
@@ -649,7 +662,13 @@ const App = struct {
         app.pending_bill = null;
     }
 
+    fn clearStepEffort(app: *App) void {
+        if (app.step_effort) |effort| app.gpa.free(effort.effort);
+        app.step_effort = null;
+    }
+
     fn finishTurn(app: *App) void {
+        app.clearStepEffort();
         app.turn.?.finish();
         app.turn = null;
         app.usage = app.session.usage;
@@ -840,4 +859,31 @@ test "insertion notifications reach the queued user entry" {
     try Turn.userInserted(&turn, 42);
     _ = try app.handle((try loop.tryEvent()).?);
     try t.expectEqual(@as(?u64, null), app.transcript.entries.items[0].queued);
+}
+
+test "Step events own effort and Runs keep their generating Step metadata" {
+    const t = std.testing;
+    var app: App = undefined;
+    app.gpa = t.allocator;
+    app.io = t.io;
+    app.transcript = .{};
+    defer app.transcript.deinit(t.allocator);
+    app.step_effort = null;
+    defer app.clearStepEffort();
+    app.activity = .start(t.io, .thinking);
+    var loop: vaxis.Loop(Event) = .{ .io = t.io, .tty = undefined, .vaxis = undefined, .queue = .init(t.io) };
+    var turn: Turn = undefined;
+    turn.gpa = t.allocator;
+    turn.loop = &loop;
+    var effort = [_]u8{ 'h', 'i', 'g', 'h' };
+    try Turn.emit(&turn, .{ .step = .{ .n = 3, .effort = &effort, .source = .guard } });
+    effort[0] = 'x';
+    _ = try app.handle((try loop.tryEvent()).?);
+    try t.expectEqual(@as(u32, 3), app.live_steps);
+    _ = try app.handle(.{ .run_start = .{ .code = try t.allocator.dupe(u8, "tools.read({})"), .step = 3 } });
+    _ = try app.handle(.{ .run_end = .{ .ok = true, .output = try t.allocator.dupe(u8, "out"), .changes = .{} } });
+    _ = try app.handle(.{ .step = .{ .n = 4, .effort = try t.allocator.dupe(u8, "low"), .source = .model } });
+    try t.expectEqualStrings("high", app.transcript.entries.items[0].step_effort.?.effort);
+    try t.expectEqualStrings("low", app.step_effort.?.effort);
+    try t.expect(std.mem.endsWith(u8, app.transcript.entries.items[0].label.items, " · high (guard)"));
 }

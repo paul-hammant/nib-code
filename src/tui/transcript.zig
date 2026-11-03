@@ -29,11 +29,13 @@ pub const Entry = struct {
     label: std.ArrayList(u8) = .empty,
     run: enum { running, ok, failed } = .running,
     elapsed_ms: u64 = 0,
+    step_effort: ?provider.StepEffort = null,
     /// Collapsible entries share the transcript ctrl+o state.
     open: bool = false,
     cached: ?struct { width: u16, len: usize, open: bool, rows: u16 } = null,
 
     pub fn deinit(e: *Entry, gpa: std.mem.Allocator) void {
+        if (e.step_effort) |effort| gpa.free(effort.effort);
         e.text.deinit(gpa);
         e.output.deinit(gpa);
         e.label.deinit(gpa);
@@ -82,6 +84,9 @@ pub const Entry = struct {
                     try e.label.print(gpa, "{s} · {d}.{d}s", .{ used, e.elapsed_ms / 1000, e.elapsed_ms % 1000 / 100 });
                 }
                 if (e.changes.summary.len > 0) try e.label.print(gpa, " · {s}", .{e.changes.summary});
+                if (e.step_effort) |effort| {
+                    try e.label.print(gpa, " · {s}{s}", .{ effort.effort, if (effort.source == .guard) " (guard)" else "" });
+                }
             },
             .user => {
                 try e.label.print(gpa, " … +{d} lines", .{long_text.lines(e.text.items) - 1});
@@ -280,7 +285,11 @@ pub const Transcript = struct {
     }
 
     pub fn startRun(t: *Transcript, gpa: std.mem.Allocator, code: []const u8) !void {
-        try t.addRun(gpa, code, t.expanded);
+        try t.startRunWithEffort(gpa, code, null);
+    }
+
+    pub fn startRunWithEffort(t: *Transcript, gpa: std.mem.Allocator, code: []const u8, effort: ?provider.StepEffort) !void {
+        try t.addRun(gpa, code, t.expanded, effort);
     }
 
     pub fn progress(t: *Transcript, gpa: std.mem.Allocator, p: Progress) !void {
@@ -330,7 +339,7 @@ pub const Transcript = struct {
                     const Args = struct { code: []const u8 = "" };
                     const args = std.json.parseFromSlice(Args, gpa, call.function.arguments, .{ .ignore_unknown_fields = true }) catch continue;
                     defer args.deinit();
-                    try t.addRun(gpa, args.value.code, false);
+                    try t.addRun(gpa, args.value.code, false, m.step_effort);
                 }
             } else if (std.mem.eql(u8, m.role, "tool")) {
                 if (t.lastRunning()) |e| {
@@ -342,8 +351,10 @@ pub const Transcript = struct {
         }
     }
 
-    fn addRun(t: *Transcript, gpa: std.mem.Allocator, code: []const u8, open: bool) !void {
+    fn addRun(t: *Transcript, gpa: std.mem.Allocator, code: []const u8, open: bool, effort: ?provider.StepEffort) !void {
         var e: Entry = .{ .kind = .run, .open = open };
+        errdefer e.deinit(gpa);
+        if (effort) |value| e.step_effort = .{ .effort = try gpa.dupe(u8, value.effort), .source = value.source };
         try e.text.appendSlice(gpa, std.mem.trim(u8, code, "\n"));
         try e.refreshLabel(gpa);
         try t.entries.append(gpa, e);
@@ -727,4 +738,44 @@ test "queued users have a dim marker until their insertion event" {
     t.removeQueued(gpa);
     try testing.expectEqual(@as(usize, 1), t.entries.items.len);
     try testing.expectEqualStrings("first", t.entries.items[0].text.items);
+}
+
+test "Run summaries retain their generating Step effort while running and done" {
+    const gpa = testing.allocator;
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    for ([_]provider.StepEffort{
+        .{ .effort = "low", .source = .model },
+        .{ .effort = "high", .source = .default },
+        .{ .effort = "high", .source = .guard },
+        .{ .effort = "default", .source = .default },
+    }) |effort| {
+        try t.startRunWithEffort(gpa, "tools.edit({})", effort);
+        const e = &t.entries.items[t.entries.items.len - 1];
+        const suffix = try std.fmt.allocPrint(gpa, " · {s}{s}", .{ effort.effort, if (effort.source == .guard) " (guard)" else "" });
+        defer gpa.free(suffix);
+        try testing.expect(std.mem.endsWith(u8, e.label.items, suffix));
+        try testing.expect(std.mem.indexOf(u8, e.label.items, "running") != null);
+        try t.endRun(gpa, effort.source != .guard, "output", 1234, .{ .summary = try gpa.dupe(u8, "a.zig +1 −0") });
+        try testing.expect(std.mem.endsWith(u8, e.label.items, suffix));
+        try testing.expect(std.mem.indexOf(u8, e.label.items, "a.zig +1 −0") != null);
+    }
+}
+
+test "history Run effort is copied from assistant metadata and absent in legacy history" {
+    const gpa = testing.allocator;
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    var effort = [_]u8{ 'h', 'i', 'g', 'h' };
+    const calls: []const provider.ToolCall = &.{.{ .id = "1", .function = .{ .name = "run", .arguments = "{\"code\":\"tools.bash({})\"}" } }};
+    try t.addHistory(gpa, &.{
+        .{ .role = "assistant", .tool_calls = calls, .step_effort = .{ .effort = &effort, .source = .guard } },
+        .{ .role = "tool", .tool_call_id = "1", .content = "out" },
+        .{ .role = "assistant", .tool_calls = calls },
+        .{ .role = "tool", .tool_call_id = "1", .content = "out" },
+    });
+    effort[0] = 'x';
+    try t.entries.items[0].refreshLabel(gpa);
+    try testing.expectEqualStrings("bash · 0.0s · high (guard)", t.entries.items[0].label.items);
+    try testing.expectEqualStrings("bash · 0.0s", t.entries.items[1].label.items);
 }

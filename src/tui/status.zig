@@ -84,10 +84,16 @@ pub const Text = struct {
     pub fn footer(text: *Text, s: Status, width: u16) []const u8 {
         var input: [32]u8 = undefined;
         var output: [32]u8 = undefined;
-        var line = std.fmt.bufPrint(&text.status, "{s} · effort {s} · ctx {d}% · in {s} ({d}% cached) · out {s} · {s}: {d} steps", .{
-            s.cfg.model,                                 s.cfg.effectiveEffort(),                                                s.context * 100 / @max(s.cfg.context_window, 1),
-            tokens(&input, s.usage.prompt_tokens),       s.usage.prompt_cache_hit_tokens * 100 / @max(s.usage.prompt_tokens, 1), tokens(&output, s.usage.completion_tokens),
-            if (s.busy != null) "turn" else "last turn", s.steps,
+        var line = std.fmt.bufPrint(&text.status, "{s} · effort {s}{s} · ctx {d}% · in {s} ({d}% cached) · out {s} · {s}: {d} steps", .{
+            s.cfg.model,
+            if (s.cfg.thinking != null or s.cfg.reasoning_effort != null) "≤" else "",
+            s.cfg.effectiveEffort(),
+            s.context * 100 / @max(s.cfg.context_window, 1),
+            tokens(&input, s.usage.prompt_tokens),
+            s.usage.prompt_cache_hit_tokens * 100 / @max(s.usage.prompt_tokens, 1),
+            tokens(&output, s.usage.completion_tokens),
+            if (s.busy != null) "turn" else "last turn",
+            s.steps,
         }) catch "";
         while (std.mem.lastIndexOf(u8, line, " · ")) |separator| {
             if (@import("vaxis").gwidth.gwidth(line, .unicode) <= width) break;
@@ -145,4 +151,17 @@ test "model silence threshold, data reset, and request boundaries" {
     activity.modelActivity(.started, later);
     try t.expectEqual(@as(?u64, 0), activity.labelAt(later).no_data_ms);
     try t.expectEqual(Phase.compacting, activity.phase);
+}
+
+test "effort footer marks configured ceilings but preserves default" {
+    const t = std.testing;
+    var text: Text = .{};
+    for ([_]provider.Id{ .chat_completions, .codex }) |id| {
+        var cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "m", .provider = id };
+        try t.expect(std.mem.startsWith(u8, text.footer(.{ .cfg = cfg }, 200), "m · effort server default ·"));
+        try cfg.setEffort("high");
+        try t.expect(std.mem.startsWith(u8, text.footer(.{ .cfg = cfg }, 200), "m · effort ≤high ·"));
+        try cfg.setEffort("default");
+        try t.expect(std.mem.startsWith(u8, text.footer(.{ .cfg = cfg }, 200), "m · effort server default ·"));
+    }
 }

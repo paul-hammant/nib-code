@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 
-from mock_llm_tool import run_code as llm_run_code, serve as serve_llm
+from mock_llm_tool import run_code as llm_run_code, serve as serve_llm, serve_effort
 
 LOG = open(sys.argv[2], "a")
 LOCK = threading.Lock()
@@ -30,6 +30,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             LOG.write(json.dumps({"path": self.path, "headers": dict(self.headers), "body": body}) + "\n")
             LOG.flush()
             number = sum(ATTEMPTS.values())
+        if serve_effort(self, body, "codex"):
+            return
         if serve_llm(self, body, "codex"):
             return
         inputs = body.get("input", [])

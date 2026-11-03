@@ -204,6 +204,7 @@ def test_during_run_and_resume(tmp):
             message = dict(message)
             if "reasoning" in message:
                 message["reasoning_content"] = message.pop("reasoning")["data"]
+            message.pop("step_effort", None)
             wire.append(message)
         assert resumed.messages == wire + [{"role": "user", "content": "after resume"}]
         events = [json.loads(line) for line in result.stdout.splitlines()]

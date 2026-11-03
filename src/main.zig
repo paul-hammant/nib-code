@@ -126,7 +126,7 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
                         for (r.changes) |c| std.debug.print("\x1b[2mchanged {s}{s} +{d} −{d}\x1b[0m\n", .{ c.path, if (c.created) " (new)" else "", c.added, c.removed });
                     },
                     .retry => |r| std.debug.print("\x1b[2mretry {d} in {d}s: {s}\x1b[0m\n", .{ r.attempt, r.delay_ms / 1000, r.reason }),
-                    .usage, .progress, .turn_end => {},
+                    .step, .usage, .progress, .turn_end => {},
                     .notice => |m| std.debug.print("\x1b[2m{s}\x1b[0m\n", .{m}),
                 }
             }

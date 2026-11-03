@@ -75,6 +75,13 @@ pub const Reasoning = struct {
     data: []const u8,
 };
 
+pub const EffortSource = enum { model, default, guard };
+
+pub const StepEffort = struct {
+    effort: []const u8,
+    source: EffortSource,
+};
+
 pub const Message = struct {
     role: []const u8,
     content: ?[]const u8 = null,
@@ -82,6 +89,7 @@ pub const Message = struct {
     tool_call_id: ?[]const u8 = null,
     reasoning: ?Reasoning = null,
     phase: ?[]const u8 = null,
+    step_effort: ?StepEffort = null,
 };
 
 pub const Usage = struct {

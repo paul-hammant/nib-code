@@ -280,6 +280,8 @@ class StatsTest(unittest.TestCase):
             report = stats.summarize([path])
             timing = report['timing']
             self.assertEqual(report['overall']['steps'], 4)
+            self.assertEqual(timing['effort']['by_effort'], {})
+            self.assertIsNone(timing['effort']['downgraded']['run_failure_rate'])
             self.assertEqual(timing['step_ms'], dict(samples=3, median=100, p90=300))
             self.assertEqual(timing['model_ms'], dict(samples=2, median=75, p90=150))
             self.assertEqual(timing['run_ms'], dict(samples=2, median=50, p90=100))
@@ -300,13 +302,110 @@ class StatsTest(unittest.TestCase):
             text = subprocess.check_output(cli).decode()
             self.assertLessEqual(len(text.split('口径：\n', 1)[1].splitlines()) + 1, 5)
             self.assertLessEqual(len(json_report['notes']), 4)
-            for snippet in ('计时 Timing', 'step_ms: samples=3 median=100.00 p90=300.00',
+            for snippet in ('计时 Timing', '无 effort 记录', 'step_ms: samples=3 median=100.00 p90=300.00',
                             'model_ms: samples=2', 'run_result_ms: samples=2',
                             'code_first_ms: samples=2', 'code_span_ms: samples=2',
                             'code streaming (last-first > 50 ms): 1/2 = 50.00%',
                             'bash: count=2 total=70 ms median=35.00 ms', 'omitted=3',
                             'heuristic', 'unmatched=1', 'git status: count=1 total=60 ms'):
                 self.assertIn(snippet, text)
+
+    def test_effort_groups_downgraded_same_step_run_failures_json_and_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'effort.jsonl'
+            records = [dict(cwd=directory, **{'from': 0},
+                            messages=[dict(role='system', content='base')])]
+            offset = 1
+
+            def step(effort=None, source=None, runs=(), **extra):
+                nonlocal offset
+                calls = [dict(id=f'r{i}', function=dict(name='run', arguments='{}'))
+                         for i in range(len(runs))]
+                messages = [dict(role='assistant', content='response', tool_calls=calls)]
+                messages.extend(dict(role='tool', tool_call_id=f'r{i}', content='result')
+                                for i in range(len(runs)))
+                record = dict({'from': offset}, effort=effort, effort_source=source, messages=messages,
+                              run_results=[dict(tool_call_id=f'r{i}', ok=ok) for i, ok in enumerate(runs)],
+                              **extra)
+                records.append(record)
+                offset += len(messages)
+                return record
+
+            step('low', 'model', (True,), effort_downgraded=True, model_ms=10,
+                 usage=dict(prompt_tokens=100, prompt_cache_hit_tokens=50))
+            step('low', 'model', (False, False, True), effort_downgraded=None, model_ms=30,
+                 usage=dict(prompt_tokens=300, completion_tokens=2, prompt_cache_hit_tokens=0))
+            step('low', 'model')
+            step('low', 'model', (False,), effort_downgraded=False)
+            step('low', 'default', (False,), effort_downgraded=True)
+            step('low', 'guard', (False,), effort_downgraded=True)
+            step('low', None, (False,))
+            step('medium', 'model', (None,))
+            orphan = step('medium', 'model')
+            orphan['run_results'] = [dict(tool_call_id='not-produced-here', ok=False)]
+            step('high', 'default', (False,))
+            for level in ('xhigh', 'max', 'off', 'none', 'minimal', 'default'):
+                step(level, 'default')
+            legacy = step()
+            legacy['messages'][0]['step_effort'] = dict(effort='low', source='model')
+            step('', 'model', (False,))
+            step(42, 'model', (False,))
+            path.write_text('\n'.join(map(json.dumps, records)) + '\n')
+
+            report = stats.summarize([path])
+            effort = report['timing']['effort']
+            groups = effort['by_effort']
+            self.assertEqual(set(groups), {'low', 'medium', 'high', 'xhigh', 'max',
+                                           'off', 'none', 'minimal', 'default'})
+            self.assertEqual(sum(g['steps'] for g in groups.values()), 16)
+            low = groups['low']
+            self.assertEqual(low['steps'], 7)
+            self.assertEqual(low['model_ms'], dict(samples=2, median=20, p90=30))
+            self.assertEqual(low['steps_with_cache_usage'], 2)
+            self.assertEqual((low['prompt_tokens'], low['prompt_cache_hit_tokens'], low['cache_hit_rate']),
+                             (400, 50, .125))
+            self.assertEqual(low['downgraded'], dict(steps=3, steps_with_runs=2, steps_with_failed_run=1,
+                steps_with_unknown_run_status=0, run_failure_rate=.5))
+            self.assertEqual(groups['medium']['downgraded'], dict(steps=2, steps_with_runs=1,
+                steps_with_failed_run=0, steps_with_unknown_run_status=1, run_failure_rate=0))
+            self.assertEqual(effort['downgraded'], dict(steps=5, steps_with_runs=3, steps_with_failed_run=1,
+                steps_with_unknown_run_status=1, run_failure_rate=1 / 3))
+            self.assertEqual(groups['high']['model_ms']['samples'], 0)
+            self.assertIsNone(groups['high']['model_ms']['median'])
+            self.assertIsNone(groups['high']['cache_hit_rate'])
+            self.assertIsNone(groups['high']['downgraded']['run_failure_rate'])
+            cli = ['python3', str(ROOT / 'scripts/stats.py'), str(path)]
+            self.assertEqual(json.loads(subprocess.check_output(cli + ['--json']))['timing']['effort'], effort)
+            text = subprocess.check_output(cli).decode()
+            for snippet in ('Step effort', 'low: steps=7 model_ms median=20.00 samples=2',
+                            'cache_hit_rate=12.50%（50/400）', '本 Step Run 失败 1/2 = 50.00%',
+                            '降档 Step 合计 5；本 Step Run 失败 1/3 = 33.33%',
+                            'high: steps=1 model_ms median=n/a samples=0 cache_hit_rate=n/a',
+                            'timing.effort.by_effort', 'steps_with_failed_run/steps_with_runs',
+                            'effort_downgraded', '未知状态仍入分母'):
+                self.assertIn(snippet, text)
+
+    def test_effort_empty_invalid_fields_and_zero_samples(self):
+        effort = stats.EffortStats()
+        self.assertEqual(effort.report()['by_effort'], {})
+        self.assertIsNone(effort.report()['downgraded']['run_failure_rate'])
+        for value in (None, '', '  ', 5, False, [], {}):
+            effort.add(dict(effort=value, effort_source='model'), [False])
+        self.assertEqual(effort.report()['by_effort'], {})
+        for usage in (None, {}, dict(prompt_tokens=10), dict(prompt_cache_hit_tokens=5),
+                      dict(prompt_tokens=True, prompt_cache_hit_tokens=5),
+                      dict(prompt_tokens=10, prompt_cache_hit_tokens=-1)):
+            effort.add(dict(effort='low', effort_source='model', effort_downgraded=False,
+                            model_ms=False, usage=usage), [False])
+        effort.add(dict(effort='low', model_ms=0,
+                        usage=dict(prompt_tokens=0, prompt_cache_hit_tokens=0)), [])
+        low = effort.report()['by_effort']['low']
+        self.assertEqual(low['steps'], 7)
+        self.assertEqual(low['model_ms'], dict(samples=1, median=0, p90=0))
+        self.assertEqual(low['steps_with_cache_usage'], 1)
+        self.assertEqual(low['prompt_cache_hit_tokens'], 0)
+        self.assertIsNone(low['cache_hit_rate'])
+        self.assertEqual(low['downgraded']['steps'], 0)
 
     def test_since_timing_uses_only_selected_complete_steps_text_and_json(self):
         cutoff = int(datetime(2025, 1, 2).timestamp() * 1000)
@@ -316,7 +415,8 @@ class StatsTest(unittest.TestCase):
                 dict(code='tools.bash({command: "git status"})'))))
 
             def step(start, duration, span, **extra):
-                return dict({'from': start}, ms=duration, model_ms=duration, run_ms=duration,
+                return dict({'from': start}, effort='low', effort_source='model',
+                            ms=duration, model_ms=duration, run_ms=duration,
                             first_data_ms=duration, attempts=1, calls_omitted=1,
                             usage=dict(prompt_tokens=duration, completion_tokens=1, prompt_cache_hit_tokens=0),
                             code=[dict(tool_call_id='r', first_ms=duration, last_ms=duration + span)],
@@ -354,6 +454,12 @@ class StatsTest(unittest.TestCase):
                     durations = [20, 30, 40] if legacy_selected else [20, 30]
                     count, total = len(durations), sum(durations)
                     steps = count + int(legacy_selected)
+                    effort = timing['effort']
+                    self.assertEqual(set(effort['by_effort']), {'low'})
+                    self.assertEqual(effort['by_effort']['low']['steps'], count)
+                    self.assertEqual(effort['by_effort']['low']['prompt_tokens'], total)
+                    self.assertEqual(effort['downgraded'], dict(steps=count, steps_with_runs=count,
+                        steps_with_failed_run=0, steps_with_unknown_run_status=0, run_failure_rate=0))
                     t = report['overall']
                     self.assertEqual((t['steps'], t['runs'], t['steps_with_ms'], t['steps_with_usage']),
                                      (steps, count, count, count))
