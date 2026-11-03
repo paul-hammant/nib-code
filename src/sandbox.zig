@@ -213,6 +213,10 @@ const prelude =
     \\  const out = (...a) => log(a.map(fmt).join(" ") + "\n");
     \\  globalThis.console = Object.freeze({ log: out, info: out, warn: out, error: out });
     \\  const call = async (name, args) => {
+    \\    if (name === "grep" && args?.pattern instanceof RegExp) {
+    \\      const re = args.pattern;
+    \\      args = { ...args, pattern: re.source, ...(re.ignoreCase && !Object.hasOwn(args, "ignore_case") ? { ignore_case: true } : {}) };
+    \\    }
     \\    let r;
     \\    try { r = await host(name, JSON.stringify(args ?? {})); } catch (e) { throw new Error(name + ": " + e.message); }
     \\    return r;

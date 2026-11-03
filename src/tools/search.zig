@@ -14,7 +14,12 @@ pub fn grep(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
     defer arena.deinit();
     var message: [128]u8 = undefined;
     var s = grep_engine.search(t.io, gpa, a.value, .{ .deny = try t.credentialPaths(arena.allocator()), .cancel = &t.cancel }, &message) catch |err| return switch (err) {
-        error.InvalidPattern => fail(gpa, "invalid pattern: {s}", .{std.mem.sliceTo(&message, 0)}),
+        error.InvalidPattern => blk: {
+            const pattern = a.value.pattern;
+            var end = @min(pattern.len, 200);
+            while (end < pattern.len and end > 0 and pattern[end] & 0xc0 == 0x80) : (end -= 1) {}
+            break :blk fail(gpa, "invalid pattern {f}: {s}", .{ std.json.fmt(pattern[0..end], .{}), std.mem.sliceTo(&message, 0) });
+        },
         error.Canceled => fail(gpa, "canceled", .{}),
         error.CredentialAccessDenied => err,
         else => fail(gpa, "{s}: {s}", .{ a.value.path, @errorName(err) }),
@@ -108,4 +113,61 @@ test "grep serializes match byte column and clipped text" {
     try testing.expect(std.unicode.utf8ValidateSlice(m.text));
     try testing.expect(std.mem.endsWith(u8, m.text, "中SyntaxError"));
     try testing.expect(std.mem.startsWith(u8, m.text, "…"));
+}
+
+test "grep RegExp literals match strings and map only implicit ignore_case" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "f", .data = "x.reserve(\nX.RESERVE(\nareserve(\n" });
+    const code = try std.fmt.allocPrint(testing.allocator,
+        \\const path = '.zig-cache/tmp/{s}/f';
+        \\const literal = await tools.grep({{pattern: /\.reserve\(/, path}});
+        \\const string = await tools.grep({{pattern: '\\.reserve\\(', path}});
+        \\const args = {{pattern: /X/i, path}};
+        \\const folded = await tools.grep(args);
+        \\const explicit = await tools.grep({{pattern: /X/i, ignore_case: false, path}});
+        \\const enabled = await tools.grep({{pattern: /x/, ignore_case: true, path}});
+        \\const flags = await tools.grep({{pattern: /^x.*$/dgmsuy, path}});
+        \\[JSON.stringify(literal) === JSON.stringify(string), literal.matches.length,
+        \\ folded.matches.length, explicit.matches.length, enabled.matches.length,
+        \\ JSON.stringify(flags) === JSON.stringify(await tools.grep({{pattern: '^x.*$', path}})),
+        \\ args.pattern instanceof RegExp, Object.hasOwn(args, 'ignore_case')];
+    , .{tmp.sub_path});
+    defer testing.allocator.free(code);
+    var t: Tools = .{ .io = testing.io, .home = "/nonexistent" };
+    const result = try sandbox.eval(testing.allocator, testing.io, code, .{}, t.host(), null);
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.ok);
+    try testing.expectEqualStrings("[true,1,2,1,2,true,true,false]", result.text);
+}
+
+test "grep invalid JS string pattern reports what the host received" {
+    var t: Tools = .{ .io = testing.io, .home = "/nonexistent" };
+    const result = try sandbox.eval(testing.allocator, testing.io,
+        \\await tools.grep({pattern: '\.a\('})
+    , .{}, t.host(), null);
+    defer result.deinit(testing.allocator);
+    try testing.expect(!result.ok);
+    try testing.expect(std.mem.indexOf(u8, result.text, "grep: invalid pattern \".a(\": expecting ')'") != null);
+}
+
+test "grep invalid pattern preview is JSON quoted and bounded to 200 UTF-8 bytes" {
+    for ([_][]const u8{ "a", "中" }) |unit| {
+        const pattern = try testing.allocator.alloc(u8, unit.len * 201 + 1);
+        defer testing.allocator.free(pattern);
+        for (0..201) |i| @memcpy(pattern[i * unit.len ..][0..unit.len], unit);
+        pattern[pattern.len - 1] = '(';
+        const args = try std.json.Stringify.valueAlloc(testing.allocator, .{ .pattern = pattern }, .{});
+        defer testing.allocator.free(args);
+        const result = try tools.callTool("grep", args);
+        defer freeResult(result);
+        const end: usize = if (unit.len == 1) 200 else 198;
+        const expected = try std.fmt.allocPrint(testing.allocator, "invalid pattern {f}:", .{std.json.fmt(pattern[0..end], .{})});
+        defer testing.allocator.free(expected);
+        try testing.expect(std.mem.startsWith(u8, result.err, expected));
+        try testing.expect(std.unicode.utf8ValidateSlice(result.err));
+    }
+    const quoted = try tools.callTool("grep", "{\"pattern\":\"\\\"\\n(\"}");
+    defer freeResult(quoted);
+    try testing.expect(std.mem.startsWith(u8, quoted.err, "invalid pattern \"\\\"\\n(\":"));
 }
