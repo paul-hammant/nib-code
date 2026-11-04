@@ -93,7 +93,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Result {
     var mr: std.Io.File.MultiReader = undefined;
     mr.init(gpa, io, streams.toStreams(), &.{stdout});
     defer mr.deinit();
-    const deadline: std.Io.Clock.Timestamp = .fromNow(io, .{ .raw = .fromMilliseconds(options.timeout_ms), .clock = .awake });
+    const deadline: ?std.Io.Clock.Timestamp = if (options.timeout_ms == 0) null else .fromNow(io, .{ .raw = .fromMilliseconds(options.timeout_ms), .clock = .awake });
     var stop: ?Stop = null;
     var line_start: usize = 0;
     var scanned: usize = 0;
@@ -148,9 +148,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Result {
     return .{ .term = term, .output = try mr.toOwnedSlice(0), .stop = stop };
 }
 
-fn check(io: std.Io, cancel: *const std.atomic.Value(bool), deadline: std.Io.Clock.Timestamp) Stop!void {
+fn check(io: std.Io, cancel: *const std.atomic.Value(bool), deadline: ?std.Io.Clock.Timestamp) Stop!void {
     if (cancel.load(.acquire)) return error.Canceled;
-    if (std.Io.Clock.Timestamp.now(io, .awake).compare(.gte, deadline)) return error.TimedOut;
+    if (deadline) |end| if (std.Io.Clock.Timestamp.now(io, .awake).compare(.gte, end)) return error.TimedOut;
 }
 
 fn inheritedEnvironment(gpa: std.mem.Allocator) !std.process.Environ.Map {
@@ -269,4 +269,34 @@ test "process drains buffered output and final lines after shell exit" {
     try testing.expectEqual(20000, capture.lines);
     try testing.expectEqual(100004, result.output.len);
     try testing.expect(std.mem.endsWith(u8, result.output, "line\ntail"));
+}
+
+test "process zero timeout has no deadline even after output pipes close" {
+    var cancel: std.atomic.Value(bool) = .init(false);
+    const result = try run(testing.allocator, testing.io, .{
+        .spawn = .{ .argv = &.{ "bash", "-c", "exec 1>&- 2>&-; sleep 0.05" }, .stdout = .pipe, .stderr = .ignore },
+        .cancel = &cancel,
+        .timeout_ms = 0,
+    });
+    defer testing.allocator.free(result.output);
+    try testing.expect(result.term.success());
+    try testing.expect(result.stop == null);
+}
+
+test "process zero timeout still honors cancellation" {
+    var cancel: std.atomic.Value(bool) = .init(false);
+    const Observer = struct {
+        fn tick(ctx: *anyopaque) void {
+            const flag: *std.atomic.Value(bool) = @ptrCast(@alignCast(ctx));
+            flag.store(true, .release);
+        }
+    };
+    const result = try run(testing.allocator, testing.io, .{
+        .spawn = .{ .argv = &.{ "bash", "-c", "sleep 5" }, .stdout = .pipe, .stderr = .ignore },
+        .cancel = &cancel,
+        .timeout_ms = 0,
+        .on_tick = .{ .ctx = &cancel, .emit = Observer.tick },
+    });
+    defer testing.allocator.free(result.output);
+    try testing.expectEqual(error.Canceled, result.stop.?);
 }

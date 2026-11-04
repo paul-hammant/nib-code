@@ -122,9 +122,10 @@ test "progress IDs have independent session counters and updates preserve creati
     try t.expectEqualStrings("b1", b1);
     try t.expectEqualStrings("a2", a2);
     try q.update(t.allocator, t.io, .{ .id = a2, .prompt = "updated", .run = 2, .background = true, .state = .done });
-    try q.update(t.allocator, t.io, .{ .id = b1, .kind = .bash, .prompt = "second", .background = true, .elapsed_ms = 1000 });
+    try q.update(t.allocator, t.io, .{ .id = b1, .kind = .bash, .prompt = "second", .background = true, .detached = true, .elapsed_ms = 1000 });
     try t.expectEqualStrings(a1, q.slots.items[0].value.id);
     try t.expectEqualStrings(b1, q.slots.items[1].value.id);
+    try t.expect(q.slots.items[1].value.detached);
     try t.expectEqualStrings(a2, q.slots.items[2].value.id);
     try t.expectEqualStrings("updated", q.slots.items[2].value.prompt);
     try t.expect(q.slots.items[2].value.background);

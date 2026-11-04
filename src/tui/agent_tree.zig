@@ -53,7 +53,8 @@ const Row = struct {
         }
         try text.appendSlice(gpa, p.prompt[0..end]);
         const prompt_end = text.items.len;
-        const state = if (p.background) "background" else @tagName(p.state);
+        const live = p.state == .queued or p.state == .working;
+        const state = if (p.detached) (if (live) "detached" else @tagName(p.state)) else if (p.background) "background" else @tagName(p.state);
         if (p.kind == .bash) {
             try text.appendSlice(gpa, " · ");
             try appendElapsed(gpa, &text, p.elapsed_ms);
@@ -275,4 +276,20 @@ test "narrow agent rows reserve state and step before long tool and file names" 
     _ = tree.print(win, true);
     try expectLine(&screen, 0, "  └─ a2  · working · step 12");
     try expectLine(&screen, 1, "");
+}
+
+test "detached shows terminal states while ordinary background waits for delivery" {
+    const gpa = testing.allocator;
+    var tree: Tree = .{};
+    defer tree.deinit(gpa);
+    try tree.update(gpa, &.{
+        .{ .id = "b1", .kind = .bash, .prompt = "server", .background = true, .detached = true },
+        .{ .id = "b2", .kind = .bash, .prompt = "test", .background = true },
+        .{ .id = "b3", .kind = .bash, .prompt = "exit", .background = true, .detached = true, .state = .done },
+        .{ .id = "b4", .kind = .bash, .prompt = "stop", .background = true, .detached = true, .state = .canceled },
+    });
+    try testing.expectEqualStrings("  ├─ b1 bash server · 0.0s · detached", tree.rows.items[0].text);
+    try testing.expectEqualStrings("  ├─ b2 bash test · 0.0s · background", tree.rows.items[1].text);
+    try testing.expectEqualStrings("  ├─ b3 bash exit · 0.0s · done", tree.rows.items[2].text);
+    try testing.expectEqualStrings("  └─ b4 bash stop · 0.0s · canceled", tree.rows.items[3].text);
 }

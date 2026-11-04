@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import select
 import signal
 import subprocess
 import sys
@@ -53,7 +54,7 @@ class Mock(http.server.ThreadingHTTPServer):
         if self.case == "concurrency":
             return ("await " + agent("one", background=True) + "; await Promise.all([" +
                     agent("two") + ", " + agent("three", background=True) + "])")
-        if self.case in ("cancel", "limit"):
+        if self.case in ("cancel", "limit", "stop"):
             return "await " + agent("worker", background=True)
         if self.case.startswith("injected_"):
             return "await " + agent("one", background=True)
@@ -110,9 +111,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.server.parent_gate.wait(15)
                     if self.server.fifo_run:
                         code = "42"
-                if self.server.case == "limit":
+                if self.server.case in ("limit", "stop"):
                     wait_for(lambda: (self.server.cwd / "worker.started").exists())
-                    code = "42"
+                    code = ("const stopped=await Promise.all([tools.stop({id:'a1'}),tools.stop({id:'a1'})]); "
+                            "const next=await tools.agent({prompt:'child:one'}); "
+                            "if(!next.ok)throw new Error('occupancy not released'); stopped"
+                            if self.server.case == "stop" else "42")
                 if self.server.case == "boundary":
                     code = "42"
             elif step == 2 and self.server.case == "boundary":
@@ -202,6 +206,7 @@ class BackgroundTests:
 
     def finish(self, process, ok=True):
         output, error = process.communicate(timeout=10)
+        output = getattr(process, "observed_output", b"").decode() + output
         self.assertEqual(error, "")
         self.assertEqual(process.returncode == 0, ok, output)
         events = [json.loads(line) for line in output.splitlines()]
@@ -269,6 +274,23 @@ class BackgroundTests:
         self.assertEqual((self.cwd / "shared.txt").read_text(), "external\nexternal-only\nkeep\n")
         self.assertEqual((self.cwd / "child-only.txt").read_text(), "owned\n")
 
+    def test_concurrent_stop_joins_background_agent_and_its_tools(self):
+        (self.home / "config.toml").write_text("[limits]\nagent_concurrency = 1\n")
+        mock = self.mock("stop")
+        mock.gates["one"].set()
+        events = self.finish(self.start())
+        runs = [e["run_end"] for e in events if "run_end" in e]
+        stopped = json.loads(runs[1]["output"].removeprefix("result: "))
+        self.assertEqual([item["id"] for item in stopped], ["a1", "a1"])
+        self.assertTrue(any(item["stopped"] for item in stopped))
+        completions = self.completions(mock.observed("initial")[-1]["messages"])
+        self.assertEqual(len(completions), 1)
+        result = json.loads(content(completions[0]).split("\n", 1)[1])
+        self.assertFalse(result["ok"])
+        pids = json.loads((self.cwd / "worker.started").read_text())
+        wait_for(lambda: all(not alive(pid) for pid in pids.values()))
+        self.assertEqual(len([e for e in events if e.get("background", {}).get("state") == "finished"]), 1)
+
     def test_returns_immediately_and_delivers_each_completion(self):
         mock = self.mock("basic")
         process = self.start()
@@ -325,6 +347,18 @@ class BackgroundTests:
         self.assertEqual([len(self.completions(r["messages"])) for r in mock.observed("initial")], [0, 0, 0])
         mock.gates["one"].set()
         wait_for(lambda: self.child_logged("done:child:one"))
+        fd, output = process.stdout.fileno(), b""
+        deadline = time.monotonic() + 5
+        seen = False
+        while time.monotonic() < deadline and not seen:
+            if select.select([fd], [], [], .1)[0]:
+                output += os.read(fd, 65536)
+                seen = any(event.get("progress", {}).get("state") == "done"
+                           and event["progress"].get("id") == "a1"
+                           for line in output.split(b"\n")[:-1] if line
+                           for event in [json.loads(line)])
+        process.observed_output = output
+        self.assertTrue(seen, output[-2000:])
         mock.parent_gate.set()
         events = self.finish(process)
         requests = mock.observed("initial")

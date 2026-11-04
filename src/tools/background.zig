@@ -8,6 +8,8 @@ const output = @import("../session/output.zig");
 
 pub const Background = struct {
     mutex: std.Io.Mutex = .init,
+    // Join/reap/destruction serialize here; workers only acquire mutex.
+    lifecycle: std.Io.Mutex = .init,
     jobs: std.ArrayList(*Job) = .empty,
     cancel: std.atomic.Value(bool) = .init(false),
     inbox: ?*Inbox = null,
@@ -24,12 +26,38 @@ pub const Background = struct {
         prompt: []u8,
         id: []u8,
         kind: BackgroundEvent.Kind,
+        detached: bool = false,
+        cancel: std.atomic.Value(bool) = .init(false),
         run: usize,
+        invocation: usize = 0,
         thread: ?std.Thread = null,
         done: std.atomic.Value(bool) = .init(false),
         announced: bool = false,
         delivered: bool = false,
         failure: ?anyerror = null,
+
+        fn join(job: *Job) void {
+            if (job.thread) |thread| {
+                thread.join();
+                job.thread = null;
+            }
+        }
+
+        fn reap(job: *Job) void {
+            if (!job.done.load(.acquire)) return;
+            job.join();
+            job.gpa.free(job.args);
+            job.gpa.free(job.prompt);
+            job.args = &.{};
+            job.prompt = &.{};
+        }
+
+        fn destroy(job: *Job) void {
+            job.gpa.free(job.args);
+            job.gpa.free(job.prompt);
+            job.gpa.free(job.id);
+            job.gpa.destroy(job);
+        }
 
         fn work(job: *Job) void {
             job.finish() catch |err| {
@@ -49,8 +77,8 @@ pub const Background = struct {
             const gpa = job.gpa;
             const t = job.t;
             const result = switch (job.kind) {
-                .agent => agent.execute(t, gpa, job.args, &t.background.cancel, job.id, job.run, true),
-                .bash => @import("bash.zig").executeBackground(t, gpa, job.args, &t.background.cancel, .{ .id = job.id, .run = job.run, .background = true, .kind = .bash, .prompt = "" }),
+                .agent => agent.execute(t, gpa, job.args, &job.cancel, job.id, job.run, true),
+                .bash => @import("bash.zig").executeBackground(t, gpa, job.args, &job.cancel, .{ .id = job.id, .run = job.run, .background = true, .kind = .bash, .prompt = "" }),
             } catch |err| try @import("../tools.zig").fail(gpa, "{s}", .{@errorName(err)});
             defer switch (result) {
                 inline else => |bytes| gpa.free(bytes),
@@ -80,9 +108,9 @@ pub const Background = struct {
             if (job.kind == .agent) {
                 t.agent_sessions.mutex.lockUncancelable(t.io);
                 defer t.agent_sessions.mutex.unlock(t.io);
-                _ = try t.background.inbox.?.enqueueBackground(gpa, t.io, job.id, job.kind, .finished, ok, formatted);
+                _ = try t.background.inbox.?.enqueueBackground(gpa, t.io, job.id, job.kind, .finished, ok, formatted, job.detached, job.invocation);
                 t.agent_sessions.releaseLocked(job.id);
-            } else _ = try t.background.inbox.?.enqueueBackground(gpa, t.io, job.id, job.kind, .finished, ok, formatted);
+            } else _ = try t.background.inbox.?.enqueueBackground(gpa, t.io, job.id, job.kind, .finished, ok, formatted, job.detached, job.invocation);
         }
     };
 
@@ -95,15 +123,23 @@ pub const Background = struct {
     }
 
     fn startWithId(bg: *Background, t: *Tools, gpa: std.mem.Allocator, kind: BackgroundEvent.Kind, args: []const u8, prompt: []const u8, task_id: ?[]const u8) ![]u8 {
+        bg.lifecycle.lockUncancelable(t.io);
+        defer bg.lifecycle.unlock(t.io);
         bg.mutex.lockUncancelable(t.io);
         defer bg.mutex.unlock(t.io);
         if (bg.cancel.load(.acquire)) return error.Canceled;
         if (bg.inbox == null) return error.BackgroundUnavailable;
         if (kind == .bash and bg.bash_active >= bash_limit) return error.BackgroundBashLimit;
         const log = bg.log orelse return error.BackgroundUnavailable;
+        const detached = if (kind == .bash) blk: {
+            const parsed = try std.json.parseFromSlice(struct { detached: bool = false }, gpa, args, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            break :blk parsed.value.detached;
+        } else false;
         const job = try gpa.create(Job);
         errdefer gpa.destroy(job);
         const progress_id = task_id orelse try t.progress.add(gpa, t.io, kind, prompt, t.run_id, true);
+        if (detached) try t.progress.update(gpa, t.io, .{ .id = progress_id, .run = t.run_id, .kind = kind, .background = true, .detached = true, .prompt = prompt, .state = .queued });
         const id = try gpa.dupe(u8, progress_id);
         errdefer gpa.free(id);
         const copy = try gpa.dupe(u8, args);
@@ -113,7 +149,7 @@ pub const Background = struct {
         const result = try std.json.Stringify.valueAlloc(gpa, .{ .id = id }, .{});
         errdefer gpa.free(result);
         try bg.jobs.ensureUnusedCapacity(gpa, 1);
-        job.* = .{ .t = t, .gpa = gpa, .args = copy, .prompt = prompt_copy, .id = id, .kind = kind, .run = t.run_id };
+        job.* = .{ .t = t, .gpa = gpa, .args = copy, .prompt = prompt_copy, .id = id, .kind = kind, .detached = detached, .run = t.run_id, .invocation = t.progress.currentInvocation(t.io, id) };
         try log.background(t.io, gpa, .{ .id = id, .kind = kind, .state = .started }, bg.turn_step);
         @import("../sandbox.zig").tool_identity = .{ .id = progress_id, .background = true };
         bg.jobs.appendAssumeCapacity(job);
@@ -121,8 +157,9 @@ pub const Background = struct {
         if (kind == .bash) bg.bash_active += 1;
         job.thread = std.Thread.spawn(.{}, Job.work, .{job}) catch |err| {
             if (kind == .bash) bg.bash_active -= 1;
-            try t.progress.update(gpa, t.io, .{ .id = id, .run = job.run, .kind = kind, .background = true, .prompt = prompt, .state = .failed });
+            try t.progress.update(gpa, t.io, .{ .id = id, .run = job.run, .invocation = job.invocation, .kind = kind, .background = true, .detached = detached, .prompt = prompt, .state = .failed });
             try job.deliver(.{ .err = @constCast(@errorName(err)) });
+            if (kind == .agent) t.agent_sessions.release(t.io, id);
             job.done.store(true, .release);
             return result;
         };
@@ -138,6 +175,13 @@ pub const Background = struct {
     pub fn pending(bg: *Background, io: std.Io) bool {
         bg.mutex.lockUncancelable(io);
         defer bg.mutex.unlock(io);
+        for (bg.jobs.items) |job| if (!job.detached and !job.delivered) return true;
+        return false;
+    }
+
+    pub fn anyPending(bg: *Background, io: std.Io) bool {
+        bg.mutex.lockUncancelable(io);
+        defer bg.mutex.unlock(io);
         for (bg.jobs.items) |job| if (!job.delivered) return true;
         return false;
     }
@@ -148,23 +192,25 @@ pub const Background = struct {
         var names: std.ArrayList(u8) = .empty;
         errdefer names.deinit(gpa);
         for (bg.jobs.items) |job| {
-            if (job.delivered) continue;
+            if (job.detached or job.delivered) continue;
             if (names.items.len > 0) try names.appendSlice(gpa, ", ");
             try names.print(gpa, "{s} {s}", .{ @tagName(job.kind), job.id });
         }
         return names.toOwnedSlice(gpa);
     }
 
-    pub fn delivered(bg: *Background, io: std.Io, id: []const u8) void {
+    pub fn delivered(bg: *Background, io: std.Io, id: []const u8, invocation: usize) void {
         bg.mutex.lockUncancelable(io);
         defer bg.mutex.unlock(io);
-        for (bg.jobs.items) |job| if (!job.delivered and std.mem.eql(u8, job.id, id)) {
+        for (bg.jobs.items) |job| if (!job.delivered and job.invocation == invocation and std.mem.eql(u8, job.id, id)) {
             job.delivered = true;
             return;
         };
     }
 
     pub fn poll(bg: *Background, io: std.Io, ctx: *anyopaque, emit: *const fn (*anyopaque, BackgroundEvent) anyerror!void) !void {
+        bg.lifecycle.lockUncancelable(io);
+        defer bg.lifecycle.unlock(io);
         bg.mutex.lockUncancelable(io);
         defer bg.mutex.unlock(io);
         for (bg.jobs.items) |job| {
@@ -172,6 +218,7 @@ pub const Background = struct {
                 try emit(ctx, .{ .id = job.id, .kind = job.kind, .state = .started });
                 job.announced = true;
             }
+            job.reap();
             if (job.done.load(.acquire)) if (job.failure) |err| {
                 job.failure = null;
                 // No inbox result will arrive after an internal worker failure.
@@ -181,15 +228,59 @@ pub const Background = struct {
         }
     }
 
-    pub fn stop(bg: *Background, gpa: std.mem.Allocator) void {
-        bg.cancel.store(true, .release);
-        for (bg.jobs.items) |job| {
-            if (job.thread) |thread| thread.join();
-            gpa.free(job.args);
-            gpa.free(job.prompt);
-            gpa.free(job.id);
-            gpa.destroy(job);
+    pub fn stopById(bg: *Background, io: std.Io, id: []const u8) !bool {
+        bg.lifecycle.lockUncancelable(io);
+        defer bg.lifecycle.unlock(io);
+        bg.mutex.lockUncancelable(io);
+        var index = bg.jobs.items.len;
+        const job = while (index > 0) {
+            index -= 1;
+            const candidate = bg.jobs.items[index];
+            if (std.mem.eql(u8, candidate.id, id)) break candidate;
+        } else {
+            bg.mutex.unlock(io);
+            return error.UnknownBackgroundTask;
+        };
+        const stopped = !job.done.load(.acquire);
+        job.cancel.store(true, .release);
+        bg.mutex.unlock(io);
+        job.join();
+        job.reap();
+        return stopped;
+    }
+
+    pub fn finishTurn(bg: *Background, gpa: std.mem.Allocator, io: std.Io, aborted: bool) void {
+        if (aborted) {
+            bg.stop(gpa);
+            return;
         }
+        bg.lifecycle.lockUncancelable(io);
+        defer bg.lifecycle.unlock(io);
+        bg.mutex.lockUncancelable(io);
+        for (bg.jobs.items) |job| if (!job.detached) {
+            job.cancel.store(true, .release);
+        };
+        bg.mutex.unlock(io);
+        for (bg.jobs.items) |job| {
+            if (!job.detached) job.join();
+            job.reap();
+        }
+    }
+
+    pub fn stop(bg: *Background, gpa: std.mem.Allocator) void {
+        // Background is owned by Tools; teardown shares the same lifecycle lock as stopById.
+        const t: *Tools = @fieldParentPtr("background", bg);
+        const io = t.io;
+        bg.lifecycle.lockUncancelable(io);
+        defer bg.lifecycle.unlock(io);
+        bg.mutex.lockUncancelable(io);
+        bg.cancel.store(true, .release);
+        for (bg.jobs.items) |job| job.cancel.store(true, .release);
+        bg.mutex.unlock(io);
+        for (bg.jobs.items) |job| job.join();
+        bg.mutex.lockUncancelable(io);
+        defer bg.mutex.unlock(io);
+        for (bg.jobs.items) |job| job.destroy();
         bg.jobs.clearAndFree(gpa);
         bg.inbox = null;
         bg.log = null;
@@ -212,14 +303,16 @@ test "background worker failures are reported once and stop being pending" {
     const testing = std.testing;
     var t: Tools = .{ .io = testing.io, .home = "/tmp" };
     defer t.background.jobs.deinit(testing.allocator);
+    defer t.agent_sessions.deinit(testing.allocator);
+    try t.agent_sessions.add(testing.allocator, testing.io, "a1", "child", true);
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     var jobs: [2]Background.Job = undefined;
     for (&jobs, [_]BackgroundEvent.Kind{ .agent, .bash }, [_][]const u8{ "a1", "b2" }) |*job, kind, id| {
         job.* = .{
             .t = &t,
             .gpa = failing.allocator(),
-            .args = @constCast("{}"),
-            .prompt = @constCast("test"),
+            .args = &.{},
+            .prompt = &.{},
             .id = @constCast(id),
             .kind = kind,
             .run = 1,
@@ -246,6 +339,7 @@ test "background worker failures are reported once and stop being pending" {
         try testing.expect(job.done.load(.acquire));
         try testing.expectEqual(error.OutOfMemory, job.failure.?);
     }
+    try testing.expectEqualStrings("a1", try t.agent_sessions.reserve(testing.io, "a1"));
     try testing.expectEqual(@as(usize, 0), t.background.bash_active);
     try testing.expectError(error.OutOfMemory, t.background.poll(testing.io, &sink, Sink.emit));
     try testing.expectEqual(null, jobs[0].failure);
@@ -300,17 +394,233 @@ test "background starts share per-kind foreground counters and leave terminal pr
     try testing.expectEqualStrings("b1", timing.entries[0].id.?);
 }
 
-test "background agent completion publishes the task ID and releases its reservation" {
+fn testBashJob(t: *Tools, command: []const u8, detached: bool) ![]const u8 {
+    const gpa = std.testing.allocator;
+    const bg = &t.background;
+    const job = try gpa.create(Background.Job);
+    errdefer gpa.destroy(job);
+    const args = try std.json.Stringify.valueAlloc(gpa, .{ .command = command, .background = true, .detached = detached }, .{});
+    errdefer gpa.free(args);
+    const prompt = try gpa.dupe(u8, command);
+    errdefer gpa.free(prompt);
+    const progress_id = try t.progress.add(gpa, t.io, .bash, command, 1, true);
+    const id = try gpa.dupe(u8, progress_id);
+    errdefer gpa.free(id);
+    bg.mutex.lockUncancelable(t.io);
+    defer bg.mutex.unlock(t.io);
+    try bg.jobs.ensureUnusedCapacity(gpa, 1);
+    job.* = .{ .t = t, .gpa = gpa, .args = args, .prompt = prompt, .id = id, .kind = .bash, .detached = detached, .run = 1 };
+    bg.bash_active += 1;
+    errdefer bg.bash_active -= 1;
+    job.thread = try std.Thread.spawn(.{}, Background.Job.work, .{job});
+    bg.jobs.appendAssumeCapacity(job);
+    return id;
+}
+
+test "normal turn finish retains detached jobs and concurrent stop delivers exactly once" {
     const testing = std.testing;
     var inbox: Inbox = .{};
     defer inbox.batch.deinit(testing.allocator);
-    var t: Tools = .{ .io = testing.io, .home = "/unused" };
-    defer t.agent_sessions.deinit(testing.allocator);
+    var t: Tools = .{ .io = testing.io, .home = "/home/nobody" };
+    defer t.progress.deinit(testing.allocator);
     t.background.inbox = &inbox;
-    try t.agent_sessions.add(testing.allocator, testing.io, "a1", "child", true);
-    var job: Background.Job = .{ .t = &t, .gpa = testing.allocator, .args = @constCast("{}"), .prompt = @constCast("child"), .id = @constCast("a1"), .kind = .agent, .run = 1 };
-    try job.deliver(.{ .err = @constCast("AgentFailed") });
+    defer t.background.stop(testing.allocator);
+    const foreground = try testBashJob(&t, "sleep 5", false);
+    const detached = try testBashJob(&t, "sleep 5", true);
+    try testing.expect(t.background.pending(testing.io));
+    const names = try t.background.pendingNames(testing.allocator, testing.io);
+    defer testing.allocator.free(names);
+    try testing.expectEqualStrings("bash b1", names);
+    t.background.finishTurn(testing.allocator, testing.io, false);
+    try testing.expectEqual(@as(usize, 2), t.background.jobs.items.len);
+    try testing.expectEqual(@as(usize, 1), t.background.bash_active);
+    try testing.expect(!t.background.cancel.load(.acquire));
+    try testing.expectEqual(@as(usize, 1), inbox.batch.items.items.len);
+    try testing.expect(std.mem.indexOf(u8, inbox.batch.items.items[0].text, "canceled") != null);
+    try testing.expect(!try t.background.stopById(testing.io, foreground));
+    t.background.delivered(testing.io, foreground, 0);
+    try testing.expect(!t.background.pending(testing.io));
+    try testing.expect(t.background.anyPending(testing.io));
+    const Stopper = struct {
+        t: *Tools,
+        id: []const u8,
+        stopped: bool = false,
+
+        fn work(stopper: *@This()) void {
+            stopper.stopped = stopper.t.background.stopById(stopper.t.io, stopper.id) catch @panic("stop failed");
+        }
+    };
+    var stoppers: [4]Stopper = undefined;
+    var threads: [4]std.Thread = undefined;
+    var spawned: usize = 0;
+    {
+        defer for (threads[0..spawned]) |thread| thread.join();
+        for (&stoppers, &threads) |*stopper, *thread| {
+            stopper.* = .{ .t = &t, .id = detached };
+            thread.* = try std.Thread.spawn(.{}, Stopper.work, .{stopper});
+            spawned += 1;
+        }
+    }
+    var stopped: usize = 0;
+    for (stoppers) |stopper| if (stopper.stopped) {
+        stopped += 1;
+    };
+    try testing.expectEqual(@as(usize, 1), stopped);
+    try testing.expectEqual(@as(usize, 0), t.background.bash_active);
+    try testing.expectEqual(@as(usize, 2), inbox.batch.items.items.len);
+    try testing.expect(std.mem.indexOf(u8, inbox.batch.items.items[1].text, "canceled") != null);
+    for (t.background.jobs.items) |job| {
+        try testing.expect(job.thread == null);
+        try testing.expectEqual(@as(usize, 0), job.args.len);
+        try testing.expectEqual(@as(usize, 0), job.prompt.len);
+    }
+    t.background.delivered(testing.io, detached, 0);
+    try testing.expect(!t.background.anyPending(testing.io));
+    try testing.expect(!try t.background.stopById(testing.io, detached));
+    try testing.expectError(error.UnknownBackgroundTask, t.background.stopById(testing.io, "b99"));
+    t.background.finishTurn(testing.allocator, testing.io, false);
+    try testing.expectEqual(@as(usize, 2), inbox.batch.items.items.len);
+}
+
+test "aborted turn stops detached jobs and suppresses completion" {
+    const testing = std.testing;
+    var inbox: Inbox = .{};
+    defer inbox.batch.deinit(testing.allocator);
+    var t: Tools = .{ .io = testing.io, .home = "/home/nobody" };
+    defer t.progress.deinit(testing.allocator);
+    defer t.background.stop(testing.allocator);
+    t.background.inbox = &inbox;
+    _ = try testBashJob(&t, "sleep 5", true);
+    t.background.finishTurn(testing.allocator, testing.io, true);
+    try testing.expectEqual(@as(usize, 0), t.background.jobs.items.len);
+    try testing.expectEqual(@as(usize, 0), t.background.bash_active);
+    try testing.expect(t.background.cancel.load(.acquire));
+    try testing.expect(inbox.empty(testing.io));
+    try testing.expect(t.background.inbox == null);
+    try testing.expect(t.background.log == null);
+}
+
+test "finished detached jobs are joined and compacted without losing their known IDs" {
+    const testing = std.testing;
+    var inbox: Inbox = .{};
+    defer inbox.batch.deinit(testing.allocator);
+    var t: Tools = .{ .io = testing.io, .home = "/home/nobody" };
+    defer t.progress.deinit(testing.allocator);
+    defer t.background.stop(testing.allocator);
+    t.background.inbox = &inbox;
+    const id = try testBashJob(&t, "true", true);
+    const job = t.background.jobs.items[0];
+    job.join();
+    try testing.expect(job.done.load(.acquire));
+    try testing.expect(!try t.background.stopById(testing.io, id));
+    try testing.expectEqual(@as(usize, 0), job.args.len);
+    try testing.expectEqual(@as(usize, 0), job.prompt.len);
+    try testing.expectEqual(@as(usize, 1), inbox.batch.items.items.len);
+    try testing.expect(!t.background.pending(testing.io));
+    try testing.expect(t.background.anyPending(testing.io));
+    t.background.delivered(testing.io, id, 0);
+    try testing.expect(!t.background.anyPending(testing.io));
+}
+
+test "detached shell exit completes the job and kills descendants" {
+    const testing = std.testing;
+    for ([_][]const u8{ "", " >/dev/null 2>&1" }) |redirect| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var inbox: Inbox = .{};
+        defer inbox.batch.deinit(testing.allocator);
+        var t: Tools = .{ .io = testing.io, .home = "/home/nobody" };
+        defer t.progress.deinit(testing.allocator);
+        defer t.background.stop(testing.allocator);
+        t.background.inbox = &inbox;
+        const command = try std.fmt.allocPrint(testing.allocator, "(sleep 0.5; echo survived > .zig-cache/tmp/{s}/survived){s} & echo started; exit 7", .{ tmp.sub_path, redirect });
+        defer testing.allocator.free(command);
+        const id = try testBashJob(&t, command, true);
+        const job = t.background.jobs.items[0];
+        const deadline = std.Io.Clock.Timestamp.fromNow(testing.io, .{ .raw = .fromSeconds(2), .clock = .awake });
+        while (!job.done.load(.acquire)) {
+            if (std.Io.Clock.Timestamp.now(testing.io, .awake).compare(.gte, deadline)) return error.JobDidNotFinish;
+            try std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(10), .clock = .awake }, testing.io);
+        }
+        job.join();
+        try testing.expect(!try t.background.stopById(testing.io, id));
+        try testing.expectEqual(@as(usize, 0), t.background.bash_active);
+        try testing.expectEqual(@as(usize, 1), inbox.batch.items.items.len);
+        try testing.expect(std.mem.indexOf(u8, inbox.batch.items.items[0].text, "\"exit_code\":7") != null);
+        try testing.expectEqual(.failed, t.progress.slots.items[0].value.state);
+        try testing.expect(t.progress.slots.items[0].value.detached);
+        try std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(600), .clock = .awake }, testing.io);
+        try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "survived", .{}));
+    }
+}
+
+test "stopping and resuming an agent keeps reservations and deliveries invocation scoped" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/session.jsonl", .{tmp.sub_path});
+    defer testing.allocator.free(path);
+    var log = try Log.create(testing.io, path);
+    defer log.close(testing.io);
+    var inbox: Inbox = .{};
+    defer inbox.batch.deinit(testing.allocator);
+    var t: Tools = .{ .io = testing.io, .home = "/unused", .cfg = .{ .model = "m", .base_url = "", .api_key = "", .limits = .{ .agent_concurrency = 1 } }, .agents_active = 1 };
+    defer t.progress.deinit(testing.allocator);
+    defer t.agent_sessions.deinit(testing.allocator);
+    defer t.background.stop(testing.allocator);
+    t.background.inbox = &inbox;
+    t.background.log = &log;
+    const started = try agent.agent(&t, testing.allocator, "{\"prompt\":\"first\",\"background\":true}");
+    defer @import("../tools.zig").freeResult(started);
+    try testing.expectEqualStrings("{\"id\":\"a1\"}", started.ok);
+    try t.agent_sessions.bind(testing.allocator, testing.io, "a1", "child");
+    try testing.expectError(error.AgentBusy, t.agent_sessions.reserve(testing.io, "a1"));
+    try testing.expect(try t.background.stopById(testing.io, "a1"));
+    try testing.expect(!try t.background.stopById(testing.io, "a1"));
+    const first = t.background.jobs.items[0];
+    try testing.expect(first.done.load(.acquire));
+    try testing.expect(!first.delivered);
+    try testing.expectEqualStrings("child", t.agent_sessions.session(testing.io, "a1").?);
+    const resumed = try agent.agent(&t, testing.allocator, "{\"prompt\":\"second\",\"resume\":\"a1\",\"background\":true}");
+    defer @import("../tools.zig").freeResult(resumed);
+    try testing.expectEqualStrings("{\"id\":\"a1\"}", resumed.ok);
+    const second = t.background.jobs.items[1];
+    try testing.expect(first.invocation != second.invocation);
+    try testing.expect(try t.background.stopById(testing.io, "a1"));
+    try testing.expect(!try t.background.stopById(testing.io, "a1"));
+    const resumed_again = try agent.agent(&t, testing.allocator, "{\"prompt\":\"third\",\"resume\":\"a1\",\"background\":true}");
+    defer @import("../tools.zig").freeResult(resumed_again);
+    try testing.expectEqualStrings("{\"id\":\"a1\"}", resumed_again.ok);
+    const third = t.background.jobs.items[2];
+    t.background.delivered(testing.io, "a1", second.invocation);
+    try testing.expect(!first.delivered);
+    try testing.expect(second.delivered);
+    try testing.expect(!third.delivered);
+    t.background.delivered(testing.io, "a1", first.invocation);
+    t.background.delivered(testing.io, "a1", first.invocation);
+    try testing.expect(first.delivered);
+    try testing.expect(!third.delivered);
+    try testing.expectError(error.AgentBusy, t.agent_sessions.reserve(testing.io, "a1"));
+    try testing.expect(try t.background.stopById(testing.io, "a1"));
+    try testing.expect(!try t.background.stopById(testing.io, "a1"));
     try testing.expectEqualStrings("a1", try t.agent_sessions.reserve(testing.io, "a1"));
+    t.background.delivered(testing.io, "a1", third.invocation);
+    try testing.expect(!t.background.anyPending(testing.io));
+    try testing.expectError(error.AgentBusy, t.agent_sessions.reserve(testing.io, "a1"));
+    try testing.expectEqualStrings("child", t.agent_sessions.session(testing.io, "a1").?);
+    try testing.expectEqual(@as(usize, 3), inbox.batch.items.items.len);
+    for (inbox.batch.items.items, t.background.jobs.items) |item, job| {
+        try testing.expectEqualStrings("a1", item.background.?.id);
+        try testing.expectEqual(job.invocation, item.invocation);
+        try testing.expect(!item.detached);
+        try testing.expect(job.thread == null);
+        try testing.expectEqual(@as(usize, 0), job.args.len);
+        try testing.expectEqual(@as(usize, 0), job.prompt.len);
+    }
+}
+
+test "background agent failure publishes its task ID without a child session ID" {
+    const testing = std.testing;
     const result = try messageResult(testing.allocator, .agent, "a1", .{ .err = @constCast("AgentFailed") });
     defer testing.allocator.free(result);
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, result, .{});
