@@ -3,6 +3,7 @@ const c = @import("qjs");
 const console = @import("sandbox/console.zig");
 const run_timing = @import("sandbox/timing.zig");
 pub const RunTiming = run_timing.Run;
+pub const tool_concurrency = 8;
 
 /// `JS_UNDEFINED` is a C compound-literal macro that translate-c cannot lower.
 const js_undefined: c.JSValue = .{ .u = .{ .uint64 = 0 }, .tag = c.JS_TAG_UNDEFINED };
@@ -31,6 +32,7 @@ pub const Host = struct {
     admit: ?*const fn (ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8) anyerror!?[]u8 = null,
     /// Borrowed until eval returns; inspect entries or change started/run_index only between evals.
     timing: ?*RunTiming = null,
+    backgroundId: ?*const fn (*anyopaque, []const u8) ?[]const u8 = null,
 };
 
 pub const LogEntry = console.Entry;
@@ -100,7 +102,18 @@ const State = struct {
             const end_ms = if (timing) |t| t.elapsed() else 0;
             st.mutex.lockUncancelable(st.io);
             defer st.mutex.unlock(st.io);
-            if (timing) |t| t.complete(call.timing_index.?, start_ms, end_ms, result == .ok);
+            if (timing) |t| {
+                t.complete(call.timing_index.?, start_ms, end_ms, result == .ok);
+                if (result == .ok and (std.mem.eql(u8, call.name, "agent") or std.mem.eql(u8, call.name, "bash"))) {
+                    const parsed = std.json.parseFromSlice(struct { id: ?[]const u8 = null }, st.gpa, result.ok, .{ .ignore_unknown_fields = true }) catch null;
+                    defer if (parsed) |p| p.deinit();
+                    if (parsed) |p| if (p.value.id) |id| {
+                        // The timing collector outlives this Run; Session owns the identifier.
+                        if (h.backgroundId) |lookup| t.entries[call.timing_index.?].id = lookup(h.ctx, id);
+                        t.entries[call.timing_index.?].background = true;
+                    };
+                }
+            }
             call.result = result;
             if (st.ready_tail) |tail| tail.next = call else st.ready = call;
             st.ready_tail = call;
@@ -184,7 +197,7 @@ const State = struct {
                 call.deinit(ctx);
             }
             if (c.JS_IsJobPending(rt)) continue;
-            while (next < st.calls.items.len and active < 8) : (next += 1) {
+            while (next < st.calls.items.len and active < tool_concurrency) : (next += 1) {
                 const call = st.calls.items[next].?;
                 const timing = st.host.?.timing;
                 if (timing) |t| call.timing_index = t.reserve(call.name);
@@ -539,7 +552,7 @@ test "tool concurrency is bounded while excess calls queue" {
     defer result.deinit(testing.allocator);
     try testing.expect(result.ok);
     try testing.expectEqualStrings("24", result.text);
-    try testing.expect(slow.peak.load(.monotonic) > 1 and slow.peak.load(.monotonic) <= 8);
+    try testing.expect(slow.peak.load(.monotonic) > 1 and slow.peak.load(.monotonic) <= tool_concurrency);
     try testing.expectEqual(0, slow.active.load(.monotonic));
 }
 

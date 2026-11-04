@@ -6,6 +6,8 @@ pub const Call = struct {
     end_ms: u64,
     ok: bool,
     run_index: usize,
+    background: ?bool = null,
+    id: ?[]const u8 = null,
 };
 
 pub const Run = struct {

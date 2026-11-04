@@ -26,11 +26,21 @@ const Entry = struct {
 };
 
 pub fn format(gpa: std.mem.Allocator, o: sandbox.Outcome) ![]u8 {
+    return renderLimit(gpa, o, max_bytes);
+}
+
+pub fn formatMessage(gpa: std.mem.Allocator, prefix: []const u8, json: []const u8) ![]u8 {
+    const payload = try renderLimit(gpa, .{ .ok = false, .text = @constCast(json), .logs = @constCast("") }, max_bytes - prefix.len);
+    defer gpa.free(payload);
+    return std.fmt.allocPrint(gpa, "{s}{s}", .{ prefix, payload });
+}
+
+fn renderLimit(gpa: std.mem.Allocator, o: sandbox.Outcome, limit: usize) ![]u8 {
     const logs = std.mem.trimEnd(u8, o.logs, "\n");
     const value: []const u8 = if (o.ok and std.mem.eql(u8, o.text, "undefined")) "" else o.text;
     const sep: []const u8 = if (logs.len > 0 and value.len > 0) "\n" else "";
     const label: []const u8 = if (o.ok and value.len > 0) "result: " else "";
-    if (!o.log_truncated and logs.len + value.len + sep.len + label.len <= max_bytes) {
+    if (!o.log_truncated and logs.len + value.len + sep.len + label.len <= limit) {
         if (logs.len == 0 and value.len == 0) return gpa.dupe(u8, "(no output)");
         return std.fmt.allocPrint(gpa, "{s}{s}{s}{s}", .{ logs, sep, label, value });
     }
@@ -69,7 +79,7 @@ pub fn format(gpa: std.mem.Allocator, o: sandbox.Outcome) ![]u8 {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var available: usize = max_bytes;
+    var available: usize = limit;
     for (entries) |e| {
         const before = out.written().len;
         try e.heading(&out.writer, total);
@@ -118,7 +128,7 @@ pub fn format(gpa: std.mem.Allocator, o: sandbox.Outcome) ![]u8 {
         }
         if (out.written().len > 0 and out.written()[out.written().len - 1] != '\n') try out.writer.writeByte('\n');
     }
-    std.debug.assert(out.written().len <= max_bytes);
+    std.debug.assert(out.written().len <= limit);
     return out.toOwnedSlice();
 }
 

@@ -108,7 +108,10 @@ def child_code(case, step):
     return None
 
 
-def reply(handler, provider, code, text):
+def reply(handler, provider, code, text, effort=None):
+    run_args = {"code": code}
+    if effort is not None:
+        run_args["effort"] = effort
     handler.send_response(200)
     handler.send_header("Content-Type", "text/event-stream")
     handler.send_header("Transfer-Encoding", "chunked")
@@ -136,7 +139,7 @@ def reply(handler, provider, code, text):
         output = [message]
         if code is not None:
             item = {"id": "agent_fc", "type": "function_call", "call_id": "agent_call", "name": "run",
-                    "arguments": json.dumps({"code": code}), "status": "completed"}
+                    "arguments": json.dumps(run_args), "status": "completed"}
             event("response.output_item.added", output_index=1, item={**item, "arguments": "", "status": "in_progress"})
             event("response.function_call_arguments.delta", output_index=1, item_id=item["id"], delta=item["arguments"])
             event("response.function_call_arguments.done", output_index=1, item_id=item["id"], arguments=item["arguments"])
@@ -149,7 +152,7 @@ def reply(handler, provider, code, text):
         event(choices=[{"delta": {"content": text}}])
         if code is not None:
             event(choices=[{"delta": {"tool_calls": [{"index": 0, "id": "agent_call", "type": "function",
-                  "function": {"name": "run", "arguments": json.dumps({"code": code})}}]}}])
+                  "function": {"name": "run", "arguments": json.dumps(run_args)}}]}}])
         event(choices=[{"delta": {}, "finish_reason": "tool_calls" if code is not None else "stop"}], usage=USAGE)
         handler.wfile.write(b"e\r\ndata: [DONE]\n\n\r\n")
     handler.wfile.write(b"0\r\n\r\n")

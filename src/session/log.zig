@@ -17,6 +17,7 @@ pub const Diagnostic = struct {
 pub const Record = struct {
     at: ?i64 = null,
     diagnostic: ?Diagnostic = null,
+    background: ?@import("events.zig").Background = null,
     usage: ?provider.Usage = null,
     effort: ?[]const u8 = null,
     effort_source: ?provider.EffortSource = null,
@@ -46,6 +47,9 @@ pub const Record = struct {
 
 pub const Log = struct {
     file: std.Io.File,
+    mutex: std.Io.Mutex = .init,
+    next_background_id: u64 = 1,
+    lost_background: []const @import("events.zig").Background = &.{},
     offset: u64,
     poisoned: bool = false,
     provider: provider.Id = .chat_completions,
@@ -68,7 +72,7 @@ pub const Log = struct {
         var reader = file.reader(io, &.{});
         const data = try reader.interface.allocRemaining(a, .unlimited);
         const restored = try replay(gpa, a, data, history, tokens);
-        var log: Log = .{ .file = file, .offset = data.len, .parent_session_id = restored.parent_session_id, .provider = restored.provider, .model = restored.model };
+        var log: Log = .{ .file = file, .offset = data.len, .parent_session_id = restored.parent_session_id, .provider = restored.provider, .model = restored.model, .next_background_id = restored.next_background_id, .lost_background = restored.lost_background };
         if (restored.needs_repair) {
             try log.append(io, a, .{ .repair = true });
             try log.file.sync(io);
@@ -81,6 +85,8 @@ pub const Log = struct {
     }
 
     fn append(log: *Log, io: std.Io, a: std.mem.Allocator, record: Record) !void {
+        log.mutex.lockUncancelable(io);
+        defer log.mutex.unlock(io);
         if (log.poisoned) return error.SessionLogFailed;
         var stamped = record;
         stamped.at = @intCast(@divFloor(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
@@ -89,6 +95,11 @@ pub const Log = struct {
         errdefer log.poisoned = true;
         try log.file.writePositionalAll(io, bytes, log.offset);
         log.offset += bytes.len;
+    }
+
+    pub fn background(log: *Log, io: std.Io, a: std.mem.Allocator, event: @import("events.zig").Background, step: u32) !void {
+        try log.append(io, a, .{ .background = event, .turn_step = step });
+        try log.file.sync(io);
     }
 
     pub fn diagnose(log: *Log, io: std.Io, a: std.mem.Allocator, diagnostic: Diagnostic) !void {
@@ -119,8 +130,10 @@ fn apply(history: *std.ArrayList(provider.Message), record: Record) void {
     }
 }
 
-pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, history: *std.ArrayList(provider.Message), tokens: *u64) !struct { needs_repair: bool, parent_session_id: ?[]const u8, provider: provider.Id, model: ?[]const u8 } {
+pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, history: *std.ArrayList(provider.Message), tokens: *u64) !struct { needs_repair: bool, parent_session_id: ?[]const u8, provider: provider.Id, model: ?[]const u8, next_background_id: u64, lost_background: []const @import("events.zig").Background } {
     var parent_session_id: ?[]const u8 = null;
+    var next_background_id: u64 = 1;
+    var pending_background: std.StringArrayHashMapUnmanaged(@import("events.zig").Background) = .empty;
     var id: provider.Id = .chat_completions;
     var model: ?[]const u8 = null;
     var lines = std.mem.splitScalar(u8, data, '\n');
@@ -142,6 +155,23 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
             continue;
         }
         if (torn) return error.InvalidSessionLog;
+        if (r.background) |b| {
+            if (b.id.len > 1 and (b.id[0] == 'a' or b.id[0] == 'b')) {
+                const number = std.fmt.parseInt(u64, b.id[1..], 10) catch return error.InvalidSessionLog;
+                next_background_id = @max(next_background_id, number + 1);
+            }
+            if (b.state == .started) try pending_background.put(a, b.id, b) else _ = pending_background.orderedRemove(b.id);
+            continue;
+        }
+        for (r.messages) |m| if (m.source == .background) {
+            if (m.background_id) |agent_id| _ = pending_background.orderedRemove(agent_id);
+        };
+        for (r.calls orelse &.{}) |call| if (call.id) |agent_id| {
+            if (agent_id.len > 1 and (agent_id[0] == 'a' or agent_id[0] == 'b')) {
+                const number = std.fmt.parseInt(u64, agent_id[1..], 10) catch continue;
+                next_background_id = @max(next_background_id, number + 1);
+            }
+        };
         if (r.diagnostic != null) continue;
         if (r.from > history.items.len) return error.InvalidSessionLog;
         try history.ensureTotalCapacity(gpa, r.from + r.messages.len);
@@ -150,7 +180,7 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
         tokens.* = r.context_tokens;
     }
     if (history.items.len == 0) return error.InvalidSessionLog;
-    return .{ .needs_repair = torn or data[data.len - 1] != '\n', .parent_session_id = parent_session_id, .provider = id, .model = model };
+    return .{ .needs_repair = torn or data[data.len - 1] != '\n', .parent_session_id = parent_session_id, .provider = id, .model = model, .next_background_id = next_background_id, .lost_background = try a.dupe(@import("events.zig").Background, pending_background.values()) };
 }
 
 fn parseRecord(a: std.mem.Allocator, line: []const u8) !Record {

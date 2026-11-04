@@ -9,17 +9,28 @@ const process = @import("process.zig");
 const Progress = @import("../session/events.zig").Progress;
 
 pub fn agent(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolResult {
-    const a = std.json.parseFromSlice(struct { prompt: []const u8, timeout_ms: i64 = 1_800_000, model: ?[]const u8 = null, effort: ?[]const u8 = null }, gpa, args, .{ .ignore_unknown_fields = true }) catch
-        return fail(gpa, "expected {{ prompt: string, timeout_ms?: number, model?: string, effort?: string }}", .{});
+    const a = std.json.parseFromSlice(struct { prompt: []const u8, timeout_ms: i64 = 1_800_000, model: ?[]const u8 = null, effort: ?[]const u8 = null, background: bool = false }, gpa, args, .{ .ignore_unknown_fields = true }) catch
+        return fail(gpa, "expected {{ prompt: string, timeout_ms?: number, model?: string, effort?: string, background?: boolean }}", .{});
     defer a.deinit();
     if (a.value.timeout_ms <= 0) return fail(gpa, "timeout_ms must be positive", .{});
+    var cfg = t.cfg orelse return error.AgentConfigUnavailable;
+    if (a.value.model) |model| cfg.model = model;
+    if (a.value.effort) |effort| try cfg.setEffort(effort);
+    if (a.value.background)
+        return .{ .ok = try t.background.start(t, gpa, .agent, args, a.value.prompt) };
+    return execute(t, gpa, args, &t.cancel, try t.progress.add(gpa, t.io, a.value.prompt), t.run_id, null);
+}
+
+pub fn execute(t: *Tools, gpa: std.mem.Allocator, args: []const u8, cancel: *const std.atomic.Value(bool), progress: usize, run_id: usize, background_id: ?[]const u8) !sandbox.ToolResult {
+    const a = try std.json.parseFromSlice(struct { prompt: []const u8, timeout_ms: i64 = 1_800_000, model: ?[]const u8 = null, effort: ?[]const u8 = null }, gpa, args, .{ .ignore_unknown_fields = true });
+    defer a.deinit();
     var cfg = t.cfg orelse return error.AgentConfigUnavailable;
     if (a.value.model) |model| cfg.model = model;
     if (a.value.effort) |effort| try cfg.setEffort(effort);
     var tracker: Tracker = .{
         .t = t,
         .arena = .init(gpa),
-        .value = .{ .agent = try t.progress.add(gpa, t.io, a.value.prompt), .prompt = a.value.prompt },
+        .value = .{ .agent = progress, .run = run_id, .background_id = background_id, .prompt = a.value.prompt },
     };
     defer tracker.arena.deinit();
     defer t.addUsage(tracker.output.usage);
@@ -29,9 +40,9 @@ pub fn agent(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolR
         tracker.publish();
     }
     t.agents_mutex.lockUncancelable(t.io);
-    while (t.agents_active >= cfg.limits.agent_concurrency and !t.cancel.load(.acquire))
+    while (t.agents_active >= cfg.limits.agent_concurrency and !cancel.load(.acquire))
         t.agents_changed.waitTimeout(t.io, &t.agents_mutex, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch {};
-    const canceled = t.cancel.load(.acquire);
+    const canceled = cancel.load(.acquire);
     if (!canceled) t.agents_active += 1;
     t.agents_mutex.unlock(t.io);
     if (canceled) {
@@ -59,12 +70,12 @@ pub fn agent(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolR
     const result = process.run(gpa, t.io, .{
         .spawn = .{ .argv = &.{ executable, "ask", "--json", "--agent-input", "-" }, .environ_map = &env, .stdout = .pipe, .stderr = .ignore },
         .input = input,
-        .cancel = &t.cancel,
+        .cancel = cancel,
         .timeout_ms = a.value.timeout_ms,
         .termination_grace_ms = 500,
         .on_line = .{ .ctx = &tracker, .emit = Tracker.line },
     }) catch |err| {
-        if (t.cancel.load(.acquire)) {
+        if (cancel.load(.acquire)) {
             state = .canceled;
             return error.Canceled;
         }
@@ -78,7 +89,7 @@ pub fn agent(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolR
     const output = &tracker.output;
     tracker.value.usage = output.usage;
     if (output.steps) |steps| tracker.value.step = steps;
-    if (t.cancel.load(.acquire) or (if (result.stop) |stop| stop == error.Canceled else false)) {
+    if (cancel.load(.acquire) or (if (result.stop) |stop| stop == error.Canceled else false)) {
         state = .canceled;
         return error.Canceled;
     }

@@ -192,6 +192,13 @@ pub const Session = struct {
             });
         }
         s.tools.session_id = s.id;
+        s.tools.background.next_id = s.log.next_background_id;
+        for (s.log.lost_background) |lost| {
+            const id = lost.id;
+            const text = try std.fmt.allocPrint(gpa, "[background {s} {s} lost: process ended]", .{ @tagName(lost.kind), id });
+            defer gpa.free(text);
+            _ = try s.inbox.enqueueBackground(gpa, io, id, lost.kind, .lost, null, text);
+        }
         return s;
     }
 
@@ -207,6 +214,8 @@ pub const Session = struct {
     }
 
     pub fn deinit(s: *Session) void {
+        s.tools.background.stop(s.gpa);
+        s.tools.progress.clear(s.gpa);
         s.inbox.batch.deinit(s.gpa);
         s.tools.discardChanges(s.gpa);
         s.log.close(s.io);
@@ -286,10 +295,27 @@ pub const Session = struct {
 
     pub fn turn(s: *Session, user_text: []const u8, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
         s.summary = .{};
+        s.tools.run_id = 0;
+        s.tools.background.cancel.store(false, .release);
+        s.tools.background.inbox = &s.inbox;
+        s.tools.background.log = &s.log;
+        var target: PollTarget = .{ .session = s, .sink = sink };
+        s.tools.usage_sink = .{ .ctx = &target, .emit = PollTarget.usage };
+        s.tools.progress.sink = .{ .ctx = &target, .emit = PollTarget.progress };
+        s.tools.background_sink = .{ .ctx = &target, .emit = PollTarget.background };
         const started: std.Io.Clock.Timestamp = .now(s.io, .awake);
         defer {
             s.summary.?.timing.wall_ms = @intCast(@max(started.untilNow(s.io).raw.toMilliseconds(), 0));
             sink.emit(sink.ctx, .{ .turn_end = s.summary.? }) catch {};
+        }
+        defer {
+            s.tools.background.stop(s.gpa);
+            s.usage.add(s.tools.takeUsage());
+            s.summary.?.usage = s.usage;
+            s.tools.usage_sink = null;
+            s.tools.progress.sink = null;
+            s.tools.background_sink = null;
+            s.tools.progress.clear(s.gpa);
         }
         errdefer {
             if (s.summary.?.status != .canceled) s.summary.?.status = if (cancel.load(.acquire)) .canceled else .failed;
@@ -355,15 +381,31 @@ pub const Session = struct {
             if (size >= s.cfg.context_window - s.cfg.context_window / 4 and size >= s.compact_backoff)
                 try s.autoCompact(sink, cancel, detail);
             if (cancel.load(.acquire)) return error.Canceled;
+            try tools.Tools.poll(&s.tools);
             var inserted = try s.inbox.insert(s.gpa, s.io, s.arena.allocator(), pending);
             defer inserted.deinit(s.gpa);
-            if (sink.onUserInserted) |notify| {
-                for (inserted.items.items) |item| try notify(sink.ctx, item.id);
+            var has_background = false;
+            for (inserted.items.items) |item| {
+                if (item.background) |b| {
+                    has_background = true;
+                    s.tools.background.delivered(s.io, b.id);
+                    var event = b;
+                    event.result = if (std.mem.indexOfScalar(u8, item.text, '\n')) |nl| item.text[nl + 1 ..] else item.text;
+                    try sink.emit(sink.ctx, .{ .background = event });
+                } else if (sink.onUserInserted) |notify| try notify(sink.ctx, item.id);
+            }
+            if (has_background) {
+                try s.commit(s.history.items.len, pending.items, s.context_tokens + estimateTokens(pending.items), null);
+                pending.clearRetainingCapacity();
+                for (inserted.items.items) |item| if (item.background) |b|
+                    try s.log.background(s.io, s.gpa, b, s.steps + 1);
             }
             var request: std.ArrayList(provider.Message) = .empty;
             defer request.deinit(s.gpa);
             try request.appendSlice(s.gpa, s.history.items);
             try request.appendSlice(s.gpa, pending.items);
+            try tools.Tools.poll(&s.tools);
+            s.tools.background.turn_step = s.steps + 1;
             const decision = effort.decide(s.cfg, step_index == 0 or inserted.items.items.len > 0, next_effort);
             next_effort = null;
             try sink.emit(sink.ctx, .{ .step = .{ .n = s.steps + 1, .effort = decision.metadata.effort, .source = decision.metadata.source } });
@@ -430,7 +472,16 @@ pub const Session = struct {
             s.summary.?.timing.agent_calls += run_timing.agent_calls;
             pending.clearRetainingCapacity();
             try sink.emit(sink.ctx, .{ .usage = s.usage });
-            if (reply.tool_calls.len == 0) return;
+            if (reply.tool_calls.len == 0) {
+                if (!s.tools.background.pending(s.io)) return;
+                if (step_index + 1 == s.cfg.limits.max_steps) break;
+                while (s.inbox.empty(s.io) and s.tools.background.pending(s.io)) {
+                    if (cancel.load(.acquire)) return error.Canceled;
+                    try tools.Tools.poll(&s.tools);
+                    try std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(20), .clock = .awake }, s.io);
+                }
+                if (s.inbox.empty(s.io)) return;
+            }
             if (cancel.load(.acquire)) return error.Canceled;
         }
         detail.* = try std.fmt.allocPrint(s.gpa, "stopped after {d} steps", .{s.cfg.limits.max_steps});
@@ -439,6 +490,7 @@ pub const Session = struct {
 
     fn complete(s: *Session, request_cfg: provider.Config, messages: []const provider.Message, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, partial: *Partial, timing: *provider.ModelTiming, attempts: *u32, first_data_ms: *?u64) !provider.Reply {
         const Forward = struct {
+            mutex: std.Io.Mutex = .init,
             sink: Sink,
             gpa: std.mem.Allocator,
             partial: *Partial,
@@ -448,16 +500,22 @@ pub const Session = struct {
             session: *Session,
             fn onData(ctx: *anyopaque) !void {
                 const f: *@This() = @ptrCast(@alignCast(ctx));
+                f.mutex.lockUncancelable(f.io);
+                defer f.mutex.unlock(f.io);
                 if (f.first_data_ms.* == null) f.first_data_ms.* = @intCast(@max(f.started.untilNow(f.io).raw.toMilliseconds(), 0));
                 try f.sink.modelActivity(.data);
             }
             fn onDelta(ctx: *anyopaque, kind: provider.Kind, text: []const u8) !void {
                 const f: *@This() = @ptrCast(@alignCast(ctx));
+                f.mutex.lockUncancelable(f.io);
+                defer f.mutex.unlock(f.io);
                 try (if (kind == .text) &f.partial.text else &f.partial.reasoning).appendSlice(f.gpa, text);
                 try f.sink.emit(f.sink.ctx, .{ .delta = .{ .kind = kind, .text = text } });
             }
             fn onRetry(ctx: *anyopaque, event: provider.RetryEvent) !void {
                 const f: *@This() = @ptrCast(@alignCast(ctx));
+                f.mutex.lockUncancelable(f.io);
+                defer f.mutex.unlock(f.io);
                 switch (event) {
                     .started => try f.sink.modelActivity(.started),
                     .finished => try f.sink.modelActivity(.finished),
@@ -479,7 +537,29 @@ pub const Session = struct {
         };
         var fwd: Forward = .{ .sink = sink, .gpa = s.gpa, .partial = partial, .io = s.io, .started = timing.started, .first_data_ms = first_data_ms, .session = s };
         const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .timing = timing };
-        return provider.complete(s.gpa, s.arena.allocator(), s.client, request_cfg, s.id, messages, tools_json, null, provider_sink, cancel, detail, attempts, .{ .ctx = &fwd, .onEvent = Forward.onRetry });
+        if (!s.tools.background.pending(s.io))
+            return provider.complete(s.gpa, s.arena.allocator(), s.client, request_cfg, s.id, messages, tools_json, null, provider_sink, cancel, detail, attempts, .{ .ctx = &fwd, .onEvent = Forward.onRetry });
+        const Request = struct {
+            fn work(session: *Session, cfg: provider.Config, history: []const provider.Message, ps: provider.Sink, flag: *const std.atomic.Value(bool), failure: *?[]u8, tries: *u32, observer: *Forward, done: *std.Io.Event) !provider.Reply {
+                defer done.set(session.io);
+                return provider.complete(session.gpa, session.arena.allocator(), session.client, cfg, session.id, history, tools_json, null, ps, flag, failure, tries, .{ .ctx = observer, .onEvent = Forward.onRetry });
+            }
+        };
+        var done: std.Io.Event = .unset;
+        var request = try s.io.concurrent(Request.work, .{ s, request_cfg, messages, provider_sink, cancel, detail, attempts, &fwd, &done });
+        defer _ = request.cancel(s.io) catch {};
+        while (!done.isSet()) {
+            {
+                fwd.mutex.lockUncancelable(s.io);
+                defer fwd.mutex.unlock(s.io);
+                try tools.Tools.poll(&s.tools);
+            }
+            done.waitTimeout(s.io, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch |err| switch (err) {
+                error.Timeout => {},
+                else => return err,
+            };
+        }
+        return request.await(s.io);
     }
 
     pub const Ran = struct {
@@ -494,8 +574,8 @@ pub const Session = struct {
 
     fn runTimed(s: *Session, code: []const u8, cancel: ?*const std.atomic.Value(bool), timing: ?*sandbox.RunTiming) !Ran {
         defer s.usage.add(s.tools.takeUsage());
-        s.tools.progress.clear(s.gpa);
-        defer s.tools.progress.clear(s.gpa);
+        if (!s.tools.background.pending(s.io)) s.tools.progress.clear(s.gpa);
+        s.tools.run_id += 1;
         s.tools.discardChanges(s.gpa);
         var host = s.tools.host();
         host.timing = timing;
@@ -504,6 +584,27 @@ pub const Session = struct {
         errdefer outcome.deinit(s.gpa);
         return .{ .outcome = outcome, .changes = try s.tools.takeChanges(s.gpa, s.arena.allocator()) };
     }
+
+    const PollTarget = struct {
+        session: *Session,
+        sink: Sink,
+
+        fn usage(ctx: *anyopaque, value: provider.Usage) !void {
+            const target: *PollTarget = @ptrCast(@alignCast(ctx));
+            target.session.usage.add(value);
+            try target.sink.emit(target.sink.ctx, .{ .usage = target.session.usage });
+        }
+
+        fn progress(ctx: *anyopaque, value: @import("session/events.zig").Progress) !void {
+            const target: *PollTarget = @ptrCast(@alignCast(ctx));
+            try target.sink.emit(target.sink.ctx, .{ .progress = value });
+        }
+
+        fn background(ctx: *anyopaque, value: @import("session/events.zig").Background) !void {
+            const target: *PollTarget = @ptrCast(@alignCast(ctx));
+            try target.sink.emit(target.sink.ctx, .{ .background = value });
+        }
+    };
 
     const Executed = struct { output: []const u8, ok: bool, run_ms: ?u64 = null, effort: ?effort.Declaration = null };
 
@@ -521,26 +622,6 @@ pub const Session = struct {
         const code = if (args.value.code) |value| (if (value == .string) value.string else null) else null;
         if (code == null) return .{ .ok = false, .output = try a.dupe(u8, "error: arguments must be a JSON object { \"code\": string }"), .effort = args.value.effort };
         try sink.emit(sink.ctx, .{ .run_start = code.? });
-        const Forward = struct {
-            const UsageTarget = struct { session: *Session, sink: Sink };
-
-            fn usage(ctx: *anyopaque, value: provider.Usage) !void {
-                const target: *UsageTarget = @ptrCast(@alignCast(ctx));
-                target.session.usage.add(value);
-                try target.sink.emit(target.sink.ctx, .{ .usage = target.session.usage });
-            }
-
-            fn progress(ctx: *anyopaque, value: @import("session/events.zig").Progress) !void {
-                const target: *const Sink = @ptrCast(@alignCast(ctx));
-                try target.emit(target.ctx, .{ .progress = value });
-            }
-        };
-        var usage_target: Forward.UsageTarget = .{ .session = s, .sink = sink };
-        s.tools.usage_sink = .{ .ctx = &usage_target, .emit = Forward.usage };
-        defer s.tools.usage_sink = null;
-        var progress_sink = sink;
-        s.tools.progress.sink = .{ .ctx = &progress_sink, .emit = Forward.progress };
-        defer s.tools.progress.sink = null;
         const ran = try s.runTimed(code.?, cancel, timing);
         const o = ran.outcome;
         defer o.deinit(s.gpa);
@@ -569,7 +650,7 @@ fn compactionCut(messages: []const provider.Message, window: u64) usize {
     var i = messages.len;
     while (i > 1) {
         i -= 1;
-        if (std.mem.eql(u8, messages[i].role, "user")) {
+        if (std.mem.eql(u8, messages[i].role, "user") and messages[i].source == null) {
             turns += 1;
             if (turns == 2) {
                 cut = i;

@@ -28,7 +28,7 @@ pub const Queue = struct {
         slot.dirty = true;
     }
 
-    // Only the Run thread calls the sink; tool threads only replace owned snapshots.
+    // Session serializes sink calls; tool threads only replace owned snapshots.
     pub fn drain(q: *Queue, io: std.Io) !void {
         try q.drainAt(io, std.Io.Clock.awake.now(io));
     }
@@ -46,7 +46,7 @@ pub const Queue = struct {
         }
     }
 
-    // Called before/after eval, when all tool threads have been joined.
+    // Called after tool joins, or once every background result has reached the inbox.
     pub fn clear(q: *Queue, gpa: std.mem.Allocator) void {
         for (q.slots.items) |*slot| slot.value.deinit(gpa);
         q.slots.clearAndFree(gpa);

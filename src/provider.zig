@@ -99,6 +99,10 @@ pub const Message = struct {
     reasoning: ?Reasoning = null,
     phase: ?[]const u8 = null,
     step_effort: ?StepEffort = null,
+    source: ?enum { background } = null,
+    background_id: ?[]const u8 = null,
+    background_ok: ?bool = null,
+    background_kind: ?@import("session/events.zig").Background.Kind = null,
 };
 
 pub const Usage = struct {

@@ -4,6 +4,10 @@ const Change = @import("../tools/diff.zig").Change;
 
 pub const Progress = struct {
     agent: usize,
+    run: usize = 0,
+    kind: Background.Kind = .agent,
+    elapsed_ms: u64 = 0,
+    background_id: ?[]const u8 = null,
     prompt: []const u8,
     state: enum { queued, working, done, failed, canceled, timed_out } = .working,
     step: u32 = 0,
@@ -17,11 +21,14 @@ pub const Progress = struct {
         const used = try cloneStrings(gpa, p.tools);
         errdefer freeStrings(gpa, used);
         const files = try cloneStrings(gpa, p.files);
-        return .{ .agent = p.agent, .prompt = prompt, .state = p.state, .step = p.step, .tools = used, .files = files, .usage = p.usage };
+        errdefer freeStrings(gpa, files);
+        const background_id = if (p.background_id) |id| try gpa.dupe(u8, id) else null;
+        return .{ .kind = p.kind, .elapsed_ms = p.elapsed_ms, .run = p.run, .background_id = background_id, .agent = p.agent, .prompt = prompt, .state = p.state, .step = p.step, .tools = used, .files = files, .usage = p.usage };
     }
 
     pub fn deinit(p: *Progress, gpa: std.mem.Allocator) void {
         gpa.free(p.prompt);
+        if (p.background_id) |id| gpa.free(id);
         freeStrings(gpa, p.tools);
         freeStrings(gpa, p.files);
         p.* = undefined;
@@ -64,6 +71,16 @@ pub const TurnSummary = struct {
 
 pub const ModelActivity = enum { started, data, finished };
 
+pub const Background = struct {
+    id: []const u8,
+    kind: Kind,
+    state: enum { started, finished, lost },
+    ok: ?bool = null,
+    result: ?[]const u8 = null,
+
+    pub const Kind = enum { agent, bash };
+};
+
 pub const Event = union(enum) {
     step: struct { n: u32, effort: []const u8, source: provider.EffortSource },
     /// Slices are valid only during the callback.
@@ -74,6 +91,7 @@ pub const Event = union(enum) {
     notice: []const u8,
     usage: provider.Usage,
     progress: Progress,
+    background: Background,
     turn_end: TurnSummary,
 };
 
@@ -89,7 +107,10 @@ pub const JsonEvent = union(enum) {
 
     pub fn jsonStringify(value: JsonEvent, writer: *std.json.Stringify) !void {
         switch (value) {
-            .event => |event| try writer.write(event),
+            .event => |event| if (event == .background) {
+                const b = event.background;
+                try writer.write(.{ .background = .{ .id = b.id, .kind = b.kind, .state = b.state, .ok = b.ok } });
+            } else try writer.write(event),
             inline else => |payload, tag| {
                 try writer.beginObject();
                 try writer.objectField(@tagName(tag));
