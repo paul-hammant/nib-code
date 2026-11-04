@@ -3,6 +3,8 @@ const sandbox = @import("../sandbox.zig");
 const tools = @import("../tools.zig");
 const Tools = tools.Tools;
 const fail = tools.fail;
+const atomic_file = @import("atomic_file.zig");
+const file_state = @import("file_state.zig");
 
 pub fn read(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolResult {
     const A = struct { path: []const u8, offset: usize = 1, limit: usize = 2000 };
@@ -13,7 +15,14 @@ pub fn read(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
     const path = try tools.normalizedPath(t.io, gpa, a.value.path);
     defer gpa.free(path);
     try t.checkCredentialPath(gpa, path);
-    const data = std.Io.Dir.cwd().readFileAlloc(t.io, path, gpa, .limited(16 * 1024 * 1024)) catch |err|
+    const lock = try file_state.lock(t, gpa, path);
+    defer lock.close(t.io);
+    const file = std.Io.Dir.cwd().openFile(t.io, path, .{}) catch |err|
+        return fail(gpa, "{s}: {s}", .{ a.value.path, @errorName(err) });
+    defer file.close(t.io);
+    const stat = try file.stat(t.io);
+    var reader = file.reader(t.io, &.{});
+    const data = reader.interface.allocRemaining(gpa, .limited(16 * 1024 * 1024)) catch |err|
         return fail(gpa, "{s}: {s}", .{ a.value.path, @errorName(err) });
     defer gpa.free(data);
 
@@ -28,7 +37,10 @@ pub fn read(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
         end = if (std.mem.indexOfScalarPos(u8, data, end, '\n')) |nl| nl + 1 else data.len;
     }
     const next_offset: ?usize = if (end < data.len) line + n else null;
-    return .{ .ok = try std.json.Stringify.valueAlloc(gpa, .{ .text = data[start..end], .next_offset = next_offset }, .{}) };
+    const result = try std.json.Stringify.valueAlloc(gpa, .{ .text = data[start..end], .next_offset = next_offset }, .{});
+    errdefer gpa.free(result);
+    try t.file_state.remember(t.io, gpa, path, stat);
+    return .{ .ok = result };
 }
 
 pub fn edit(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolResult {
@@ -40,14 +52,13 @@ pub fn edit(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
     const path = try tools.normalizedPath(t.io, gpa, v.path);
     defer gpa.free(path);
     try t.checkCredentialPath(gpa, path);
-    var lock: Tools.PathLock = .{ .path = path };
-    t.lockPath(&lock);
-    defer t.unlockPath(&lock);
+    const lock = try file_state.lock(t, gpa, path);
+    defer lock.close(t.io);
     if (t.cancel.load(.acquire)) return error.Canceled;
     if (v.old_text.len == 0) return fail(gpa, "old_text is empty; use write to create a file", .{});
 
     const dir = std.Io.Dir.cwd();
-    const data = dir.readFileAlloc(t.io, v.path, gpa, .limited(16 * 1024 * 1024)) catch |err|
+    const data = dir.readFileAlloc(t.io, path, gpa, .limited(16 * 1024 * 1024)) catch |err|
         return fail(gpa, "{s}: {s}", .{ v.path, @errorName(err) });
     defer gpa.free(data);
 
@@ -58,8 +69,9 @@ pub fn edit(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
 
     const out = try std.mem.replaceOwned(u8, gpa, data, v.old_text, v.new_text);
     defer gpa.free(out);
-    dir.writeFile(t.io, .{ .sub_path = v.path, .data = out }) catch |err|
+    const written = atomic_file.replace(t.io, gpa, path, out, .{}) catch |err|
         return fail(gpa, "{s}: {s}", .{ v.path, @errorName(err) });
+    try t.file_state.remember(t.io, gpa, path, written);
     try t.noteChange(gpa, path, data, out);
     return .{ .ok = try std.fmt.allocPrint(gpa, "{{\"replaced\":{d}}}", .{count}) };
 }
@@ -73,22 +85,30 @@ pub fn write(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolR
     const path = try tools.normalizedPath(t.io, gpa, v.path);
     defer gpa.free(path);
     try t.checkCredentialPath(gpa, path);
-    var lock: Tools.PathLock = .{ .path = path };
-    t.lockPath(&lock);
-    defer t.unlockPath(&lock);
+    const lock = try file_state.lock(t, gpa, path);
+    defer lock.close(t.io);
     if (t.cancel.load(.acquire)) return error.Canceled;
 
     const dir = std.Io.Dir.cwd();
+    const current = dir.statFile(t.io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return fail(gpa, "{s}: {s}", .{ v.path, @errorName(err) }),
+    };
+    if (current) |stat| {
+        if (t.file_state.changed(t.io, path, stat))
+            return fail(gpa, "{s} changed since this session last read or wrote it (by bash, a background agent, or the user); read it again before overwriting", .{v.path});
+    }
     var can_track = t.track_changes;
     const before = if (can_track) dir.readFileAlloc(t.io, path, gpa, .limited(16 * 1024 * 1024)) catch |err| before: {
         if (err != error.FileNotFound) can_track = false;
         break :before null;
     } else null;
     defer if (before) |data| gpa.free(data);
-    if (std.fs.path.dirname(v.path)) |parent| dir.createDirPath(t.io, parent) catch |err|
+    if (std.fs.path.dirname(path)) |parent| dir.createDirPath(t.io, parent) catch |err|
         return fail(gpa, "{s}: {s}", .{ parent, @errorName(err) });
-    dir.writeFile(t.io, .{ .sub_path = v.path, .data = v.content }) catch |err|
+    const written = atomic_file.replace(t.io, gpa, path, v.content, .{}) catch |err|
         return fail(gpa, "{s}: {s}", .{ v.path, @errorName(err) });
+    try t.file_state.remember(t.io, gpa, path, written);
     if (can_track) try t.noteChange(gpa, path, before, v.content);
     return .{ .ok = try std.fmt.allocPrint(gpa, "{{\"bytes\":{d}}}", .{v.content.len}) };
 }
@@ -169,7 +189,10 @@ test "parallel edits lock the normalized path through read and write" {
         \\}})))
     , .{tmp.sub_path});
     defer testing.allocator.free(code);
-    var t: Tools = .{ .io = testing.io, .home = "/home/nobody" };
+    const home = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer testing.allocator.free(home);
+    var t: Tools = .{ .io = testing.io, .home = home };
+    defer t.file_state.deinit(testing.allocator);
     const result = try sandbox.eval(testing.allocator, testing.io, code, .{}, t.host(), null);
     defer result.deinit(testing.allocator);
     try testing.expect(result.ok);
@@ -226,7 +249,10 @@ test "read and write round trip more than 16 KiB inside JS" {
         \\await tools.write({{path, content: page.text}});
     , .{tmp.sub_path});
     defer testing.allocator.free(code);
-    var t: Tools = .{ .io = testing.io, .home = "/home/nobody" };
+    const home = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer testing.allocator.free(home);
+    var t: Tools = .{ .io = testing.io, .home = home };
+    defer t.file_state.deinit(testing.allocator);
     const result = try sandbox.eval(testing.allocator, testing.io, code, .{}, t.host(), null);
     defer result.deinit(testing.allocator);
     try testing.expect(result.ok);
@@ -258,7 +284,10 @@ test "read default pagination reconstructs every byte in JS" {
         \\await tools.write({{path, content: text}});
     , .{tmp.sub_path});
     defer testing.allocator.free(code);
-    var t: Tools = .{ .io = testing.io, .home = "/home/nobody" };
+    const home = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer testing.allocator.free(home);
+    var t: Tools = .{ .io = testing.io, .home = home };
+    defer t.file_state.deinit(testing.allocator);
     const result = try sandbox.eval(testing.allocator, testing.io, code, .{}, t.host(), null);
     defer result.deinit(testing.allocator);
     try testing.expect(result.ok);
@@ -307,13 +336,19 @@ test "change tracking excludes other writers between and after calls" {
     const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/f", .{tmp.sub_path});
     defer testing.allocator.free(path);
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "f", .data = "base\nother\nlast\n" });
-    var root: Tools = .{ .io = testing.io, .home = "/home/nobody", .track_changes = true };
+    const home = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer testing.allocator.free(home);
+    var root: Tools = .{ .io = testing.io, .home = home, .track_changes = true };
     defer root.discardChanges(testing.allocator);
-    var child: Tools = .{ .io = testing.io, .home = "/home/nobody", .track_changes = true };
+    defer root.file_state.deinit(testing.allocator);
+    var child: Tools = .{ .io = testing.io, .home = home, .track_changes = true };
     defer child.discardChanges(testing.allocator);
+    defer child.file_state.deinit(testing.allocator);
     try trackedCall(&root, "edit", .{ .path = path, .old_text = "base", .new_text = "root" });
     try trackedCall(&child, "edit", .{ .path = path, .old_text = "other", .new_text = "child" });
+    try trackedCall(&root, "read", .{ .path = path });
     try trackedCall(&root, "write", .{ .path = path, .content = "root2\nchild\nlast\n" });
+    try trackedCall(&child, "read", .{ .path = path });
     try trackedCall(&child, "write", .{ .path = path, .content = "root2\nchild\ntail\n" });
     try tmp.dir.deleteFile(testing.io, "f");
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -339,8 +374,11 @@ test "change tracking omits no-ops and failed calls but reports empty creation" 
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/f", .{tmp.sub_path});
     defer testing.allocator.free(path);
-    var t: Tools = .{ .io = testing.io, .home = "/home/nobody", .track_changes = true };
+    const home = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer testing.allocator.free(home);
+    var t: Tools = .{ .io = testing.io, .home = home, .track_changes = true };
     defer t.discardChanges(testing.allocator);
+    defer t.file_state.deinit(testing.allocator);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     try trackedCall(&t, "write", .{ .path = path, .content = "" });
@@ -357,4 +395,108 @@ test "change tracking omits no-ops and failed calls but reports empty creation" 
     try testing.expect(result == .err);
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "f", .data = "external\n" });
     try testing.expectEqual(@as(usize, 0), (try t.takeChanges(testing.allocator, arena.allocator())).len);
+}
+
+const FileTest = struct {
+    tmp: testing.TmpDir,
+    home: []u8,
+    path: []u8,
+    host: Tools,
+
+    fn init() !FileTest {
+        var tmp = testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const home = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        errdefer testing.allocator.free(home);
+        const path = try std.fs.path.join(testing.allocator, &.{ home, "f" });
+        return .{ .tmp = tmp, .home = home, .path = path, .host = .{ .io = testing.io, .home = home } };
+    }
+
+    fn deinit(f: *FileTest) void {
+        f.host.file_state.deinit(testing.allocator);
+        testing.allocator.free(f.path);
+        testing.allocator.free(f.home);
+        f.tmp.cleanup();
+    }
+
+    fn call(f: *FileTest, name: []const u8, value: anytype) !sandbox.ToolResult {
+        const args = try std.json.Stringify.valueAlloc(testing.allocator, value, .{});
+        defer testing.allocator.free(args);
+        return Tools.call(&f.host, testing.allocator, name, args);
+    }
+
+    fn ok(f: *FileTest, name: []const u8, value: anytype) !void {
+        const result = try f.call(name, value);
+        defer freeResult(result);
+        if (result == .err) std.debug.print("tool failed: {s}\n", .{result.err});
+        try testing.expect(result == .ok);
+    }
+
+    fn content(f: *FileTest, expected: []const u8) !void {
+        const actual = try f.tmp.dir.readFileAlloc(testing.io, "f", testing.allocator, .limited(1024));
+        defer testing.allocator.free(actual);
+        try testing.expectEqualStrings(expected, actual);
+    }
+};
+
+test "write rejects external changes after paginated read and reread permits overwrite" {
+    var f = try FileTest.init();
+    defer f.deinit();
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "f", .data = "one\ntwo\n" });
+    try f.ok("read", .{ .path = f.path, .offset = 2, .limit = 1 });
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "f", .data = "external change" });
+    const rejected = try f.call("write", .{ .path = f.path, .content = "stale" });
+    defer freeResult(rejected);
+    try testing.expect(rejected == .err);
+    try testing.expect(std.mem.indexOf(u8, rejected.err, f.path) != null);
+    try testing.expect(std.mem.indexOf(u8, rejected.err, "read it again before overwriting") != null);
+    try f.content("external change");
+    try f.ok("read", .{ .path = f.path });
+    try f.ok("write", .{ .path = f.path, .content = "fresh" });
+    try f.content("fresh");
+}
+
+test "write allows unseen existing files and remembers successful writes" {
+    var f = try FileTest.init();
+    defer f.deinit();
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "f", .data = "unseen" });
+    try f.ok("write", .{ .path = f.path, .content = "first" });
+    try f.ok("write", .{ .path = f.path, .content = "second" });
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "f", .data = "external longer" });
+    const rejected = try f.call("write", .{ .path = f.path, .content = "third" });
+    defer freeResult(rejected);
+    try testing.expect(rejected == .err);
+    try f.content("external longer");
+}
+
+test "edit ignores stale state and updates the session observation" {
+    var f = try FileTest.init();
+    defer f.deinit();
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "f", .data = "old" });
+    try f.ok("read", .{ .path = f.path });
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "f", .data = "external" });
+    try f.ok("edit", .{ .path = f.path, .old_text = "external", .new_text = "edited" });
+    try f.ok("write", .{ .path = f.path, .content = "after edit" });
+    try f.content("after edit");
+}
+
+test "file observations are independent per session and follow aliases" {
+    var f = try FileTest.init();
+    defer f.deinit();
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "f", .data = "old" });
+    try f.tmp.dir.symLink(testing.io, "f", "alias", .{});
+    const alias = try std.fs.path.join(testing.allocator, &.{ f.home, "alias" });
+    defer testing.allocator.free(alias);
+    try f.ok("read", .{ .path = alias });
+    var other: Tools = .{ .io = testing.io, .home = f.home };
+    defer other.file_state.deinit(testing.allocator);
+    const args = try std.json.Stringify.valueAlloc(testing.allocator, .{ .path = f.path, .content = "other session" }, .{});
+    defer testing.allocator.free(args);
+    const changed = Tools.call(&other, testing.allocator, "write", args);
+    defer freeResult(changed);
+    try testing.expect(changed == .ok);
+    const rejected = try f.call("write", .{ .path = f.path, .content = "stale" });
+    defer freeResult(rejected);
+    try testing.expect(rejected == .err);
+    try f.content("other session");
 }

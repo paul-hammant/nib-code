@@ -1,4 +1,5 @@
 const std = @import("std");
+const atomic_file = @import("tools/atomic_file.zig");
 const provider = @import("provider.zig");
 const codex = @import("provider/codex.zig");
 const Allocator = std.mem.Allocator;
@@ -330,11 +331,7 @@ pub fn saveEffort(a: Allocator, io: std.Io, home_path: []const u8, value: []cons
     if (std.mem.eql(u8, text, out.items)) return;
     const cwd = std.Io.Dir.cwd();
     try cwd.createDirPath(io, home_path);
-    var atomic = try cwd.createFileAtomic(io, path, .{ .replace = true, .permissions = .fromMode(0o600) });
-    defer atomic.deinit(io);
-    try atomic.file.writeStreamingAll(io, out.items);
-    try atomic.file.sync(io);
-    try atomic.replace(io);
+    _ = try atomic_file.replace(io, a, path, out.items, .{ .permissions = .fromMode(0o600), .sync = true });
 }
 
 test "TOML sections comments strings and scalar values" {
@@ -635,4 +632,23 @@ test "limits defaults, bounds and diagnostics" {
         try t.expectError(error.InvalidConfig, resolve(a, &env, text, "config.toml", &detail));
         try t.expect(std.mem.startsWith(u8, detail.?, "config.toml:"));
     }
+}
+
+test "effort replacement preserves config symlink and permissions" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(t.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer t.allocator.free(root);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "settings.toml", .data = "effort = \"low\"\n" });
+    try tmp.dir.symLink(t.io, "settings.toml", "config.toml", .{});
+    if (@import("builtin").os.tag != .windows) try tmp.dir.setFilePermissions(t.io, "settings.toml", .fromMode(0o640), .{});
+    try saveEffort(t.allocator, t.io, root, "high");
+    try t.expectEqual(std.Io.File.Kind.sym_link, (try tmp.dir.statFile(t.io, "config.toml", .{ .follow_symlinks = false })).kind);
+    if (@import("builtin").os.tag != .windows) try t.expectEqual(@as(std.posix.mode_t, 0o640), (try tmp.dir.statFile(t.io, "settings.toml", .{})).permissions.toMode() & 0o7777);
+    const text = try tmp.dir.readFileAlloc(t.io, "settings.toml", t.allocator, .unlimited);
+    defer t.allocator.free(text);
+    try t.expectEqualStrings("effort = \"high\"\n", text);
+    var it = tmp.dir.iterate();
+    while (try it.next(t.io)) |entry| try t.expect(!std.mem.startsWith(u8, entry.name, ".nib-"));
 }
