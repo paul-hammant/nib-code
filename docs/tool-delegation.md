@@ -16,6 +16,8 @@ llm 限额由 [config.toml 的 `[limits]`](config.md#limits) 配置：同进程�
 
 `tools.bash({command, background: true})` 同样立即返回含 `id` 的启动确认；后台 bash 与后台 agent 共用编号，独立于 agent 并发限额。后台 bash 最多同时运行 8 个，超出时立即 reject 并给出明确错误，不排队；子 agent 内也可使用。结果在下一次主模型请求前作为带来源标记的 user 消息插入，恢复未完成任务时插入 lost 消息。后台 bash 的生命周期也通过 `background` 事件报告。
 
+后台 agent/bash 的执行失败通常转换成结果消息；若后台工作线程自身出错，无法生成或写入 inbox 结果（例如分配失败），内部错误由轮询路径上报一次，该任务不再计入待结果集合，后续 Run 不会反复收到同一错误。
+
 changes 汇总子会话所有 Run（包括失败 Run）已收到的 `run_end.changes`，按路径首次出现顺序返回 `[{ path, added, removed, created }]`：同路径 added/removed 累加，created 取逻辑或，不含 diff 正文。这是各 Run 的累计行改动量，不是起止文件的净 diff；只涵盖 edit/write，不包含 bash 或外部进程改动。中断时尚未发出 run_end 的改动也可能不在汇总中，失败后仍须检查半成品文件。
 
 ## 进度、用量与取消

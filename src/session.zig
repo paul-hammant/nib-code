@@ -410,7 +410,7 @@ pub const Session = struct {
             try request.appendSlice(s.gpa, s.history.items);
             try request.appendSlice(s.gpa, pending.items);
             try tools.Tools.poll(&s.tools);
-            s.tools.background.turn_step = s.steps + 1;
+            s.tools.background.setTurnStep(s.io, s.steps + 1);
             const decision = effort.decide(s.cfg, step_index == 0 or inserted.items.items.len > 0, next_effort);
             next_effort = null;
             try sink.emit(sink.ctx, .{ .step = .{ .n = s.steps + 1, .effort = decision.metadata.effort, .source = decision.metadata.source } });

@@ -116,6 +116,12 @@ pub const Background = struct {
         return result;
     }
 
+    pub fn setTurnStep(bg: *Background, io: std.Io, step: u32) void {
+        bg.mutex.lockUncancelable(io);
+        defer bg.mutex.unlock(io);
+        bg.turn_step = step;
+    }
+
     pub fn pending(bg: *Background, io: std.Io) bool {
         bg.mutex.lockUncancelable(io);
         defer bg.mutex.unlock(io);
@@ -140,7 +146,12 @@ pub const Background = struct {
                 try emit(ctx, .{ .id = job.id, .kind = job.kind, .state = .started });
                 job.announced = true;
             }
-            if (job.done.load(.acquire)) if (job.failure) |err| return err;
+            if (job.done.load(.acquire)) if (job.failure) |err| {
+                job.failure = null;
+                // No inbox result will arrive after an internal worker failure.
+                job.delivered = true;
+                return err;
+            };
         }
     }
 
@@ -169,4 +180,57 @@ fn messageResult(gpa: std.mem.Allocator, kind: BackgroundEvent.Kind, result: @im
     const parsed = try std.json.parseFromSlice(Parsed, gpa, result.ok, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     return std.json.Stringify.valueAlloc(gpa, parsed.value, .{ .emit_null_optional_fields = false });
+}
+
+test "background worker failures are reported once and stop being pending" {
+    const testing = std.testing;
+    var t: Tools = .{ .io = testing.io, .home = "/tmp" };
+    defer t.background.jobs.deinit(testing.allocator);
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var jobs: [2]Background.Job = undefined;
+    for (&jobs, [_]BackgroundEvent.Kind{ .agent, .bash }, [_][]const u8{ "a1", "b2" }) |*job, kind, id| {
+        job.* = .{
+            .t = &t,
+            .gpa = failing.allocator(),
+            .args = @constCast("{}"),
+            .prompt = @constCast("test"),
+            .id = @constCast(id),
+            .kind = kind,
+            .progress = 0,
+            .run = 1,
+            .started = .now(testing.io, .awake),
+        };
+        try t.background.jobs.append(testing.allocator, job);
+    }
+    t.background.bash_active = 1;
+    const Sink = struct {
+        starts: usize = 0,
+
+        fn emit(ctx: *anyopaque, event: BackgroundEvent) !void {
+            const sink: *@This() = @ptrCast(@alignCast(ctx));
+            try testing.expectEqual(.started, event.state);
+            sink.starts += 1;
+        }
+    };
+    var sink: Sink = .{};
+    try testing.expect(t.background.pending(testing.io));
+    try t.background.poll(testing.io, &sink, Sink.emit);
+    try testing.expectEqual(@as(usize, 2), sink.starts);
+    for (&jobs) |*job| {
+        const thread = try std.Thread.spawn(.{}, Background.Job.work, .{job});
+        thread.join();
+        try testing.expect(job.done.load(.acquire));
+        try testing.expectEqual(error.OutOfMemory, job.failure.?);
+    }
+    try testing.expectEqual(@as(usize, 0), t.background.bash_active);
+    try testing.expectError(error.OutOfMemory, t.background.poll(testing.io, &sink, Sink.emit));
+    try testing.expectEqual(null, jobs[0].failure);
+    try testing.expect(jobs[0].delivered);
+    try testing.expect(!jobs[1].delivered);
+    try testing.expect(t.background.pending(testing.io));
+    try testing.expectError(error.OutOfMemory, t.background.poll(testing.io, &sink, Sink.emit));
+    try testing.expect(!t.background.pending(testing.io));
+    try t.background.poll(testing.io, &sink, Sink.emit);
+    try t.background.poll(testing.io, &sink, Sink.emit);
+    try testing.expectEqual(@as(usize, 2), sink.starts);
 }
