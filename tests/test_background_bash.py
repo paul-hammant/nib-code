@@ -15,6 +15,7 @@ import time
 import unittest
 
 import mock_agent
+from background_assertions import assert_background_bytes, root_records
 from mock_agent import reply
 from mock_llm_tool import content
 from test_agent import alive
@@ -91,7 +92,8 @@ class Mock(http.server.ThreadingHTTPServer):
         if self.case == "nonzero":
             return "await " + bash("echo failed; exit 7")
         if self.case == "long":
-            return "await " + bash("python3 -c 'print(\"head:\" + \"z\" * 50000 + \":tail\")'")
+            return "await " + bash(shlex.join([sys.executable, "-c",
+                                              'print("head:" + "中文🙂" * 10000 + ":tail")']))
         if self.case == "cancel":
             program = ("import os,time,pathlib; pathlib.Path('worker.started').write_text(str(os.getpid())); "
                        "time.sleep(30)")
@@ -112,6 +114,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with self.server.lock:
             step = sum(r["prompt"] == prompt for r in self.server.requests)
             self.server.requests.append({"prompt": prompt, "step": step, "body": body, "messages": messages})
+        if (prompt == "initial" and self.server.case.startswith("injected_") and
+                any(content(m).startswith("[background ") for m in messages)):
+            if self.server.case == "injected_cancel":
+                self.server.model_gate.wait(15)
+                return
+            data = json.dumps({"error": {"message": "injected request failed"}}).encode()
+            self.send_response(400)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         code, text = None, "complete"
         if users[-1].startswith("Summarize the conversation above"):
             self.server.summary_seen.set()
@@ -226,6 +239,35 @@ class BackgroundBashTests:
     def log(self, events):
         return records(self.home / "sessions" / (events[0]["start"]["session_id"] + ".jsonl"))
 
+    def assert_accounting(self, mock, events=None):
+        log = self.log(events) if events is not None else root_records(self.home)
+        terminal = events[-1].get("end", events[-1].get("error")) if events is not None else None
+        return assert_background_bytes(self, log, mock.observed(), terminal)
+
+    def check_injected_request_aborted(self, cancel):
+        mock = self.mock("injected_cancel" if cancel else "injected_failure")
+        process = self.start()
+        wait_for(lambda: len(mock.observed()) == 2)
+        wait_for(lambda: (self.cwd / "worker.started").exists())
+        self.release()
+        wait_for(lambda: len(mock.observed()) == 3)
+        self.assertTrue(any(content(m).startswith("[background ")
+                            for m in mock.observed()[-1]["messages"]))
+        if cancel:
+            process.send_signal(signal.SIGINT)
+        events = self.finish(process, ok=False)
+        steps = self.assert_accounting(mock, events)
+        self.assertEqual(len(steps), 2)
+        self.assertEqual(steps[-1]["output_bytes"], 0)
+        self.assertEqual(events[-1]["error"]["timing"]["output_bytes"],
+                         sum(run["output_bytes"] for step in steps for run in step["run_results"]))
+
+    def test_failed_request_does_not_count_injected_result(self):
+        self.check_injected_request_aborted(cancel=False)
+
+    def test_canceled_request_does_not_count_injected_result(self):
+        self.check_injected_request_aborted(cancel=True)
+
     def test_no_run_wait_and_result_metadata(self):
         mock = self.mock("basic")
         process = self.start()
@@ -248,6 +290,7 @@ class BackgroundBashTests:
         self.assertEqual([(m["background_kind"], m["background_id"]) for m in stored], [("bash", "b1")])
         calls = [c for r in log for c in r.get("calls", []) if c["name"] == "bash"]
         self.assertEqual([(c["background"], c["id"]) for c in calls], [(True, "b1")])
+        self.assert_accounting(mock, events)
 
     def test_two_steps_and_next_boundary(self):
         mock = self.mock("boundary")
@@ -263,6 +306,7 @@ class BackgroundBashTests:
         self.assertEqual(len(mock.observed()), 4)
         self.completion(mock.observed()[-1]["messages"])
         self.assertEqual(len([e for e in events if "run_end" in e]), 3)
+        self.assert_accounting(mock, events)
 
     def test_completion_after_auto_compaction(self):
         self.env["NIB_CONTEXT_WINDOW"] = "8192"
@@ -284,6 +328,9 @@ class BackgroundBashTests:
         self.assertIn("head:", content(message))
         self.assertIn(":tail", content(message))
         self.assertEqual(events[-1]["end"]["text"], "complete")
+        self.assert_accounting(mock, events)
+        self.assertGreater(len(content(message).encode("utf-8")), len(content(message)))
+        self.assertIn("中文🙂", content(message))
 
     def test_nonzero_exit_is_result(self):
         mock = self.mock("nonzero")
@@ -332,6 +379,9 @@ class BackgroundBashTests:
         output = next(e["run_end"]["output"] for e in events if "run_end" in e)
         self.assertIn("error", output)
         self.assertEqual(len([e for e in events if e.get("background", {}).get("state") == "started"]), 8)
+        self.assertEqual(sum(content(m).startswith("[background bash ")
+                             for m in mock.observed()[-1]["messages"]), 8)
+        self.assert_accounting(mock, events)
 
     def test_mixed_agent_and_bash_share_id_counter(self):
         mock = self.mock("mixed")
@@ -344,6 +394,7 @@ class BackgroundBashTests:
         self.assertEqual(json.loads(first.removeprefix("result: ")), [{"id": "a1"}, {"id": "b2"}])
         lifecycle = [e["background"] for e in events if e.get("background", {}).get("state") == "started"]
         self.assertEqual([(e["id"], e["kind"]) for e in lifecycle], [("a1", "agent"), ("b2", "bash")])
+        self.assert_accounting(mock, events)
 
     def test_subagent_can_launch_background_bash(self):
         mock = self.mock("child_bash")
@@ -396,6 +447,16 @@ class BackgroundBashTests:
         self.assertIn(("b2", "finished"), [(e["id"], e["state"]) for e in lifecycle])
         self.assertFalse(any(content(m).startswith("[background bash b1 finished]")
                              for r in mock.observed() for m in r["messages"]))
+        log = self.log(events)
+        summary = events[-1]["end"]
+        steps = [r for r in log if "model_ms" in r][-summary["steps"]:]
+        messages = [m["content"] for r in log for m in r.get("messages", [])
+                    if m.get("source") == "background"]
+        self.assertIn("[background bash b1 lost: process ended]", messages)
+        self.assertEqual(summary["timing"]["output_bytes"],
+                         sum(run["output_bytes"] for step in steps for run in step["run_results"]) +
+                         sum(len(message.encode("utf-8")) for message in messages))
+        self.assertEqual(summary["timing"]["output_bytes"], sum(step["output_bytes"] for step in steps))
 
 
 class ChatTests(BackgroundBashTests, unittest.TestCase):
@@ -443,6 +504,7 @@ class ChatTests(BackgroundBashTests, unittest.TestCase):
         self.assertEqual(users[0:2], ["initial", "while waiting"])
         self.assertTrue(users[2].startswith("[background bash b1 finished]\n"), users)
         wait_for(lambda: history(self.home)[-1].get("content") == "complete")
+        self.assert_accounting(mock)
 
     def test_escape_stops_background_process_group(self):
         self.mock("cancel")

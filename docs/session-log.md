@@ -40,11 +40,11 @@
 
 ## 工具字节度量
 
-完整 Step 顶层另有可选 `tool_bytes`、`output_bytes`，分别为该 Step 各 Run 的同名字段之和；`run_results[]` 保存每个 Run 的可选 `tool_bytes`、`output_bytes`。它们与现有 Step 顶层计时字段并列，不嵌套到 `timing` 对象。旧日志缺失字段仍可恢复，不把缺失当作零。
+完整 Step 顶层另有可选 `tool_bytes`、`output_bytes`：`tool_bytes` 为该 Step 各 Run 的同名字段之和，`output_bytes` 为各 Run 的同名字段之和加上该 Step 请求前新插入的后台结果消息正文字节数；`run_results[]` 保存每个 Run 的可选 `tool_bytes`、`output_bytes`，不含后台结果消息。它们与现有 Step 顶层计时字段并列，不嵌套到 `timing` 对象。旧日志缺失字段仍可恢复，不把缺失当作零。
 
 - `sandbox.Outcome.tool_bytes` 在宿主工具结果交给 JS 时累计：成功按序列化 JSON 的 UTF-8 字节数，错误按错误文本的 UTF-8 字节数计量。无论 JS 是否使用或 await 结果都计入；未产生交回 JS 的结果计 0。`agent` 只计父 Run 收到的返回对象，不累加子会话内部工具数据。
-- `output_bytes` 是 `session/output.format` 格式化后交给模型的 tool result 实际 UTF-8 字节数，包含 16 KiB 预算内的截断标记、错误、`no output`、条目标签和分隔符等。harness 拒绝执行的 Run 也记录其返回文本的 `output_bytes`，`tool_bytes` 为 0。
-- 后台 agent/bash 只计启动时交回 JS 的 `{id}`；之后插入的结果消息不经过 Run，不计入这两个字段。
+- Run 的 `output_bytes` 是 `session/output.format` 格式化后交给模型的 tool result 实际 UTF-8 字节数，包含 16 KiB 预算内的截断标记、错误、`no output`、条目标签和分隔符等。harness 拒绝执行的 Run 也记录其返回文本的 `output_bytes`，`tool_bytes` 为 0。
+- 后台 agent/bash 启动时交回 JS 的 `{id}` 按普通工具结果计量；之后插入的结果消息不经过 Run，仅计入接收它的完整 Step 的 `output_bytes`，不增加 `tool_bytes` 或 `run_results[]` 的字节数。按实际消息正文的 UTF-8 字节数计量，包含 `[background ...]` 前缀、换行、截断后的 JSON 和截断标记；恢复后的 lost 消息同样计入。仅统计该 Step 新插入的后台消息，后续请求重带历史不重复计量，用户插话不计入。独立的消息提交和生命周期记录不写字节字段，避免与完整 Step 重复累计。若接收消息的 Step 失败或取消而未完整提交，其后台字节也不计入账单和 Step 统计；已提交的后台消息仍可恢复。
 - `calls[]` 的 `dispatched` 默认为 true；入队前被限额拒绝的调用记录为 false，仍计入错误文本字节，但不增加原有的 llm/agent 实际调度次数。
 - `calls[]` 新增可选 `result_bytes`，口径与单次宿主调用贡献的 `tool_bytes` 相同。旧明细可为 null 或省略；新记录中取消时尚未结算的调用为 0。超过 200 条的明细仍按 `calls_omitted` 省略，不影响 Run/Step 的字节总数。
 
@@ -58,7 +58,7 @@ TUI 在每个 Turn 的内容后追加一行淡色账单，例如：
 
 宽度不足时从右向左移除整个字段，不换行；llm/agent 次数为 0 时不显示。失败或取消时开头为 `failed` 或 `canceled`，Step 数、think/tools 和调用次数只计已提交的完整 Step。总耗时是整个 Turn 的单调墙钟时间，不是 Step 耗时之和；think/tools 分别复用 Step 的 `model_ms`/`run_ms`。token 数使用完成 Step 后的本轮累计 usage（prompt + completion，包含截至该点已报告的压缩和委派用量），缓存率为 prompt_cache_hit_tokens / prompt_tokens。取消或失败的未完成 Step 不纳入账单，但墙钟仍包含其等待时间。
 
-`TurnSummary.timing` 的 `tool_bytes`、`output_bytes` 为本轮已提交完整 Step 的同名字段之和，0 也保留键；失败和取消仍沿用上述完整 Step 口径。TUI 在 tools 后显示 `3.2M→18k B`（tool_bytes → output_bytes），`B` 表示字节，`k`/`M` 为十进制缩写；`tool_bytes=0` 时省略此字段。
+`TurnSummary.timing` 的 `tool_bytes`、`output_bytes` 为本轮已提交完整 Step 的同名字段之和，0 也保留键；失败和取消仍沿用上述完整 Step 口径。`output_bytes` 包含上述新插入的后台消息，旧日志中该字段可能仅包含 Run 输出。TUI 在 tools 后显示 `3.2M→18k B`（tool_bytes → output_bytes），`B` 表示字节，`k`/`M` 为十进制缩写；两项字节数都为 0 时省略此字段，只有后台消息输出时仍显示。
 
 Session 累计这些数据并通过 `turn_end` 按值传给 TUI，TUI 不跨线程读取统计；账单只是界面条目，不写入模型历史，恢复旧会话时不重建。`ask --json` 的 `end/error.timing` 与账单计时相同，详见 [ask-json.md](ask-json.md)。
 
