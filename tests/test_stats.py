@@ -929,7 +929,7 @@ class StatsTest(unittest.TestCase):
             self.assertEqual((timing['calls_steps'], timing['calls_omitted']), (2, 3))
             self.assertEqual(timing['tools'], {'bash': dict(count=2, total_ms=70, median_ms=35),
                                               'read': dict(count=1, total_ms=20, median_ms=20)})
-            self.assertEqual(timing['bash'], dict(heuristic=True, matched_calls=1, unmatched_calls=1,
+            self.assertEqual(timing['bash'], dict(heuristic=True, sources=dict(recorded=0, static=1), matched_calls=1, unmatched_calls=1,
                              top10=[dict(command='git status', count=1, total_ms=60, median_ms=60)]))
             cli = ['python3', str(ROOT / 'scripts/stats.py'), str(path)]
             json_report = json.loads(subprocess.check_output(cli + ['--json']))
@@ -1019,6 +1019,136 @@ class StatsTest(unittest.TestCase):
                             'timing.effort.by_effort', 'steps_with_failed_run/steps_with_runs',
                             'effort_downgraded', '未知状态仍入分母'):
                 self.assertIn(snippet, text)
+
+    def test_effort_cache_transitions_rates_median_mean_and_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'transitions.jsonl'
+            records = synthetic_log(path, [[None] * 6], provider='provider-a', model='model-a')
+            levels = ['low', 'low', 'high', 'high', 'high', 'low']
+            for record, level, prompt, cache in zip(records[1:], levels,
+                                                    [100, 10, 20, 1000, 10, 10],
+                                                    [99, 0, 5, 200, 10, 0]):
+                record.update(effort=level, provider='not-the-header', model='not-the-header',
+                              usage=dict(prompt_tokens=prompt, prompt_cache_hit_tokens=cache))
+            path.write_text('\n'.join(map(json.dumps, records)))
+            report = stats.summarize([path])
+            transitions = report['timing']['effort']['cache_transitions']
+            self.assertEqual(len(transitions), 1)
+            group = transitions[0]
+            self.assertEqual((group['provider'], group['model']), ('provider-a', 'model-a'))
+            self.assertEqual(group['same_effort']['samples'], 3)
+            self.assertEqual(group['same_effort']['median'], .2)
+            self.assertAlmostEqual(group['same_effort']['mean'], .4)
+            self.assertEqual(group['different_effort'], dict(samples=2, median=.125, mean=.125))
+            self.assertEqual(report['overall']['steps_with_usage'], 0)
+            self.assertEqual(report['timing']['effort']['by_effort']['high']['steps'], 3)
+            text = stats.text_report(report)
+            self.assertIn('provider=provider-a model=model-a', text)
+            self.assertIn('same_effort: samples=3 median=20.00% mean=40.00%', text)
+            self.assertIn('different_effort: samples=2 median=12.50% mean=12.50%', text)
+            cli = subprocess.run(['python3', str(ROOT / 'scripts/stats.py'), str(path), '--json'],
+                                 check=True, capture_output=True, text=True)
+            self.assertEqual(json.loads(cli.stdout)['timing']['effort']['cache_transitions'], transitions)
+            self.assertLessEqual(len(report['notes']), 4)
+
+    def test_effort_cache_transitions_header_groups_turn_and_session_boundaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            cases = [({'provider': 'p', 'model': 'm'}, [[None, None], [None]], .1, False),
+                     ({'provider': 'p', 'model': 'm'}, [[None, None]], .9, True),
+                     ({'provider': 'p', 'model': 'n'}, [[None, None]], .3, False),
+                     ({'provider': 'q', 'model': 'm'}, [[None, None]], .4, False),
+                     ({}, [[None, None]], .5, False),
+                     ({'provider': '  ', 'model': 7}, [[None, None]], .7, False)]
+            for index, (header, turns, rate, different) in enumerate(cases):
+                path = Path(directory) / f'{index}.jsonl'
+                records = synthetic_log(path, turns, **header)
+                for ordinal, record in enumerate(records[1:]):
+                    record.update(effort='high' if different and ordinal else 'low',
+                                  usage=dict(prompt_tokens=100, prompt_cache_hit_tokens=round(100 * rate)))
+                path.write_text('\n'.join(map(json.dumps, records)))
+                paths.append(path)
+            groups = stats.summarize(paths)['timing']['effort']['cache_transitions']
+            self.assertEqual([(g['provider'], g['model']) for g in groups],
+                             [('p', 'm'), ('p', 'n'), ('q', 'm'), ('unknown', 'unknown')])
+            self.assertEqual(groups[0]['same_effort'], dict(samples=1, median=.1, mean=.1))
+            self.assertEqual(groups[0]['different_effort'], dict(samples=1, median=.9, mean=.9))
+            for group, expected in zip(groups[1:], [.3, .4, .6]):
+                same = group['same_effort']
+                self.assertEqual(same['samples'], 2 if group['provider'] == 'unknown' else 1)
+                self.assertAlmostEqual(same['median'], expected)
+                self.assertAlmostEqual(same['mean'], expected)
+                self.assertEqual(group['different_effort'], dict(samples=0, median=None, mean=None))
+
+    def test_effort_cache_transitions_invalid_steps_break_adjacency(self):
+        invalid = [dict(effort=value) for value in (None, '', '  ', 5, False, [], {})]
+        invalid += [dict(usage=value) for value in (None, [], {},
+            dict(prompt_tokens=10), dict(prompt_cache_hit_tokens=5),
+            dict(prompt_tokens=True, prompt_cache_hit_tokens=5),
+            dict(prompt_tokens=-1, prompt_cache_hit_tokens=5),
+            dict(prompt_tokens=1.5, prompt_cache_hit_tokens=0),
+            dict(prompt_tokens='10', prompt_cache_hit_tokens=5),
+            dict(prompt_tokens=10, prompt_cache_hit_tokens=False),
+            dict(prompt_tokens=10, prompt_cache_hit_tokens=-1),
+            dict(prompt_tokens=10, prompt_cache_hit_tokens=1.5))]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'invalid.jsonl'
+            for fields in invalid:
+                with self.subTest(fields=fields):
+                    records = synthetic_log(path, [[None] * 3])
+                    for record in records[1:]:
+                        record['effort'] = 'low'
+                    records[2].update(fields)
+                    path.write_text('\n'.join(map(json.dumps, records)))
+                    self.assertEqual(stats.summarize([path])['timing']['effort']['cache_transitions'], [])
+                    last = dict(records[-1], **{'from': records[-1]['from'] + len(records[-1]['messages'])})
+                    records.append(last)
+                    path.write_text('\n'.join(map(json.dumps, records)))
+                    group, = stats.summarize([path])['timing']['effort']['cache_transitions']
+                    self.assertEqual(group['same_effort'], dict(samples=1, median=.4, mean=.4))
+
+    def test_effort_cache_transitions_zero_later_prompt_is_not_a_sample(self):
+        self.assertEqual(stats.EffortStats().report()['cache_transitions'], [])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'zero.jsonl'
+            records = synthetic_log(path, [[None] * 3])
+            for record in records[1:]:
+                record['effort'] = 'low'
+            records[2]['usage'] = dict(prompt_tokens=0, prompt_cache_hit_tokens=0)
+            path.write_text('\n'.join(map(json.dumps, records[:3])))
+            self.assertEqual(stats.summarize([path])['timing']['effort']['cache_transitions'], [])
+            path.write_text('\n'.join(map(json.dumps, records)))
+            group, = stats.summarize([path])['timing']['effort']['cache_transitions']
+            self.assertEqual(group['same_effort'], dict(samples=1, median=.4, mean=.4))
+
+    def test_effort_cache_transitions_filter_interruption_and_interjections(self):
+        old = int(datetime(2025, 1, 1, 12).timestamp() * 1000)
+        new = int(datetime(2025, 1, 2, 12).timestamp() * 1000)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'selected.jsonl'
+            for interrupted_at in (old, new):
+                with self.subTest(interrupted_at=interrupted_at):
+                    records = synthetic_log(path, [[None] * 8])
+                    for ordinal, record in enumerate(records[1:], 1):
+                        record.update(turn_step=ordinal, at=old if ordinal == 2 else new,
+                                      effort='high' if ordinal >= 7 else 'low',
+                                      usage=dict(prompt_tokens=10, prompt_cache_hit_tokens=ordinal))
+                        if ordinal in (4, 7):
+                            record['messages'].insert(0, dict(role='user', content='interjection'))
+                    records[5]['messages'] = [dict(role='assistant', content='[interrupted by user]')]
+                    records[5]['at'] = interrupted_at
+                    offset = 1
+                    for record in records[1:]:
+                        record['from'] = offset
+                        offset += len(record['messages'])
+                    path.write_text('\n'.join(map(json.dumps, records)))
+                    report = stats.summarize([path], since=date(2025, 1, 2))
+                    self.assertEqual(report['overall']['turns'], 1)
+                    group, = report['timing']['effort']['cache_transitions']
+                    self.assertEqual(group['same_effort']['samples'], 2)
+                    self.assertAlmostEqual(group['same_effort']['median'], .6)
+                    self.assertAlmostEqual(group['same_effort']['mean'], .6)
+                    self.assertEqual(group['different_effort'], dict(samples=1, median=.7, mean=.7))
 
     def test_effort_empty_invalid_fields_and_zero_samples(self):
         effort = stats.EffortStats()
@@ -1118,7 +1248,7 @@ class StatsTest(unittest.TestCase):
                     self.assertEqual((timing['calls_steps'], timing['calls_omitted']), (count, count))
                     tool = dict(count=count, total_ms=total, median_ms=expected['median'])
                     self.assertEqual(timing['tools'], {'bash': tool})
-                    self.assertEqual(timing['bash'], dict(heuristic=True, matched_calls=count,
+                    self.assertEqual(timing['bash'], dict(heuristic=True, sources=dict(recorded=0, static=count), matched_calls=count,
                         unmatched_calls=0, top10=[dict(command='git status', **tool)]))
                     cli = [sys.executable, str(ROOT / 'scripts/stats.py'), str(path),
                            '--since', '2025-01-02']
@@ -1178,8 +1308,106 @@ class StatsTest(unittest.TestCase):
         self.assertEqual(report['calls_omitted'], 0)
         self.assertEqual(stats.distribution(list(range(1, 11))), dict(samples=10, median=5.5, p90=9))
 
+    def test_bash_command_chain_groups_and_quoted_separators(self):
+        cases = [
+            ('zig fmt x && zig build test', 'zig fmt → zig build'),
+            ('zig fmt x || zig build test; git diff | head -n 2\npwd',
+             'zig fmt → zig build → git diff → head -n → pwd'),
+            ('A=1 /usr/bin/zig fmt x && env zig build test', 'zig fmt → zig build'),
+            ('git status --short', 'git status'),
+            ('pwd > /tmp/out && git status', 'pwd → git status'),
+            ('pwd 2>/tmp/err && git status', 'pwd → git status'),
+            ('pwd >| /tmp/out && git status', 'pwd → git status'),
+            ('> /tmp/out pwd && git status', 'pwd → git status'),
+            ('echo 2 > /tmp/out && git status', 'echo 2 → git status'),
+            ('echo "&&" && pwd', 'echo && → pwd'),
+            ('echo ";"; echo "|"', 'echo ; → echo |'),
+            ('printf x |& head -n 1', 'printf x → head -n'),
+            ("cat <<EOF\nbody && fake | command\nEOF\ngit status", 'cat → git status'),
+            ('echo "a && b; c | d" && git status', 'echo a && b; c | d → git status'),
+            ("echo 'one\ntwo' && pwd", 'echo one\ntwo → pwd'),
+            ('zig fmt x \\\n && zig build test # ignored ; rm x\ngit diff',
+             'zig fmt → zig build → git diff'),
+            ("python3 - <<'PY'\nprint('a; b && c | d')\nnot_a_command\nPY\nzig build test",
+             'python3 - → zig build'),
+            ("python3 - <<-'PY'\n\tprint('a; b')\n\tPY\ngit status", 'python3 - → git status'),
+            ("python3 - <<'EOF-SCRIPT'\nprint('a && b')\nEOF-SCRIPT\nzig build", 'python3 - → zig build'),
+            ("python3 - <<'123'\nprint('a; b')\n123\ngit diff", 'python3 - → git diff'),
+            ("echo ok 'not a <<HEREDOC'\nzig build", 'echo ok → zig build'),
+            ("python3 - <<EOF\nprint(1)\n EOF\nzig build", None),
+            ('git status && echo "broken', None),
+            ('git status && zig $ACTION', None),
+        ]
+        for command, expected in cases:
+            with self.subTest(command=command):
+                self.assertEqual(stats.bash_command_group(command), expected)
+                code = 'tools.bash({command: ' + json.dumps(command) + '})'
+                self.assertEqual(stats.bash_timing_group(code), expected)
+
+    def test_bash_recording_priority_dynamic_calls_and_legacy_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'recorded.jsonl'
+            codes = ['tools.bash({command: "git status"})',
+                     'tools.bash({command: dynamic})',
+                     'for (const cmd of commands) await tools.bash({command: cmd})',
+                     'tools.bash({command: "cargo test"})']
+            rows = synthetic_log(path, [codes])
+            for row, durations in zip(rows[1:], [[180], [40], [10, 20], [30]]):
+                row['calls'] = [dict(name='bash', start_ms=0, end_ms=duration, run_index=0)
+                                for duration in durations]
+            path.write_text('\n'.join(map(json.dumps, rows)) + '\n')
+            recording = [dict(step=1, run=0, index=0, name='bash',
+                              args=dict(command='zig fmt x && zig build test')),
+                         dict(step=2, run=0, index=0, name='bash', args=dict(command='python3 tests/a.py')),
+                         dict(step=3, run=0, index=1, seq=0, name='bash', args=dict(command='git diff')),
+                         dict(step=3, run=0, index=0, seq=1, name='bash', args=dict(command='git status')),
+                         dict(step=3, run=0, meta=dict(end='ok')),
+                         dict(step=99, run=0, index=0, name='bash', args=dict(command='orphan call'))]
+            calls_path = path.with_suffix('.calls.jsonl')
+            calls_path.write_text('garbage\n[]\n' + '\n'.join(map(json.dumps, recording)) + '\n{')
+            before = path.read_bytes(), calls_path.read_bytes()
+            report = stats.summarize([path])
+            bash = report['timing']['bash']
+            self.assertEqual(bash['sources'], dict(recorded=4, static=1))
+            self.assertEqual((bash['matched_calls'], bash['unmatched_calls']), (5, 0))
+            self.assertEqual(bash['top10'], [
+                dict(command='zig fmt → zig build', count=1, total_ms=180, median_ms=180),
+                dict(command='python3 tests/a.py', count=1, total_ms=40, median_ms=40),
+                dict(command='cargo test', count=1, total_ms=30, median_ms=30),
+                dict(command='git diff', count=1, total_ms=20, median_ms=20),
+                dict(command='git status', count=1, total_ms=10, median_ms=10)])
+            self.assertEqual(report['tools']['bash'], 4)
+            self.assertEqual(report['bash_top10'], [dict(command='cargo', count=1), dict(command='git', count=1)])
+            cli = ['python3', str(ROOT / 'scripts/stats.py'), directory]
+            self.assertEqual(json.loads(subprocess.check_output(cli + ['--json']))['timing']['bash'], bash)
+            text = subprocess.check_output(cli).decode()
+            self.assertIn('录制=4, 静态=1', text)
+            self.assertIn('zig fmt → zig build: count=1 total=180 ms', text)
+            self.assertEqual((path.read_bytes(), calls_path.read_bytes()), before)
+            calls_path.unlink()
+            fallback = stats.summarize([path])['timing']['bash']
+            self.assertEqual(fallback['sources'], dict(recorded=0, static=2))
+            self.assertEqual((fallback['matched_calls'], fallback['unmatched_calls']), (2, 3))
+
+    def test_bash_recording_step_numbers_survive_interruption_and_filtering(self):
+        cutoff = int(datetime(2025, 1, 2).timestamp() * 1000)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'numbering.jsonl'
+            code = 'tools.bash({command: "git status"})'
+            rows = synthetic_log(path, [[code], [code], [code]])
+            rows[1]['messages'][-1] = dict(role='assistant', content='[interrupted by user]')
+            for index, row in enumerate(rows[1:], 1):
+                row['at'] = cutoff - 1 if index < 3 else cutoff
+                row['calls'] = [dict(name='bash', start_ms=0, end_ms=10, run_index=0)]
+            path.write_text('\n'.join(map(json.dumps, rows)) + '\n')
+            path.with_suffix('.calls.jsonl').write_text(json.dumps(dict(
+                step=4, run=0, index=0, name='bash', args=dict(command='zig build test'))) + '\n')
+            bash = stats.summarize([path], since=date(2025, 1, 2))['timing']['bash']
+            self.assertEqual(bash['sources'], dict(recorded=1, static=0))
+            self.assertEqual(bash['top10'][0]['command'], 'zig build')
+
     def test_bash_timing_literal_heuristic_and_unmatched(self):
-        cases = [('tools.bash({command: "git status --short; zig build"})', 'git status'),
+        cases = [('tools.bash({command: "git status --short; zig build"})', 'git status → zig build'),
                  ("tools.bash({command: 'echo 你好'})", 'echo 你好'),
                  ('tools.bash({command: `zig build`})', 'zig build'),
                  ('tools.bash({command: "A=1 /usr/bin/git diff --stat"})', 'git diff'),
