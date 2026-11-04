@@ -58,9 +58,9 @@ pub fn edit(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
 
     const out = try std.mem.replaceOwned(u8, gpa, data, v.old_text, v.new_text);
     defer gpa.free(out);
-    try t.noteBefore(gpa, path, data);
     dir.writeFile(t.io, .{ .sub_path = v.path, .data = out }) catch |err|
         return fail(gpa, "{s}: {s}", .{ v.path, @errorName(err) });
+    try t.noteChange(gpa, path, data, out);
     return .{ .ok = try std.fmt.allocPrint(gpa, "{{\"replaced\":{d}}}", .{count}) };
 }
 
@@ -79,18 +79,17 @@ pub fn write(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolR
     if (t.cancel.load(.acquire)) return error.Canceled;
 
     const dir = std.Io.Dir.cwd();
-    if (t.track_changes) track: {
-        const before = dir.readFileAlloc(t.io, path, gpa, .limited(16 * 1024 * 1024)) catch |err| {
-            if (err == error.FileNotFound) try t.noteBefore(gpa, path, null);
-            break :track;
-        };
-        defer gpa.free(before);
-        try t.noteBefore(gpa, path, before);
-    }
+    var can_track = t.track_changes;
+    const before = if (can_track) dir.readFileAlloc(t.io, path, gpa, .limited(16 * 1024 * 1024)) catch |err| before: {
+        if (err != error.FileNotFound) can_track = false;
+        break :before null;
+    } else null;
+    defer if (before) |data| gpa.free(data);
     if (std.fs.path.dirname(v.path)) |parent| dir.createDirPath(t.io, parent) catch |err|
         return fail(gpa, "{s}: {s}", .{ parent, @errorName(err) });
     dir.writeFile(t.io, .{ .sub_path = v.path, .data = v.content }) catch |err|
         return fail(gpa, "{s}: {s}", .{ v.path, @errorName(err) });
+    if (can_track) try t.noteChange(gpa, path, before, v.content);
     return .{ .ok = try std.fmt.allocPrint(gpa, "{{\"bytes\":{d}}}", .{v.content.len}) };
 }
 
@@ -292,4 +291,70 @@ test "read pagination boundaries do not add text" {
         defer testing.allocator.free(expected);
         try testing.expectEqualStrings(expected, result.ok);
     }
+}
+
+fn trackedCall(t: *Tools, name: []const u8, args: anytype) !void {
+    const json = try std.json.Stringify.valueAlloc(testing.allocator, args, .{});
+    defer testing.allocator.free(json);
+    const result = Tools.call(t, testing.allocator, name, json);
+    defer freeResult(result);
+    try testing.expect(result == .ok);
+}
+
+test "change tracking excludes other writers between and after calls" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/f", .{tmp.sub_path});
+    defer testing.allocator.free(path);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "f", .data = "base\nother\nlast\n" });
+    var root: Tools = .{ .io = testing.io, .home = "/home/nobody", .track_changes = true };
+    defer root.discardChanges(testing.allocator);
+    var child: Tools = .{ .io = testing.io, .home = "/home/nobody", .track_changes = true };
+    defer child.discardChanges(testing.allocator);
+    try trackedCall(&root, "edit", .{ .path = path, .old_text = "base", .new_text = "root" });
+    try trackedCall(&child, "edit", .{ .path = path, .old_text = "other", .new_text = "child" });
+    try trackedCall(&root, "write", .{ .path = path, .content = "root2\nchild\nlast\n" });
+    try trackedCall(&child, "write", .{ .path = path, .content = "root2\nchild\ntail\n" });
+    try tmp.dir.deleteFile(testing.io, "f");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const changes = try root.takeChanges(testing.allocator, arena.allocator());
+    try testing.expectEqual(@as(usize, 1), changes.len);
+    try testing.expectEqualStrings(path, changes[0].path);
+    try testing.expectEqual(@as(usize, 2), changes[0].added);
+    try testing.expectEqual(@as(usize, 2), changes[0].removed);
+    try testing.expect(!changes[0].created);
+    try testing.expectEqualStrings("-base\n+root\n other\n…\n-root\n+root2\n child\n", changes[0].diff);
+    const child_changes = try child.takeChanges(testing.allocator, arena.allocator());
+    try testing.expectEqual(@as(usize, 1), child_changes.len);
+    try testing.expectEqual(@as(usize, 2), child_changes[0].added);
+    try testing.expectEqual(@as(usize, 2), child_changes[0].removed);
+    try testing.expect(std.mem.indexOf(u8, child_changes[0].diff, "+root") == null);
+    try testing.expect(std.mem.indexOf(u8, child_changes[0].diff, "-base") == null);
+    try testing.expectEqual(@as(usize, 0), (try root.takeChanges(testing.allocator, arena.allocator())).len);
+}
+
+test "change tracking omits no-ops and failed calls but reports empty creation" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/f", .{tmp.sub_path});
+    defer testing.allocator.free(path);
+    var t: Tools = .{ .io = testing.io, .home = "/home/nobody", .track_changes = true };
+    defer t.discardChanges(testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try trackedCall(&t, "write", .{ .path = path, .content = "" });
+    const created = try t.takeChanges(testing.allocator, arena.allocator());
+    try testing.expectEqual(@as(usize, 1), created.len);
+    try testing.expect(created[0].created);
+    try testing.expectEqual(@as(usize, 0), created[0].added);
+    try testing.expectEqualStrings("", created[0].diff);
+    try trackedCall(&t, "write", .{ .path = path, .content = "" });
+    const args = try std.json.Stringify.valueAlloc(testing.allocator, .{ .path = path, .old_text = "missing", .new_text = "new" }, .{});
+    defer testing.allocator.free(args);
+    const result = Tools.call(&t, testing.allocator, "edit", args);
+    defer freeResult(result);
+    try testing.expect(result == .err);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "f", .data = "external\n" });
+    try testing.expectEqual(@as(usize, 0), (try t.takeChanges(testing.allocator, arena.allocator())).len);
 }

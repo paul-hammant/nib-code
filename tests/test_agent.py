@@ -145,8 +145,7 @@ class AgentTests:
         self.assertEqual(len(changes), len(result["changes"]))
         self.assertEqual(changes, {
             "new.txt": {"path": "new.txt", "added": 3, "removed": 1, "created": True},
-            str(self.cwd / "existing.txt"): {"path": str(self.cwd / "existing.txt"),
-                                             "added": 2, "removed": 3, "created": False},
+            "existing.txt": {"path": "existing.txt", "added": 2, "removed": 3, "created": False},
             "failed-run.txt": {"path": "failed-run.txt", "added": 1, "removed": 0, "created": True}})
         self.assertEqual((self.cwd / "new.txt").read_text(), "a\nc\n")
         self.assertEqual((self.cwd / "existing.txt").read_text(), "final\n")
