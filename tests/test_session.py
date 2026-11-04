@@ -323,6 +323,21 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         assert [e["step"]["n"] for e in compact_json if "step" in e] == list(
             range(1, compact_json[-1]["end"]["steps"] + 1)), compact_json
         print("JSON E2E passed: NDJSON events, stdin, final text/usage/steps, resume, errors and notices")
+        for case, expected_ok, expected_output in (
+                ("run_drain_read_failure", False, "FileNotFound"),
+                ("run_drain_reject_continuation", False, "original rejection"),
+                ("run_drain_fulfill_continuation", True, "fulfilled")):
+            drain_cwd = tmp / case
+            drain_cwd.mkdir()
+            drained = events(ask("--json", case, workdir=drain_cwd,
+                                 overrides={"NIB_HOME": str(tmp / (case + "-home"))}))
+            runs = [event["run_end"] for event in drained if "run_end" in event]
+            assert len(runs) == 1, drained
+            assert runs[0]["ok"] is expected_ok, runs[0]
+            assert expected_output in runs[0]["output"], runs[0]
+            assert "stopped before completion" not in runs[0]["output"], runs[0]
+            assert (drain_cwd / "marker").read_text() == "finished\n", runs[0]
+        print("Run drain E2E passed: failed read leaves sibling bash running; reject/fulfill drain continuation calls")
         timing_home = tmp / "timing-home"
         timed = events(ask("--json", "timing", overrides={"NIB_HOME": str(timing_home)}))
         timed_id = timed[0]["start"]["session_id"]
