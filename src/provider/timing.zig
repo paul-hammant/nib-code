@@ -12,6 +12,8 @@ pub const Model = struct {
     started: std.Io.Clock.Timestamp,
     slots: [65]Slot = @splat(.{}),
     used: usize = 0,
+    max_gap_ms: ?u64 = null,
+    last_byte_ms: ?u64 = null,
 
     const Slot = struct {
         index: usize = 0,
@@ -48,6 +50,17 @@ pub const Model = struct {
 
     pub fn resetAttempt(m: *Model) void {
         m.used = 0;
+        m.max_gap_ms = null;
+        m.last_byte_ms = null;
+    }
+
+    pub fn received(m: *Model) void {
+        m.receivedAt(m.elapsed());
+    }
+
+    fn receivedAt(m: *Model, ms: u64) void {
+        if (m.last_byte_ms) |last| m.max_gap_ms = @max(m.max_gap_ms orelse 0, ms -| last);
+        m.last_byte_ms = ms;
     }
 
     fn elapsed(m: *const Model) u64 {
@@ -221,4 +234,23 @@ test "fixed slots cover all accepted chat indices and ignore excess safely" {
     try t.expectEqual(@as(usize, 164), m.slots[64].index);
     m.argumentsAt(100, 1, 100);
     try t.expectEqual(@as(u64, 2), m.slots[0].bytes);
+}
+
+test "byte gaps exclude first wait and reset between attempts" {
+    const t = std.testing;
+    var m: Model = .init(t.io, .now(t.io, .awake));
+    try t.expectEqual(@as(?u64, null), m.max_gap_ms);
+    m.receivedAt(10000);
+    try t.expectEqual(@as(?u64, null), m.max_gap_ms);
+    m.receivedAt(10015);
+    m.receivedAt(10015);
+    m.receivedAt(10030);
+    try t.expectEqual(@as(?u64, 15), m.max_gap_ms);
+    m.receivedAt(10100);
+    try t.expectEqual(@as(?u64, 70), m.max_gap_ms);
+    m.resetAttempt();
+    try t.expectEqual(@as(?u64, null), m.max_gap_ms);
+    m.receivedAt(50000);
+    m.receivedAt(50000);
+    try t.expectEqual(@as(?u64, 0), m.max_gap_ms);
 }

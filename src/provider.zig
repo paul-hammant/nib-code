@@ -4,6 +4,7 @@ const codex = @import("provider/codex.zig");
 const cancelable = @import("provider/cancel.zig");
 const model_timing = @import("provider/timing.zig");
 const retry = @import("provider/retry.zig");
+const idle = @import("provider/idle.zig");
 pub const complete = retry.complete;
 pub const RetryEvent = retry.Event;
 pub const RetrySink = retry.Sink;
@@ -18,6 +19,7 @@ pub const Limits = struct {
     llm_input_kib: usize = 256,
     agent_concurrency: usize = 4,
     max_steps: usize = 50,
+    stream_idle_timeout_s: usize = 300,
 };
 
 pub const Config = struct {
@@ -156,9 +158,13 @@ pub fn stream(
 ) !Reply {
     if (sink.timing) |timing| timing.resetAttempt();
     errdefer if (sink.timing) |timing| timing.resetAttempt();
+    var monitor: idle.Monitor = .init(client.io, cfg.limits.stream_idle_timeout_s, sink.timing);
     return switch (cfg.provider) {
-        .chat_completions => cancelable.run(client.io, cancel, chat.stream, .{ gpa, out, client, cfg, messages, tools_json, max_tokens, sink, cancel, detail }),
-        .codex => cancelable.run(client.io, cancel, codex.stream, .{ gpa, out, client, cfg, cache_key, messages, tools_json, max_tokens, sink, cancel, detail }),
+        .chat_completions => cancelable.run(client.io, cancel, chat.stream, .{ gpa, out, client, cfg, messages, tools_json, max_tokens, sink, cancel, detail, &monitor }),
+        .codex => cancelable.run(client.io, cancel, codex.stream, .{ gpa, out, client, cfg, cache_key, messages, tools_json, max_tokens, sink, cancel, detail, &monitor }),
+    } catch |err| {
+        if (cancel.load(.acquire)) return error.Canceled;
+        return monitor.failure(gpa, detail, err);
     };
 }
 

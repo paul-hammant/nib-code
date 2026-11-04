@@ -995,6 +995,21 @@ class StatsTest(unittest.TestCase):
             self.assertEqual(excluded['overall']['steps'], 0)
             self.assertEqual(excluded['timing'], stats.Timing().report())
 
+    def test_max_gap_distribution_skips_legacy_and_invalid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'gaps.jsonl'
+            rows = synthetic_log(path, [[None] for _ in range(15)])
+            for row, gap in zip(rows[1:], list(range(1, 11)) + [None, -1, True, '5']):
+                row['max_gap_ms'] = gap
+            rows.append(dict(diagnostic=dict(error_name='StreamIdleTimeout', message='idle timeout after 1s',
+                                             attempts=5, step=16), max_gap_ms=9999))
+            path.write_text('\n'.join(map(json.dumps, rows)) + '\n')
+            report = stats.summarize([path])
+            self.assertEqual(report['timing']['max_gap_ms'], dict(samples=10, median=5.5, p90=9, max=10))
+            self.assertIn('max_gap_ms: samples=10 median=5.50 p90=9.00 max=10.00', stats.text_report(report))
+        self.assertEqual(stats.summarize([])['timing']['max_gap_ms'],
+                         dict(samples=0, median=None, p90=None, max=None))
+
     def test_timing_legacy_empty_and_invalid_fields(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'legacy.jsonl'
