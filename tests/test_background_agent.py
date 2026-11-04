@@ -205,7 +205,8 @@ class BackgroundTests:
             result = json.loads(encoded)
             self.assertTrue(result["ok"], result)
             self.assertEqual(result["changes"], [])
-            self.assertEqual(set(result), {"ok", "text", "changes"})
+            self.assertEqual(set(result), {"ok", "text", "changes", "session"})
+            self.assertRegex(result["session"], r"^[0-9a-f]{32}$")
             self.assertNotIn("source", message)
             self.assertNotIn("background_id", message)
         progress = [e["background"] for e in events if "background" in e]
@@ -323,7 +324,8 @@ class BackgroundTests:
         result = json.loads(content(completion).split("\n", 1)[1])
         self.assertFalse(result["ok"], result)
         self.assertTrue(result["error"])
-        self.assertEqual(set(result), {"ok", "text", "changes", "error"})
+        self.assertEqual(set(result), {"ok", "text", "changes", "error", "session"})
+        self.assertRegex(result["session"], r"^[0-9a-f]{32}$")
         self.assertFalse([e["background"] for e in events if e.get("background", {}).get("kind") == "agent" and e.get("background", {}).get("state") == "finished"][0]["ok"])
 
     def worker_pids(self):

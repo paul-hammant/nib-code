@@ -451,7 +451,8 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         assert timeout_run["ok"], timeout_run
         timeout_result = json.loads(timeout_run["output"].removeprefix("result: "))
         assert timeout_result["ok"] is False, timeout_result
-        assert set(timeout_result) == {"ok", "error", "text", "usage", "changes"}, timeout_result
+        assert set(timeout_result) == {"ok", "session", "error", "text", "usage", "changes"}, timeout_result
+        assert len(timeout_result["session"]) == 32, timeout_result
         timeout_message = timeout_result["error"]
         match = re.search(r"stopped due to timeout after (\d+) ms \(limit 1600 ms\); child session id: ([0-9a-f]{32})", timeout_message)
         assert match and 1600 <= int(match[1]) < 4500, timeout_message

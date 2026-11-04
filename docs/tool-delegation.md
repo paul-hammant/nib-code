@@ -1,6 +1,6 @@
 # tools.llm 与 tools.agent：调用与实现
 
-少量文件直接 read 最便宜。大量数据的单步判断、分类、抽取适合 llm，通常几秒；批量简单判断优先低成本模型和低 effort，强模型留给少量难题。agent 用于独立多步工作：几十行以上改动的提交前只读审查、先约定接口并划分负责文件的并行实现、需要大量读代码的调查；每个子会话从零读代码，常消耗几千到几万 token、几十秒以上，不代替 read 或 llm。延迟与成本是量级提示，不是保证。
+少量文件直接 read 最便宜。大量数据的单步判断、分类、抽取适合 llm，通常几秒；批量简单判断优先低成本模型和低 effort，强模型留给少量难题。agent 用于独立多步工作：几十行以上改动的提交前只读审查、先约定接口并划分负责文件的并行实现、需要大量读代码的调查；新子会话从零读代码，后续可用 session 接续，常消耗几千到几万 token、几十秒以上，不代替 read 或 llm。延迟与成本是量级提示，不是保证。
 
 ## 接口与限额
 
@@ -8,15 +8,30 @@ Run 中可调用 `await tools.llm({ prompt, input, schema, model, effort })`，�
 
 llm 限额由 [config.toml 的 `[limits]`](config.md#limits) 配置：同进程并发调用默认 4，可配置，超出排队（不计请求超时）；每 Run 调用上限默认 100，可配置，超出时在沙箱入队前 reject，建议分批或先用 JS 过滤；单次 prompt + 序列化 input 合计上限默认 256 KiB（UTF-8 字节），可配置，超出 reject，不截断。请求超时沿用 provider（当前无额外读超时），限流/临时错误复用 `src/provider/retry.zig` 的主会话重试、退避与服务端延迟提示。Esc/SIGINT/SIGTERM 同时取消在途和排队调用。各 Run 仍是无状态沙箱，中间结果用 JSON 文件传递，见 [ADR 0013](adr/0013-llm-functions.md)。
 
-根会话可调用 `await tools.agent({ prompt, timeout_ms: 1800000, model, effort })`，成功返回 `{ ok: true, text, usage, changes }`；子会话超时、崩溃、非零退出或 NDJSON error 返回 `{ ok: false, error, text, usage, changes }`，不会 reject，也不会取消同一 Run 中的其他子 agent。只有参数错误和用户取消（Esc/SIGINT/SIGTERM）仍 reject。text 成功时取 end.text；失败时保留已收到的最终文本（text delta，不含思考或工具代码），没有则为空串。error 保留原失败信息，并带实际耗时（含终止宽限）、子会话 id（未收到 start 时明确标为不可用）和检查半成品文件的提醒。timeout_ms 可省略，默认 30 分钟，不计排队时间。model/effort 同 llm：省略则继承，覆盖子会话有效配置，只在当前 provider 内选择，effort 沿用现有校验与映射，不影响父会话。并行实现前先写接口约定，告诉每个子 agent 负责哪些文件，收到结果后检查 changes 是否越界或冲突；`Promise.all` 并行派生，同时运行的子会话上限默认 4，可配置（全部工具最多同时运行 8 个）。子会话独立读取指令文件，沿用 cwd 和有效 provider/模型配置及限额（通过 stdin 管道传递，子会话跳过配置文件读取；Codex 凭证各自读取），不继承父会话历史。内部环境变量 `NIB_AGENT_DEPTH` 从 0 递增，深度达到 1 时，工具说明与实际 JS API 都移除 agent。`NIB_PARENT_SESSION_ID` 写入子会话日志首条记录的 `parent_session_id`。显式 `--resume` 子会话仍保留深度限制；`--continue` 跳过子会话。
+根会话可调用 `await tools.agent({ prompt, session, timeout_ms: 1800000, model, effort, background: false })`。session 可省略：不传则新建子会话；传入必须是 32 位小写十六进制 id，接续同一子会话的历史和原始 system，并追加本次 prompt。每次调用仍启动独立的 nib 子进程、运行一个 Turn；接续使用 `nib ask --resume`，不是常驻 worker 或进程内句柄。新子会话独立读取指令文件，不继承父会话历史；额外上下文需放入 prompt 或文件。
 
-`background` 可选，默认 false，保留上述前台等待行为。设为 true 时，调用在登记后台任务后立即返回含 `id` 的启动确认，子会话由父会话持有，可跨 Run 继续工作；父模型可继续其他 Step，不需要额外的查询或等待工具。任务完成后，Session 在下一次主模型请求前，把 `[background agent <id> finished]` 和截断后的 `{ok,text,changes,error?}` JSON 作为 user 消息插入历史，不含 usage。结果不会在模型流式响应或 Run 执行中途插入，也不会当作用户新 Turn。若模型已给出无工具回答但仍有后台任务，Session 等待下一条 inbox 消息（后台结果或用户插话），按 FIFO 插入后发起新 Step；不必等待全部后台任务完成。
+成功返回 `{ ok: true, session, text, usage, changes }`；子会话超时、崩溃、非零退出或 NDJSON error 返回 `{ ok: false, session, error, text, usage, changes }`，不会 reject，也不会取消同一 Run 中的其他子 agent。session 在成功及失败时都返回已知的子会话 id；新建且启动前失败、尚不知道 id 时为 null。只有参数错误（包括 session 格式错误）和用户取消（Esc/SIGINT/SIGTERM）仍 reject。text 成功时取 end.text；失败时保留已收到的最终文本（text delta，不含思考或工具代码），没有则为空串。error 保留原失败信息，并带实际耗时（含终止宽限）、已知子会话 id 和检查半成品文件的提醒。usage 和 changes 只统计本次调用，不重复累计该子会话之前的历史。
+
+只能接续当前父会话的子会话：日志的 parent_session_id 必须等于当前父会话 id；恢复父会话后仍可接续其原有子会话。根会话或其他父会话的子会话返回 ok:false，而非 reject。执行阶段在等待并发槽之前预留 session；同一 session 的重复在途调用返回 `ok:false`、`AgentSessionBusy`，不排队等待前一次结束。预留在完成、失败或取消时释放，前台和后台共用；跨进程的日志独占锁也阻止同时通过 CLI 接续同一会话。并行任务应使用不同 session，而不是并发接续同一个子会话。
+
+例如先只读审查，再让同一子会话按已有上下文修复：
+
+```js
+const review = await tools.agent({ prompt: "只读审查 src/tools/agent.zig，报告问题，不要修改文件。" });
+if (!review.ok) throw new Error(review.error);
+const fix = await tools.agent({ session: review.session, prompt: "修复刚才发现的问题，并运行相关测试。" });
+console.log(fix);
+```
+
+超时或取消不会回滚文件；接续被停止的子会话前应检查不完整文件，不要假定日志或 changes 包含全部改动。timeout_ms 可省略，默认 30 分钟，不计排队时间。model/effort 省略时继承父会话的当前有效配置，接续时也不改为沿用子会话上次覆盖值；覆盖只影响本次子调用，不影响父会话或切换 provider，effort 沿用现有校验与映射。恢复的 provider 必须与日志一致，Codex 模型也必须相同（见 [codex.md](codex.md)）；若父会话当前模型与子会话原模型不同，接续时须显式指定子会话原模型或新建会话。并行实现前先写接口约定，告诉每个子 agent 负责哪些文件，收到结果后检查 changes 是否越界或冲突；`Promise.all` 并行派生，同时运行的子会话上限默认 4，可配置（全部工具最多同时运行 8 个）。子会话沿用 cwd、有效 provider/模型配置及限额（通过 stdin 管道传递，子会话跳过配置文件读取；Codex 凭证各自读取）。内部环境变量 `NIB_AGENT_DEPTH` 从 0 递增，深度达到 1 时，工具说明与实际 JS API 都移除 agent。`NIB_PARENT_SESSION_ID` 写入新子会话日志首条记录的 `parent_session_id`。显式 `--resume` 子会话仍保留深度限制；`--continue` 跳过子会话。
+
+`background` 可选，默认 false，保留上述前台等待行为。设为 true 时，调用在登记后台任务后立即返回含 `id` 的启动确认，子会话由父会话持有，可跨 Run 继续工作；父模型可继续其他 Step，不需要额外的查询或等待工具。任务完成后，Session 在下一次主模型请求前，把 `[background agent <id> finished]` 和截断后的 `{ok,session,text,changes,error?}` JSON 作为 user 消息插入历史，不含 usage。结果不会在模型流式响应或 Run 执行中途插入，也不会当作用户新 Turn。若模型已给出无工具回答但仍有后台任务，Session 等待下一条 inbox 消息（后台结果或用户插话），按 FIFO 插入后发起新 Step；不必等待全部后台任务完成。
 
 后台任务与前台调用共用 agent 并发限额、模型/effort 配置、超时和取消路径；同一父会话的各 Run 不会因各自沙箱退出而取消后台任务。父 Turn 取消或失败、Session 退出时停止并清理未完成任务，不留下脱离父会话的子进程；恢复会话保留已写入日志的结果，未完成任务不会重启，而是插入 `[background agent <id> lost: process ended]`。后台 agent 的启动/结果插入通过 `background` 事件报告，见 [ask-json.md](ask-json.md)；结果消息的日志来源标记与统计口径见 [session-log.md](session-log.md)。
 
 `tools.bash({command, background: true})` 同样立即返回含 `id` 的启动确认；后台 bash 与后台 agent 共用编号，独立于 agent 并发限额。后台 bash 最多同时运行 8 个，超出时立即 reject 并给出明确错误，不排队；子 agent 内也可使用。结果在下一次主模型请求前作为带来源标记的 user 消息插入，恢复未完成任务时插入 lost 消息。后台 bash 的生命周期也通过 `background` 事件报告。
 
-changes 汇总子会话所有 Run（包括失败 Run）已收到的 `run_end.changes`，按路径首次出现顺序返回 `[{ path, added, removed, created }]`：同路径 added/removed 累加，created 取逻辑或，不含 diff 正文。这是各 Run 的累计行改动量，不是起止文件的净 diff；只涵盖 edit/write，不包含 bash 或外部进程改动。中断时尚未发出 run_end 的改动也可能不在汇总中，失败后仍须检查半成品文件。
+changes 汇总本次调用中子会话所有 Run（包括失败 Run）已收到的 `run_end.changes`，按路径首次出现顺序返回 `[{ path, added, removed, created }]`：同路径 added/removed 累加，created 取逻辑或，不含 diff 正文。这是各 Run 的累计行改动量，不是起止文件的净 diff；只涵盖 edit/write，不包含 bash 或外部进程改动。中断时尚未发出 run_end 的改动也可能不在汇总中，失败后仍须检查半成品文件。
 
 ## 进度、用量与取消
 

@@ -93,9 +93,10 @@ const all = [_]Tool{
         .root_only = true,
         .run = subagent.agent,
         .doc =
-        \\  // Independent multi-step worker with the same tools except agent; starts from scratch and reads code itself: thousands of tokens, tens of seconds or more. Only prompt is shared. Failures resolve ok:false (invalid args and user cancel reject); stopped children may leave partial files. changes: edit/write only. model/effort as in llm.
-        \\  // background returns {id} now; the result arrives as a message in a later Step, and a reply without Run waits for it. Background edits share the workspace and can land at any time, even mid-build.
-        \\  async agent({ prompt, timeout_ms = 1800000, model, effort, background = false }) {}, // → { ok, text, usage, changes, error? } or { id }
+        \\  // Multi-step child; new starts fresh (thousands of tokens). session: 32 lowercase hex, own child only; resumes history/system. Use separate sessions for parallel tasks.
+        \\  // session is id if known, else null. Failures ok:false; invalid args/cancel reject. Inspect stopped files. usage/changes: this call only; changes: edit/write. model/effort inherit parent.
+        \\  // One call/session (AgentSessionBusy). background: {id} now; later result has session, no usage. Final reply waits; edits may land mid-build.
+        \\  async agent({ prompt, session, timeout_ms = 1800000, model, effort, background = false }) {}, // → { ok, session, text, usage, changes, error? } or { id }
         ,
     },
 };
@@ -138,6 +139,8 @@ pub const Tools = struct {
     agents_mutex: std.Io.Mutex = .init,
     agents_changed: std.Io.Condition = .init,
     agents_active: usize = 0,
+    // Stack-owned by executing tool threads; protected by agents_mutex.
+    agent_sessions: ?*subagent.Reservation = null,
     background: @import("tools/background.zig").Background = .{},
     run_id: usize = 0,
     background_sink: ?struct { ctx: *anyopaque, emit: *const fn (*anyopaque, @import("session/events.zig").Background) anyerror!void } = null,

@@ -114,8 +114,9 @@ class AgentTests:
         return json.loads(runs[0]["output"].removeprefix("result: ")), events
 
     def assert_result(self, result, ok):
-        self.assertEqual(set(result), {"ok", "text", "usage", "changes"} | (set() if ok else {"error"}), result)
+        self.assertEqual(set(result), {"ok", "text", "usage", "changes", "session"} | (set() if ok else {"error"}), result)
         self.assertIs(result["ok"], ok)
+        self.assertRegex(result["session"], r"^[0-9a-f]{32}$")
         self.assertIsInstance(result["text"], str)
         self.assertEqual(set(result["usage"]), set(USAGE))
         self.assertIsInstance(result["changes"], list)

@@ -161,12 +161,26 @@ pub const Background = struct {
 
 fn messageResult(gpa: std.mem.Allocator, kind: BackgroundEvent.Kind, result: @import("../sandbox.zig").ToolResult) ![]u8 {
     if (result == .err) return if (kind == .agent)
-        std.json.Stringify.valueAlloc(gpa, .{ .ok = false, .text = "", .changes = @as([]const struct {}, &.{}), .@"error" = result.err }, .{})
+        std.json.Stringify.valueAlloc(gpa, .{ .ok = false, .session = @as(?[]const u8, null), .text = "", .changes = @as([]const struct {}, &.{}), .@"error" = result.err }, .{})
     else
         std.json.Stringify.valueAlloc(gpa, .{ .@"error" = result.err }, .{});
     if (kind == .bash) return gpa.dupe(u8, result.ok);
-    const Parsed = struct { ok: bool, text: []const u8, changes: std.json.Value, @"error": ?[]const u8 = null };
+    const Parsed = struct { ok: bool, session: std.json.Value = .null, text: []const u8, changes: std.json.Value, @"error": ?[]const u8 = null };
     const parsed = try std.json.parseFromSlice(Parsed, gpa, result.ok, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     return std.json.Stringify.valueAlloc(gpa, parsed.value, .{ .emit_null_optional_fields = false });
+}
+
+test "background agent messages retain session even before start and omit usage" {
+    const t = std.testing;
+    for ([_][]const u8{ "null", "\"0123456789abcdef0123456789abcdef\"" }) |session| {
+        const json = try std.fmt.allocPrint(t.allocator, "{{\"ok\":false,\"session\":{s},\"text\":\"\",\"changes\":[],\"usage\":{{}},\"error\":\"failed\"}}", .{session});
+        defer t.allocator.free(json);
+        const result = try messageResult(t.allocator, .agent, .{ .ok = json });
+        defer t.allocator.free(result);
+        const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, result, .{});
+        defer parsed.deinit();
+        try t.expect(parsed.value.object.contains("session"));
+        try t.expect(!parsed.value.object.contains("usage"));
+    }
 }

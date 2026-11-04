@@ -71,12 +71,15 @@ pub const Log = struct {
         }), .offset = 0 };
     }
 
-    pub fn restore(io: std.Io, gpa: std.mem.Allocator, a: std.mem.Allocator, path: []const u8, history: *std.ArrayList(provider.Message), tokens: *u64) !Log {
-        const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write, .lock = .exclusive, .lock_nonblocking = true });
+    pub fn restore(io: std.Io, gpa: std.mem.Allocator, a: std.mem.Allocator, path: []const u8, history: *std.ArrayList(provider.Message), tokens: *u64, expected_parent: ?[]const u8) !Log {
+        const file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write, .lock = .exclusive, .lock_nonblocking = true }) catch |err| return if (err == error.WouldBlock) error.SessionBusy else err;
         errdefer file.close(io);
         var reader = file.reader(io, &.{});
         const data = try reader.interface.allocRemaining(a, .unlimited);
         const restored = try replay(gpa, a, data, history, tokens);
+        if (expected_parent) |parent| {
+            if (!std.mem.eql(u8, parent, restored.parent_session_id orelse "")) return error.AgentSessionParentMismatch;
+        }
         var log: Log = .{ .file = file, .offset = data.len, .parent_session_id = restored.parent_session_id, .provider = restored.provider, .model = restored.model, .steps = restored.steps, .next_background_id = restored.next_background_id, .lost_background = restored.lost_background };
         if (restored.needs_repair) {
             try log.append(io, a, .{ .repair = true });
@@ -369,7 +372,7 @@ test "commit and replay preserve safe history, compaction and torn tail" {
     log.close(t.io);
     var restored: std.ArrayList(provider.Message) = .empty;
     var tokens: u64 = 0;
-    log = try Log.restore(t.io, a, a, path, &restored, &tokens);
+    log = try Log.restore(t.io, a, a, path, &restored, &tokens, null);
     defer log.close(t.io);
     try t.expectEqualDeep(history.items, restored.items);
     try log.commit(t.io, a, &restored, &tokens, .{ .from = restored.items.len, .messages = &.{.{ .role = "assistant", .content = "next" }} });
@@ -562,4 +565,27 @@ test "Step effort restores from Record and survives compacted message snapshots"
     const old = try parseRecord(a, "{\"messages\":[{\"role\":\"assistant\",\"content\":\"old\"}]}");
     try t.expect(old.effort == null and old.effort_source == null);
     try t.expect(old.messages[0].step_effort == null);
+}
+
+test "child restore checks parent before repairing and keeps the session exclusively locked" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/child.jsonl", .{tmp.sub_path});
+    const data = "{\"parent_session_id\":\"parent\",\"messages\":[{\"role\":\"system\",\"content\":\"child system\"}]}\n{\"from\":";
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "child.jsonl", .data = data });
+    var history: std.ArrayList(provider.Message) = .empty;
+    var tokens: u64 = 0;
+    try t.expectError(error.AgentSessionParentMismatch, Log.restore(t.io, a, a, path, &history, &tokens, "other"));
+    try t.expectEqualStrings(data, try tmp.dir.readFileAlloc(t.io, "child.jsonl", a, .unlimited));
+    history = .empty;
+    var log = try Log.restore(t.io, a, a, path, &history, &tokens, "parent");
+    defer log.close(t.io);
+    try t.expectEqualStrings("parent", log.parent_session_id.?);
+    try t.expectEqualStrings("child system", history.items[0].content.?);
+    var concurrent: std.ArrayList(provider.Message) = .empty;
+    try t.expectError(error.SessionBusy, Log.restore(t.io, a, a, path, &concurrent, &tokens, "parent"));
 }

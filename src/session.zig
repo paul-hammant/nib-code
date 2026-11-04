@@ -164,7 +164,7 @@ pub const Session = struct {
                 break :blk try std.fmt.allocPrint(a, "{s}/{s}.jsonl", .{ directory, id });
             } else try session_log.latest(io, a, directory, cwd);
             s.id = try a.dupe(u8, std.fs.path.stem(path));
-            s.log = try session_log.Log.restore(io, gpa, a, path, &s.history, &s.context_tokens);
+            s.log = try session_log.Log.restore(io, gpa, a, path, &s.history, &s.context_tokens, options.parent_session_id);
             errdefer s.log.close(io);
             try cfg.checkSession(s.log.provider, s.log.model);
             s.parent_session_id = s.log.parent_session_id;
