@@ -514,6 +514,8 @@ def summarize(paths, since=None, cwd=None, group_by=None):
             item['examples'].append(example)
 
     for path in paths:
+        if path.name.endswith('.calls.jsonl'):
+            continue
         try:
             mtime_ms = path.stat().st_mtime * 1000
         except OSError:
@@ -798,8 +800,8 @@ def main():
     for path in inputs:
         path = path.expanduser()
         if path.is_dir():
-            paths.update(p.resolve() for p in path.glob('*.jsonl') if p.is_file())
-        elif path.is_file():
+            paths.update(p.resolve() for p in path.glob('*.jsonl') if p.is_file() and not p.name.endswith('.calls.jsonl'))
+        elif path.is_file() and not path.name.endswith('.calls.jsonl'):
             paths.add(path.resolve())
     report = summarize(sorted(paths), args.since, args.cwd.expanduser().resolve() if args.cwd else None, args.group_by)
     print(json.dumps(report, ensure_ascii=False, indent=2) if args.json else text_report(report))

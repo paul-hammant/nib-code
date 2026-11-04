@@ -6,7 +6,7 @@
 ~/.nib/
   AGENTS.md       全局指令
   config.toml     非秘密运行配置，可不创建
-  sessions/       <32位小写十六进制ID>.jsonl 会话日志
+  sessions/       <32位小写十六进制ID>.jsonl 主日志及同 ID 的 .calls.jsonl 工具录制
   reflections.md  /reflect 正常结束后的回答与 issue 发布结果
 ```
 
@@ -78,6 +78,7 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 
 | 变量 | 含义 |
 |---|---|
+| `NIB_RECORD` | 默认开启工具结果录制；仅 `off` 关闭，不删除已有 calls 文件，见 [replay.md](replay.md) |
 | `NIB_HOME` | 用户目录，默认 `~/.nib`；不改变 Codex 凭证位置 |
 | `NIB_PROVIDER` | `codex` / `chat_completions` |
 | `NIB_BASE_URL` | 当前 provider 的服务地址 |
@@ -89,6 +90,12 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 | `NIB_API_KEY` / `DEEPSEEK_API_KEY` | Chat Completions 的凭证，仅从环境读取 |
 | `NIB_PATCHES_OFF` | 关闭提示词中的模型补丁：`all` 或逗号分隔的 id，见 [compromises.md](compromises.md) |
 | `NIB_ISSUE_REPO` | `/reflect` 自动发布的目标仓库或 `off`，见 [reflect.md](reflect.md) |
+
+## 工具结果录制
+
+工具结果录制默认开启，设置环境变量 `NIB_RECORD=off` 关闭后续录制，不删除已有旁路文件。其他取值与未设置一样开启，不添加 TOML 配置项。录制写入 `$NIB_HOME/sessions/<session_id>.calls.jsonl`，创建权限 `0600`，独立于主日志和恢复功能。它可能含模型展示预算之外的完整文件内容、命令输出和秘密；关闭前已录下的数据仍需单独检查或删除。旁路不自动发给 provider，也不供 `/reflect` 枚举读取。
+
+离线命令、JSONL 格式、SHA-256 去重、每项 1 MiB 截断和隐私/能力边界见 [replay.md](replay.md)。
 
 ## 逐 Step effort 调度
 

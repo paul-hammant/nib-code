@@ -123,6 +123,7 @@ pub const Session = struct {
     compact_backoff: u64 = 0,
     tools: tools.Tools,
     log: session_log.Log = undefined,
+    recorder: ?sandbox.Recorder = null,
     id: []const u8 = undefined,
     parent_session_id: ?[]const u8 = null,
     options: Options = undefined,
@@ -191,6 +192,9 @@ pub const Session = struct {
                 .patches_off = try disabledPatches(a, options.environ),
             });
         }
+        const recording = if (options.environ) |env| !std.mem.eql(u8, env.get("NIB_RECORD") orelse "", "off") else true;
+        const calls_path = try std.fmt.allocPrint(a, "{s}/{s}.calls.jsonl", .{ directory, s.id });
+        s.recorder = sandbox.Recorder.init(gpa, io, calls_path, recording);
         s.tools.session_id = s.id;
         return s;
     }
@@ -209,6 +213,7 @@ pub const Session = struct {
     pub fn deinit(s: *Session) void {
         s.inbox.batch.deinit(s.gpa);
         s.tools.discardChanges(s.gpa);
+        if (s.recorder) |*recorder| recorder.deinit();
         s.log.close(s.io);
         s.history.deinit(s.gpa);
         s.arena.deinit();
@@ -512,7 +517,15 @@ pub const Session = struct {
         var host = s.tools.host();
         host.timing = timing;
         if (timing) |t| t.started = .now(s.io, .awake);
+        const recorder = if (timing != null) (if (s.recorder) |*r| r else null) else null;
+        if (recorder) |r| {
+            r.begin(s.log.steps + 1, timing.?.run_index);
+            host.record = r;
+        }
+        var end: @import("sandbox/record.zig").End = .@"error";
+        defer if (recorder) |r| r.finish(end);
         const outcome = try sandbox.eval(s.gpa, s.io, code, .{}, host, cancel);
+        end = if (cancel != null and cancel.?.load(.acquire)) .cancelled else if (outcome.ok) .ok else if (std.mem.eql(u8, outcome.text, "Error: run timed out")) .timeout else .@"error";
         errdefer outcome.deinit(s.gpa);
         return .{ .outcome = outcome, .changes = try s.tools.takeChanges(s.gpa, s.arena.allocator()) };
     }

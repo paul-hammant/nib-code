@@ -156,7 +156,10 @@ test "prompt fills the session, log path, issue repo and optional focus" {
     const plain = try prompt(testing.allocator, "abc123", "/h/.nib/sessions/abc123.jsonl", "o/r", "");
     defer testing.allocator.free(plain);
     try testing.expect(std.mem.indexOf(u8, plain, "本会话日志是 /h/.nib/sessions/abc123.jsonl") != null);
-    try testing.expect(std.mem.indexOf(u8, plain, "parent_session_id 是 abc123") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "本会话 ID 是 abc123") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "只允许读取上面明确指定的本会话主日志路径") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "不要枚举、glob 或搜索 sessions 目录") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "`.calls.jsonl`") != null);
     try testing.expect(std.mem.indexOf(u8, plain, "gh issue list --repo o/r ") != null);
     try testing.expect(std.mem.indexOf(u8, plain, "{{") == null);
     try testing.expect(std.mem.indexOf(u8, plain, "用户特别想了解") == null);
