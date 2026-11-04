@@ -93,7 +93,7 @@ const all = [_]Tool{
         .root_only = true,
         .run = subagent.agent,
         .doc =
-        \\  // Independent multi-step worker with the same tools except agent; starts from scratch and reads code itself: thousands of tokens, tens of seconds or more. Only prompt is shared. Failures resolve ok:false (invalid args and user cancel reject); stopped children may leave partial files. changes: edit/write only. model/effort as in llm.
+        \\  // Independent multi-step worker; same tools except agent; starts from scratch: thousands of tokens, tens of seconds or more. Only prompt is shared. Failures resolve ok:false (invalid args and user cancel reject); stopped children may leave partial files. changes: cumulative edit/write deltas (not net). model/effort as in llm.
         \\  // background returns {id} now; the result arrives as a message in a later Step, and a reply without Run waits for it. Background edits share the workspace and can land at any time, even mid-build.
         \\  async agent({ prompt, timeout_ms = 1800000, model, effort, background = false }) {}, // → { ok, text, usage, changes, error? } or { id }
         ,
@@ -152,9 +152,7 @@ pub const Tools = struct {
     /// Off in tests that call tools directly, so nothing is left to free.
     track_changes: bool = false,
     changes_mutex: std.Io.Mutex = .init,
-    touched: std.ArrayList(Touched) = .empty,
-
-    const Touched = struct { path: []u8, before: ?[]u8 };
+    changes: @import("tools/changes.zig").Tracker = .{},
 
     pub const PathLock = struct { path: []const u8, next: ?*PathLock = null };
 
@@ -180,47 +178,21 @@ pub const Tools = struct {
         t.paths_changed.broadcast(t.io);
     }
 
-    /// Remembers a file as it was before the current Run first changed it.
-    pub fn noteBefore(t: *Tools, gpa: std.mem.Allocator, path: []const u8, before: ?[]const u8) !void {
+    pub fn noteChange(t: *Tools, gpa: std.mem.Allocator, path: []const u8, before: ?[]const u8, after: []const u8) !void {
         if (!t.track_changes) return;
         t.changes_mutex.lockUncancelable(t.io);
         defer t.changes_mutex.unlock(t.io);
-        for (t.touched.items) |x| if (std.mem.eql(u8, x.path, path)) return;
-        const p = try gpa.dupe(u8, path);
-        errdefer gpa.free(p);
-        const b = if (before) |data| try gpa.dupe(u8, data) else null;
-        errdefer if (b) |data| gpa.free(data);
-        try t.touched.append(gpa, .{ .path = p, .before = b });
+        try t.changes.record(gpa, path, before, after);
     }
 
-    /// What edit/write changed since the last call, compared with the files now. Result is allocated with `a`.
     pub fn takeChanges(t: *Tools, gpa: std.mem.Allocator, a: std.mem.Allocator) ![]const diff.Change {
-        defer t.discardChanges(gpa);
-        var scratch: std.heap.ArenaAllocator = .init(gpa);
-        defer scratch.deinit();
-        const cwd = try std.process.currentPathAlloc(t.io, scratch.allocator());
-        var out: std.ArrayList(diff.Change) = .empty;
-        for (t.touched.items) |x| {
-            _ = scratch.reset(.retain_capacity);
-            const s = scratch.allocator();
-            const after = std.Io.Dir.cwd().readFileAlloc(t.io, x.path, s, .limited(16 * 1024 * 1024)) catch |err| switch (err) {
-                error.FileNotFound => "",
-                else => continue,
-            };
-            const stat = try diff.compare(s, x.before orelse "", after);
-            if (stat.added == 0 and stat.removed == 0 and x.before != null) continue;
-            const shown = if (std.mem.startsWith(u8, x.path, cwd) and x.path.len > cwd.len and x.path[cwd.len] == '/') x.path[cwd.len + 1 ..] else x.path;
-            try out.append(a, .{ .path = try a.dupe(u8, shown), .added = stat.added, .removed = stat.removed, .created = x.before == null, .diff = try a.dupe(u8, stat.diff) });
-        }
-        return out.items;
+        const cwd = try std.process.currentPathAlloc(t.io, gpa);
+        defer gpa.free(cwd);
+        return t.changes.take(gpa, a, cwd);
     }
 
     pub fn discardChanges(t: *Tools, gpa: std.mem.Allocator) void {
-        for (t.touched.items) |x| {
-            gpa.free(x.path);
-            if (x.before) |b| gpa.free(b);
-        }
-        t.touched.clearAndFree(gpa);
+        t.changes.discard(gpa);
     }
 
     pub fn api(t: *const Tools) Api {

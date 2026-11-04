@@ -16,6 +16,7 @@ import unittest
 
 import mock_agent
 from background_assertions import assert_background_bytes, root_records
+from change_helpers import call, checked_bash, wait_command
 from mock_agent import reply
 from mock_llm_tool import content
 from test_agent import alive
@@ -72,6 +73,37 @@ class Mock(http.server.ThreadingHTTPServer):
                 shlex.quote(str(release)) + " ]; do sleep .02; done; echo " + name + "-done")
 
     def first_code(self):
+        if self.case in ("changes_after_write", "changes_between_writes"):
+            code = ("await " + call("write", path="shared.txt", content="foreground\nkeep\n") + "; " +
+                    "await " + bash("printf 'background\nkeep\n' > shared.txt; touch mutation.done") + "; " +
+                    checked_bash(wait_command("mutation.done")))
+            if self.case == "changes_between_writes":
+                code += "await " + call("edit", path="shared.txt", old_text="keep", new_text="tail") + "; "
+            return code + "'mutated'"
+        if self.case == "changes_accumulate":
+            return (
+                "await " + call("write", path="z.txt", content="a\n") + "; " +
+                "await " + call("write", path="a.txt", content="new\n") + "; " +
+                "await " + call("edit", path="z.txt", old_text="a", new_text="b") + "; " +
+                "await " + call("edit", path="z.txt", old_text="b", new_text="a") + "; " +
+                "await " + call("write", path="unchanged.txt", content="same\n") + "; " +
+                "await " + call("edit", path="undo.txt", old_text="before", new_text="after") + "; " +
+                "await " + call("edit", path="undo.txt", old_text="after", new_text="before") + "; " +
+                "await " + call("edit", path="failed.txt", old_text="missing", new_text="bad") +
+                ".then(() => { throw new Error('expected edit rejection') }, e => console.log(e.message)); " +
+                "await " + call("write", path="directory", content="bad\n") +
+                ".then(() => { throw new Error('expected write rejection') }, e => console.log(e.message)); " +
+                checked_bash("printf 'external\n' > failed.txt; rmdir directory; printf 'external\n' > directory") +
+                "'done'")
+        if self.case == "changes_bounded":
+            original = "".join(f"line {i}\n" for i in range(150))
+            replacement = "".join(f"replacement {i}\n" for i in range(250))
+            return (
+                "await " + call("write", path="large.txt", content=original) + "; " +
+                "await " + call("edit", path="large.txt", old_text="line 149", new_text="LAST") + "; " +
+                "await " + call("write", path="large.txt", content=replacement) + "; " +
+                "await " + call("edit", path="large.txt", old_text="replacement 249", new_text="FINAL") + "; " +
+                "await " + call("write", path="small.txt", content="tail\n") + "; 'bounded'")
         if self.case == "mixed":
             return ("const a = await tools.agent({prompt:'child:one',background:true}); " +
                     "const b = await " + bash(self.waiting_command()) + "; [a,b]")
@@ -273,6 +305,70 @@ class BackgroundBashTests:
 
     def test_canceled_request_does_not_count_injected_result(self):
         self.check_injected_request_aborted(cancel=True)
+
+    def test_background_mutation_after_last_write_is_not_attributed(self):
+        (self.cwd / "shared.txt").write_text("old\nkeep\n")
+        mock = self.mock("changes_after_write")
+        events = self.finish(self.start())
+        run = next(e["run_end"] for e in events if "run_end" in e)
+        self.assertTrue(run["ok"], run)
+        self.assertEqual(run["changes"], [{"path": "shared.txt", "added": 1, "removed": 1,
+                                              "created": False, "diff": "-old\n+foreground\n keep\n"}])
+        self.assertEqual((self.cwd / "shared.txt").read_text(), "background\nkeep\n")
+        result = json.loads(content(self.completion(mock.observed()[-1]["messages"])).split("\n", 1)[1])
+        self.assertEqual(result["exit_code"], 0, result)
+
+    def test_background_mutation_between_writes_is_only_context(self):
+        (self.cwd / "shared.txt").write_text("old\nkeep\n")
+        self.mock("changes_between_writes")
+        events = self.finish(self.start())
+        run = next(e["run_end"] for e in events if "run_end" in e)
+        self.assertTrue(run["ok"], run)
+        self.assertEqual(run["changes"], [{"path": "shared.txt", "added": 2, "removed": 2,
+                                              "created": False,
+                                              "diff": "-old\n+foreground\n keep\n…\n background\n-keep\n+tail\n"}])
+        self.assertEqual((self.cwd / "shared.txt").read_text(), "background\ntail\n")
+
+    def test_changes_accumulate_undo_and_preserve_first_seen_order(self):
+        (self.cwd / "a.txt").write_text("old\n")
+        (self.cwd / "unchanged.txt").write_text("same\n")
+        (self.cwd / "undo.txt").write_text("before\n")
+        (self.cwd / "failed.txt").write_text("untouched\n")
+        (self.cwd / "directory").mkdir()
+        self.mock("changes_accumulate")
+        events = self.finish(self.start())
+        run = next(e["run_end"] for e in events if "run_end" in e)
+        self.assertTrue(run["ok"], run)
+        self.assertEqual(run["changes"], [
+            {"path": "z.txt", "added": 3, "removed": 2, "created": True,
+             "diff": "+a\n…\n-a\n+b\n…\n-b\n+a\n"},
+            {"path": "a.txt", "added": 1, "removed": 1, "created": False,
+             "diff": "-old\n+new\n"},
+            {"path": "undo.txt", "added": 2, "removed": 2, "created": False,
+             "diff": "-before\n+after\n…\n-after\n+before\n"},
+        ])
+        self.assertEqual((self.cwd / "z.txt").read_text(), "a\n")
+        self.assertEqual((self.cwd / "undo.txt").read_text(), "before\n")
+        self.assertEqual((self.cwd / "failed.txt").read_text(), "external\n")
+        self.assertEqual((self.cwd / "directory").read_text(), "external\n")
+
+    def test_diff_budget_is_per_path_across_operations_not_stats(self):
+        self.mock("changes_bounded")
+        events = self.finish(self.start())
+        run = next(e["run_end"] for e in events if "run_end" in e)
+        self.assertTrue(run["ok"], run)
+        large, small = run["changes"]
+        self.assertEqual({k: v for k, v in large.items() if k != "diff"},
+                         {"path": "large.txt", "added": 402, "removed": 152, "created": True})
+        lines = large["diff"].splitlines()
+        self.assertEqual(sum(line.startswith(("+", "-", " ")) for line in lines), 200)
+        self.assertEqual(lines[:150], [f"+line {i}" for i in range(150)])
+        self.assertEqual(lines[150:154], ["…", " line 148", "-line 149", "+LAST"])
+        self.assertTrue(any(line.startswith("…") for line in lines[154:]), lines)
+        self.assertNotIn("+FINAL", lines)
+        self.assertEqual(small, {"path": "small.txt", "added": 1, "removed": 0,
+                                 "created": True, "diff": "+tail\n"})
+        self.assertTrue((self.cwd / "large.txt").read_text().endswith("FINAL\n"))
 
     def test_no_run_wait_and_result_metadata(self):
         mock = self.mock("basic")

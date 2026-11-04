@@ -15,6 +15,7 @@ import unittest
 
 from background_assertions import assert_background_bytes, root_records
 from mock_agent import USAGE, reply
+from change_helpers import call, checked_bash, wait_command
 from mock_llm_tool import content
 from test_agent import alive
 from test_interjections import Terminal, history
@@ -43,6 +44,12 @@ class Mock(http.server.ThreadingHTTPServer):
     def code(self):
         def agent(name, **options):
             return "tools.agent(" + json.dumps({"prompt": "child:" + name, **options}) + ")"
+        if self.case == "changes":
+            return ("await " + call("write", path="shared.txt", content="parent\nkeep\n") + "; " +
+                    "await " + agent("changes", background=True) + "; " +
+                    checked_bash(wait_command("child.written") +
+                                 " && printf 'external\nexternal-only\nkeep\n' > shared.txt && touch parent.written") +
+                    checked_bash(wait_command("child.run-ended")) + "'parent finished'")
         if self.case == "concurrency":
             return ("await " + agent("one", background=True) + "; await Promise.all([" +
                     agent("two") + ", " + agent("three", background=True) + "])")
@@ -109,6 +116,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif step == 2 and self.server.case == "boundary":
                 self.server.parent_gate.wait(15)
                 code, text = "console.log('z'.repeat(50000)); 43", "second continued step"
+        elif prompt == "child:changes":
+            if step == 0:
+                code = ("await " + call("write", path="shared.txt", content="child\nkeep\n") + "; " +
+                        "await " + call("write", path="child-only.txt", content="owned\n") + "; " +
+                        checked_bash("touch child.written; " + wait_command("parent.written")) +
+                        "'child wrote'")
+            else:
+                (self.server.cwd / "child.run-ended").touch()
+            text = "child complete"
         elif prompt == "child:error":
             data = json.dumps({"error": {"message": "background mock failure"}}).encode()
             self.send_response(400)
@@ -222,6 +238,31 @@ class BackgroundTests:
 
     def test_canceled_request_does_not_count_injected_result(self):
         self.check_injected_request_aborted(cancel=True)
+
+    def test_background_changes_are_isolated_from_parent_and_external_writes(self):
+        (self.cwd / "shared.txt").write_text("old\nkeep\n")
+        mock = self.mock("changes")
+        events = self.finish(self.start())
+        runs = [e["run_end"] for e in events if "run_end" in e]
+        self.assertEqual(len(runs), 1, runs)
+        self.assertTrue(runs[0]["ok"], runs)
+        self.assertEqual(runs[0]["changes"], [
+            {"path": "shared.txt", "added": 1, "removed": 1, "created": False,
+             "diff": "-old\n+parent\n keep\n"},
+        ])
+        completions = self.completions(mock.observed("initial")[-1]["messages"])
+        self.assertEqual(len(completions), 1, completions)
+        heading, encoded = content(completions[0]).split("\n", 1)
+        self.assertEqual(heading, "[background agent a1 finished]")
+        result = json.loads(encoded)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["changes"], [
+            {"path": "shared.txt", "added": 1, "removed": 1, "created": False},
+            {"path": "child-only.txt", "added": 1, "removed": 0, "created": True},
+        ])
+        self.assertTrue((self.cwd / "child.run-ended").exists())
+        self.assertEqual((self.cwd / "shared.txt").read_text(), "external\nexternal-only\nkeep\n")
+        self.assertEqual((self.cwd / "child-only.txt").read_text(), "owned\n")
 
     def test_returns_immediately_and_delivers_each_completion(self):
         mock = self.mock("basic")

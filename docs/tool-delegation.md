@@ -18,7 +18,9 @@ llm 限额由 [config.toml 的 `[limits]`](config.md#limits) 配置：同进程�
 
 后台 agent/bash 的执行失败通常转换成结果消息；若后台工作线程自身出错，无法生成或写入 inbox 结果（例如分配失败），内部错误由轮询路径上报一次，该任务不再计入待结果集合，后续 Run 不会反复收到同一错误。
 
-changes 汇总子会话所有 Run（包括失败 Run）已收到的 `run_end.changes`，按路径首次出现顺序返回 `[{ path, added, removed, created }]`：同路径 added/removed 累加，created 取逻辑或，不含 diff 正文。这是各 Run 的累计行改动量，不是起止文件的净 diff；只涵盖 edit/write，不包含 bash 或外部进程改动。中断时尚未发出 run_end 的改动也可能不在汇总中，失败后仍须检查半成品文件。
+changes 汇总子会话所有 Run（包括失败 Run）已收到的 `run_end.changes`，按路径首次出现顺序返回 `[{ path, added, removed, created }]`：同路径 added/removed 累加，created 取逻辑或，不含 diff 正文。每个 Run 也按本会话每次成功 edit/write 的紧邻 before/after 内容累加，不是 Run 或整个子会话起止文件的净 diff；改后又撤销仍累计两个方向，失败的工具调用不贡献改动。Run 的 diff 按操作拼接，操作间用 `…` 分隔，每路径整个 Run 限 200 行改动/上下文（不含省略标记），不影响完整计数；格式见 [ask-json.md](ask-json.md)。
+
+Run 结束只取已记录的改动，不重新读盘。bash、外部进程、父/其他子会话和后台任务在两次 edit/write 之间或最后一次写入之后的改动不归入当前会话；后续操作读到这些内容时，可以在 diff 中显示为未改动的上下文。后台 agent 的改动只由其自己的 Run 记录，随该任务的结果 changes 返回，不归入启动它或同时运行的前台 Run；子会话的 changes 也不会把父会话或 bash 同期的改动算给自己。这些记录不是当前磁盘状态或文件所有权的证明。write 沿用 16 MiB 的 before 读取上限；已有文件的 before 超限或无法读取时，写入仍可成功，但该次操作不计入 changes。中断时尚未发出 run_end 的改动也可能不在汇总中，失败后仍须检查半成品文件。
 
 ## 进度、用量与取消
 

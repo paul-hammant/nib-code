@@ -581,11 +581,12 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         (cwd / "same.txt").write_text("x\n")
         edited = events(ask("--json", "edit_test"))
         end = next(e["run_end"] for e in edited if "run_end" in e)
-        assert end["changes"] == [{"path": "notes.txt", "added": 2, "removed": 0, "created": True, "diff": "+a\n+B\n"}], end
+        assert end["changes"] == [{"path": "notes.txt", "added": 3, "removed": 1, "created": True,
+                                   "diff": "+a\n+b\n…\n a\n-b\n+B\n"}], end
         (cwd / "notes.txt").write_text("a\nc\n")
         human = ask("edit_test")
-        assert b"changed notes.txt +1 \xe2\x88\x921" in human.stderr, human.stderr
-        print("Change E2E passed: edit/write changes per Run, diffed against the files before the Run, unchanged files omitted")
+        assert b"changed notes.txt +2 \xe2\x88\x922" in human.stderr, human.stderr
+        print("Change E2E passed: successful edit/write diffs accumulate per operation; unchanged calls are omitted")
 
         contents = ["你" * 16000, "x" * 48000]
         for name, content in zip(("bytes-a.txt", "bytes-b.txt"), contents):

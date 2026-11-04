@@ -1,11 +1,11 @@
 const std = @import("std");
 
-/// What a Run did to one file through edit/write.
+/// Cumulative successful edit/write operations on one file within a Run.
 pub const Change = struct {
     path: []const u8,
     added: usize,
     removed: usize,
-    /// The file did not exist before the Run.
+    /// At least one write created the file.
     created: bool = false,
     /// Changed lines with one line of context, prefixed "+", "-" or " ", gaps as "…";
     /// cut after `max_lines` lines with a final "… N more lines".
@@ -17,7 +17,49 @@ const context = 1;
 /// Larger changed regions are reported as fully replaced instead of aligned line by line.
 const max_cells = 1 << 20;
 
-pub const Stat = struct { added: usize, removed: usize, diff: []const u8 };
+pub const Stat = struct { added: usize, removed: usize, diff: []const u8, preview: Preview = .{} };
+
+pub const Preview = struct {
+    text: std.ArrayList(u8) = .empty,
+    shown: usize = 0,
+    omitted: usize = 0,
+
+    pub fn deinit(p: *Preview, a: std.mem.Allocator) void {
+        p.text.deinit(a);
+    }
+
+    fn gap(p: *Preview, a: std.mem.Allocator) !void {
+        if (p.shown > 0 and p.shown < max_lines) try p.text.appendSlice(a, "…\n");
+    }
+
+    fn line(p: *Preview, a: std.mem.Allocator, prefix: []const u8, text: []const u8) !void {
+        if (p.shown == max_lines) {
+            p.omitted += 1;
+            return;
+        }
+        try p.text.appendSlice(a, prefix);
+        try p.text.appendSlice(a, text);
+        try p.text.append(a, '\n');
+        p.shown += 1;
+    }
+
+    pub fn append(p: *Preview, a: std.mem.Allocator, other: Preview) !void {
+        if (other.shown > 0) try p.gap(a);
+        var it = std.mem.splitScalar(u8, other.text.items, '\n');
+        while (it.next()) |text| {
+            if (text.len == 0) continue;
+            if (std.mem.eql(u8, text, "…")) {
+                try p.gap(a);
+            } else try p.line(a, "", text);
+        }
+        p.omitted += other.omitted;
+    }
+
+    pub fn format(p: Preview, a: std.mem.Allocator) ![]const u8 {
+        if (p.omitted == 0) return a.dupe(u8, p.text.items);
+        return std.fmt.allocPrint(a, "{s}… {d} more lines\n", .{ p.text.items, p.omitted });
+    }
+};
 
 pub fn compare(a: std.mem.Allocator, before: []const u8, after: []const u8) !Stat {
     const old = try lines(a, before);
@@ -40,7 +82,8 @@ pub fn compare(a: std.mem.Allocator, before: []const u8, after: []const u8) !Sta
         .remove => stat.removed += 1,
         .same => {},
     };
-    stat.diff = try render(a, ops.items);
+    stat.preview = try render(a, ops.items);
+    stat.diff = try stat.preview.format(a);
     return stat;
 }
 
@@ -97,30 +140,20 @@ fn alignMiddle(a: std.mem.Allocator, old: []const []const u8, new: []const []con
     }
 }
 
-fn render(a: std.mem.Allocator, ops: []const Op) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    var shown: usize = 0;
+fn render(a: std.mem.Allocator, ops: []const Op) !Preview {
+    var out: Preview = .{};
     var last: ?usize = null;
     for (ops, 0..) |op, i| {
         if (!near(ops, i)) continue;
-        if (shown == max_lines) {
-            var rest: usize = 0;
-            for (ops[i..], i..) |_, k| rest += @intFromBool(near(ops, k));
-            try out.print(a, "… {d} more lines\n", .{rest});
-            break;
-        }
-        if (last) |l| if (i > l + 1) try out.appendSlice(a, "…\n");
-        try out.append(a, switch (op.kind) {
-            .same => ' ',
-            .add => '+',
-            .remove => '-',
-        });
-        try out.appendSlice(a, op.text);
-        try out.append(a, '\n');
-        shown += 1;
+        if (last) |l| if (i > l + 1) try out.gap(a);
+        try out.line(a, switch (op.kind) {
+            .same => " ",
+            .add => "+",
+            .remove => "-",
+        }, op.text);
         last = i;
     }
-    return out.items;
+    return out;
 }
 
 /// A change, or within `context` lines of one.
