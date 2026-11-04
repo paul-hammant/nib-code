@@ -733,6 +733,7 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         ask("patch labels", overrides={"NIB_HOME": str(patches_home), "NIB_PATCHES_OFF": "all"})
         patches_header = replay(next((patches_home / "sessions").glob("[0-9a-f]" * 32 + ".jsonl")))[1][0]
         patch_ids = re.findall(r'\.id = "([^"]+)"', (ROOT / "src/session/prompt.zig").read_text().split("fn patchLines", 1)[0])
+        assert "expected-continuation" in patches_header["patches_off"], patches_header
         assert patches_header["patches_off"] == sorted(patch_ids), patches_header
         assert patches_header["system_sha"] != header["system_sha"]
         changed_base = patches_header["messages"][0]["content"].split(

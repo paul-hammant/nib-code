@@ -43,6 +43,18 @@ def synthetic_log(path, turns, **metadata):
     return records
 
 
+def mechanical_metric(count, samples, *, ms=None, sample_ms=None, timed_count=None,
+                      timed_samples=None, sources=None, hit_sources=None):
+    ms = count * 10 if ms is None else ms
+    sample_ms = samples * 10 if sample_ms is None else sample_ms
+    return dict(count=count, samples=samples, ratio=count / samples if samples else None,
+                ms=ms, sample_ms=sample_ms, time_ratio=ms / sample_ms if sample_ms else None,
+                timed_count=count if timed_count is None else timed_count,
+                timed_samples=samples if timed_samples is None else timed_samples,
+                sources=sources if sources is not None else dict(recorded=0, static=samples, mixed=0),
+                hit_sources=hit_sources if hit_sources is not None else dict(recorded=0, static=count, mixed=0))
+
+
 class StatsTest(unittest.TestCase):
     def test_child_costs_parent_system_groups_and_cli(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -382,7 +394,7 @@ class StatsTest(unittest.TestCase):
             self.assertEqual(stats.summarize([path])['agents']['background_steps']['samples'], 0)
 
     def assertRoundTrips(self, actual, expected):
-        self.assertEqual(len(actual["notes"]), 2)
+        self.assertEqual(len(actual["notes"]), 3)
         self.assertEqual({key: value for key, value in actual.items() if key != "notes"}, expected)
 
     def test_round_trips_exact_counts_and_cli(self):
@@ -406,7 +418,8 @@ class StatsTest(unittest.TestCase):
             report = stats.summarize([path])
             expected = dict(steps_per_turn=dict(samples=3, median=7, p90=7),
                             write_to_validation=dict(count=2, pairs=16, ratio=.125),
-                            disjoint_write_files=dict(count=2, pairs=5, ratio=.4))
+                            disjoint_write_files=dict(count=2, pairs=5, ratio=.4),
+                            mechanical_followups=mechanical_metric(3, 16))
             self.assertRoundTrips(report['round_trips'], expected)
             self.assertEqual(report['overall']['steps'], 19)
             cli = ['python3', str(ROOT / 'scripts/stats.py'), str(path)]
@@ -418,6 +431,324 @@ class StatsTest(unittest.TestCase):
             self.assertIn('写→仅验证: 2/16 = 12.50%', text)
             self.assertIn('连续写不同文件（不相交）: 2/5 = 40.00%', text)
             self.assertEqual(path.read_bytes(), before)
+
+    def test_mechanical_followups_static_hits_misses_and_timing(self):
+        edit = 'tools.edit({path: "a", old_text: "x", new_text: "y"})'
+        read = 'tools.read({path: "a"})'
+        status = 'tools.bash({command: "git status --short"})'
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "static.jsonl"
+            rows = synthetic_log(path, [[edit, status, read, edit,
+                                        'tools.bash({command: "git diff && pwd"})',
+                                        'tools.bash({command: dynamic})',
+                                        ['tools.bash({command: "tail -n 5 a"})', read], None]])
+            for row, ms in zip(rows[1:], [9999, 20, None, 30, -1, True, 0, 50]):
+                if ms is None:
+                    row.pop("ms")
+                else:
+                    row["ms"] = ms
+            path.write_text("\n".join(map(json.dumps, rows)) + "\n")
+            report = stats.summarize([path])["round_trips"]
+            self.assertEqual(report["mechanical_followups"], mechanical_metric(
+                3, 7, ms=20, sample_ms=100, timed_count=2, timed_samples=4))
+            self.assertEqual(report["write_to_validation"], dict(count=1, pairs=7, ratio=1/7))
+            self.assertEqual(stats.summarize([])["round_trips"]["mechanical_followups"],
+                             mechanical_metric(0, 0))
+
+    def test_mechanical_followups_require_explicit_successful_previous_runs(self):
+        edit = 'tools.edit({path: "a", old_text: "x", new_text: "y"})'
+        read = 'tools.read({path: "a"})'
+        cases = [("success", [edit], [True], True),
+                 ("all-success", [edit, edit], [True, True], True),
+                 ("failed", [edit], [False], False),
+                 ("unknown", [edit], [None], False),
+                 ("null", [edit], [None], False),
+                 ("truthy-int", [edit], [1], False),
+                 ("truthy-string", [edit], ["true"], False),
+                 ("one-failed", [edit, edit], [True, False], False),
+                 ("one-unknown", [edit, edit], [True, None], False),
+                 ("zero-runs", None, [], False)]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "previous.jsonl"
+            for name, codes, statuses, eligible in cases:
+                with self.subTest(name=name):
+                    rows = synthetic_log(path, [[codes, read]])
+                    for result, ok in zip(rows[1]["run_results"], statuses):
+                        if ok is None and name != "null":
+                            result.pop("ok")
+                        else:
+                            result["ok"] = ok
+                    if name == "unknown":
+                        rows[1].pop("run_results")
+                    path.write_text("\n".join(map(json.dumps, rows)) + "\n")
+                    self.assertEqual(stats.summarize([path])["round_trips"]["mechanical_followups"],
+                                     mechanical_metric(int(eligible), int(eligible)))
+            rows = synthetic_log(path, [[edit, read]])
+            rows[2]["run_results"][0]["ok"] = False
+            path.write_text("\n".join(map(json.dumps, rows)) + "\n")
+            report = stats.summarize([path])["round_trips"]
+            self.assertEqual(report["mechanical_followups"], mechanical_metric(1, 1))
+            self.assertEqual(report["write_to_validation"], dict(count=0, pairs=1, ratio=0))
+
+    def test_mechanical_followups_turn_boundaries_and_explicit_interjections(self):
+        edit = 'tools.edit({path: "a", old_text: "x", new_text: "y"})'
+        read = 'tools.read({path: "a"})'
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "turns.jsonl"
+            synthetic_log(path, [[edit], [read]])
+            self.assertEqual(stats.summarize([path])["round_trips"]["mechanical_followups"],
+                             mechanical_metric(0, 0))
+            for explicit in (False, True):
+                for source in (None, "background", "background_agent"):
+                    with self.subTest(explicit=explicit, source=source):
+                        rows = synthetic_log(path, [[edit, read]])
+                        user = dict(role="user", content="interjection")
+                        if source is not None:
+                            user["source"] = source
+                        rows[2]["messages"].insert(0, user)
+                        if explicit:
+                            rows[1]["turn_step"], rows[2]["turn_step"] = 1, 2
+                        path.write_text("\n".join(map(json.dumps, rows)) + "\n")
+                        eligible = explicit or source is not None
+                        self.assertEqual(stats.summarize([path])["round_trips"]["mechanical_followups"],
+                                         mechanical_metric(int(eligible), int(eligible)))
+            for position in (1, 3):
+                with self.subTest(position=position):
+                    rows = synthetic_log(path, [[edit, read]])
+                    rows[1]["turn_step"], rows[2]["turn_step"] = 1, position
+                    path.write_text("\n".join(map(json.dumps, rows)) + "\n")
+                    self.assertEqual(stats.summarize([path])["round_trips"]["mechanical_followups"],
+                                     mechanical_metric(0, 0))
+
+    def test_mechanical_followups_filter_cancel_and_replacement_break_adjacency(self):
+        edit = 'tools.edit({path: "a", old_text: "x", new_text: "y"})'
+        read = 'tools.read({path: "a"})'
+        cutoff = int(datetime(2025, 1, 2).timestamp() * 1000)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gaps.jsonl"
+            rows = synthetic_log(path, [[edit, read, read]])
+            for row, at in zip(rows, [cutoff, cutoff, cutoff - 1, cutoff]):
+                row["at"] = at
+            path.write_text("\n".join(map(json.dumps, rows)) + "\n")
+            self.assertEqual(stats.summarize([path], since=date(2025, 1, 2))["round_trips"]["mechanical_followups"],
+                             mechanical_metric(0, 0))
+            for boundary in ("[interrupted by user]", "[interrupted: process terminated]", "replacement"):
+                with self.subTest(boundary=boundary):
+                    rows = synthetic_log(path, [[edit, read]])
+                    if boundary == "replacement":
+                        middle = dict({"from": rows[1]["from"]},
+                                      messages=[dict(role="user", content="compacted context")])
+                    else:
+                        middle = dict({"from": rows[2]["from"]},
+                                      messages=[dict(role="assistant", content=boundary)])
+                        rows[2]["from"] += 1
+                    rows.insert(2, middle)
+                    path.write_text("\n".join(map(json.dumps, rows)) + "\n")
+                    self.assertEqual(stats.summarize([path])["round_trips"]["mechanical_followups"],
+                                     mechanical_metric(0, 0))
+
+    def test_mechanical_followups_static_token_extraction_is_conservative(self):
+        read = 'tools.read({path: "a"})'
+        cases = [(read, True),
+                 ('await Promise.all([tools.read({path: "a"}), tools.bash({command: "git diff"})])', True),
+                 ('// tools.write({path: "a"})\n' + read, True),
+                 ('const text = "tools.edit({})"; ' + read, True),
+                 ('const text = "tools.read({})"; /* tools.bash({command: "pwd"}) */', False),
+                 ('tools.bash({command: "pwd"}); helper()', False),
+                 ('tools.bash({command: "git " + subcommand})', False),
+                 ('tools.bash({command: `git ${subcommand}`})', False),
+                 ('tools[method]({path: "a"})', False),
+                 ('tools.write({path: "a", content: "x"})', False),
+                 ('tools.edit({path: "a", old_text: "x", new_text: "y"})', False),
+                 (['console.log("status")', read], True),
+                 (['console.log("status")', 'const x = 1'], False),
+                 ('false && ' + read, False),
+                 ('true || ' + read, False),
+                 ('true ? 0 : ' + read, False),
+                 ('const check = () => ' + read + '; console.log("done")', False),
+                 ('if (false) { ' + read + ' }', False)]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tokens.jsonl"
+            for code, hit in cases:
+                with self.subTest(code=code):
+                    synthetic_log(path, [[read, code]])
+                    self.assertEqual(stats.summarize([path])["round_trips"]["mechanical_followups"],
+                                     mechanical_metric(int(hit), 1))
+            for command in ("git status; pwd", "git status && pwd", "git status || pwd",
+                            "cat a | head", "pwd > output", "cat < input", "pwd 2>&1",
+                            "git show $REF", "cat $(pwd)", "cat `pwd`", "pwd\nls",
+                            "git push", "gh pr merge 42", "rm a"):
+                with self.subTest(command=command):
+                    self.assertFalse(stats.validation_command(command))
+                    synthetic_log(path, [[read, 'tools.bash({command: ' + json.dumps(command) + '})']])
+                    self.assertEqual(stats.summarize([path])["round_trips"]["mechanical_followups"],
+                                     mechanical_metric(0, 1))
+
+    def test_mechanical_followups_complete_recordings_override_static_calls(self):
+        read = 'tools.read({path: "a"})'
+        edit = 'tools.edit({path: "a", old_text: "x", new_text: "y"})'
+        status = 'tools.bash({command: "git status"})'
+        cases = [('tools.bash({command: dynamic})', [("bash", dict(command="git status --short"))], True),
+                 (status, [("bash", dict(command="rm a"))], False),
+                 (read, [("write", dict(path="a", content="x"))], False),
+                 (edit, [("read", dict(path="a"))], True),
+                 (status, [("bash", dict(command="pwd")), ("edit", dict(path="a"))], False),
+                 ('await helper()', [("read", dict(path="a")),
+                                       ("bash", dict(command="gh pr checks 42"))], True),
+                 (status, [], False),
+                 (status, [("agent", dict(prompt="check"))], False),
+                 (status, [("llm", dict(prompt="check"))], False),
+                 (status, [("bash", None)], False)]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "recorded.jsonl"
+            synthetic_log(path, [[edit, code] for code, _, _ in cases])
+            recording = []
+            for number, (_, calls, _) in enumerate(cases, 1):
+                for index, (name, args) in enumerate(calls):
+                    recording.append(dict(step=number * 2, run=0, index=index, name=name, args=args))
+                meta = dict(end="ok")
+                if number % 2 == 0:
+                    meta["incomplete"] = None
+                recording.append(dict(step=number * 2, run=0, meta=meta))
+            recording.append(dict(step=999, run=0, index=0, name="bash", args=dict(command="pwd")))
+            calls_path = path.with_suffix(".calls.jsonl")
+            calls_path.write_text("garbage\n[]\n" + "\n".join(map(json.dumps, reversed(recording))) + "\n{")
+            before = path.read_bytes(), calls_path.read_bytes()
+            report = stats.summarize([path])["round_trips"]["mechanical_followups"]
+            self.assertEqual(report, mechanical_metric(
+                3, 10, sources=dict(recorded=10, static=0, mixed=0),
+                hit_sources=dict(recorded=3, static=0, mixed=0)))
+            self.assertEqual((path.read_bytes(), calls_path.read_bytes()), before)
+
+    def test_mechanical_followups_complete_failed_current_run_uses_recording(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "current-failure.jsonl"
+            rows = synthetic_log(path, [['tools.read({path: "a"})',
+                                         'tools.bash({command: dynamic}); throw new Error("unexpected")']])
+            rows[2]["run_results"][0]["ok"] = False
+            path.write_text("\n".join(map(json.dumps, rows)) + "\n")
+            path.with_suffix(".calls.jsonl").write_text("\n".join(map(json.dumps, [
+                dict(step=2, run=0, index=0, name="bash", args=dict(command="git status")),
+                dict(step=2, run=0, meta=dict(end="error", incomplete=None))])) + "\n")
+            self.assertEqual(stats.summarize([path])["round_trips"]["mechanical_followups"],
+                             mechanical_metric(1, 1, sources=dict(recorded=1, static=0, mixed=0),
+                                               hit_sources=dict(recorded=1, static=0, mixed=0)))
+
+    def test_mechanical_followups_incomplete_recordings_fall_back_per_run(self):
+        read = 'tools.read({path: "a"})'
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "incomplete.jsonl"
+            synthetic_log(path, [[read, read]])
+            call = dict(step=2, run=0, index=0, name="write", args=dict(path="a", content="x"))
+            end = dict(step=2, run=0, meta=dict(end="ok"))
+            cases = {
+                "no-sidecar": None,
+                "no-end": [call],
+                "null-meta": [call, dict(step=2, run=0, meta=None)],
+                "incomplete": [call, dict(step=2, run=0, meta=dict(end="ok", incomplete=True))],
+                "cancelled": [call, dict(step=2, run=0, meta=dict(end="cancel"))],
+                "duplicate-index": [call, call, end],
+                "missing-index-zero": [dict(call, index=1), end],
+                "index-gap": [call, dict(call, index=2), end],
+                "duplicate-end": [call, end, end],
+            }
+            calls_path = path.with_suffix(".calls.jsonl")
+            for name, recording in cases.items():
+                with self.subTest(name=name):
+                    if recording is None:
+                        calls_path.unlink(missing_ok=True)
+                    else:
+                        calls_path.write_text("\n".join(map(json.dumps, recording)) + "\n")
+                    self.assertEqual(stats.summarize([path])["round_trips"]["mechanical_followups"],
+                                     mechanical_metric(1, 1))
+            synthetic_log(path, [[read, 'tools.bash({command: dynamic})']])
+            calls_path.write_text(json.dumps(dict(call, name="read", args=dict(path="a"))) + "\n")
+            self.assertEqual(stats.summarize([path])["round_trips"]["mechanical_followups"],
+                             mechanical_metric(0, 1))
+
+    def test_mechanical_followups_recorded_static_and_mixed_sources(self):
+        read = 'tools.read({path: "a"})'
+        edit = 'tools.edit({path: "a", old_text: "x", new_text: "y"})'
+        dynamic = 'tools.bash({command: command})'
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mixed.jsonl"
+            synthetic_log(path, [[read, codes] for codes in
+                                 ([dynamic, read], [dynamic, edit], [dynamic, dynamic], [read, read])])
+            recording = []
+            for step, run in [(2, 0), (4, 0), (6, 0), (6, 1)]:
+                recording.extend([dict(step=step, run=run, index=0, name="bash", args=dict(command="pwd")),
+                                  dict(step=step, run=run, meta=dict(end="ok", incomplete=False))])
+            recording.append(dict(step=2, run=1, index=0, name="write", args=dict(path="a")))
+            path.with_suffix(".calls.jsonl").write_text("\n".join(map(json.dumps, recording)) + "\n")
+            self.assertEqual(stats.summarize([path])["round_trips"]["mechanical_followups"], mechanical_metric(
+                3, 4, sources=dict(recorded=1, static=1, mixed=2),
+                hit_sources=dict(recorded=1, static=1, mixed=1)))
+
+    def test_mechanical_followups_recording_numbers_include_filtered_interrupted_assistants(self):
+        edit = 'tools.edit({path: "a", old_text: "x", new_text: "y"})'
+        cutoff = int(datetime(2025, 1, 2).timestamp() * 1000)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "numbering.jsonl"
+            rows = synthetic_log(path, [[edit, edit, edit, 'tools.bash({command: dynamic})']])
+            rows[2]["messages"][-1] = dict(role="assistant", content="[interrupted by user]")
+            for index, row in enumerate(rows):
+                row["at"] = cutoff - 1 if index < 3 else cutoff
+            path.write_text("\n".join(map(json.dumps, rows)) + "\n")
+            path.with_suffix(".calls.jsonl").write_text("\n".join(map(json.dumps, [
+                dict(step=4, run=0, index=0, name="write", args=dict(path="a")),
+                dict(step=4, run=0, meta=dict(end="ok")),
+                dict(step=5, run=0, index=0, name="bash", args=dict(command="git show HEAD")),
+                dict(step=5, run=0, meta=dict(end="ok"))])) + "\n")
+            self.assertEqual(stats.summarize([path], since=date(2025, 1, 2))["round_trips"]["mechanical_followups"],
+                             mechanical_metric(1, 1, sources=dict(recorded=1, static=0, mixed=0),
+                                               hit_sources=dict(recorded=1, static=0, mixed=0)))
+
+    def test_mechanical_followups_zero_and_missing_timing(self):
+        read = 'tools.read({path: "a"})'
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "untimed.jsonl"
+            for ms in (None, True, -1, "10", 1.5, 0):
+                with self.subTest(ms=ms):
+                    rows = synthetic_log(path, [[read, read]])
+                    if ms is None:
+                        rows[2].pop("ms")
+                    else:
+                        rows[2]["ms"] = ms
+                    path.write_text("\n".join(map(json.dumps, rows)) + "\n")
+                    self.assertEqual(stats.summarize([path])["round_trips"]["mechanical_followups"],
+                                     mechanical_metric(1, 1, ms=0, sample_ms=0,
+                                                       timed_count=int(ms == 0), timed_samples=int(ms == 0)))
+
+    def test_mechanical_followups_patches_groups_json_and_text(self):
+        edit = 'tools.edit({path: "a", old_text: "x", new_text: "y"})'
+        read = 'tools.read({path: "a"})'
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            plain, patched = directory / "plain.jsonl", directory / "patched.jsonl"
+            synthetic_log(plain, [[edit, read]], nib_version="test")
+            synthetic_log(patched, [[edit, edit, 'tools.bash({command: dynamic})']], patches_off=["b", "a"])
+            calls_path = patched.with_suffix(".calls.jsonl")
+            calls_path.write_text("\n".join(map(json.dumps, [
+                dict(step=3, run=0, index=0, name="bash", args=dict(command="pwd")),
+                dict(step=3, run=0, meta=dict(end="ok"))])) + "\n")
+            before = {path: path.read_bytes() for path in (plain, patched, calls_path)}
+            report = stats.summarize([patched, plain], group_by="patches")
+            self.assertEqual(report["round_trips"]["mechanical_followups"], mechanical_metric(
+                2, 3, sources=dict(recorded=1, static=2, mixed=0),
+                hit_sources=dict(recorded=1, static=1, mixed=0)))
+            self.assertEqual(report["groups"]["none"]["round_trips"]["mechanical_followups"],
+                             mechanical_metric(1, 1))
+            self.assertEqual(report["groups"]['["a", "b"]']["round_trips"]["mechanical_followups"], mechanical_metric(
+                1, 2, sources=dict(recorded=1, static=1, mixed=0),
+                hit_sources=dict(recorded=1, static=0, mixed=0)))
+            cli = [sys.executable, str(ROOT / "scripts/stats.py"), str(directory), "--group-by", "patches"]
+            self.assertEqual(json.loads(subprocess.check_output(cli + ["--json"])), report)
+            text = subprocess.check_output(cli).decode()
+            self.assertEqual(text.count("成功后的机械收尾 Step（mechanical follow-ups）:"), 3)
+            self.assertIn("2/3 = 66.67%；Step 时间 20/30 ms = 66.67%（计时 2/3）", text)
+            self.assertIn("1/1 = 100.00%；Step 时间 10/10 ms = 100.00%（计时 1/1）", text)
+            self.assertIn("1/2 = 50.00%；Step 时间 10/20 ms = 50.00%（计时 1/2）", text)
+            self.assertEqual({path: path.read_bytes() for path in before}, before)
 
     def test_turn_step_keeps_interjections_in_the_same_turn(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -443,7 +774,10 @@ class StatsTest(unittest.TestCase):
 
     def test_structure_literal_paths_and_conservative_validation(self):
         valid_commands = ['zig build', 'zig test x.zig', 'zig fmt x.zig', 'cargo check',
-                          'cargo test --all', 'git diff --stat', 'pytest -q', 'diff a b',
+                          'cargo test --all', 'git diff --stat', 'git status --short',
+                          'git log -1', 'git fetch origin', 'git show HEAD',
+                          'gh pr view 42', 'gh pr checks 42', 'tail -n 20 output.log',
+                          'cat a', 'ls -la', 'head -n 5 a', 'pwd', 'pytest -q', 'diff a b',
                           'python3 tests/test_stats.py', 'python3 -m unittest',
                           'go test ./...', 'make check', 'A=1 /usr/bin/git diff']
         for command in valid_commands:
@@ -457,7 +791,6 @@ class StatsTest(unittest.TestCase):
                          'tools.bash({command: "zig build; rm x"})',
                          'tools.bash({command: "zig build && zig test x"})',
                          'tools.bash({command: "zig build > result"})',
-                         'tools.bash({command: "git status"})',
                          'tools.bash({command: "echo test"})',
                          'tools.bash({command: "python3 arbitrary.py"})',
                          'tools.bash({command: "zig build"}); tools.read({path: "a"})',
@@ -587,7 +920,8 @@ class StatsTest(unittest.TestCase):
             self.assertRoundTrips(version['round_trips'], dict(
                 steps_per_turn=dict(samples=2, median=3, p90=4),
                 write_to_validation=dict(count=2, pairs=4, ratio=.5),
-                disjoint_write_files=dict(count=1, pairs=1, ratio=1)))
+                disjoint_write_files=dict(count=1, pairs=1, ratio=1),
+                mechanical_followups=mechanical_metric(2, 4)))
             patches = stats.summarize(paths.values(), group_by='patches')['groups']
             self.assertEqual(patches['none']['overall']['steps'], 8)
             self.assertEqual(patches['none']['round_trips']['steps_per_turn'], dict(samples=4, median=1.5, p90=4))
@@ -623,7 +957,8 @@ class StatsTest(unittest.TestCase):
             self.assertEqual(set(report['groups']), {'none'})
             expected = dict(steps_per_turn=dict(samples=1, median=3, p90=3),
                             write_to_validation=dict(count=1, pairs=1, ratio=1),
-                            disjoint_write_files=dict(count=0, pairs=0, ratio=None))
+                            disjoint_write_files=dict(count=0, pairs=0, ratio=None),
+                            mechanical_followups=mechanical_metric(1, 1))
             self.assertRoundTrips(report['round_trips'], expected)
             self.assertRoundTrips(report['groups']['none']['round_trips'], expected)
             records = synthetic_log(path, [[write, verify, None]])

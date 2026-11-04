@@ -12,7 +12,7 @@ pub const tools_json =
     \\"required":["code"]}}}]
 ;
 
-/// Prompt lines that compensate for current models instead of stating facts. Each id is registered in
+/// Prompt lines that compensate for current models. Each id is registered in
 /// docs/compromises.md; NIB_PATCHES_OFF=<id,...|all> drops them so their effect can be measured.
 pub const patches = [_]struct { id: []const u8, text: []const u8 }{
     .{
@@ -22,6 +22,10 @@ pub const patches = [_]struct { id: []const u8, text: []const u8 }{
         ,
     },
     .{ .id = "no-shell-search", .text = "Search with tools.grep/tools.glob, not shell rg/find/grep." },
+    .{
+        .id = "expected-continuation",
+        .text = "A Run can continue while results match expectations and return at the first unexpected result. Command output redirected to a file can be read within the same Run, returning only the needed portion.",
+    },
 };
 
 pub fn patchLines(a: std.mem.Allocator, environ: ?*const std.process.Environ.Map) ![]const u8 {
@@ -156,11 +160,17 @@ test "prompt patches can be disabled individually or all at once" {
     const all_on = try patchLines(gpa, &env);
     defer gpa.free(all_on);
     for (patches) |patch| try std.testing.expect(std.mem.indexOf(u8, all_on, patch.text) != null);
-    try env.put("NIB_PATCHES_OFF", "json-escape");
-    const one_off = try patchLines(gpa, &env);
-    defer gpa.free(one_off);
-    try std.testing.expect(std.mem.indexOf(u8, one_off, "backticks") == null);
-    try std.testing.expect(std.mem.indexOf(u8, one_off, "rg/find/grep") != null);
+    for (patches) |disabled| {
+        try env.put("NIB_PATCHES_OFF", disabled.id);
+        const one_off = try patchLines(gpa, &env);
+        defer gpa.free(one_off);
+        for (patches) |patch| {
+            try std.testing.expectEqual(
+                !std.mem.eql(u8, disabled.id, patch.id),
+                std.mem.indexOf(u8, one_off, patch.text) != null,
+            );
+        }
+    }
     try env.put("NIB_PATCHES_OFF", "no-shell-search, all");
     const none = try patchLines(gpa, &env);
     defer gpa.free(none);
@@ -176,11 +186,12 @@ test "experiment labels hash exact base text and normalize actual disabled patch
     const a = arena.allocator();
     var env: std.process.Environ.Map = .init(a);
     try t.expectEqual(null, try disabledPatches(a, &env));
-    try env.put("NIB_PATCHES_OFF", "unknown, no-shell-search, json-escape, json-escape");
+    try env.put("NIB_PATCHES_OFF", "unknown, no-shell-search, expected-continuation, json-escape, expected-continuation, json-escape");
     const normalized = (try disabledPatches(a, &env)).?;
-    try t.expectEqual(@as(usize, 2), normalized.len);
-    try t.expectEqualStrings("json-escape", normalized[0]);
-    try t.expectEqualStrings("no-shell-search", normalized[1]);
+    try t.expectEqual(@as(usize, 3), normalized.len);
+    try t.expectEqualStrings("expected-continuation", normalized[0]);
+    try t.expectEqualStrings("json-escape", normalized[1]);
+    try t.expectEqualStrings("no-shell-search", normalized[2]);
     try env.put("NIB_PATCHES_OFF", "all");
     const all = (try disabledPatches(a, &env)).?;
     try t.expectEqual(patches.len, all.len);
