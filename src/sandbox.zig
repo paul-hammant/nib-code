@@ -47,7 +47,6 @@ pub const Outcome = struct {
     log_tail_start: usize = 0,
     log_truncated: bool = false,
     tool_bytes: u64 = 0,
-    output_bytes: u64 = 0,
 
     pub fn deinit(o: Outcome, gpa: std.mem.Allocator) void {
         gpa.free(o.text);
@@ -696,10 +695,9 @@ test "tool bytes include both file results but output bytes only include the for
     try testing.expectEqual(result.tool_bytes, timing.tool_bytes);
     try testing.expectEqual(@as(?u64, json_a.len), timing.entries[0].result_bytes);
     try testing.expectEqual(@as(?u64, json_b.len), timing.entries[1].result_bytes);
-    const output = try @import("session/output.zig").format(testing.allocator, &result);
+    const output = try @import("session/output.zig").format(testing.allocator, result);
     defer testing.allocator.free(output);
     try testing.expectEqualStrings("result: \"ok\"", output);
-    try testing.expectEqual(output.len, result.output_bytes);
 }
 
 test "rejected and unawaited settled calls contribute their UTF-8 result bytes" {

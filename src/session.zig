@@ -554,10 +554,10 @@ pub const Session = struct {
         s.tools.progress.sink = .{ .ctx = &progress_sink, .emit = Forward.progress };
         defer s.tools.progress.sink = null;
         const ran = try s.runTimed(code.?, cancel, timing);
-        var o = ran.outcome;
+        const o = ran.outcome;
         defer o.deinit(s.gpa);
 
-        const output = try output_format.format(a, &o);
+        const output = try output_format.format(a, o);
         const run_ms = timing.elapsed();
         try sink.emit(sink.ctx, .{ .run_end = .{ .ok = o.ok, .output = output, .changes = ran.changes } });
         return .{ .output = output, .ok = o.ok, .run_ms = run_ms, .effort = args.value.effort };
@@ -607,23 +607,19 @@ test "formatOutcome" {
     const gpa = std.testing.allocator;
     var logs = "a\nb\n".*;
     var text = "1".*;
-    var ok_outcome: sandbox.Outcome = .{ .ok = true, .text = &text, .logs = &logs };
-    const ok = try output_format.format(gpa, &ok_outcome);
+    const ok = try output_format.format(gpa, .{ .ok = true, .text = &text, .logs = &logs });
     defer gpa.free(ok);
     try std.testing.expectEqualStrings("a\nb\nresult: 1", ok);
     var err = "Error: x".*;
     var none = "".*;
-    var bad_outcome: sandbox.Outcome = .{ .ok = false, .text = &err, .logs = &none };
-    const bad = try output_format.format(gpa, &bad_outcome);
+    const bad = try output_format.format(gpa, .{ .ok = false, .text = &err, .logs = &none });
     defer gpa.free(bad);
     try std.testing.expectEqualStrings("Error: x", bad);
     var undef = "undefined".*;
-    var logged_outcome: sandbox.Outcome = .{ .ok = true, .text = &undef, .logs = &logs };
-    const logged = try output_format.format(gpa, &logged_outcome);
+    const logged = try output_format.format(gpa, .{ .ok = true, .text = &undef, .logs = &logs });
     defer gpa.free(logged);
     try std.testing.expectEqualStrings("a\nb", logged);
-    var silent_outcome: sandbox.Outcome = .{ .ok = true, .text = &undef, .logs = &none };
-    const silent = try output_format.format(gpa, &silent_outcome);
+    const silent = try output_format.format(gpa, .{ .ok = true, .text = &undef, .logs = &none });
     defer gpa.free(silent);
     try std.testing.expectEqualStrings("(no output)", silent);
 }
