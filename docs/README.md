@@ -61,7 +61,7 @@ nib 面向越来越强的模型：给模型事实和能力，不替它做判断�
 - [run-output.md](run-output.md)：工具数据完整性、显式上限、Run 输出预算与执行超时
 - [tool-delegation.md](tool-delegation.md)：read / llm / agent 的选择、接口与委派实现
 - [compromises.md](compromises.md)：为当下做的妥协登记表（模型补丁、实现妥协、写死的策略）
-- [releases/](releases/)：版本发布说明（[0.2.0](releases/0.2.0.md)）
+- [releases/](releases/)：版本发布说明（[0.3.0](releases/0.3.0.md)、[0.2.0](releases/0.2.0.md)）
 
 ## 没写成 ADR 的选择
 

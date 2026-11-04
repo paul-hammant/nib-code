@@ -10,7 +10,7 @@ const r = await tools.bash({ command: "zig build test" });
 r.exit_code === 0 ? "ok" : r.output
 ```
 
-当前版本 0.2.0，个人项目，仍在快速迭代。
+当前版本 0.3.0，个人项目，仍在快速迭代。
 
 ## 特点
 
@@ -73,4 +73,6 @@ bash 有一层防误操作的检查：拒绝提权、关机、删除系统目录
 - [docs/releases/](docs/releases/)：版本说明
 - [AGENTS.md](AGENTS.md)：给参与开发的 agent 看的构建、测试命令和代码地图
 
-尚未指定开源许可证。
+## 许可证
+
+[MIT](LICENSE)
