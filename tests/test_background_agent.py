@@ -32,6 +32,7 @@ class Mock(http.server.ThreadingHTTPServer):
         self.lock = threading.Lock()
         self.gates = {name: threading.Event() for name in ("one", "two", "three")}
         self.parent_gate = threading.Event()
+        self.fifo_run = False
         super().__init__(("127.0.0.1", 0), Handler)
 
     def observed(self, prompt):
@@ -85,7 +86,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 text = "complete" if any(content(m).startswith("[background agent ") for m in messages) else "early final"
                 if self.server.case == "fifo":
                     self.server.parent_gate.wait(15)
-                    code = "42"
+                    if self.server.fifo_run:
+                        code = "42"
                 if self.server.case == "limit":
                     wait_for(lambda: (self.server.cwd / "worker.started").exists())
                 if self.server.case == "boundary":
@@ -372,6 +374,7 @@ class ChatTests(BackgroundTests, unittest.TestCase):
 
     def test_interjections_and_background_results_keep_fifo(self):
         mock = self.mock("fifo")
+        mock.fifo_run = True
         terminal = Terminal(self.cwd, self.env)
         self.addCleanup(terminal.close)
         terminal.send("initial\r")

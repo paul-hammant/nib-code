@@ -85,8 +85,6 @@ pub const Log = struct {
     }
 
     fn append(log: *Log, io: std.Io, a: std.mem.Allocator, record: Record) !void {
-        log.mutex.lockUncancelable(io);
-        defer log.mutex.unlock(io);
         if (log.poisoned) return error.SessionLogFailed;
         var stamped = record;
         stamped.at = @intCast(@divFloor(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
@@ -98,17 +96,24 @@ pub const Log = struct {
     }
 
     pub fn background(log: *Log, io: std.Io, a: std.mem.Allocator, event: @import("events.zig").Background, step: u32) !void {
+        log.mutex.lockUncancelable(io);
+        defer log.mutex.unlock(io);
         try log.append(io, a, .{ .background = event, .turn_step = step });
+        errdefer log.poisoned = true;
         try log.file.sync(io);
     }
 
     pub fn diagnose(log: *Log, io: std.Io, a: std.mem.Allocator, diagnostic: Diagnostic) !void {
+        log.mutex.lockUncancelable(io);
+        defer log.mutex.unlock(io);
         try log.append(io, a, .{ .diagnostic = diagnostic });
         errdefer log.poisoned = true;
         try log.file.sync(io);
     }
 
     pub fn commit(log: *Log, io: std.Io, a: std.mem.Allocator, history: *std.ArrayList(provider.Message), tokens: *u64, record: Record) !void {
+        log.mutex.lockUncancelable(io);
+        defer log.mutex.unlock(io);
         if (record.from > history.items.len) return error.InvalidSessionLog;
         try history.ensureTotalCapacity(a, record.from + record.messages.len);
         try log.append(io, a, record);
