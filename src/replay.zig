@@ -68,6 +68,7 @@ const Run = struct {
     code: []const u8,
     expected: ?[]const u8,
     child: bool = false,
+    remaining_steps: ?usize = null,
 };
 
 fn field(v: Value, name: []const u8) !Value {
@@ -126,6 +127,7 @@ fn loadMain(a: Allocator, data: []const u8) ![]Run {
         }
         if (torn) return error.InvalidReplayLog;
         if (record.object.get("diagnostic")) |d| if (d != .null) continue;
+        if (record.object.get("agent_session")) |mapping| if (mapping != .null) continue;
         const messages: []const Value = if (record.object.get("messages")) |v| try array(v) else &.{};
         const from = if (record.object.get("from")) |v| try natural(v) else 0;
         if (from > length) return error.InvalidReplayLog;
@@ -158,7 +160,18 @@ fn loadMain(a: Allocator, data: []const u8) ![]Run {
                         }
                     }
                 }
-                try runs.append(a, .{ .key = .{ .step = step, .run = index }, .code = code.?, .expected = expected, .child = child });
+                var remaining_steps: ?usize = null;
+                if (record.object.get("run_results")) |results| {
+                    if (results != .null) for (try array(results)) |result| {
+                        if (std.mem.eql(u8, id, try string(try field(result, "tool_call_id")))) {
+                            if (result.object.get("remaining_steps")) |remaining| {
+                                if (remaining != .null) remaining_steps = try natural(remaining);
+                            }
+                            break;
+                        }
+                    };
+                }
+                try runs.append(a, .{ .key = .{ .step = step, .run = index }, .code = code.?, .expected = expected, .child = child, .remaining_steps = remaining_steps });
             }
         }
     }
@@ -264,7 +277,7 @@ const Report = struct {
 fn replayOne(a: Allocator, io: std.Io, original: Run, recording: Recording, script: ?[]const u8) !Report {
     const evaluated = try core.executeSession(a, io, script orelse original.code, recording.entries.items, recording.start_ms_epoch, recording.end orelse .ok, script != null, original.child);
     defer evaluated.deinit(a);
-    const text = try output.format(a, evaluated.outcome);
+    const text = try output.stepLimitOutput(a, try output.format(a, evaluated.outcome), original.remaining_steps);
     const incomplete = recording.incomplete or evaluated.incomplete or original.expected == null;
     const determined = script == null and !incomplete and recording.end != .timeout and recording.end != .cancelled;
     const equal = if (original.expected) |expected| std.mem.eql(u8, expected, text) else false;
@@ -369,6 +382,7 @@ test "raw main records count global assistant Steps across turns and compaction"
     defer arena.deinit();
     const data = "{\"messages\":[{\"role\":\"system\",\"content\":\"s\"},{\"role\":\"user\",\"content\":\"one\"}]}\n" ++
         "{\"from\":2,\"turn_step\":1,\"messages\":[{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"a\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"code\\\":\\\"first\\\"}\"}},{\"id\":\"x\",\"function\":{\"name\":\"other\",\"arguments\":\"{\\\"code\\\":\\\"ignored\\\"}\"}},{\"id\":\"b\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"code\\\":\\\"second\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"a\",\"content\":\"one\"},{\"role\":\"tool\",\"tool_call_id\":\"x\",\"content\":\"unknown\"},{\"role\":\"tool\",\"tool_call_id\":\"b\",\"content\":\"two\"}]}\n" ++
+        "{\"agent_session\":{\"id\":\"a1\",\"session\":\"0123456789abcdef0123456789abcdef\"}}\n" ++
         "{\"from\":6,\"turn_step\":2,\"messages\":[{\"role\":\"assistant\",\"content\":\"done\"}]}\n" ++
         "{\"from\":7,\"turn_step\":1,\"messages\":[{\"role\":\"user\",\"content\":\"two\"},{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"c\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"code\\\":\\\"third\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"c\",\"content\":\"three\"}]}\n" ++
         "{\"from\":1,\"messages\":[{\"role\":\"user\",\"content\":\"summary\"},{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"c\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"code\\\":\\\"third\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"c\",\"content\":\"three\"}]}\n" ++

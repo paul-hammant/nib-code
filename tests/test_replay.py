@@ -162,6 +162,131 @@ class ReplayTests(unittest.TestCase):
         self.assertFalse((self.cwd / "sample.txt").exists())
         self.assertFalse((self.cwd / "side-effect").exists())
 
+    def test_explicit_step_limits_replay_from_run_metadata(self):
+        config = self.home / "config.toml"
+        for limit in (1, 2):
+            with self.subTest(max_steps=limit):
+                config.write_text(f"[limits]\nmax_steps = {limit}\n")
+                for step in range(1, limit + 1):
+                    self.mock.reply(codes=[f'console.log("step-{step}");',
+                                           '"x".repeat(20000)'])
+                before = len(self.mock.requests)
+                result = self.command("ask", "--json", "limited replay probe", check=False)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                events = [json.loads(line) for line in result.stdout.splitlines()]
+                self.assertEqual(events[-1]["error"]["steps"], limit)
+                session = events[0]["start"]["session_id"]
+                self.assertEqual(len(self.mock.requests) - before, limit)
+                records = jsonl(self.home / "sessions" / f"{session}.jsonl")
+                runs = [run for record in records for run in record.get("run_results", [])]
+                self.assertEqual([run["remaining_steps"] for run in runs],
+                                 [limit - step for step in range(1, limit + 1) for _ in range(2)])
+                # Replay must use recorded metadata, not the current limit.
+                config.unlink()
+                before = len(self.mock.requests)
+                for step in range(1, limit + 1):
+                    for run in range(2):
+                        report = self.replay(session, "--run", f"{step}:{run}")
+                        self.assertIs(report["match"], True, report)
+                        self.assertTrue(report["output"].endswith(
+                            f"\n[{limit - step} Steps left in this Turn]"), report)
+                report = self.replay(session, "--all")
+                self.assertEqual(report["matched"], limit * 2, report)
+                self.assertEqual(report["divergences"], 0, report)
+                self.assertEqual(len(self.mock.requests), before)
+
+    def test_unlimited_and_legacy_logs_replay_without_step_suffix(self):
+        session = self.ask(['console.log("legacy output");'])
+        main = self.home / "sessions" / f"{session}.jsonl"
+        records = jsonl(main)
+        runs = [run for record in records for run in record.get("run_results", [])]
+        self.assertTrue(runs)
+        self.assertTrue(all("remaining_steps" not in run for run in runs))
+        (self.home / "config.toml").write_text("[limits]\nmax_steps = 1\n")
+        before = len(self.mock.requests)
+        current = self.replay(session, "--run", "1:0")
+        self.assertIs(current["match"], True, current)
+        self.assertEqual(current["output"], "legacy output")
+        for record in records:
+            record.pop("run_results", None)
+        main.write_text("".join(json.dumps(row) + "\n" for row in records))
+        legacy = self.replay(session, "--run", "1:0")
+        self.assertEqual(legacy, current)
+        self.assertEqual(len(self.mock.requests), before)
+
+    def test_resume_exposes_changed_turn_budget_without_rewriting_system(self):
+        self.mock.reply(text="initial complete")
+        result = self.command("ask", "--json", "initial prompt")
+        events = [json.loads(line) for line in result.stdout.splitlines()]
+        session = events[0]["start"]["session_id"]
+        main = self.home / "sessions" / f"{session}.jsonl"
+        original_header = jsonl(main)[0]
+        config = self.home / "config.toml"
+        for limit in (1, 3):
+            config.write_text(f"[limits]\nmax_steps = {limit}\n")
+            self.mock.reply(text="resumed complete")
+            self.command("ask", "--json", "resumed prompt", "--resume", session)
+            user = [m["content"] for m in self.mock.requests[-1]["messages"] if m["role"] == "user"][-1]
+            self.assertIn(f"This Turn may use at most {limit} Steps", user)
+            self.assertTrue(user.endswith("\n\nresumed prompt"))
+            self.assertEqual(jsonl(main)[0], original_header)
+
+        config.unlink()
+        self.mock.reply(text="unlimited again")
+        self.command("ask", "--json", "unlimited prompt", "--resume", session)
+        user = [m["content"] for m in self.mock.requests[-1]["messages"] if m["role"] == "user"][-1]
+        self.assertEqual(user, "unlimited prompt")
+        self.assertEqual(jsonl(main)[0], original_header)
+
+    def test_sleep_records_and_replays_without_real_wait(self):
+        session = self.ask([
+            'const pending = tools.sleep(80); '
+            'console.log(await tools.sleep(5)); await pending; console.log("awake");'
+        ])
+        path = self.calls_path(session)
+        rows = jsonl(path)
+        calls = [r for r in rows if "index" in r]
+        self.assertEqual([(r["index"], r["seq"], r["name"], r["args"]) for r in calls],
+                         [(1, 0, "sleep", 5), (0, 1, "sleep", 80)])
+        self.assertTrue(all(r["ok"] for r in calls))
+        self.assertEqual(calls[0]["result"], "null")
+        self.assertEqual(calls[1]["result"], {"same_as": calls[0]["sha256"]})
+        report = self.replay(session, "--run", "1:0")
+        self.assertTrue(report["match"], report)
+        self.assertIn("awake", report["output"])
+        # Matching long recorded waits must not turn into real replay timers.
+        for row in rows:
+            if "index" in row:
+                row["args"] = 2147483647
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        script = self.cwd / "sleep.js"
+        script.write_text('console.log(await tools.sleep(2147483647)); '
+                          'await tools.sleep(2147483647); console.log("awake");')
+        report = self.replay(session, "--run", "1:0", "--script", str(script))
+        self.assertIn("awake", report["output"])
+        self.assertFalse(report["incomplete"], report)
+
+    def test_worker_and_expired_sleep_replay_preserve_microtask_checkpoints(self):
+        session = self.ask([
+            'const p = tools.bash({command: "printf ready"}); await tools.sleep(0); '
+            'let n = 0; for (let i = 0; i < 20000000; i++) n += i; '
+            'const q = tools.sleep(0); console.log(await Promise.race(['
+            'p.then(() => "worker").then(x => x).then(x => x), q.then(() => "timer")]));'
+        ])
+        report = self.replay(session, "--run", "1:0")
+        self.assertTrue(report["match"], report)
+        self.assertFalse(report["incomplete"], report)
+
+    def test_rejected_run_discards_sleep_without_fabricating_a_settlement(self):
+        session = self.ask(['tools.sleep(2147483647); throw new Error("stop");'])
+        rows = jsonl(self.calls_path(session))
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["meta"]["end"], "error")
+        self.assertTrue(rows[0]["meta"]["incomplete"])
+        report = self.replay(session, "--run", "1:0")
+        self.assertTrue(report["incomplete"], report)
+        self.assertIsNone(report["match"])
+
     def test_record_off_creates_no_calls_file(self):
         self.env["NIB_RECORD"] = "off"
         (self.cwd / "sample.txt").write_text("off probe")
@@ -358,7 +483,7 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(report["divergences"], 0, report)
         self.assertEqual([r["run"] for r in report["reports"]], ["1:0", "3:0", "3:1"])
 
-    def test_ordinary_errors_with_pending_calls_are_incomplete_not_determined_diffs(self):
+    def test_ordinary_errors_drain_pending_calls_and_replay_completely(self):
         (self.cwd / "sample.txt").write_text("settled")
         session = self.ask([
             'await Promise.all([tools.bash({command: "sleep 2"}), tools.read({path: "missing"})])',
@@ -372,32 +497,24 @@ class ReplayTests(unittest.TestCase):
         rows = jsonl(self.calls_path(session))
         metas = [r["meta"] for r in rows if "meta" in r]
         self.assertEqual(len(metas), 6, rows)
-        for index, meta in enumerate(metas):
+        for meta in metas:
             self.assertEqual(meta["end"], "error")
-            if index < 3:
-                self.assertIs(meta.get("incomplete"), True, meta)
-            else:
-                self.assertNotIn("incomplete", meta)
-        self.assertEqual([r["index"] for r in rows if r["run"] == 0 and "index" in r], [1])
-        self.assertEqual([r["index"] for r in rows if r["run"] == 1 and "index" in r], [0])
-        self.assertFalse(any("index" in r for r in rows if r["run"] == 2))
+            self.assertNotIn("incomplete", meta)
+        self.assertEqual([r["index"] for r in rows if r["run"] == 0 and "index" in r], [1, 0])
+        self.assertEqual([r["index"] for r in rows if r["run"] == 1 and "index" in r], [0, 1])
+        self.assertEqual([r["index"] for r in rows if r["run"] == 2 and "index" in r], [0])
         for index in range(6):
             report = self.replay(session, "--run", f"1:{index}")
             self.assertEqual(report["end"], "error", report)
-            if index < 3:
-                self.assertTrue(report["incomplete"], report)
-                self.assertIsNone(report["match"], report)
-                self.assertIsNotNone(report["divergence"], report)
-            else:
-                self.assertFalse(report["incomplete"], report)
-                self.assertIs(report["match"], True, report)
-                self.assertIsNone(report["divergence"], report)
+            self.assertFalse(report["incomplete"], report)
+            self.assertIs(report["match"], True, report)
+            self.assertIsNone(report["divergence"], report)
         report = self.replay(session, "--all")
         self.assertEqual(report["total"], 6, report)
-        self.assertEqual(report["matched"], 3, report)
-        self.assertEqual(report["undetermined"], 3, report)
+        self.assertEqual(report["matched"], 6, report)
+        self.assertEqual(report["undetermined"], 0, report)
         self.assertEqual(report["divergences"], 0, report)
-        self.assertEqual(len(report["differences"]), 3, report)
+        self.assertEqual(report["differences"], [], report)
 
     def test_reflect_does_not_read_or_publish_calls(self):
         marker = "PRIVATE_CALLS_ONLY_7e4eb7d95c6b"

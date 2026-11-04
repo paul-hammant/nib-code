@@ -9,6 +9,7 @@ const session_log = @import("session/log.zig");
 const instructions = @import("session/instructions.zig");
 const output_format = @import("session/output.zig");
 const effort = @import("session/effort.zig");
+const ToolSummary = @import("session/tool_summary.zig").Summary;
 
 pub const Event = @import("session/events.zig").Event;
 pub const ModelActivity = @import("session/events.zig").ModelActivity;
@@ -148,12 +149,13 @@ pub const Session = struct {
             .client = client,
             .cfg = cfg,
             .arena = .init(gpa),
-            .tools = .{ .io = io, .home = options.user_home, .depth = options.depth, .environ = options.environ, .cfg = cfg, .track_changes = true },
+            .tools = .{ .io = io, .home = options.user_home, .data_home = options.home, .depth = options.depth, .environ = options.environ, .cfg = cfg, .track_changes = true },
             .parent_session_id = options.parent_session_id,
             .options = options,
         };
         errdefer s.arena.deinit();
         errdefer s.history.deinit(gpa);
+        errdefer s.tools.agent_sessions.deinit(gpa);
         const a = s.arena.allocator();
         const cwd = try std.process.currentPathAlloc(io, a);
         const directory = try std.fs.path.join(a, &.{ options.home, "sessions" });
@@ -176,7 +178,8 @@ pub const Session = struct {
             s.id = try a.dupe(u8, std.fs.path.stem(path));
             s.log = try session_log.Log.create(io, path);
             errdefer s.log.close(io);
-            const base = try std.fmt.allocPrint(a, system_template, .{ cwd, try s.tools.documentation(a), try patchLines(a, options.environ) });
+            const template = try std.fmt.allocPrint(a, system_template, .{ cwd, try s.tools.documentation(a), try patchLines(a, options.environ) });
+            const base = try stepLimitPrompt(a, template, cfg.limits.max_steps);
             const global = try std.fs.path.join(a, &.{ options.home, "AGENTS.md" });
             const project = try std.fs.path.join(a, &.{ try instructions.projectRoot(io, a, cwd), "AGENTS.md" });
             const system = try instructions.append(io, a, base, global, project);
@@ -192,11 +195,16 @@ pub const Session = struct {
                 .patches_off = try disabledPatches(a, options.environ),
             });
         }
+        errdefer s.log.close(io);
         const recording = if (options.environ) |env| !std.mem.eql(u8, env.get("NIB_RECORD") orelse "", "off") else true;
         const calls_path = try std.fmt.allocPrint(a, "{s}/{s}.calls.jsonl", .{ directory, s.id });
         s.recorder = sandbox.Recorder.init(gpa, io, calls_path, recording);
+        errdefer if (s.recorder) |*recorder| recorder.deinit();
         s.tools.session_id = s.id;
-        s.tools.background.next_id = s.log.next_background_id;
+        for (s.log.agent_sessions) |entry|
+            try s.tools.agent_sessions.add(gpa, io, entry.id, entry.session, false);
+        s.tools.progress.next_agent_id = s.log.next_agent_id;
+        s.tools.progress.next_bash_id = s.log.next_bash_id;
         for (s.log.lost_background) |lost| {
             const id = lost.id;
             const text = try std.fmt.allocPrint(gpa, "[background {s} {s} lost: process ended]", .{ @tagName(lost.kind), id });
@@ -219,9 +227,11 @@ pub const Session = struct {
 
     pub fn deinit(s: *Session) void {
         s.tools.background.stop(s.gpa);
-        s.tools.progress.clear(s.gpa);
+        s.tools.progress.deinit(s.gpa);
+        s.tools.agent_sessions.deinit(s.gpa);
         s.inbox.batch.deinit(s.gpa);
         s.tools.discardChanges(s.gpa);
+        s.tools.file_state.deinit(s.gpa);
         if (s.recorder) |*recorder| recorder.deinit();
         s.log.close(s.io);
         s.history.deinit(s.gpa);
@@ -229,7 +239,7 @@ pub const Session = struct {
     }
 
     fn commit(s: *Session, from: usize, messages: []const provider.Message, tokens: u64, cwd: ?[]const u8) !void {
-        try s.log.commit(s.io, s.gpa, &s.history, &s.context_tokens, .{ .from = from, .messages = messages, .context_tokens = tokens, .cwd = cwd, .provider = if (cwd != null) s.cfg.provider else null, .model = s.cfg.model, .parent_session_id = if (cwd != null) s.parent_session_id else null });
+        try s.log.commit(s.io, s.gpa, &s.history, &s.context_tokens, .{ .from = from, .messages = messages, .context_tokens = tokens, .task_ids = s.tools.progress.highWater(s.io), .cwd = cwd, .provider = if (cwd != null) s.cfg.provider else null, .model = s.cfg.model, .parent_session_id = if (cwd != null) s.parent_session_id else null });
     }
 
     pub const Compaction = enum { compacted, too_few_steps, ineffective };
@@ -256,10 +266,11 @@ pub const Session = struct {
         // Thinking would spend the small summary budget on reasoning.
         var cfg = s.cfg;
         cfg.thinking = false;
+        var attempts: u32 = 0;
         const reply = request_model: {
             try sink.modelActivity(.started);
             defer sink.modelActivity(.finished) catch {};
-            break :request_model try provider.stream(s.gpa, a, s.client, cfg, s.id, request.items, "[]", @intCast(@min(2048, @max(32, s.cfg.context_window / 8))), .{ .ctx = &observer, .onDelta = Silent.delta, .onData = Silent.data }, cancel, detail);
+            break :request_model try provider.complete(s.gpa, a, s.client, cfg, s.id, request.items, "[]", @intCast(@min(2048, @max(32, s.cfg.context_window / 8))), .{ .ctx = &observer, .onDelta = Silent.delta, .onData = Silent.data, .replay_safe = true }, cancel, detail, &attempts, null);
         };
         s.usage.add(reply.usage);
         try sink.emit(sink.ctx, .{ .usage = s.usage });
@@ -315,6 +326,7 @@ pub const Session = struct {
         }
         defer {
             s.tools.background.stop(s.gpa);
+            s.tools.progress.drain(s.io) catch {};
             s.usage.add(s.tools.takeUsage());
             s.summary.?.usage = s.usage;
             s.tools.usage_sink = null;
@@ -329,7 +341,7 @@ pub const Session = struct {
         defer pending.deinit(s.gpa);
         var partial: Partial = .{};
         defer partial.deinit(s.gpa);
-        try pending.append(s.gpa, .{ .role = "user", .content = try s.arena.allocator().dupe(u8, user_text) });
+        try pending.append(s.gpa, .{ .role = "user", .content = try turnBudgetText(s.arena.allocator(), s.history.items[0].content orelse "", s.cfg.limits.max_steps, user_text) });
         s.usage = .{};
         s.steps = 0;
         try sink.emit(sink.ctx, .{ .usage = s.usage });
@@ -379,38 +391,79 @@ pub const Session = struct {
         try s.commit(s.history.items.len, messages.items, s.context_tokens + estimateTokens(messages.items), null);
     }
 
+    fn insertInbox(s: *Session, pending: *std.ArrayList(provider.Message), sink: Sink, background_only: bool) !@import("session/inbox.zig").Batch {
+        var inserted = if (background_only)
+            try s.inbox.insertBackground(s.gpa, s.io, s.arena.allocator(), pending)
+        else
+            try s.inbox.insert(s.gpa, s.io, s.arena.allocator(), pending);
+        errdefer inserted.deinit(s.gpa);
+        var has_background = false;
+        for (inserted.items.items) |item| {
+            if (item.background) |b| {
+                has_background = true;
+                s.tools.background.delivered(s.io, b.id);
+                var event = b;
+                event.result = if (std.mem.indexOfScalar(u8, item.text, '\n')) |nl| item.text[nl + 1 ..] else item.text;
+                try sink.emit(sink.ctx, .{ .background = event });
+            } else if (sink.onUserInserted) |notify| try notify(sink.ctx, item.id);
+        }
+        if (has_background) {
+            try s.commit(s.history.items.len, pending.items, s.context_tokens + estimateTokens(pending.items), null);
+            pending.clearRetainingCapacity();
+            for (inserted.items.items) |item| if (item.background) |b|
+                try s.log.background(s.io, s.gpa, b, s.steps + 1);
+        }
+        return inserted;
+    }
+
+    fn finishStepLimit(s: *Session, pending: *std.ArrayList(provider.Message), sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, max_steps: usize) !void {
+        const waited = try s.tools.background.pendingNames(s.gpa, s.io);
+        defer s.gpa.free(waited);
+        if (waited.len > 0) {
+            const notice = try std.fmt.allocPrint(s.arena.allocator(), "Step limit reached; waiting for background tasks: {s}", .{waited});
+            try sink.emit(sink.ctx, .{ .notice = notice });
+        }
+        while (s.tools.background.pending(s.io)) {
+            if (cancel.load(.acquire)) return error.Canceled;
+            try tools.Tools.poll(&s.tools);
+            var inserted = try s.insertInbox(pending, sink, true);
+            inserted.deinit(s.gpa);
+            if (s.tools.background.pending(s.io))
+                try std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(20), .clock = .awake }, s.io);
+        }
+        if (cancel.load(.acquire)) return error.Canceled;
+        detail.* = if (waited.len > 0)
+            try std.fmt.allocPrint(s.gpa, "stopped after {d} steps (waited for background tasks: {s})", .{ max_steps, waited })
+        else
+            try std.fmt.allocPrint(s.gpa, "stopped after {d} steps", .{max_steps});
+        return error.TooManySteps;
+    }
+
     fn runSteps(s: *Session, pending: *std.ArrayList(provider.Message), partial: *Partial, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
         var next_effort: ?effort.Pending = null;
-        for (0..s.cfg.limits.max_steps) |step_index| {
+        var step_index: usize = 0;
+        while (true) : (step_index += 1) {
+            if (cancel.load(.acquire)) return error.Canceled;
+            if (s.cfg.limits.max_steps) |max_steps| {
+                if (step_index >= max_steps) return s.finishStepLimit(pending, sink, cancel, detail, max_steps);
+            }
             const size = s.context_tokens + estimateTokens(pending.items);
             if (size >= s.cfg.context_window - s.cfg.context_window / 4 and size >= s.compact_backoff)
                 try s.autoCompact(sink, cancel, detail);
             if (cancel.load(.acquire)) return error.Canceled;
             try tools.Tools.poll(&s.tools);
-            var inserted = try s.inbox.insert(s.gpa, s.io, s.arena.allocator(), pending);
+            var inserted = try s.insertInbox(pending, sink, false);
             defer inserted.deinit(s.gpa);
-            var has_background = false;
-            for (inserted.items.items) |item| {
-                if (item.background) |b| {
-                    has_background = true;
-                    s.tools.background.delivered(s.io, b.id);
-                    var event = b;
-                    event.result = if (std.mem.indexOfScalar(u8, item.text, '\n')) |nl| item.text[nl + 1 ..] else item.text;
-                    try sink.emit(sink.ctx, .{ .background = event });
-                } else if (sink.onUserInserted) |notify| try notify(sink.ctx, item.id);
-            }
-            if (has_background) {
-                try s.commit(s.history.items.len, pending.items, s.context_tokens + estimateTokens(pending.items), null);
-                pending.clearRetainingCapacity();
-                for (inserted.items.items) |item| if (item.background) |b|
-                    try s.log.background(s.io, s.gpa, b, s.steps + 1);
-            }
+            var background_output_bytes: u64 = 0;
+            for (inserted.items.items) |item| if (item.background != null) {
+                background_output_bytes += item.text.len;
+            };
             var request: std.ArrayList(provider.Message) = .empty;
             defer request.deinit(s.gpa);
             try request.appendSlice(s.gpa, s.history.items);
             try request.appendSlice(s.gpa, pending.items);
             try tools.Tools.poll(&s.tools);
-            s.tools.background.turn_step = s.steps + 1;
+            s.tools.background.setTurnStep(s.io, s.steps + 1);
             const decision = effort.decide(s.cfg, step_index == 0 or inserted.items.items.len > 0, next_effort);
             next_effort = null;
             try sink.emit(sink.ctx, .{ .step = .{ .n = s.steps + 1, .effort = decision.metadata.effort, .source = decision.metadata.source } });
@@ -440,18 +493,21 @@ pub const Session = struct {
             for (reply.tool_calls, 0..) |call, run_index| {
                 run_timing.run_index = run_index;
                 const before_bytes = run_timing.tool_bytes;
+                const before_omitted = run_timing.omitted;
                 const result = try s.execute(call, sink, cancel, &run_timing);
                 run_timing.output_bytes += result.output.len;
                 effort.Pending.record(&next_effort, result.effort, result.ok);
                 run_ms += result.run_ms orelse 0;
                 try sink.emit(sink.ctx, .{ .usage = s.usage });
-                try pending.append(s.gpa, .{ .role = "tool", .content = result.output, .tool_call_id = call.id });
+                try pending.append(s.gpa, .{ .role = "tool", .content = result.output, .tool_call_id = call.id, .tool_summary = result.tool_summary });
                 try run_results.append(s.gpa, .{
                     .tool_call_id = call.id,
                     .ok = result.ok,
                     .run_ms = result.run_ms,
                     .tool_bytes = run_timing.tool_bytes - before_bytes,
+                    .calls_omitted = run_timing.omitted - before_omitted,
                     .output_bytes = result.output.len,
+                    .remaining_steps = result.remaining_steps,
                 });
                 output_tokens += result.output.len / 3 + 1;
             }
@@ -471,12 +527,14 @@ pub const Session = struct {
                 .effort_downgraded = decision.downgraded,
                 .attempts = attempts,
                 .first_data_ms = first_data_ms,
+                .max_gap_ms = model_timing.max_gap_ms,
                 .code = try model_timing.finish(s.arena.allocator(), reply.tool_calls),
                 .run_ms = run_ms,
                 .calls = run_timing.entries[0..run_timing.count],
                 .calls_omitted = run_timing.omitted,
+                .task_ids = s.tools.progress.highWater(s.io),
                 .tool_bytes = run_timing.tool_bytes,
-                .output_bytes = run_timing.output_bytes,
+                .output_bytes = run_timing.output_bytes + background_output_bytes,
                 .run_results = run_results.items,
             });
             s.summary.?.steps += 1;
@@ -484,14 +542,16 @@ pub const Session = struct {
             s.summary.?.timing.model_ms += model_ms;
             s.summary.?.timing.run_ms += run_ms;
             s.summary.?.timing.tool_bytes += run_timing.tool_bytes;
-            s.summary.?.timing.output_bytes += run_timing.output_bytes;
+            s.summary.?.timing.output_bytes += run_timing.output_bytes + background_output_bytes;
             s.summary.?.timing.llm_calls += run_timing.llm_calls;
             s.summary.?.timing.agent_calls += run_timing.agent_calls;
             pending.clearRetainingCapacity();
             try sink.emit(sink.ctx, .{ .usage = s.usage });
             if (reply.tool_calls.len == 0) {
                 if (!s.tools.background.pending(s.io)) return;
-                if (step_index + 1 == s.cfg.limits.max_steps) break;
+                if (s.cfg.limits.max_steps) |max_steps| {
+                    if (s.steps >= max_steps) continue;
+                }
                 while (s.inbox.empty(s.io) and s.tools.background.pending(s.io)) {
                     if (cancel.load(.acquire)) return error.Canceled;
                     try tools.Tools.poll(&s.tools);
@@ -501,8 +561,6 @@ pub const Session = struct {
             }
             if (cancel.load(.acquire)) return error.Canceled;
         }
-        detail.* = try std.fmt.allocPrint(s.gpa, "stopped after {d} steps", .{s.cfg.limits.max_steps});
-        return error.TooManySteps;
     }
 
     fn complete(s: *Session, request_cfg: provider.Config, messages: []const provider.Message, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, partial: *Partial, timing: *provider.ModelTiming, attempts: *u32, first_data_ms: *?u64) !provider.Reply {
@@ -591,6 +649,7 @@ pub const Session = struct {
 
     fn runTimed(s: *Session, code: []const u8, cancel: ?*const std.atomic.Value(bool), timing: ?*sandbox.RunTiming) !Ran {
         defer s.usage.add(s.tools.takeUsage());
+        defer s.tools.progress.drain(s.io) catch {};
         if (!s.tools.background.pending(s.io)) s.tools.progress.clear(s.gpa);
         s.tools.run_id += 1;
         s.tools.discardChanges(s.gpa);
@@ -631,7 +690,7 @@ pub const Session = struct {
         }
     };
 
-    const Executed = struct { output: []const u8, ok: bool, run_ms: ?u64 = null, effort: ?effort.Declaration = null };
+    const Executed = struct { output: []const u8, ok: bool, run_ms: ?u64 = null, effort: ?effort.Declaration = null, remaining_steps: ?usize = null, tool_summary: ?ToolSummary = null };
 
     /// Output is arena-owned.
     fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const std.atomic.Value(bool), timing: *sandbox.RunTiming) !Executed {
@@ -647,16 +706,36 @@ pub const Session = struct {
         const code = if (args.value.code) |value| (if (value == .string) value.string else null) else null;
         if (code == null) return .{ .ok = false, .output = try a.dupe(u8, "error: arguments must be a JSON object { \"code\": string }"), .effort = args.value.effort };
         try sink.emit(sink.ctx, .{ .run_start = code.? });
+        const before_omitted = timing.omitted;
         const ran = try s.runTimed(code.?, cancel, timing);
         const o = ran.outcome;
         defer o.deinit(s.gpa);
 
-        const output = try output_format.format(a, o);
+        const remaining_steps = if (s.cfg.limits.max_steps) |limit| limit -| s.steps else null;
+        const output = try output_format.stepLimitOutput(a, try output_format.format(a, o), remaining_steps);
         const run_ms = timing.elapsed();
-        try sink.emit(sink.ctx, .{ .run_end = .{ .ok = o.ok, .output = output, .changes = ran.changes } });
-        return .{ .output = output, .ok = o.ok, .run_ms = run_ms, .effort = args.value.effort };
+        const tool_summary = try ToolSummary.init(a, timing.entries[0..timing.count], timing.run_index, timing.omitted - before_omitted);
+        try sink.emit(sink.ctx, .{ .run_end = .{ .ok = o.ok, .output = output, .changes = ran.changes, .tool_summary = tool_summary } });
+        return .{ .output = output, .ok = o.ok, .run_ms = run_ms, .effort = args.value.effort, .remaining_steps = remaining_steps, .tool_summary = tool_summary };
     }
 };
+
+fn turnBudgetText(a: std.mem.Allocator, system: []const u8, max_steps: ?usize, user_text: []const u8) ![]const u8 {
+    const marker = "This Turn may use at most ";
+    if (max_steps) |limit| {
+        const fact = try stepLimitPrompt(a, "", limit);
+        if (std.mem.indexOf(u8, system, fact[1..]) == null)
+            return std.fmt.allocPrint(a, "[Current Turn budget; configuration changed since the system prompt was recorded]{s}\n\n{s}", .{ fact, user_text });
+    } else if (std.mem.indexOf(u8, system, marker) != null) {
+        return std.fmt.allocPrint(a, "[Current Turn budget: no Step limit; configuration changed since the system prompt was recorded]\n\n{s}", .{user_text});
+    }
+    return a.dupe(u8, user_text);
+}
+
+fn stepLimitPrompt(a: std.mem.Allocator, base: []const u8, max_steps: ?usize) ![]const u8 {
+    const limit = max_steps orelse return base;
+    return std.fmt.allocPrint(a, "{s}\nThis Turn may use at most {d} Steps; when they run out, the Turn stops without another model request.", .{ base, limit });
+}
 
 fn estimateTokens(messages: []const provider.Message) u64 {
     var total: u64 = 0;
@@ -734,7 +813,7 @@ test "system prompt documents every tool in JavaScript" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "last expression and console.log output share 16 KiB per Run") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "tool results inside JS remain complete") != null);
     for (tools.names) |name| {
-        const call = try std.fmt.allocPrint(gpa, "async {s}({{", .{name});
+        const call = try std.fmt.allocPrint(gpa, "async {s}(", .{name});
         defer gpa.free(call);
         try std.testing.expect(std.mem.indexOf(u8, prompt, call) != null);
     }
@@ -792,7 +871,10 @@ test "json-escape patch example survives JS parsing verbatim" {
     const example = text[std.mem.indexOf(u8, text, marker).? + marker.len ..];
     const code = try std.fmt.allocPrint(std.testing.allocator, "await tools.write({{path: '.zig-cache/tmp/{s}/f', content: {s}}})", .{ tmp.sub_path, example });
     defer std.testing.allocator.free(code);
-    var t: tools.Tools = .{ .io = std.testing.io, .home = "/home/nobody" };
+    const home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(home);
+    var t: tools.Tools = .{ .io = std.testing.io, .home = home };
+    defer t.file_state.deinit(std.testing.allocator);
     const result = try sandbox.eval(std.testing.allocator, std.testing.io, code, .{}, t.host(), null);
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(result.ok);
@@ -901,4 +983,129 @@ test "run schema exposes optional one-shot effort enum" {
     const values = parameters.object.get("properties").?.object.get("effort").?.object.get("enum").?.array.items;
     try t.expectEqual(@as(usize, 4), values.len);
     inline for (.{ "low", "medium", "high", "default" }, 0..) |value, index| try t.expectEqualStrings(value, values[index].string);
+}
+
+test "Step budget facts leave unlimited prompts unchanged" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = "unchanged system prompt";
+    const unlimited = try stepLimitPrompt(a, base, null);
+    try t.expectEqual(base.ptr, unlimited.ptr);
+    try t.expectEqualStrings(&systemSha(base), &systemSha(unlimited));
+    const limited = try stepLimitPrompt(a, base, 5);
+    try t.expectEqualStrings("unchanged system prompt\nThis Turn may use at most 5 Steps; when they run out, the Turn stops without another model request.", limited);
+}
+
+test "resumed Turns expose budget changes without rewriting the original system" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const system = try stepLimitPrompt(a, "base", 5);
+    try t.expectEqualStrings("prompt", try turnBudgetText(a, system, 5, "prompt"));
+    try t.expectEqualStrings("prompt", try turnBudgetText(a, "base", null, "prompt"));
+    const enabled = try turnBudgetText(a, "base", 1, "prompt");
+    try t.expect(std.mem.indexOf(u8, enabled, "at most 1 Steps") != null);
+    const changed = try turnBudgetText(a, system, 7, "prompt");
+    try t.expect(std.mem.indexOf(u8, changed, "at most 7 Steps") != null);
+    const disabled = try turnBudgetText(a, system, null, "prompt");
+    try t.expect(std.mem.indexOf(u8, disabled, "no Step limit") != null);
+    try t.expect(std.mem.endsWith(u8, disabled, "\n\nprompt"));
+}
+
+test "execute emits per-Run actual tool summaries including empty and overflow" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var client: std.http.Client = .{ .allocator = t.allocator, .io = t.io };
+    defer client.deinit();
+    const cfg: provider.Config = .{ .base_url = "invalid://local", .api_key = "mock", .model = "mock" };
+    var session = try Session.init(t.allocator, t.io, &client, cfg, .{ .home = root, .user_home = root });
+    defer session.deinit();
+    var cancel: std.atomic.Value(bool) = .init(false);
+    const Observe = struct {
+        summary: ?ToolSummary = null,
+        ok: bool = true,
+        starts: usize = 0,
+        ends: usize = 0,
+
+        fn emit(ctx: *anyopaque, event: Event) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (event) {
+                .run_start => self.starts += 1,
+                .run_end => |value| {
+                    try std.testing.expect(self.summary == null);
+                    try std.testing.expect(value.tool_summary != null);
+                    self.summary = try value.tool_summary.?.clone(std.testing.allocator);
+                    self.ok = value.ok;
+                    self.ends += 1;
+                },
+                else => {},
+            }
+        }
+    };
+    var observed: Observe = .{};
+    var timing: sandbox.RunTiming = .init(t.io, .now(t.io, .awake));
+    const failing = try std.fmt.allocPrint(a, "try {{ await tools.read({{path: \"{s}/missing\"}}); }} catch (_) {{}} throw new Error(\"failed Run\");", .{root});
+    for ([_][]const u8{ failing, "console.log(\"tools.write is not a call\")", failing }, 0..) |code, run_index| {
+        if (run_index == 2) {
+            while (timing.count < timing.entries.len) _ = timing.reserve("bash");
+            _ = timing.reserve("bash");
+            _ = timing.reserve("bash");
+        }
+        timing.run_index = run_index;
+        const arguments = try std.json.Stringify.valueAlloc(a, .{ .code = code }, .{});
+        const result = try session.execute(.{ .id = "run", .function = .{ .name = "run", .arguments = arguments } }, .{ .ctx = &observed, .emit = Observe.emit }, &cancel, &timing);
+        const summary = observed.summary.?;
+        defer {
+            summary.deinit(t.allocator);
+            observed.summary = null;
+        }
+        try t.expectEqual(run_index == 1, observed.ok);
+        try t.expectEqual(observed.ok, result.ok);
+        try t.expectEqual(@as(u64, if (run_index == 2) 1 else 0), summary.omitted);
+        if (run_index == 0) {
+            try t.expectEqual(@as(usize, 1), summary.counts.len);
+            try t.expectEqualStrings("read", summary.counts[0].name);
+            try t.expectEqual(@as(u64, 1), summary.counts[0].count);
+        } else {
+            try t.expectEqual(@as(usize, 0), summary.counts.len);
+        }
+    }
+    try t.expectEqual(@as(usize, 3), observed.starts);
+    try t.expectEqual(@as(usize, 3), observed.ends);
+}
+
+test "allocation failures while restoring agent mappings release the session log lock" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(t.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer t.allocator.free(root);
+    const id = "0123456789abcdef0123456789abcdef";
+    const path = try std.fmt.allocPrint(t.allocator, "{s}/sessions/{s}.jsonl", .{ root, id });
+    defer t.allocator.free(path);
+    try tmp.dir.createDir(t.io, "sessions", .default_dir);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "sessions/" ++ id ++ ".jsonl", .data = "{\"messages\":[{\"role\":\"system\",\"content\":\"original system\"}]}\n{\"agent_session\":{\"id\":\"a1\",\"session\":\"child\"}}\n" });
+    var client: std.http.Client = .{ .allocator = t.allocator, .io = t.io };
+    defer client.deinit();
+    const Check = struct {
+        fn run(gpa: std.mem.Allocator, home: []const u8, log_path: []const u8, http: *std.http.Client) !void {
+            const cfg: provider.Config = .{ .base_url = "invalid://local", .api_key = "mock", .model = "mock" };
+            var session = Session.init(gpa, std.testing.io, http, cfg, .{ .home = home, .user_home = home, .resume_id = id }) catch |err| {
+                const file = try std.Io.Dir.cwd().openFile(std.testing.io, log_path, .{ .mode = .read_write, .lock = .exclusive, .lock_nonblocking = true });
+                file.close(std.testing.io);
+                return err;
+            };
+            defer session.deinit();
+            try std.testing.expectEqual(@as(usize, 1), session.tools.agent_sessions.entries.items.len);
+        }
+    };
+    try t.checkAllAllocationFailures(t.allocator, Check.run, .{ root, path, &client });
 }

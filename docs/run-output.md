@@ -6,6 +6,8 @@
 
 `src/session/output.zig` 为**整个 Run**生成最多 16 KiB 的 UTF-8 输出，包含标题、分隔符与省略标记。这也是 `run_end.output`、会话日志中的 tool content、下一次模型请求共用的文本；不是每次工具调用各有 16 KiB。
 
+若用户设置了 `max_steps`，且剩余不多于 3 个 Step，Session 在上述格式化之后追加 `[N Steps left in this Turn]`。这行不占 16 KiB 预算，不会被截断；`run_end.output`、日志和下一次模型请求包含相同的完整文本。未设置上限时不追加。
+
 输出较小时沿用原格式。需要截断时：
 
 - 每次 `console.log/info/warn/error` 算一个条目，多个参数或多行文本仍是同一条。最终返回值／错误另算一条；成功时的 `undefined` 不占条目。
@@ -15,7 +17,7 @@
 
 一次 console 打印整个结果数组仍只有一个条目。需要分别定位时，给每个结果单独打印标签；需要大量正文时，先在 JS 里过滤，或分成多个 Run 输出。
 
-日志的 `tool_bytes` 统计宿主实际交给 JS 的工具结果 UTF-8 字节数（成功按序列化 JSON、错误按错误文本），不取决于 JS 是否使用或 await；未交回结果计 0，agent 只计父 Run 返回对象。`output_bytes` 则是 `session/output.format` 格式化后交给模型的实际 tool result 字节数，包含 16 KiB 预算内的截断标记、错误、无输出提示与标签等，不是原始工具数据大小。
+日志的 `tool_bytes` 统计宿主实际交给 JS 的工具结果 UTF-8 字节数（成功按序列化 JSON、错误按错误文本），不取决于 JS 是否使用或 await；未交回结果计 0，agent 只计父 Run 返回对象。`output_bytes` 则是交给模型的实际 tool result 字节数，包含 16 KiB 预算内的截断标记、错误、无输出提示与标签，以及预算外的剩余 Step 提示（若有），不是原始工具数据大小。
 
 ## 捕获上限
 
@@ -38,6 +40,52 @@
 
 搜索返回字段和 UTF-8 列定义见 [ADR 0012](adr/0012-search-and-fetch-tools.md)。
 
+## 文件替换、会话版本与跨进程协调
+
+`edit` / `write` 先把完整内容写入目标所在目录的随机 `.nib-*` 临时文件，再通过同目录 rename 原子替换目标；失败时清理临时文件。已有文件的权限位保留，路径中的符号链接会跟随到实际目标，链接本身不被替换。替换产生新 inode，因此会打断目标与其他硬链接的共享关系：其他硬链接仍指向旧内容。文件工具不执行 fsync；原子可见性不等于断电后的持久性保证。配置写回仍保留原有 fsync 行为。
+
+会话按规范化后的实际路径记录最近观察到的 inode、size 和纳秒精度 mtime。成功的 `read`（包括只读一页）、`edit`、`write` 都更新这份状态。`write` 覆盖已有目标时对比当前文件与已记录版本；若已有外部改动则拒绝覆盖，要求先重新 `read`，基于新内容再写。尚未观察过的已有文件仍允许直接 `write`，目标不存在时按新建处理。`edit` 在锁内读取最新内容并匹配 old_text，不用旧的会话快照替换文件；成功后也更新版本。
+
+`read` / `edit` / `write` 使用同一套跨进程 advisory lock：锁文件位于 `$NIB_HOME/locks/`（默认 `~/.nib/locks/`），文件名为目标规范路径的 SHA-256 十六进制摘要。同一 NIB_HOME 下，独立 nib 进程、子 agent 与相对路径／符号链接别名因此协调到同一把锁。`read` 也持锁，使返回内容与记录版本在参与协议的写入者之间保持一致。锁文件持久保留，释放时只解锁／关闭，不 unlink，避免等待者与后来者锁住不同 inode。等待锁时仍响应取消。
+
+这些锁只协调遵守协议且共用 NIB_HOME 的文件工具；bash、用户编辑器与其他外部程序不会自动参与。版本检查能发现检查前已经发生的改动，但检查到 rename 之间仍可能被不合作的写入者抢先修改，因此不能提供对任意外部并发写入的绝对保护。需要保留外部结果时，先等待外部工作完成并重新读取，再修改文件。
+
+本地端到端回归不需要 provider 或 key：构建后运行 `python3 tests/test_files.py`。测试使用临时 NIB_HOME，覆盖多进程高频 edit、路径别名／符号链接、过期 write 与重新读取、分页版本记录、权限／硬链接、锁等待取消和原子替换的并发读取。
+
 ## Run 执行预算与取消
 
-Run 的默认 5 分钟超时只累计 QuickJS 执行片段（初始脚本、Promise jobs、工具结果解析/resolve、返回值序列化和错误转换），不计算等待工具完成的时间，也不在每次 await 后重置预算。它用于中断 JS 死循环；bash/fetch/agent 的执行时限由各自工具负责。等待时仍每 20 ms 检查取消，Esc/SIGINT/SIGTERM 不受计时暂停影响。
+顶层 Run Promise fulfill 或 reject 后都继续 drain：等待在途及排队工具完成，执行剩余 JS jobs，并接纳 continuation 新发起的工具调用，直到没有剩余工作。任意调用失败都不会取消其他调用（不只子 agent 失败）；顶层 reject 时，Run 最终仍报原始拒绝原因，不被后续完成或失败覆盖。因此 `Promise.all` 提前 reject 不代表并行副作用停止，失败的 Run 也可能继续写文件；前台 agent 仍需等待完成并计入用量，等待期间用户仍可按 Esc 取消。后台任务的跨 Run 生命周期见 [tool-delegation.md](tool-delegation.md)。
+
+只有用户取消或 JS 执行超时才中止 Run 内工具；工具自身超时只终止该调用，不取消其他调用。中止时如有未完成调用，Run 输出保留一行：
+
+```text
+[stopped before completion: bash #0, agent #2]
+```
+
+这里的索引按该 Run 内全部工具调用的创建顺序从 0 开始，不是各工具独立编号，也不是后台任务 id；已交回 JS 的调用不列入，未交回的调用（包括仍在排队或已产生结果但尚未交回的调用）按创建顺序列出。这行最多 4 KiB；清单过长时用 `..., N more` 明示剩余调用数，为错误和 console 保留空间。整行预留模型侧 16 KiB 输出预算，不会被正文截断，用于区分报错前已完成的副作用与可能留下半成品的调用。普通 fulfill/reject 的 drain 完成不会产生这行。
+
+Run 的默认 5 分钟超时只累计 QuickJS 执行片段（初始脚本、Promise jobs、工具结果解析/resolve、返回值序列化和错误转换），不计算等待工具完成（包括 `tools.sleep`）的时间，也不在每次 await 后重置预算。它用于中断 JS 死循环；bash/fetch/agent 的执行时限由各自工具负责。等待时仍以不超过 20 ms 的间隔检查取消，Esc/SIGINT/SIGTERM 不受计时暂停影响。
+
+## Run 内延时与轮询
+
+`await tools.sleep(ms)` 返回 `null`；`ms` 必须是 `0..2147483647` 的整数（毫秒）。缺少参数、非数字、非有限值、小数或越界值都会使 Promise reject，不做类型转换。`0` 也走异步调度。
+
+延时由 sandbox 原生事件循环计时器完成，不启动进程或线程，也不占工具并发槽；优先用它代替 `bash` 执行 `sleep` 或 JS 忙等。等待本身不调用模型、不产生 token 用量，但仍增加 Run 的墙钟耗时；JS 执行预算在等待期间暂停，轮询中的 JS 执行仍累计，read/fetch 等调用仍有各自成本。
+
+例如轮询本地服务的 HTTP 状态，最多检查 10 次，相邻检查之间等待 1 秒；非 200 状态重试，连接等错误仍会 reject 并终止 Run：
+
+```js
+let ready = false;
+for (let attempt = 0; attempt < 10; attempt++) {
+  const result = await tools.fetch({url: "http://127.0.0.1:8080/health"});
+  if (result.status === 200) {
+    ready = true;
+    break;
+  }
+  if (attempt < 9) await tools.sleep(1000);
+}
+if (!ready) throw new Error("service not ready after 10 checks");
+console.log("service ready");
+```
+
+与其他已调度工具一样，正常结束 Run 前会排空待完成的 sleep，即使没有 `await`；它不是跨 Run 的后台任务。用户取消或 JS 执行超时时会及时丢弃未到期计时器，不等延时结束；顶层 Promise reject 时，已发出的工具调用继续排空，但未到期的计时器直接丢弃（计时器本身没有副作用，它的后续逻辑尚未开始）；取消检查沿用上述不超过 20 ms 的间隔。sleep 走标准工具计时、结果字节统计和录制/重放路径；重放按录制结果结算，不实际等待，见 [replay.md](replay.md)。

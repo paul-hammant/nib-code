@@ -19,6 +19,7 @@ const selection = @import("tui/selection.zig");
 const reflect = @import("tui/reflect.zig");
 const bill = @import("tui/bill.zig");
 const TurnSummary = @import("session/events.zig").TurnSummary;
+const ToolSummary = @import("session/tool_summary.zig").Summary;
 
 const Event = union(enum) {
     key_press: vaxis.Key,
@@ -32,7 +33,7 @@ const Event = union(enum) {
     step: struct { n: u32, effort: []u8, source: provider.EffortSource },
     delta: struct { kind: provider.Kind, text: []u8, step: u32 },
     run_start: struct { code: []u8, step: u32 },
-    run_end: struct { ok: bool, output: []u8, changes: ChangeText },
+    run_end: struct { ok: bool, output: []u8, changes: ChangeText, tool_summary: ?ToolSummary = null },
     retry: []u8,
     notice: []u8,
     user_inserted: u64,
@@ -122,7 +123,13 @@ const Turn = struct {
             .step => |s| .{ .step = .{ .n = s.n, .effort = try gpa.dupe(u8, s.effort), .source = s.source } },
             .delta => |d| .{ .delta = .{ .kind = d.kind, .text = try gpa.dupe(u8, d.text), .step = t.session.steps + 1 } },
             .run_start => |code| .{ .run_start = .{ .code = try gpa.dupe(u8, code), .step = t.session.steps } },
-            .run_end => |r| .{ .run_end = .{ .ok = r.ok, .output = try gpa.dupe(u8, r.output), .changes = try .init(gpa, r.changes) } },
+            .run_end => |r| blk: {
+                const output = try gpa.dupe(u8, r.output);
+                errdefer gpa.free(output);
+                var changes = try ChangeText.init(gpa, r.changes);
+                errdefer changes.deinit(gpa);
+                break :blk .{ .run_end = .{ .ok = r.ok, .output = output, .changes = changes, .tool_summary = if (r.tool_summary) |summary| try summary.clone(gpa) else null } };
+            },
             .retry => |r| .{ .retry = try std.fmt.allocPrint(gpa, "retry {d} in {d}s: {s}", .{ r.attempt, r.delay_ms / 1000, r.reason }) },
             .notice => |m| .{ .notice = try gpa.dupe(u8, m) },
             .usage => |u| .{ .usage = .{ .tokens = u, .context = t.session.context_tokens, .steps = t.session.steps } },
@@ -135,6 +142,12 @@ const Turn = struct {
             .turn_end => |summary| .{ .turn_end = summary },
         };
         errdefer switch (event) {
+            .run_end => |r| {
+                gpa.free(r.output);
+                var changes = r.changes;
+                changes.deinit(gpa);
+                if (r.tool_summary) |summary| summary.deinit(gpa);
+            },
             .step => |s| gpa.free(s.effort),
             .background => |b| {
                 gpa.free(b.id);
@@ -367,9 +380,10 @@ const App = struct {
             },
             .run_end => |r| {
                 defer gpa.free(r.output);
+                defer if (r.tool_summary) |summary| summary.deinit(gpa);
                 const elapsed = app.activity.label(app.io).ms;
                 app.activity.set(app.io, .thinking);
-                try app.transcript.endRun(gpa, r.ok, r.output, elapsed, r.changes);
+                try app.transcript.endRunWithSummary(gpa, r.ok, r.output, elapsed, r.changes, r.tool_summary);
             },
             .retry, .notice => |msg| {
                 defer gpa.free(msg);
@@ -906,19 +920,19 @@ test "background events own their payload and maintain running count" {
     app.transcript = .{};
     app.background_count = 0;
     defer app.transcript.deinit(t.allocator);
-    var id = [_]u8{ 'b', 'g', '_', '1' };
+    var id = [_]u8{ 'a', '1' };
     try Turn.emit(&turn, .{ .background = .{ .id = &id, .kind = .agent, .state = .started } });
-    id[3] = '2';
+    id[1] = '2';
     const started = (try loop.tryEvent()).?;
-    try t.expectEqualStrings("bg_1", started.background.id);
+    try t.expectEqualStrings("a1", started.background.id);
     _ = try app.handle(started);
     try t.expectEqual(@as(usize, 1), app.background_count);
     try t.expectEqual(@as(usize, 0), app.transcript.entries.items.len);
-    try Turn.emit(&turn, .{ .background = .{ .id = "bg_1", .kind = .agent, .state = .finished, .ok = true, .result = "{\"ok\":true,\"text\":\"done\"}" } });
+    try Turn.emit(&turn, .{ .background = .{ .id = "a1", .kind = .agent, .state = .finished, .ok = true, .result = "{\"ok\":true,\"text\":\"done\"}" } });
     _ = try app.handle((try loop.tryEvent()).?);
     try t.expectEqual(@as(usize, 0), app.background_count);
     try t.expectEqual(EntryKind.background, app.transcript.entries.items[0].kind);
-    try t.expectEqualStrings("bg agent bg_1 · ok=true · done", app.transcript.entries.items[0].label.items);
+    try t.expectEqualStrings("a1 agent · ok · done", app.transcript.entries.items[0].label.items);
 }
 
 test "Step events own effort and Runs keep their generating Step metadata" {
@@ -946,4 +960,28 @@ test "Step events own effort and Runs keep their generating Step metadata" {
     try t.expectEqualStrings("high", app.transcript.entries.items[0].step_effort.?.effort);
     try t.expectEqualStrings("low", app.step_effort.?.effort);
     try t.expect(std.mem.endsWith(u8, app.transcript.entries.items[0].label.items, " · high (guard)"));
+}
+
+test "Run summary survives event queue and original summary destruction" {
+    const t = std.testing;
+    var app: App = undefined;
+    app.gpa = t.allocator;
+    app.io = t.io;
+    app.transcript = .{};
+    defer app.transcript.deinit(t.allocator);
+    app.activity = .start(t.io, .running);
+    var loop: vaxis.Loop(Event) = .{ .io = t.io, .tty = undefined, .vaxis = undefined, .queue = .init(t.io) };
+    var turn: Turn = undefined;
+    turn.gpa = t.allocator;
+    turn.loop = &loop;
+    try app.transcript.startRun(t.allocator, "// tools.llm(");
+    {
+        const source = try (ToolSummary{ .counts = &.{.{ .name = "edit", .count = 2 }}, .omitted = 3 }).clone(t.allocator);
+        defer source.deinit(t.allocator);
+        try Turn.emit(&turn, .{ .run_end = .{ .ok = true, .output = "done", .tool_summary = source } });
+    }
+    _ = try app.handle((try loop.tryEvent()).?);
+    try t.expectEqualStrings("edit", app.transcript.entries.items[0].tool_summary.?.counts[0].name);
+    try t.expectEqual(@as(u64, 2), app.transcript.entries.items[0].tool_summary.?.counts[0].count);
+    try t.expect(std.mem.startsWith(u8, app.transcript.entries.items[0].label.items, "edit ×2, +3 · "));
 }

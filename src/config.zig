@@ -1,4 +1,5 @@
 const std = @import("std");
+const atomic_file = @import("tools/atomic_file.zig");
 const provider = @import("provider.zig");
 const codex = @import("provider/codex.zig");
 const Allocator = std.mem.Allocator;
@@ -147,7 +148,7 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
     const Section = enum { chat_completions, codex, limits };
     var section: ?Section = null;
     var seen_sections: [3]bool = @splat(false);
-    var seen: [4][5]bool = @splat(@splat(false));
+    var seen: [4][6]bool = @splat(@splat(false));
     var offset: usize = 0;
     while (offset < text.len) : (p.line += 1) {
         const end = if (std.mem.indexOfScalarPos(u8, text, offset, '\n')) |n| n + 1 else text.len;
@@ -182,7 +183,7 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
         const index: usize = if (section == null)
             if (std.mem.eql(u8, key, "provider")) 0 else if (std.mem.eql(u8, key, "effort")) 1 else return p.bad("unknown top-level key '{s}'", .{key})
         else if (section == .limits) blk: {
-            const names = .{ "llm_concurrency", "llm_calls_per_run", "llm_input_kib", "agent_concurrency", "max_steps" };
+            const names = .{ "llm_concurrency", "llm_calls_per_run", "llm_input_kib", "agent_concurrency", "max_steps", "stream_idle_timeout_s" };
             inline for (names, 0..) |name, i| {
                 if (std.mem.eql(u8, key, name)) break :blk i;
             }
@@ -197,7 +198,7 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
         const parsed = try p.value(value, &consumed);
         if (section == .limits) {
             if (parsed != .integer) return p.bad("{s} must be an integer", .{key});
-            const maxima = [_]usize{ 64, 10000, 65536, 64, 1000 };
+            const maxima = [_]usize{ 64, 10000, 65536, 64, 100000, 3600 };
             if (parsed.integer < 1 or parsed.integer > maxima[index]) return p.bad("{s} must be between 1 and {d}", .{ key, maxima[index] });
             const n: usize = @intCast(parsed.integer);
             switch (index) {
@@ -206,6 +207,7 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
                 2 => file.limits.llm_input_kib = n,
                 3 => file.limits.agent_concurrency = n,
                 4 => file.limits.max_steps = n,
+                5 => file.limits.stream_idle_timeout_s = n,
                 else => unreachable,
             }
         } else if (section != null and index == 2) {
@@ -330,11 +332,7 @@ pub fn saveEffort(a: Allocator, io: std.Io, home_path: []const u8, value: []cons
     if (std.mem.eql(u8, text, out.items)) return;
     const cwd = std.Io.Dir.cwd();
     try cwd.createDirPath(io, home_path);
-    var atomic = try cwd.createFileAtomic(io, path, .{ .replace = true, .permissions = .fromMode(0o600) });
-    defer atomic.deinit(io);
-    try atomic.file.writeStreamingAll(io, out.items);
-    try atomic.file.sync(io);
-    try atomic.replace(io);
+    _ = try atomic_file.replace(io, a, path, out.items, .{ .permissions = .fromMode(0o600), .sync = true });
 }
 
 test "TOML sections comments strings and scalar values" {
@@ -609,16 +607,18 @@ test "limits defaults, bounds and diagnostics" {
     defer env.deinit();
     var detail: ?[]u8 = null;
     const defaults = (try resolve(a, &env, "", "config.toml", &detail)).limits;
-    try t.expectEqualDeep(provider.Limits{ .llm_concurrency = 4, .llm_calls_per_run = 100, .llm_input_kib = 256, .agent_concurrency = 4, .max_steps = 50 }, defaults);
+    try t.expectEqualDeep(provider.Limits{ .llm_concurrency = 4, .llm_calls_per_run = 100, .llm_input_kib = 256, .agent_concurrency = 4, .max_steps = null, .stream_idle_timeout_s = 300 }, defaults);
     try t.expectEqualDeep(defaults, (try resolve(a, &env, "[limits]\n", "config.toml", &detail)).limits);
-    const names = [_][]const u8{ "llm_concurrency", "llm_calls_per_run", "llm_input_kib", "agent_concurrency", "max_steps" };
-    const maxima = [_]usize{ 64, 10000, 65536, 64, 1000 };
+    try t.expectEqual(@as(?usize, null), (try resolve(a, &env, "[limits]\nllm_concurrency = 8\n", "config.toml", &detail)).limits.max_steps);
+    try t.expectEqual(@as(?usize, 50), (try resolve(a, &env, "[limits]\nmax_steps = 50\n", "config.toml", &detail)).limits.max_steps);
+    const names = [_][]const u8{ "llm_concurrency", "llm_calls_per_run", "llm_input_kib", "agent_concurrency", "max_steps", "stream_idle_timeout_s" };
+    const maxima = [_]usize{ 64, 10000, 65536, 64, 100000, 3600 };
     for (names, maxima) |name, max| {
         for ([_]usize{ 1, max }) |n| {
             const text = try std.fmt.allocPrint(a, "[limits]\n{s} = {d}\n", .{ name, n });
             const limits = (try resolve(a, &env, text, "config.toml", &detail)).limits;
             inline for (names) |field| {
-                if (std.mem.eql(u8, name, field)) try t.expectEqual(n, @field(limits, field));
+                if (std.mem.eql(u8, name, field)) try t.expectEqual(@as(@TypeOf(@field(limits, field)), n), @field(limits, field));
             }
         }
         const values = [_][]const u8{ "0", "-1", "true", "\"1\"", "1.5" };
@@ -635,4 +635,23 @@ test "limits defaults, bounds and diagnostics" {
         try t.expectError(error.InvalidConfig, resolve(a, &env, text, "config.toml", &detail));
         try t.expect(std.mem.startsWith(u8, detail.?, "config.toml:"));
     }
+}
+
+test "effort replacement preserves config symlink and permissions" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(t.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer t.allocator.free(root);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "settings.toml", .data = "effort = \"low\"\n" });
+    try tmp.dir.symLink(t.io, "settings.toml", "config.toml", .{});
+    if (@import("builtin").os.tag != .windows) try tmp.dir.setFilePermissions(t.io, "settings.toml", .fromMode(0o640), .{});
+    try saveEffort(t.allocator, t.io, root, "high");
+    try t.expectEqual(std.Io.File.Kind.sym_link, (try tmp.dir.statFile(t.io, "config.toml", .{ .follow_symlinks = false })).kind);
+    if (@import("builtin").os.tag != .windows) try t.expectEqual(@as(std.posix.mode_t, 0o640), (try tmp.dir.statFile(t.io, "settings.toml", .{})).permissions.toMode() & 0o7777);
+    const text = try tmp.dir.readFileAlloc(t.io, "settings.toml", t.allocator, .unlimited);
+    defer t.allocator.free(text);
+    try t.expectEqualStrings("effort = \"high\"\n", text);
+    var it = tmp.dir.iterate();
+    while (try it.next(t.io)) |entry| try t.expect(!std.mem.startsWith(u8, entry.name, ".nib-"));
 }

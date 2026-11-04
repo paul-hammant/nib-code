@@ -72,9 +72,26 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Result {
         };
     }
 
+    // Child.wait closes its streams; the reader must retain stdout through the final drain.
+    const stdout = child.stdout.?;
+    child.stdout = null;
+    defer stdout.close(io);
+    const Wait = struct {
+        fn work(c: *std.process.Child, i: std.Io, done: *std.Io.Event) !std.process.Child.Term {
+            defer done.set(i);
+            return c.wait(i);
+        }
+    };
+    var done: std.Io.Event = .unset;
+    var waiter = try io.concurrent(Wait.work, .{ &child, io, &done });
+    defer {
+        group.kill();
+        _ = waiter.await(io) catch {};
+    }
+
     var streams: std.Io.File.MultiReader.Buffer(1) = undefined;
     var mr: std.Io.File.MultiReader = undefined;
-    mr.init(gpa, io, streams.toStreams(), &.{child.stdout.?});
+    mr.init(gpa, io, streams.toStreams(), &.{stdout});
     defer mr.deinit();
     const deadline: std.Io.Clock.Timestamp = .fromNow(io, .{ .raw = .fromMilliseconds(options.timeout_ms), .clock = .awake });
     var stop: ?Stop = null;
@@ -82,7 +99,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Result {
     var scanned: usize = 0;
     while (true) {
         if (options.on_tick) |observer| observer.emit(observer.ctx);
-        if (stop == null) check(io, options.cancel, deadline) catch |err| {
+        if (done.isSet()) {
+            group.grace_ms = 0;
+            group.kill();
+        } else if (stop == null) check(io, options.cancel, deadline) catch |err| {
             stop = err;
             group.kill();
         };
@@ -103,15 +123,6 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Result {
         }
     }
     try mr.checkAnyError();
-    const Wait = struct {
-        fn work(c: *std.process.Child, i: std.Io, done: *std.Io.Event) !std.process.Child.Term {
-            defer done.set(i);
-            return c.wait(i);
-        }
-    };
-    var done: std.Io.Event = .unset;
-    var waiter = try io.concurrent(Wait.work, .{ &child, io, &done });
-    defer _ = waiter.await(io) catch {};
     while (!done.isSet()) {
         if (options.on_tick) |observer| observer.emit(observer.ctx);
         if (stop == null) check(io, options.cancel, deadline) catch |err| {
@@ -209,4 +220,53 @@ test "process observes complete lines before exit without changing collected out
     try testing.expectEqualStrings("first|second|", capture.output.items);
     try testing.expectEqualStrings("first\nsecond\ntrailing", result.output);
     try testing.expect(capture.first.?.durationTo(std.Io.Clock.awake.now(testing.io)).toMilliseconds() >= 200);
+}
+
+test "process returns on shell exit and kills descendants holding stdout" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cancel: std.atomic.Value(bool) = .init(false);
+    const start = std.Io.Clock.awake.now(testing.io);
+    const result = try run(testing.allocator, testing.io, .{
+        .spawn = .{
+            .argv = &.{ "bash", "-c", "(sleep 0.5; echo survived > survived) & printf 'started\n'; exit 7" },
+            .cwd = .{ .dir = tmp.dir },
+            .stdout = .pipe,
+            .stderr = .ignore,
+        },
+        .cancel = &cancel,
+        .timeout_ms = 2000,
+    });
+    defer testing.allocator.free(result.output);
+    try testing.expectEqual(@as(?Stop, null), result.stop);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 7 }, result.term);
+    try testing.expectEqualStrings("started\n", result.output);
+    try testing.expect(start.durationTo(std.Io.Clock.awake.now(testing.io)).toMilliseconds() < 1000);
+    try std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(600), .clock = .awake }, testing.io);
+    try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "survived", .{}));
+}
+
+test "process drains buffered output and final lines after shell exit" {
+    const Capture = struct {
+        lines: usize = 0,
+        fn line(ctx: *anyopaque, bytes: []const u8) void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            testing.expectEqualStrings("line", bytes) catch unreachable;
+            c.lines += 1;
+        }
+    };
+    var capture: Capture = .{};
+    var cancel: std.atomic.Value(bool) = .init(false);
+    const result = try run(testing.allocator, testing.io, .{
+        .spawn = .{ .argv = &.{ "bash", "-c", "sleep 5 & printf 'line\n%.0s' {1..20000}; printf tail; exit 9" }, .stdout = .pipe, .stderr = .ignore },
+        .cancel = &cancel,
+        .timeout_ms = 2000,
+        .on_line = .{ .ctx = &capture, .emit = Capture.line },
+    });
+    defer testing.allocator.free(result.output);
+    try testing.expectEqual(@as(?Stop, null), result.stop);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 9 }, result.term);
+    try testing.expectEqual(20000, capture.lines);
+    try testing.expectEqual(100004, result.output.len);
+    try testing.expect(std.mem.endsWith(u8, result.output, "line\ntail"));
 }

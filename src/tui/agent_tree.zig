@@ -39,7 +39,7 @@ const Row = struct {
     fn init(gpa: std.mem.Allocator, p: Progress, last: bool) !Row {
         var text: std.ArrayList(u8) = .empty;
         errdefer text.deinit(gpa);
-        try text.print(gpa, "  {s} #{d} {s}", .{ if (last) "└─" else "├─", p.agent, if (p.kind == .bash) "bash " else "" });
+        try text.print(gpa, "  {s} {s} {s}", .{ if (last) "└─" else "├─", p.id, if (p.kind == .bash) "bash " else "" });
         const prompt_start = text.items.len;
         var end: usize = 0;
         var chars: usize = 0;
@@ -53,10 +53,14 @@ const Row = struct {
         }
         try text.appendSlice(gpa, p.prompt[0..end]);
         const prompt_end = text.items.len;
-        if (p.kind == .bash)
-            try text.print(gpa, " · {d}.{d}s · {s}", .{ p.elapsed_ms / 1000, p.elapsed_ms % 1000 / 100, @tagName(p.state) })
-        else
-            try text.print(gpa, " · {s} · step {d}", .{ @tagName(p.state), p.step });
+        const state = if (p.background) "background" else @tagName(p.state);
+        if (p.kind == .bash) {
+            try text.appendSlice(gpa, " · ");
+            try appendElapsed(gpa, &text, p.elapsed_ms);
+            try text.print(gpa, " · {s}", .{state});
+        } else {
+            try text.print(gpa, " · {s} · step {d}", .{ state, p.step });
+        }
         const status_end = text.items.len;
         for (p.tools, 0..) |name, i| {
             try text.appendSlice(gpa, if (i == 0) " · " else ", ");
@@ -83,8 +87,8 @@ const Row = struct {
     fn print(row: *const Row, win: vaxis.Window, commit: bool) void {
         const prefix = row.text[0..row.prompt_start];
         const status = row.text[row.prompt_end..row.status_end];
-        const used = row.text[row.status_end..row.tools_end];
-        const fixed = width(win, prefix) +| width(win, status) +| width(win, used);
+        const used = fit(win, row.text[row.status_end..row.tools_end], win.width -| (width(win, prefix) +| width(win, status)), false);
+        const fixed = width(win, prefix) +| width(win, status) +| width(win, used.text) +| width(win, used.suffix);
         const prompt = fit(win, row.text[row.prompt_start..row.prompt_end], win.width -| fixed, row.prompt_omitted);
         const files = fit(win, row.text[row.tools_end..], win.width -| (fixed +| width(win, prompt.text) +| width(win, prompt.suffix)), false);
         const dim: vaxis.Style = .{ .dim = true };
@@ -93,12 +97,21 @@ const Row = struct {
             .{ .text = prompt.text, .style = dim },
             .{ .text = prompt.suffix, .style = dim },
             .{ .text = status, .style = dim },
-            .{ .text = used, .style = dim },
+            .{ .text = used.text, .style = dim },
+            .{ .text = used.suffix, .style = dim },
             .{ .text = files.text, .style = dim },
             .{ .text = files.suffix, .style = dim },
         }, .{ .wrap = .none, .commit = commit });
     }
 };
+
+pub fn appendElapsed(gpa: std.mem.Allocator, out: *std.ArrayList(u8), elapsed_ms: u64) !void {
+    if (elapsed_ms >= 60_000) {
+        try out.print(gpa, "{d}m{d}s", .{ elapsed_ms / 60_000, elapsed_ms / 1000 % 60 });
+    } else {
+        try out.print(gpa, "{d}.{d}s", .{ elapsed_ms / 1000, elapsed_ms % 1000 / 100 });
+    }
+}
 
 fn width(win: vaxis.Window, text: []const u8) u16 {
     return vaxis.gwidth.gwidth(text, win.screen.width_method);
@@ -143,25 +156,25 @@ test "tree rows fit Unicode prompts and files around state step and tools" {
     var tree: Tree = .{};
     defer tree.deinit(gpa);
     try tree.update(gpa, &.{
-        .{ .agent = 1, .prompt = "修复登录流程，补充测试", .step = 56, .tools = &.{ "edit", "bash" }, .files = &.{"src/auth.zig"} },
-        .{ .agent = 2, .prompt = "check config", .state = .done, .step = 27, .tools = &.{ "grep", "read" } },
-        .{ .agent = 3, .prompt = "test", .state = .failed, .step = 38, .files = &.{"docs/config.md"} },
+        .{ .id = "a1", .prompt = "修复登录流程，补充测试", .step = 56, .tools = &.{ "edit", "bash" }, .files = &.{"src/auth.zig"} },
+        .{ .id = "a2", .prompt = "check config", .state = .done, .step = 27, .tools = &.{ "grep", "read" } },
+        .{ .id = "a3", .prompt = "test", .state = .failed, .step = 38, .files = &.{"docs/config.md"} },
     });
     try testing.expectEqual(@as(u16, 3), tree.print(win, true));
-    try expectLine(&screen, 0, "  ├─ #1 修复登录流程，补充测试 · working · step 56 · edit, bash src/auth.zig");
-    try expectLine(&screen, 1, "  ├─ #2 check config · done · step 27 · grep, read");
-    try expectLine(&screen, 2, "  └─ #3 test · failed · step 38 · docs/config.md");
+    try expectLine(&screen, 0, "  ├─ a1 修复登录流程，补充测试 · working · step 56 · edit, bash src/auth.zig");
+    try expectLine(&screen, 1, "  ├─ a2 check config · done · step 27 · grep, read");
+    try expectLine(&screen, 2, "  └─ a3 test · failed · step 38 · docs/config.md");
     try expectLine(&screen, 3, "");
 
     win.clear();
     win.width = 48;
     _ = tree.print(win, true);
-    try expectLine(&screen, 0, "  ├─ #1 修复登… · working · step 56 · edit, bash");
+    try expectLine(&screen, 0, "  ├─ a1 修复登… · working · step 56 · edit, bash");
     win.width = 120;
     win.clear();
     win.width = 75;
     _ = tree.print(win, true);
-    try expectLine(&screen, 0, "  ├─ #1 修复登录流程，补充测试 · working · step 56 · edit, bash src/auth.z…");
+    try expectLine(&screen, 0, "  ├─ a1 修复登录流程，补充测试 · working · step 56 · edit, bash src/auth.z…");
 }
 
 test "tree previews sanitize control bytes and cap prompts without wrapping" {
@@ -172,12 +185,12 @@ test "tree previews sanitize control bytes and cap prompts without wrapping" {
     var tree: Tree = .{};
     defer tree.deinit(gpa);
     try tree.update(gpa, &.{
-        .{ .agent = 1, .prompt = "line\nnext\r\t\x1b", .state = .queued, .files = &.{"a\nb"} },
-        .{ .agent = 2, .prompt = "12345678901234567890123456789012345678901234567890", .state = .timed_out, .step = 4 },
+        .{ .id = "a1", .prompt = "line\nnext\r\t\x1b", .state = .queued, .files = &.{"a\nb"} },
+        .{ .id = "a2", .prompt = "12345678901234567890123456789012345678901234567890", .state = .timed_out, .step = 4 },
     });
     _ = tree.print(win, true);
-    try expectLine(&screen, 0, "  ├─ #1 line next    · queued · step 0 · a b");
-    try expectLine(&screen, 1, "  └─ #2 1234567890123456789012345678901234567890… · timed_out · step 4");
+    try expectLine(&screen, 0, "  ├─ a1 line next    · queued · step 0 · a b");
+    try expectLine(&screen, 1, "  └─ a2 1234567890123456789012345678901234567890… · timed_out · step 4");
     try expectLine(&screen, 2, "");
     for (0..121) |columns| {
         win.width = 120;
@@ -196,4 +209,70 @@ test "truncation preserves complete graphemes" {
     const fitted = fit(win, text, 4, false);
     try testing.expectEqualStrings("á👩‍💻", fitted.text);
     try testing.expectEqualStrings("…", fitted.suffix);
+}
+
+test "mixed task ids retain input order and background hides terminal states until delivery" {
+    const gpa = testing.allocator;
+    var tree: Tree = .{};
+    defer tree.deinit(gpa);
+    try tree.update(gpa, &.{
+        .{ .id = "a10", .prompt = "first", .step = 2 },
+        .{ .id = "b2", .kind = .bash, .prompt = "echo ready", .background = true, .state = .done, .elapsed_ms = 192_900 },
+        .{ .id = "a2", .prompt = "last", .background = true, .state = .failed, .step = 7 },
+    });
+    try testing.expectEqualStrings("  ├─ a10 first · working · step 2", tree.rows.items[0].text);
+    try testing.expectEqualStrings("  ├─ b2 bash echo ready · 3m12s · background", tree.rows.items[1].text);
+    try testing.expectEqualStrings("  └─ a2 last · background · step 7", tree.rows.items[2].text);
+}
+
+test "bash elapsed formatting at the minute boundary" {
+    const gpa = testing.allocator;
+    const cases = .{
+        .{ 0, "0.0s" },
+        .{ 42_399, "42.3s" },
+        .{ 59_999, "59.9s" },
+        .{ 60_000, "1m0s" },
+        .{ 192_999, "3m12s" },
+        .{ 3_600_000, "60m0s" },
+    };
+    inline for (cases) |case| {
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(gpa);
+        try appendElapsed(gpa, &text, case[0]);
+        try testing.expectEqualStrings(case[1], text.items);
+    }
+}
+
+test "narrow bash rows preserve id duration and delivery state before command" {
+    const gpa = testing.allocator;
+    var screen = try vaxis.Screen.init(gpa, .{ .cols = 60, .rows = 3, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(gpa);
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 36, .height = 3, .screen = &screen };
+    var tree: Tree = .{};
+    defer tree.deinit(gpa);
+    try tree.update(gpa, &.{
+        .{ .id = "b2", .kind = .bash, .prompt = "abcdefghijklmnopqrstuvwxyz", .background = true, .elapsed_ms = 42_300 },
+        .{ .id = "b3", .kind = .bash, .prompt = "abcdefghijklmnopqrstuvwxyz", .background = true, .state = .done, .elapsed_ms = 192_000 },
+    });
+    _ = tree.print(win, true);
+    try expectLine(&screen, 0, "  ├─ b2 bash a… · 42.3s · background");
+    try expectLine(&screen, 1, "  └─ b3 bash a… · 3m12s · background");
+    try expectLine(&screen, 2, "");
+}
+
+test "narrow agent rows reserve state and step before long tool and file names" {
+    const gpa = testing.allocator;
+    var screen = try vaxis.Screen.init(gpa, .{ .cols = 60, .rows = 2, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(gpa);
+    var win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 32, .height = 2, .screen = &screen };
+    var tree: Tree = .{};
+    defer tree.deinit(gpa);
+    try tree.update(gpa, &.{.{ .id = "a2", .prompt = "a long prompt", .step = 12, .tools = &.{ "read", "edit", "write" }, .files = &.{"src/a_very_long_path.zig"} }});
+    _ = tree.print(win, true);
+    try expectLine(&screen, 0, "  └─ a2  · working · step 12 · …");
+    win.clear();
+    win.width = 28;
+    _ = tree.print(win, true);
+    try expectLine(&screen, 0, "  └─ a2  · working · step 12");
+    try expectLine(&screen, 1, "");
 }

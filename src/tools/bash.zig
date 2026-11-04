@@ -6,6 +6,8 @@ const fail = tools.fail;
 const process = @import("process.zig");
 const policy = @import("policy.zig");
 
+pub const foreground_progress_threshold_ms = 3000;
+
 pub fn bash(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolResult {
     const A = struct { command: []const u8, timeout_ms: i64 = 120_000, background: bool = false };
     const a = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch
@@ -43,7 +45,9 @@ pub fn executeBackground(t: *Tools, gpa: std.mem.Allocator, args: []const u8, ca
 }
 
 fn execute(t: *Tools, gpa: std.mem.Allocator, command: []const u8, timeout_ms: i64, cancel: *const std.atomic.Value(bool), progress: ?@import("../session/events.zig").Progress) !sandbox.ToolResult {
-    var tracker: Tracker = .{ .t = t, .gpa = gpa, .value = progress, .started = .now(t.io, .awake) };
+    var tracker: Tracker = .{ .t = t, .gpa = gpa, .command = command, .value = progress, .started = .now(t.io, .awake) };
+    var state: @FieldType(@import("../session/events.zig").Progress, "state") = .failed;
+    defer tracker.finish(state);
     tracker.tick();
     // In-shell redirect keeps stdout/stderr interleaving order.
     const script = try std.fmt.allocPrint(gpa, "exec 2>&1\n{s}", .{command});
@@ -55,26 +59,31 @@ fn execute(t: *Tools, gpa: std.mem.Allocator, command: []const u8, timeout_ms: i
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .ignore,
-    }, .cancel = cancel, .timeout_ms = timeout_ms, .on_tick = if (progress != null) .{ .ctx = &tracker, .emit = Tracker.observe } else null, .max_output_bytes = 16 * 1024 * 1024 }) catch |err| return switch (err) {
+    }, .cancel = cancel, .timeout_ms = timeout_ms, .on_tick = .{ .ctx = &tracker, .emit = Tracker.observe }, .max_output_bytes = 16 * 1024 * 1024 }) catch |err| return switch (err) {
         error.OutputLimit => fail(gpa, "output exceeds 16 MiB; redirect output to a file", .{}),
         else => err,
     };
     const stdout = result.output;
     defer gpa.free(stdout);
-    if (result.stop) |err| return switch (err) {
-        error.TimedOut => fail(gpa, "timed out after {d} ms", .{timeout_ms}),
-        error.Canceled => fail(gpa, "canceled", .{}),
-    };
+    if (result.stop) |err| {
+        state = if (err == error.TimedOut) .timed_out else .canceled;
+        return switch (err) {
+            error.TimedOut => fail(gpa, "timed out after {d} ms", .{timeout_ms}),
+            error.Canceled => fail(gpa, "canceled", .{}),
+        };
+    }
     const code: ?u8 = switch (result.term) {
         .exited => |e| e,
         else => null,
     };
+    state = if (code != null and code.? == 0) .done else .failed;
     return .{ .ok = try std.json.Stringify.valueAlloc(gpa, .{ .exit_code = code, .output = stdout }, .{}) };
 }
 
 const Tracker = struct {
     t: *Tools,
     gpa: std.mem.Allocator,
+    command: []const u8,
     value: ?@import("../session/events.zig").Progress,
     started: std.Io.Clock.Timestamp,
     last_second: ?u64 = null,
@@ -85,12 +94,32 @@ const Tracker = struct {
     }
 
     fn tick(tr: *Tracker) void {
-        var value = tr.value orelse return;
-        value.elapsed_ms = @intCast(@max(tr.started.untilNow(tr.t.io).raw.toMilliseconds(), 0));
+        tr.tickAt(@intCast(@max(tr.started.untilNow(tr.t.io).raw.toMilliseconds(), 0)));
+    }
+
+    fn tickAt(tr: *Tracker, elapsed_ms: u64) void {
+        if (tr.value == null) {
+            if (elapsed_ms < foreground_progress_threshold_ms) return;
+            const id = tr.t.progress.add(tr.gpa, tr.t.io, .bash, tr.command, tr.t.run_id, false) catch return;
+            sandbox.tool_identity = .{ .id = id };
+            tr.value = .{ .id = id, .kind = .bash, .prompt = tr.command, .run = tr.t.run_id };
+        }
+        var value = tr.value.?;
+        value.elapsed_ms = elapsed_ms;
         const second = value.elapsed_ms / 1000;
         if (tr.last_second == second) return;
         tr.last_second = second;
         value.state = .working;
+        tr.value = value;
+        tr.t.progress.update(tr.gpa, tr.t.io, value) catch {};
+    }
+
+    fn finish(tr: *Tracker, state: @FieldType(@import("../session/events.zig").Progress, "state")) void {
+        tr.tick();
+        var value = tr.value orelse return;
+        value.elapsed_ms = @intCast(@max(tr.started.untilNow(tr.t.io).raw.toMilliseconds(), 0));
+        value.state = state;
+        tr.value = value;
         tr.t.progress.update(tr.gpa, tr.t.io, value) catch {};
     }
 };
@@ -206,4 +235,62 @@ test "bash rejects output over 16 MiB and kills the process group" {
     defer freeResult(r);
     try testing.expectEqualStrings("output exceeds 16 MiB; redirect output to a file", r.err);
     try testing.expect(start.durationTo(std.Io.Clock.awake.now(testing.io)).toMilliseconds() < 5000);
+}
+
+test "bash does not wait for background jobs inheriting stdout or stderr" {
+    const start = std.Io.Clock.awake.now(testing.io);
+    const r = try callTool("bash", "{\"command\":\"sleep 8 & echo started; echo error >&2; exit 3\",\"timeout_ms\":2000}");
+    defer freeResult(r);
+    try testing.expectEqualStrings("{\"exit_code\":3,\"output\":\"started\\nerror\\n\"}", r.ok);
+    try testing.expect(start.durationTo(std.Io.Clock.awake.now(testing.io)).toMilliseconds() < 1000);
+}
+
+test "bash returns when a silent background job holds stdout" {
+    const r = try callTool("bash", "{\"command\":\"sleep 8 & exit 0\",\"timeout_ms\":1000}");
+    defer freeResult(r);
+    try testing.expectEqualStrings("{\"exit_code\":0,\"output\":\"\"}", r.ok);
+}
+
+test "foreground bash allocates only at the visibility threshold and advances once per second" {
+    var t: Tools = .{ .io = testing.io, .home = "/unused", .run_id = 3 };
+    defer t.progress.deinit(testing.allocator);
+    var tracker: Tracker = .{ .t = &t, .gpa = testing.allocator, .command = "slow", .value = null, .started = .now(testing.io, .awake) };
+    tracker.tickAt(2999);
+    try testing.expectEqual(@as(usize, 0), t.progress.slots.items.len);
+    try testing.expectEqual(@as(u64, 1), t.progress.next_bash_id);
+    tracker.tickAt(3000);
+    const value = t.progress.slots.items[0].value;
+    try testing.expectEqualStrings("b1", value.id);
+    try testing.expectEqual(.bash, value.kind);
+    try testing.expect(!value.background);
+    try testing.expectEqual(@as(usize, 3), value.run);
+    try testing.expectEqual(@as(u64, 3000), value.elapsed_ms);
+    tracker.tickAt(3999);
+    try testing.expectEqual(@as(u64, 3000), t.progress.slots.items[0].value.elapsed_ms);
+    tracker.tickAt(4000);
+    try testing.expectEqual(@as(u64, 4000), t.progress.slots.items[0].value.elapsed_ms);
+    try testing.expectEqual(@as(u64, 2), t.progress.next_bash_id);
+    tracker.finish(.done);
+    try testing.expectEqual(.done, t.progress.slots.items[0].value.state);
+}
+
+test "foreground bash logs the visible call ID without changing its result" {
+    var t: Tools = .{ .io = testing.io, .home = "/home/nobody", .run_id = 1 };
+    defer t.progress.deinit(testing.allocator);
+    var timing: sandbox.RunTiming = .init(testing.io, .now(testing.io, .awake));
+    var host = t.host();
+    host.timing = &timing;
+    const result = try sandbox.eval(testing.allocator, testing.io, "await tools.bash({command: 'true'}); await tools.bash({command: 'sleep 3.2; exit 7'})", .{}, host, null);
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.ok);
+    try testing.expectEqualStrings("{\"exit_code\":7,\"output\":\"\"}", result.text);
+    try testing.expectEqual(@as(usize, 2), timing.count);
+    try testing.expect(timing.entries[0].id == null);
+    try testing.expectEqualStrings("b1", timing.entries[1].id.?);
+    try testing.expectEqual(@as(?bool, false), timing.entries[1].background);
+    try testing.expectEqual(@as(usize, 1), t.progress.slots.items.len);
+    try testing.expectEqual(.failed, t.progress.slots.items[0].value.state);
+    try testing.expect(t.progress.slots.items[0].value.elapsed_ms >= 3000);
+    t.progress.clear(testing.allocator);
+    try testing.expectEqualStrings("b1", timing.entries[1].id.?);
 }

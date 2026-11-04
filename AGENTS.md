@@ -4,7 +4,7 @@
 
 ## 常用命令
 
-- 构建：`zig build`；测试：`zig build test --summary all`；端到端（本地 mock，无真实 key）：`zig build` 后 `python3 tests/test_session.py`、`python3 tests/test_agent.py`、`python3 tests/test_agent_reuse.py`、`python3 tests/test_background_agent.py`、`python3 tests/test_background_bash.py`、`python3 tests/test_codex.py`、`python3 tests/test_llm.py`、`python3 tests/test_stats.py`、`python3 tests/test_effort.py`、`python3 tests/test_interjections.py`、`python3 tests/test_limits.py`、`python3 tests/test_replay.py`
+- 构建：`zig build`；测试：`zig build test --summary all`；端到端（本地 mock，无真实 key）：`zig build` 后 `python3 tests/test_session.py`、`python3 tests/test_agent.py`、`python3 tests/test_agent_reuse.py`、`python3 tests/test_background_agent.py`、`python3 tests/test_background_bash.py`、`python3 tests/test_codex.py`、`python3 tests/test_llm.py`、`python3 tests/test_stats.py`、`python3 tests/test_effort.py`、`python3 tests/test_interjections.py`、`python3 tests/test_limits.py`、`python3 tests/test_replay.py`、`python3 tests/test_stream_idle.py`、`python3 tests/test_files.py`
 - 安装到 `~/.local/bin/nib`：`zig build -Doptimize=ReleaseFast --prefix ~/.local`；版本号在 `build.zig.zon`，`nib --version` 查看。
 - 运行：`./zig-out/bin/nib`（TUI）、`nib ask '<prompt>'`、`nib js '<code>'`；TUI 用 `/compact` 手动压缩上下文。
 - 恢复：`nib -c` / `nib --continue`；`nib --resume <32位小写十六进制ID>`。`ask` 同样支持，选项可放在 prompt 前后。
@@ -16,7 +16,7 @@
 - provider、凭证、effort、配置与环境变量：[docs/config.md](docs/config.md)、[docs/codex.md](docs/codex.md)、[ADR 0011](docs/adr/0011-provider-wire-protocols.md)。
 - `ask --json` 的 NDJSON 格式：[docs/ask-json.md](docs/ask-json.md)。
 - 会话日志、恢复/取消语义、计时字段与统计口径：[docs/session-log.md](docs/session-log.md)。
-- `tools.llm({ prompt, input, schema, model, effort }) → { text, data, usage }`；`tools.agent({ prompt, session?, timeout_ms, model, effort, background }) → { ok, session, text, usage, changes, error? }`（子会话失败为数据，仅参数错误/用户取消 reject；changes 仅 edit/write）；agent 和 bash 传 `background: true` 时立即返回 `{ id }`，结果在之后的 Step 作为消息插入：[接口、限额、用量与取消](docs/tool-delegation.md)。
+- `tools.llm({ prompt, input, schema, model, effort }) → { text, data, usage }`；`tools.agent({ prompt, resume?: string, timeout_ms, model, effort, background }) → { ok, id, text, usage, changes, error? }`（resume 使用当前父会话的 agent 任务 id，如 `a1`；接续沿用 `a1`，不分配新 id，前台结果、后台启动和完成、progress/tree 均使用该 id；同一 agent 一次只允许一个在途调用，busy、不存在或非本会话 agent 均返回 `ok:false`；不暴露内部子会话 ID；子会话失败为数据，仅参数错误/用户取消 reject；usage/changes 仅本次，changes 仅 edit/write）；agent 和 bash 传 `background: true` 时，成功登记后立即返回 `{ id }`，结果在之后的 Step 作为消息插入，agent 结果含同一 id：[接口、限额、用量与取消](docs/tool-delegation.md)。
 
 ## 代码地图
 
@@ -27,7 +27,7 @@
 - `src/config.zig`：解析 `NIB_HOME/config.toml`、合并环境配置、解析用户目录与原子写回 effort。
 - `src/session.zig`：Session 引擎（Turn、Step、压缩、取消）；`session/` 下是日志、指令拼接、事件、Run 输出格式化。
 - `src/provider.zig`：Provider 接口与配置；`provider/` 下是各线路协议和 SSE 解析，`provider/timing.zig` 只负责 run 参数到达进度采样；首个接收活动时间由 Session 复用 Sink.onData 记录。
-- `src/sandbox.zig`：QuickJS Run 与宿主桥接；`sandbox/console.zig` 捕获有界 console 首尾，`sandbox/timing.zig` 在原生工具调度/完成路径记录 Run 内工具调用耗时与结果字节数；`sandbox/record.zig` 在同一个结算出口录制工具参数和结果，`sandbox/replay.zig` + `sandbox/virtual.zig` 用录制结果代替真实工具执行。
+- `src/sandbox.zig`：QuickJS Run 与宿主桥接、`tools.sleep(ms)` 原生事件循环计时器（不占工具线程；语义见 [docs/run-output.md](docs/run-output.md)）；`sandbox/console.zig` 捕获有界 console 首尾，`sandbox/timing.zig` 在原生工具调度/完成路径记录 Run 内工具调用耗时与结果字节数；`sandbox/record.zig` 在同一个结算出口录制工具参数和结果，`sandbox/replay.zig` + `sandbox/virtual.zig` 用录制结果代替真实工具执行。
 - `src/tools.zig`：工具表（给模型看的 JS 说明集中在这里）、`Tools` 共享状态与调度。`tools/` 下每个工具族一个入口文件，函数名即工具名：`files.zig`（read/edit/write）、`search.zig`（grep/glob）、`web.zig`（fetch）、`bash.zig`、`agent.zig`、`llm.zig`（进程内单步纯模型调用，限额也集中在这里）、`background.zig`（后台 agent/bash 任务，由 Session 持有，跨 Run 存活）；其余是它们的辅助模块。加工具：在 `tools/` 写入口函数，再在表里加一行。
 - `src/tui.zig`：TUI 事件循环（按键、`/` 指令分派、Session 事件、后台 Turn）；`tui/` 下：`transcript.zig`（对话条目与折叠）、`agent_tree.zig`（Run 下方的子 agent/后台任务状态树）、`viewport.zig`（滚动锚定）、`view.zig`（一帧的布局绘制）、`status.zig`（活动行与下边框元数据）、`menu.zig`（`/` 候选菜单）、`commands.zig`（指令表）、`reflect.zig` + `reflect.md`（/reflect 的提示词与 reflections.md 追加）、`editor.zig`（输入框、原子粘贴块与进程内草稿历史）、`long_text.zig`（长文本阈值与计数）、`markdown.zig`、`selection.zig`（鼠标选区、高亮与剪贴板复制）。
 - `tests/`：端到端测试和 mock 服务器；`scripts/`：辅助脚本。

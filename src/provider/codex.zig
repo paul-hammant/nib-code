@@ -1,6 +1,8 @@
 const std = @import("std");
 const p = @import("../provider.zig");
 const sse = @import("sse.zig");
+const idle = @import("idle.zig");
+const body_reader = @import("body.zig");
 
 const Model = struct { id: []const u8, context_window: u64, can_disable_reasoning: bool = true };
 pub const models = [_]Model{
@@ -59,7 +61,7 @@ fn authError(gpa: std.mem.Allocator, detail: *?[]u8, message: []const u8) !std.j
     return error.InvalidCredentials;
 }
 
-pub fn stream(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.Client, cfg: p.Config, cache_key: []const u8, messages: []const p.Message, tools_json: []const u8, max_tokens: ?u32, sink: p.Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !p.Reply {
+pub fn stream(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.Client, cfg: p.Config, cache_key: []const u8, messages: []const p.Message, tools_json: []const u8, max_tokens: ?u32, sink: p.Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, monitor: *idle.Monitor) !p.Reply {
     const body = try requestBody(gpa, cfg, cache_key, messages, tools_json, max_tokens);
     defer gpa.free(body);
     const url = try std.fmt.allocPrint(gpa, "{s}/codex/responses", .{std.mem.trimEnd(u8, cfg.base_url, "/")});
@@ -87,6 +89,8 @@ pub fn stream(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.
         try writer.writer.writeAll(body);
         try writer.end();
         try req.connection.?.flush();
+        monitor.attach(req.connection.?);
+        defer monitor.detach(req.connection.?);
         var response = try req.receiveHead(&.{});
         const buffer = try gpa.alloc(u8, 64 * 1024);
         defer gpa.free(buffer);
@@ -101,7 +105,9 @@ pub fn stream(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.
             detail.* = try std.fmt.allocPrint(gpa, "Codex request failed (HTTP {d})", .{status});
             return if (status == 429 or status >= 500) error.HttpTransient else error.HttpStatus;
         }
-        return readStream(gpa, out, reader, sink, cancel, detail);
+        var observed = try body_reader.Reader.init(gpa, reader, monitor, sink);
+        defer observed.deinit(gpa);
+        return readStream(gpa, out, &observed.reader, sink, cancel, detail);
     }
     unreachable;
 }
@@ -220,7 +226,6 @@ fn readStream(gpa: std.mem.Allocator, out: std.mem.Allocator, reader: *std.Io.Re
             else => return err,
         };
         reader.toss(1);
-        try sink.received();
         const data = (try parser.feed(gpa, line.written())) orelse continue;
         const ev = std.json.parseFromSliceLeaky(ResponseEvent, a, data, .{ .ignore_unknown_fields = true }) catch return error.InvalidResponse;
         if (sink.timing) |timing| observeTiming(timing, ev);
@@ -524,8 +529,12 @@ test "Codex stream activity covers non-text events and SSE heartbeats" {
         var cancel: std.atomic.Value(bool) = .init(false);
         var detail: ?[]u8 = null;
         defer if (detail) |d| t.allocator.free(d);
-        _ = try readStream(t.allocator, arena.allocator(), &reader, .{ .ctx = &state, .onDelta = State.delta, .onData = State.data }, &cancel, &detail);
-        try t.expectEqual(std.mem.count(u8, prefix, "\n") + 2, state.received);
+        const sink: p.Sink = .{ .ctx = &state, .onDelta = State.delta, .onData = State.data };
+        var monitor: idle.Monitor = .init(t.io, 1, null);
+        var observed = try body_reader.Reader.init(t.allocator, &reader, &monitor, sink);
+        defer observed.deinit(t.allocator);
+        _ = try readStream(t.allocator, arena.allocator(), &observed.reader, sink, &cancel, &detail);
+        try t.expectEqual(@as(usize, 1), state.received);
     }
 }
 
