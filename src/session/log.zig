@@ -29,6 +29,7 @@ pub const Record = struct {
     model_ms: ?u64 = null,
     attempts: ?u32 = null,
     first_data_ms: ?u64 = null,
+    max_gap_ms: ?u64 = null,
     code: ?[]const @import("../provider/timing.zig").Code = null,
     run_ms: ?u64 = null,
     tool_bytes: ?u64 = null,
@@ -486,6 +487,7 @@ test "timing fields are optional and replay preserves mixed old and measured Ste
     try t.expect(legacy.tool_bytes == null and legacy.output_bytes == null);
     try t.expectEqual(@as(?u32, null), legacy.attempts);
     try t.expectEqual(@as(?u64, null), legacy.first_data_ms);
+    try t.expectEqual(@as(?u64, null), legacy.max_gap_ms);
     try t.expect(legacy.code == null and legacy.calls == null and legacy.run_ms == null and legacy.calls_omitted == null);
     const measured: Record = .{
         .from = 2,
@@ -495,6 +497,7 @@ test "timing fields are optional and replay preserves mixed old and measured Ste
         .model_ms = 60,
         .attempts = 2,
         .first_data_ms = 3,
+        .max_gap_ms = 17,
         .code = &.{.{ .tool_call_id = "c", .first_ms = 5, .last_ms = 55, .progress = &.{ .{ 5, 1 }, .{ 55, 20 } } }},
         .run_ms = 20,
         .tool_bytes = 4000,
@@ -507,6 +510,7 @@ test "timing fields are optional and replay preserves mixed old and measured Ste
     const restored = try parseRecord(a, encoded);
     try t.expectEqual(@as(?u64, 60), restored.model_ms);
     try t.expectEqual(@as(?u32, 2), restored.attempts);
+    try t.expectEqual(@as(?u64, 17), restored.max_gap_ms);
     try t.expectEqual([2]u64{ 55, 20 }, restored.code.?[0].progress[1]);
     try t.expectEqualStrings("read", restored.calls.?[0].name);
     try t.expectEqual(@as(?u64, 4), restored.calls_omitted);

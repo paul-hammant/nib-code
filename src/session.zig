@@ -256,10 +256,11 @@ pub const Session = struct {
         // Thinking would spend the small summary budget on reasoning.
         var cfg = s.cfg;
         cfg.thinking = false;
+        var attempts: u32 = 0;
         const reply = request_model: {
             try sink.modelActivity(.started);
             defer sink.modelActivity(.finished) catch {};
-            break :request_model try provider.stream(s.gpa, a, s.client, cfg, s.id, request.items, "[]", @intCast(@min(2048, @max(32, s.cfg.context_window / 8))), .{ .ctx = &observer, .onDelta = Silent.delta, .onData = Silent.data }, cancel, detail);
+            break :request_model try provider.complete(s.gpa, a, s.client, cfg, s.id, request.items, "[]", @intCast(@min(2048, @max(32, s.cfg.context_window / 8))), .{ .ctx = &observer, .onDelta = Silent.delta, .onData = Silent.data, .replay_safe = true }, cancel, detail, &attempts, null);
         };
         s.usage.add(reply.usage);
         try sink.emit(sink.ctx, .{ .usage = s.usage });
@@ -471,6 +472,7 @@ pub const Session = struct {
                 .effort_downgraded = decision.downgraded,
                 .attempts = attempts,
                 .first_data_ms = first_data_ms,
+                .max_gap_ms = model_timing.max_gap_ms,
                 .code = try model_timing.finish(s.arena.allocator(), reply.tool_calls),
                 .run_ms = run_ms,
                 .calls = run_timing.entries[0..run_timing.count],

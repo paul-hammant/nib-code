@@ -37,6 +37,7 @@ llm_calls_per_run = 100
 llm_input_kib = 256
 agent_concurrency = 4
 max_steps = 50
+stream_idle_timeout_s = 300
 ```
 
 只使用当前 provider 的段落；切换 provider 不需要改写另一段。环境和配置文件均未指定时，默认 provider 为 `codex`，默认模型 `gpt-6.1-sol`、窗口 500000 tokens；使用本机 Codex 登录，无需 API key。Codex 窗口随模型变化，未知模型需要显式提供 `context_window` 或 `NIB_CONTEXT_WINDOW`。模型、恢复和凭证边界见 [codex.md](codex.md) 与 [ADR 0011](adr/0011-provider-wire-protocols.md)。
@@ -56,6 +57,9 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 | `llm_input_kib` | 单次 prompt + 序列化 input 的 UTF-8 字节上限（KiB），超出 reject，不截断 | 256 | 1–65536 |
 | `agent_concurrency` | 每进程同时运行的子 agent 数，超出排队 | 4 | 1–64 |
 | `max_steps` | 每个 Turn 的 Step 上限，耗尽时返回 `TooManySteps` | 50 | 1–1000 |
+| `stream_idle_timeout_s` | 流式模型响应连续无字节到达的超时秒数（含首次数据前等待；心跳、元数据也重置计时），超时按连接中断沿用重试策略 | 300 | 1–3600 |
+
+`stream_idle_timeout_s` 同时约束主模型请求、`tools.llm` 和压缩摘要请求。空闲超时复用连接中断的重试上限和退避；Chat Completions 已输出可见增量时仍不自动重放，缓冲结果的 `tools.llm` 与摘要可以安全重试。
 
 这些限额没有环境变量或 CLI 覆盖；随有效配置经 stdin 传给子会话，子会话不读取配置文件。sandbox 内全部工具最多 8 并发是线程调度实现，不由此小节控制。
 
