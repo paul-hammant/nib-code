@@ -358,7 +358,7 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(report["divergences"], 0, report)
         self.assertEqual([r["run"] for r in report["reports"]], ["1:0", "3:0", "3:1"])
 
-    def test_ordinary_errors_with_pending_calls_are_incomplete_not_determined_diffs(self):
+    def test_ordinary_errors_drain_pending_calls_and_replay_completely(self):
         (self.cwd / "sample.txt").write_text("settled")
         session = self.ask([
             'await Promise.all([tools.bash({command: "sleep 2"}), tools.read({path: "missing"})])',
@@ -372,32 +372,24 @@ class ReplayTests(unittest.TestCase):
         rows = jsonl(self.calls_path(session))
         metas = [r["meta"] for r in rows if "meta" in r]
         self.assertEqual(len(metas), 6, rows)
-        for index, meta in enumerate(metas):
+        for meta in metas:
             self.assertEqual(meta["end"], "error")
-            if index < 3:
-                self.assertIs(meta.get("incomplete"), True, meta)
-            else:
-                self.assertNotIn("incomplete", meta)
-        self.assertEqual([r["index"] for r in rows if r["run"] == 0 and "index" in r], [1])
-        self.assertEqual([r["index"] for r in rows if r["run"] == 1 and "index" in r], [0])
-        self.assertFalse(any("index" in r for r in rows if r["run"] == 2))
+            self.assertNotIn("incomplete", meta)
+        self.assertEqual([r["index"] for r in rows if r["run"] == 0 and "index" in r], [1, 0])
+        self.assertEqual([r["index"] for r in rows if r["run"] == 1 and "index" in r], [0, 1])
+        self.assertEqual([r["index"] for r in rows if r["run"] == 2 and "index" in r], [0])
         for index in range(6):
             report = self.replay(session, "--run", f"1:{index}")
             self.assertEqual(report["end"], "error", report)
-            if index < 3:
-                self.assertTrue(report["incomplete"], report)
-                self.assertIsNone(report["match"], report)
-                self.assertIsNotNone(report["divergence"], report)
-            else:
-                self.assertFalse(report["incomplete"], report)
-                self.assertIs(report["match"], True, report)
-                self.assertIsNone(report["divergence"], report)
+            self.assertFalse(report["incomplete"], report)
+            self.assertIs(report["match"], True, report)
+            self.assertIsNone(report["divergence"], report)
         report = self.replay(session, "--all")
         self.assertEqual(report["total"], 6, report)
-        self.assertEqual(report["matched"], 3, report)
-        self.assertEqual(report["undetermined"], 3, report)
+        self.assertEqual(report["matched"], 6, report)
+        self.assertEqual(report["undetermined"], 0, report)
         self.assertEqual(report["divergences"], 0, report)
-        self.assertEqual(len(report["differences"]), 3, report)
+        self.assertEqual(report["differences"], [], report)
 
     def test_reflect_does_not_read_or_publish_calls(self):
         marker = "PRIVATE_CALLS_ONLY_7e4eb7d95c6b"
