@@ -34,6 +34,9 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
         try stdout.print("nib {s}\n", .{@import("build_options").version});
         return stdout.flush();
     }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "replay")) {
+        return @import("replay.zig").run(init, args[2..], stdout);
+    }
     const js = args.len >= 3 and std.mem.eql(u8, args[1], "js");
 
     var options: Session.Options = .{
@@ -174,6 +177,10 @@ fn onSignal(signal: std.posix.SIG) callconv(.c) void {
 
 fn errorMessage(err: anyerror) []const u8 {
     return switch (err) {
+        error.InvalidSessionId => "Session ID must be exactly 32 lowercase hexadecimal characters.",
+        error.InvalidReplayArguments => "Use nib replay <session-id> --run <step>:<run> [--script <file>] [--json], or nib replay <session-id> --all [--json].",
+        error.ReplayMetadataNotFound => "No replay recording found for this Run; recording must be enabled when the original Run executes.",
+        error.ReplayRunNotFound => "Run not found; step counts assistant messages across the entire session (1-based), run indexes tool_calls (0-based).",
         error.InvalidReasoningEffort, error.MissingReasoningEffort => "Use --effort default|off|none|minimal|low|medium|high|xhigh|max (model support varies).",
         error.SessionProviderMismatch => "Cannot resume this session with a different provider; use its original NIB_PROVIDER or start a new session.",
         error.SessionModelMismatch => "Cannot resume this Codex session with a different model; set NIB_MODEL to its original model or start a new session.",
@@ -183,6 +190,7 @@ fn errorMessage(err: anyerror) []const u8 {
 }
 
 test {
+    _ = @import("replay.zig");
     _ = sandbox;
     _ = provider;
     _ = config;

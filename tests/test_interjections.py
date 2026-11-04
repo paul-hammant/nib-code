@@ -126,7 +126,7 @@ class Terminal:
 
 
 def history(home):
-    paths = list((home / "sessions").glob("*.jsonl"))
+    paths = list((home / "sessions").glob("[0-9a-f]" * 32 + ".jsonl"))
     if not paths:
         return []
     messages = []

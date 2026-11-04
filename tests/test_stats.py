@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location('stats', ROOT / 'scripts/stats.py')
@@ -43,6 +44,19 @@ def synthetic_log(path, turns, **metadata):
 
 
 class StatsTest(unittest.TestCase):
+    def test_calls_sidecars_are_never_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sidecar = Path(directory) / ('a' * 32 + '.calls.jsonl')
+            sidecar.write_text('PRIVATE_CALLS_SENTINEL')
+            with mock.patch.object(Path, 'stat', side_effect=AssertionError('sidecar accessed')), \
+                    mock.patch.object(Path, 'read_text', side_effect=AssertionError('sidecar read')):
+                report = stats.summarize([sidecar])
+            self.assertEqual(report['overall']['sessions'], 0)
+            result = subprocess.run([sys.executable, str(ROOT / 'scripts/stats.py'),
+                                     directory, '--json'], capture_output=True, text=True, check=True)
+            self.assertNotIn('PRIVATE_CALLS_SENTINEL', result.stdout + result.stderr)
+            self.assertEqual(json.loads(result.stdout)['overall']['sessions'], 0)
+
     def assertRoundTrips(self, actual, expected):
         self.assertEqual(len(actual["notes"]), 2)
         self.assertEqual({key: value for key, value in actual.items() if key != "notes"}, expected)

@@ -3,6 +3,25 @@ const c = @import("qjs");
 const console = @import("sandbox/console.zig");
 const run_timing = @import("sandbox/timing.zig");
 pub const RunTiming = run_timing.Run;
+pub const Recorder = @import("sandbox/record.zig").Recorder;
+pub const replay = @import("sandbox/replay.zig");
+
+// Callbacks run only on the eval thread; contexts and pending-index slices are borrowed.
+pub const Virtual = struct {
+    ctx: *anyopaque,
+    create: *const fn (*anyopaque, usize, []const u8, []const u8) void,
+    select: *const fn (*anyopaque, []const usize) ?usize,
+    result: *const fn (*anyopaque, std.mem.Allocator, usize) anyerror!VirtualResult,
+    stopped: *const fn (*anyopaque) bool,
+    start_ms_epoch: i64,
+    uses_time: bool = false,
+    uses_random: bool = false,
+};
+
+pub const VirtualResult = struct {
+    result: ToolResult,
+    string_result: bool = false,
+};
 
 /// `JS_UNDEFINED` is a C compound-literal macro that translate-c cannot lower.
 const js_undefined: c.JSValue = .{ .u = .{ .uint64 = 0 }, .tag = c.JS_TAG_UNDEFINED };
@@ -31,6 +50,8 @@ pub const Host = struct {
     admit: ?*const fn (ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8) anyerror!?[]u8 = null,
     /// Borrowed until eval returns; inspect entries or change started/run_index only between evals.
     timing: ?*RunTiming = null,
+    record: ?*Recorder = null,
+    virtual: ?*Virtual = null,
 };
 
 pub const LogEntry = console.Entry;
@@ -68,10 +89,13 @@ const State = struct {
     completed: std.Io.Condition = .init,
     ready: ?*Call = null,
     ready_tail: ?*Call = null,
+    creation_index: usize = 0,
 
     const Call = struct {
         state: *State,
         index: usize,
+        creation_index: usize,
+        string_result: bool = false,
         name: []u8,
         args: []u8,
         settle: [2]c.JSValue,
@@ -130,6 +154,34 @@ const State = struct {
         st.calls.deinit(st.gpa);
     }
 
+    fn deliver(st: *State, ctx: *c.JSContext, call: *Call) !void {
+        const result = call.result.?;
+        if (st.host.?.record) |recorder| recorder.settle(call.creation_index, call.name, call.args, result);
+        st.beginJs();
+        defer st.endJs();
+        const value = switch (result) {
+            .ok => |json| blk: {
+                if (call.string_result) break :blk c.JS_NewStringLen(ctx, json.ptr, json.len);
+                // QuickJS requires buf[len] == 0 even with an explicit length.
+                const source = try st.gpa.dupeSentinel(u8, json, 0);
+                defer st.gpa.free(source);
+                break :blk c.JS_ParseJSON(ctx, source.ptr, source.len, "<tool>");
+            },
+            .err => |msg| blk: {
+                const err = c.JS_NewError(ctx);
+                _ = c.JS_SetPropertyStr(ctx, err, "message", c.JS_NewStringLen(ctx, msg.ptr, msg.len));
+                break :blk err;
+            },
+        };
+        const rejected = result == .err or c.JS_IsException(value);
+        const arg = if (c.JS_IsException(value)) c.JS_GetException(ctx) else value;
+        const r = c.JS_Call(ctx, call.settle[@intFromBool(rejected)], js_undefined, 1, @constCast(&arg));
+        c.JS_FreeValue(ctx, r);
+        c.JS_FreeValue(ctx, arg);
+        st.calls.items[call.index] = null;
+        call.deinit(ctx);
+    }
+
     fn jobs(st: *State, ctx: *c.JSContext, rt: *c.JSRuntime, promise: c.JSValue) !void {
         var active: usize = 0;
         var next: usize = 0;
@@ -139,6 +191,7 @@ const State = struct {
                 st.calls.clearRetainingCapacity();
                 next = 0;
             }
+            if (virtualStopped(st)) return;
             if (isInterrupted(st) or c.JS_PromiseState(ctx, promise) == c.JS_PROMISE_REJECTED) {
                 st.stop();
                 return;
@@ -149,43 +202,46 @@ const State = struct {
             st.endJs();
             if (n < 0) return;
             if (n > 0) continue;
+            if (st.host) |h| if (h.virtual) |v| {
+                if (v.stopped(v.ctx)) return;
+                var pending: std.ArrayList(usize) = .empty;
+                defer pending.deinit(st.gpa);
+                for (st.calls.items) |item| if (item) |call| try pending.append(st.gpa, call.creation_index);
+                if (pending.items.len == 0) return;
+                const selected = v.select(v.ctx, pending.items) orelse return;
+                for (st.calls.items) |item| {
+                    const call = item orelse continue;
+                    if (call.creation_index != selected) continue;
+                    const result = try v.result(v.ctx, st.gpa, selected);
+                    call.result = result.result;
+                    call.string_result = result.string_result;
+                    try st.deliver(ctx, call);
+                    break;
+                }
+                continue;
+            };
             st.mutex.lockUncancelable(st.io);
-            var ready = st.ready;
-            st.ready = null;
-            st.ready_tail = null;
+            const ready = st.ready;
+            if (ready) |call| st.ready = call.next;
+            if (st.ready == null) st.ready_tail = null;
             st.mutex.unlock(st.io);
-            while (ready) |call| {
-                ready = call.next;
-                call.thread.?.join();
+            if (ready) |call| {
+                if (call.thread) |thread| thread.join();
                 call.thread = null;
                 active -= 1;
-                st.beginJs();
-                defer st.endJs();
-                const result = call.result.?;
-                const value = switch (result) {
-                    .ok => |json| blk: {
-                        // QuickJS requires buf[len] == 0 even with an explicit length.
-                        const source = try st.gpa.dupeSentinel(u8, json, 0);
-                        defer st.gpa.free(source);
-                        break :blk c.JS_ParseJSON(ctx, source.ptr, source.len, "<tool>");
-                    },
-                    .err => |msg| blk: {
-                        const err = c.JS_NewError(ctx);
-                        _ = c.JS_SetPropertyStr(ctx, err, "message", c.JS_NewStringLen(ctx, msg.ptr, msg.len));
-                        break :blk err;
-                    },
-                };
-                const rejected = result == .err or c.JS_IsException(value);
-                const arg = if (c.JS_IsException(value)) c.JS_GetException(ctx) else value;
-                const r = c.JS_Call(ctx, call.settle[@intFromBool(rejected)], js_undefined, 1, @constCast(&arg));
-                c.JS_FreeValue(ctx, r);
-                c.JS_FreeValue(ctx, arg);
-                st.calls.items[call.index] = null;
-                call.deinit(ctx);
+                try st.deliver(ctx, call);
             }
-            if (c.JS_IsJobPending(rt)) continue;
+            if (ready != null or c.JS_IsJobPending(rt)) continue;
             while (next < st.calls.items.len and active < 8) : (next += 1) {
                 const call = st.calls.items[next].?;
+                if (call.result != null) {
+                    st.mutex.lockUncancelable(st.io);
+                    if (st.ready_tail) |tail| tail.next = call else st.ready = call;
+                    st.ready_tail = call;
+                    st.mutex.unlock(st.io);
+                    active += 1;
+                    continue;
+                }
                 const timing = st.host.?.timing;
                 if (timing) |t| call.timing_index = t.reserve(call.name);
                 call.thread = std.Thread.spawn(.{}, Call.work, .{call}) catch |err| {
@@ -242,6 +298,7 @@ pub fn eval(
         .cancel = cancel,
     };
     defer st.logs.deinit(gpa);
+    defer if (host) |h| if (h.record) |recorder| recorder.evalEnd(st.creation_index);
 
     const rt = c.JS_NewRuntime() orelse return error.OutOfMemory;
     defer c.JS_FreeRuntime(rt);
@@ -260,6 +317,8 @@ pub fn eval(
         defer c.JS_FreeValue(ctx, v);
         if (c.JS_IsException(v)) return error.PreludeFailed;
     }
+
+    if (host) |h| if (h.virtual) |v| try installVirtual(gpa, ctx, v);
 
     const src = try gpa.dupeSentinel(u8, code, 0);
     defer gpa.free(src);
@@ -328,6 +387,28 @@ fn install(gpa: std.mem.Allocator, ctx: *c.JSContext, host: ?Host) !void {
     _ = c.JS_SetPropertyStr(ctx, global, "__names", c.JS_NewStringLen(ctx, names.ptr, names.len));
 }
 
+fn virtualTime(ctx: ?*c.JSContext, _: c.JSValue, _: c_int, _: [*c]c.JSValue) callconv(.c) c.JSValue {
+    state(ctx).host.?.virtual.?.uses_time = true;
+    return js_undefined;
+}
+
+fn virtualRandom(ctx: ?*c.JSContext, _: c.JSValue, _: c_int, _: [*c]c.JSValue) callconv(.c) c.JSValue {
+    state(ctx).host.?.virtual.?.uses_random = true;
+    return js_undefined;
+}
+
+fn installVirtual(_: std.mem.Allocator, ctx: *c.JSContext, v: *Virtual) !void {
+    const global = c.JS_GetGlobalObject(ctx);
+    defer c.JS_FreeValue(ctx, global);
+    _ = c.JS_SetPropertyStr(ctx, global, "__replayEpoch", c.JS_NewFloat64(ctx, @floatFromInt(v.start_ms_epoch)));
+    _ = c.JS_SetPropertyStr(ctx, global, "__replayTime", c.JS_NewCFunction2(ctx, virtualTime, "time", 0, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, global, "__replayRandom", c.JS_NewCFunction2(ctx, virtualRandom, "random", 0, c.JS_CFUNC_generic, 0));
+    const source = @import("sandbox/virtual.zig").prelude;
+    const result = c.JS_Eval(ctx, source, source.len, "<virtual>", c.JS_EVAL_TYPE_GLOBAL);
+    defer c.JS_FreeValue(ctx, result);
+    if (c.JS_IsException(result)) return error.PreludeFailed;
+}
+
 fn state(ctx: ?*c.JSContext) *State {
     return @ptrCast(@alignCast(c.JS_GetContextOpaque(ctx).?));
 }
@@ -338,8 +419,14 @@ fn isInterrupted(st: *State) bool {
     return elapsed >= st.js_remaining_ns;
 }
 
+fn virtualStopped(st: *State) bool {
+    if (st.host) |h| if (h.virtual) |v| return v.stopped(v.ctx);
+    return false;
+}
+
 fn interrupt(_: ?*c.JSContext, opaque_ptr: ?*anyopaque) callconv(.c) c_int {
-    return @intFromBool(isInterrupted(@ptrCast(@alignCast(opaque_ptr.?))));
+    const st: *State = @ptrCast(@alignCast(opaque_ptr.?));
+    return @intFromBool(isInterrupted(st) or virtualStopped(st));
 }
 
 fn nativeLog(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
@@ -355,7 +442,14 @@ fn nativeLog(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue)
 }
 
 fn nativeHost(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
-    return enqueue(state(ctx), ctx.?, argc, argv) catch c.JS_ThrowOutOfMemory(ctx);
+    return enqueue(state(ctx), ctx.?, argc, argv) catch |err| {
+        if (err == error.ReplayDivergence) {
+            const reason = c.JS_NewError(ctx);
+            _ = c.JS_SetPropertyStr(ctx, reason, "message", c.JS_NewString(ctx, "replay diverged"));
+            return c.JS_Throw(ctx, reason);
+        }
+        return c.JS_ThrowOutOfMemory(ctx);
+    };
 }
 
 fn enqueue(st: *State, ctx: *c.JSContext, argc: c_int, argv: [*c]c.JSValue) !c.JSValue {
@@ -373,23 +467,17 @@ fn enqueue(st: *State, ctx: *c.JSContext, argc: c_int, argv: [*c]c.JSValue) !c.J
         c.JS_FreeValue(ctx, promise);
         for (settle) |v| c.JS_FreeValue(ctx, v);
     }
-    if (st.host.?.admit) |admit| {
-        if (try admit(st.host.?.ctx, st.gpa, name)) |message| {
-            defer st.gpa.free(message);
-            const reason = c.JS_NewError(ctx);
-            _ = c.JS_SetPropertyStr(ctx, reason, "message", c.JS_NewStringLen(ctx, message.ptr, message.len));
-            defer c.JS_FreeValue(ctx, reason);
-            var values = [_]c.JSValue{reason};
-            const result = c.JS_Call(ctx, settle[1], js_undefined, 1, &values);
-            c.JS_FreeValue(ctx, result);
-            for (settle) |v| c.JS_FreeValue(ctx, v);
-            st.gpa.free(name);
-            st.gpa.free(args);
-            st.gpa.destroy(call);
-            return promise;
-        }
+    call.* = .{ .state = st, .index = st.calls.items.len, .creation_index = st.creation_index, .name = name, .args = args, .settle = settle };
+    if (st.host.?.virtual) |v| {
+        v.create(v.ctx, st.creation_index, name, args);
+        if (v.stopped(v.ctx)) return error.ReplayDivergence;
+    } else if (st.host.?.admit) |admit| {
+        if (try admit(st.host.?.ctx, st.gpa, name)) |message| call.result = .{ .err = message };
     }
-    call.* = .{ .state = st, .index = st.calls.items.len, .name = name, .args = args, .settle = settle };
+    errdefer if (call.result) |result| switch (result) {
+        inline else => |bytes| st.gpa.free(bytes),
+    };
+    st.creation_index += 1;
     try st.calls.append(st.gpa, call);
     return promise;
 }
@@ -623,4 +711,90 @@ test "undispatched tools do not produce native timings" {
     defer result.deinit(testing.allocator);
     try testing.expect(!result.ok);
     try testing.expectEqual(@as(usize, 0), timing.count);
+}
+
+test "record and virtual replay share settlement path including admission rejects and monotonic creation indices" {
+    const RecordHost = struct {
+        fast: std.atomic.Value(bool) = .init(false),
+        calls: std.atomic.Value(usize) = .init(0),
+
+        fn call(ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8, _: []const u8) ToolResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            if (std.mem.eql(u8, name, "slow")) {
+                while (!self.fast.load(.acquire)) std.Thread.yield() catch {};
+                std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(30), .clock = .awake }, testing.io) catch unreachable;
+            } else if (std.mem.eql(u8, name, "fast")) self.fast.store(true, .release);
+            if (std.mem.eql(u8, name, "fail")) return .{ .err = gpa.dupe(u8, "worker denied") catch unreachable };
+            return .{ .ok = std.json.Stringify.valueAlloc(gpa, name, .{}) catch unreachable };
+        }
+
+        fn admit(_: *anyopaque, gpa: std.mem.Allocator, name: []const u8) !?[]u8 {
+            return if (std.mem.eql(u8, name, "denied")) try gpa.dupe(u8, "admission denied") else null;
+        }
+    };
+    var recorder = Recorder.init(testing.allocator, testing.io, "unused-record-test-path", true);
+    defer recorder.deinit();
+    recorder.begin(7, 2);
+    var host: RecordHost = .{};
+    const code = "const pending=[tools.slow(),tools.fast()]; const winner=await Promise.race(pending); await Promise.all(pending); const again=await tools.fast(); let denied,fail; try { await tools.denied(); } catch(e) { denied=e.message; } try { await tools.fail(); } catch(e) { fail=e.message; } [winner,again,denied,fail]";
+    const actual = try run(code, .{}, .{ .ctx = &host, .names = &.{ "slow", "fast", "denied", "fail" }, .call = RecordHost.call, .admit = RecordHost.admit, .record = &recorder });
+    defer actual.deinit(testing.allocator);
+    try testing.expect(actual.ok);
+    try testing.expectEqualStrings("[\"fast\",\"fast\",\"denied: admission denied\",\"fail: worker denied\"]", actual.text);
+    try testing.expectEqual(@as(usize, 4), host.calls.load(.monotonic));
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var entries: std.ArrayList(replay.Entry) = .empty;
+    var lines = std.mem.splitScalar(u8, recorder.buffer.items, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var row = try std.json.parseFromSliceLeaky(std.json.Value, a, line, .{});
+        if (row.object.contains("meta")) continue;
+        if (row.object.get("result")) |value| if (value == .object) {
+            _ = row.object.swapRemove("result");
+            try row.object.put(a, "same_as", value.object.get("same_as").?);
+        };
+        var entry = try std.json.parseFromValueLeaky(replay.Entry, a, row, .{ .ignore_unknown_fields = true });
+        if (entry.same_as) |hash| {
+            for (entries.items) |prev| if (prev.ok == entry.ok and std.mem.eql(u8, prev.sha256, hash)) {
+                entry.result = prev.result;
+                entry.@"error" = prev.@"error";
+                break;
+            };
+        }
+        try entries.append(a, entry);
+    }
+    try testing.expectEqual(@as(usize, 5), entries.items.len);
+    try testing.expectEqual(@as(usize, 1), entries.items[0].index);
+    try testing.expectEqual(@as(usize, 0), entries.items[1].index);
+    for (entries.items[2..], 2..) |entry, index| try testing.expectEqual(index, entry.index);
+    for (entries.items, 0..) |entry, seq| try testing.expectEqual(seq, entry.seq);
+    const repeated = try replay.execute(testing.allocator, testing.io, code, entries.items, recorder.start_ms_epoch, .ok, false);
+    defer repeated.deinit(testing.allocator);
+    try testing.expect(repeated.divergence == null);
+    try testing.expectEqualStrings(actual.text, repeated.outcome.text);
+}
+
+test "eval exit records missing creations on errors but settled errors stay complete" {
+    const Case = struct { code: []const u8, incomplete: bool, delivered: usize };
+    for ([_]Case{
+        .{ .code = "tools.bash(); throw new Error('pending')", .incomplete = true, .delivered = 0 },
+        .{ .code = "await tools.bash(); tools.bash(); throw new Error('tail pending')", .incomplete = true, .delivered = 1 },
+        .{ .code = "await Promise.all([tools.read(), tools.fetch()])", .incomplete = true, .delivered = 1 },
+        .{ .code = "await tools.bash(); throw new Error('settled')", .incomplete = false, .delivered = 1 },
+        .{ .code = "await tools.fetch()", .incomplete = false, .delivered = 1 },
+        .{ .code = "throw new Error('zero calls')", .incomplete = false, .delivered = 0 },
+    }) |case| {
+        var recorder = Recorder.init(testing.allocator, testing.io, "unused-record-test-path", true);
+        defer recorder.deinit();
+        recorder.begin(1, 0);
+        var host: TimingHost = .{ .fail_fetch = true };
+        const result = try run(case.code, .{}, .{ .ctx = &host, .names = &.{ "bash", "read", "fetch" }, .call = TimingHost.call, .record = &recorder });
+        defer result.deinit(testing.allocator);
+        try testing.expect(!result.ok);
+        try testing.expectEqual(case.incomplete, recorder.incomplete);
+        try testing.expectEqual(case.delivered, recorder.seq);
+    }
 }

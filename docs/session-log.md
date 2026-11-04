@@ -6,6 +6,14 @@
 
 新会话按基础指令、全局 `$NIB_HOME/AGENTS.md`（默认 `~/.nib/AGENTS.md`）、项目 `AGENTS.md` 的顺序拼接 system，后者优先。项目目录是从 cwd 向上遇到的第一个 `.git` 标记所在目录；没有则用 cwd。只读取 `AGENTS.md`。恢复会话沿用日志中的原始 system，之后修改指令文件只影响新会话。
 
+## 工具录制与离线重放
+
+主日志 `$NIB_HOME/sessions/<session_id>.jsonl` 保存模型消息和 Step；独立的 `<session_id>.calls.jsonl` 保存 Run 内工具的实际返回值与拒绝信息，权限为 `0600`。旁路录制默认开启，可关闭；主日志格式与恢复不依赖它。`nib replay` 只在新沙箱内重跑已保存的 JavaScript，以录制结果替代真实工具，不请求模型、不执行 bash 或文件写入。
+
+重放定位的 `step` 是**整个会话中 assistant Step 的 1-based 序号**（包括无 Run 的最终回答，不随 Turn 重置），`run` 是该 assistant 消息中 `tool_calls` 的 **0-based 数组索引**；它们不是 `turn_step` 或 Run 内工具调用的 `index`。格式、命令、截断/去重和无法判定的情况见 [replay.md](replay.md)。
+
+旁路文件可能含主日志未展示的完整文件内容、命令输出与秘密，不发送给 provider，也不作为 `/reflect` 的输入。反思提示只允许读指定主日志，不枚举 sessions 目录或读取旁路/兄弟/子会话日志；这是提示词约束，不是独立的文件访问控制。分享日志时分别检查两个文件，不因主日志已经脱敏就分享旁路文件。
+
 ## 实验标签（header）
 
 日志首行是 header，根会话与子会话在新建时记录以下可选字段；旧日志缺失时仍可恢复。标签只用于记录和统计，不发送给 provider，也不改变执行、系统提示或工具说明。恢复会话保留原 header，不用当前构建或环境重算、回填或改写。
