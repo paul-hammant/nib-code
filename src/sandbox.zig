@@ -2,7 +2,9 @@ const std = @import("std");
 const c = @import("qjs");
 const console = @import("sandbox/console.zig");
 const run_timing = @import("sandbox/timing.zig");
-const Timer = @import("sandbox/timer.zig").Timer;
+const scheduler = @import("sandbox/scheduler.zig");
+const native = @import("sandbox/native.zig");
+const State = scheduler.State;
 pub const RunTiming = run_timing.Run;
 pub const tool_concurrency = 8;
 pub const max_stopped_bytes = 4096;
@@ -28,7 +30,7 @@ pub const VirtualResult = struct {
 };
 
 /// `JS_UNDEFINED` is a C compound-literal macro that translate-c cannot lower.
-const js_undefined: c.JSValue = .{ .u = .{ .uint64 = 0 }, .tag = c.JS_TAG_UNDEFINED };
+pub const js_undefined: c.JSValue = .{ .u = .{ .uint64 = 0 }, .tag = c.JS_TAG_UNDEFINED };
 
 pub const Limits = struct {
     memory_bytes: usize = 64 * 1024 * 1024,
@@ -85,269 +87,6 @@ pub const Outcome = struct {
     }
 };
 
-const State = struct {
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    host: ?Host,
-    logs: console.Capture,
-    js_remaining_ns: i96,
-    js_started: ?std.Io.Clock.Timestamp = null,
-    cancel: ?*const std.atomic.Value(bool),
-    oom: bool = false,
-    calls: std.ArrayList(?*Call) = .empty,
-    mutex: std.Io.Mutex = .init,
-    completed: std.Io.Condition = .init,
-    ready: ?*Call = null,
-    ready_tail: ?*Call = null,
-    creation_index: usize = 0,
-    tool_bytes: u64 = 0,
-    /// The Run's top-level promise; once it rejects, unexpired timers are dropped while host calls still drain.
-    promise: ?c.JSValue = null,
-
-    fn recordResult(st: *State, index: ?usize, bytes: usize) void {
-        st.tool_bytes += bytes;
-        if (st.host.?.timing) |t| t.result(index, bytes);
-    }
-
-    const Call = struct {
-        state: *State,
-        index: usize,
-        creation_index: usize,
-        string_result: bool = false,
-        name: []u8,
-        args: []u8,
-        settle: [2]c.JSValue,
-        thread: ?std.Thread = null,
-        timer: ?Timer = null,
-        result: ?ToolResult = null,
-        timing_index: ?usize = null,
-        next: ?*Call = null,
-
-        fn deinit(call: *Call, ctx: *c.JSContext) void {
-            const gpa = call.state.gpa;
-            if (call.result) |result| switch (result) {
-                inline else => |bytes| gpa.free(bytes),
-            };
-            for (call.settle) |value| c.JS_FreeValue(ctx, value);
-            gpa.free(call.name);
-            gpa.free(call.args);
-            gpa.destroy(call);
-        }
-
-        fn work(call: *Call) void {
-            const st = call.state;
-            const h = st.host.?;
-            const timing = if (call.timing_index != null) h.timing else null;
-            const start_ms = if (timing) |t| t.elapsed() else 0;
-            tool_identity = .{};
-            const result = h.call(h.ctx, st.gpa, call.name, call.args);
-            const end_ms = if (timing) |t| t.elapsed() else 0;
-            st.mutex.lockUncancelable(st.io);
-            defer st.mutex.unlock(st.io);
-            if (timing) |t| {
-                t.complete(call.timing_index.?, start_ms, end_ms, result == .ok);
-                if (tool_identity.id) |id| {
-                    t.entries[call.timing_index.?].id = id;
-                    t.entries[call.timing_index.?].background = tool_identity.background;
-                }
-            }
-            call.result = result;
-            if (st.ready_tail) |tail| tail.next = call else st.ready = call;
-            st.ready_tail = call;
-            st.completed.signal(st.io);
-        }
-    };
-
-    fn beginJs(st: *State) void {
-        std.debug.assert(st.js_started == null);
-        st.js_started = .now(st.io, .awake);
-    }
-
-    fn endJs(st: *State) void {
-        const started = st.js_started.?;
-        st.js_remaining_ns -= started.durationTo(.now(st.io, .awake)).raw.toNanoseconds();
-        st.js_started = null;
-    }
-
-    fn stop(st: *State) void {
-        if (st.host) |h| if (h.cancel) |flag| flag.store(true, .release);
-    }
-
-    fn stoppedCalls(st: *State) ![]const u8 {
-        var out: std.Io.Writer.Allocating = .init(st.gpa);
-        defer out.deinit();
-        var remaining: usize = 0;
-        for (st.calls.items) |item| {
-            const call = item orelse continue;
-            if (remaining > 0 or out.written().len + call.name.len + 64 > max_stopped_bytes) {
-                remaining += 1;
-                continue;
-            }
-            try out.writer.print("{s}{s} #{d}", .{ if (out.written().len == 0) "[stopped before completion: " else ", ", call.name, call.creation_index });
-        }
-        if (remaining > 0) try out.writer.print("{s}..., {d} more", .{ if (out.written().len == 0) "[stopped before completion: " else ", ", remaining });
-        if (out.written().len > 0) try out.writer.writeByte(']');
-        return out.toOwnedSlice();
-    }
-
-    fn deinit(st: *State, ctx: *c.JSContext) void {
-        st.stop();
-        for (st.calls.items) |item| if (item) |call| if (call.thread) |thread| thread.join();
-        for (st.calls.items) |item| if (item) |call| {
-            if (call.timer != null) {
-                if (st.host.?.timing) |t| if (call.timing_index) |i|
-                    t.complete(i, t.entries[i].start_ms, t.elapsed(), false);
-            }
-            call.deinit(ctx);
-        };
-        st.calls.deinit(st.gpa);
-    }
-
-    fn deliver(st: *State, ctx: *c.JSContext, call: *Call) !void {
-        const result = call.result.?;
-        if (st.host.?.record) |recorder| recorder.settle(call.creation_index, call.name, call.args, result);
-        st.recordResult(call.timing_index, switch (result) {
-            inline else => |bytes| bytes.len,
-        });
-        st.beginJs();
-        defer st.endJs();
-        const value = switch (result) {
-            .ok => |json| blk: {
-                if (call.string_result) break :blk c.JS_NewStringLen(ctx, json.ptr, json.len);
-                // QuickJS requires buf[len] == 0 even with an explicit length.
-                const source = try st.gpa.dupeSentinel(u8, json, 0);
-                defer st.gpa.free(source);
-                break :blk c.JS_ParseJSON(ctx, source.ptr, source.len, "<tool>");
-            },
-            .err => |msg| blk: {
-                const err = c.JS_NewError(ctx);
-                _ = c.JS_SetPropertyStr(ctx, err, "message", c.JS_NewStringLen(ctx, msg.ptr, msg.len));
-                break :blk err;
-            },
-        };
-        const rejected = result == .err or c.JS_IsException(value);
-        const arg = if (c.JS_IsException(value)) c.JS_GetException(ctx) else value;
-        const r = c.JS_Call(ctx, call.settle[@intFromBool(rejected)], js_undefined, 1, @constCast(&arg));
-        c.JS_FreeValue(ctx, r);
-        c.JS_FreeValue(ctx, arg);
-        st.calls.items[call.index] = null;
-        call.deinit(ctx);
-    }
-
-    fn compactCalls(st: *State, next: *usize) void {
-        var len: usize = 0;
-        var dispatched: usize = 0;
-        for (st.calls.items, 0..) |item, index| if (item) |call| {
-            // Workers retain Call pointers; only the eval thread reads array indices.
-            call.index = len;
-            st.calls.items[len] = call;
-            len += 1;
-            if (index < next.*) dispatched += 1;
-        };
-        st.calls.items.len = len;
-        next.* = dispatched;
-    }
-
-    fn hasTimers(st: *State) bool {
-        for (st.calls.items) |item| if (item) |call| {
-            if (call.timer != null) return true;
-        };
-        return false;
-    }
-
-    fn jobs(st: *State, ctx: *c.JSContext, rt: *c.JSRuntime) !bool {
-        var active: usize = 0;
-        var next: usize = 0;
-        while (true) {
-            if (st.host) |h| if (h.poll) |poll| try poll(h.ctx);
-            st.compactCalls(&next);
-            if (virtualStopped(st)) return false;
-            if (isInterrupted(st)) {
-                st.stop();
-                return false;
-            }
-            var pctx: ?*c.JSContext = null;
-            st.beginJs();
-            const n = c.JS_ExecutePendingJob(rt, &pctx);
-            st.endJs();
-            if (n < 0) return false;
-            if (n > 0) continue;
-            if (st.host) |h| if (h.virtual) |v| {
-                if (v.stopped(v.ctx)) return false;
-                var pending: std.ArrayList(usize) = .empty;
-                defer pending.deinit(st.gpa);
-                for (st.calls.items) |item| if (item) |call| try pending.append(st.gpa, call.creation_index);
-                if (pending.items.len == 0) return true;
-                const selected = v.select(v.ctx, pending.items) orelse return false;
-                for (st.calls.items) |item| {
-                    const call = item orelse continue;
-                    if (call.creation_index != selected) continue;
-                    const result = try v.result(v.ctx, st.gpa, selected);
-                    call.result = result.result;
-                    call.string_result = result.string_result;
-                    try st.deliver(ctx, call);
-                    break;
-                }
-                continue;
-            };
-            st.mutex.lockUncancelable(st.io);
-            const ready = st.ready;
-            if (ready) |call| st.ready = call.next;
-            if (st.ready == null) st.ready_tail = null;
-            st.mutex.unlock(st.io);
-            if (ready) |call| {
-                if (call.thread) |thread| thread.join();
-                call.thread = null;
-                active -= 1;
-                try st.deliver(ctx, call);
-            }
-            if (ready != null or c.JS_IsJobPending(rt)) continue;
-            while (next < st.calls.items.len) : (next += 1) {
-                const call = st.calls.items[next] orelse continue;
-                if (call.timer != null) continue;
-                if (active == tool_concurrency) break;
-                if (call.result != null) {
-                    st.mutex.lockUncancelable(st.io);
-                    if (st.ready_tail) |tail| tail.next = call else st.ready = call;
-                    st.ready_tail = call;
-                    st.mutex.unlock(st.io);
-                    active += 1;
-                    continue;
-                }
-                const timing = st.host.?.timing;
-                if (timing) |t| call.timing_index = t.reserve(call.name);
-                call.thread = std.Thread.spawn(.{}, Call.work, .{call}) catch |err| {
-                    if (timing) |t| t.undoReservation(call.timing_index, call.name);
-                    return err;
-                };
-                active += 1;
-            }
-            const failed = if (st.promise) |p| c.JS_PromiseState(ctx, p) == c.JS_PROMISE_REJECTED else false;
-            var wait_ms: i64 = 20;
-            var expired: ?*Call = null;
-            if (!failed) for (st.calls.items) |item| if (item) |call| {
-                if (call.timer) |timer| {
-                    const remaining = timer.remaining(st.io);
-                    wait_ms = @min(wait_ms, remaining);
-                    if (remaining == 0 and (expired == null or timer.before(expired.?.timer.?)))
-                        expired = call;
-                }
-            };
-            if (expired) |call| {
-                call.result = .{ .ok = try st.gpa.dupe(u8, "null") };
-                if (st.host.?.timing) |t| if (call.timing_index) |i|
-                    t.complete(i, t.entries[i].start_ms, t.elapsed(), true);
-                try st.deliver(ctx, call);
-            }
-            if (expired != null or c.JS_IsJobPending(rt)) continue;
-            if (active == 0 and (failed or !st.hasTimers())) return true;
-            st.mutex.lockUncancelable(st.io);
-            if (st.ready == null) st.completed.waitTimeout(st.io, &st.mutex, .{ .duration = .{ .raw = .fromMilliseconds(wait_ms), .clock = .awake } }) catch {};
-            st.mutex.unlock(st.io);
-        }
-    }
-};
-
 const prelude =
     \\(() => {
     \\  const host = globalThis.__host, log = globalThis.__log, names = JSON.parse(globalThis.__names);
@@ -396,21 +135,21 @@ pub fn eval(
     defer c.JS_FreeRuntime(rt);
     c.JS_SetMemoryLimit(rt, limits.memory_bytes);
     c.JS_SetMaxStackSize(rt, limits.stack_bytes);
-    c.JS_SetInterruptHandler(rt, interrupt, &st);
+    c.JS_SetInterruptHandler(rt, native.interrupt, &st);
 
     const ctx = c.JS_NewContext(rt) orelse return error.OutOfMemory;
     defer c.JS_FreeContext(ctx);
     defer st.deinit(ctx);
     c.JS_SetContextOpaque(ctx, &st);
 
-    try install(gpa, ctx, host);
+    try native.install(gpa, ctx, host);
     {
         const v = c.JS_Eval(ctx, prelude, prelude.len, "<prelude>", c.JS_EVAL_TYPE_GLOBAL);
         defer c.JS_FreeValue(ctx, v);
         if (c.JS_IsException(v)) return error.PreludeFailed;
     }
 
-    if (host) |h| if (h.virtual) |v| try installVirtual(gpa, ctx, v);
+    if (host) |h| if (h.virtual) |v| try native.installVirtual(gpa, ctx, v);
 
     const src = try gpa.dupeSentinel(u8, code, 0);
     defer gpa.free(src);
@@ -426,7 +165,7 @@ pub fn eval(
     if (c.JS_IsException(promise)) {
         st.beginJs();
         defer st.endJs();
-        text = try takeException(gpa, ctx);
+        text = try native.takeException(gpa, ctx);
     } else {
         st.promise = promise;
         jobs_drained = try st.jobs(ctx, rt);
@@ -439,13 +178,13 @@ pub fn eval(
                 // Async global eval resolves to `{ value: <completion value> }`.
                 const value = c.JS_GetPropertyStr(ctx, res, "value");
                 defer c.JS_FreeValue(ctx, value);
-                text = try toJson(gpa, ctx, value);
+                text = try native.toJson(gpa, ctx, value);
                 ok = true;
             },
             c.JS_PROMISE_REJECTED => {
                 const err = c.JS_PromiseResult(ctx, promise);
                 defer c.JS_FreeValue(ctx, err);
-                text = try describeError(gpa, ctx, err);
+                text = try native.describeError(gpa, ctx, err);
             },
             else => text = try gpa.dupe(u8, "Error: script is still awaiting something that can never settle"),
         }
@@ -454,12 +193,12 @@ pub fn eval(
     if (jobs_drained) _ = try st.jobs(ctx, rt);
     if (st.oom) return error.OutOfMemory;
 
-    if (isInterrupted(&st)) {
+    if (scheduler.isInterrupted(&st)) {
         ok = false;
         gpa.free(text);
         text = try gpa.dupe(u8, if (st.cancel != null and st.cancel.?.load(.acquire)) "Error: run canceled" else "Error: run timed out");
     }
-    const stopped = if (isInterrupted(&st)) try st.stoppedCalls() else "";
+    const stopped = if (scheduler.isInterrupted(&st)) try st.stoppedCalls() else "";
     errdefer gpa.free(stopped);
     const captured = try st.logs.snapshot(gpa);
     return .{
@@ -474,170 +213,6 @@ pub fn eval(
         .log_tail_start = captured.tail_start,
         .log_truncated = st.logs.bytes > limits.max_log_bytes,
     };
-}
-
-fn install(gpa: std.mem.Allocator, ctx: *c.JSContext, host: ?Host) !void {
-    const global = c.JS_GetGlobalObject(ctx);
-    defer c.JS_FreeValue(ctx, global);
-    _ = c.JS_SetPropertyStr(ctx, global, "__log", c.JS_NewCFunction2(ctx, nativeLog, "__log", 1, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, global, "__host", c.JS_NewCFunction2(ctx, nativeHost, "__host", 2, c.JS_CFUNC_generic, 0));
-    const names = try std.json.Stringify.valueAlloc(gpa, if (host) |h| h.names else &.{}, .{});
-    defer gpa.free(names);
-    _ = c.JS_SetPropertyStr(ctx, global, "__names", c.JS_NewStringLen(ctx, names.ptr, names.len));
-}
-
-fn virtualTime(ctx: ?*c.JSContext, _: c.JSValue, _: c_int, _: [*c]c.JSValue) callconv(.c) c.JSValue {
-    state(ctx).host.?.virtual.?.uses_time = true;
-    return js_undefined;
-}
-
-fn virtualRandom(ctx: ?*c.JSContext, _: c.JSValue, _: c_int, _: [*c]c.JSValue) callconv(.c) c.JSValue {
-    state(ctx).host.?.virtual.?.uses_random = true;
-    return js_undefined;
-}
-
-fn installVirtual(_: std.mem.Allocator, ctx: *c.JSContext, v: *Virtual) !void {
-    const global = c.JS_GetGlobalObject(ctx);
-    defer c.JS_FreeValue(ctx, global);
-    _ = c.JS_SetPropertyStr(ctx, global, "__replayEpoch", c.JS_NewFloat64(ctx, @floatFromInt(v.start_ms_epoch)));
-    _ = c.JS_SetPropertyStr(ctx, global, "__replayTime", c.JS_NewCFunction2(ctx, virtualTime, "time", 0, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, global, "__replayRandom", c.JS_NewCFunction2(ctx, virtualRandom, "random", 0, c.JS_CFUNC_generic, 0));
-    const source = @import("sandbox/virtual.zig").prelude;
-    const result = c.JS_Eval(ctx, source, source.len, "<virtual>", c.JS_EVAL_TYPE_GLOBAL);
-    defer c.JS_FreeValue(ctx, result);
-    if (c.JS_IsException(result)) return error.PreludeFailed;
-}
-
-fn state(ctx: ?*c.JSContext) *State {
-    return @ptrCast(@alignCast(c.JS_GetContextOpaque(ctx).?));
-}
-
-fn isInterrupted(st: *State) bool {
-    if (st.cancel) |flag| if (flag.load(.acquire)) return true;
-    const elapsed = if (st.js_started) |started| started.durationTo(.now(st.io, .awake)).raw.toNanoseconds() else 0;
-    return elapsed >= st.js_remaining_ns;
-}
-
-fn virtualStopped(st: *State) bool {
-    if (st.host) |h| if (h.virtual) |v| return v.stopped(v.ctx);
-    return false;
-}
-
-fn interrupt(_: ?*c.JSContext, opaque_ptr: ?*anyopaque) callconv(.c) c_int {
-    const st: *State = @ptrCast(@alignCast(opaque_ptr.?));
-    return @intFromBool(isInterrupted(st) or virtualStopped(st));
-}
-
-fn nativeLog(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
-    const st = state(ctx);
-    if (argc < 1) return js_undefined;
-    var len: usize = 0;
-    const p = c.JS_ToCStringLen2(ctx, &len, argv[0], false) orelse return js_undefined;
-    defer c.JS_FreeCString(ctx, p);
-    st.logs.append(st.gpa, p[0..len]) catch {
-        st.oom = true;
-    };
-    return js_undefined;
-}
-
-fn nativeHost(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
-    return enqueue(state(ctx), ctx.?, argc, argv) catch |err| {
-        if (err == error.ReplayDivergence) {
-            const reason = c.JS_NewError(ctx);
-            _ = c.JS_SetPropertyStr(ctx, reason, "message", c.JS_NewString(ctx, "replay diverged"));
-            return c.JS_Throw(ctx, reason);
-        }
-        return c.JS_ThrowOutOfMemory(ctx);
-    };
-}
-
-fn enqueue(st: *State, ctx: *c.JSContext, argc: c_int, argv: [*c]c.JSValue) !c.JSValue {
-    if (st.host == null or argc < 2) return error.InvalidHostCall;
-    const call = try st.gpa.create(State.Call);
-    errdefer st.gpa.destroy(call);
-    const name = try toStr(st.gpa, ctx, argv[0]);
-    errdefer st.gpa.free(name);
-    const args = try toStr(st.gpa, ctx, argv[1]);
-    errdefer st.gpa.free(args);
-    var settle: [2]c.JSValue = undefined;
-    const promise = c.JS_NewPromiseCapability(ctx, &settle);
-    if (c.JS_IsException(promise)) return error.OutOfMemory;
-    errdefer {
-        c.JS_FreeValue(ctx, promise);
-        for (settle) |v| c.JS_FreeValue(ctx, v);
-    }
-    call.* = .{ .state = st, .index = st.calls.items.len, .creation_index = st.creation_index, .name = name, .args = args, .settle = settle };
-    if (st.host.?.virtual) |v| {
-        v.create(v.ctx, st.creation_index, name, args);
-        if (v.stopped(v.ctx)) return error.ReplayDivergence;
-    } else if (st.host.?.admit) |admit| {
-        if (try admit(st.host.?.ctx, st.gpa, name)) |message| {
-            call.result = .{ .err = message };
-            if (st.host.?.timing) |t| {
-                call.timing_index = t.reserveEntry(name);
-                if (call.timing_index) |i| {
-                    const ms = t.elapsed();
-                    t.complete(i, ms, ms, false);
-                    t.entries[i].dispatched = false;
-                }
-            }
-        }
-    }
-    errdefer if (call.result) |result| switch (result) {
-        inline else => |bytes| st.gpa.free(bytes),
-    };
-    if (st.host.?.virtual == null and call.result == null and std.mem.eql(u8, name, "sleep")) {
-        const ms = try std.json.parseFromSlice(u31, st.gpa, args, .{});
-        defer ms.deinit();
-        call.timer = .init(st.io, ms.value);
-    }
-    st.creation_index += 1;
-    try st.calls.append(st.gpa, call);
-    if (call.timer != null) {
-        if (st.host.?.timing) |t| {
-            call.timing_index = t.reserve(name);
-            if (call.timing_index) |i| {
-                const ms = t.elapsed();
-                t.complete(i, ms, ms, false);
-            }
-        }
-    }
-    return promise;
-}
-
-fn takeException(gpa: std.mem.Allocator, ctx: *c.JSContext) ![]u8 {
-    const exc = c.JS_GetException(ctx);
-    defer c.JS_FreeValue(ctx, exc);
-    return describeError(gpa, ctx, exc);
-}
-
-fn toJson(gpa: std.mem.Allocator, ctx: *c.JSContext, val: c.JSValue) ![]u8 {
-    if (c.JS_IsUndefined(val)) return gpa.dupe(u8, "undefined");
-    const json = c.JS_JSONStringify(ctx, val, js_undefined, js_undefined);
-    defer c.JS_FreeValue(ctx, json);
-    if (c.JS_IsException(json) or c.JS_IsUndefined(json)) {
-        c.JS_FreeValue(ctx, c.JS_GetException(ctx));
-        return toStr(gpa, ctx, val);
-    }
-    return toStr(gpa, ctx, json);
-}
-
-fn describeError(gpa: std.mem.Allocator, ctx: *c.JSContext, exc: c.JSValue) ![]u8 {
-    const msg = try toStr(gpa, ctx, exc);
-    const stack = c.JS_GetPropertyStr(ctx, exc, "stack");
-    defer c.JS_FreeValue(ctx, stack);
-    if (c.JS_IsUndefined(stack)) return msg;
-    defer gpa.free(msg);
-    const st = try toStr(gpa, ctx, stack);
-    defer gpa.free(st);
-    return std.fmt.allocPrint(gpa, "{s}\n{s}", .{ msg, std.mem.trimEnd(u8, st, "\n") });
-}
-
-fn toStr(gpa: std.mem.Allocator, ctx: *c.JSContext, val: c.JSValue) ![]u8 {
-    var len: usize = 0;
-    const p = c.JS_ToCStringLen2(ctx, &len, val, false) orelse return gpa.dupe(u8, "<unprintable>");
-    defer c.JS_FreeCString(ctx, p);
-    return gpa.dupe(u8, p[0..len]);
 }
 
 const testing = std.testing;
