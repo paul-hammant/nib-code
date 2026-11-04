@@ -1,4 +1,7 @@
 const std = @import("std");
+const vaxis = @import("vaxis");
+const App = @import("../tui.zig").App;
+const Event = @import("../tui.zig").Event;
 
 /// Edit the wording in reflect.md; `{{session_id}}`, `{{log_path}}`, `{{issue_repo}}` and `{{focus}}` are filled in here.
 const template = @embedFile("reflect.md");
@@ -35,9 +38,9 @@ pub fn append(io: std.Io, gpa: std.mem.Allocator, path: []const u8, e: Entry) !v
     const month_day = date.calculateMonthDay();
     const clock = day.getDaySeconds();
     try text.print(gpa, "## {d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2} UTC · session {s} · {s} · {s} · effort {s}\n", .{
-        date.year,                  month_day.month.numeric(), month_day.day_index + 1,
-        clock.getHoursIntoDay(),    clock.getMinutesIntoHour(), e.session_id[0..@min(8, e.session_id.len)],
-        e.cwd,                      e.model,                   e.effort,
+        date.year,               month_day.month.numeric(),  month_day.day_index + 1,
+        clock.getHoursIntoDay(), clock.getMinutesIntoHour(), e.session_id[0..@min(8, e.session_id.len)],
+        e.cwd,                   e.model,                    e.effort,
     });
     if (e.focus.len > 0) try text.print(gpa, "focus: {s}\n", .{e.focus});
     try text.print(gpa, "\n{s}\n\n", .{std.mem.trim(u8, e.answer, "\n")});
@@ -151,6 +154,115 @@ fn firstLine(text: []const u8) []const u8 {
 }
 
 const testing = std.testing;
+
+/// Background filing of one reflection's issue drafts; owns copies of everything it needs.
+pub const Issues = struct {
+    pub const default_repo = "yyydddkkk/nib-code";
+
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    loop: *vaxis.Loop(Event),
+    environ: *const std.process.Environ.Map,
+    arena: std.heap.ArenaAllocator,
+    drafts: []const Draft = &.{},
+    repo: []const u8 = "",
+    reflections_path: []const u8 = "",
+    session: []const u8 = "",
+    home: []const u8 = "",
+    cwd: []const u8 = "",
+    footer: []const u8 = "",
+    thread: ?std.Thread = null,
+
+    pub fn work(job: *Issues) void {
+        for (job.drafts) |draft| job.report(draft) catch {};
+        job.loop.postEvent(.issues_done) catch {};
+    }
+
+    fn report(job: *Issues, draft: Draft) !void {
+        const gpa = job.gpa;
+        var scratch: std.heap.ArenaAllocator = .init(gpa);
+        defer scratch.deinit();
+        const outcome = if (try sanitize(scratch.allocator(), draft, job.home, job.cwd)) |clean|
+            fileIssue(job.io, gpa, job.environ, "gh", job.repo, clean, job.footer) catch |err| try std.fmt.allocPrint(gpa, "could not file the issue: {s}", .{@errorName(err)})
+        else
+            try gpa.dupe(u8, "not filed: the draft looks like it contains a credential");
+        defer gpa.free(outcome);
+        const line = try std.fmt.allocPrint(gpa, "issue · {s} · {s}", .{ draft.title, outcome });
+        const record = try std.fmt.allocPrint(scratch.allocator(), "- session {s} · {s}\n", .{ job.session, line });
+        appendText(job.io, job.reflections_path, record) catch {};
+        job.loop.postEvent(.{ .issue = line }) catch gpa.free(line);
+    }
+
+    /// Joins the filing thread; gh runs to completion first.
+    pub fn finish(job: *Issues) void {
+        if (job.thread) |t| t.join();
+        job.arena.deinit();
+        job.gpa.destroy(job);
+    }
+};
+
+/// Appends the answer of a finished /reflect Turn to NIB_HOME/reflections.md.
+pub fn saveReflection(app: *App) !void {
+    const focus = app.reflecting orelse return;
+    defer stopReflecting(app);
+    const history = app.session.history.items;
+    const last = if (history.len > 0) history[history.len - 1] else return;
+    const answer = if (std.mem.eql(u8, last.role, "assistant")) last.content orelse "" else "";
+    if (answer.len == 0) return;
+    const path = try std.fs.path.join(app.gpa, &.{ app.session.options.home, "reflections.md" });
+    defer app.gpa.free(path);
+    const cwd = try std.process.currentPathAlloc(app.io, app.gpa);
+    defer app.gpa.free(cwd);
+    append(app.io, app.gpa, path, .{
+        .unix_seconds = @intCast(@divFloor(std.Io.Clock.real.now(app.io).nanoseconds, std.time.ns_per_s)),
+        .session_id = app.session.id,
+        .cwd = cwd,
+        .model = app.cfg.model,
+        .effort = app.cfg.effectiveEffort(),
+        .focus = focus,
+        .answer = answer,
+    }) catch |err| {
+        app.notice = std.fmt.bufPrint(&app.notice_buf, "could not save reflection to {s}: {s}", .{ path, @errorName(err) }) catch null;
+        return;
+    };
+    app.notice = std.fmt.bufPrint(&app.notice_buf, "reflection saved to {s}", .{path}) catch null;
+    try fileIssues(app, answer, path);
+}
+
+/// Null when `NIB_ISSUE_REPO=off`.
+pub fn issueRepo(app: *const App) ?[]const u8 {
+    const repo = app.environ.get("NIB_ISSUE_REPO") orelse Issues.default_repo;
+    return if (std.mem.eql(u8, repo, "off")) null else repo;
+}
+
+/// Publishes the reflection's issue drafts in the background; no confirmation by design.
+pub fn fileIssues(app: *App, answer: []const u8, reflections_path: []const u8) !void {
+    const repo = issueRepo(app) orelse return;
+    if (app.issues != null) return;
+    const job = try app.gpa.create(Issues);
+    job.* = .{ .gpa = app.gpa, .io = app.io, .loop = app.loop, .environ = app.environ, .arena = .init(app.gpa) };
+    errdefer job.finish();
+    const a = job.arena.allocator();
+    job.drafts = try drafts(a, answer);
+    if (job.drafts.len == 0) {
+        job.finish();
+        return;
+    }
+    job.repo = try a.dupe(u8, repo);
+    job.reflections_path = try a.dupe(u8, reflections_path);
+    job.session = try a.dupe(u8, app.session.id[0..8]);
+    job.home = try a.dupe(u8, app.environ.get("HOME") orelse "");
+    job.cwd = try std.process.currentPathAlloc(app.io, a);
+    job.footer = try std.fmt.allocPrint(a, "_Filed automatically by nib /reflect · nib {s} · {s} · effort {s} · session {s}_", .{ @import("build_options").version, app.cfg.model, app.cfg.effectiveEffort(), job.session });
+    job.thread = try std.Thread.spawn(.{}, Issues.work, .{job});
+    app.issues = job;
+    try app.report(.info, "filing {d} issue draft{s} to {s}", .{ job.drafts.len, if (job.drafts.len == 1) "" else "s", repo });
+}
+
+pub fn stopReflecting(app: *App) void {
+    if (app.reflecting) |focus| app.gpa.free(focus);
+    app.reflecting = null;
+}
 
 test "prompt fills the session, log path, issue repo and optional focus" {
     const plain = try prompt(testing.allocator, "abc123", "/h/.nib/sessions/abc123.jsonl", "o/r", "");

@@ -1,4 +1,9 @@
 const std = @import("std");
+const App = @import("../tui.zig").App;
+const Turn = @import("turn.zig").Turn;
+const reflect = @import("reflect.zig");
+const config = @import("../config.zig");
+const ChangeText = @import("transcript.zig").ChangeText;
 const provider = @import("../provider.zig");
 
 pub const Command = enum { help, new, @"resume", compact, effort, copy, reflect, js };
@@ -145,6 +150,93 @@ pub fn helpText(gpa: std.mem.Allocator) ![]u8 {
 }
 
 const testing = std.testing;
+
+pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
+    const gpa = app.gpa;
+    const session = app.session;
+    switch (c) {
+        .help => {
+            const text = try helpText(gpa);
+            defer gpa.free(text);
+            try app.transcript.add(gpa, .info, text);
+        },
+        .new, .@"resume" => {
+            const id = if (c == .new) null else app.menu.resolveSession(app.io, session, arg) catch |err| {
+                return app.transcript.add(gpa, .err, switch (err) {
+                    error.MissingSessionId => "usage: /resume <id> · type /resume and a space to pick one",
+                    error.UnknownSession => "no session here starts with that id",
+                    error.AmbiguousSession => "several sessions start with that id; type more of it",
+                    else => @errorName(err),
+                });
+            };
+            if (id != null and std.mem.eql(u8, id.?, session.id)) return app.transcript.add(gpa, .info, "already in this session");
+            session.reopen(id) catch |err| return app.report(.err, "could not open session: {s}", .{@errorName(err)});
+            app.transcript.clear(gpa);
+            app.background_count = 0;
+            try app.transcript.addHistory(gpa, session.history.items);
+            app.usage = .{};
+            app.steps = 0;
+            app.context = session.context_tokens;
+            try app.report(.info, "{s} session {s}", .{ if (c == .new) "new" else "resumed", session.id[0..8] });
+        },
+        .copy => {
+            const answer = app.transcript.lastAnswer() orelse return app.transcript.add(gpa, .err, "no answer to copy yet");
+            try app.vx.copyToSystemClipboard(app.w, answer, gpa);
+            try app.report(.info, "copied {d} bytes (needs a terminal with OSC 52 clipboard support)", .{answer.len});
+        },
+        .effort => {
+            if (arg.len > 0) {
+                app.cfg.setEffort(arg) catch return app.transcript.add(gpa, .err, "usage: /effort [default|off|none|minimal|low|medium|high|xhigh|max]");
+                session.cfg = app.cfg;
+                session.tools.cfg = app.cfg;
+                config.saveEffort(gpa, app.io, session.options.home, arg) catch |err| {
+                    try app.report(.err, "effort applied, but could not save {s}/config.toml: {s}", .{ session.options.home, @errorName(err) });
+                    return;
+                };
+                try app.report(.info, "effort: {s} · saved to {s}/config.toml (environment and --effort override saved preferences)", .{ app.cfg.effectiveEffort(), session.options.home });
+                return;
+            }
+            try app.report(.info, "effort: {s} · thinking: {s} · configured: {s} (model support varies)", .{
+                app.cfg.effectiveEffort(),
+                if (app.cfg.thinking) |on| (if (on) "on" else "off") else "default",
+                app.cfg.reasoning_effort orelse "default",
+            });
+        },
+        .js => {
+            if (arg.len == 0) return app.transcript.add(gpa, .err, "usage: /js <code>");
+            try app.transcript.add(gpa, .user, line);
+            defer app.transcript.next_run = session.tools.run_id;
+            const ran = try session.run(arg, null);
+            const r = ran.outcome;
+            app.usage = session.usage;
+            defer r.deinit(gpa);
+            if (r.logs.len > 0) try app.transcript.add(gpa, .info, std.mem.trimEnd(u8, r.logs, "\n"));
+            try app.transcript.add(gpa, if (r.ok) .info else .err, r.text);
+            var changes: ChangeText = try .init(gpa, ran.changes);
+            defer changes.deinit(gpa);
+            if (changes.diff.len > 0) try app.transcript.add(gpa, .info, std.mem.trimEnd(u8, changes.diff, "\n"));
+        },
+        .compact => {
+            app.turn = try Turn.spawn(gpa, session, app.loop, try gpa.dupe(u8, line), true);
+            app.live_steps = 0;
+            app.activity = .start(app.io, .compacting);
+        },
+        .reflect => {
+            if (app.cfg.missingKey()) return app.transcript.add(gpa, .err, "no API key");
+            const log_path = try std.fmt.allocPrint(gpa, "{s}/sessions/{s}.jsonl", .{ session.options.home, session.id });
+            defer gpa.free(log_path);
+            const text = try reflect.prompt(gpa, session.id, log_path, reflect.issueRepo(app) orelse reflect.Issues.default_repo, arg);
+            errdefer gpa.free(text);
+            const focus = try gpa.dupe(u8, arg);
+            errdefer gpa.free(focus);
+            try app.transcript.add(gpa, .user, line);
+            app.turn = try Turn.spawn(gpa, session, app.loop, text, false);
+            app.live_steps = 0;
+            app.activity = .start(app.io, .thinking);
+            app.reflecting = focus;
+        },
+    }
+}
 
 test "parse tells commands from paths and messages" {
     try testing.expect(parse("hello") == null);

@@ -3,9 +3,7 @@ const vaxis = @import("vaxis");
 const Session = @import("session.zig").Session;
 const SessionEvent = @import("session.zig").Event;
 const ModelActivity = @import("session.zig").ModelActivity;
-const Sink = @import("session.zig").Sink;
 const provider = @import("provider.zig");
-const config = @import("config.zig");
 const Editor = @import("tui/editor.zig").Editor;
 const commands = @import("tui/commands.zig");
 const Transcript = @import("tui/transcript.zig").Transcript;
@@ -17,11 +15,13 @@ const status = @import("tui/status.zig");
 const view = @import("tui/view.zig");
 const selection = @import("tui/selection.zig");
 const reflect = @import("tui/reflect.zig");
+const Turn = @import("tui/turn.zig").Turn;
+const Ticker = @import("tui/turn.zig").Ticker;
 const bill = @import("tui/bill.zig");
 const TurnSummary = @import("session/events.zig").TurnSummary;
 const ToolSummary = @import("session/tool_summary.zig").Summary;
 
-const Event = union(enum) {
+pub const Event = union(enum) {
     key_press: vaxis.Key,
     winsize: vaxis.Winsize,
     paste_start,
@@ -46,174 +46,6 @@ const Event = union(enum) {
     /// One outcome line from automatic issue filing, owned by the receiver.
     issue: []u8,
     issues_done,
-};
-
-/// Posts `.tick` while `busy` so the spinner and timer advance without input.
-const Ticker = struct {
-    io: std.Io,
-    loop: *vaxis.Loop(Event),
-    busy: std.atomic.Value(bool) = .init(false),
-    stop: std.atomic.Value(bool) = .init(false),
-
-    fn work(t: *Ticker) void {
-        while (!t.stop.load(.acquire)) {
-            std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(100), .clock = .awake }, t.io) catch return;
-            if (t.busy.load(.acquire)) t.loop.postEvent(.tick) catch {};
-        }
-    }
-};
-
-/// A Turn or `/compact` on its own thread. Only Session.enqueue is shared with the UI.
-const Turn = struct {
-    gpa: std.mem.Allocator,
-    session: *Session,
-    text: []const u8,
-    loop: *vaxis.Loop(Event),
-    cancel: std.atomic.Value(bool) = .init(false),
-    thread: std.Thread = undefined,
-    last_model_activity: ?std.Io.Clock.Timestamp = null,
-
-    fn spawn(gpa: std.mem.Allocator, session: *Session, loop: *vaxis.Loop(Event), text: []const u8, compact: bool) !*Turn {
-        const t = try gpa.create(Turn);
-        errdefer gpa.destroy(t);
-        t.* = .{ .gpa = gpa, .session = session, .text = text, .loop = loop };
-        t.thread = try std.Thread.spawn(.{}, work, .{ t, compact });
-        return t;
-    }
-
-    fn work(t: *Turn, compact: bool) void {
-        var detail: ?[]u8 = null;
-        t.execute(compact, &detail) catch |err| {
-            const msg = detail orelse (t.gpa.dupe(u8, @errorName(err)) catch return);
-            t.loop.postEvent(.{ .failed = msg }) catch t.gpa.free(msg);
-            return;
-        };
-        t.loop.postEvent(.done) catch {};
-    }
-
-    fn execute(t: *Turn, compact: bool, detail: *?[]u8) !void {
-        const sink: Sink = .{ .ctx = t, .emit = emit, .onModelActivity = modelActivity, .onUserInserted = userInserted };
-        if (compact) {
-            errdefer t.session.tools.background.stop(t.gpa);
-            _ = try t.session.compact(sink, &t.cancel, detail);
-        } else try t.session.turn(t.text, sink, &t.cancel, detail);
-    }
-
-    fn userInserted(ctx: *anyopaque, id: u64) !void {
-        const t: *Turn = @ptrCast(@alignCast(ctx));
-        try t.loop.postEvent(.{ .user_inserted = id });
-    }
-
-    fn modelActivity(ctx: *anyopaque, state: ModelActivity) !void {
-        const t: *Turn = @ptrCast(@alignCast(ctx));
-        try t.modelActivityAt(state, .now(t.session.io, .awake));
-    }
-
-    fn modelActivityAt(t: *Turn, state: ModelActivity, at: std.Io.Clock.Timestamp) !void {
-        if (state == .data) if (t.last_model_activity) |last| {
-            if (last.durationTo(at).raw.toMilliseconds() < 1000) return;
-        };
-        try t.loop.postEvent(.{ .model_activity = .{ .state = state, .at = at } });
-        t.last_model_activity = if (state == .finished) null else at;
-    }
-
-    fn emit(ctx: *anyopaque, ev: SessionEvent) !void {
-        const t: *Turn = @ptrCast(@alignCast(ctx));
-        const gpa = t.gpa;
-        const event: Event = switch (ev) {
-            .step => |s| .{ .step = .{ .n = s.n, .effort = try gpa.dupe(u8, s.effort), .source = s.source } },
-            .delta => |d| .{ .delta = .{ .kind = d.kind, .text = try gpa.dupe(u8, d.text), .step = t.session.steps + 1 } },
-            .run_start => |code| .{ .run_start = .{ .code = try gpa.dupe(u8, code), .step = t.session.steps } },
-            .run_end => |r| blk: {
-                const output = try gpa.dupe(u8, r.output);
-                errdefer gpa.free(output);
-                var changes = try ChangeText.init(gpa, r.changes);
-                errdefer changes.deinit(gpa);
-                break :blk .{ .run_end = .{ .ok = r.ok, .output = output, .changes = changes, .tool_summary = if (r.tool_summary) |summary| try summary.clone(gpa) else null } };
-            },
-            .retry => |r| .{ .retry = try std.fmt.allocPrint(gpa, "retry {d} in {d}s: {s}", .{ r.attempt, r.delay_ms / 1000, r.reason }) },
-            .notice => |m| .{ .notice = try gpa.dupe(u8, m) },
-            .usage => |u| .{ .usage = .{ .tokens = u, .context = t.session.context_tokens, .steps = t.session.steps } },
-            .progress => |p| .{ .progress = try p.clone(gpa) },
-            .background => |b| blk: {
-                const id = try gpa.dupe(u8, b.id);
-                errdefer gpa.free(id);
-                break :blk .{ .background = .{ .id = id, .kind = b.kind, .state = b.state, .ok = b.ok, .result = if (b.result) |result| try gpa.dupe(u8, result) else null } };
-            },
-            .turn_end => |summary| .{ .turn_end = summary },
-        };
-        errdefer switch (event) {
-            .run_end => |r| {
-                gpa.free(r.output);
-                var changes = r.changes;
-                changes.deinit(gpa);
-                if (r.tool_summary) |summary| summary.deinit(gpa);
-            },
-            .step => |s| gpa.free(s.effort),
-            .background => |b| {
-                gpa.free(b.id);
-                if (b.result) |result| gpa.free(result);
-            },
-            .progress => |p| {
-                var owned = p;
-                owned.deinit(gpa);
-            },
-            else => {},
-        };
-        try t.loop.postEvent(event);
-    }
-
-    fn finish(t: *Turn) void {
-        t.thread.join();
-        t.gpa.free(t.text);
-        t.gpa.destroy(t);
-    }
-};
-
-/// Background filing of one reflection's issue drafts; owns copies of everything it needs.
-const Issues = struct {
-    const default_repo = "yyydddkkk/nib-code";
-
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    loop: *vaxis.Loop(Event),
-    environ: *const std.process.Environ.Map,
-    arena: std.heap.ArenaAllocator,
-    drafts: []const reflect.Draft = &.{},
-    repo: []const u8 = "",
-    reflections_path: []const u8 = "",
-    session: []const u8 = "",
-    home: []const u8 = "",
-    cwd: []const u8 = "",
-    footer: []const u8 = "",
-    thread: ?std.Thread = null,
-
-    fn work(job: *Issues) void {
-        for (job.drafts) |draft| job.report(draft) catch {};
-        job.loop.postEvent(.issues_done) catch {};
-    }
-
-    fn report(job: *Issues, draft: reflect.Draft) !void {
-        const gpa = job.gpa;
-        var scratch: std.heap.ArenaAllocator = .init(gpa);
-        defer scratch.deinit();
-        const outcome = if (try reflect.sanitize(scratch.allocator(), draft, job.home, job.cwd)) |clean|
-            reflect.fileIssue(job.io, gpa, job.environ, "gh", job.repo, clean, job.footer) catch |err| try std.fmt.allocPrint(gpa, "could not file the issue: {s}", .{@errorName(err)})
-        else
-            try gpa.dupe(u8, "not filed: the draft looks like it contains a credential");
-        defer gpa.free(outcome);
-        const line = try std.fmt.allocPrint(gpa, "issue · {s} · {s}", .{ draft.title, outcome });
-        const record = try std.fmt.allocPrint(scratch.allocator(), "- session {s} · {s}\n", .{ job.session, line });
-        reflect.appendText(job.io, job.reflections_path, record) catch {};
-        job.loop.postEvent(.{ .issue = line }) catch gpa.free(line);
-    }
-
-    /// Joins the filing thread; gh runs to completion first.
-    fn finish(job: *Issues) void {
-        if (job.thread) |t| t.join();
-        job.arena.deinit();
-        job.gpa.destroy(job);
-    }
 };
 
 /// `session` may already hold history (a resumed Session); it is shown first.
@@ -274,7 +106,7 @@ pub fn run(init: std.process.Init, session: *Session) !void {
     }
 }
 
-const App = struct {
+pub const App = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     session: *Session,
@@ -289,7 +121,7 @@ const App = struct {
     notice_buf: [256]u8 = undefined,
     /// Set while a /reflect Turn runs: its focus, owned.
     reflecting: ?[]u8 = null,
-    issues: ?*Issues = null,
+    issues: ?*reflect.Issues = null,
     transcript: Transcript = .{},
     input: Editor = .{},
     pasting: bool = false,
@@ -307,6 +139,10 @@ const App = struct {
     turn: ?*Turn = null,
     // turn_end precedes done/failed; append only after their terminal content.
     pending_bill: ?TurnSummary = null,
+
+    const command = commands.execute;
+    const saveReflection = reflect.saveReflection;
+    const stopReflecting = reflect.stopReflecting;
 
     fn deinit(app: *App) void {
         if (app.turn) |t| {
@@ -551,160 +387,10 @@ const App = struct {
         app.activity = .start(app.io, .thinking);
     }
 
-    fn command(app: *App, c: commands.Command, arg: []const u8, line: []const u8) !void {
-        const gpa = app.gpa;
-        const session = app.session;
-        switch (c) {
-            .help => {
-                const text = try commands.helpText(gpa);
-                defer gpa.free(text);
-                try app.transcript.add(gpa, .info, text);
-            },
-            .new, .@"resume" => {
-                const id = if (c == .new) null else app.menu.resolveSession(app.io, session, arg) catch |err| {
-                    return app.transcript.add(gpa, .err, switch (err) {
-                        error.MissingSessionId => "usage: /resume <id> · type /resume and a space to pick one",
-                        error.UnknownSession => "no session here starts with that id",
-                        error.AmbiguousSession => "several sessions start with that id; type more of it",
-                        else => @errorName(err),
-                    });
-                };
-                if (id != null and std.mem.eql(u8, id.?, session.id)) return app.transcript.add(gpa, .info, "already in this session");
-                session.reopen(id) catch |err| return app.report(.err, "could not open session: {s}", .{@errorName(err)});
-                app.transcript.clear(gpa);
-                app.background_count = 0;
-                try app.transcript.addHistory(gpa, session.history.items);
-                app.usage = .{};
-                app.steps = 0;
-                app.context = session.context_tokens;
-                try app.report(.info, "{s} session {s}", .{ if (c == .new) "new" else "resumed", session.id[0..8] });
-            },
-            .copy => {
-                const answer = app.transcript.lastAnswer() orelse return app.transcript.add(gpa, .err, "no answer to copy yet");
-                try app.vx.copyToSystemClipboard(app.w, answer, gpa);
-                try app.report(.info, "copied {d} bytes (needs a terminal with OSC 52 clipboard support)", .{answer.len});
-            },
-            .effort => {
-                if (arg.len > 0) {
-                    app.cfg.setEffort(arg) catch return app.transcript.add(gpa, .err, "usage: /effort [default|off|none|minimal|low|medium|high|xhigh|max]");
-                    session.cfg = app.cfg;
-                    session.tools.cfg = app.cfg;
-                    config.saveEffort(gpa, app.io, session.options.home, arg) catch |err| {
-                        try app.report(.err, "effort applied, but could not save {s}/config.toml: {s}", .{ session.options.home, @errorName(err) });
-                        return;
-                    };
-                    try app.report(.info, "effort: {s} · saved to {s}/config.toml (environment and --effort override saved preferences)", .{ app.cfg.effectiveEffort(), session.options.home });
-                    return;
-                }
-                try app.report(.info, "effort: {s} · thinking: {s} · configured: {s} (model support varies)", .{
-                    app.cfg.effectiveEffort(),
-                    if (app.cfg.thinking) |on| (if (on) "on" else "off") else "default",
-                    app.cfg.reasoning_effort orelse "default",
-                });
-            },
-            .js => {
-                if (arg.len == 0) return app.transcript.add(gpa, .err, "usage: /js <code>");
-                try app.transcript.add(gpa, .user, line);
-                defer app.transcript.next_run = session.tools.run_id;
-                const ran = try session.run(arg, null);
-                const r = ran.outcome;
-                app.usage = session.usage;
-                defer r.deinit(gpa);
-                if (r.logs.len > 0) try app.transcript.add(gpa, .info, std.mem.trimEnd(u8, r.logs, "\n"));
-                try app.transcript.add(gpa, if (r.ok) .info else .err, r.text);
-                var changes: ChangeText = try .init(gpa, ran.changes);
-                defer changes.deinit(gpa);
-                if (changes.diff.len > 0) try app.transcript.add(gpa, .info, std.mem.trimEnd(u8, changes.diff, "\n"));
-            },
-            .compact => {
-                app.turn = try Turn.spawn(gpa, session, app.loop, try gpa.dupe(u8, line), true);
-                app.live_steps = 0;
-                app.activity = .start(app.io, .compacting);
-            },
-            .reflect => {
-                if (app.cfg.missingKey()) return app.transcript.add(gpa, .err, "no API key");
-                const log_path = try std.fmt.allocPrint(gpa, "{s}/sessions/{s}.jsonl", .{ session.options.home, session.id });
-                defer gpa.free(log_path);
-                const text = try reflect.prompt(gpa, session.id, log_path, app.issueRepo() orelse Issues.default_repo, arg);
-                errdefer gpa.free(text);
-                const focus = try gpa.dupe(u8, arg);
-                errdefer gpa.free(focus);
-                try app.transcript.add(gpa, .user, line);
-                app.turn = try Turn.spawn(gpa, session, app.loop, text, false);
-                app.live_steps = 0;
-                app.activity = .start(app.io, .thinking);
-                app.reflecting = focus;
-            },
-        }
-    }
-
-    fn report(app: *App, kind: EntryKind, comptime fmt: []const u8, args: anytype) !void {
+    pub fn report(app: *App, kind: EntryKind, comptime fmt: []const u8, args: anytype) !void {
         const message = try std.fmt.allocPrint(app.gpa, fmt, args);
         defer app.gpa.free(message);
         try app.transcript.add(app.gpa, kind, message);
-    }
-
-    /// Appends the answer of a finished /reflect Turn to NIB_HOME/reflections.md.
-    fn saveReflection(app: *App) !void {
-        const focus = app.reflecting orelse return;
-        defer app.stopReflecting();
-        const history = app.session.history.items;
-        const last = if (history.len > 0) history[history.len - 1] else return;
-        const answer = if (std.mem.eql(u8, last.role, "assistant")) last.content orelse "" else "";
-        if (answer.len == 0) return;
-        const path = try std.fs.path.join(app.gpa, &.{ app.session.options.home, "reflections.md" });
-        defer app.gpa.free(path);
-        const cwd = try std.process.currentPathAlloc(app.io, app.gpa);
-        defer app.gpa.free(cwd);
-        reflect.append(app.io, app.gpa, path, .{
-            .unix_seconds = @intCast(@divFloor(std.Io.Clock.real.now(app.io).nanoseconds, std.time.ns_per_s)),
-            .session_id = app.session.id,
-            .cwd = cwd,
-            .model = app.cfg.model,
-            .effort = app.cfg.effectiveEffort(),
-            .focus = focus,
-            .answer = answer,
-        }) catch |err| {
-            app.notice = std.fmt.bufPrint(&app.notice_buf, "could not save reflection to {s}: {s}", .{ path, @errorName(err) }) catch null;
-            return;
-        };
-        app.notice = std.fmt.bufPrint(&app.notice_buf, "reflection saved to {s}", .{path}) catch null;
-        try app.fileIssues(answer, path);
-    }
-
-    /// Null when `NIB_ISSUE_REPO=off`.
-    fn issueRepo(app: *const App) ?[]const u8 {
-        const repo = app.environ.get("NIB_ISSUE_REPO") orelse Issues.default_repo;
-        return if (std.mem.eql(u8, repo, "off")) null else repo;
-    }
-
-    /// Publishes the reflection's issue drafts in the background; no confirmation by design.
-    fn fileIssues(app: *App, answer: []const u8, reflections_path: []const u8) !void {
-        const repo = app.issueRepo() orelse return;
-        if (app.issues != null) return;
-        const job = try app.gpa.create(Issues);
-        job.* = .{ .gpa = app.gpa, .io = app.io, .loop = app.loop, .environ = app.environ, .arena = .init(app.gpa) };
-        errdefer job.finish();
-        const a = job.arena.allocator();
-        job.drafts = try reflect.drafts(a, answer);
-        if (job.drafts.len == 0) {
-            job.finish();
-            return;
-        }
-        job.repo = try a.dupe(u8, repo);
-        job.reflections_path = try a.dupe(u8, reflections_path);
-        job.session = try a.dupe(u8, app.session.id[0..8]);
-        job.home = try a.dupe(u8, app.environ.get("HOME") orelse "");
-        job.cwd = try std.process.currentPathAlloc(app.io, a);
-        job.footer = try std.fmt.allocPrint(a, "_Filed automatically by nib /reflect · nib {s} · {s} · effort {s} · session {s}_", .{ @import("build_options").version, app.cfg.model, app.cfg.effectiveEffort(), job.session });
-        job.thread = try std.Thread.spawn(.{}, Issues.work, .{job});
-        app.issues = job;
-        try app.report(.info, "filing {d} issue draft{s} to {s}", .{ job.drafts.len, if (job.drafts.len == 1) "" else "s", repo });
-    }
-
-    fn stopReflecting(app: *App) void {
-        if (app.reflecting) |focus| app.gpa.free(focus);
-        app.reflecting = null;
     }
 
     fn appendBill(app: *App) !void {
