@@ -390,9 +390,11 @@ pub const Session = struct {
             var inserted = try s.inbox.insert(s.gpa, s.io, s.arena.allocator(), pending);
             defer inserted.deinit(s.gpa);
             var has_background = false;
+            var background_output_bytes: u64 = 0;
             for (inserted.items.items) |item| {
                 if (item.background) |b| {
                     has_background = true;
+                    background_output_bytes += item.text.len;
                     s.tools.background.delivered(s.io, b.id);
                     var event = b;
                     event.result = if (std.mem.indexOfScalar(u8, item.text, '\n')) |nl| item.text[nl + 1 ..] else item.text;
@@ -476,7 +478,7 @@ pub const Session = struct {
                 .calls = run_timing.entries[0..run_timing.count],
                 .calls_omitted = run_timing.omitted,
                 .tool_bytes = run_timing.tool_bytes,
-                .output_bytes = run_timing.output_bytes,
+                .output_bytes = run_timing.output_bytes + background_output_bytes,
                 .run_results = run_results.items,
             });
             s.summary.?.steps += 1;
@@ -484,7 +486,7 @@ pub const Session = struct {
             s.summary.?.timing.model_ms += model_ms;
             s.summary.?.timing.run_ms += run_ms;
             s.summary.?.timing.tool_bytes += run_timing.tool_bytes;
-            s.summary.?.timing.output_bytes += run_timing.output_bytes;
+            s.summary.?.timing.output_bytes += run_timing.output_bytes + background_output_bytes;
             s.summary.?.timing.llm_calls += run_timing.llm_calls;
             s.summary.?.timing.agent_calls += run_timing.agent_calls;
             pending.clearRetainingCapacity();

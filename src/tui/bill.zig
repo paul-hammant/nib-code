@@ -19,7 +19,7 @@ pub const Text = struct {
             componentDuration(&model, summary.timing.model_ms),
             componentDuration(&run, summary.timing.run_ms),
         }) catch unreachable;
-        if (summary.timing.tool_bytes > 0) w.print(" · {s}→{s} B", .{
+        if (summary.timing.tool_bytes > 0 or summary.timing.output_bytes > 0) w.print(" · {s}→{s} B", .{
             tokens(&tool_bytes, summary.timing.tool_bytes),
             tokens(&output_bytes, summary.timing.output_bytes),
         }) catch unreachable;
@@ -145,11 +145,12 @@ test "bill prefixes canceled and failed outcomes" {
     }
 }
 
-test "bill omits bytes when tool bytes are zero and retains zero output" {
+test "bill omits zero bytes and shows output without tool bytes" {
     var text: Text = .{};
     var summary: TurnSummary = .{};
-    summary.timing.output_bytes = 18_000;
     try std.testing.expectEqualStrings("0 steps · 0s · think 0s · tools 0s · 0 tok (0% cached)", text.format(summary, 200));
+    summary.timing.output_bytes = 18_000;
+    try std.testing.expectEqualStrings("0 steps · 0s · think 0s · tools 0s · 0→18k B · 0 tok (0% cached)", text.format(summary, 200));
     summary.timing.tool_bytes = 320;
     summary.timing.output_bytes = 0;
     try std.testing.expectEqualStrings("0 steps · 0s · think 0s · tools 0s · 320→0 B · 0 tok (0% cached)", text.format(summary, 200));

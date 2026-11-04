@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 
+from background_assertions import assert_background_bytes, root_records
 from mock_agent import USAGE, reply
 from mock_llm_tool import content
 from test_agent import alive
@@ -47,6 +48,8 @@ class Mock(http.server.ThreadingHTTPServer):
                     agent("two") + ", " + agent("three", background=True) + "])")
         if self.case in ("cancel", "limit"):
             return "await " + agent("worker", background=True)
+        if self.case.startswith("injected_"):
+            return "await " + agent("one", background=True)
         if self.case == "fifo":
             return "await " + agent("one", background=True)
         if self.case == "boundary":
@@ -78,6 +81,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with self.server.lock:
             step = sum(r["prompt"] == prompt for r in self.server.requests)
             self.server.requests.append(dict(prompt=prompt, body=body, messages=messages, step=step))
+        if (prompt == "initial" and self.server.case.startswith("injected_") and
+                any(content(m).startswith("[background ") for m in messages)):
+            if self.server.case == "injected_cancel":
+                self.server.parent_gate.wait(15)
+                return
+            data = json.dumps({"error": {"message": "injected request failed"}}).encode()
+            self.send_response(400)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         code, text = None, "complete"
         if prompt == "initial":
             if step == 0:
@@ -108,7 +122,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 code = "await tools.bash(" + json.dumps({"command": command}) + ")"
             text = "worker finished"
         elif prompt == "child:long":
-            text = "head:" + "z" * 50000 + ":tail"
+            text = "head:" + "中文🙂" * 2500 + ":tail"
         else:
             self.server.gates[prompt.split(":")[1]].wait(15)
             text = "done:" + prompt
@@ -178,8 +192,36 @@ class BackgroundTests:
     def log(self, events):
         return records(self.home / "sessions" / (events[0]["start"]["session_id"] + ".jsonl"))
 
+    def assert_accounting(self, mock, events=None):
+        log = self.log(events) if events is not None else root_records(self.home)
+        terminal = events[-1].get("end", events[-1].get("error")) if events is not None else None
+        return assert_background_bytes(self, log, mock.observed("initial"), terminal)
+
     def completions(self, messages):
         return [m for m in messages if content(m).startswith("[background agent ")]
+
+    def check_injected_request_aborted(self, cancel):
+        mock = self.mock("injected_cancel" if cancel else "injected_failure")
+        process = self.start()
+        wait_for(lambda: len(mock.observed("initial")) == 2)
+        mock.gates["one"].set()
+        wait_for(lambda: len(mock.observed("initial")) == 3)
+        self.assertTrue(any(content(m).startswith("[background ")
+                            for m in mock.observed("initial")[-1]["messages"]))
+        if cancel:
+            process.send_signal(signal.SIGINT)
+        events = self.finish(process, ok=False)
+        steps = self.assert_accounting(mock, events)
+        self.assertEqual(len(steps), 2)
+        self.assertEqual(steps[-1]["output_bytes"], 0)
+        self.assertEqual(events[-1]["error"]["timing"]["output_bytes"],
+                         sum(run["output_bytes"] for step in steps for run in step["run_results"]))
+
+    def test_failed_request_does_not_count_injected_result(self):
+        self.check_injected_request_aborted(cancel=False)
+
+    def test_canceled_request_does_not_count_injected_result(self):
+        self.check_injected_request_aborted(cancel=True)
 
     def test_returns_immediately_and_delivers_each_completion(self):
         mock = self.mock("basic")
@@ -223,6 +265,7 @@ class BackgroundTests:
             body = request["body"]
             effort = body.get("reasoning", {}).get("effort") if self.provider == "codex" else body.get("reasoning_effort")
             self.assertEqual(effort, "high", body)
+        self.assert_accounting(mock, events)
 
     def child_logged(self, text):
         return any(text in path.read_text() for path in (self.home / "sessions").glob("?" * 32 + ".jsonl"))
@@ -245,6 +288,7 @@ class BackgroundTests:
         self.assertLessEqual(len(runs[-1]["output"].encode()), 16 * 1024)
         logged = [m for r in self.log(events) for m in r.get("messages", []) if m.get("source") == "background" and m.get("background_kind") == "agent"]
         self.assertEqual([m["background_id"] for m in logged], ["a1"])
+        self.assert_accounting(mock, events)
 
     def test_launch_error_keeps_prior_agent(self):
         mock = self.mock("launch_error")
@@ -267,6 +311,7 @@ class BackgroundTests:
         self.assertEqual([e["background"]["state"] for e in events if "background" in e],
                          ["started", "finished"])
         self.assertEqual(len(self.completions(mock.observed("initial")[-1]["messages"])), 1)
+        self.assert_accounting(mock, events)
 
     def test_completion_order_follows_finish_order(self):
         mock = self.mock("basic")
@@ -301,6 +346,9 @@ class BackgroundTests:
         self.assertIn("head:", content(message))
         self.assertIn(":tail", content(message))
         self.assertEqual(events[-1]["end"]["text"], "complete")
+        self.assert_accounting(mock, events)
+        self.assertGreater(len(content(message).encode("utf-8")), len(content(message)))
+        self.assertIn("中文🙂", content(message))
 
     def test_foreground_and_background_share_concurrency(self):
         (self.home / "config.toml").write_text("[limits]\nagent_concurrency = 1\n")
@@ -325,6 +373,7 @@ class BackgroundTests:
         self.assertTrue(result["error"])
         self.assertEqual(set(result), {"ok", "text", "changes", "error"})
         self.assertFalse([e["background"] for e in events if e.get("background", {}).get("kind") == "agent" and e.get("background", {}).get("state") == "finished"][0]["ok"])
+        self.assert_accounting(mock, events)
 
     def worker_pids(self):
         path = self.cwd / "worker.started"
@@ -397,6 +446,7 @@ class ChatTests(BackgroundTests, unittest.TestCase):
         logged = [m for p in (self.home / "sessions").glob("?" * 32 + ".jsonl") for r in records(p)
                   for m in r.get("messages", []) if m.get("source") == "background" and m.get("background_kind") == "agent"]
         self.assertEqual([m["background_id"] for m in logged], ["a1"])
+        self.assert_accounting(mock)
 
     def test_escape_cancels_pending(self):
         self.mock("cancel")
