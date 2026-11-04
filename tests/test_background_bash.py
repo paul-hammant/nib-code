@@ -90,6 +90,12 @@ class Mock(http.server.ThreadingHTTPServer):
             return "await " + bash(shlex.join([sys.executable, "-c", program]), timeout_ms=500)
         if self.case == "nonzero":
             return "await " + bash("echo failed; exit 7")
+        if self.case == "inherited_pipe":
+            program = ("import os,time,pathlib; pathlib.Path('worker.started').write_text(str(os.getpid())); "
+                       "time.sleep(8)")
+            command = (shlex.join([sys.executable, "-c", program]) +
+                       " & while [ ! -f worker.started ]; do sleep .01; done; echo started; exit 7")
+            return "await " + bash(command, timeout_ms=2000)
         if self.case == "long":
             return "await " + bash("python3 -c 'print(\"head:\" + \"z\" * 50000 + \":tail\")'")
         if self.case == "cancel":
@@ -290,6 +296,16 @@ class BackgroundBashTests:
         self.finish(self.start())
         result = json.loads(content(self.completion(mock.observed()[-1]["messages"])).split("\n", 1)[1])
         self.assertEqual(result, {"exit_code": 7, "output": "failed\n"})
+
+    def test_shell_exit_finishes_despite_inherited_stdout(self):
+        mock = self.mock("inherited_pipe")
+        events = self.finish(self.start())
+        result = json.loads(content(self.completion(mock.observed()[-1]["messages"])).split("\n", 1)[1])
+        self.assertEqual(result, {"exit_code": 7, "output": "started\n"})
+        self.assertFalse(next(e["background"]["ok"] for e in events if "background" in e and
+                              e["background"]["state"] == "finished"))
+        pid = int((self.cwd / "worker.started").read_text())
+        wait_for(lambda: not alive(pid))
 
     def test_timeout_is_delivered_and_process_group_stops(self):
         mock = self.mock("timeout")
