@@ -10,6 +10,8 @@ const effort = @import("session/effort.zig");
 const prompt = @import("session/prompt.zig");
 const compaction = @import("session/compact.zig");
 const runner = @import("session/run.zig");
+const session_history = @import("session/history.zig");
+const Fork = @import("tools/agent/input.zig").Fork;
 
 pub const Event = @import("session/events.zig").Event;
 pub const ModelActivity = @import("session/events.zig").ModelActivity;
@@ -49,6 +51,7 @@ pub const Session = struct {
     log: session_log.Log = undefined,
     recorder: ?sandbox.Recorder = null,
     id: []const u8 = undefined,
+    cache_key: []const u8 = undefined,
     parent_session_id: ?[]const u8 = null,
     options: Options = undefined,
     inbox: @import("session/inbox.zig").Inbox = .{},
@@ -63,9 +66,13 @@ pub const Session = struct {
         return s.inbox.takeUsers(s.gpa, s.io);
     }
 
-    pub const Options = struct { environ: ?*const std.process.Environ.Map = null, depth: u32 = 0, parent_session_id: ?[]const u8 = null, home: []const u8, user_home: []const u8, resume_id: ?[]const u8 = null, continue_latest: bool = false };
+    pub const Options = struct { environ: ?*const std.process.Environ.Map = null, depth: u32 = 0, parent_session_id: ?[]const u8 = null, home: []const u8, user_home: []const u8, resume_id: ?[]const u8 = null, continue_latest: bool = false, fork: ?Fork = null };
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, client: *std.http.Client, cfg: provider.Config, options: Options) !Session {
+        if (options.fork) |fork| {
+            if (options.resume_id != null or options.continue_latest) return error.ConflictingForkOptions;
+            try cfg.checkSession(fork.provider, fork.model);
+        }
         var s: Session = .{
             .gpa = gpa,
             .io = io,
@@ -79,6 +86,8 @@ pub const Session = struct {
         errdefer s.arena.deinit();
         errdefer s.history.deinit(gpa);
         errdefer s.tools.agent_sessions.deinit(gpa);
+        errdefer s.tools.file_state.deinit(gpa);
+        s.options.fork = null;
         const a = s.arena.allocator();
         const cwd = try std.process.currentPathAlloc(io, a);
         const directory = try std.fs.path.join(a, &.{ options.home, "sessions" });
@@ -93,6 +102,8 @@ pub const Session = struct {
             s.pending_background_bytes = s.log.pending_background_bytes;
             errdefer s.log.close(io);
             try cfg.checkSession(s.log.provider, s.log.model);
+            s.cache_key = s.log.cache_key orelse s.id;
+            s.tools.forked = s.log.forked_from != null;
             s.parent_session_id = s.log.parent_session_id;
             if (s.parent_session_id != null) s.tools.depth = @max(s.tools.depth, 1);
         } else {
@@ -102,22 +113,44 @@ pub const Session = struct {
             s.id = try a.dupe(u8, std.fs.path.stem(path));
             s.log = try session_log.Log.create(io, path);
             errdefer s.log.close(io);
-            const template = try prompt.renderSystem(a, cwd, &s.tools, options.environ);
-            const base = try prompt.stepLimitPrompt(a, template, cfg.limits.max_steps);
-            const global = try std.fs.path.join(a, &.{ options.home, "AGENTS.md" });
-            const project = try std.fs.path.join(a, &.{ try instructions.projectRoot(io, a, cwd), "AGENTS.md" });
-            const system = try instructions.append(io, a, base, global, project);
-            const sha = prompt.systemSha(base);
-            try s.log.commit(io, gpa, &s.history, &s.context_tokens, .{
-                .messages = &.{.{ .role = "system", .content = system }},
-                .cwd = cwd,
-                .provider = cfg.provider,
-                .model = cfg.model,
-                .parent_session_id = s.parent_session_id,
-                .nib_version = @import("build_options").nib_version,
-                .system_sha = &sha,
-                .patches_off = try prompt.disabledPatches(a, options.environ),
-            });
+            s.cache_key = s.id;
+            if (options.fork) |fork| {
+                s.cache_key = try a.dupe(u8, fork.cache_key);
+                s.tools.forked = true;
+                s.tools.depth = @max(s.tools.depth, 1);
+                s.parent_session_id = options.parent_session_id orelse try a.dupe(u8, fork.session);
+                try s.tools.file_state.importVersions(io, gpa, fork.file_versions);
+                const messages = try session_history.inherit(a, fork);
+                try s.log.commit(io, gpa, &s.history, &s.context_tokens, .{
+                    .messages = messages,
+                    .context_tokens = compaction.estimateTokens(messages),
+                    .cwd = cwd,
+                    .provider = cfg.provider,
+                    .model = cfg.model,
+                    .parent_session_id = s.parent_session_id,
+                    .cache_key = s.cache_key,
+                    .forked_from = .{ .session = try a.dupe(u8, fork.session), .message_count = fork.message_count },
+                    .nib_version = @import("build_options").nib_version,
+                });
+            } else {
+                const template = try prompt.renderSystem(a, cwd, &s.tools, options.environ);
+                const base = try prompt.stepLimitPrompt(a, template, cfg.limits.max_steps);
+                const global = try std.fs.path.join(a, &.{ options.home, "AGENTS.md" });
+                const project = try std.fs.path.join(a, &.{ try instructions.projectRoot(io, a, cwd), "AGENTS.md" });
+                const system = try instructions.append(io, a, base, global, project);
+                const sha = prompt.systemSha(base);
+                try s.log.commit(io, gpa, &s.history, &s.context_tokens, .{
+                    .messages = &.{.{ .role = "system", .content = system }},
+                    .cwd = cwd,
+                    .provider = cfg.provider,
+                    .model = cfg.model,
+                    .parent_session_id = s.parent_session_id,
+                    .cache_key = s.cache_key,
+                    .nib_version = @import("build_options").nib_version,
+                    .system_sha = &sha,
+                    .patches_off = try prompt.disabledPatches(a, options.environ),
+                });
+            }
         }
         errdefer s.log.close(io);
         const recording = if (options.environ) |env| !std.mem.eql(u8, env.get("NIB_RECORD") orelse "", "off") else true;
@@ -125,8 +158,10 @@ pub const Session = struct {
         s.recorder = sandbox.Recorder.init(gpa, io, calls_path, recording);
         errdefer if (s.recorder) |*recorder| recorder.deinit();
         s.tools.session_id = s.id;
-        for (s.log.agent_sessions) |entry|
+        for (s.log.agent_sessions) |entry| {
             try s.tools.agent_sessions.add(gpa, io, entry.id, entry.session, false);
+            s.tools.agent_sessions.setFork(io, entry.id, entry.fork);
+        }
         s.tools.progress.next_agent_id = s.log.next_agent_id;
         s.tools.progress.next_bash_id = s.log.next_bash_id;
         for (s.log.lost_background) |lost| {
@@ -317,7 +352,8 @@ pub const Session = struct {
                 if (step_index >= max_steps) return s.finishStepLimit(pending, sink, cancel, detail, max_steps);
             }
             const size = s.context_tokens + compaction.estimateTokens(pending.items);
-            if (size >= s.cfg.context_window - s.cfg.context_window / 4 and size >= s.compact_backoff)
+            // The first fork request must send the inherited cache prefix before compaction can rewrite it.
+            if (!(s.tools.forked and s.log.steps == 0) and size >= s.cfg.context_window - s.cfg.context_window / 4 and size >= s.compact_backoff)
                 try s.autoCompact(sink, cancel, detail);
             if (cancel.load(.acquire)) return error.Canceled;
             try tools.Tools.poll(&s.tools);
@@ -353,6 +389,28 @@ pub const Session = struct {
                 .phase = reply.phase,
                 .step_effort = decision.metadata,
             });
+            const fork_prefix = if (reply.tool_calls.len > 0 and s.tools.depth == 0 and !s.tools.forked)
+                try session_history.snapshot(s.gpa, s.history.items, pending.items)
+            else
+                null;
+            defer if (fork_prefix) |prefix| s.gpa.free(prefix);
+            const fork_versions = if (fork_prefix != null) try s.tools.file_state.exportVersions(s.io, s.gpa) else null;
+            defer if (fork_versions) |versions| @import("tools/file_state.zig").freeVersions(s.gpa, versions);
+            if (fork_prefix) |prefix| {
+                s.tools.fork_snapshot = .{
+                    .session = s.id,
+                    .message_count = prefix.len,
+                    .history = prefix,
+                    .cache_key = s.cache_key,
+                    .id = "",
+                    .provider = s.cfg.provider,
+                    .model = s.cfg.model,
+                    .thinking = decision.cfg.thinking,
+                    .reasoning_effort = decision.cfg.reasoning_effort,
+                    .file_versions = fork_versions.?,
+                };
+            }
+            defer s.tools.fork_snapshot = null;
             var run_results: std.ArrayList(session_log.RunResult) = .empty;
             defer run_results.deinit(s.gpa);
             var output_tokens: u64 = 0;
@@ -480,11 +538,11 @@ pub const Session = struct {
         var fwd: Forward = .{ .sink = sink, .gpa = s.gpa, .partial = partial, .io = s.io, .started = timing.started, .first_data_ms = first_data_ms, .session = s };
         const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .timing = timing };
         if (!s.tools.background.anyPending(s.io))
-            return provider.complete(s.gpa, s.arena.allocator(), s.client, request_cfg, s.id, messages, prompt.tools_json, null, provider_sink, cancel, detail, attempts, .{ .ctx = &fwd, .onEvent = Forward.onRetry });
+            return provider.complete(s.gpa, s.arena.allocator(), s.client, request_cfg, s.cache_key, messages, prompt.tools_json, null, provider_sink, cancel, detail, attempts, .{ .ctx = &fwd, .onEvent = Forward.onRetry });
         const Request = struct {
             fn work(session: *Session, cfg: provider.Config, history: []const provider.Message, ps: provider.Sink, flag: *const std.atomic.Value(bool), failure: *?[]u8, tries: *u32, observer: *Forward, done: *std.Io.Event) !provider.Reply {
                 defer done.set(session.io);
-                return provider.complete(session.gpa, session.arena.allocator(), session.client, cfg, session.id, history, prompt.tools_json, null, ps, flag, failure, tries, .{ .ctx = observer, .onEvent = Forward.onRetry });
+                return provider.complete(session.gpa, session.arena.allocator(), session.client, cfg, session.cache_key, history, prompt.tools_json, null, ps, flag, failure, tries, .{ .ctx = observer, .onEvent = Forward.onRetry });
             }
         };
         var done: std.Io.Event = .unset;
@@ -594,4 +652,73 @@ test "allocation failures while restoring agent mappings release the session log
         }
     };
     try t.checkAllAllocationFailures(t.allocator, Check.run, .{ root, path, &client });
+}
+
+test "fork initialization copies history and resume retains independent identity and parent cache" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var client: std.http.Client = .{ .allocator = t.allocator, .io = t.io };
+    defer client.deinit();
+    const cfg: provider.Config = .{ .base_url = "invalid://local", .api_key = "mock", .model = "mock" };
+    const messages = [_]provider.Message{
+        .{ .role = "system", .content = "parent system, including original tools and depth text\n" },
+        .{ .role = "user", .content = "current compacted history" },
+        .{ .role = "assistant", .reasoning = .{ .provider = .chat_completions, .data = "parent reasoning" }, .tool_calls = &.{
+            .{ .id = "first", .function = .{ .name = "run", .arguments = "{}" } },
+            .{ .id = "second", .function = .{ .name = "run", .arguments = "{}" } },
+        } },
+    };
+    const fork: Fork = .{ .session = "parent-session", .message_count = messages.len, .history = &messages, .cache_key = "root-cache-key", .id = "a2", .provider = cfg.provider, .model = cfg.model };
+    var codex_fork = fork;
+    codex_fork.provider = .codex;
+    var wrong_model = cfg;
+    wrong_model.provider = .codex;
+    wrong_model.model = "other-model";
+    try t.expectError(error.SessionModelMismatch, Session.init(t.allocator, t.io, &client, wrong_model, .{ .home = root, .user_home = root, .fork = codex_fork }));
+    var wrong_provider = cfg;
+    wrong_provider.provider = .codex;
+    try t.expectError(error.SessionProviderMismatch, Session.init(t.allocator, t.io, &client, wrong_provider, .{ .home = root, .user_home = root, .fork = fork }));
+    var session = try Session.init(t.allocator, t.io, &client, cfg, .{ .home = root, .user_home = root, .depth = 1, .fork = fork });
+    var live = true;
+    defer if (live) session.deinit();
+    try t.expect(session.tools.forked);
+    try t.expectEqual(@as(usize, 0), session.log.steps);
+    try t.expect(session.options.fork == null);
+    try t.expect(!std.mem.eql(u8, fork.session, session.id));
+    try t.expectEqualStrings(fork.cache_key, session.cache_key);
+    try t.expectEqualDeep(@as([]const provider.Message, &messages), session.history.items[0..messages.len]);
+    try t.expect(session.history.items[0].content.?.ptr != messages[0].content.?.ptr);
+    try t.expectEqual(@as(usize, 5), session.history.items.len);
+    try session.log.agentSession(t.io, t.allocator, .{ .id = "a9", .session = "grandchild", .fork = true });
+    const id = try a.dupe(u8, session.id);
+    const expected = try a.dupe(provider.Message, session.history.items);
+    const path = try std.fmt.allocPrint(a, "{s}/sessions/{s}.jsonl", .{ root, id });
+    const data = try std.Io.Dir.cwd().readFileAlloc(t.io, path, a, .unlimited);
+    var restored: std.ArrayList(provider.Message) = .empty;
+    var tokens: u64 = 0;
+    const replayed = try session_log.replay(a, a, data, &restored, &tokens);
+    try t.expectEqualDeep(session.history.items, restored.items);
+    try t.expectEqualDeep(session_log.ForkedFrom{ .session = fork.session, .message_count = fork.message_count }, replayed.forked_from.?);
+    try t.expectEqualStrings(fork.cache_key, replayed.cache_key.?);
+    try t.expectEqual(session.context_tokens, tokens);
+    const expected_encoded = try std.json.Stringify.valueAlloc(a, expected, .{});
+    session.deinit();
+    live = false;
+    session = try Session.init(t.allocator, t.io, &client, cfg, .{ .home = root, .user_home = root, .resume_id = id });
+    live = true;
+    try t.expectEqualStrings(id, session.id);
+    try t.expect(session.tools.forked);
+    try t.expect(session.tools.agent_sessions.isFork(t.io, "a9"));
+    try t.expectEqual(@as(usize, 0), session.log.steps);
+    try t.expectEqualStrings(fork.cache_key, session.cache_key);
+    const resumed_encoded = try std.json.Stringify.valueAlloc(a, session.history.items, .{});
+    try t.expectEqualStrings(expected_encoded, resumed_encoded);
+    try session.reopen(null);
+    try t.expect(!session.tools.forked);
+    try t.expectEqualStrings(session.id, session.cache_key);
 }

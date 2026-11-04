@@ -14,6 +14,14 @@ pub const Queue = struct {
 
     // IDs outlive cleared progress slots because Step call logs can span several Runs.
     pub fn add(q: *Queue, gpa: std.mem.Allocator, io: std.Io, kind: @FieldType(Progress, "kind"), prompt: []const u8, run: usize, background: bool) ![]const u8 {
+        return q.addTask(gpa, io, kind, prompt, run, background, false);
+    }
+
+    pub fn addAgent(q: *Queue, gpa: std.mem.Allocator, io: std.Io, prompt: []const u8, run: usize, background: bool, fork: bool) ![]const u8 {
+        return q.addTask(gpa, io, .agent, prompt, run, background, fork);
+    }
+
+    fn addTask(q: *Queue, gpa: std.mem.Allocator, io: std.Io, kind: @FieldType(Progress, "kind"), prompt: []const u8, run: usize, background: bool, fork: bool) ![]const u8 {
         q.mutex.lockUncancelable(io);
         defer q.mutex.unlock(io);
         const next = if (kind == .agent) &q.next_agent_id else &q.next_bash_id;
@@ -21,7 +29,7 @@ pub const Queue = struct {
         const id = try std.fmt.allocPrint(gpa, "{s}{d}", .{ if (kind == .agent) "a" else "b", next.* });
         errdefer gpa.free(id);
         if (kind == .agent and q.next_invocation == std.math.maxInt(usize)) return error.InvocationExhausted;
-        var value = try (Progress{ .invocation = if (kind == .agent) q.next_invocation else 0, .id = id, .kind = kind, .prompt = prompt, .run = run, .background = background, .state = .queued }).clone(gpa);
+        var value = try (Progress{ .invocation = if (kind == .agent) q.next_invocation else 0, .id = id, .kind = kind, .prompt = prompt, .run = run, .background = background, .fork = fork, .state = .queued }).clone(gpa);
         errdefer value.deinit(gpa);
         try q.ids.ensureUnusedCapacity(gpa, 1);
         try q.slots.append(gpa, .{ .value = value });

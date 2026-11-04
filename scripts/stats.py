@@ -446,10 +446,12 @@ class ChildCosts:
     def __init__(self):
         self.sessions = []
 
-    def add(self, steps, selected_steps, model_ms, prompt_tokens, uncached_prompt_tokens, parent_system):
+    def add(self, steps, selected_steps, model_ms, prompt_tokens, uncached_prompt_tokens, parent_system,
+            creation, first_request_cache_hit_rate):
         self.sessions.append(dict(steps=steps, selected_steps=selected_steps,
                                   model_ms=model_ms, prompt_tokens=prompt_tokens,
-                                  uncached_prompt_tokens=uncached_prompt_tokens, parent_system=parent_system))
+                                  uncached_prompt_tokens=uncached_prompt_tokens, parent_system=parent_system,
+                                  creation=creation, first_request_cache_hit_rate=first_request_cache_hit_rate))
 
     def report(self):
         def summary(sessions):
@@ -461,16 +463,28 @@ class ChildCosts:
             for field in ('model_ms', 'prompt_tokens', 'uncached_prompt_tokens'):
                 result[field] = distribution([sum(s[field]) for s in full
                                               if len(s[field]) == s['steps']])
+            result['first_request_cache_hit_rate'] = distribution(
+                [s['first_request_cache_hit_rate'] for s in full
+                 if s['first_request_cache_hit_rate'] is not None])
             return result
+
+        def with_creation(sessions):
+            groups = {}
+            for session in sessions:
+                groups.setdefault(session['creation'], []).append(session)
+            return dict(summary(sessions),
+                        by_creation={key: summary(members) for key, members in sorted(groups.items())})
 
         groups = {}
         for session in self.sessions:
             groups.setdefault(session['parent_system'], []).append(session)
-        return dict(summary(self.sessions),
-                    by_parent_system={key: summary(sessions) for key, sessions in sorted(groups.items())},
+        return dict(with_creation(self.sessions),
+                    by_parent_system={key: with_creation(sessions) for key, sessions in sorted(groups.items())},
                     notes=["每个带 parent_session_id 的入选子日志一个样本，含前台/后台；只计已提交完整 Step，失败、取消或仍运行的日志也是已记录成本的下界，不推断完成状态。",
                            "分布要求非零 Step 且所有完整 Step 都入选；--since 截断的子会话列 partial_range_sessions，不当作整次成本。model_ms/prompt_tokens/uncached_prompt_tokens 各自要求所有 Step 字段有效，缺失不补零，samples 表示覆盖；p90=nearest-rank。",
                            "model_ms 为累计模型时间（含重试/退避），非墙钟耗时；prompt_tokens 为累计输入（含重复上下文和缓存），非费用，不加父会话 usage 或工具结果 usage；uncached_prompt_tokens=prompt_tokens-prompt_cache_hit_tokens，要求两字段为非负整数且 cache<=prompt。",
+                           "by_creation 按子 header.forked_from 分为 fork/new：有效的 {session,message_count} 为 fork，缺失为 new（含旧日志），显式无效为 unknown；session 要求非空字符串，message_count 要求非负整数。父 system 组内也按此分组。",
+                           "first_request_cache_hit_rate 为每子会话首个完整 Step 的 cache/prompt 分布（逐会话等权），仅全范围子会话且首 Step 的 prompt/cache 有效、cache<=prompt、prompt>0 时入样；不以之后的有效 usage 替代，不计 header 继承历史。",
                            "by_parent_system 通过 parent_session_id 关联本次输入日志的父 header.system_sha；父日志缺失或标签无效为 unknown，不回退到子 system_sha。--group-by 仍按每个日志自己的 header 分组。"])
 
 
@@ -840,6 +854,7 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
         session_step = 0
         child_selected_steps = 0
         child_model_ms, child_prompt_tokens, child_uncached_prompt_tokens = [], [], []
+        child_first_request_cache_hit_rate = None
         recorded_steps = 0
         recorded_commands = recorded_bash_commands(path)
         pending_agents = {}
@@ -917,6 +932,8 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
                     cache = child_usage.get('prompt_cache_hit_tokens')
                     if number(cache) and cache <= child_usage['prompt_tokens']:
                         child_uncached_prompt_tokens.append(child_usage['prompt_tokens'] - cache)
+                        if session_step == 1 and child_usage['prompt_tokens'] > 0:
+                            child_first_request_cache_hit_rate = cache / child_usage['prompt_tokens']
             if current is not None:
                 current['full_steps'] += 1
                 current['complete'] = any(m['role'] == 'assistant' and not m.get('tool_calls') for m in messages)
@@ -1008,8 +1025,13 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
             if header.get('parent_session_id'):
                 parent_id = header['parent_session_id']
                 parent_system = _systems.get(parent_id, 'unknown') if isinstance(parent_id, str) else 'unknown'
+                fork = header.get('forked_from')
+                creation = ('new' if 'forked_from' not in header else
+                            'fork' if isinstance(fork, dict) and isinstance(fork.get('session'), str)
+                            and fork['session'].strip() and number(fork.get('message_count')) else 'unknown')
                 child_costs.add(session_step, child_selected_steps, child_model_ms,
-                                child_prompt_tokens, child_uncached_prompt_tokens, parent_system)
+                                child_prompt_tokens, child_uncached_prompt_tokens, parent_system,
+                                creation, child_first_request_cache_hit_rate)
     totals['runs_unknown'] = totals['runs'] - totals['runs_with_status']
     totals['run_failure_rate'] = totals['runs_failed'] / totals['runs_with_status'] if totals['runs_with_status'] else None
     totals['avg_steps_per_turn'] = sum(turn_steps) / len(turn_steps) if turn_steps else None
@@ -1071,11 +1093,17 @@ def text_report(report):
     lines.extend('  ' + note for note in report['agents']['notes'])
     costs = report['child_costs']
     lines.append('子会话已记录成本（每子会话；非费用）：')
+    cost_groups = []
     for label, item in [('全部', costs)] + list(costs['by_parent_system'].items()):
-        lines.append(f"  parent_system={label}: sessions={item['sessions']} full_range={item['full_range_sessions']} partial_range={item['partial_range_sessions']} no_steps={item['no_step_sessions']}")
-        for field in ('steps', 'model_ms', 'prompt_tokens', 'uncached_prompt_tokens'):
+        cost_groups.append((f'parent_system={label}', item))
+        cost_groups.extend((f'parent_system={label} creation={kind}', group)
+                           for kind, group in item['by_creation'].items())
+    for label, item in cost_groups:
+        lines.append(f"  {label}: sessions={item['sessions']} full_range={item['full_range_sessions']} partial_range={item['partial_range_sessions']} no_steps={item['no_step_sessions']}")
+        for field in ('steps', 'model_ms', 'prompt_tokens', 'uncached_prompt_tokens', 'first_request_cache_hit_rate'):
             value = item[field]
-            lines.append(f"    {field}: samples={value['samples']} median={fmt(value['median'])} p90={fmt(value['p90'])}")
+            format_value = pct if field == 'first_request_cache_hit_rate' else fmt
+            lines.append(f"    {field}: samples={value['samples']} median={format_value(value['median'])} p90={format_value(value['p90'])}")
     lines.extend('  ' + note for note in costs['notes'])
     structure = report['round_trips']
     steps = structure['steps_per_turn']

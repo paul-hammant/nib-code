@@ -39,7 +39,7 @@ const Row = struct {
     fn init(gpa: std.mem.Allocator, p: Progress, last: bool) !Row {
         var text: std.ArrayList(u8) = .empty;
         errdefer text.deinit(gpa);
-        try text.print(gpa, "  {s} {s} {s}", .{ if (last) "└─" else "├─", p.id, if (p.kind == .bash) "bash " else "" });
+        try text.print(gpa, "  {s} {s}{s} {s}", .{ if (last) "└─" else "├─", p.id, if (p.fork) " fork" else "", if (p.kind == .bash) "bash " else "" });
         const prompt_start = text.items.len;
         var end: usize = 0;
         var chars: usize = 0;
@@ -292,4 +292,11 @@ test "detached shows terminal states while ordinary background waits for deliver
     try testing.expectEqualStrings("  ├─ b2 bash test · 0.0s · background", tree.rows.items[1].text);
     try testing.expectEqualStrings("  ├─ b3 bash exit · 0.0s · done", tree.rows.items[2].text);
     try testing.expectEqualStrings("  └─ b4 bash stop · 0.0s · canceled", tree.rows.items[3].text);
+}
+
+test "fork label follows task id" {
+    var tree: Tree = .{};
+    defer tree.deinit(testing.allocator);
+    try tree.update(testing.allocator, &.{.{ .id = "a3", .fork = true, .prompt = "child" }});
+    try testing.expectEqualStrings("  └─ a3 fork child · working · step 0", tree.rows.items[0].text);
 }

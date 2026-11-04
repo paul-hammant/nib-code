@@ -4,7 +4,7 @@ pub const Registry = struct {
     mutex: std.Io.Mutex = .init,
     entries: std.ArrayList(Entry) = .empty,
 
-    const Entry = struct { id: []const u8, session: ?[]const u8, busy: bool };
+    const Entry = struct { id: []const u8, session: ?[]const u8, busy: bool, fork: bool = false };
 
     pub fn deinit(r: *Registry, gpa: std.mem.Allocator) void {
         for (r.entries.items) |entry| {
@@ -22,6 +22,26 @@ pub const Registry = struct {
         const session_copy = if (child) |value| try gpa.dupe(u8, value) else null;
         errdefer if (session_copy) |value| gpa.free(value);
         try r.entries.append(gpa, .{ .id = copy, .session = session_copy, .busy = busy });
+    }
+
+    pub fn setFork(r: *Registry, io: std.Io, id: []const u8, fork: bool) void {
+        r.mutex.lockUncancelable(io);
+        defer r.mutex.unlock(io);
+        for (r.entries.items) |*entry| {
+            if (std.mem.eql(u8, entry.id, id)) {
+                entry.fork = fork;
+                return;
+            }
+        }
+    }
+
+    pub fn isFork(r: *Registry, io: std.Io, id: []const u8) bool {
+        r.mutex.lockUncancelable(io);
+        defer r.mutex.unlock(io);
+        for (r.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.id, id)) return entry.fork;
+        }
+        return false;
     }
 
     pub fn reserve(r: *Registry, io: std.Io, id: []const u8) ![]const u8 {

@@ -342,6 +342,82 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(self.replay(child, "--all")["matched"], 1)
         self.assertEqual(len(self.mock.requests), before)
 
+    def test_fork_replays_only_child_runs_across_compaction_and_resume(self):
+        parent_code = 'console.log("parent-only", await tools.read({path: "parent.txt"}));'
+        child_code = 'console.log("child-only", await tools.read({path: "child.txt"}));'
+        (self.cwd / "parent.txt").write_text("parent file result")
+        (self.cwd / "child.txt").write_text("child file result")
+        self.mock.reply(codes=[parent_code])
+        self.mock.reply(codes=['console.log(await tools.agent({prompt: "fork probe", fork: true}));'])
+        self.mock.reply(codes=[child_code])
+        self.mock.reply(text="child finished")
+        self.mock.reply(text="parent finished")
+        events = [json.loads(line) for line in self.command(
+            "ask", "--json", "parent fork probe").stdout.splitlines()]
+        parent = events[0]["start"]["session_id"]
+        agent = next(row for row in jsonl(self.calls_path(parent)) if row.get("name") == "agent")
+        result = json.loads(agent["result"])
+        self.assertTrue(result["ok"], result)
+        children = [path for path in (self.home / "sessions").glob("*.jsonl")
+                    if not path.name.endswith(".calls.jsonl") and path.stem != parent]
+        self.assertEqual(len(children), 1, children)
+        main = children[0]
+        child = main.stem
+        records = jsonl(main)
+        header = records[0]
+        self.assertEqual(header["forked_from"]["session"], parent)
+        inherited = [m for m in header["messages"] if m["role"] == "assistant"]
+        self.assertEqual(len(inherited), 2)
+        inherited_codes = [json.loads(call["function"]["arguments"])["code"]
+                           for m in inherited for call in m.get("tool_calls", [])]
+        self.assertIn(parent_code, inherited_codes)
+        self.assertEqual([(r["step"], r["run"]) for r in jsonl(self.calls_path(child))
+                          if "meta" in r], [(1, 0)])
+        (self.cwd / "parent.txt").unlink()
+        (self.cwd / "child.txt").unlink()
+
+        def check_replay(expected):
+            before = len(self.mock.requests)
+            report = self.replay(child, "--all")
+            self.assertEqual(report["total"], len(expected), report)
+            self.assertEqual(report["matched"], len(expected), report)
+            self.assertEqual(report["divergences"], 0, report)
+            self.assertEqual(report["undetermined"], 0, report)
+            self.assertEqual([r["run"] for r in report["reports"]], list(expected))
+            for entry in report["reports"]:
+                self.assertIn(expected[entry["run"]], entry["output"])
+                self.assertNotIn("parent-only", entry["output"])
+                single = self.replay(child, "--run", entry["run"])
+                self.assertTrue(single["match"], single)
+                self.assertFalse(single["incomplete"], single)
+                self.assertEqual(single["output"], entry["output"])
+            self.assertEqual(len(self.mock.requests), before)
+            self.assertFalse((self.cwd / "parent.txt").exists())
+            self.assertFalse((self.cwd / "child.txt").exists())
+
+        check_replay({"1:0": "child-only"})
+        before = len(self.mock.requests)
+        self.assertEqual(self.replay(parent, "--all")["matched"], 2)
+        self.assertEqual(len(self.mock.requests), before)
+        replacement = {"from": 1, "messages": [
+            {"role": "user", "content": "compacted child summary"},
+            {"role": "assistant", "content": "child finished"}], "context_tokens": 50}
+        with main.open("a") as stream:
+            stream.write(json.dumps(replacement) + "\n")
+        check_replay({"1:0": "child-only"})
+
+        self.mock.reply(codes=['console.log(await tools.agent({prompt: "resume fork", resume: "a1"}));'])
+        self.mock.reply(codes=['console.log("resumed-child-only");'])
+        self.mock.reply(text="child resumed finished")
+        self.mock.reply(text="parent resumed finished")
+        self.command("ask", "--json", "resume parent", "--resume", parent)
+        agents = [r for r in jsonl(self.calls_path(parent)) if r.get("name") == "agent"]
+        self.assertEqual(len(agents), 2)
+        self.assertTrue(json.loads(agents[-1]["result"])["ok"], agents[-1])
+        self.assertEqual([(r["step"], r["run"]) for r in jsonl(self.calls_path(child))
+                          if "meta" in r], [(1, 0), (3, 0)])
+        check_replay({"1:0": "child-only", "3:0": "resumed-child-only"})
+
     def test_script_lookup_and_unrecorded_rejection(self):
         session = self.record_files()
         script = self.tmp / "lookup.js"

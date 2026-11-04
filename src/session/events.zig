@@ -13,6 +13,7 @@ pub const Progress = struct {
     elapsed_ms: u64 = 0,
     background: bool = false,
     detached: bool = false,
+    fork: bool = false,
     prompt: []const u8,
     state: enum { queued, working, done, failed, canceled, timed_out } = .working,
     step: u32 = 0,
@@ -28,7 +29,7 @@ pub const Progress = struct {
         const files = try cloneStrings(gpa, p.files);
         errdefer freeStrings(gpa, files);
         const id = try gpa.dupe(u8, p.id);
-        return .{ .kind = p.kind, .elapsed_ms = p.elapsed_ms, .run = p.run, .invocation = p.invocation, .background = p.background, .detached = p.detached, .id = id, .prompt = prompt, .state = p.state, .step = p.step, .tools = used, .files = files, .usage = p.usage };
+        return .{ .kind = p.kind, .elapsed_ms = p.elapsed_ms, .run = p.run, .invocation = p.invocation, .background = p.background, .detached = p.detached, .fork = p.fork, .id = id, .prompt = prompt, .state = p.state, .step = p.step, .tools = used, .files = files, .usage = p.usage };
     }
 
     pub fn deinit(p: *Progress, gpa: std.mem.Allocator) void {
