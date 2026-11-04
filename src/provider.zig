@@ -17,7 +17,7 @@ pub const Limits = struct {
     llm_calls_per_run: usize = 100,
     llm_input_kib: usize = 256,
     agent_concurrency: usize = 4,
-    max_steps: usize = 50,
+    max_steps: ?usize = null,
 };
 
 pub const Config = struct {

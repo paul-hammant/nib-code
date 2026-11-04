@@ -23,7 +23,7 @@
 
 这些是用户的预算和偏好，现在写成了常量，应进入 `config.toml`。
 
-llm/agent 的并发、调用次数、输入大小和 Step 上限已于 2026-11-03 改为可配置，见 [config.md](config.md#limits)。sandbox 内全部工具最多 8 并发仍属于线程调度实现。
+llm/agent 的并发、调用次数、输入大小和 Step 上限已改为可配置，见 [config.md](config.md#limits)。Step 不再默认限制为 50：`max_steps` 省略时不设上限，显式设置范围为 1–100000，子会话继承当前有效值。sandbox 内全部工具最多 8 并发仍属于线程调度实现。
 
 | 名称 | 位置 | 当前值 | 删除条件 |
 |---|---|---|---|

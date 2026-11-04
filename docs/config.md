@@ -36,7 +36,7 @@ llm_concurrency = 4
 llm_calls_per_run = 100
 llm_input_kib = 256
 agent_concurrency = 4
-max_steps = 50
+# max_steps = 50  # 可选；省略时不设 Step 上限
 ```
 
 只使用当前 provider 的段落；切换 provider 不需要改写另一段。环境和配置文件均未指定时，默认 provider 为 `codex`，默认模型 `gpt-6.1-sol`、窗口 500000 tokens；使用本机 Codex 登录，无需 API key。Codex 窗口随模型变化，未知模型需要显式提供 `context_window` 或 `NIB_CONTEXT_WINDOW`。模型、恢复和凭证边界见 [codex.md](codex.md) 与 [ADR 0011](adr/0011-provider-wire-protocols.md)。
@@ -47,7 +47,7 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 
 ## [limits]
 
-`[limits]` 适用于当前有效配置，与 provider 无关；各项可独立省略，默认值见示例。所有值必须为范围内的正整数：
+`[limits]` 适用于当前有效配置，与 provider 无关；各项可独立省略，默认值见下表。显式设置的值必须为范围内的正整数：
 
 | 键 | 含义 | 默认值 | 范围 |
 | --- | --- | --- | --- |
@@ -55,9 +55,11 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 | `llm_calls_per_run` | 每个 Run 的 `tools.llm` 调用上限，超出 reject | 100 | 1–10000 |
 | `llm_input_kib` | 单次 prompt + 序列化 input 的 UTF-8 字节上限（KiB），超出 reject，不截断 | 256 | 1–65536 |
 | `agent_concurrency` | 每进程同时运行的子 agent 数，超出排队 | 4 | 1–64 |
-| `max_steps` | 每个 Turn 的 Step 上限，耗尽时返回 `TooManySteps` | 50 | 1–1000 |
+| `max_steps` | 每个 Turn 的 Step 上限，耗尽时返回 `TooManySteps`；省略时不设上限（内部为 `null`） | 无上限 | 1–100000 |
 
-这些限额没有环境变量或 CLI 覆盖；随有效配置经 stdin 传给子会话，子会话不读取配置文件。sandbox 内全部工具最多 8 并发是线程调度实现，不由此小节控制。
+这些限额没有环境变量或 CLI 覆盖；随有效配置经 stdin 传给子会话，子会话不读取配置文件。`max_steps` 未设置时子会话同样为 `null`，显式设置时继承该上限。sandbox 内全部工具最多 8 并发是线程调度实现，不由此小节控制。
+
+显式设置 `max_steps` 时，新会话的 system prompt 会写明每个 Turn 的上限；剩余不多于 3 个 Step 时，每个 Run 输出末尾追加剩余步数（不计入 16 KiB 输出预算）。耗尽后不再请求模型；正在运行的后台 agent/bash 会先完成，结果按现有格式写进历史和日志，下一 Turn 可见。Turn 仍以 `TooManySteps` / `stopped after N steps` 结束；若等待了任务，提示会列出任务类型与 ID。等待期间 Esc 仍会立即取消 Turn 并停止后台任务。未设置时不添加这些提示，也不限制 Step 数。恢复会话保留原始 system；若当前配置与其中记录的上限不同，会在每个 Turn 的用户输入前附加当前预算事实，避免沿用过期上限。
 
 配置文件不存秘密，也不接受 API key、token、密码或凭证字段。Chat Completions 的 key 使用 `NIB_API_KEY` / `DEEPSEEK_API_KEY`；Codex 使用现有登录文件。不要把秘密放进 URL。
 

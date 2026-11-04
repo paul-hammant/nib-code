@@ -21,18 +21,20 @@
 | 字段 | 含义 |
 | --- | --- |
 | `nib_version` | `build.zig.zon` 版本号加构建时注入的 git 短提交号，如 `0.1.0+abc1234`；无法取得提交号时仅版本号。 |
-| `system_sha` | `system_template` 实际渲染结果（含 cwd、工具说明和生效补丁，不含全局/项目 AGENTS.md）的 SHA-256 前 12 位小写十六进制。因此 cwd、工具可用性或补丁变化也可能改变它，不只是模板文字修改。 |
+| `system_sha` | `system_template` 实际渲染结果（含 cwd、工具说明、生效补丁和显式配置的 Step 上限，不含全局/项目 AGENTS.md）的 SHA-256 前 12 位小写十六进制。因此 cwd、工具可用性或补丁变化也可能改变它，不只是模板文字修改。 |
 | `patches_off` | `NIB_PATCHES_OFF` 实际禁用的已注册补丁 id，去重并排序；未知 id 忽略，`all` 展开为全部已注册 id。没有禁用项时省略字段。 |
 
 ## 提交与中断
 
-会话日志位于 `$NIB_HOME/sessions/<ID>.jsonl`（默认 `~/.nib/sessions/`）。新写入的每条日志记录带 `at`（Unix 毫秒，追加时的墙上时钟时间），恢复兼容无时间戳的旧记录；`scripts/stats.py --since` 按记录时间筛选，无效或缺失 `at` 回退文件修改时间并报告数量。通常只在完整 Step 后提交；后台结果消息及其生命周期记录在下一次 Step 请求前独立提交。Codex 请求最终失败时另追加 `diagnostic: {error_name, message, attempts, step}` 诊断记录（message 保留服务端 code/reason），不提交用户消息或失败输出，不改变模型历史和 context_tokens，恢复时跳过；`scripts/stats.py` 将其计入 `errors.provider_failure`，不算 Step/token。取消（TUI 的 Esc、ask 收到 SIGTERM/SIGINT）时额外提交本轮用户消息和已流出的文本，TUI Esc / ask SIGINT 在末尾标记 `[interrupted by user]`，ask SIGTERM 标记 `[interrupted: process terminated]`，未完成的工具调用丢弃；恢复不重执行已提交的 Run；未完成 Step 可能已产生外部副作用，日志不回滚这些变化。
+会话日志位于 `$NIB_HOME/sessions/<ID>.jsonl`（默认 `~/.nib/sessions/`）。新写入的每条日志记录带 `at`（Unix 毫秒，追加时的墙上时钟时间），恢复兼容无时间戳的旧记录；`scripts/stats.py --since` 按记录时间筛选，无效或缺失 `at` 回退文件修改时间并报告数量。通常只在完整 Step 后提交；后台结果消息及其生命周期记录在下一次 Step 请求前独立提交；Step 上限耗尽时也会等待后台任务并独立提交结果，然后结束 Turn，不再请求模型。Codex 请求最终失败时另追加 `diagnostic: {error_name, message, attempts, step}` 诊断记录（message 保留服务端 code/reason），不提交用户消息或失败输出，不改变模型历史和 context_tokens，恢复时跳过；`scripts/stats.py` 将其计入 `errors.provider_failure`，不算 Step/token。取消（TUI 的 Esc、ask 收到 SIGTERM/SIGINT）时额外提交本轮用户消息和已流出的文本，TUI Esc / ask SIGINT 在末尾标记 `[interrupted by user]`，ask SIGTERM 标记 `[interrupted: process terminated]`，未完成的工具调用丢弃；恢复不重执行已提交的 Run；未完成 Step 可能已产生外部副作用，日志不回滚这些变化。
 
 模型请求的两条线路共用 `src/provider/cancel.zig` 的 `std.Io.Select` 取消封装：请求任务实时写入 sink，另一个任务每 20 ms 检查 cancel 标志；取消时中断连接、发送或读取中的阻塞 I/O，并等待请求任务清理后返回 `error.Canceled`，无需等下一块数据。TUI Esc 与 ask SIGINT/SIGTERM 均走此路径，不设读超时，不改变重试策略；已流出的文本继续由原有 `commitInterrupted` 提交。
 
 ## 后台任务结果
 
-`tools.agent({prompt, background: true})` 与 `tools.bash({command, background: true})` 启动前同步追加独立的 `background: {id, kind: "agent"|"bash", state: "started"}` 记录；结果消息插入后追加 `state: "finished", ok` 记录，恢复发现未完成任务时追加 `state: "lost"`。两类任务共享编号，如 `a1`、`b2`。这些记录带 `at` 和 `turn_step`，不改变历史或 context_tokens。结果在下次主模型请求前单独提交为一条 user 消息：`source: "background"`、`background_kind`、`background_id`、`background_ok`；可选的 `background_ok` 记录任务是否成功，供 TUI 在正文 JSON 截断后正确回放。agent 正文为 `[background agent a1 finished]\n` 后接截断后的 `{ok,text,changes,error?}` JSON，不含 usage；bash 正文结果恰为 `{exit_code,output}` 或 `{error}`，无 `ok` 字段。恢复时未完成任务不会重启，插入 `[background agent a1 lost: process ended]` 或对应的 bash 消息。来源字段只保存在日志中，不发送给 provider；正文会发送给模型。后台消息不发起新 Turn。旧 `background_agent` 日志仍可统计。
+`tools.agent({prompt, background: true})` 与 `tools.bash({command, background: true})` 启动前同步追加独立的 `background: {id, kind: "agent"|"bash", state: "started"}` 记录；结果消息插入后追加 `state: "finished", ok` 记录，恢复发现未完成任务时追加 `state: "lost"`。两类任务共享编号，如 `a1`、`b2`。这些记录带 `at` 和 `turn_step`，不改变历史或 context_tokens。完成记录的 `turn_step` 表示插入边界（已完成 Step 数加一）；在上限耗尽后插入的结果仍使用该边界编号，不代表发起了下一次模型请求。结果在下次主模型请求前单独提交为一条 user 消息：`source: "background"`、`background_kind`、`background_id`、`background_ok`；可选的 `background_ok` 记录任务是否成功，供 TUI 在正文 JSON 截断后正确回放。agent 正文为 `[background agent a1 finished]\n` 后接截断后的 `{ok,text,changes,error?}` JSON，不含 usage；bash 正文结果恰为 `{exit_code,output}` 或 `{error}`，无 `ok` 字段。恢复时未完成任务不会重启，插入 `[background agent a1 lost: process ended]` 或对应的 bash 消息。来源字段只保存在日志中，不发送给 provider；正文会发送给模型。后台消息不发起新 Turn。旧 `background_agent` 日志仍可统计。
+
+显式配置 Step 上限时，已执行 Run 的 `run_results[].remaining_steps` 记录该 Step 完成后剩余的步数（同一 Step 的多个 Run 共用此值）。无上限时省略；replay 使用此元数据恢复预算外的剩余步数提示，不读取当前配置，也不从输出正文反推。
 
 ## Step 计时字段
 

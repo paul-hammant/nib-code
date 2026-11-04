@@ -197,7 +197,7 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
         const parsed = try p.value(value, &consumed);
         if (section == .limits) {
             if (parsed != .integer) return p.bad("{s} must be an integer", .{key});
-            const maxima = [_]usize{ 64, 10000, 65536, 64, 1000 };
+            const maxima = [_]usize{ 64, 10000, 65536, 64, 100000 };
             if (parsed.integer < 1 or parsed.integer > maxima[index]) return p.bad("{s} must be between 1 and {d}", .{ key, maxima[index] });
             const n: usize = @intCast(parsed.integer);
             switch (index) {
@@ -609,16 +609,18 @@ test "limits defaults, bounds and diagnostics" {
     defer env.deinit();
     var detail: ?[]u8 = null;
     const defaults = (try resolve(a, &env, "", "config.toml", &detail)).limits;
-    try t.expectEqualDeep(provider.Limits{ .llm_concurrency = 4, .llm_calls_per_run = 100, .llm_input_kib = 256, .agent_concurrency = 4, .max_steps = 50 }, defaults);
+    try t.expectEqualDeep(provider.Limits{ .llm_concurrency = 4, .llm_calls_per_run = 100, .llm_input_kib = 256, .agent_concurrency = 4, .max_steps = null }, defaults);
     try t.expectEqualDeep(defaults, (try resolve(a, &env, "[limits]\n", "config.toml", &detail)).limits);
+    try t.expectEqual(@as(?usize, null), (try resolve(a, &env, "[limits]\nllm_concurrency = 8\n", "config.toml", &detail)).limits.max_steps);
+    try t.expectEqual(@as(?usize, 50), (try resolve(a, &env, "[limits]\nmax_steps = 50\n", "config.toml", &detail)).limits.max_steps);
     const names = [_][]const u8{ "llm_concurrency", "llm_calls_per_run", "llm_input_kib", "agent_concurrency", "max_steps" };
-    const maxima = [_]usize{ 64, 10000, 65536, 64, 1000 };
+    const maxima = [_]usize{ 64, 10000, 65536, 64, 100000 };
     for (names, maxima) |name, max| {
         for ([_]usize{ 1, max }) |n| {
             const text = try std.fmt.allocPrint(a, "[limits]\n{s} = {d}\n", .{ name, n });
             const limits = (try resolve(a, &env, text, "config.toml", &detail)).limits;
             inline for (names) |field| {
-                if (std.mem.eql(u8, name, field)) try t.expectEqual(n, @field(limits, field));
+                if (std.mem.eql(u8, name, field)) try t.expectEqual(@as(@TypeOf(@field(limits, field)), n), @field(limits, field));
             }
         }
         const values = [_][]const u8{ "0", "-1", "true", "\"1\"", "1.5" };

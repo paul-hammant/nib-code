@@ -29,6 +29,12 @@ pub fn format(gpa: std.mem.Allocator, o: sandbox.Outcome) ![]u8 {
     return renderLimit(gpa, o, max_bytes);
 }
 
+pub fn stepLimitOutput(a: std.mem.Allocator, output: []const u8, remaining_steps: ?usize) ![]const u8 {
+    const remaining = remaining_steps orelse return output;
+    if (remaining > 3) return output;
+    return std.fmt.allocPrint(a, "{s}\n[{d} Steps left in this Turn]", .{ output, remaining });
+}
+
 pub fn formatMessage(gpa: std.mem.Allocator, prefix: []const u8, json: []const u8) ![]u8 {
     const payload = try renderLimit(gpa, .{ .ok = false, .text = @constCast(json), .logs = @constCast("") }, max_bytes - prefix.len);
     defer gpa.free(payload);
@@ -321,4 +327,20 @@ test "bounded call metadata plus completion preserves original numbering" {
         defer testing.allocator.free(result);
         try testing.expect(std.mem.endsWith(u8, out, result));
     }
+}
+
+test "Step budget metadata leaves unlimited output unchanged and appends after the output budget" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try t.expectEqualStrings("output", try stepLimitOutput(a, "output", null));
+    try t.expectEqualStrings("output", try stepLimitOutput(a, "output", 4));
+    try t.expectEqualStrings("output\n[3 Steps left in this Turn]", try stepLimitOutput(a, "output", 3));
+    try t.expectEqualStrings("output\n[0 Steps left in this Turn]", try stepLimitOutput(a, "output", 0));
+    const full = try a.alloc(u8, 16 * 1024);
+    @memset(full, 'x');
+    const output = try stepLimitOutput(a, full, 2);
+    try t.expectEqualStrings(full, output[0..full.len]);
+    try t.expectEqualStrings("\n[2 Steps left in this Turn]", output[full.len..]);
 }

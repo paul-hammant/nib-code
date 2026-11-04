@@ -123,6 +123,19 @@ pub const Background = struct {
         return false;
     }
 
+    pub fn pendingNames(bg: *Background, gpa: std.mem.Allocator, io: std.Io) ![]u8 {
+        bg.mutex.lockUncancelable(io);
+        defer bg.mutex.unlock(io);
+        var names: std.ArrayList(u8) = .empty;
+        errdefer names.deinit(gpa);
+        for (bg.jobs.items) |job| {
+            if (job.delivered) continue;
+            if (names.items.len > 0) try names.appendSlice(gpa, ", ");
+            try names.print(gpa, "{s} {s}", .{ @tagName(job.kind), job.id });
+        }
+        return names.toOwnedSlice(gpa);
+    }
+
     pub fn delivered(bg: *Background, io: std.Io, id: []const u8) void {
         bg.mutex.lockUncancelable(io);
         defer bg.mutex.unlock(io);

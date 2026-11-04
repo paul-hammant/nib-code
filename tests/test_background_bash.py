@@ -142,7 +142,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 text = "complete" if any(u.startswith("[background ") for u in users) else "early final"
                 if self.server.case == "interjection" and step == 1:
                     self.server.model_gate.wait(15)
-                if self.server.case == "max_steps" and step == 1:
+                if self.server.case == "max_steps" and step < 5:
                     code = "42"
             if self.server.case == "compact" and code is not None:
                 text += "x" * 1000
@@ -367,16 +367,60 @@ class BackgroundBashTests:
         self.finish(process, ok=False)
         wait_for(lambda: not alive(pid))
 
-    def test_max_steps_stops_background_process(self):
-        (self.home / "config.toml").write_text("[limits]\nmax_steps = 2\n")
-        self.mock("max_steps")
+    def start_limited_wait(self):
+        (self.home / "config.toml").write_text("[limits]\nmax_steps = 5\n")
+        mock = self.mock("max_steps")
         process = self.start()
         path = self.cwd / "worker.started"
-        wait_for(lambda: path.exists())
+        wait_for(lambda: path.exists() and path.stat().st_size)
         pid = int(path.read_text())
+        root_log = wait_for(lambda: next((p for p in (self.home / "sessions").glob("?" * 32 + ".jsonl")
+                                         if any(r.get("turn_step") == 5 for r in records(p))), None))
+        time.sleep(.1)
+        self.assertIsNone(process.poll())
+        self.assertEqual(len(mock.observed()), 5)
+        self.assertTrue(alive(pid))
+        self.assertFalse(any(m.get("source") == "background" for r in records(root_log)
+                             for m in r.get("messages", [])))
+        return mock, process, pid, root_log
+
+    def test_max_steps_waits_and_persists_result_for_next_turn(self):
+        mock, process, pid, root_log = self.start_limited_wait()
+        self.release()
         events = self.finish(process, ok=False)
-        self.assertIn("stopped after 2 steps", json.dumps(events[-1]))
+        self.assertIn("stopped after 5 steps", json.dumps(events[-1]))
+        self.assertIn("waited for background tasks: bash b1", json.dumps(events[-1]))
+        self.assertEqual(events[-1]["error"]["steps"], 5)
+        self.assertEqual(len(mock.observed()), 5)
         wait_for(lambda: not alive(pid))
+        stored = [m for r in records(root_log) for m in r.get("messages", []) if m.get("source") == "background"]
+        self.assertEqual([(m["background_kind"], m["background_id"]) for m in stored], [("bash", "b1")])
+        self.assertEqual(json.loads(content(stored[0]).split("\n", 1)[1]),
+                         {"exit_code": 0, "output": "worker-done\n"})
+        finished = [e["background"] for e in events if e.get("background", {}).get("state") == "finished"]
+        self.assertEqual([(e["id"], e["ok"]) for e in finished], [("b1", True)])
+        resumed = self.finish(self.start("--resume", root_log.stem, "next turn"))
+        self.assertEqual(resumed[-1]["end"]["text"], "complete")
+        self.assertEqual(len(mock.observed()), 6)
+        self.assertEqual(content(self.completion(mock.observed()[-1]["messages"])), content(stored[0]))
+
+    def check_cancel_at_max_steps(self, sig):
+        mock, process, pid, root_log = self.start_limited_wait()
+        process.send_signal(sig)
+        events = self.finish(process, ok=False)
+        self.assertIn("canceled", json.dumps(events[-1]).lower())
+        self.assertNotIn("stopped after", json.dumps(events[-1]))
+        self.assertEqual(len(mock.observed()), 5)
+        wait_for(lambda: not alive(pid))
+        self.assertFalse(any(m.get("source") == "background" for r in records(root_log)
+                             for m in r.get("messages", [])))
+        self.assertFalse(any(e.get("background", {}).get("state") == "finished" for e in events))
+
+    def test_sigint_cancels_max_steps_wait_and_kills_bash(self):
+        self.check_cancel_at_max_steps(signal.SIGINT)
+
+    def test_sigterm_cancels_max_steps_wait_and_kills_bash(self):
+        self.check_cancel_at_max_steps(signal.SIGTERM)
 
     def test_killed_parent_marks_job_lost_and_advances_id_on_resume(self):
         mock = self.mock("resume")
@@ -443,6 +487,44 @@ class ChatTests(BackgroundBashTests, unittest.TestCase):
         self.assertEqual(users[0:2], ["initial", "while waiting"])
         self.assertTrue(users[2].startswith("[background bash b1 finished]\n"), users)
         wait_for(lambda: history(self.home)[-1].get("content") == "complete")
+
+    def start_limited_terminal(self):
+        (self.home / "config.toml").write_text("[limits]\nmax_steps = 5\n")
+        mock = self.mock("max_steps")
+        terminal = Terminal(self.cwd, self.env)
+        self.addCleanup(terminal.close)
+        terminal.send("initial\r")
+        path = self.cwd / "worker.started"
+        wait_for(lambda: path.exists() and path.stat().st_size)
+        pid = int(path.read_text())
+        root_log = wait_for(lambda: next((p for p in (self.home / "sessions").glob("?" * 32 + ".jsonl")
+                                         if any(r.get("turn_step") == 5 for r in records(p))), None))
+        self.assertEqual(len(mock.observed()), 5)
+        self.assertTrue(alive(pid))
+        return mock, terminal, pid, root_log
+
+    def test_max_steps_result_is_visible_in_next_tui_turn(self):
+        mock, terminal, pid, root_log = self.start_limited_terminal()
+        self.release()
+        terminal.until(b"stopped after 5 steps")
+        wait_for(lambda: not alive(pid))
+        self.assertEqual(len(mock.observed()), 5)
+        stored = self.completion([m for r in records(root_log) for m in r.get("messages", [])])
+        terminal.send("next turn\r")
+        request = wait_for(lambda: next((r for r in mock.observed()
+                                         if any(content(m) == "next turn" for m in r["messages"])), None))
+        self.assertEqual(content(self.completion(request["messages"])), content(stored))
+        wait_for(lambda: history(self.home)[-1].get("content") == "complete")
+
+    def test_escape_cancels_max_steps_wait(self):
+        mock, terminal, pid, root_log = self.start_limited_terminal()
+        terminal.send("\x1b")
+        terminal.until(b"canceled")
+        wait_for(lambda: not alive(pid))
+        self.assertEqual(len(mock.observed()), 5)
+        self.assertNotIn(b"stopped after 5 steps", terminal.read())
+        self.assertFalse(any(m.get("source") == "background" for r in records(root_log)
+                             for m in r.get("messages", [])))
 
     def test_escape_stops_background_process_group(self):
         self.mock("cancel")

@@ -82,7 +82,7 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
     if (agent_input) {
         var input = std.Io.File.stdin().reader(init.io, &.{});
         const data = try input.interface.allocRemaining(init.arena.allocator(), .unlimited);
-        const envelope = try std.json.parseFromSliceLeaky(struct { prompt: []const u8, config: provider.Config }, init.arena.allocator(), data, .{});
+        const envelope = try std.json.parseFromSliceLeaky(@import("tools/agent/input.zig").Input, init.arena.allocator(), data, .{});
         cfg = envelope.config;
         prompt = envelope.prompt;
     } else {

@@ -7,6 +7,7 @@ pub const RunResult = struct {
     run_ms: ?u64 = null,
     tool_bytes: ?u64 = null,
     output_bytes: ?u64 = null,
+    remaining_steps: ?usize = null,
 };
 
 pub const Diagnostic = struct {

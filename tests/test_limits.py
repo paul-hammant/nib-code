@@ -5,6 +5,7 @@ import unittest
 
 from test_llm import LlmTests, records
 from test_agent import AgentTests
+from mock_llm_tool import content
 
 
 class LlmLimits(unittest.TestCase):
@@ -86,6 +87,85 @@ class AgentLimits(unittest.TestCase):
         self.assertEqual(completed, 5)
         self.assertEqual(active, set())
 
+    def session_log(self, events):
+        session = events[0]["start"]["session_id"]
+        return records(Path(self.env["NIB_HOME"]) / "sessions" / (session + ".jsonl"))
+
+    def limited_turn(self, case, steps):
+        (Path(self.env["NIB_HOME"]) / "config.toml").write_text(f"[limits]\nmax_steps = {steps}\n")
+        process = self.start(case)
+        output, error = process.communicate(timeout=20)
+        self.assertEqual(error, "")
+        self.assertNotEqual(process.returncode, 0, output)
+        events = [json.loads(line) for line in output.splitlines()]
+        self.assertIn("error", events[-1], events)
+        self.assertIn(f"stopped after {steps} steps", json.dumps(events[-1]))
+        self.assertEqual(events[-1]["error"]["steps"], steps)
+        self.assertFalse(any("end" in e for e in events), events)
+        self.assertEqual([r["step"] for r in records(self.requests)], list(range(steps)))
+        runs = [e["run_end"] for e in events if "run_end" in e]
+        self.assertEqual(len(runs), steps)
+        self.assertTrue(all(r["ok"] for r in runs), runs)
+        return events, [r["output"] for r in runs]
+
+    def test_default_max_steps_is_unlimited(self):
+        process = self.start("limits-default")
+        output, error = process.communicate(timeout=30)
+        self.assertEqual(process.returncode, 0, output + error)
+        self.assertEqual(error, "")
+        events = [json.loads(line) for line in output.splitlines()]
+        self.assertEqual(events[-1]["end"]["steps"], 60)
+        self.assertEqual([r["step"] for r in records(self.requests)], list(range(60)))
+        system = self.session_log(events)[0]["messages"][0]["content"]
+        self.assertNotIn("This Turn may use at most", system)
+        for request in records(self.requests):
+            body = request["body"]
+            sent_system = body["instructions"] if self.provider == "codex" else body["messages"][0]["content"]
+            self.assertNotIn("This Turn may use at most", sent_system)
+        runs = [e["run_end"]["output"] for e in events if "run_end" in e]
+        self.assertEqual(len(runs), 59)
+        self.assertTrue(all("Steps left in this Turn]" not in r for r in runs))
+
+    def assert_five_step_countdown(self, events, outputs):
+        system = self.session_log(events)[0]["messages"][0]["content"]
+        instruction = "This Turn may use at most 5 Steps; when they run out, the Turn stops without another model request."
+        self.assertIn(instruction, system)
+        for request in records(self.requests):
+            body = request["body"]
+            sent_system = body["instructions"] if self.provider == "codex" else body["messages"][0]["content"]
+            self.assertIn(instruction, sent_system)
+        self.assertNotIn("Steps left in this Turn]", outputs[0])
+        self.assertTrue(outputs[1].endswith("[3 Steps left in this Turn]"))
+        for output, left in zip(outputs[2:], (2, 1, 0)):
+            marker = f"[{left} Steps left in this Turn]"
+            self.assertTrue(output.endswith(marker), output[-200:])
+            self.assertEqual(output.count(marker), 1)
+        stored = [m["content"] for r in self.session_log(events) for m in r.get("messages", [])
+                  if m.get("role") == "tool"]
+        self.assertEqual(stored, outputs)
+        for request, previous in zip(records(self.requests)[1:], outputs):
+            messages = request["body"].get("messages", request["body"].get("input", []))
+            results = [m.get("output", content(m)) for m in messages
+                       if m.get("role") == "tool" or m.get("type") == "function_call_output"]
+            self.assertEqual(results[-1], previous)
+
+    def test_five_steps_system_countdown_and_no_sixth_request(self):
+        events, outputs = self.limited_turn("limits-loop", 5)
+        self.assert_five_step_countdown(events, outputs)
+
+    def test_countdown_is_outside_run_output_budget(self):
+        (self.cwd / "budget.txt").write_text("x" * 50000)
+        events, outputs = self.limited_turn("limits-budget", 5)
+        self.assert_five_step_countdown(events, outputs)
+        payload = outputs[0]
+        self.assertIn("bytes omitted", payload)
+        self.assertLessEqual(len(payload.encode()), 16 * 1024)
+        self.assertEqual(outputs[1].removesuffix("\n[3 Steps left in this Turn]"), payload)
+        for output, left in zip(outputs[2:], (2, 1, 0)):
+            self.assertEqual(output[:len(payload)], payload)
+            self.assertEqual(output[len(payload):].strip("\n"), f"[{left} Steps left in this Turn]")
+            self.assertGreater(len(output.encode()), 16 * 1024)
+
     def test_turn_stops_before_third_step(self):
         self.configure()
         process = self.start("limits-loop")
@@ -100,7 +180,16 @@ class AgentLimits(unittest.TestCase):
 
     def test_child_inherits_limits_without_reading_poisoned_config(self):
         self.configure()
-        result, events = self.ask("limits-child")
+        process = self.start("limits-child")
+        output, error = process.communicate(timeout=20)
+        self.assertEqual(process.returncode, 0, output + error)
+        self.assertEqual(error, "")
+        events = [json.loads(line) for line in output.splitlines()]
+        self.assertIn("end", events[-1], events)
+        runs = [e["run_end"] for e in events if "run_end" in e]
+        self.assertEqual(len(runs), 1)
+        self.assertTrue(runs[0]["ok"], runs[0])
+        result, _ = json.JSONDecoder().raw_decode(runs[0]["output"].removeprefix("result: "))
         self.assertFalse(result["ok"], result)
         self.assertIn("stopped after 2 steps", result["error"])
         requests = records(self.requests)

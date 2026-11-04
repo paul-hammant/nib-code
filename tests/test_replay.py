@@ -162,6 +162,82 @@ class ReplayTests(unittest.TestCase):
         self.assertFalse((self.cwd / "sample.txt").exists())
         self.assertFalse((self.cwd / "side-effect").exists())
 
+    def test_explicit_step_limits_replay_from_run_metadata(self):
+        config = self.home / "config.toml"
+        for limit in (1, 2):
+            with self.subTest(max_steps=limit):
+                config.write_text(f"[limits]\nmax_steps = {limit}\n")
+                for step in range(1, limit + 1):
+                    self.mock.reply(codes=[f'console.log("step-{step}");',
+                                           '"x".repeat(20000)'])
+                before = len(self.mock.requests)
+                result = self.command("ask", "--json", "limited replay probe", check=False)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                events = [json.loads(line) for line in result.stdout.splitlines()]
+                self.assertEqual(events[-1]["error"]["steps"], limit)
+                session = events[0]["start"]["session_id"]
+                self.assertEqual(len(self.mock.requests) - before, limit)
+                records = jsonl(self.home / "sessions" / f"{session}.jsonl")
+                runs = [run for record in records for run in record.get("run_results", [])]
+                self.assertEqual([run["remaining_steps"] for run in runs],
+                                 [limit - step for step in range(1, limit + 1) for _ in range(2)])
+                # Replay must use recorded metadata, not the current limit.
+                config.unlink()
+                before = len(self.mock.requests)
+                for step in range(1, limit + 1):
+                    for run in range(2):
+                        report = self.replay(session, "--run", f"{step}:{run}")
+                        self.assertIs(report["match"], True, report)
+                        self.assertTrue(report["output"].endswith(
+                            f"\n[{limit - step} Steps left in this Turn]"), report)
+                report = self.replay(session, "--all")
+                self.assertEqual(report["matched"], limit * 2, report)
+                self.assertEqual(report["divergences"], 0, report)
+                self.assertEqual(len(self.mock.requests), before)
+
+    def test_unlimited_and_legacy_logs_replay_without_step_suffix(self):
+        session = self.ask(['console.log("legacy output");'])
+        main = self.home / "sessions" / f"{session}.jsonl"
+        records = jsonl(main)
+        runs = [run for record in records for run in record.get("run_results", [])]
+        self.assertTrue(runs)
+        self.assertTrue(all("remaining_steps" not in run for run in runs))
+        (self.home / "config.toml").write_text("[limits]\nmax_steps = 1\n")
+        before = len(self.mock.requests)
+        current = self.replay(session, "--run", "1:0")
+        self.assertIs(current["match"], True, current)
+        self.assertEqual(current["output"], "legacy output")
+        for record in records:
+            record.pop("run_results", None)
+        main.write_text("".join(json.dumps(row) + "\n" for row in records))
+        legacy = self.replay(session, "--run", "1:0")
+        self.assertEqual(legacy, current)
+        self.assertEqual(len(self.mock.requests), before)
+
+    def test_resume_exposes_changed_turn_budget_without_rewriting_system(self):
+        self.mock.reply(text="initial complete")
+        result = self.command("ask", "--json", "initial prompt")
+        events = [json.loads(line) for line in result.stdout.splitlines()]
+        session = events[0]["start"]["session_id"]
+        main = self.home / "sessions" / f"{session}.jsonl"
+        original_header = jsonl(main)[0]
+        config = self.home / "config.toml"
+        for limit in (1, 3):
+            config.write_text(f"[limits]\nmax_steps = {limit}\n")
+            self.mock.reply(text="resumed complete")
+            self.command("ask", "--json", "resumed prompt", "--resume", session)
+            user = [m["content"] for m in self.mock.requests[-1]["messages"] if m["role"] == "user"][-1]
+            self.assertIn(f"This Turn may use at most {limit} Steps", user)
+            self.assertTrue(user.endswith("\n\nresumed prompt"))
+            self.assertEqual(jsonl(main)[0], original_header)
+
+        config.unlink()
+        self.mock.reply(text="unlimited again")
+        self.command("ask", "--json", "unlimited prompt", "--resume", session)
+        user = [m["content"] for m in self.mock.requests[-1]["messages"] if m["role"] == "user"][-1]
+        self.assertEqual(user, "unlimited prompt")
+        self.assertEqual(jsonl(main)[0], original_header)
+
     def test_record_off_creates_no_calls_file(self):
         self.env["NIB_RECORD"] = "off"
         (self.cwd / "sample.txt").write_text("off probe")

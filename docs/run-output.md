@@ -6,6 +6,8 @@
 
 `src/session/output.zig` 为**整个 Run**生成最多 16 KiB 的 UTF-8 输出，包含标题、分隔符与省略标记。这也是 `run_end.output`、会话日志中的 tool content、下一次模型请求共用的文本；不是每次工具调用各有 16 KiB。
 
+若用户设置了 `max_steps`，且剩余不多于 3 个 Step，Session 在上述格式化之后追加 `[N Steps left in this Turn]`。这行不占 16 KiB 预算，不会被截断；`run_end.output`、日志和下一次模型请求包含相同的完整文本。未设置上限时不追加。
+
 输出较小时沿用原格式。需要截断时：
 
 - 每次 `console.log/info/warn/error` 算一个条目，多个参数或多行文本仍是同一条。最终返回值／错误另算一条；成功时的 `undefined` 不占条目。
@@ -15,7 +17,7 @@
 
 一次 console 打印整个结果数组仍只有一个条目。需要分别定位时，给每个结果单独打印标签；需要大量正文时，先在 JS 里过滤，或分成多个 Run 输出。
 
-日志的 `tool_bytes` 统计宿主实际交给 JS 的工具结果 UTF-8 字节数（成功按序列化 JSON、错误按错误文本），不取决于 JS 是否使用或 await；未交回结果计 0，agent 只计父 Run 返回对象。`output_bytes` 则是 `session/output.format` 格式化后交给模型的实际 tool result 字节数，包含 16 KiB 预算内的截断标记、错误、无输出提示与标签等，不是原始工具数据大小。
+日志的 `tool_bytes` 统计宿主实际交给 JS 的工具结果 UTF-8 字节数（成功按序列化 JSON、错误按错误文本），不取决于 JS 是否使用或 await；未交回结果计 0，agent 只计父 Run 返回对象。`output_bytes` 则是交给模型的实际 tool result 字节数，包含 16 KiB 预算内的截断标记、错误、无输出提示与标签，以及预算外的剩余 Step 提示（若有），不是原始工具数据大小。
 
 ## 捕获上限
 
