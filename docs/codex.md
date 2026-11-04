@@ -55,6 +55,23 @@ TUI 切换只在空闲时处理，从后续 Turn 生效，子 agent 同步继承
 
 NIB_THINKING=on 默认用 medium；NIB_REASONING_EFFORT 可显式指定服务端支持的 effort。NIB_THINKING=off 覆盖 effort：能关闭的模型用 none，sol/astra 用允许的最低档 low；未设置环境推理覆盖时使用文件 effort，再无配置则沿用服务端默认。
 
+## effort 与 prompt 缓存
+
+分析本机 `~/.nib/sessions` 中 Codex、`gpt-6.1-sol` 的实测日志：只比较同一 Turn 内相邻 Step，按请求实际使用的 effort 是否变化分组，计算后一个 Step 的 `prompt_cache_hit_tokens / prompt_tokens`，并对照切换前的命中率。
+
+| 相邻 Step 的 effort | 后一个 Step 样本量 | 缓存命中率中位数 | 平均值 |
+|---|---:|---:|---:|
+| 相同 | 1,504 | 96% | — |
+| 改变 | 12 | 0% | 15% |
+
+例如 `high 99% → medium 0%`、`medium 96% → low 0% → low 99%`；切回之前用过的档位能部分恢复（47%–70%）。这些样本表明 Codex 的 prompt 缓存按 effort 分开；这是当前模型和线路的观测，不是服务端协议保证，也不能外推到 Chat Completions（如 DeepSeek）。
+
+切换后的请求可能按未缓存计费整段上下文，上下文越大代价越高。Run 的 effort 仅作用于下一次模型请求；Run 失败或用户插话后会自动恢复用户档位，因此一次降档通常意味着两次缓存失效（切回旧档位可能部分命中）。Codex 新会话的 system 在 effort 说明旁用两句话陈述这个事实；Chat Completions 的 system 不加这句，也不作为 `NIB_PATCHES_OFF` 可关闭的补丁。提示改变会使新会话的 `system_sha` 改变，恢复会话仍沿用原始 system。
+
+**删除条件：** 如果之后按上述方法统计显示切换 effort 不再导致缓存失效，就删除 system 中这句提示，并同步更新对应测试与本文。
+
+## 摘要与会话恢复
+
 摘要始终使用当前模型，保留原请求前缀和该模型的加密推理条目，以命中缓存并避免跨模型传递密文。能关闭推理时关闭，否则用 low。Codex 摘要不沿用 Chat Completions 的小额总输出限制：按 pi 的请求格式不发送 max_output_tokens，保留服务端正常输出额度；原 32–2048-token 预算只写进提示约束摘要文字，给推理留出空间（pi 目录 maxTokens 为 128000，实际限额仍由服务端决定）。空摘要、截断、压缩无效等失败，自动压缩发 notice 后继续；手动压缩报告错误。
 
 会话记录 provider 和模型；跨 provider 恢复会拒绝，使用原 provider 或开新会话。Codex 恢复模型也要相同，以免加密推理条目跨模型；Chat Completions 恢复沿用原行为，采用当前模型配置。环境和配置文件均未指定 provider 时默认使用 Codex（2026-11-02 起，此前默认 DeepSeek）；设 `NIB_PROVIDER=chat_completions` 使用 Chat Completions 线路，默认 DeepSeek。

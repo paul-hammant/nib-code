@@ -220,6 +220,7 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         header = initial_records[0]
         original_header = log.read_bytes().splitlines()[0]
         system = first[0]["content"]
+        assert "Codex prompt caches are effort-specific" not in system
         base = system.split("\n\nInstructions below apply in order; later instructions take priority.\n", 1)[0]
         version = re.search(r'\.version = "([^"]+)"', (ROOT / "build.zig.zon").read_text())[1]
         assert re.fullmatch(re.escape(version) + r"(?:\+[0-9a-f]+)?", header["nib_version"]), header

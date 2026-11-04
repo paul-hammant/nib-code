@@ -75,10 +75,21 @@ pub const system_template =
     \\Writing scripts:
     \\- Top-level `await` works. Each Step is a full model round trip, usually 10 s or more; one Run can read several files, make all independent edits, then build and test, returning only what you need (such as failures).
     \\- The last expression and console.log output share 16 KiB per Run, truncated by console call and final result with markers; filter in JS first; tool results inside JS remain complete.
-    \\- run's effort sets reasoning for only the next model request; lower effort answers faster but reasons less.
+    \\- run's effort sets reasoning for only the next model request; lower effort answers faster but reasons less.{s}
     \\{s}
     \\When the task is done, answer the user directly without calling the tool.
 ;
+
+const codex_effort_cache_fact = "Codex prompt caches are effort-specific: measured median hit rates were 96% with unchanged effort and 0% just after a switch, potentially billing the full context as uncached. Run failure or user interjection automatically restores the user's effort, so one downgrade typically causes two cache misses.";
+
+pub fn renderSystem(a: std.mem.Allocator, cwd: []const u8, host: *const tools.Tools, environ: ?*const std.process.Environ.Map) ![]const u8 {
+    const docs = try host.documentation(a);
+    defer a.free(docs);
+    const lines = try patchLines(a, environ);
+    defer a.free(lines);
+    const effort_cache = if (host.cfg != null and host.cfg.?.provider == .codex) "\n- " ++ codex_effort_cache_fact else "";
+    return std.fmt.allocPrint(a, system_template, .{ cwd, docs, effort_cache, lines });
+}
 
 pub fn turnBudgetText(a: std.mem.Allocator, system: []const u8, max_steps: ?usize, user_text: []const u8) ![]const u8 {
     const marker = "This Turn may use at most ";
@@ -100,11 +111,7 @@ pub fn stepLimitPrompt(a: std.mem.Allocator, base: []const u8, max_steps: ?usize
 test "system prompt documents every tool in JavaScript" {
     const gpa = std.testing.allocator;
     var host: tools.Tools = .{ .io = std.testing.io, .home = "/unused", .cfg = .{ .provider = .codex, .base_url = "", .api_key = "", .model = @import("../provider/codex.zig").default_model } };
-    const docs = try host.documentation(gpa);
-    defer gpa.free(docs);
-    const lines = try patchLines(gpa, null);
-    defer gpa.free(lines);
-    const prompt = try std.fmt.allocPrint(gpa, system_template, .{ "/work", docs, lines });
+    const prompt = try renderSystem(gpa, "/work", &host, null);
     defer gpa.free(prompt);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "```js\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "{{llm_options}}") == null);
@@ -116,6 +123,27 @@ test "system prompt documents every tool in JavaScript" {
         const call = try std.fmt.allocPrint(gpa, "async {s}(", .{name});
         defer gpa.free(call);
         try std.testing.expect(std.mem.indexOf(u8, prompt, call) != null);
+    }
+}
+
+test "only Codex system prompts include effort cache facts, independent of patches" {
+    const t = std.testing;
+    var host: tools.Tools = .{ .io = t.io, .home = "/unused", .cfg = .{ .provider = .codex, .base_url = "", .api_key = "", .model = @import("../provider/codex.zig").default_model } };
+    var env: std.process.Environ.Map = .init(t.allocator);
+    defer env.deinit();
+    try env.put("NIB_PATCHES_OFF", "all");
+    inline for (.{ @import("../provider.zig").Id.codex, .chat_completions }) |id| {
+        host.cfg.?.provider = id;
+        const system = try renderSystem(t.allocator, "/work", &host, &env);
+        defer t.allocator.free(system);
+        const fact = std.mem.indexOf(u8, system, codex_effort_cache_fact);
+        try t.expectEqual(id == .codex, fact != null);
+        if (fact) |index| {
+            const effort = std.mem.indexOf(u8, system, "run's effort sets reasoning").?;
+            try t.expect(effort < index);
+            try t.expect(std.mem.endsWith(u8, system[effort..index], "reasons less.\n- "));
+        }
+        for (patches) |patch| try t.expect(std.mem.indexOf(u8, system, patch.text) == null);
     }
 }
 

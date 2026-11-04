@@ -2,6 +2,7 @@
 
     python3 tests/test_codex.py
 """
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -158,6 +159,8 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
         assert headers["openai-beta"] == "responses=experimental" and headers["originator"] == "nib"
         assert body["model"] == "gpt-6.1-sol" and body["store"] is False and body["stream"] is True
         assert "You are nib" in body["instructions"]
+        assert "Codex prompt caches are effort-specific" in body["instructions"]
+        assert "one downgrade typically causes two cache misses" in body["instructions"]
         assert "reasoning.encrypted_content" in body["include"]
         assert "messages" not in body
         tool = body["tools"][0]
@@ -167,6 +170,8 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
         assert_cache_key([request], session)
         history, records = replay(tmp / f"nib/sessions/{session}.jsonl")
         assert records[0]["provider"] == "codex" and records[0]["model"] == "gpt-6.1-sol"
+        base = body["instructions"].split("\n\nInstructions below apply in order; later instructions take priority.\n", 1)[0]
+        assert records[0]["system_sha"] == hashlib.sha256(base.encode()).hexdigest()[:12]
         reasoning = history[-1]["reasoning"]
         assert reasoning["provider"] == "codex"
         items = json.loads(reasoning["data"])

@@ -102,7 +102,7 @@ pub const Session = struct {
             s.id = try a.dupe(u8, std.fs.path.stem(path));
             s.log = try session_log.Log.create(io, path);
             errdefer s.log.close(io);
-            const template = try std.fmt.allocPrint(a, prompt.system_template, .{ cwd, try s.tools.documentation(a), try prompt.patchLines(a, options.environ) });
+            const template = try prompt.renderSystem(a, cwd, &s.tools, options.environ);
             const base = try prompt.stepLimitPrompt(a, template, cfg.limits.max_steps);
             const global = try std.fs.path.join(a, &.{ options.home, "AGENTS.md" });
             const project = try std.fs.path.join(a, &.{ try instructions.projectRoot(io, a, cwd), "AGENTS.md" });
