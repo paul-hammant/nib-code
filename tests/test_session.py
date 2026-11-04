@@ -35,6 +35,8 @@ def replay(path):
         messages = [dict(message) for message in record["messages"]]
         for message in messages:
             message.pop("step_effort", None)
+            message.pop("tool_summary", None)
+            message.pop("step_calls_omitted", None)
             if "reasoning" in message:
                 reasoning = message.pop("reasoning")
                 assert reasoning["provider"] == "chat_completions"
@@ -277,6 +279,21 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
             parsed = [json.loads(line) for line in result.stdout.splitlines()]
             assert all(len(event) == 1 for event in parsed), parsed
             return parsed
+
+        summary_home = tmp / "summary-home"
+        (cwd / "summary.txt").write_text("old")
+        for prompt, expected in [
+                ("run_summary_test", {"counts": [{"name": "edit", "count": 1}, {"name": "bash", "count": 1}], "omitted": 0}),
+                ("run_summary_overflow", {"counts": [{"name": "read", "count": 200}], "omitted": 3})]:
+            summary_events = events(ask("--json", prompt, overrides={"NIB_HOME": str(summary_home)}))
+            run_end = next(event["run_end"] for event in summary_events if "run_end" in event)
+            assert run_end["tool_summary"] == expected, run_end
+            summary_id = summary_events[0]["start"]["session_id"]
+            summary_records = replay(summary_home / "sessions" / f"{summary_id}.jsonl")[1]
+            step = next(record for record in summary_records if record.get("calls"))
+            assert step["run_results"][0]["calls_omitted"] == expected["omitted"], step
+            assert step["messages"][-1]["tool_summary"] == expected, step
+        print("Run summary E2E passed: source text ignored, actual calls and bounded overflow")
 
         streamed = events(ask("--json", "-", input=b"stdin prompt\nsecond line"))
         session_id = streamed[0]["start"]["session_id"]

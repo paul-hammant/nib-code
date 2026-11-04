@@ -139,6 +139,12 @@ class H(http.server.BaseHTTPRequestHandler):
                 code = ('await tools.write({path: "notes.txt", content: "a\\nb\\n"});\n'
                         'await tools.edit({path: "notes.txt", old_text: "b", new_text: "B"});\n'
                         'await tools.write({path: "same.txt", content: "x\\n"}); "done"')
+            elif lastuser == 'run_summary_test':
+                code = ('await tools.edit({path: "summary.txt", old_text: "old", '
+                        'new_text: "tools.llm( tools.llm( tools.write("});'
+                        '/* tools.agent( */ await tools.bash({command: "true"})')
+            elif lastuser == 'run_summary_overflow':
+                code = 'for (let i = 0; i < 203; i++) await tools.read({path: "summary.txt"})'
             elif lastuser == 'tool_bytes_test':
                 code = ('await Promise.all([tools.read({path: "bytes-a.txt"}), tools.read({path: "bytes-b.txt"})]);'
                         '"ok"')

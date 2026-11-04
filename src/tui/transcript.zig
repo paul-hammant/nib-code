@@ -9,6 +9,7 @@ const Background = @import("../session/events.zig").Background;
 const BackgroundKind = @FieldType(Background, "kind");
 const bill = @import("bill.zig");
 const AgentTree = @import("agent_tree.zig").Tree;
+const ToolSummary = @import("../session/tool_summary.zig").Summary;
 
 const run_output_lines = 12;
 const max_diff_lines = 60;
@@ -27,6 +28,7 @@ pub const Entry = struct {
     changes: ChangeText = .{},
     agents: std.ArrayList(Progress) = .empty,
     run_number: usize = 0,
+    tool_summary: ?ToolSummary = null,
     agent_tree: AgentTree = .{},
     /// One-line summary of a collapsible entry. vaxis keeps printed slices
     /// until render, so this must outlive draw(); see `refreshLabel`.
@@ -40,6 +42,7 @@ pub const Entry = struct {
 
     pub fn deinit(e: *Entry, gpa: std.mem.Allocator) void {
         if (e.step_effort) |effort| gpa.free(effort.effort);
+        if (e.tool_summary) |summary| summary.deinit(gpa);
         e.text.deinit(gpa);
         e.output.deinit(gpa);
         e.label.deinit(gpa);
@@ -53,8 +56,8 @@ pub const Entry = struct {
         e.label.clearRetainingCapacity();
         switch (e.kind) {
             .run => {
-                var buf: [96]u8 = undefined;
-                const used = toolSummary(e.text.items, &buf);
+                var buf: [512]u8 = undefined;
+                const used = if (e.tool_summary) |summary| actualToolSummary(summary, &buf) else toolSummary(e.text.items, &buf);
                 var live: std.ArrayList(Progress) = .empty;
                 defer live.deinit(gpa);
                 for (e.agents.items) |p| if (e.isLive(p)) try live.append(gpa, p);
@@ -426,6 +429,11 @@ pub const Transcript = struct {
 
     /// Takes ownership of `changes`.
     pub fn endRun(t: *Transcript, gpa: std.mem.Allocator, ok: bool, output: []const u8, elapsed_ms: u64, changes: ChangeText) !void {
+        try t.endRunWithSummary(gpa, ok, output, elapsed_ms, changes, null);
+    }
+
+    /// Takes ownership of `changes`; borrows `summary`.
+    pub fn endRunWithSummary(t: *Transcript, gpa: std.mem.Allocator, ok: bool, output: []const u8, elapsed_ms: u64, changes: ChangeText, summary: ?ToolSummary) !void {
         const e = t.lastRunning() orelse {
             var c = changes;
             c.deinit(gpa);
@@ -435,12 +443,15 @@ pub const Transcript = struct {
         e.elapsed_ms = elapsed_ms;
         e.changes.deinit(gpa);
         e.changes = changes;
+        if (summary) |value| e.tool_summary = try value.clone(gpa);
         try appendHead(gpa, &e.output, output, run_output_lines);
         try e.refreshLabel(gpa);
         e.cached = null;
     }
 
     pub fn addHistory(t: *Transcript, gpa: std.mem.Allocator, history: []const provider.Message) !void {
+        var runs: std.StringHashMap(usize) = .init(gpa);
+        defer runs.deinit();
         for (history) |m| {
             const content = m.content orelse "";
             if (m.source == .background) {
@@ -464,10 +475,18 @@ pub const Transcript = struct {
                     const args = std.json.parseFromSlice(Args, gpa, call.function.arguments, .{ .ignore_unknown_fields = true }) catch continue;
                     defer args.deinit();
                     try t.addRun(gpa, args.value.code, false, m.step_effort);
+                    try runs.put(call.id, t.entries.items.len - 1);
+                }
+                if (m.step_calls_omitted) |omitted| {
+                    const text = try std.fmt.allocPrint(gpa, "tools +{d} · omitted calls (Run unknown)", .{omitted});
+                    defer gpa.free(text);
+                    try t.add(gpa, .info, text);
                 }
             } else if (std.mem.eql(u8, m.role, "tool")) {
-                if (t.lastRunning()) |e| {
+                if (runs.get(m.tool_call_id orelse "")) |index| {
+                    const e = &t.entries.items[index];
                     e.run = .ok;
+                    if (m.tool_summary) |summary| e.tool_summary = try summary.clone(gpa);
                     try appendHead(gpa, &e.output, content, run_output_lines);
                     try e.refreshLabel(gpa);
                 }
@@ -564,7 +583,22 @@ fn appendHead(gpa: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8,
     }
 }
 
-/// "bash ×2, read" from the `tools.<name>(` calls in a script.
+fn actualToolSummary(summary: ToolSummary, buf: []u8) []const u8 {
+    if (summary.counts.len == 0 and summary.omitted == 0) return "js";
+    var w: std.Io.Writer = .fixed(buf);
+    for (summary.counts, 0..) |call, i| {
+        if (i > 0) w.writeAll(", ") catch break;
+        w.writeAll(call.name) catch break;
+        if (call.count > 1) w.print(" ×{d}", .{call.count}) catch break;
+    }
+    if (summary.omitted > 0) {
+        if (summary.counts.len > 0) w.writeAll(", ") catch {};
+        w.print("+{d}", .{summary.omitted}) catch {};
+    }
+    return w.buffered();
+}
+
+/// Source estimate used until actual calls are available.
 fn toolSummary(code: []const u8, buf: []u8) []const u8 {
     var names: [8][]const u8 = undefined;
     var counts: [8]u32 = undefined;
@@ -1065,4 +1099,143 @@ test "agent rows have stable heights across folding resizing completion and scro
     try t.startRun(gpa, "1 + 1");
     try testing.expectEqual(@as(u16, 1), t.entries.items[1].height(win));
     try testing.expectEqual(@as(u16, 3), t.entries.items[0].height(win));
+}
+
+test "completed Run replaces source estimate with dispatched host tools" {
+    const gpa = testing.allocator;
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    try t.startRun(gpa, "await tools.edit({new_text: 'tools.llm( tools.llm( tools.write('}); await tools.bash({})");
+    try testing.expect(std.mem.indexOf(u8, t.entries.items[0].label.items, "llm ×2") != null);
+    const calls = [_]@import("../sandbox/timing.zig").Call{
+        .{ .name = "edit", .start_ms = 0, .end_ms = 1, .ok = true, .run_index = 0 },
+        .{ .name = "llm", .start_ms = 1, .end_ms = 1, .ok = false, .run_index = 0, .dispatched = false },
+        .{ .name = "bash", .start_ms = 1, .end_ms = 2, .ok = false, .run_index = 0 },
+    };
+    const summary = try ToolSummary.init(gpa, &calls, 0, 0);
+    defer summary.deinit(gpa);
+    try t.endRunWithSummary(gpa, false, "failed bash", 200, .{}, summary);
+    try testing.expectEqualStrings("edit, bash · 0.2s", t.entries.items[0].label.items);
+}
+
+test "completed Run includes omitted calls without guessing their names" {
+    const gpa = testing.allocator;
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    var timing: @import("../sandbox/timing.zig").Run = .init(testing.io, .now(testing.io, .awake));
+    for (0..203) |_| _ = timing.reserve("read");
+    try t.startRun(gpa, "for (;;) tools.read({}); tools.llm({})");
+    const summary = try ToolSummary.init(gpa, timing.entries[0..timing.count], 0, timing.omitted);
+    defer summary.deinit(gpa);
+    try t.endRunWithSummary(gpa, true, "done", 0, .{}, summary);
+    try testing.expectEqualStrings("read ×200, +3 · 0.0s", t.entries.items[0].label.items);
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("+3", actualToolSummary(.{ .omitted = 3 }, &buf));
+}
+
+test "empty actual summary does not fall back to source text" {
+    var t: Transcript = .{};
+    defer t.deinit(testing.allocator);
+    try t.startRun(testing.allocator, "// tools.llm({})");
+    try t.endRunWithSummary(testing.allocator, true, "done", 0, .{}, .{});
+    try testing.expectEqualStrings("js · 0.0s", t.entries.items[0].label.items);
+}
+
+test "restored Run summaries follow run_index and tool_call_id and survive compaction" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const log = @import("../session/log.zig");
+    const record: log.Record = .{ .messages = &.{
+        .{ .role = "system", .content = "base" },
+        .{ .role = "assistant", .tool_calls = &.{
+            .{ .id = "first", .function = .{ .name = "run", .arguments = "{\"code\":\"tools.llm({})\"}" } },
+            .{ .id = "second", .function = .{ .name = "run", .arguments = "{\"code\":\"tools.agent({})\"}" } },
+        } },
+        .{ .role = "tool", .tool_call_id = "first", .content = "first output" },
+        .{ .role = "tool", .tool_call_id = "second", .content = "second output" },
+    }, .calls = &.{
+        .{ .name = "edit", .start_ms = 0, .end_ms = 1, .ok = true, .run_index = 0 },
+        .{ .name = "bash", .start_ms = 0, .end_ms = 1, .ok = true, .run_index = 1 },
+        .{ .name = "bash", .start_ms = 0, .end_ms = 1, .ok = false, .run_index = 1 },
+        .{ .name = "llm", .start_ms = 0, .end_ms = 0, .ok = false, .run_index = 1, .dispatched = false },
+    }, .calls_omitted = 5, .run_results = &.{
+        .{ .tool_call_id = "first", .ok = true, .calls_omitted = 2 },
+        .{ .tool_call_id = "second", .ok = true, .calls_omitted = 3 },
+    } };
+    const data = try std.fmt.allocPrint(a, "{f}\n", .{std.json.fmt(record, .{ .emit_null_optional_fields = false })});
+    var history: std.ArrayList(provider.Message) = .empty;
+    var tokens: u64 = 0;
+    _ = try log.replay(a, a, data, &history, &tokens);
+    var t: Transcript = .{};
+    defer t.deinit(testing.allocator);
+    try t.addHistory(testing.allocator, history.items);
+    try testing.expectEqualStrings("edit, +2 · 0.0s", t.entries.items[0].label.items);
+    try testing.expectEqualStrings("bash ×2, +3 · 0.0s", t.entries.items[1].label.items);
+    try testing.expectEqualStrings("first output", t.entries.items[0].output.items);
+    try testing.expectEqualStrings("second output", t.entries.items[1].output.items);
+    const compacted = try std.fmt.allocPrint(a, "{f}\n", .{std.json.fmt(log.Record{ .messages = history.items }, .{ .emit_null_optional_fields = false })});
+    history = .empty;
+    _ = try log.replay(a, a, compacted, &history, &tokens);
+    t.clear(testing.allocator);
+    try t.addHistory(testing.allocator, history.items);
+    try testing.expectEqualStrings("edit, +2 · 0.0s", t.entries.items[0].label.items);
+    try testing.expectEqualStrings("bash ×2, +3 · 0.0s", t.entries.items[1].label.items);
+}
+
+test "legacy logs without calls retain the source estimate" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const log = @import("../session/log.zig");
+    const data = "{\"messages\":[{\"role\":\"system\",\"content\":\"base\"},{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"old\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"code\\\":\\\"tools.llm({}); tools.llm({})\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"old\",\"content\":\"done\"}]}\n";
+    var history: std.ArrayList(provider.Message) = .empty;
+    var tokens: u64 = 0;
+    _ = try log.replay(a, a, data, &history, &tokens);
+    var t: Transcript = .{};
+    defer t.deinit(testing.allocator);
+    try t.addHistory(testing.allocator, history.items);
+    try testing.expectEqualStrings("llm ×2 · 0.0s", t.entries.items[0].label.items);
+}
+
+test "legacy Step overflow is not attributed to a pure JS Run" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const log = @import("../session/log.zig");
+    var calls: [200]@import("../sandbox/timing.zig").Call = undefined;
+    @memset(&calls, .{ .name = "read", .start_ms = 0, .end_ms = 1, .ok = true, .run_index = 0 });
+    const record: log.Record = .{ .messages = &.{
+        .{ .role = "system", .content = "base" },
+        .{ .role = "assistant", .tool_calls = &.{
+            .{ .id = "first", .function = .{ .name = "run", .arguments = "{\"code\":\"for (;;) tools.read({})\"}" } },
+            .{ .id = "second", .function = .{ .name = "run", .arguments = "{\"code\":\"1+1\"}" } },
+        } },
+        .{ .role = "tool", .tool_call_id = "first", .content = "first output" },
+        .{ .role = "tool", .tool_call_id = "second", .content = "second output" },
+    }, .calls = &calls, .calls_omitted = 3 };
+    var data = try std.fmt.allocPrint(a, "{f}\n", .{std.json.fmt(record, .{ .emit_null_optional_fields = false })});
+    for (0..2) |_| {
+        var history: std.ArrayList(provider.Message) = .empty;
+        var tokens: u64 = 0;
+        _ = try log.replay(a, a, data, &history, &tokens);
+        var t: Transcript = .{};
+        defer t.deinit(testing.allocator);
+        try t.addHistory(testing.allocator, history.items);
+        try testing.expectEqualStrings("read ×200 · 0.0s", t.entries.items[0].label.items);
+        try testing.expectEqualStrings("js · 0.0s", t.entries.items[1].label.items);
+        try testing.expectEqualStrings("tools +3 · omitted calls (Run unknown)", t.entries.items[2].text.items);
+        data = try std.fmt.allocPrint(a, "{f}\n", .{std.json.fmt(log.Record{ .messages = history.items }, .{ .emit_null_optional_fields = false })});
+    }
+}
+
+fn endRunAllocationFailures(gpa: std.mem.Allocator) !void {
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    try t.startRun(gpa, "tools.llm({})");
+    try t.endRunWithSummary(gpa, true, "done", 0, .{}, .{ .counts = &.{.{ .name = "read", .count = 1 }} });
+}
+
+test "endRun summary cloning failures release owned data" {
+    try testing.checkAllAllocationFailures(testing.allocator, endRunAllocationFailures, .{});
 }

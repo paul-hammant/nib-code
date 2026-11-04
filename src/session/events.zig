@@ -1,6 +1,7 @@
 const std = @import("std");
 const provider = @import("../provider.zig");
 const Change = @import("../tools/diff.zig").Change;
+const Summary = @import("tool_summary.zig").Summary;
 
 pub const Progress = struct {
     agent: usize,
@@ -88,7 +89,7 @@ pub const Event = union(enum) {
     /// Slices are valid only during the callback.
     delta: struct { kind: provider.Kind, text: []const u8 },
     run_start: []const u8,
-    run_end: struct { ok: bool, output: []const u8, changes: []const Change = &.{} },
+    run_end: struct { ok: bool, output: []const u8, changes: []const Change = &.{}, tool_summary: ?Summary = null },
     retry: struct { attempt: u32, delay_ms: u64, reason: []const u8 },
     notice: []const u8,
     usage: provider.Usage,
@@ -127,3 +128,28 @@ pub const JsonEvent = union(enum) {
         try writer.flush();
     }
 };
+
+test "run_end JSON includes actual tool summary including empty counts" {
+    const t = std.testing;
+    const counts = [_]@import("tool_summary.zig").Count{
+        .{ .name = "bash", .count = 2 },
+        .{ .name = "read", .count = 1 },
+    };
+    const populated = try std.json.Stringify.valueAlloc(t.allocator, JsonEvent{ .event = .{ .run_end = .{
+        .ok = false,
+        .output = "failed",
+        .tool_summary = .{ .counts = &counts, .omitted = 3 },
+    } } }, .{ .emit_null_optional_fields = false });
+    defer t.allocator.free(populated);
+    try t.expectEqualStrings("{\"run_end\":{\"ok\":false,\"output\":\"failed\",\"changes\":[],\"tool_summary\":{\"counts\":[{\"name\":\"bash\",\"count\":2},{\"name\":\"read\",\"count\":1}],\"omitted\":3}}}", populated);
+    const empty = try std.json.Stringify.valueAlloc(t.allocator, JsonEvent{ .event = .{ .run_end = .{
+        .ok = true,
+        .output = "",
+        .tool_summary = .{},
+    } } }, .{ .emit_null_optional_fields = false });
+    defer t.allocator.free(empty);
+    try t.expectEqualStrings("{\"run_end\":{\"ok\":true,\"output\":\"\",\"changes\":[],\"tool_summary\":{\"counts\":[],\"omitted\":0}}}", empty);
+    const legacy = try std.json.Stringify.valueAlloc(t.allocator, JsonEvent{ .event = .{ .run_end = .{ .ok = true, .output = "" } } }, .{ .emit_null_optional_fields = false });
+    defer t.allocator.free(legacy);
+    try t.expectEqualStrings("{\"run_end\":{\"ok\":true,\"output\":\"\",\"changes\":[]}}", legacy);
+}
