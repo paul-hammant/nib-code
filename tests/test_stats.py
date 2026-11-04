@@ -43,6 +43,83 @@ def synthetic_log(path, turns, **metadata):
 
 
 class StatsTest(unittest.TestCase):
+    def test_tool_data_mixed_logs_and_cli(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'bytes.jsonl'
+            records = synthetic_log(path, [['tools.read({path: \"a\"})', None]], nib_version='bytes')
+            records[1].update(tool_bytes=1000, output_bytes=250,
+                run_results=[dict(tool_bytes=100, output_bytes=value) for value in range(10, 111, 10)]
+                            + [dict(tool_bytes=0, output_bytes=99), dict(tool_bytes=1), {}],
+                calls=[dict(name='read', result_bytes=300), dict(name='read', result_bytes=100),
+                       dict(name='bash', result_bytes=600), dict(name='write', result_bytes=0),
+                       dict(name='legacy'), dict(name='bad', result_bytes=True)])
+            records[2].update(output_bytes=0)
+            path.write_text('\n'.join(map(json.dumps, records)) + '\n')
+            report = stats.summarize([path], group_by='version')
+            data = report['tool_data']
+            self.assertEqual(data['step_bytes'], dict(
+                tool_bytes=dict(samples=1, total_bytes=1000),
+                output_bytes=dict(samples=2, total_bytes=250)))
+            self.assertEqual(data['output_tool_ratio'], dict(samples=11, median=0.6, p90=1.0))
+            self.assertEqual(data['result_bytes'], 1000)
+            self.assertEqual(data['tools'], {
+                'bash': dict(count=1, result_bytes=600, ratio=0.6),
+                'read': dict(count=2, result_bytes=400, ratio=0.4),
+                'write': dict(count=1, result_bytes=0, ratio=0.0)})
+            self.assertEqual(report['groups']['bytes']['tool_data'], data)
+            cli = subprocess.check_output([sys.executable, str(ROOT / 'scripts/stats.py'),
+                                           str(path), '--json'], text=True)
+            self.assertEqual(json.loads(cli)['tool_data'], data)
+            text = subprocess.check_output([sys.executable, str(ROOT / 'scripts/stats.py'),
+                                            str(path)], text=True)
+            self.assertIn('工具数据度量', text)
+            self.assertIn('output_bytes/tool_bytes: samples=11 median=0.6 p90=1', text)
+            self.assertIn('read: count=2 result_bytes=400 ratio=40.00%', text)
+            report['tool_data']['output_tool_ratio'] = dict(samples=1, median=12/96060, p90=12/96060)
+            self.assertIn('median=0.000124922 p90=0.000124922', stats.text_report(report))
+
+    def test_tool_data_legacy_invalid_and_zero(self):
+        empty = stats.ToolData().report()
+        self.assertEqual(stats.summarize([])['tool_data'], empty)
+        data = stats.ToolData()
+        for value in (None, True, -1, 1.5, '10', [], {}):
+            data.add(dict(tool_bytes=value, output_bytes=value, run_results=value, calls=value))
+            data.add(dict(run_results=[None, value, dict(tool_bytes=value, output_bytes=10),
+                                      dict(tool_bytes=10, output_bytes=value)],
+                          calls=[None, value, dict(name='read', result_bytes=value),
+                                 dict(name=value if not isinstance(value, str) else '', result_bytes=10)]))
+        self.assertEqual(data.report(), empty)
+        data.add(dict(run_results=[dict(tool_bytes=0, output_bytes=10),
+                                   dict(tool_bytes=10, output_bytes=0),
+                                   dict(tool_bytes=10, output_bytes=20)],
+                      calls=[dict(name='read', result_bytes=0)]))
+        self.assertEqual(data.report()['output_tool_ratio'], dict(samples=2, median=1.0, p90=2.0))
+        self.assertIsNone(data.report()['tools']['read']['ratio'])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'legacy.jsonl'
+            synthetic_log(path, [[None]])
+            report = stats.summarize([path])
+            self.assertEqual(report['tool_data'], empty)
+            self.assertIn('output_bytes/tool_bytes: samples=0 median=n/a p90=n/a', stats.text_report(report))
+
+    def test_tool_data_selected_steps_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'filter.jsonl'
+            records = synthetic_log(path, [[None], [None]])
+            for record, day, size in zip(records, (1, 1, 3), (999, 100, 20)):
+                record.update(at=int(datetime(2025, 1, day).timestamp() * 1000),
+                              tool_bytes=size, output_bytes=size,
+                              run_results=[dict(tool_bytes=size, output_bytes=size)],
+                              calls=[dict(name='read', result_bytes=size)])
+            records.append(dict(records[2], **{'from': 0, 'tool_bytes': 9999}))
+            path.write_text('\n'.join(map(json.dumps, records)) + '\n')
+            data = stats.summarize([path], since=date(2025, 1, 2))['tool_data']
+            self.assertEqual(data['step_bytes']['tool_bytes'], dict(samples=1, total_bytes=20))
+            self.assertEqual(data['output_tool_ratio'], dict(samples=1, median=1.0, p90=1.0))
+            self.assertEqual(data['tools']['read'], dict(count=1, result_bytes=20, ratio=1.0))
+            self.assertEqual(stats.summarize([path], cwd=Path(directory) / 'other')['tool_data'],
+                             stats.ToolData().report())
+
     def assertRoundTrips(self, actual, expected):
         self.assertEqual(len(actual["notes"]), 2)
         self.assertEqual({key: value for key, value in actual.items() if key != "notes"}, expected)

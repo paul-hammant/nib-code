@@ -120,7 +120,8 @@ class LlmTests:
         timing = events[-1]["end"]["timing"]
         for name in ("llm", "agent"):
             self.assertEqual(timing[name + "_calls"], sum(
-                call["name"] == name for step in steps for call in step.get("calls", [])))
+                call["name"] == name and call.get("dispatched", True)
+                for step in steps for call in step.get("calls", [])))
         for key in ("model_ms", "run_ms"):
             self.assertEqual(timing[key], sum(step[key] for step in steps))
         return events

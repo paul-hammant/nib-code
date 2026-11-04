@@ -9,13 +9,21 @@ pub const Text = struct {
         var model: [64]u8 = undefined;
         var run: [64]u8 = undefined;
         var tok: [64]u8 = undefined;
+        var tool_bytes: [64]u8 = undefined;
+        var output_bytes: [64]u8 = undefined;
         var w: std.Io.Writer = .fixed(&text.buf);
         if (summary.status != .completed) w.print("{s} · ", .{@tagName(summary.status)}) catch unreachable;
-        w.print("{d} steps · {s} · think {s} · tools {s} · {s} tok ({d}% cached)", .{
+        w.print("{d} steps · {s} · think {s} · tools {s}", .{
             summary.steps,
             duration(&wall, summary.timing.wall_ms),
             componentDuration(&model, summary.timing.model_ms),
             componentDuration(&run, summary.timing.run_ms),
+        }) catch unreachable;
+        if (summary.timing.tool_bytes > 0) w.print(" · {s}→{s} B", .{
+            tokens(&tool_bytes, summary.timing.tool_bytes),
+            tokens(&output_bytes, summary.timing.output_bytes),
+        }) catch unreachable;
+        w.print(" · {s} tok ({d}% cached)", .{
             tokens(&tok, @as(u128, summary.usage.prompt_tokens) + summary.usage.completion_tokens),
             @as(u128, summary.usage.prompt_cache_hit_tokens) * 100 / @max(summary.usage.prompt_tokens, 1),
         }) catch unreachable;
@@ -25,7 +33,7 @@ pub const Text = struct {
     }
 };
 
-// Generated bill text contains only single-cell ASCII, middle dots and multiplication signs.
+// Generated bill text contains only single-cell ASCII, middle dots, arrows and multiplication signs.
 pub fn fit(full: []const u8, width: u16) []const u8 {
     var line = full;
     while ((std.unicode.utf8CountCodepoints(line) catch unreachable) > width) {
@@ -59,12 +67,12 @@ fn tokens(buf: []u8, n: u128) []const u8 {
 const example: TurnSummary = .{
     .steps = 12,
     .usage = .{ .prompt_tokens = 44_000, .completion_tokens = 1000, .prompt_cache_hit_tokens = 40_040 },
-    .timing = .{ .wall_ms = 190_000, .model_ms = 100_000, .run_ms = 80_000, .llm_calls = 8, .agent_calls = 1 },
+    .timing = .{ .wall_ms = 190_000, .model_ms = 100_000, .run_ms = 80_000, .tool_bytes = 3_200_000, .output_bytes = 18_000, .llm_calls = 8, .agent_calls = 1 },
 };
 
 test "bill formats turn totals and cache hits over prompt tokens" {
     var text: Text = .{};
-    try std.testing.expectEqualStrings("12 steps · 3m10s · think 1m40 · tools 1m20 · 45k tok (91% cached) · llm ×8 · agent ×1", text.format(example, 200));
+    try std.testing.expectEqualStrings("12 steps · 3m10s · think 1m40 · tools 1m20 · 3.2M→18k B · 45k tok (91% cached) · llm ×8 · agent ×1", text.format(example, 200));
     var summary = example;
     summary.usage = .{ .prompt_tokens = 1000, .completion_tokens = 1000, .prompt_cache_hit_tokens = 910 };
     try std.testing.expect(std.mem.indexOf(u8, text.format(summary, 200), "2k tok (91% cached)") != null);
@@ -134,5 +142,29 @@ test "bill prefixes canceled and failed outcomes" {
         try std.testing.expect(std.mem.startsWith(u8, text.format(summary, 200), prefix ++ " · 0 steps"));
         try std.testing.expectEqualStrings(prefix, text.format(summary, @intCast(prefix.len)));
         try std.testing.expectEqualStrings("", text.format(summary, @intCast(prefix.len - 1)));
+    }
+}
+
+test "bill omits bytes when tool bytes are zero and retains zero output" {
+    var text: Text = .{};
+    var summary: TurnSummary = .{};
+    summary.timing.output_bytes = 18_000;
+    try std.testing.expectEqualStrings("0 steps · 0s · think 0s · tools 0s · 0 tok (0% cached)", text.format(summary, 200));
+    summary.timing.tool_bytes = 320;
+    summary.timing.output_bytes = 0;
+    try std.testing.expectEqualStrings("0 steps · 0s · think 0s · tools 0s · 320→0 B · 0 tok (0% cached)", text.format(summary, 200));
+}
+
+test "bill fits delegation counts before tokens and bytes" {
+    var text: Text = .{};
+    const prefixes = [_][]const u8{
+        "12 steps · 3m10s · think 1m40 · tools 1m20 · 3.2M→18k B · 45k tok (91% cached) · llm ×8",
+        "12 steps · 3m10s · think 1m40 · tools 1m20 · 3.2M→18k B · 45k tok (91% cached)",
+        "12 steps · 3m10s · think 1m40 · tools 1m20 · 3.2M→18k B",
+        "12 steps · 3m10s · think 1m40 · tools 1m20",
+    };
+    for (prefixes) |prefix| {
+        const width: u16 = @intCast(try std.unicode.utf8CountCodepoints(prefix));
+        try std.testing.expectEqualStrings(prefix, text.format(example, width));
     }
 }

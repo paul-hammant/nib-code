@@ -344,6 +344,46 @@ class EffortStats:
         return dict(by_effort=groups, downgraded=downgrade_summary(total))
 
 
+class ToolData:
+    def __init__(self):
+        self.step_bytes = {key: dict(samples=0, total_bytes=0)
+                           for key in ('tool_bytes', 'output_bytes')}
+        self.ratios = []
+        self.tools = {}
+
+    def add(self, record):
+        for key, item in self.step_bytes.items():
+            if number(record.get(key)):
+                item['samples'] += 1
+                item['total_bytes'] += record[key]
+        results = record.get('run_results')
+        for result in results if isinstance(results, list) else []:
+            if not isinstance(result, dict):
+                continue
+            tool, output = result.get('tool_bytes'), result.get('output_bytes')
+            if number(tool) and tool > 0 and number(output):
+                self.ratios.append(output / tool)
+        calls = record.get('calls')
+        for call in calls if isinstance(calls, list) else []:
+            if not isinstance(call, dict):
+                continue
+            name, size = call.get('name'), call.get('result_bytes')
+            if isinstance(name, str) and name and number(size):
+                item = self.tools.setdefault(name, dict(count=0, result_bytes=0))
+                item['count'] += 1
+                item['result_bytes'] += size
+
+    def report(self):
+        total = sum(item['result_bytes'] for item in self.tools.values())
+        return dict(step_bytes={key: dict(item) for key, item in self.step_bytes.items()},
+                    output_tool_ratio=distribution(self.ratios),
+                    result_bytes=total,
+                    tools={name: dict(item, ratio=item['result_bytes'] / total if total else None)
+                           for name, item in sorted(self.tools.items())},
+                    notes=["Step 顶层 tool_bytes/output_bytes 独立累计，不与 Run 或 calls 相加，不从其他层回填；缺失或无效字段跳过。",
+                           "output_tool_ratio 为每 Run output_bytes/tool_bytes（非总量之比），仅取两字段有效且 tool_bytes>0 的样本，p90=nearest-rank；可大于 1。工具占比以有效 calls[].result_bytes 总和为分母，按 name 汇总，不依赖计时；缺失或省略调用不补零，总字节为零时占比 n/a。"])
+
+
 class Timing:
     def __init__(self):
         self.values = {key: [] for key in ('step_ms', 'model_ms', 'run_ms', 'run_result_ms',
@@ -462,6 +502,7 @@ def summarize(paths, since=None, cwd=None, group_by=None):
     usage = dict.fromkeys(TOKEN_KEYS, 0)
     tool_counts, bash_counts = Counter(), Counter()
     timing = Timing()
+    tool_data = ToolData()
     errors = {name: {'count': 0, 'examples': []} for name in ERRORS}
     slowest, turn_steps, turn_times = [], [], []
 
@@ -611,6 +652,7 @@ def summarize(paths, since=None, cwd=None, group_by=None):
                     if not matched and (ok is False or candidates):
                         error('other_failure', candidates[0] if candidates else text, path.stem)
             timing.add(record, sources, run_statuses)
+            tool_data.add(record)
             if current is not None:
                 structure = step_structure(step_codes, header.get('cwd') if isinstance(header.get('cwd'), str) else None)
                 previous = current['previous']
@@ -638,6 +680,7 @@ def summarize(paths, since=None, cwd=None, group_by=None):
     report = {'overall': totals, 'usage': usage, 'time_filter': time_filter, 'tools': dict(sorted(tool_counts.items())),
             'bash_top10': [{'command': k, 'count': v} for k, v in sorted(bash_counts.items(), key=lambda p: (-p[1], p[0]))[:10]],
             'errors': errors, 'slowest_steps': slowest, 'timing': timing.report(),
+            'tool_data': tool_data.report(),
             'round_trips': dict(steps_per_turn=distribution(turn_steps),
                                write_to_validation=pair_summary(write_validation_pairs, adjacent_pairs),
                                disjoint_write_files=pair_summary(disjoint_pairs, file_pairs),
@@ -667,6 +710,8 @@ def text_report(report):
         return 'n/a' if value is None else f'{value:.2f}{suffix}'
     def pct(value):
         return fmt(None if value is None else 100 * value, '%')
+    def ratio_fmt(value):
+        return 'n/a' if value is None else f'{value:.6g}'
     token_total = str(u['total_tokens']) if t['steps_with_usage'] else 'n/a'
     lines = [f"会话 {t['sessions']}（根 {t['root_sessions']} / 子 {t['child_sessions']}）；Turn {t['turns']}；Step {t['steps']}；Run {t['runs']}",
              f"Run 失败 {t['runs_failed']}/{t['runs_with_status']} = {pct(t['run_failure_rate'])}（状态未知 {t['runs_unknown']}）",
@@ -717,6 +762,18 @@ def text_report(report):
         lines.append(f"    {item['command']}: count={item['count']} total={item['total_ms']} ms median={fmt(item['median_ms'])} ms")
     if not bash['top10']:
         lines.append('    无可匹配计时记录')
+    data = report['tool_data']
+    lines.append('工具数据度量（bytes；缺失字段不补零）：')
+    for name, item in data['step_bytes'].items():
+        lines.append(f"  Step {name}: samples={item['samples']} total={item['total_bytes']} bytes")
+    ratio = data['output_tool_ratio']
+    lines.append(f"  每 Run output_bytes/tool_bytes: samples={ratio['samples']} median={ratio_fmt(ratio['median'])} p90={ratio_fmt(ratio['p90'])}")
+    lines.append(f"  工具 result_bytes 占比（总计 {data['result_bytes']} bytes）：")
+    for name, item in data['tools'].items():
+        lines.append(f"    {name}: count={item['count']} result_bytes={item['result_bytes']} ratio={pct(item['ratio'])}")
+    if not data['tools']:
+        lines.append('    无字节记录')
+    lines.extend('  ' + note for note in data['notes'])
     lines.extend(['口径：'] + ['  ' + note for note in report['notes']])
     if 'groups' in report:
         lines.append(f"分组 group_by={report['group_by']}：")

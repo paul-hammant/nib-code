@@ -5,6 +5,8 @@ pub const RunResult = struct {
     tool_call_id: []const u8,
     ok: bool,
     run_ms: ?u64 = null,
+    tool_bytes: ?u64 = null,
+    output_bytes: ?u64 = null,
 };
 
 pub const Diagnostic = struct {
@@ -28,6 +30,8 @@ pub const Record = struct {
     first_data_ms: ?u64 = null,
     code: ?[]const @import("../provider/timing.zig").Code = null,
     run_ms: ?u64 = null,
+    tool_bytes: ?u64 = null,
+    output_bytes: ?u64 = null,
     calls: ?[]const @import("../sandbox/timing.zig").Call = null,
     calls_omitted: ?u64 = null,
     run_results: ?[]const RunResult = null,
@@ -431,6 +435,7 @@ test "timing fields are optional and replay preserves mixed old and measured Ste
         \\{"from":1,"messages":[{"role":"assistant","content":"old"}],"ms":10,"run_results":[]}
     );
     try t.expectEqual(@as(?u64, null), legacy.model_ms);
+    try t.expect(legacy.tool_bytes == null and legacy.output_bytes == null);
     try t.expectEqual(@as(?u32, null), legacy.attempts);
     try t.expectEqual(@as(?u64, null), legacy.first_data_ms);
     try t.expect(legacy.code == null and legacy.calls == null and legacy.run_ms == null and legacy.calls_omitted == null);
@@ -444,9 +449,11 @@ test "timing fields are optional and replay preserves mixed old and measured Ste
         .first_data_ms = 3,
         .code = &.{.{ .tool_call_id = "c", .first_ms = 5, .last_ms = 55, .progress = &.{ .{ 5, 1 }, .{ 55, 20 } } }},
         .run_ms = 20,
-        .calls = &.{.{ .name = "read", .start_ms = 1, .end_ms = 19, .ok = true, .run_index = 0 }},
+        .tool_bytes = 4000,
+        .output_bytes = 12,
+        .calls = &.{.{ .name = "read", .start_ms = 1, .end_ms = 19, .ok = true, .run_index = 0, .result_bytes = 4000 }},
         .calls_omitted = 4,
-        .run_results = &.{.{ .tool_call_id = "c", .ok = true, .run_ms = 20 }},
+        .run_results = &.{.{ .tool_call_id = "c", .ok = true, .run_ms = 20, .tool_bytes = 4000, .output_bytes = 12 }},
     };
     const encoded = try std.json.Stringify.valueAlloc(a, measured, .{ .emit_null_optional_fields = false });
     const restored = try parseRecord(a, encoded);
@@ -456,6 +463,11 @@ test "timing fields are optional and replay preserves mixed old and measured Ste
     try t.expectEqualStrings("read", restored.calls.?[0].name);
     try t.expectEqual(@as(?u64, 4), restored.calls_omitted);
     try t.expectEqual(@as(?u64, 20), restored.run_results.?[0].run_ms);
+    try t.expectEqual(@as(?u64, 4000), restored.tool_bytes);
+    try t.expectEqual(@as(?u64, 12), restored.output_bytes);
+    try t.expectEqual(restored.tool_bytes, restored.calls.?[0].result_bytes);
+    try t.expectEqual(restored.tool_bytes, restored.run_results.?[0].tool_bytes);
+    try t.expectEqual(restored.output_bytes, restored.run_results.?[0].output_bytes);
     const data = try std.fmt.allocPrint(a,
         \\{{"from":0,"messages":[{{"role":"system","content":"base"}}]}}
         \\{f}
