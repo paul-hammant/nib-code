@@ -72,7 +72,18 @@ NIB_THINKING=on 默认用 medium；NIB_REASONING_EFFORT 可显式指定服务端
 
 ## fork 与父缓存路由
 
-`tools.agent({ prompt, fork: true })` 创建独立子会话，但 Codex 请求的 `prompt_cache_key` 使用父会话的值，不改用新子会话 ID。fork 继承父会话压缩后的当前完整 history（含发起 fork 的当前 assistant 及 reasoning，之后补合成 tool results 和 user prompt），system/工具 schema 与父会话逐字节相同。共用 key 的目的，是让相同前缀的请求路由到同一缓存；**这是待实测假设，不是服务端命中保证**。目前没有真实 fork 对照实验确认缓存命中率、延迟或费用收益，不能把上面的相邻 Step effort 样本当成 fork 的证据。
+`tools.agent({ prompt, fork: true })` 创建独立子会话，但 Codex 请求的 `prompt_cache_key` 使用父会话的值，不改用新子会话 ID。fork 继承父会话压缩后的当前完整 history（含发起 fork 的当前 assistant 及 reasoning，之后补合成 tool results 和 user prompt），system/工具 schema 与父会话逐字节相同。共用 key 的目的，是让相同前缀的请求路由到同一缓存。
+
+2026-11-04 用 `gpt-6.1-sol`、默认 effort 做了两轮真实对照（同一任务，父会话先读文件，再分别以 `fork: true` / `false` 委派同一个问题）：
+
+| 子会话 | 第一个请求 prompt | 缓存命中 | 子会话 Step | 子会话耗时 |
+|---|---:|---:|---:|---:|
+| fork，父上下文约 2k | 2,166 | 1,920（89%） | 2 | 5.8 s |
+| 新建，同上 | 1,575 | 0 | 2 | 6.7 s |
+| fork，父上下文约 6.6k | 6,814 | 6,528（96%） | 1（未重读文件） | 3.9 s |
+| 新建，同上 | 1,579 | 0 | 2 | 7.9 s |
+
+样本很少，只说明共用 key 时首请求能命中父前缀，不是服务端保证；上下文更大时的收益仍需 `stats.py` 的 `child_costs.by_creation` 持续观察。若之后统计显示 fork 首请求命中率不再明显高于新建子会话，就重新考虑共用 key。
 
 model/effort 默认继承父配置，也可显式覆盖；两者不同时不再具有父前缀的缓存复用优势，共用 key 不改变这一点。Codex fork 适用与 resume 相同的模型一致性检查，覆盖 model 不能将父历史中的加密推理条目跨模型使用。后续可在同 model/effort、相同父前缀下对照父 key 与独立 key，记录首请求的 `prompt_cache_hit_tokens / prompt_tokens`、未缓存输入及耗时；结果不支持路由收益时重新考虑共用 key。完整语义及置信度见 [委派工具](tool-delegation.md) 与 [ADR 0015](adr/0015-agent-fork.md)。
 
