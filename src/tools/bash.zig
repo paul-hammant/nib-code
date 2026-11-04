@@ -67,19 +67,38 @@ test "bash refuses commands denied by policy" {
     try testing.expect(std.mem.startsWith(u8, r.err, "refused by nib: privileged"));
 }
 
-test "bash explains the shell-word limit for long heredocs" {
+test "bash executes a 300-line Python heredoc" {
     var script: std.ArrayList(u8) = .empty;
     defer script.deinit(testing.allocator);
-    try script.appendSlice(testing.allocator, "python3 - <<'EOF'\n");
-    for (0..300) |_| try script.appendSlice(testing.allocator, "x = 1\n");
-    try script.appendSlice(testing.allocator, "EOF\n");
-    try testing.expect(script.items.len < 2048);
+    try script.appendSlice(testing.allocator, "python3 - <<'EOF'\nx = 0\n");
+    for (0..298) |_| try script.appendSlice(testing.allocator, "x += 1\n");
+    try script.appendSlice(testing.allocator, "print(x)\nEOF\n");
     const args = try std.json.Stringify.valueAlloc(testing.allocator, .{ .command = script.items }, .{});
     defer testing.allocator.free(args);
     const r = try callTool("bash", args);
     defer freeResult(r);
+    try testing.expectEqualStrings("{\"exit_code\":0,\"output\":\"298\\n\"}", r.ok);
+}
+
+test "bash rejects more than 256 shell words in the command portion" {
+    var command: std.ArrayList(u8) = .empty;
+    defer command.deinit(testing.allocator);
+    try command.appendSlice(testing.allocator, "echo");
+    for (0..256) |_| try command.appendSlice(testing.allocator, " x");
+    const args = try std.json.Stringify.valueAlloc(testing.allocator, .{ .command = command.items }, .{});
+    defer testing.allocator.free(args);
+    const r = try callTool("bash", args);
+    defer freeResult(r);
     try testing.expectEqualStrings("refused by nib: " ++ policy.too_long, r.err);
-    try testing.expect(std.mem.indexOf(u8, r.err, "256 shell words") != null);
+    try testing.expectEqualStrings("refused by nib: command portion has more than 256 shell words; write long scripts to a file with tools.write and run that file", r.err);
+}
+
+test "bash refuses credential references inside heredoc bodies" {
+    const args = try std.json.Stringify.valueAlloc(testing.allocator, .{ .command = "python3 - <<'EOF'\nprint('~/.codex/auth.json')\nEOF\n" }, .{});
+    defer testing.allocator.free(args);
+    const r = try callTool("bash", args);
+    defer freeResult(r);
+    try testing.expectEqualStrings("refused by nib: access to Codex credentials", r.err);
 }
 
 test "bash timeout kills the whole process group" {

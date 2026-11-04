@@ -1,5 +1,6 @@
 //! Refuses destructive deletion and privilege/system commands. A guard
-//! against mistakes, not against a model trying to evade it.
+//! against mistakes, not against a model trying to evade it. Calls from other
+//! languages, such as os.system in a Python heredoc, are not inspected.
 
 const std = @import("std");
 
@@ -9,7 +10,7 @@ pub const Verdict = union(enum) {
 };
 
 const max_words = 256;
-pub const too_long = std.fmt.comptimePrint("command has more than {d} shell words (heredoc bodies count); write long scripts to a file with tools.write and run that file", .{max_words});
+pub const too_long = std.fmt.comptimePrint("command portion has more than {d} shell words; write long scripts to a file with tools.write and run that file", .{max_words});
 
 const always_denied = [_][]const u8{
     "sudo",    "su",        "doas",  "pkexec", "shutdown", "reboot", "poweroff", "halt",
@@ -45,12 +46,26 @@ pub fn checkCredentials(command: []const u8, codex_home: ?[]const u8) Verdict {
 
 fn checkDepth(command: []const u8, home: []const u8, depth: u8) Verdict {
     if (depth > 4) return .{ .deny = "command nesting is too deep to check" };
-    if (std.mem.indexOf(u8, command, "--no-preserve-root") != null) return .{ .deny = "rm --no-preserve-root" };
+    const heredocs = scanHeredocs(command) orelse Heredocs{};
+    const bodies = heredocs.items[0..heredocs.len];
+    var checked: usize = 0;
+    for (bodies) |body| {
+        if (std.mem.indexOf(u8, command[checked..body.start], "--no-preserve-root") != null)
+            return .{ .deny = "rm --no-preserve-root" };
+        if (!body.quoted) switch (checkExpansions(command[body.start..body.end], home, depth, false)) {
+            .allow => {},
+            .deny => |why| return .{ .deny = why },
+        };
+        checked = body.after;
+    }
+    if (std.mem.indexOf(u8, command[checked..], "--no-preserve-root") != null)
+        return .{ .deny = "rm --no-preserve-root" };
 
     var buf: [max_words]Word = undefined;
-    const words = split(command, &buf) orelse return .{ .deny = too_long };
+    const words = split(command, &buf, bodies) orelse return .{ .deny = too_long };
 
     var fetched = false;
+    var runs_shell = false;
     var start: usize = 0;
     while (start < words.len) {
         var end = start;
@@ -72,6 +87,7 @@ fn checkDepth(command: []const u8, home: []const u8, depth: u8) Verdict {
             return .{ .deny = "recursive rm of a protected path" };
 
         if (in(&shells, cmd) or std.mem.eql(u8, cmd, "eval")) {
+            runs_shell = true;
             if (fetched) return .{ .deny = "piping a downloaded script into a shell" };
             for (argv[1..], 1..) |a, i| {
                 if (a.substitutes_fetch) return .{ .deny = "running a downloaded script" };
@@ -85,6 +101,209 @@ fn checkDepth(command: []const u8, home: []const u8, depth: u8) Verdict {
         if (in(&fetchers, cmd) and sep == .pipe) fetched = true;
         if (sep != .pipe) fetched = false;
     }
+    // A heredoc may be a shell's stdin script; when a shell runs here, its bodies are commands, not data.
+    if (runs_shell) for (bodies) |body| switch (checkDepth(command[body.start..body.end], home, depth + 1)) {
+        .allow => {},
+        .deny => |why| return .{ .deny = why },
+    };
+    return .allow;
+}
+
+const Heredoc = struct {
+    delimiter: []const u8,
+    quoted: bool,
+    strip_tabs: bool,
+    start: usize = 0,
+    end: usize = 0,
+    after: usize = 0,
+};
+
+const Heredocs = struct {
+    items: [max_words]Heredoc = undefined,
+    len: usize = 0,
+};
+
+fn scanHeredocs(command: []const u8) ?Heredocs {
+    var result: Heredocs = .{};
+    var pending: usize = 0;
+    var i: usize = 0;
+    while (i < command.len) {
+        const ch = command[i];
+        if (ch == '\\') {
+            i = @min(i + 2, command.len);
+        } else if (ch == '\'' or ch == '"' or ch == '`') {
+            i = quotedEnd(command, i);
+        } else if (ch == '(' and i + 1 < command.len and command[i + 1] == '(') {
+            i = @min(skipParens(command, i) + 1, command.len);
+        } else if (ch == '#' and (i == 0 or std.mem.indexOfScalar(u8, " \t\n;|&()", command[i - 1]) != null)) {
+            i = std.mem.indexOfScalarPos(u8, command, i, '\n') orelse command.len;
+        } else if (ch == '\n') {
+            i += 1;
+            while (pending < result.len) : (pending += 1) {
+                const body = &result.items[pending];
+                body.start = i;
+                while (true) {
+                    var end = std.mem.indexOfScalarPos(u8, command, i, '\n') orelse command.len;
+                    if (!body.quoted) {
+                        while (end < command.len and continuedLine(command[i..end])) {
+                            end = std.mem.indexOfScalarPos(u8, command, end + 1, '\n') orelse command.len;
+                        }
+                    }
+                    const line = if (body.strip_tabs) std.mem.trimStart(u8, command[i..end], "\t") else command[i..end];
+                    if (delimiterMatches(body.delimiter, line, !body.quoted)) {
+                        body.end = i;
+                        body.after = if (end < command.len) end + 1 else end;
+                        i = body.after;
+                        break;
+                    }
+                    if (end == command.len) return null;
+                    i = end + 1;
+                }
+            }
+        } else if (ch == '<' and i + 1 < command.len and command[i + 1] == '<') {
+            i += 2;
+            if (i < command.len and command[i] == '<') {
+                while (i < command.len and command[i] == '<') i += 1;
+                continue;
+            }
+            const strip_tabs = i < command.len and command[i] == '-';
+            if (strip_tabs) i += 1;
+            while (i < command.len and (command[i] == ' ' or command[i] == '\t')) i += 1;
+            const begin = i;
+            var quoted = false;
+            while (i < command.len) {
+                if (command[i] == '\'' or command[i] == '"') {
+                    quoted = true;
+                    i = quotedEnd(command, i);
+                } else if (command[i] == '\\') {
+                    quoted = true;
+                    i = @min(i + 2, command.len);
+                } else if (std.mem.indexOfScalar(u8, " \t\n|;&()<>", command[i]) != null) {
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            if (i == begin or result.len == result.items.len) return null;
+            result.items[result.len] = .{ .delimiter = command[begin..i], .quoted = quoted, .strip_tabs = strip_tabs };
+            result.len += 1;
+        } else {
+            i += 1;
+        }
+    }
+    return if (pending == result.len) result else null;
+}
+
+fn quotedEnd(s: []const u8, open: usize) usize {
+    const quote = s[open];
+    var i = open + 1;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == quote) return i + 1;
+        if (s[i] == '\\' and quote != '\'') i += 1;
+    }
+    return s.len;
+}
+
+fn continuedLine(line: []const u8) bool {
+    return (line.len - std.mem.trimEnd(u8, line, "\\").len) % 2 == 1;
+}
+
+fn lineByte(line: []const u8, index: *usize, join_lines: bool) ?u8 {
+    while (index.* < line.len) {
+        const i = index.*;
+        if (join_lines and line[i] == '\\' and i + 1 < line.len and line[i + 1] == '\n') {
+            index.* += 2;
+            continue;
+        }
+        index.* += 1;
+        return line[i];
+    }
+    return null;
+}
+
+fn delimiterMatches(raw: []const u8, line: []const u8, join_lines: bool) bool {
+    var quote: u8 = 0;
+    var i: usize = 0;
+    var n: usize = 0;
+    while (i < raw.len) : (i += 1) {
+        var ch = raw[i];
+        if (quote == 0 and (ch == '\'' or ch == '"')) {
+            quote = ch;
+            continue;
+        }
+        if (quote != 0 and ch == quote) {
+            quote = 0;
+            continue;
+        }
+        if (ch == '\\' and quote != '\'' and i + 1 < raw.len and
+            (quote == 0 or std.mem.indexOfScalar(u8, "$`\"\\\n", raw[i + 1]) != null))
+        {
+            i += 1;
+            ch = raw[i];
+        }
+        if (lineByte(line, &n, join_lines) != ch) return false;
+    }
+    return quote == 0 and lineByte(line, &n, join_lines) == null;
+}
+
+fn checkExpansions(text: []const u8, home: []const u8, depth: u8, shell_quotes: bool) Verdict {
+    if (depth > 4) return .{ .deny = "command nesting is too deep to check" };
+    const heredocs = if (shell_quotes) scanHeredocs(text) orelse Heredocs{} else Heredocs{};
+    var body_index: usize = 0;
+    var quote: u8 = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (body_index < heredocs.len and i == heredocs.items[body_index].start) {
+            i = heredocs.items[body_index].after;
+            body_index += 1;
+            continue;
+        }
+        if (text[i] == '\\') {
+            i = @min(i + 2, text.len);
+            continue;
+        }
+        if (shell_quotes) {
+            if (text[i] == '"') {
+                quote = if (quote == 0) '"' else 0;
+                i += 1;
+                continue;
+            }
+            if (quote == 0 and text[i] == '\'') {
+                i = quotedEnd(text, i);
+                continue;
+            }
+            if (quote == 0 and text[i] == '#' and
+                (i == 0 or std.mem.indexOfScalar(u8, " \t\n;|&()", text[i - 1]) != null))
+            {
+                i = std.mem.indexOfScalarPos(u8, text, i, '\n') orelse text.len;
+                continue;
+            }
+        }
+        var begin: usize = undefined;
+        var end: usize = undefined;
+        if (text[i] == '$' and i + 1 < text.len and text[i + 1] == '(') {
+            begin = i + 2;
+            end = skipParens(text, i + 1);
+        } else if (text[i] == '`') {
+            begin = i + 1;
+            const after = quotedEnd(text, i);
+            end = if (after > begin and text[after - 1] == '`') after - 1 else text.len;
+        } else {
+            i += 1;
+            continue;
+        }
+        const inner = text[begin..end];
+        const arithmetic = text[i] == '$' and begin < text.len and text[begin] == '(';
+        if (!arithmetic) switch (checkDepth(inner, home, depth + 1)) {
+            .allow => {},
+            .deny => |why| return .{ .deny = why },
+        };
+        switch (checkExpansions(inner, home, depth + 1, true)) {
+            .allow => {},
+            .deny => |why| return .{ .deny = why },
+        }
+        i = @min(end + 1, text.len);
+    }
     return .allow;
 }
 
@@ -96,10 +315,16 @@ const Word = struct {
     substitutes_fetch: bool = false,
 };
 
-fn split(command: []const u8, buf: []Word) ?[]Word {
+fn split(command: []const u8, buf: []Word, bodies: []const Heredoc) ?[]Word {
     var n: usize = 0;
     var i: usize = 0;
+    var body_index: usize = 0;
     while (i < command.len) {
+        if (body_index < bodies.len and i == bodies[body_index].start) {
+            i = bodies[body_index].after;
+            body_index += 1;
+            continue;
+        }
         const ch = command[i];
         if (ch == ' ' or ch == '\t') {
             i += 1;
@@ -145,6 +370,14 @@ fn skipParens(s: []const u8, open: usize) usize {
     var depth: usize = 0;
     var i = open;
     while (i < s.len) : (i += 1) {
+        if (s[i] == '\\') {
+            i += 1;
+            continue;
+        }
+        if (s[i] == '\'' or s[i] == '"' or s[i] == '`') {
+            i = quotedEnd(s, i) - 1;
+            continue;
+        }
         if (s[i] == '(') depth += 1;
         if (s[i] == ')') {
             depth -= 1;
@@ -228,6 +461,14 @@ fn in(list: []const []const u8, s: []const u8) bool {
 }
 
 const testing = std.testing;
+
+test "heredocs fed to a shell are checked as scripts" {
+    try expectDenied("bash <<'EOF'\nsudo reboot\nEOF");
+    try expectDenied("sh -s <<EOF\nrm -rf /\nEOF");
+    try expectDenied("cat <<'A' | bash\nsudo true\nA");
+    try expectAllowed("bash <<'EOF'\necho hi\nEOF");
+    try expectAllowed("python3 - <<'EOF'\nprint('sudo reboot')\nEOF");
+}
 
 fn expectDenied(cmd: []const u8) !void {
     switch (check(cmd, "/home/u")) {
@@ -318,4 +559,127 @@ test "credential directory globs and recursive searches are denied" {
     try testing.expect(checkCredentials("cat ~/.codex/*", null) == .deny);
     try testing.expect(checkCredentials("rg . \"$CODEX_HOME\"", null) == .deny);
     try testing.expect(checkCredentials("rg . /tmp/custom-codex", "/tmp/custom-codex") == .deny);
+}
+
+fn repeat(comptime text: []const u8, comptime count: usize) [text.len * count]u8 {
+    @setEvalBranchQuota(20000);
+    var out: [text.len * count]u8 = undefined;
+    for (0..count) |i| @memcpy(out[i * text.len ..][0..text.len], text);
+    return out;
+}
+
+fn expectTooLong(command: []const u8) !void {
+    const verdict = check(command, "/home/u");
+    try testing.expect(verdict == .deny);
+    try testing.expectEqualStrings(too_long, verdict.deny);
+}
+
+test "heredoc bodies do not consume the shell word buffer" {
+    try expectAllowed("python3 - <<'EOF'\n" ++ repeat("x = 1\n", 300) ++ "EOF\n");
+    try expectAllowed("python3 - <<\"EOF\"\n" ++ repeat("x = 1\n", 300) ++ "EOF\n");
+    try expectAllowed("cat <<EOF\n" ++ repeat("many ordinary data words\n", 300) ++ "EOF\n");
+}
+
+test "only unquoted heredoc bodies execute substitutions" {
+    for ([_][]const u8{ "$(rm -rf /)", "`sudo true`", "$(echo ok) $(sudo true)", "$(printf ')'; sudo true)", "$(echo $(sudo true))", "$(echo \"$(sudo true)\")" }) |body| {
+        const unquoted = try std.fmt.allocPrint(testing.allocator, "cat <<EOF\n{s}\nEOF\n", .{body});
+        defer testing.allocator.free(unquoted);
+        try expectDenied(unquoted);
+        for ([_][]const u8{ "'EOF'", "\"EOF\"" }) |delimiter| {
+            const quoted = try std.fmt.allocPrint(testing.allocator, "cat <<{s}\n{s}\nEOF\n", .{ delimiter, body });
+            defer testing.allocator.free(quoted);
+            try expectAllowed(quoted);
+        }
+    }
+    try expectAllowed("cat <<EOF\nsudo rm -rf / --no-preserve-root\nEOF\n");
+    try expectAllowed("cat <<'EOF'\n$(rm --no-preserve-root -rf /)\nEOF\n");
+    try expectAllowed("cat <<EOF\n\\$(sudo true) \\`sudo true\\`\nEOF\n");
+    try expectAllowed("cat <<EOF\n$(printf '%s' '$(sudo true)')\nEOF\n");
+    try expectAllowed("cat <<EOF\n$(printf hello) `printf world`\nEOF\n");
+    try expectDenied("cat <<EOF\n'$(sudo true)'\nEOF\n");
+}
+
+test "heredoc substitutions share the command nesting limit" {
+    try expectAllowed("cat <<EOF\n$(echo $(echo $(echo $(echo hi))))\nEOF\n");
+    const verdict = check("cat <<EOF\n$(echo $(echo $(echo $(echo $(echo hi)))))\nEOF\n", "/home/u");
+    try testing.expect(verdict == .deny);
+    try testing.expectEqualStrings("command nesting is too deep to check", verdict.deny);
+    try expectDenied("cat <<EOF\n$(bash -c 'sudo true')\nEOF\n");
+}
+
+test "tab stripping heredocs accept tab indented terminators" {
+    try expectAllowed("cat <<-'EOF'\n\tsudo true\n\t\tEOF\n");
+    try expectAllowed("cat <<-EOF\n" ++ repeat("\tdata words\n", 300) ++ "\tEOF\n");
+    try expectDenied("cat <<-EOF\n\t$(sudo true)\n\tEOF\n");
+    try expectDenied("cat <<-'EOF'\nsudo true\n EOF\n");
+    try expectDenied("cat <<'EOF'\nsudo true\n\tEOF\n");
+}
+
+test "multiple heredocs are consumed in declaration order" {
+    try expectAllowed("cat <<'ONE' <<\"TWO\"\n" ++ repeat("sudo true\n", 300) ++ "ONE\n$(rm -rf /)\nTWO\n");
+    try expectAllowed("cat <<'ONE' <<TWO\n$(sudo true)\nONE\n$(printf safe)\nTWO\n");
+    try expectDenied("cat <<'ONE' <<TWO\nplain data\nONE\n$(sudo true)\nTWO\n");
+    try expectDenied("cat <<ONE <<'TWO'\n$(rm -rf /)\nONE\nplain data\nTWO\n");
+    try expectDenied("cat <<'ONE'\nsudo true\nONE\nsudo true\n");
+    try expectAllowed("cat <<'ONE'\nsudo true\nONE\ncat <<'TWO'\nrm -rf /\nTWO");
+}
+
+test "missing heredoc terminators retain the original policy" {
+    try expectAllowed("cat <<'EOF'\nordinary text\n");
+    try expectDenied("cat <<'EOF'\nsudo true\n");
+    try expectTooLong("cat <<'EOF'\n" ++ repeat("x = 1\n", 300));
+    try expectTooLong("cat <<'ONE' <<'TWO'\n" ++ repeat("data words\n", 300) ++ "ONE\nunterminated\n");
+    try expectDenied("cat <<'EOF'\nsudo true\nEOF extra\n");
+}
+
+test "here strings and heredoc lookalikes retain the original policy" {
+    try expectAllowed("cat <<< 'sudo true'");
+    try expectDenied("cat <<< text; sudo true");
+    try expectTooLong("cat <<< " ++ repeat("data ", 300));
+    try expectDenied("echo '<<EOF'\nsudo true\nEOF\n");
+    try expectDenied("echo \"<<EOF\"\nsudo true\nEOF\n");
+    try expectDenied("echo hi # <<EOF\nsudo true\nEOF\n");
+    try expectDenied("echo \\<\\<EOF\nsudo true\nEOF\n");
+}
+
+test "heredoc delimiter quote removal" {
+    try expectAllowed("cat << E'O'F\n$(sudo true)\nEOF\n");
+    try expectAllowed("cat <<\\EOF\n$(sudo true)\nEOF\n");
+    try expectAllowed("cat <<''\nsudo true\n\n");
+    try expectAllowed("cat <<'END OF DATA'\nsudo true\nEND OF DATA");
+}
+
+test "heredocs do not relax command word or credential checks" {
+    try expectAllowed("echo " ++ repeat("x ", 255));
+    try expectTooLong("echo " ++ repeat("x ", 256));
+    try expectTooLong("cat <<'EOF' " ++ repeat("x ", 256) ++ "\nsudo true\nEOF\n");
+    try expectTooLong("cat <<'EOF'\ndata\nEOF\necho " ++ repeat("x ", 256));
+    try testing.expectEqualStrings("command portion has more than 256 shell words; write long scripts to a file with tools.write and run that file", too_long);
+    try expectDenied("cat <<'EOF'\n.codex/auth.json\nEOF\n");
+    try testing.expect(checkCredentials("cat <<'EOF'\n/tmp/private-codex/auth.json\nEOF\n", "/tmp/private-codex") == .deny);
+}
+
+test "arithmetic shifts are not heredoc declarations" {
+    try expectDenied("echo $((1 << 2))\nsudo true\n2\n");
+    try expectDenied("((x = 1 << 2))\nsudo true\n2\n");
+    try expectAllowed("echo $((1 << 2)); cat <<'EOF'\n" ++ repeat("data words\n", 300) ++ "EOF\n");
+}
+
+test "unquoted heredoc delimiters respect backslash newline joining" {
+    try expectDenied("cat <<EOF\nE\\\nOF\nsudo true\nEOF\n");
+    try expectAllowed("cat <<'EOF'\nE\\\nOF\nsudo true\nEOF\n");
+    try expectDenied("cat <<EOF\nx\\\nEOF\nsudo true\n");
+    try expectAllowed("cat <<EOF\nx\\\\\nEOF\n");
+}
+
+test "nested substitutions preserve shell quotes and heredoc bodies" {
+    try expectDenied("cat <<EOF\n$(echo \"don't $(sudo true)\")\nEOF\n");
+    try expectAllowed("cat <<EOF\n$(cat <<'INNER'\n$(sudo true)\nINNER\n)\nEOF\n");
+    try expectDenied("cat <<EOF\n$(cat <<INNER\n$(sudo true)\nINNER\n)\nEOF\n");
+}
+
+test "heredoc arithmetic and command comments are not executed as commands" {
+    try expectAllowed("cat <<EOF\n$((sudo + 1))\nEOF\n");
+    try expectDenied("cat <<EOF\n$((1 + $(sudo true)))\nEOF\n");
+    try expectAllowed("cat <<EOF\n$(echo hi # $(sudo true)\n)\nEOF\n");
 }
