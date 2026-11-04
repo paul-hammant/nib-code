@@ -81,7 +81,7 @@ const all = [_]Tool{
         .name = "llm",
         .run = model_function.llm,
         .doc =
-        \\  // Pure single-step model call: judgments, classification, extraction on supplied data; no tools/side effects, usually seconds. Limits: 4 concurrent/process, 100/Run, 256 KiB prompt+input.
+        \\  // Pure single-step model call: judgments, classification, extraction on supplied data; no tools/side effects, usually seconds. Limits: {{llm_limits}} prompt+input.
         \\  // {{llm_options}}
         \\  // Example: await Promise.all(["yes", "no"].map(input => tools.llm({prompt: "Classify the input", input})))
         \\  async llm({ prompt, input, schema, model, effort }) {}, // → { text, data, usage }
@@ -238,7 +238,11 @@ pub const Tools = struct {
         if (!known) try models.append(a, cfg.model);
         const options = try std.fmt.allocPrint(a, "model: {f}; current: {f}; effort low/medium/high (else inherit); smaller model/lower effort: faster, cheaper; schema→parsed JSON data.", .{ std.json.fmt(models.items, .{}), std.json.fmt(cfg.model, .{}) });
         defer a.free(options);
-        return std.mem.replaceOwned(u8, a, t.api().docs, "{{llm_options}}", options);
+        const limits = try std.fmt.allocPrint(a, "{d} concurrent/process, {d}/Run, {d} KiB", .{ cfg.limits.llm_concurrency, cfg.limits.llm_calls_per_run, cfg.limits.llm_input_kib });
+        defer a.free(limits);
+        const limited_docs = try std.mem.replaceOwned(u8, a, t.api().docs, "{{llm_limits}}", limits);
+        defer a.free(limited_docs);
+        return std.mem.replaceOwned(u8, a, limited_docs, "{{llm_options}}", options);
     }
 
     pub fn addUsage(t: *Tools, usage: provider.Usage) void {
@@ -263,8 +267,11 @@ pub const Tools = struct {
 
     fn admit(ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8) !?[]u8 {
         const t: *Tools = @ptrCast(@alignCast(ctx));
-        if (std.mem.eql(u8, name, "llm") and t.llm_calls.fetchAdd(1, .monotonic) >= model_function.max_calls)
-            return try std.fmt.allocPrint(gpa, "llm limit is {d} calls per Run; split into batches or filter in JavaScript first", .{model_function.max_calls});
+        if (std.mem.eql(u8, name, "llm")) {
+            const limit = (t.cfg orelse return error.LlmConfigUnavailable).limits.llm_calls_per_run;
+            if (t.llm_calls.fetchAdd(1, .monotonic) >= limit)
+                return try std.fmt.allocPrint(gpa, "llm limit is {d} calls per Run; split into batches or filter in JavaScript first", .{limit});
+        }
         return null;
     }
 
@@ -492,7 +499,7 @@ test "grep documentation RegExp example reaches the host byte for byte" {
 }
 
 test "llm admission rejects call 101 before dispatch and resets on each Run" {
-    var t: Tools = .{ .io = testing.io, .home = "/unused" };
+    var t: Tools = .{ .io = testing.io, .home = "/unused", .cfg = .{ .base_url = "", .api_key = "", .model = "" } };
     var host = t.host();
     host.call = EchoLlm.call;
     const full = try sandbox.eval(testing.allocator, testing.io, "(await Promise.all(Array.from({length: 100}, () => tools.llm({prompt: 'x'})))).length", .{}, host, null);

@@ -43,6 +43,13 @@ def worker(mode, name):
 
 
 def parent_code(case):
+    if case == "limits-queue":
+        return ('await Promise.all(Array.from({length: 5}, (_, i) => '
+                'tools.agent({prompt: "agent-child:limits-wait-" + i})))')
+    if case == "limits-child":
+        return 'await tools.agent({prompt: "agent-child:limits-loop"})'
+    if case == "limits-loop":
+        return '42'
     if case == "changes":
         return 'await tools.agent({prompt: "agent-child:changes"})'
     if case.startswith("parallel:"):
@@ -75,6 +82,10 @@ def parent_code(case):
 
 
 def child_code(case, step):
+    if case.startswith("limits-wait-"):
+        return 'await tools.bash({command: "sleep 0.15"})' if step == 0 else None
+    if case == "limits-loop":
+        return "42"
     if case == "empty":
         return None
     if case == "changes":
@@ -168,8 +179,10 @@ def serve(port, logfile):
                 self.end_headers()
                 self.wfile.write(error)
                 return
+            if prompt == "agent-parent:limits-child" and step == 0:
+                Path(os.environ["NIB_HOME"], "config.toml").write_text("[limits]\nmax_steps = 0\n")
             if prompt.startswith("agent-parent:"):
-                code = parent_code(prompt.split(":", 1)[1]) if step == 0 else None
+                code = parent_code(prompt.split(":", 1)[1]) if step == 0 or prompt == "agent-parent:limits-loop" else None
                 text = "parent complete"
             else:
                 case = prompt.split(":", 1)[1]

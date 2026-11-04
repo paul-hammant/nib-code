@@ -12,7 +12,16 @@ pub const ModelTiming = model_timing.Model;
 
 pub const Id = enum { chat_completions, codex };
 
+pub const Limits = struct {
+    llm_concurrency: usize = 4,
+    llm_calls_per_run: usize = 100,
+    llm_input_kib: usize = 256,
+    agent_concurrency: usize = 4,
+    max_steps: usize = 50,
+};
+
 pub const Config = struct {
+    limits: Limits = .{},
     provider: Id = .chat_completions,
     codex_home: ?[]const u8 = null,
     base_url: []const u8,

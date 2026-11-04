@@ -29,7 +29,7 @@ pub fn agent(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolR
         tracker.publish();
     }
     t.agents_mutex.lockUncancelable(t.io);
-    while (t.agents_active >= 4 and !t.cancel.load(.acquire))
+    while (t.agents_active >= cfg.limits.agent_concurrency and !t.cancel.load(.acquire))
         t.agents_changed.waitTimeout(t.io, &t.agents_mutex, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch {};
     const canceled = t.cancel.load(.acquire);
     if (!canceled) t.agents_active += 1;

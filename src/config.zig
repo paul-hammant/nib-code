@@ -37,6 +37,7 @@ const Settings = struct {
 const Span = struct { start: usize, end: usize };
 const File = struct {
     top_end: usize = 0,
+    limits: provider.Limits = .{},
     provider_id: ?provider.Id = null,
     effort: ?[]const u8 = null,
     codex_settings: Settings = .{},
@@ -143,9 +144,10 @@ fn secretKey(key: []const u8) bool {
 fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u8, detail: *?[]u8) !File {
     var p: Parser = .{ .a = a, .diagnostics = diagnostics, .path = path, .detail = detail };
     var file: File = .{};
-    var section: ?provider.Id = null;
-    var seen_sections = [_]bool{ false, false };
-    var seen: [3][3]bool = @splat(@splat(false));
+    const Section = enum { chat_completions, codex, limits };
+    var section: ?Section = null;
+    var seen_sections: [3]bool = @splat(false);
+    var seen: [4][5]bool = @splat(@splat(false));
     var offset: usize = 0;
     while (offset < text.len) : (p.line += 1) {
         const end = if (std.mem.indexOfScalarPos(u8, text, offset, '\n')) |n| n + 1 else text.len;
@@ -164,7 +166,7 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
             const name = std.mem.trim(u8, line[1..close], " \t");
             if (secretKey(name)) return p.bad("secrets are not allowed; use NIB_API_KEY or DEEPSEEK_API_KEY (Codex uses CODEX_HOME/auth.json)", .{});
             if (section == null) file.top_end = start;
-            section = std.meta.stringToEnum(provider.Id, name) orelse return p.bad("unknown section '{s}'", .{name});
+            section = std.meta.stringToEnum(Section, name) orelse return p.bad("unknown section '{s}'", .{name});
             const tail = std.mem.trimStart(u8, line[close + 1 ..], " \t");
             if (tail.len > 0 and tail[0] != '#') return p.bad("unexpected text after section", .{});
             const index = @backingInt(section.?);
@@ -179,7 +181,13 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
         for (key) |c| if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return p.bad("expected a bare key (dotted and quoted keys are unsupported)", .{});
         const index: usize = if (section == null)
             if (std.mem.eql(u8, key, "provider")) 0 else if (std.mem.eql(u8, key, "effort")) 1 else return p.bad("unknown top-level key '{s}'", .{key})
-        else if (std.mem.eql(u8, key, "model")) 0 else if (std.mem.eql(u8, key, "base_url")) 1 else if (std.mem.eql(u8, key, "context_window")) 2 else return p.bad("unknown provider key '{s}'", .{key});
+        else if (section == .limits) blk: {
+            const names = .{ "llm_concurrency", "llm_calls_per_run", "llm_input_kib", "agent_concurrency", "max_steps" };
+            inline for (names, 0..) |name, i| {
+                if (std.mem.eql(u8, key, name)) break :blk i;
+            }
+            return p.bad("unknown limits key '{s}'", .{key});
+        } else if (std.mem.eql(u8, key, "model")) 0 else if (std.mem.eql(u8, key, "base_url")) 1 else if (std.mem.eql(u8, key, "context_window")) 2 else return p.bad("unknown provider key '{s}'", .{key});
         const group: usize = if (section) |id| @as(usize, @backingInt(id)) + 1 else 0;
         if (seen[group][index]) return p.bad("duplicate key '{s}'", .{key});
         seen[group][index] = true;
@@ -187,7 +195,20 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
         var consumed: usize = 0;
         const settings = if (section == .codex) &file.codex_settings else &file.chat_settings;
         const parsed = try p.value(value, &consumed);
-        if (section != null and index == 2) {
+        if (section == .limits) {
+            if (parsed != .integer) return p.bad("{s} must be an integer", .{key});
+            const maxima = [_]usize{ 64, 10000, 65536, 64, 1000 };
+            if (parsed.integer < 1 or parsed.integer > maxima[index]) return p.bad("{s} must be between 1 and {d}", .{ key, maxima[index] });
+            const n: usize = @intCast(parsed.integer);
+            switch (index) {
+                0 => file.limits.llm_concurrency = n,
+                1 => file.limits.llm_calls_per_run = n,
+                2 => file.limits.llm_input_kib = n,
+                3 => file.limits.agent_concurrency = n,
+                4 => file.limits.max_steps = n,
+                else => unreachable,
+            }
+        } else if (section != null and index == 2) {
             if (parsed != .integer) return p.bad("context_window must be an integer", .{});
             if (parsed.integer <= 0 or parsed.integer > std.math.maxInt(u64)) return p.bad("context_window must be a positive u64 integer", .{});
             settings.context_window = @intCast(parsed.integer);
@@ -241,7 +262,7 @@ pub fn resolve(a: Allocator, env: *const Env, text: []const u8, path: []const u8
         detail.* = try std.fmt.allocPrint(a, "{s}:{d}: unknown Codex model context window; set context_window or NIB_CONTEXT_WINDOW", .{ path, settings.model_line });
         return err;
     } else 1_000_000;
-    var cfg: provider.Config = .{ .provider = id, .api_key = "", .base_url = "", .model = "", .context_window = context_window };
+    var cfg: provider.Config = .{ .provider = id, .api_key = "", .base_url = "", .model = "", .context_window = context_window, .limits = file.limits };
     if (env.get("NIB_THINKING") == null and env.get("NIB_REASONING_EFFORT") == null) {
         if (file.effort) |v| try cfg.setEffort(v);
     }
@@ -498,6 +519,7 @@ test "effort writeback preserves surrounding bytes and inserts at top-level end"
         .{ .before = "# first\n  effort = \"low\" # keep\n[codex]\n", .effort = "default", .after = "# first\n  # keep\n[codex]\n" },
         .{ .before = "# top\nprovider = \"codex\"\n\n[codex]\n# end", .effort = "medium", .after = "# top\nprovider = \"codex\"\n\neffort = \"medium\"\n[codex]\n# end" },
         .{ .before = "[codex]\n", .effort = "off", .after = "effort = \"off\"\n[codex]\n" },
+        .{ .before = "[limits]\nmax_steps = 7 # keep\n", .effort = "off", .after = "effort = \"off\"\n[limits]\nmax_steps = 7 # keep\n" },
         .{ .before = "# only comment", .effort = "high", .after = "# only comment\neffort = \"high\"\n" },
         .{ .before = "# top\r\n[codex]\r\n", .effort = "high", .after = "# top\r\neffort = \"high\"\r\n[codex]\r\n" },
         .{ .before = "effort=\"low\"", .effort = "max", .after = "effort=\"max\"" },
@@ -576,4 +598,41 @@ test "environment validation and model-dependent defaults" {
     try t.expectError(error.InvalidReasoningEffort, resolve(a, &env, "", "config.toml", &detail));
     try env.put("NIB_PROVIDER", "invalid");
     try t.expectError(error.InvalidProvider, resolve(a, &env, "", "config.toml", &detail));
+}
+
+test "limits defaults, bounds and diagnostics" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: Env = .init(t.allocator);
+    defer env.deinit();
+    var detail: ?[]u8 = null;
+    const defaults = (try resolve(a, &env, "", "config.toml", &detail)).limits;
+    try t.expectEqualDeep(provider.Limits{ .llm_concurrency = 4, .llm_calls_per_run = 100, .llm_input_kib = 256, .agent_concurrency = 4, .max_steps = 50 }, defaults);
+    try t.expectEqualDeep(defaults, (try resolve(a, &env, "[limits]\n", "config.toml", &detail)).limits);
+    const names = [_][]const u8{ "llm_concurrency", "llm_calls_per_run", "llm_input_kib", "agent_concurrency", "max_steps" };
+    const maxima = [_]usize{ 64, 10000, 65536, 64, 1000 };
+    for (names, maxima) |name, max| {
+        for ([_]usize{ 1, max }) |n| {
+            const text = try std.fmt.allocPrint(a, "[limits]\n{s} = {d}\n", .{ name, n });
+            const limits = (try resolve(a, &env, text, "config.toml", &detail)).limits;
+            inline for (names) |field| {
+                if (std.mem.eql(u8, name, field)) try t.expectEqual(n, @field(limits, field));
+            }
+        }
+        const values = [_][]const u8{ "0", "-1", "true", "\"1\"", "1.5" };
+        for (values) |value| {
+            const text = try std.fmt.allocPrint(a, "[limits]\n{s} = {s}\n", .{ name, value });
+            try t.expectError(error.InvalidConfig, resolve(a, &env, text, "config.toml", &detail));
+            try t.expect(std.mem.startsWith(u8, detail.?, "config.toml:2:"));
+        }
+        const text = try std.fmt.allocPrint(a, "[limits]\n{s} = {d}\n", .{ name, max + 1 });
+        try t.expectError(error.InvalidConfig, resolve(a, &env, text, "config.toml", &detail));
+        try t.expect(std.mem.startsWith(u8, detail.?, "config.toml:2:"));
+    }
+    for ([_][]const u8{ "[limits]\nunknown = 1", "[limits]\nmax_steps = 1\nmax_steps = 2", "[limits]\n[limits]" }) |text| {
+        try t.expectError(error.InvalidConfig, resolve(a, &env, text, "config.toml", &detail));
+        try t.expect(std.mem.startsWith(u8, detail.?, "config.toml:"));
+    }
 }
