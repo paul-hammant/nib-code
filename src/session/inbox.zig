@@ -71,16 +71,36 @@ pub const Inbox = struct {
     }
 
     pub fn insert(q: *Inbox, gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, pending: *std.ArrayList(provider.Message)) !Batch {
+        return q.insertSelected(gpa, io, arena, pending, false);
+    }
+
+    pub fn insertBackground(q: *Inbox, gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, pending: *std.ArrayList(provider.Message)) !Batch {
+        return q.insertSelected(gpa, io, arena, pending, true);
+    }
+
+    fn insertSelected(q: *Inbox, gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, pending: *std.ArrayList(provider.Message), background_only: bool) !Batch {
         q.mutex.lockUncancelable(io);
         defer q.mutex.unlock(io);
+        var selected: Batch = .{};
+        errdefer selected.items.deinit(gpa);
+        try selected.items.ensureTotalCapacity(gpa, q.batch.items.items.len);
         var messages: std.ArrayList(provider.Message) = .empty;
         defer messages.deinit(gpa);
-        for (q.batch.items.items) |item|
+        for (q.batch.items.items) |item| {
+            if (background_only and item.background == null) continue;
+            selected.items.appendAssumeCapacity(item);
             try messages.append(gpa, .{ .role = "user", .content = try arena.dupe(u8, item.text), .source = if (item.background != null) .background else null, .background_kind = if (item.background) |b| b.kind else null, .background_ok = if (item.background) |b| b.ok else null, .background_id = if (item.background) |b| try arena.dupe(u8, b.id) else null });
+        }
         try pending.appendSlice(gpa, messages.items);
-        const batch = q.batch;
-        q.batch = .{};
-        return batch;
+        var retained: usize = 0;
+        for (q.batch.items.items) |item| {
+            if (background_only and item.background == null) {
+                q.batch.items.items[retained] = item;
+                retained += 1;
+            }
+        }
+        q.batch.items.shrinkRetainingCapacity(retained);
+        return selected;
     }
 };
 
@@ -138,4 +158,26 @@ test "concurrent enqueue assigns FIFO ids without losing messages" {
     defer batch.deinit(t.allocator);
     try t.expectEqual(@as(usize, 100), batch.items.items.len);
     for (batch.items.items, 1..) |item, id| try t.expectEqual(@as(u64, id), item.id);
+}
+
+test "limit wait inserts background results and preserves queued user messages" {
+    const t = std.testing;
+    var q: Inbox = .{};
+    defer q.batch.deinit(t.allocator);
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    var pending: std.ArrayList(provider.Message) = .empty;
+    defer pending.deinit(t.allocator);
+    _ = try q.enqueue(t.allocator, t.io, "next user message");
+    _ = try q.enqueueBackground(t.allocator, t.io, "b1", .bash, .finished, true, "background result");
+    _ = try q.enqueue(t.allocator, t.io, "another user message");
+    var inserted = try q.insertBackground(t.allocator, t.io, arena.allocator(), &pending);
+    defer inserted.deinit(t.allocator);
+    try t.expectEqual(@as(usize, 1), inserted.items.items.len);
+    try t.expectEqual(@as(usize, 1), pending.items.len);
+    try t.expectEqualStrings("background result", pending.items[0].content.?);
+    try t.expect(pending.items[0].source.? == .background);
+    try t.expectEqual(@as(usize, 2), q.batch.items.items.len);
+    try t.expectEqualStrings("next user message", q.batch.items.items[0].text);
+    try t.expectEqualStrings("another user message", q.batch.items.items[1].text);
 }

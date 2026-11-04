@@ -68,6 +68,7 @@ const Run = struct {
     code: []const u8,
     expected: ?[]const u8,
     child: bool = false,
+    remaining_steps: ?usize = null,
 };
 
 fn field(v: Value, name: []const u8) !Value {
@@ -158,7 +159,18 @@ fn loadMain(a: Allocator, data: []const u8) ![]Run {
                         }
                     }
                 }
-                try runs.append(a, .{ .key = .{ .step = step, .run = index }, .code = code.?, .expected = expected, .child = child });
+                var remaining_steps: ?usize = null;
+                if (record.object.get("run_results")) |results| {
+                    if (results != .null) for (try array(results)) |result| {
+                        if (std.mem.eql(u8, id, try string(try field(result, "tool_call_id")))) {
+                            if (result.object.get("remaining_steps")) |remaining| {
+                                if (remaining != .null) remaining_steps = try natural(remaining);
+                            }
+                            break;
+                        }
+                    };
+                }
+                try runs.append(a, .{ .key = .{ .step = step, .run = index }, .code = code.?, .expected = expected, .child = child, .remaining_steps = remaining_steps });
             }
         }
     }
@@ -264,7 +276,7 @@ const Report = struct {
 fn replayOne(a: Allocator, io: std.Io, original: Run, recording: Recording, script: ?[]const u8) !Report {
     const evaluated = try core.executeSession(a, io, script orelse original.code, recording.entries.items, recording.start_ms_epoch, recording.end orelse .ok, script != null, original.child);
     defer evaluated.deinit(a);
-    const text = try output.format(a, evaluated.outcome);
+    const text = try output.stepLimitOutput(a, try output.format(a, evaluated.outcome), original.remaining_steps);
     const incomplete = recording.incomplete or evaluated.incomplete or original.expected == null;
     const determined = script == null and !incomplete and recording.end != .timeout and recording.end != .cancelled;
     const equal = if (original.expected) |expected| std.mem.eql(u8, expected, text) else false;

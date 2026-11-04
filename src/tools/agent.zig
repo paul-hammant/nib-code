@@ -64,7 +64,7 @@ pub fn execute(t: *Tools, gpa: std.mem.Allocator, args: []const u8, cancel: *con
     try env.put("NIB_PARENT_SESSION_ID", t.session_id orelse return error.MissingSessionId);
     const executable = try std.process.executablePathAlloc(t.io, gpa);
     defer gpa.free(executable);
-    const input = try std.json.Stringify.valueAlloc(gpa, .{ .prompt = a.value.prompt, .config = cfg }, .{});
+    const input = try std.json.Stringify.valueAlloc(gpa, @import("agent/input.zig").Input{ .prompt = a.value.prompt, .config = cfg }, .{});
     defer gpa.free(input);
     const started = std.Io.Clock.awake.now(t.io);
     const result = process.run(gpa, t.io, .{

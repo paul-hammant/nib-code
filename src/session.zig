@@ -176,7 +176,8 @@ pub const Session = struct {
             s.id = try a.dupe(u8, std.fs.path.stem(path));
             s.log = try session_log.Log.create(io, path);
             errdefer s.log.close(io);
-            const base = try std.fmt.allocPrint(a, system_template, .{ cwd, try s.tools.documentation(a), try patchLines(a, options.environ) });
+            const template = try std.fmt.allocPrint(a, system_template, .{ cwd, try s.tools.documentation(a), try patchLines(a, options.environ) });
+            const base = try stepLimitPrompt(a, template, cfg.limits.max_steps);
             const global = try std.fs.path.join(a, &.{ options.home, "AGENTS.md" });
             const project = try std.fs.path.join(a, &.{ try instructions.projectRoot(io, a, cwd), "AGENTS.md" });
             const system = try instructions.append(io, a, base, global, project);
@@ -331,7 +332,7 @@ pub const Session = struct {
         defer pending.deinit(s.gpa);
         var partial: Partial = .{};
         defer partial.deinit(s.gpa);
-        try pending.append(s.gpa, .{ .role = "user", .content = try s.arena.allocator().dupe(u8, user_text) });
+        try pending.append(s.gpa, .{ .role = "user", .content = try turnBudgetText(s.arena.allocator(), s.history.items[0].content orelse "", s.cfg.limits.max_steps, user_text) });
         s.usage = .{};
         s.steps = 0;
         try sink.emit(sink.ctx, .{ .usage = s.usage });
@@ -381,34 +382,73 @@ pub const Session = struct {
         try s.commit(s.history.items.len, messages.items, s.context_tokens + estimateTokens(messages.items), null);
     }
 
+    fn insertInbox(s: *Session, pending: *std.ArrayList(provider.Message), sink: Sink, background_only: bool) !@import("session/inbox.zig").Batch {
+        var inserted = if (background_only)
+            try s.inbox.insertBackground(s.gpa, s.io, s.arena.allocator(), pending)
+        else
+            try s.inbox.insert(s.gpa, s.io, s.arena.allocator(), pending);
+        errdefer inserted.deinit(s.gpa);
+        var has_background = false;
+        for (inserted.items.items) |item| {
+            if (item.background) |b| {
+                has_background = true;
+                s.tools.background.delivered(s.io, b.id);
+                var event = b;
+                event.result = if (std.mem.indexOfScalar(u8, item.text, '\n')) |nl| item.text[nl + 1 ..] else item.text;
+                try sink.emit(sink.ctx, .{ .background = event });
+            } else if (sink.onUserInserted) |notify| try notify(sink.ctx, item.id);
+        }
+        if (has_background) {
+            try s.commit(s.history.items.len, pending.items, s.context_tokens + estimateTokens(pending.items), null);
+            pending.clearRetainingCapacity();
+            for (inserted.items.items) |item| if (item.background) |b|
+                try s.log.background(s.io, s.gpa, b, s.steps + 1);
+        }
+        return inserted;
+    }
+
+    fn finishStepLimit(s: *Session, pending: *std.ArrayList(provider.Message), sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, max_steps: usize) !void {
+        const waited = try s.tools.background.pendingNames(s.gpa, s.io);
+        defer s.gpa.free(waited);
+        if (waited.len > 0) {
+            const notice = try std.fmt.allocPrint(s.arena.allocator(), "Step limit reached; waiting for background tasks: {s}", .{waited});
+            try sink.emit(sink.ctx, .{ .notice = notice });
+        }
+        while (s.tools.background.pending(s.io)) {
+            if (cancel.load(.acquire)) return error.Canceled;
+            try tools.Tools.poll(&s.tools);
+            var inserted = try s.insertInbox(pending, sink, true);
+            inserted.deinit(s.gpa);
+            if (s.tools.background.pending(s.io))
+                try std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(20), .clock = .awake }, s.io);
+        }
+        if (cancel.load(.acquire)) return error.Canceled;
+        detail.* = if (waited.len > 0)
+            try std.fmt.allocPrint(s.gpa, "stopped after {d} steps (waited for background tasks: {s})", .{ max_steps, waited })
+        else
+            try std.fmt.allocPrint(s.gpa, "stopped after {d} steps", .{max_steps});
+        return error.TooManySteps;
+    }
+
     fn runSteps(s: *Session, pending: *std.ArrayList(provider.Message), partial: *Partial, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
         var next_effort: ?effort.Pending = null;
-        for (0..s.cfg.limits.max_steps) |step_index| {
+        var step_index: usize = 0;
+        while (true) : (step_index += 1) {
+            if (cancel.load(.acquire)) return error.Canceled;
+            if (s.cfg.limits.max_steps) |max_steps| {
+                if (step_index >= max_steps) return s.finishStepLimit(pending, sink, cancel, detail, max_steps);
+            }
             const size = s.context_tokens + estimateTokens(pending.items);
             if (size >= s.cfg.context_window - s.cfg.context_window / 4 and size >= s.compact_backoff)
                 try s.autoCompact(sink, cancel, detail);
             if (cancel.load(.acquire)) return error.Canceled;
             try tools.Tools.poll(&s.tools);
-            var inserted = try s.inbox.insert(s.gpa, s.io, s.arena.allocator(), pending);
+            var inserted = try s.insertInbox(pending, sink, false);
             defer inserted.deinit(s.gpa);
-            var has_background = false;
             var background_output_bytes: u64 = 0;
-            for (inserted.items.items) |item| {
-                if (item.background) |b| {
-                    has_background = true;
-                    background_output_bytes += item.text.len;
-                    s.tools.background.delivered(s.io, b.id);
-                    var event = b;
-                    event.result = if (std.mem.indexOfScalar(u8, item.text, '\n')) |nl| item.text[nl + 1 ..] else item.text;
-                    try sink.emit(sink.ctx, .{ .background = event });
-                } else if (sink.onUserInserted) |notify| try notify(sink.ctx, item.id);
-            }
-            if (has_background) {
-                try s.commit(s.history.items.len, pending.items, s.context_tokens + estimateTokens(pending.items), null);
-                pending.clearRetainingCapacity();
-                for (inserted.items.items) |item| if (item.background) |b|
-                    try s.log.background(s.io, s.gpa, b, s.steps + 1);
-            }
+            for (inserted.items.items) |item| if (item.background != null) {
+                background_output_bytes += item.text.len;
+            };
             var request: std.ArrayList(provider.Message) = .empty;
             defer request.deinit(s.gpa);
             try request.appendSlice(s.gpa, s.history.items);
@@ -456,6 +496,7 @@ pub const Session = struct {
                     .run_ms = result.run_ms,
                     .tool_bytes = run_timing.tool_bytes - before_bytes,
                     .output_bytes = result.output.len,
+                    .remaining_steps = result.remaining_steps,
                 });
                 output_tokens += result.output.len / 3 + 1;
             }
@@ -496,7 +537,9 @@ pub const Session = struct {
             try sink.emit(sink.ctx, .{ .usage = s.usage });
             if (reply.tool_calls.len == 0) {
                 if (!s.tools.background.pending(s.io)) return;
-                if (step_index + 1 == s.cfg.limits.max_steps) break;
+                if (s.cfg.limits.max_steps) |max_steps| {
+                    if (s.steps >= max_steps) continue;
+                }
                 while (s.inbox.empty(s.io) and s.tools.background.pending(s.io)) {
                     if (cancel.load(.acquire)) return error.Canceled;
                     try tools.Tools.poll(&s.tools);
@@ -506,8 +549,6 @@ pub const Session = struct {
             }
             if (cancel.load(.acquire)) return error.Canceled;
         }
-        detail.* = try std.fmt.allocPrint(s.gpa, "stopped after {d} steps", .{s.cfg.limits.max_steps});
-        return error.TooManySteps;
     }
 
     fn complete(s: *Session, request_cfg: provider.Config, messages: []const provider.Message, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, partial: *Partial, timing: *provider.ModelTiming, attempts: *u32, first_data_ms: *?u64) !provider.Reply {
@@ -636,7 +677,7 @@ pub const Session = struct {
         }
     };
 
-    const Executed = struct { output: []const u8, ok: bool, run_ms: ?u64 = null, effort: ?effort.Declaration = null };
+    const Executed = struct { output: []const u8, ok: bool, run_ms: ?u64 = null, effort: ?effort.Declaration = null, remaining_steps: ?usize = null };
 
     /// Output is arena-owned.
     fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const std.atomic.Value(bool), timing: *sandbox.RunTiming) !Executed {
@@ -656,12 +697,30 @@ pub const Session = struct {
         const o = ran.outcome;
         defer o.deinit(s.gpa);
 
-        const output = try output_format.format(a, o);
+        const remaining_steps = if (s.cfg.limits.max_steps) |limit| limit -| s.steps else null;
+        const output = try output_format.stepLimitOutput(a, try output_format.format(a, o), remaining_steps);
         const run_ms = timing.elapsed();
         try sink.emit(sink.ctx, .{ .run_end = .{ .ok = o.ok, .output = output, .changes = ran.changes } });
-        return .{ .output = output, .ok = o.ok, .run_ms = run_ms, .effort = args.value.effort };
+        return .{ .output = output, .ok = o.ok, .run_ms = run_ms, .effort = args.value.effort, .remaining_steps = remaining_steps };
     }
 };
+
+fn turnBudgetText(a: std.mem.Allocator, system: []const u8, max_steps: ?usize, user_text: []const u8) ![]const u8 {
+    const marker = "This Turn may use at most ";
+    if (max_steps) |limit| {
+        const fact = try stepLimitPrompt(a, "", limit);
+        if (std.mem.indexOf(u8, system, fact[1..]) == null)
+            return std.fmt.allocPrint(a, "[Current Turn budget; configuration changed since the system prompt was recorded]{s}\n\n{s}", .{ fact, user_text });
+    } else if (std.mem.indexOf(u8, system, marker) != null) {
+        return std.fmt.allocPrint(a, "[Current Turn budget: no Step limit; configuration changed since the system prompt was recorded]\n\n{s}", .{user_text});
+    }
+    return a.dupe(u8, user_text);
+}
+
+fn stepLimitPrompt(a: std.mem.Allocator, base: []const u8, max_steps: ?usize) ![]const u8 {
+    const limit = max_steps orelse return base;
+    return std.fmt.allocPrint(a, "{s}\nThis Turn may use at most {d} Steps; when they run out, the Turn stops without another model request.", .{ base, limit });
+}
 
 fn estimateTokens(messages: []const provider.Message) u64 {
     var total: u64 = 0;
@@ -909,4 +968,34 @@ test "run schema exposes optional one-shot effort enum" {
     const values = parameters.object.get("properties").?.object.get("effort").?.object.get("enum").?.array.items;
     try t.expectEqual(@as(usize, 4), values.len);
     inline for (.{ "low", "medium", "high", "default" }, 0..) |value, index| try t.expectEqualStrings(value, values[index].string);
+}
+
+test "Step budget facts leave unlimited prompts unchanged" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = "unchanged system prompt";
+    const unlimited = try stepLimitPrompt(a, base, null);
+    try t.expectEqual(base.ptr, unlimited.ptr);
+    try t.expectEqualStrings(&systemSha(base), &systemSha(unlimited));
+    const limited = try stepLimitPrompt(a, base, 5);
+    try t.expectEqualStrings("unchanged system prompt\nThis Turn may use at most 5 Steps; when they run out, the Turn stops without another model request.", limited);
+}
+
+test "resumed Turns expose budget changes without rewriting the original system" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const system = try stepLimitPrompt(a, "base", 5);
+    try t.expectEqualStrings("prompt", try turnBudgetText(a, system, 5, "prompt"));
+    try t.expectEqualStrings("prompt", try turnBudgetText(a, "base", null, "prompt"));
+    const enabled = try turnBudgetText(a, "base", 1, "prompt");
+    try t.expect(std.mem.indexOf(u8, enabled, "at most 1 Steps") != null);
+    const changed = try turnBudgetText(a, system, 7, "prompt");
+    try t.expect(std.mem.indexOf(u8, changed, "at most 7 Steps") != null);
+    const disabled = try turnBudgetText(a, system, null, "prompt");
+    try t.expect(std.mem.indexOf(u8, disabled, "no Step limit") != null);
+    try t.expect(std.mem.endsWith(u8, disabled, "\n\nprompt"));
 }
