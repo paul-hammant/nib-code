@@ -93,8 +93,8 @@ const all = [_]Tool{
         .root_only = true,
         .run = subagent.agent,
         .doc =
-        \\  // Independent multi-step worker with the same tools except agent; starts from scratch and reads code itself: thousands of tokens, tens of seconds or more. Only prompt is shared. Failures resolve ok:false (invalid args and user cancel reject); stopped children may leave partial files. changes: edit/write only. model/effort as in llm.
-        \\  // background returns {id} now; the result arrives as a message in a later Step, and a reply without Run waits for it. Background edits share the workspace and can land at any time, even mid-build.
+        \\  // Independent multi-step worker; same tools except agent, fresh context, only prompt shared. Observed coding tasks: 15-40 Steps, minutes, hundreds of thousands to millions of input tokens (incl. cache); varies by task/model/effort. Failures resolve ok:false (invalid args/user cancel reject); stopped children may leave partial files. changes: edit/write only; model/effort as in llm.
+        \\  // background returns {id} now, result as a message in a later Step; a reply without Run waits. Background edits share the workspace and may land mid-build.
         \\  async agent({ prompt, timeout_ms = 1800000, model, effort, background = false }) {}, // → { ok, text, usage, changes, error? } or { id }
         ,
     },

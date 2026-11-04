@@ -44,6 +44,96 @@ def synthetic_log(path, turns, **metadata):
 
 
 class StatsTest(unittest.TestCase):
+    def test_child_costs_parent_system_groups_and_cli(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            paths = []
+            for name, sha, steps in [('before', 'old', 2), ('after', 'new', 3)]:
+                parent = directory / (name + '.jsonl')
+                synthetic_log(parent, [[None]], system_sha=sha)
+                child = directory / (name + '-child.jsonl')
+                synthetic_log(child, [['tools.read({path: \"a\"})'] * (steps - 1) + [None]],
+                              parent_session_id=name, system_sha='same-child-system')
+                paths.extend([parent, child])
+            report = stats.summarize(sorted(paths), group_by='system')
+            costs = report['child_costs']
+            self.assertEqual(costs['sessions'], 2)
+            self.assertEqual(costs['full_range_sessions'], 2)
+            self.assertEqual(costs['steps'], dict(samples=2, median=2.5, p90=3))
+            self.assertEqual(costs['model_ms'], dict(samples=2, median=15, p90=18))
+            self.assertEqual(costs['prompt_tokens'], dict(samples=2, median=25, p90=30))
+            self.assertEqual(set(costs['by_parent_system']), {'old', 'new'})
+            self.assertEqual(costs['by_parent_system']['old']['prompt_tokens']['median'], 20)
+            self.assertEqual(costs['by_parent_system']['new']['prompt_tokens']['median'], 30)
+            self.assertEqual(report['groups']['same-child-system']['child_costs'], costs)
+            orphan = stats.summarize([paths[1]])['child_costs']
+            self.assertEqual(set(orphan['by_parent_system']), {'unknown'})
+            cli = [sys.executable, str(ROOT / 'scripts/stats.py'), str(directory), '--group-by', 'system']
+            self.assertEqual(json.loads(subprocess.check_output(cli + ['--json'])), report)
+            text = subprocess.check_output(cli).decode()
+            self.assertIn('子会话已记录成本', text)
+            self.assertIn('parent_system=old', text)
+            self.assertIn('parent_system=new', text)
+
+    def test_child_costs_missing_invalid_zero_and_interrupted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            paths = []
+            for name, steps in [('missing', 2), ('invalid', 1), ('zero', 1), ('interrupted', 1), ('empty', 0)]:
+                path = directory / (name + '.jsonl')
+                rows = synthetic_log(path, [[None] * steps], parent_session_id='missing-parent')
+                if name == 'missing':
+                    rows[1].pop('model_ms')
+                    rows[2]['usage'].pop('prompt_tokens')
+                elif name == 'invalid':
+                    rows[1]['model_ms'] = True
+                    rows[1]['usage']['prompt_tokens'] = -1
+                elif name == 'zero':
+                    rows[1]['model_ms'] = 0
+                    rows[1]['usage'] = dict(prompt_tokens=0)
+                elif name == 'interrupted':
+                    rows[1]['calls'] = [dict(name='llm', usage=dict(prompt_tokens=999999))]
+                    rows.append(dict({'from': rows[1]['from'] + 2}, messages=[
+                        dict(role='user', content='request'),
+                        dict(role='assistant', content='[interrupted by user]')],
+                        model_ms=999999, usage=dict(prompt_tokens=999999)))
+                path.write_text('\n'.join(map(json.dumps, rows)) + '\n{broken json\n')
+                paths.append(path)
+            sidecar = directory / 'zero.calls.jsonl'
+            synthetic_log(sidecar, [[None]], parent_session_id='parent')
+            costs = stats.summarize(paths + [sidecar])['child_costs']
+            self.assertEqual(costs['sessions'], 5)
+            self.assertEqual(costs['full_range_sessions'], 4)
+            self.assertEqual(costs['no_step_sessions'], 1)
+            self.assertEqual(costs['partial_range_sessions'], 0)
+            self.assertEqual(costs['steps'], dict(samples=4, median=1, p90=2))
+            self.assertEqual(costs['model_ms'], dict(samples=2, median=3, p90=6))
+            self.assertEqual(costs['prompt_tokens'], dict(samples=2, median=5, p90=10))
+            self.assertEqual(set(costs['by_parent_system']), {'unknown'})
+
+    def test_child_costs_since_partial_range_and_cwd(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            parent = directory / 'parent.jsonl'
+            parent_rows = synthetic_log(parent, [[None]], system_sha='original')
+            child = directory / 'child.jsonl'
+            rows = synthetic_log(child, [['tools.read({path: \"a\"})', None]], parent_session_id='parent')
+            cutoff = int(datetime(2025, 1, 2).timestamp() * 1000)
+            for row in parent_rows + rows:
+                row['at'] = cutoff - 1
+            parent_rows[0]['cwd'] = '/different-parent-cwd'
+            rows[-1]['at'] = cutoff
+            parent.write_text('\n'.join(map(json.dumps, parent_rows)) + '\n')
+            child.write_text('\n'.join(map(json.dumps, rows)) + '\n')
+            costs = stats.summarize([parent, child], since=date(2025, 1, 2), cwd=directory)['child_costs']
+            self.assertEqual(costs['sessions'], 1)
+            self.assertEqual(costs['partial_range_sessions'], 1)
+            self.assertEqual(costs['full_range_sessions'], 0)
+            for field in ('steps', 'model_ms', 'prompt_tokens'):
+                self.assertEqual(costs[field], dict(samples=0, median=None, p90=None))
+            self.assertEqual(set(costs['by_parent_system']), {'original'})
+            self.assertEqual(stats.summarize([child], cwd=ROOT)['child_costs']['sessions'], 0)
+
     def test_tool_data_mixed_logs_and_cli(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'bytes.jsonl'
