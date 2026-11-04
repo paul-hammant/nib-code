@@ -16,6 +16,7 @@ pub const Options = struct {
     input: ?[]const u8 = null,
     termination_grace_ms: u32 = 0,
     max_output_bytes: usize = 8 * 1024 * 1024,
+    on_tick: ?struct { ctx: *anyopaque, emit: *const fn (*anyopaque) void } = null,
     on_line: ?struct { ctx: *anyopaque, emit: *const fn (*anyopaque, []const u8) void } = null,
 };
 
@@ -80,6 +81,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Result {
     var line_start: usize = 0;
     var scanned: usize = 0;
     while (true) {
+        if (options.on_tick) |observer| observer.emit(observer.ctx);
         if (stop == null) check(io, options.cancel, deadline) catch |err| {
             stop = err;
             group.kill();
@@ -111,6 +113,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Result {
     var waiter = try io.concurrent(Wait.work, .{ &child, io, &done });
     defer _ = waiter.await(io) catch {};
     while (!done.isSet()) {
+        if (options.on_tick) |observer| observer.emit(observer.ctx);
         if (stop == null) check(io, options.cancel, deadline) catch |err| {
             stop = err;
             group.kill();

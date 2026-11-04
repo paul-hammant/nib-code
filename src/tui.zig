@@ -40,6 +40,7 @@ const Event = union(enum) {
     turn_end: TurnSummary,
     usage: struct { tokens: provider.Usage, context: u64, steps: u32 },
     progress: @import("session/events.zig").Progress,
+    background: @FieldType(SessionEvent, "background"),
     failed: []u8,
     /// One outcome line from automatic issue filing, owned by the receiver.
     issue: []u8,
@@ -126,10 +127,19 @@ const Turn = struct {
             .notice => |m| .{ .notice = try gpa.dupe(u8, m) },
             .usage => |u| .{ .usage = .{ .tokens = u, .context = t.session.context_tokens, .steps = t.session.steps } },
             .progress => |p| .{ .progress = try p.clone(gpa) },
+            .background => |b| blk: {
+                const id = try gpa.dupe(u8, b.id);
+                errdefer gpa.free(id);
+                break :blk .{ .background = .{ .id = id, .kind = b.kind, .state = b.state, .ok = b.ok, .result = if (b.result) |result| try gpa.dupe(u8, result) else null } };
+            },
             .turn_end => |summary| .{ .turn_end = summary },
         };
         errdefer switch (event) {
             .step => |s| gpa.free(s.effort),
+            .background => |b| {
+                gpa.free(b.id);
+                if (b.result) |result| gpa.free(result);
+            },
             .progress => |p| {
                 var owned = p;
                 owned.deinit(gpa);
@@ -271,6 +281,7 @@ const App = struct {
     pasting: bool = false,
     paste_buf: std.ArrayList(u8) = .empty,
     live_steps: u32 = 0,
+    background_count: usize = 0,
     step_effort: ?provider.StepEffort = null,
     scroll: Viewport = .{},
     menu: Menu,
@@ -375,11 +386,26 @@ const App = struct {
                 defer owned.deinit(gpa);
                 try app.transcript.progress(gpa, p);
             },
+            .background => |b| {
+                defer gpa.free(b.id);
+                defer if (b.result) |result| gpa.free(result);
+                switch (b.state) {
+                    .started => app.background_count += 1,
+                    .finished => {
+                        app.background_count -|= 1;
+                        try app.transcript.backgroundResult(gpa, b.kind, b.id, b.ok orelse false, b.result orelse "{}");
+                    },
+                    .lost => {
+                        app.background_count -|= 1;
+                        try app.transcript.lostBackground(gpa, b.kind, b.id, b.result orelse "background task was lost");
+                    },
+                }
+            },
             .turn_end => |summary| app.pending_bill = summary,
             .user_inserted => |id| app.transcript.userInserted(id),
             .done => {
                 const canceled = app.turn.?.cancel.load(.acquire);
-                app.finishTurn();
+                try app.finishTurn();
                 try app.saveReflection();
                 try app.appendBill();
                 try app.finishQueued(!canceled);
@@ -397,7 +423,7 @@ const App = struct {
                 app.stopReflecting();
                 const canceled = app.turn.?.cancel.load(.acquire);
                 try app.transcript.add(gpa, if (canceled) .info else .err, if (canceled) "canceled" else msg);
-                app.finishTurn();
+                try app.finishTurn();
                 try app.appendBill();
                 try app.finishQueued(false);
             },
@@ -667,10 +693,13 @@ const App = struct {
         app.step_effort = null;
     }
 
-    fn finishTurn(app: *App) void {
+    fn finishTurn(app: *App) !void {
         app.clearStepEffort();
         app.turn.?.finish();
         app.turn = null;
+        app.background_count = 0;
+        try app.transcript.clearBackgroundProgress(app.gpa);
+        app.transcript.next_run = 0;
         app.usage = app.session.usage;
         app.steps = app.session.steps;
         app.context = app.session.context_tokens;
@@ -681,6 +710,10 @@ const App = struct {
         defer batch.deinit(app.gpa);
         if (batch.items.items.len == 0) return;
         const text = try batch.joined(app.gpa);
+        if (text.len == 0) {
+            app.gpa.free(text);
+            return;
+        }
         app.transcript.removeQueued(app.gpa);
         if (send) {
             try app.startTurn(text);
@@ -704,6 +737,7 @@ const App = struct {
             .usage = app.usage,
             .steps = app.steps,
             .current_step = @max(1, app.live_steps),
+            .background_count = app.background_count,
             .context = app.context,
             .busy = if (app.turn != null) app.activity.label(app.io) else null,
             .notice = app.notice,
@@ -859,6 +893,32 @@ test "insertion notifications reach the queued user entry" {
     try Turn.userInserted(&turn, 42);
     _ = try app.handle((try loop.tryEvent()).?);
     try t.expectEqual(@as(?u64, null), app.transcript.entries.items[0].queued);
+}
+
+test "background events own their payload and maintain running count" {
+    const t = std.testing;
+    var loop: vaxis.Loop(Event) = .{ .io = t.io, .tty = undefined, .vaxis = undefined, .queue = .init(t.io) };
+    var turn: Turn = undefined;
+    turn.gpa = t.allocator;
+    turn.loop = &loop;
+    var app: App = undefined;
+    app.gpa = t.allocator;
+    app.transcript = .{};
+    app.background_count = 0;
+    defer app.transcript.deinit(t.allocator);
+    var id = [_]u8{ 'b', 'g', '_', '1' };
+    try Turn.emit(&turn, .{ .background = .{ .id = &id, .kind = .agent, .state = .started } });
+    id[3] = '2';
+    const started = (try loop.tryEvent()).?;
+    try t.expectEqualStrings("bg_1", started.background.id);
+    _ = try app.handle(started);
+    try t.expectEqual(@as(usize, 1), app.background_count);
+    try t.expectEqual(@as(usize, 0), app.transcript.entries.items.len);
+    try Turn.emit(&turn, .{ .background = .{ .id = "bg_1", .kind = .agent, .state = .finished, .ok = true, .result = "{\"ok\":true,\"text\":\"done\"}" } });
+    _ = try app.handle((try loop.tryEvent()).?);
+    try t.expectEqual(@as(usize, 0), app.background_count);
+    try t.expectEqual(EntryKind.background, app.transcript.entries.items[0].kind);
+    try t.expectEqualStrings("bg agent bg_1 · ok=true · done", app.transcript.entries.items[0].label.items);
 }
 
 test "Step events own effort and Runs keep their generating Step metadata" {

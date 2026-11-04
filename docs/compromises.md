@@ -23,7 +23,9 @@
 
 这些是用户的预算和偏好，现在写成了常量，应进入 `config.toml`。
 
+llm/agent 的并发、调用次数、输入大小和 Step 上限已于 2026-11-03 改为可配置，见 [config.md](config.md#limits)。sandbox 内全部工具最多 8 并发仍属于线程调度实现。
+
 | 名称 | 位置 | 当前值 | 删除条件 |
 |---|---|---|---|
-
-已于 2026-11-03 改为可配置，见 [config.md](config.md#limits)。sandbox 内全部工具最多 8 并发仍属于线程调度实现。
+| 后台 bash 同时运行上限，超出即 reject | `src/tools/background.zig`（复用 `sandbox.tool_concurrency`） | 8 | 移入 `[limits]` |
+| 工具录制的单条结果上限；calls 文件没有总量上限或轮转 | `src/sandbox/record.zig` | 1 MiB | 有存储预算与清理配置后移入配置 |

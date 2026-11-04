@@ -384,6 +384,71 @@ class ToolData:
                            "output_tool_ratio 为每 Run output_bytes/tool_bytes（非总量之比），仅取两字段有效且 tool_bytes>0 的样本，p90=nearest-rank；可大于 1。工具占比以有效 calls[].result_bytes 总和为分母，按 name 汇总，不依赖计时；缺失或省略调用不补零，总字节为零时占比 n/a。"])
 
 
+class AgentStats:
+    def __init__(self):
+        self.counts = {kind: dict(foreground_calls=0, background_calls=0, steps=[])
+                       for kind in ('agent', 'bash')}
+
+    def add(self, record, completed_steps, include, pending, seen, is_step=False, allow_agent=True):
+        if not include:
+            pending.clear()
+            return
+        event = record.get('background') or record.get('background_agent')
+        if isinstance(event, dict):
+            task_id, state = event.get('id'), event.get('state')
+            kind = event.get('kind', 'agent')
+            if isinstance(task_id, str) and task_id and isinstance(kind, str) and kind in self.counts and (kind != 'agent' or allow_agent):
+                if state == 'started':
+                    seen.add(task_id)
+                    self.counts[kind]['background_calls'] += 1
+                    pending[task_id] = dict(kind=kind, launch=completed_steps + 1,
+                                            terminal=False, result=None)
+                elif state in ('finished', 'lost') and task_id in pending:
+                    pending[task_id]['terminal'] = True
+                    self.complete(task_id, pending)
+            return
+        for message in record['messages']:
+            if message.get('source') not in ('background', 'background_agent'):
+                continue
+            task_id = message.get('background_id', message.get('background_agent_id'))
+            kind = message.get('background_kind', 'agent')
+            if isinstance(task_id, str) and task_id in pending and pending[task_id]['kind'] == kind:
+                pending[task_id]['result'] = completed_steps
+                self.complete(task_id, pending)
+        if not is_step:
+            return
+        calls = record.get('calls')
+        for call in calls if isinstance(calls, list) else []:
+            if not isinstance(call, dict) or call.get('dispatched') is False:
+                continue
+            kind = call.get('name')
+            if not isinstance(kind, str) or kind not in self.counts or (kind == 'agent' and not allow_agent):
+                continue
+            if call.get('background') is True:
+                task_id = call.get('id')
+                if isinstance(task_id, str) and task_id and task_id not in seen:
+                    self.counts[kind]['background_calls'] += 1
+                    pending[task_id] = dict(kind=kind, launch=completed_steps + 1,
+                                            terminal=True, result=None)
+            else:
+                self.counts[kind]['foreground_calls'] += 1
+
+    def complete(self, task_id, pending):
+        item = pending[task_id]
+        if item['terminal'] and item['result'] is not None:
+            if item['result'] >= item['launch']:
+                self.counts[item['kind']]['steps'].append(item['result'] - item['launch'])
+            del pending[task_id]
+
+    def report(self, kind='agent'):
+        counts = self.counts[kind]
+        return dict(foreground_calls=counts['foreground_calls'],
+                    background_calls=counts['background_calls'],
+                    background_steps=distribution(counts['steps']),
+                    notes=["前台调用取有效 calls[]；agent 只计根会话，bash 含子会话。后台优先取 background.started 生命周期记录，旧日志回退 calls[]；dispatched=false 不计，缺失明细不补前台调用。",
+                           "background_steps 按 id 关联 started、finished/lost 与 source=background 的结果消息；旧日志按 calls[].id 与结果消息关联。只计启动 Step 后、结果插入前已完成的主模型 Step，同一根会话且范围全入选、未中断。"])
+
+
 class Timing:
     def __init__(self):
         self.values = {key: [] for key in ('step_ms', 'model_ms', 'run_ms', 'run_result_ms',
@@ -476,6 +541,11 @@ def records(path):
                 if isinstance(diagnostic, dict) and isinstance(diagnostic.get('message'), str):
                     yield record
                     continue
+                event = record.get('background') or record.get('background_agent')
+                if (isinstance(event, dict) and isinstance(event.get('id'), str)
+                        and event.get('state') in ('started', 'finished', 'lost')):
+                    yield record
+                    continue
                 messages = record.get('messages')
                 if not number(record.get('from')) or not isinstance(messages, list) or not messages:
                     continue
@@ -503,6 +573,7 @@ def summarize(paths, since=None, cwd=None, group_by=None):
     tool_counts, bash_counts = Counter(), Counter()
     timing = Timing()
     tool_data = ToolData()
+    agents = AgentStats()
     errors = {name: {'count': 0, 'examples': []} for name in ERRORS}
     slowest, turn_steps, turn_times = [], [], []
 
@@ -538,6 +609,8 @@ def summarize(paths, since=None, cwd=None, group_by=None):
         length = header['from'] + len(header['messages'])
         current = None
         session_step = 0
+        pending_agents = {}
+        seen_agents = set()
 
         def finish_turn():
             if current is not None and current['selected']:
@@ -551,7 +624,8 @@ def summarize(paths, since=None, cwd=None, group_by=None):
             include = selected(record)
             has_at = number(record.get('at'))
             diagnostic = isinstance(record.get('diagnostic'), dict)
-            if not diagnostic:
+            lifecycle = isinstance(record.get('background') or record.get('background_agent'), dict)
+            if not diagnostic and not lifecycle:
                 messages = record['messages']
                 replacement = record['from'] < length
                 length = record['from'] + len(messages)
@@ -564,9 +638,13 @@ def summarize(paths, since=None, cwd=None, group_by=None):
                 if include:
                     error('provider_failure', record['diagnostic']['message'], path.stem)
                 continue
+            if lifecycle:
+                agents.add(record, session_step, include, pending_agents, seen_agents,
+                           allow_agent=not header.get('parent_session_id'))
+                continue
             turn_step = record.get('turn_step')
             explicit_turn = number(turn_step) and turn_step > 0
-            new_turn = (turn_step == 1 if explicit_turn else any(m['role'] == 'user' for m in messages))
+            new_turn = (turn_step == 1 if explicit_turn else any(m['role'] == 'user' and m.get('source') not in ('background', 'background_agent') for m in messages))
             if new_turn or (explicit_turn and current is None):
                 finish_turn()
                 current = dict(steps=0, full_steps=0, timed=0, ms=0, complete=False, selected=False, previous=None)
@@ -580,7 +658,12 @@ def summarize(paths, since=None, cwd=None, group_by=None):
                     interrupted = True
                     if current is not None:
                         current['previous'] = None
-            if not any(m['role'] == 'assistant' for m in messages) or interrupted:
+            is_step = any(m['role'] == 'assistant' for m in messages) and not interrupted
+            if interrupted:
+                pending_agents.clear()
+            agents.add(record, session_step, include, pending_agents, seen_agents, is_step,
+                       allow_agent=not header.get('parent_session_id'))
+            if not is_step:
                 continue
             session_step += 1
             if current is not None:
@@ -683,6 +766,7 @@ def summarize(paths, since=None, cwd=None, group_by=None):
             'bash_top10': [{'command': k, 'count': v} for k, v in sorted(bash_counts.items(), key=lambda p: (-p[1], p[0]))[:10]],
             'errors': errors, 'slowest_steps': slowest, 'timing': timing.report(),
             'tool_data': tool_data.report(),
+            'agents': agents.report(), 'bash_calls': agents.report('bash'),
             'round_trips': dict(steps_per_turn=distribution(turn_steps),
                                write_to_validation=pair_summary(write_validation_pairs, adjacent_pairs),
                                disjoint_write_files=pair_summary(disjoint_pairs, file_pairs),
@@ -720,7 +804,13 @@ def text_report(report):
              f"Token {token_total}（prompt {u['prompt_tokens']} / completion {u['completion_tokens']}）；缓存命中 {pct(u['cache_hit_rate'])}；usage 覆盖 {t['steps_with_usage']}/{t['steps']} Step",
              f"每 Turn 平均 {fmt(t['avg_steps_per_turn'])} Step；平均耗时 {fmt(t['avg_turn_ms'], ' ms')}（完整计时 {t['timed_turns']}/{t['turns']} Turn，{t['steps_with_ms']} Step）",
              '工具（静态调用点）：' + (', '.join(f'{k} {v}' for k, v in report['tools'].items()) or '无'),
-             'bash 命令 Top 10：' + (', '.join(f"{v['command']} {v['count']}" for v in report['bash_top10']) or '无'), '错误分类：']
+             'bash 命令 Top 10：' + (', '.join(f"{v['command']} {v['count']}" for v in report['bash_top10']) or '无')]
+    for name, key in (('Agent', 'agents'), ('Bash', 'bash_calls')):
+        calls = report[key]
+        overlap = calls['background_steps']
+        lines.extend([f"{name} 调用：前台 {calls['foreground_calls']} / 后台 {calls['background_calls']}",
+                      f"{'' if key == 'agents' else 'Bash '}后台期间主模型 Step: samples={overlap['samples']} median={fmt(overlap['median'])} p90={fmt(overlap['p90'])}"])
+    lines.extend('  ' + note for note in report['agents']['notes'])
     structure = report['round_trips']
     steps = structure['steps_per_turn']
     section = ["往返结构：", f"  每 Turn Step: samples={steps['samples']} median={fmt(steps['median'])} p90={fmt(steps['p90'])}"]
@@ -729,6 +819,7 @@ def text_report(report):
         section.append(f"  {label}: {item['count']}/{item['pairs']} = {pct(item['ratio'])}（samples={item['pairs']}）")
     section.extend("  " + note for note in structure['notes'])
     lines[4:4] = section
+    lines.append('错误分类：')
     for name, item in report['errors'].items():
         lines.append(f"  {name}: {item['count']}")
         lines.extend(f"    [{e['session_id']}] {e['text']}" for e in item['examples'])

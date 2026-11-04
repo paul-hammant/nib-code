@@ -134,6 +134,114 @@ class StatsTest(unittest.TestCase):
             self.assertNotIn('PRIVATE_CALLS_SENTINEL', result.stdout + result.stderr)
             self.assertEqual(json.loads(result.stdout)['overall']['sessions'], 0)
 
+    def test_mixed_background_agent_and_bash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'mixed.jsonl'
+            rows = synthetic_log(path, [['tools.agent({prompt: "check", background: true})',
+                                         'tools.read({path: "a"})', None]])
+            rows[1]['calls'] = [dict(name='agent', background=True, id='a1'),
+                                  dict(name='bash'), dict(name='bash', background=True, id='b2')]
+            result_from = rows[3]['from']
+            rows[3]['from'] += 2
+            result = lambda offset, kind, task_id: dict({'from': result_from + offset}, messages=[
+                dict(role='user', source='background', background_kind=kind, background_id=task_id,
+                     content=f'[background {kind} {task_id} finished]')])
+            event = lambda kind, task_id, state, step: dict(background=dict(id=task_id, kind=kind, state=state),
+                                                            messages=[], turn_step=step)
+            ordered = [rows[0], event('agent', 'a1', 'started', 1), event('bash', 'b2', 'started', 1),
+                       rows[1], rows[2], result(0, 'agent', 'a1'), event('agent', 'a1', 'finished', 3),
+                       result(1, 'bash', 'b2'), event('bash', 'b2', 'finished', 3), rows[3]]
+            path.write_text('\n'.join(map(json.dumps, ordered)) + '\n')
+            report = stats.summarize([path])
+            self.assertEqual(report['agents']['foreground_calls'], 0)
+            self.assertEqual(report['agents']['background_calls'], 1)
+            self.assertEqual(report['bash_calls']['foreground_calls'], 1)
+            self.assertEqual(report['bash_calls']['background_calls'], 1)
+            self.assertEqual(report['bash_calls']['background_steps'], dict(samples=1, median=1, p90=1))
+            self.assertEqual(report['overall']['turns'], 1)
+            rows[0]['parent_session_id'] = 'parent'
+            path.write_text('\n'.join(map(json.dumps, ordered)) + '\n')
+            child = stats.summarize([path])
+            self.assertEqual(child['agents']['background_calls'], 0)
+            self.assertEqual(child['bash_calls']['background_calls'], 1)
+
+    def test_background_agent_standalone_result_needs_terminal_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'background.jsonl'
+            rows = synthetic_log(path, [['tools.agent({prompt: "one", background: true})',
+                                         'tools.read({path: "a"})', None]])
+            rows[1]['calls'] = [dict(name='agent', background=True, id='a1')]
+            result = dict({'from': rows[3]['from']}, messages=[dict(role='user',
+                source='background_agent', background_agent_id='a1', content='[background agent a1 finished]\n{}')])
+            rows[3]['from'] += 1
+            started = dict(background_agent=dict(id='a1', state='started'), messages=[], turn_step=1)
+            finished = dict(background_agent=dict(id='a1', state='finished', ok=True), messages=[], turn_step=3)
+            ordered = [rows[0], started, rows[1], rows[2], result, finished, rows[3]]
+
+            def measure(records):
+                path.write_text('\n'.join(map(json.dumps, records)) + '\n')
+                return stats.summarize([path])['agents']
+
+            self.assertEqual(measure(ordered)['background_steps'], dict(samples=1, median=1, p90=1))
+            self.assertEqual(measure(ordered[:-2] + ordered[-1:])['background_steps']['samples'], 0)
+            self.assertEqual(measure(ordered[:4] + ordered[5:])['background_steps']['samples'], 0)
+            self.assertEqual(measure([rows[0], rows[1], rows[2], result, rows[3]])['background_steps']['samples'], 1)
+
+    def test_background_agent_overlap_and_turn_boundaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'background.jsonl'
+            records = synthetic_log(path, [['tools.agent({prompt: "one", background: true})',
+                                            'tools.read({path: "a"})',
+                                            'tools.agent({prompt: "three", background: true})', None]], nib_version='background')
+            records[1]['calls'] = [dict(name='agent', background=True, id='a1'),
+                                   dict(name='agent'), dict(name='agent', dispatched=False)]
+            records[2]['calls'] = []  # lifecycle remains available when calls are omitted
+            records[3]['messages'].insert(0, dict(role='user', source='background_agent',
+                background_agent_id='a1', content='[background agent a1 finished]\n{}'))
+            records[3]['calls'] = [dict(name='agent', background=True, id='a3')]
+            records[4]['from'] += 1
+            records[4]['messages'][0:0] = [
+                dict(role='user', source='background_agent', background_agent_id=agent_id, content='result')
+                for agent_id in ('a2', 'a3', 'unknown')]
+            lifecycle = lambda agent_id, state, step: dict(background_agent=dict(id=agent_id, state=state),
+                                                          messages=[], turn_step=step)
+            records = [records[0], lifecycle('a1', 'started', 1), records[1],
+                       lifecycle('a2', 'started', 2), records[2],
+                       lifecycle('a1', 'finished', 3), lifecycle('a3', 'started', 3), records[3],
+                       lifecycle('a2', 'finished', 4), lifecycle('a3', 'lost', 4), records[4]]
+            path.write_text('\n'.join(map(json.dumps, records)) + '\n')
+            report = stats.summarize([path], group_by='version')
+            agents = report['agents']
+            self.assertEqual(agents['foreground_calls'], 1)
+            self.assertEqual(agents['background_calls'], 3)
+            self.assertEqual(agents['background_steps'], dict(samples=3, median=1, p90=1))
+            self.assertEqual(report['overall']['turns'], 1)
+            self.assertEqual(report['overall']['steps'], 4)
+            self.assertEqual(report['groups']['background']['agents'], agents)
+            self.assertIn('Agent 调用：前台 1 / 后台 3', stats.text_report(report))
+            self.assertIn('后台期间主模型 Step: samples=3 median=1.00 p90=1.00', stats.text_report(report))
+            records[0]['parent_session_id'] = 'parent'
+            path.write_text('\n'.join(map(json.dumps, records)))
+            self.assertEqual(stats.summarize([path])['agents'], stats.AgentStats().report())
+
+    def test_background_agent_overlap_skips_filtered_and_interrupted_pairs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'background.jsonl'
+            records = synthetic_log(path, [['tools.agent({prompt: "one", background: true})',
+                                            'tools.read({path: "a"})', None]])
+            for record in records:
+                record['at'] = int(datetime(2026, 2, 2).timestamp() * 1000)
+            records[1]['calls'] = [dict(name='agent', background=True, id='a1')]
+            records[3]['messages'].insert(0, dict(role='user', source='background_agent',
+                background_agent_id='a1', content='result'))
+            records[2]['at'] = int(datetime(2026, 1, 1).timestamp() * 1000)
+            path.write_text('\n'.join(map(json.dumps, records)))
+            self.assertEqual(stats.summarize([path], since=date(2026, 2, 1))['agents']['background_steps']['samples'], 0)
+            records[2]['messages'] = [dict(role='assistant', content='[interrupted by user]')]
+            records[3]['from'] = records[2]['from'] + 1
+            path.write_text('\n'.join(map(json.dumps, records)))
+            self.assertEqual(stats.summarize([path])['agents']['background_steps']['samples'], 0)
+
     def assertRoundTrips(self, actual, expected):
         self.assertEqual(len(actual["notes"]), 2)
         self.assertEqual({key: value for key, value in actual.items() if key != "notes"}, expected)

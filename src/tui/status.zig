@@ -49,6 +49,7 @@ pub const Status = struct {
     usage: provider.Usage = .{},
     steps: u32 = 0,
     current_step: u32 = 1,
+    background_count: usize = 0,
     context: u64 = 0,
     /// Set while a Turn runs.
     busy: ?Activity.Label = null,
@@ -69,6 +70,10 @@ pub const Text = struct {
                 w.print(" · no data {d}s", .{ms / 1000}) catch {};
             };
             w.print(" · step {d} · esc to cancel", .{s.current_step}) catch {};
+        }
+        if (s.background_count > 0) {
+            if (w.end > 0) w.writeAll(" · ") catch {};
+            w.print("bg {d}", .{s.background_count}) catch {};
         }
         if (scrolled) {
             if (w.end > 0) w.writeAll(" · ") catch {};
@@ -95,9 +100,17 @@ pub const Text = struct {
             if (s.busy != null) "turn" else "last turn",
             s.steps,
         }) catch "";
+        var bg_buf: [32]u8 = undefined;
+        const bg = if (s.background_count > 0) std.fmt.bufPrint(&bg_buf, " · bg {d}", .{s.background_count}) catch "" else "";
         while (std.mem.lastIndexOf(u8, line, " · ")) |separator| {
-            if (@import("vaxis").gwidth.gwidth(line, .unicode) <= width) break;
+            if (@import("vaxis").gwidth.gwidth(line, .unicode) + @import("vaxis").gwidth.gwidth(bg, .unicode) <= width) break;
             line = line[0..separator];
+        }
+        if (bg.len > 0) {
+            const fits = @import("vaxis").gwidth.gwidth(line, .unicode) + @import("vaxis").gwidth.gwidth(bg, .unicode) <= width;
+            if (!fits) line = "";
+            const suffix = std.fmt.bufPrint(text.status[line.len..], "{s}", .{if (fits) bg else bg[3..]}) catch "";
+            line = text.status[0 .. line.len + suffix.len];
         }
         return line;
     }
@@ -122,6 +135,15 @@ test "activity is optional and footer shows latest reported usage" {
     try std.testing.expectEqualStrings("m · effort server default · ctx 25% · in 1.8M (94% cached) · out 18k · last turn: 2 steps", line);
     const busy = text.footer(.{ .cfg = cfg, .context = 400, .steps = 1, .usage = .{ .prompt_tokens = 1200, .completion_tokens = 50, .prompt_cache_hit_tokens = 600 }, .busy = .{ .phase = .running, .ms = 100 } }, 200);
     try std.testing.expectEqualStrings("m · effort server default · ctx 40% · in 1.2k (50% cached) · out 50 · turn: 1 steps", busy);
+}
+
+test "background task count remains visible during model work" {
+    const t = std.testing;
+    var text: Text = .{};
+    const s: Status = .{ .cfg = .{ .base_url = "", .api_key = "", .model = "m" }, .busy = .{ .phase = .thinking, .ms = 0 }, .background_count = 2 };
+    try t.expectEqualStrings("⠋ thinking 0s · step 1 · esc to cancel · bg 2", text.format(s, false));
+    try t.expect(std.mem.endsWith(u8, text.footer(s, 200), " · bg 2"));
+    try t.expectEqualStrings("bg 2", text.format(.{ .cfg = s.cfg, .background_count = 2 }, false));
 }
 
 test "model silence threshold, data reset, and request boundaries" {

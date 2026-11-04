@@ -39,7 +39,7 @@ const Row = struct {
     fn init(gpa: std.mem.Allocator, p: Progress, last: bool) !Row {
         var text: std.ArrayList(u8) = .empty;
         errdefer text.deinit(gpa);
-        try text.print(gpa, "  {s} #{d} ", .{ if (last) "└─" else "├─", p.agent });
+        try text.print(gpa, "  {s} #{d} {s}", .{ if (last) "└─" else "├─", p.agent, if (p.kind == .bash) "bash " else "" });
         const prompt_start = text.items.len;
         var end: usize = 0;
         var chars: usize = 0;
@@ -53,7 +53,10 @@ const Row = struct {
         }
         try text.appendSlice(gpa, p.prompt[0..end]);
         const prompt_end = text.items.len;
-        try text.print(gpa, " · {s} · step {d}", .{ @tagName(p.state), p.step });
+        if (p.kind == .bash)
+            try text.print(gpa, " · {d}.{d}s · {s}", .{ p.elapsed_ms / 1000, p.elapsed_ms % 1000 / 100, @tagName(p.state) })
+        else
+            try text.print(gpa, " · {s} · step {d}", .{ @tagName(p.state), p.step });
         const status_end = text.items.len;
         for (p.tools, 0..) |name, i| {
             try text.appendSlice(gpa, if (i == 0) " · " else ", ");

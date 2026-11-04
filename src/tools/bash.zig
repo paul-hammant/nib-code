@@ -7,9 +7,9 @@ const process = @import("process.zig");
 const policy = @import("policy.zig");
 
 pub fn bash(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolResult {
-    const A = struct { command: []const u8, timeout_ms: i64 = 120_000 };
+    const A = struct { command: []const u8, timeout_ms: i64 = 120_000, background: bool = false };
     const a = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch
-        return fail(gpa, "expected {{ command: string, timeout_ms?: number }}", .{});
+        return fail(gpa, "expected {{ command: string, timeout_ms?: number, background?: boolean }}", .{});
     defer a.deinit();
 
     switch (policy.checkCredentials(a.value.command, t.codexHome())) {
@@ -24,8 +24,29 @@ pub fn bash(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
             fail(gpa, "refused by nib: {s}. If it is really needed, ask the user to run it.", .{why}),
     }
 
+    if (a.value.background) {
+        const result = t.background.start(t, gpa, .bash, args, a.value.command) catch |err| return switch (err) {
+            error.BackgroundBashLimit => fail(gpa, "background bash limit is {d} running commands; retry after a background result arrives", .{@import("background.zig").Background.bash_limit}),
+            else => err,
+        };
+        return .{ .ok = result };
+    }
+    return execute(t, gpa, a.value.command, a.value.timeout_ms, &t.cancel, null);
+}
+
+pub fn executeBackground(t: *Tools, gpa: std.mem.Allocator, args: []const u8, cancel: *const std.atomic.Value(bool), progress: @import("../session/events.zig").Progress) !sandbox.ToolResult {
+    const parsed = try std.json.parseFromSlice(struct { command: []const u8, timeout_ms: i64 = 120_000 }, gpa, args, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    var value = progress;
+    value.prompt = parsed.value.command;
+    return execute(t, gpa, value.prompt, parsed.value.timeout_ms, cancel, value);
+}
+
+fn execute(t: *Tools, gpa: std.mem.Allocator, command: []const u8, timeout_ms: i64, cancel: *const std.atomic.Value(bool), progress: ?@import("../session/events.zig").Progress) !sandbox.ToolResult {
+    var tracker: Tracker = .{ .t = t, .gpa = gpa, .value = progress, .started = .now(t.io, .awake) };
+    tracker.tick();
     // In-shell redirect keeps stdout/stderr interleaving order.
-    const script = try std.fmt.allocPrint(gpa, "exec 2>&1\n{s}", .{a.value.command});
+    const script = try std.fmt.allocPrint(gpa, "exec 2>&1\n{s}", .{command});
     defer gpa.free(script);
 
     const result = process.run(gpa, t.io, .{ .spawn = .{
@@ -34,14 +55,14 @@ pub fn bash(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .ignore,
-    }, .cancel = &t.cancel, .timeout_ms = a.value.timeout_ms, .max_output_bytes = 16 * 1024 * 1024 }) catch |err| return switch (err) {
+    }, .cancel = cancel, .timeout_ms = timeout_ms, .on_tick = if (progress != null) .{ .ctx = &tracker, .emit = Tracker.observe } else null, .max_output_bytes = 16 * 1024 * 1024 }) catch |err| return switch (err) {
         error.OutputLimit => fail(gpa, "output exceeds 16 MiB; redirect output to a file", .{}),
         else => err,
     };
     const stdout = result.output;
     defer gpa.free(stdout);
     if (result.stop) |err| return switch (err) {
-        error.TimedOut => fail(gpa, "timed out after {d} ms", .{a.value.timeout_ms}),
+        error.TimedOut => fail(gpa, "timed out after {d} ms", .{timeout_ms}),
         error.Canceled => fail(gpa, "canceled", .{}),
     };
     const code: ?u8 = switch (result.term) {
@@ -50,6 +71,29 @@ pub fn bash(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
     };
     return .{ .ok = try std.json.Stringify.valueAlloc(gpa, .{ .exit_code = code, .output = stdout }, .{}) };
 }
+
+const Tracker = struct {
+    t: *Tools,
+    gpa: std.mem.Allocator,
+    value: ?@import("../session/events.zig").Progress,
+    started: std.Io.Clock.Timestamp,
+    last_second: ?u64 = null,
+
+    fn observe(ctx: *anyopaque) void {
+        const tr: *Tracker = @ptrCast(@alignCast(ctx));
+        tr.tick();
+    }
+
+    fn tick(tr: *Tracker) void {
+        var value = tr.value orelse return;
+        value.elapsed_ms = @intCast(@max(tr.started.untilNow(tr.t.io).raw.toMilliseconds(), 0));
+        const second = value.elapsed_ms / 1000;
+        if (tr.last_second == second) return;
+        tr.last_second = second;
+        value.state = .working;
+        tr.t.progress.update(tr.gpa, tr.t.io, value) catch {};
+    }
+};
 
 const testing = std.testing;
 const callTool = tools.callTool;

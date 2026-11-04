@@ -1,26 +1,31 @@
 const std = @import("std");
 const provider = @import("../provider.zig");
+const Background = @import("events.zig").Background;
 
 pub const Batch = struct {
     items: std.ArrayList(Item) = .empty,
 
     pub fn deinit(b: *Batch, gpa: std.mem.Allocator) void {
-        for (b.items.items) |item| gpa.free(item.text);
+        for (b.items.items) |item| {
+            gpa.free(item.text);
+            if (item.background) |bkg| gpa.free(bkg.id);
+        }
         b.items.deinit(gpa);
     }
 
     pub fn joined(b: Batch, gpa: std.mem.Allocator) ![]u8 {
         var text: std.ArrayList(u8) = .empty;
         errdefer text.deinit(gpa);
-        for (b.items.items, 0..) |item, i| {
-            if (i > 0) try text.appendSlice(gpa, "\n\n");
+        for (b.items.items) |item| {
+            if (item.background != null) continue;
+            if (text.items.len > 0) try text.appendSlice(gpa, "\n\n");
             try text.appendSlice(gpa, item.text);
         }
         return text.toOwnedSlice(gpa);
     }
 };
 
-const Item = struct { id: u64, text: []const u8 };
+pub const Item = struct { id: u64, text: []const u8, background: ?Background = null };
 
 pub const Inbox = struct {
     mutex: std.Io.Mutex = .init,
@@ -38,6 +43,25 @@ pub const Inbox = struct {
         return id;
     }
 
+    pub fn enqueueBackground(q: *Inbox, gpa: std.mem.Allocator, io: std.Io, id: []const u8, kind: Background.Kind, state: @FieldType(Background, "state"), ok: ?bool, text: []const u8) !u64 {
+        q.mutex.lockUncancelable(io);
+        defer q.mutex.unlock(io);
+        const copy = try gpa.dupe(u8, text);
+        errdefer gpa.free(copy);
+        const agent_id = try gpa.dupe(u8, id);
+        errdefer gpa.free(agent_id);
+        const message_id = q.next_id;
+        try q.batch.items.append(gpa, .{ .id = message_id, .text = copy, .background = .{ .id = agent_id, .kind = kind, .state = state, .ok = ok } });
+        q.next_id += 1;
+        return message_id;
+    }
+
+    pub fn empty(q: *Inbox, io: std.Io) bool {
+        q.mutex.lockUncancelable(io);
+        defer q.mutex.unlock(io);
+        return q.batch.items.items.len == 0;
+    }
+
     pub fn take(q: *Inbox, io: std.Io) Batch {
         q.mutex.lockUncancelable(io);
         defer q.mutex.unlock(io);
@@ -52,7 +76,7 @@ pub const Inbox = struct {
         var messages: std.ArrayList(provider.Message) = .empty;
         defer messages.deinit(gpa);
         for (q.batch.items.items) |item|
-            try messages.append(gpa, .{ .role = "user", .content = try arena.dupe(u8, item.text) });
+            try messages.append(gpa, .{ .role = "user", .content = try arena.dupe(u8, item.text), .source = if (item.background != null) .background else null, .background_kind = if (item.background) |b| b.kind else null, .background_ok = if (item.background) |b| b.ok else null, .background_id = if (item.background) |b| try arena.dupe(u8, b.id) else null });
         try pending.appendSlice(gpa, messages.items);
         const batch = q.batch;
         q.batch = .{};

@@ -74,7 +74,8 @@ const all = [_]Tool{
         .doc =
         \\  // Run bash in the working directory; stderr is merged into output. exit_code is null if killed.
         \\  // Output is returned verbatim; over 16 MiB errors (redirect output to a file). Commands over 256 shell words, excluding heredoc bodies, are refused: write long scripts to a file with tools.write and run that file.
-        \\  async bash({ command, timeout_ms = 120000 }) {}, // → { exit_code, output }
+        \\  // background returns {id} immediately; {exit_code,output} arrives as a message in a later Step. File changes during the command affect its result.
+        \\  async bash({ command, timeout_ms = 120000, background = false }) {}, // → { exit_code, output } or { id }
         ,
     },
     .{
@@ -92,8 +93,9 @@ const all = [_]Tool{
         .root_only = true,
         .run = subagent.agent,
         .doc =
-        \\  // Independent multi-step worker with the same tools except agent; starts from scratch and reads code itself: thousands of tokens, tens of seconds or more. Only prompt is shared. Failures resolve ok:false (invalid args and user cancel reject); stopped children may leave partial files. changes: files edited/written, not bash. model/effort as in llm.
-        \\  async agent({ prompt, timeout_ms = 1800000, model, effort }) {}, // → { ok, text, usage, changes, error? }
+        \\  // Independent multi-step worker with the same tools except agent; starts from scratch and reads code itself: thousands of tokens, tens of seconds or more. Only prompt is shared. Failures resolve ok:false (invalid args and user cancel reject); stopped children may leave partial files. changes: edit/write only. model/effort as in llm.
+        \\  // background returns {id} now; the result arrives as a message in a later Step, and a reply without Run waits for it. Background edits share the workspace and can land at any time, even mid-build.
+        \\  async agent({ prompt, timeout_ms = 1800000, model, effort, background = false }) {}, // → { ok, text, usage, changes, error? } or { id }
         ,
     },
 };
@@ -136,6 +138,9 @@ pub const Tools = struct {
     agents_mutex: std.Io.Mutex = .init,
     agents_changed: std.Io.Condition = .init,
     agents_active: usize = 0,
+    background: @import("tools/background.zig").Background = .{},
+    run_id: usize = 0,
+    background_sink: ?struct { ctx: *anyopaque, emit: *const fn (*anyopaque, @import("session/events.zig").Background) anyerror!void } = null,
     progress: @import("tools/progress.zig").Queue = .{},
     agent_usage: provider.Usage = .{},
     llm_calls: std.atomic.Value(usize) = .init(0),
@@ -262,7 +267,15 @@ pub const Tools = struct {
     pub fn host(t: *Tools) sandbox.Host {
         t.cancel.store(false, .release);
         t.llm_calls.store(0, .monotonic);
-        return .{ .ctx = t, .names = t.api().names, .call = call, .cancel = &t.cancel, .poll = poll, .admit = admit };
+        return .{ .ctx = t, .names = t.api().names, .call = call, .cancel = &t.cancel, .poll = poll, .admit = admit, .backgroundId = backgroundId };
+    }
+
+    fn backgroundId(ctx: *anyopaque, id: []const u8) ?[]const u8 {
+        const t: *Tools = @ptrCast(@alignCast(ctx));
+        t.background.mutex.lockUncancelable(t.io);
+        defer t.background.mutex.unlock(t.io);
+        for (t.background.jobs.items) |job| if (std.mem.eql(u8, job.id, id)) return job.id;
+        return null;
     }
 
     fn admit(ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8) !?[]u8 {
@@ -275,13 +288,14 @@ pub const Tools = struct {
         return null;
     }
 
-    fn poll(ctx: *anyopaque) !void {
+    pub fn poll(ctx: *anyopaque) !void {
         const t: *Tools = @ptrCast(@alignCast(ctx));
         if (t.usage_sink) |sink| {
             const usage = t.takeUsage();
             if (usage.prompt_tokens != 0 or usage.completion_tokens != 0 or usage.prompt_cache_hit_tokens != 0)
                 try sink.emit(sink.ctx, usage);
         }
+        if (t.background_sink) |sink| try t.background.poll(t.io, sink.ctx, sink.emit);
         try t.progress.drain(t.io);
     }
 

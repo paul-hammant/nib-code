@@ -10,13 +10,19 @@ llm 限额由 [config.toml 的 `[limits]`](config.md#limits) 配置：同进程�
 
 根会话可调用 `await tools.agent({ prompt, timeout_ms: 1800000, model, effort })`，成功返回 `{ ok: true, text, usage, changes }`；子会话超时、崩溃、非零退出或 NDJSON error 返回 `{ ok: false, error, text, usage, changes }`，不会 reject，也不会取消同一 Run 中的其他子 agent。只有参数错误和用户取消（Esc/SIGINT/SIGTERM）仍 reject。text 成功时取 end.text；失败时保留已收到的最终文本（text delta，不含思考或工具代码），没有则为空串。error 保留原失败信息，并带实际耗时（含终止宽限）、子会话 id（未收到 start 时明确标为不可用）和检查半成品文件的提醒。timeout_ms 可省略，默认 30 分钟，不计排队时间。model/effort 同 llm：省略则继承，覆盖子会话有效配置，只在当前 provider 内选择，effort 沿用现有校验与映射，不影响父会话。并行实现前先写接口约定，告诉每个子 agent 负责哪些文件，收到结果后检查 changes 是否越界或冲突；`Promise.all` 并行派生，同时运行的子会话上限默认 4，可配置（全部工具最多同时运行 8 个）。子会话独立读取指令文件，沿用 cwd 和有效 provider/模型配置及限额（通过 stdin 管道传递，子会话跳过配置文件读取；Codex 凭证各自读取），不继承父会话历史。内部环境变量 `NIB_AGENT_DEPTH` 从 0 递增，深度达到 1 时，工具说明与实际 JS API 都移除 agent。`NIB_PARENT_SESSION_ID` 写入子会话日志首条记录的 `parent_session_id`。显式 `--resume` 子会话仍保留深度限制；`--continue` 跳过子会话。
 
+`background` 可选，默认 false，保留上述前台等待行为。设为 true 时，调用在登记后台任务后立即返回含 `id` 的启动确认，子会话由父会话持有，可跨 Run 继续工作；父模型可继续其他 Step，不需要额外的查询或等待工具。任务完成后，Session 在下一次主模型请求前，把 `[background agent <id> finished]` 和截断后的 `{ok,text,changes,error?}` JSON 作为 user 消息插入历史，不含 usage。结果不会在模型流式响应或 Run 执行中途插入，也不会当作用户新 Turn。若模型已给出无工具回答但仍有后台任务，Session 等待下一条 inbox 消息（后台结果或用户插话），按 FIFO 插入后发起新 Step；不必等待全部后台任务完成。
+
+后台任务与前台调用共用 agent 并发限额、模型/effort 配置、超时和取消路径；同一父会话的各 Run 不会因各自沙箱退出而取消后台任务。父 Turn 取消或失败、Session 退出时停止并清理未完成任务，不留下脱离父会话的子进程；恢复会话保留已写入日志的结果，未完成任务不会重启，而是插入 `[background agent <id> lost: process ended]`。后台 agent 的启动/结果插入通过 `background` 事件报告，见 [ask-json.md](ask-json.md)；结果消息的日志来源标记与统计口径见 [session-log.md](session-log.md)。
+
+`tools.bash({command, background: true})` 同样立即返回含 `id` 的启动确认；后台 bash 与后台 agent 共用编号，独立于 agent 并发限额。后台 bash 最多同时运行 8 个，超出时立即 reject 并给出明确错误，不排队；子 agent 内也可使用。结果在下一次主模型请求前作为带来源标记的 user 消息插入，恢复未完成任务时插入 lost 消息。后台 bash 的生命周期也通过 `background` 事件报告。
+
 changes 汇总子会话所有 Run（包括失败 Run）已收到的 `run_end.changes`，按路径首次出现顺序返回 `[{ path, added, removed, created }]`：同路径 added/removed 累加，created 取逻辑或，不含 diff 正文。这是各 Run 的累计行改动量，不是起止文件的净 diff；只涵盖 edit/write，不包含 bash 或外部进程改动。中断时尚未发出 run_end 的改动也可能不在汇总中，失败后仍须检查半成品文件。
 
 ## 进度、用量与取消
 
 llm 与 agent 的 usage 都计入本轮累计用量；Esc/SIGINT/SIGTERM 取消在途及排队调用。
 
-子进程 NDJSON 在运行途中按完整行观察；最终输出仍按原路径解析和统计。进度使用受互斥锁保护、每个子 agent 仅保留最新快照的队列；工具线程只更新队列，不调用 Session sink。Run 线程在 sandbox 的 Promise/工具等待循环里约每 20 ms 尝试转发，转发不计入 JS 执行预算；eval 返回前已停止并 join 所有工具线程，之后清空队列。TUI 收到事件后复制数据到自身事件循环，在 agent Run 下方默认显示子任务树，每个子 agent 固定一行：`#编号 prompt 摘要 · 状态 · step N · 工具名 变更文件`，按编号排序并原地更新。prompt 最多预览前 40 个 Unicode 字符；窄屏优先缩短 prompt 和末尾文件信息，保留编号、状态、step 和工具名，不换行。ctrl+o 只切换 Run 代码、结果及 diff 的展开，不隐藏子任务树。Run 结束恢复工具/耗时/改动摘要，并保留最后收到的子任务状态；从历史恢复的 Run 不重建子任务树。工具名来自最近一次 Run，文件仅为 edit/write 报告的变更路径，不代表当前正在执行的命令或任务完成百分比。
+子进程 NDJSON 在运行途中按完整行观察；最终输出仍按原路径解析和统计。进度使用受互斥锁保护、每个子 agent 仅保留最新快照的队列；工具线程只更新队列，不调用 Session sink。Run 线程在 sandbox 的 Promise/工具等待循环里约每 20 ms 尝试转发，转发不计入 JS 执行预算；eval 返回前已停止并 join 所有前台工具线程，后台 agent 由父会话持有，不随 Run 结束而 join；进度队列在 Turn 结束时清理，后台任务的原 Run 进度会继续显示到结果插入。TUI 收到事件后复制数据到自身事件循环，在 agent Run 下方默认显示子任务树，每个子 agent 固定一行：`#编号 prompt 摘要 · 状态 · step N · 工具名 变更文件`，按编号排序并原地更新。prompt 最多预览前 40 个 Unicode 字符；窄屏优先缩短 prompt 和末尾文件信息，保留编号、状态、step 和工具名，不换行。ctrl+o 只切换 Run 代码、结果及 diff 的展开，不隐藏子任务树。Run 结束恢复工具/耗时/改动摘要，并保留最后收到的子任务状态；从历史恢复的 Run 不重建子任务树。工具名来自最近一次 Run，文件仅为 edit/write 报告的变更路径，不代表当前正在执行的命令或任务完成百分比。
 
 bash 与子会话复用进程组执行器，取消和超时会清理整组；子 nib 先收到 SIGTERM，有 500 ms 取消自身工具，之后强制终止。用量按已收到的累计快照统计，无法推知服务端尚未报告的 token。路径写锁只协调当前进程内的 edit/write，不协调独立子会话或 bash 的写入。
 

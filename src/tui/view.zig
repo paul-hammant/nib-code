@@ -22,7 +22,7 @@ pub fn draw(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewpo
     const input_w = win.width - x - @as(u16, if (framed) 2 else 0);
     const input_h = @min(input.rows(win.child(.{ .width = input_w })), @max(1, win.height / 3));
     const saved_scroll = scroll.*;
-    var activity_h: u16 = @intFromBool(s.busy != null or s.notice != null or scroll.top != null or scroll.pending < 0);
+    var activity_h: u16 = @intFromBool(s.busy != null or s.background_count > 0 or s.notice != null or scroll.top != null or scroll.pending < 0);
     activity_h = @min(activity_h, win.height - input_h - borders - hints);
     const menu_h: u16 = @intCast(@min(menu.len, max_menu_rows, (win.height - input_h - borders - hints - activity_h) / 2));
     var body_h = win.height - input_h - borders - hints - menu_h - activity_h;

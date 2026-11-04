@@ -121,5 +121,6 @@ plain 单 Run 显示 `match`、`diff` 或 `undetermined`，必要时附 `incompl
 - 重放**不能重放模型**、恢复推理过程或检验另一个模型会怎样决定；保存的是已执行的 Run，不是可重复的 provider 请求。
 - 重放**不能验证工具实现**或外部系统是否正确；工具返回值是输入数据，不会重新读取当前文件、重新请求网络或校验当前 bash 行为。
 - 重放**不能重现 bash 副作用**，也不会再次编辑/写入项目。匹配只说明这段 JS 在录制结果与重放语义下得到同样输出，不证明真实世界状态相同。
+- 后台任务（`background: true` 的 agent/bash）只录制启动时交回 JS 的 `{ id }`；它们之后作为消息插入的结果不经过 Run，不在 calls 录制中，已写入主日志。
 
 本地 mock、固定时间、首次参数分歧与 `/reflect` 特殊标记隐私回归测试：`zig build` 后运行 `python3 tests/test_replay.py`。

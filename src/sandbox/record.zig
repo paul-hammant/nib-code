@@ -51,7 +51,7 @@ pub const Recorder = struct {
         r.active = false;
         if (!r.warned) {
             r.warned = true;
-            std.debug.print("warning: tool call recording disabled (cannot write calls JSONL)\n", .{});
+            if (!@import("builtin").is_test) std.debug.print("warning: tool call recording disabled (cannot write calls JSONL)\n", .{});
         }
     }
 

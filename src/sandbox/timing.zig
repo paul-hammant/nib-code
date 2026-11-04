@@ -8,6 +8,8 @@ pub const Call = struct {
     run_index: usize,
     result_bytes: ?u64 = null,
     dispatched: bool = true,
+    background: ?bool = null,
+    id: ?[]const u8 = null,
 };
 
 pub const Run = struct {
