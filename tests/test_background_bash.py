@@ -4,6 +4,7 @@ import http.server
 import json
 import os
 from pathlib import Path
+import re
 import select
 import shlex
 import signal
@@ -107,6 +108,28 @@ class Mock(http.server.ThreadingHTTPServer):
         if self.case == "mixed":
             return ("const a = await tools.agent({prompt:'child:one',background:true}); " +
                     "const b = await " + bash(self.waiting_command()) + "; [a,b]")
+        if self.case == "overflow_ids":
+            return ("for(let i=0;i<200;i++) await tools.glob({pattern:'*.missing'}); "
+                    "await tools.agent({prompt:'child:foreground'}); "
+                    "await tools.bash({command:'sleep 3.2'})")
+        if self.case == "foreground_cancel":
+            return ("await Promise.all([tools.bash({command:'sleep 30'}), "
+                    "(async()=>{await tools.bash({command:'sleep 4'}); throw new Error('stop')})()])")
+        if self.case in ("mixed", "resume_counters", "legacy_resume"):
+            foreground = "await tools.agent({prompt:'child:foreground'}); "
+            launches = ("const a = await tools.agent({prompt:'child:one',background:true}); " +
+                        "const b = await " + bash(self.waiting_command()) + "; ")
+            if self.case == "legacy_resume":
+                return launches + "const c = await tools.agent({prompt:'child:one',background:true}); [a,b,c]"
+            if self.case == "resume_counters":
+                return (foreground + launches + foreground +
+                        "await tools.bash({command:'sleep 5'}); [a,b]")
+            return foreground + launches + "[a,b]"
+        if self.case == "foreground_bash":
+            commands = ["sleep 5; echo slow-one", "sleep 1; echo quick", "sleep 5; echo slow-two"]
+            return "const results=[]; " + "; ".join(
+                "results.push(await tools.bash(" + json.dumps({"command": command}) + "))"
+                for command in commands) + "; results"
         if self.case == "child_bash":
             return "await tools.agent({prompt:'child:bash'})"
         if self.case == "run_failure":
@@ -167,6 +190,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if users[-1].startswith("Summarize the conversation above"):
             self.server.summary_seen.set()
             text = "s"
+        elif prompt == "child:foreground":
+            time.sleep(1.1)
+            text = "foreground complete"
         elif prompt == "child:one":
             self.server.child_gate.wait(15)
             text = "child complete"
@@ -179,10 +205,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if "resume" in users:
                 if not self.server.resume_launched:
                     code = "await " + bash("echo resumed")
+                    if self.server.case in ("resume_counters", "legacy_resume", "overflow_ids"):
+                        code = ("await tools.agent({prompt:'child:foreground'}); "
+                                "const a = await tools.agent({prompt:'child:one',background:true}); " +
+                                "const b = await " + bash("echo resumed") + "; [a,b]")
                     self.server.resume_launched = True
                 text = "resumed"
             elif step == 0:
                 code, text = self.server.first_code(), "started"
+            elif self.server.case in ("resume_counters", "legacy_resume") and step == 1:
+                self.server.model_gate.wait(30)
             elif self.server.case in ("boundary", "compact") and step == 1:
                 code, text = "42", "first continued step"
             elif self.server.case in ("boundary", "compact") and step == 2:
@@ -369,6 +401,15 @@ class BackgroundBashTests:
         self.assertEqual(small, {"path": "small.txt", "added": 1, "removed": 0,
                                  "created": True, "diff": "+tail\n"})
         self.assertTrue((self.cwd / "large.txt").read_text().endswith("FINAL\n"))
+    def assert_progress_ids(self, events, expected):
+        progress = [e["progress"] for e in events if "progress" in e]
+        self.assertEqual({p["id"] for p in progress}, set(expected), progress)
+        for p in progress:
+            self.assertNotIn("agent", p)
+            self.assertNotIn("background_id", p)
+            self.assertIsInstance(p["id"], str)
+            self.assertIs(type(p["background"]), bool)
+            self.assertEqual((p["kind"], p["background"]), expected[p["id"]])
 
     def test_no_run_wait_and_result_metadata(self):
         mock = self.mock("basic")
@@ -495,7 +536,33 @@ class BackgroundBashTests:
                              for m in mock.observed()[-1]["messages"]), 8)
         self.assert_accounting(mock, events)
 
-    def test_mixed_agent_and_bash_share_id_counter(self):
+    def test_ids_beyond_timing_capacity_survive_resume(self):
+        mock = self.mock("overflow_ids")
+        events = self.finish(self.start())
+        rows = self.log(events)
+        step = next(r for r in rows if r.get("calls_omitted"))
+        self.assertEqual((len(step["calls"]), step["calls_omitted"]), (200, 2))
+        self.assertTrue(all("id" not in c for c in step["calls"]))
+        self.assertEqual(step["task_ids"], {"agent": 1, "bash": 1})
+        self.assert_progress_ids(events, {"a1": ("agent", False), "b1": ("bash", False)})
+        mock.child_gate.set()
+        resumed = self.finish(self.start("--resume", events[0]["start"]["session_id"], "resume"))
+        self.assert_progress_ids(resumed, {"a2": ("agent", False), "a3": ("agent", True), "b2": ("bash", True)})
+        lifecycle = [e["background"] for e in resumed if e.get("background", {}).get("state") == "started"]
+        self.assertEqual({e["id"] for e in lifecycle}, {"a3", "b2"})
+
+    def test_failed_run_flushes_frontend_cancellation_before_run_end(self):
+        self.mock("foreground_cancel")
+        events = self.finish(self.start())
+        updates = [(i, e["progress"]) for i, e in enumerate(events)
+                   if e.get("progress", {}).get("prompt") == "sleep 30"]
+        self.assertTrue(updates)
+        self.assertEqual(updates[-1][1]["state"], "canceled", updates)
+        end_index = next(i for i, e in enumerate(events) if "run_end" in e)
+        self.assertLess(updates[-1][0], end_index)
+        self.assertFalse(events[end_index]["run_end"]["ok"])
+
+    def test_foreground_and_background_agents_share_ids_bash_is_independent(self):
         mock = self.mock("mixed")
         process = self.start()
         wait_for(lambda: (self.cwd / "worker.started").exists())
@@ -503,10 +570,130 @@ class BackgroundBashTests:
         self.release()
         events = self.finish(process)
         first = next(e["run_end"]["output"] for e in events if "run_end" in e)
-        self.assertEqual(json.loads(first.removeprefix("result: ")), [{"id": "a1"}, {"id": "b2"}])
+        self.assertEqual(json.loads(first.removeprefix("result: ")), [{"id": "a2"}, {"id": "b1"}])
         lifecycle = [e["background"] for e in events if e.get("background", {}).get("state") == "started"]
         self.assertEqual([(e["id"], e["kind"]) for e in lifecycle], [("a1", "agent"), ("b2", "bash")])
         self.assert_accounting(mock, events)
+        self.assertEqual([(e["id"], e["kind"]) for e in lifecycle], [("a2", "agent"), ("b1", "bash")])
+        calls = [c for r in self.log(events) for c in r.get("calls", [])]
+        self.assertEqual([(c["name"], c["id"], c.get("background", False)) for c in calls],
+                         [("agent", "a1", False), ("agent", "a2", True), ("bash", "b1", True)])
+        self.assert_progress_ids(events, {"a1": ("agent", False), "a2": ("agent", True), "b1": ("bash", True)})
+        messages = mock.observed()[-1]["messages"]
+        self.completion(messages, "b1")
+        self.assertTrue(any(content(m).startswith("[background agent a2 finished]\n") for m in messages))
+        logged = [m for r in self.log(events) for m in r.get("messages", [])
+                  if m.get("source") == "background"]
+        self.assertEqual({m["background_id"] for m in logged}, {"a2", "b1"})
+
+    def test_foreground_bash_delays_progress_and_keeps_two_completed_ids(self):
+        self.mock("foreground_bash")
+        started = time.monotonic()
+        process = self.start()
+        pending, events, updates = b"", [], []
+        deadline = started + 25
+        fd = process.stdout.fileno()
+        while time.monotonic() < deadline:
+            if not select.select([fd], [], [], .1)[0]:
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            pending += chunk
+            while b"\n" in pending:
+                line, pending = pending.split(b"\n", 1)
+                event = json.loads(line)
+                events.append(event)
+                if "progress" in event:
+                    p = event["progress"]
+                    updates.append((time.monotonic() - started, p))
+                    if p["state"] == "working":
+                        self.assertIsNone(process.poll(), "progress was buffered until exit")
+        else:
+            self.fail("foreground bash did not finish within 25 seconds")
+        output, error = process.communicate(timeout=5)
+        self.assertEqual((process.returncode, output, error, pending), (0, "", "", b""))
+        self.assertIn("end", events[-1])
+        self.assertFalse(any("background" in e for e in events))
+        self.assert_progress_ids(events, {"b1": ("bash", False), "b2": ("bash", False)})
+        completed = {}
+        for id in ("b1", "b2"):
+            samples = [(stamp, p) for stamp, p in updates if p["id"] == id]
+            elapsed = [p["elapsed_ms"] for _, p in samples]
+            self.assertGreaterEqual(len(samples), 2, samples)
+            self.assertGreaterEqual(elapsed[0], 3000, samples)
+            self.assertEqual(elapsed, sorted(elapsed), samples)
+            self.assertGreater(elapsed[-1], elapsed[0], samples)
+            self.assertTrue(any(p["state"] == "working" for _, p in samples), samples)
+            self.assertEqual(samples[-1][1]["state"], "done", samples)
+            self.assertGreaterEqual(elapsed[-1], 4900, samples)
+            completed[id] = samples[-1]
+        self.assertGreaterEqual(updates[0][0], 2.8, updates)
+        self.assertLess(completed["b1"][0], next(stamp for stamp, p in updates if p["id"] == "b2"))
+        calls = [c for r in self.log(events) for c in r.get("calls", []) if c["name"] == "bash"]
+        self.assertEqual([c.get("id") for c in calls], ["b1", None, "b2"])
+        self.assertTrue(all(not c.get("background", False) for c in calls))
+        self.assertTrue(all(c["ok"] for c in calls))
+        for call in (calls[0], calls[2]):
+            self.assertLessEqual(abs(completed[call["id"]][1]["elapsed_ms"] -
+                                     (call["end_ms"] - call["start_ms"])), 500, call)
+        result = json.loads(next(e["run_end"]["output"] for e in events if "run_end" in e)
+                            .removeprefix("result: "))
+        self.assertEqual(result, [{"exit_code": 0, "output": text + "\n"}
+                                  for text in ("slow-one", "quick", "slow-two")])
+
+    def check_killed_parent_resumes_independent_counters(self, legacy=False):
+        mock = self.mock("legacy_resume" if legacy else "resume_counters")
+        process = self.start()
+        expected_calls = ["a1", "b1", "a2"] if legacy else ["a1", "a2", "b1", "a3", "b2"]
+
+        def persisted():
+            for path in (self.home / "sessions").glob("?" * 32 + ".jsonl"):
+                calls = [c for r in records(path) for c in r.get("calls", [])]
+                if [c.get("id") for c in calls] == expected_calls:
+                    return path
+            return None
+
+        root_log = wait_for(persisted, timeout=15)
+        wait_for(lambda: len(mock.observed()) == 2)
+        process.kill()
+        process.communicate(timeout=5)
+        self.release()
+        if legacy:
+            mapping = {"b1": "b2", "a2": "a3"}
+            rows = records(root_log)
+            rows[1:] = [json.loads(re.sub(r"\b(?:b1|a2)\b", lambda m: mapping[m[0]], json.dumps(row)))
+                        for row in rows[1:]]
+            for row in rows:
+                row.pop("task_ids", None)
+            root_log.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        before = len(records(root_log))
+        resumed = self.start("--resume", root_log.stem, "resume")
+        wait_for(lambda: any(r.get("background", {}).get("id") == "a5" and
+                             r["background"]["state"] == "started" for r in records(root_log)[before:]))
+        mock.child_gate.set()
+        events = self.finish(resumed)
+        self.assertEqual(events[0]["start"]["session_id"], root_log.stem)
+        lifecycle = [e["background"] for e in events if "background" in e]
+        lost = {e["id"] for e in lifecycle if e["state"] == "lost"}
+        self.assertEqual(lost, {"a1", "b2", "a3"} if legacy else {"a2", "b1"})
+        for state in ("started", "finished"):
+            self.assertEqual({e["id"] for e in lifecycle if e["state"] == state}, {"a5", "b3"})
+        calls = [c for r in records(root_log)[before:] for c in r.get("calls", [])]
+        self.assertEqual([(c["id"], c.get("background", False)) for c in calls],
+                         [("a4", False), ("a5", True), ("b3", True)])
+        self.assert_progress_ids(events, {"a4": ("agent", False), "a5": ("agent", True), "b3": ("bash", True)})
+        messages = mock.observed()[-1]["messages"]
+        self.completion(messages, "b3")
+        self.assertTrue(any(content(m).startswith("[background agent a5 finished]\n") for m in messages))
+        self.assertFalse(any(content(m).startswith(f"[background {kind} {id} finished]\n")
+                             for m in messages for id in lost for kind in ("agent", "bash")))
+
+    def test_killed_parent_resumes_max_ids_including_foreground_calls(self):
+        self.check_killed_parent_resumes_independent_counters()
+
+    def test_killed_parent_resumes_legacy_shared_counter_log(self):
+        self.check_killed_parent_resumes_independent_counters(legacy=True)
 
     def test_subagent_can_launch_background_bash(self):
         mock = self.mock("child_bash")

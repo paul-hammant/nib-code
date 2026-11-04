@@ -73,7 +73,8 @@ class Mock(http.server.ThreadingHTTPServer):
             return "await " + agent("long", background=True)
         if self.case == "timeout":
             return "await " + agent("worker", background=True, timeout_ms=2200)
-        return "await Promise.all([" + agent("one", background=True) + ", " + agent("two", background=True) + "])"
+        return ("const one = await " + agent("one", background=True) +
+                "; const two = await " + agent("two", background=True) + "; [one, two]")
 
 
 class Handler(http.server.BaseHTTPRequestHandler):

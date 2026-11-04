@@ -198,7 +198,8 @@ pub const Session = struct {
         const calls_path = try std.fmt.allocPrint(a, "{s}/{s}.calls.jsonl", .{ directory, s.id });
         s.recorder = sandbox.Recorder.init(gpa, io, calls_path, recording);
         s.tools.session_id = s.id;
-        s.tools.background.next_id = s.log.next_background_id;
+        s.tools.progress.next_agent_id = s.log.next_agent_id;
+        s.tools.progress.next_bash_id = s.log.next_bash_id;
         for (s.log.lost_background) |lost| {
             const id = lost.id;
             const text = try std.fmt.allocPrint(gpa, "[background {s} {s} lost: process ended]", .{ @tagName(lost.kind), id });
@@ -221,7 +222,7 @@ pub const Session = struct {
 
     pub fn deinit(s: *Session) void {
         s.tools.background.stop(s.gpa);
-        s.tools.progress.clear(s.gpa);
+        s.tools.progress.deinit(s.gpa);
         s.inbox.batch.deinit(s.gpa);
         s.tools.discardChanges(s.gpa);
         s.tools.file_state.deinit(s.gpa);
@@ -232,7 +233,7 @@ pub const Session = struct {
     }
 
     fn commit(s: *Session, from: usize, messages: []const provider.Message, tokens: u64, cwd: ?[]const u8) !void {
-        try s.log.commit(s.io, s.gpa, &s.history, &s.context_tokens, .{ .from = from, .messages = messages, .context_tokens = tokens, .cwd = cwd, .provider = if (cwd != null) s.cfg.provider else null, .model = s.cfg.model, .parent_session_id = if (cwd != null) s.parent_session_id else null });
+        try s.log.commit(s.io, s.gpa, &s.history, &s.context_tokens, .{ .from = from, .messages = messages, .context_tokens = tokens, .task_ids = s.tools.progress.highWater(s.io), .cwd = cwd, .provider = if (cwd != null) s.cfg.provider else null, .model = s.cfg.model, .parent_session_id = if (cwd != null) s.parent_session_id else null });
     }
 
     pub const Compaction = enum { compacted, too_few_steps, ineffective };
@@ -319,6 +320,7 @@ pub const Session = struct {
         }
         defer {
             s.tools.background.stop(s.gpa);
+            s.tools.progress.drain(s.io) catch {};
             s.usage.add(s.tools.takeUsage());
             s.summary.?.usage = s.usage;
             s.tools.usage_sink = null;
@@ -524,6 +526,7 @@ pub const Session = struct {
                 .run_ms = run_ms,
                 .calls = run_timing.entries[0..run_timing.count],
                 .calls_omitted = run_timing.omitted,
+                .task_ids = s.tools.progress.highWater(s.io),
                 .tool_bytes = run_timing.tool_bytes,
                 .output_bytes = run_timing.output_bytes + background_output_bytes,
                 .run_results = run_results.items,
@@ -640,6 +643,7 @@ pub const Session = struct {
 
     fn runTimed(s: *Session, code: []const u8, cancel: ?*const std.atomic.Value(bool), timing: ?*sandbox.RunTiming) !Ran {
         defer s.usage.add(s.tools.takeUsage());
+        defer s.tools.progress.drain(s.io) catch {};
         if (!s.tools.background.pending(s.io)) s.tools.progress.clear(s.gpa);
         s.tools.run_id += 1;
         s.tools.discardChanges(s.gpa);

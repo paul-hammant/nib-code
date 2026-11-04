@@ -458,9 +458,14 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         assert not pending
         assert live.wait(timeout=5) == 0, live.stderr.read()
         assert len(updates) >= 6, updates
-        for agent in (1, 2):
-            samples = [(stamp, p) for stamp, p in updates if p["agent"] == agent]
-            assert samples and all(b[0] - a[0] >= .95 for a, b in zip(samples, samples[1:])), samples
+        assert {p["id"] for _, p in updates} == {"a1", "a2"}, updates
+        assert all(p["background"] is False and "agent" not in p and "background_id" not in p
+                   for _, p in updates), updates
+        for agent in ("a1", "a2"):
+            samples = [(stamp, p) for stamp, p in updates if p["id"] == agent]
+            assert samples and all(b[0] - a[0] >= .95 for a, b in zip(samples, samples[1:])
+                                   if b[1]["state"] in ("queued", "working")), samples
+            assert samples[-1][1]["state"] == "done", samples
             assert {p["prompt"] for _, p in samples} <= {"child progress alpha", "child progress beta"}
             assert any(p["step"] >= 3 for _, p in samples), samples
             assert any("edit" in p["tools"] and p["files"] == ["progress-" + p["prompt"].split()[-1] + ".txt"]

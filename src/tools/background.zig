@@ -9,7 +9,6 @@ const output = @import("../session/output.zig");
 pub const Background = struct {
     mutex: std.Io.Mutex = .init,
     jobs: std.ArrayList(*Job) = .empty,
-    next_id: u64 = 1,
     cancel: std.atomic.Value(bool) = .init(false),
     inbox: ?*Inbox = null,
     log: ?*Log = null,
@@ -25,9 +24,7 @@ pub const Background = struct {
         prompt: []u8,
         id: []u8,
         kind: BackgroundEvent.Kind,
-        progress: usize,
         run: usize,
-        started: std.Io.Clock.Timestamp,
         thread: ?std.Thread = null,
         done: std.atomic.Value(bool) = .init(false),
         announced: bool = false,
@@ -51,8 +48,8 @@ pub const Background = struct {
             const gpa = job.gpa;
             const t = job.t;
             const result = switch (job.kind) {
-                .agent => agent.execute(t, gpa, job.args, &t.background.cancel, job.progress, job.run, job.id),
-                .bash => @import("bash.zig").executeBackground(t, gpa, job.args, &t.background.cancel, .{ .agent = job.progress, .run = job.run, .background_id = job.id, .kind = .bash, .prompt = "" }),
+                .agent => agent.execute(t, gpa, job.args, &t.background.cancel, job.id, job.run, true),
+                .bash => @import("bash.zig").executeBackground(t, gpa, job.args, &t.background.cancel, .{ .id = job.id, .run = job.run, .background = true, .kind = .bash, .prompt = "" }),
             } catch |err| try @import("../tools.zig").fail(gpa, "{s}", .{@errorName(err)});
             defer switch (result) {
                 inline else => |bytes| gpa.free(bytes),
@@ -72,7 +69,6 @@ pub const Background = struct {
                 .agent => parsed.value.object.get("ok").?.bool,
                 .bash => if (parsed.value.object.get("exit_code")) |code| code == .integer and code.integer == 0 else false,
             };
-            if (job.kind == .bash) try t.progress.update(gpa, t.io, .{ .agent = job.progress, .run = job.run, .kind = .bash, .background_id = job.id, .prompt = job.prompt, .elapsed_ms = @intCast(@max(job.started.untilNow(t.io).raw.toMilliseconds(), 0)), .state = if (ok) .done else .failed });
             const prefix = try std.fmt.allocPrint(gpa, "[background {s} {s} finished]\n", .{ @tagName(job.kind), job.id });
             defer gpa.free(prefix);
             const formatted = try output.formatMessage(gpa, prefix, json);
@@ -90,7 +86,8 @@ pub const Background = struct {
         const log = bg.log orelse return error.BackgroundUnavailable;
         const job = try gpa.create(Job);
         errdefer gpa.destroy(job);
-        const id = try std.fmt.allocPrint(gpa, "{s}{d}", .{ if (kind == .agent) "a" else "b", bg.next_id });
+        const progress_id = try t.progress.add(gpa, t.io, kind, prompt, t.run_id, true);
+        const id = try gpa.dupe(u8, progress_id);
         errdefer gpa.free(id);
         const copy = try gpa.dupe(u8, args);
         errdefer gpa.free(copy);
@@ -99,16 +96,15 @@ pub const Background = struct {
         const result = try std.json.Stringify.valueAlloc(gpa, .{ .id = id }, .{});
         errdefer gpa.free(result);
         try bg.jobs.ensureUnusedCapacity(gpa, 1);
-        const progress = try t.progress.add(gpa, t.io, prompt);
-        job.* = .{ .t = t, .gpa = gpa, .args = copy, .prompt = prompt_copy, .id = id, .kind = kind, .progress = progress, .run = t.run_id, .started = .now(t.io, .awake) };
-        try t.progress.update(gpa, t.io, .{ .agent = progress, .run = t.run_id, .kind = kind, .background_id = id, .prompt = prompt, .state = .queued });
+        job.* = .{ .t = t, .gpa = gpa, .args = copy, .prompt = prompt_copy, .id = id, .kind = kind, .run = t.run_id };
         try log.background(t.io, gpa, .{ .id = id, .kind = kind, .state = .started }, bg.turn_step);
-        bg.next_id += 1;
+        @import("../sandbox.zig").tool_identity = .{ .id = progress_id, .background = true };
         bg.jobs.appendAssumeCapacity(job);
         errdefer _ = bg.jobs.pop();
         if (kind == .bash) bg.bash_active += 1;
         job.thread = std.Thread.spawn(.{}, Job.work, .{job}) catch |err| {
             if (kind == .bash) bg.bash_active -= 1;
+            try t.progress.update(gpa, t.io, .{ .id = id, .run = job.run, .kind = kind, .background = true, .prompt = prompt, .state = .failed });
             try job.deliver(.{ .err = @constCast(@errorName(err)) });
             job.done.store(true, .release);
             return result;
@@ -209,9 +205,7 @@ test "background worker failures are reported once and stop being pending" {
             .prompt = @constCast("test"),
             .id = @constCast(id),
             .kind = kind,
-            .progress = 0,
             .run = 1,
-            .started = .now(testing.io, .awake),
         };
         try t.background.jobs.append(testing.allocator, job);
     }
@@ -246,4 +240,44 @@ test "background worker failures are reported once and stop being pending" {
     try t.background.poll(testing.io, &sink, Sink.emit);
     try t.background.poll(testing.io, &sink, Sink.emit);
     try testing.expectEqual(@as(usize, 2), sink.starts);
+}
+
+test "background starts share per-kind foreground counters and leave terminal progress" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/session.jsonl", .{tmp.sub_path});
+    defer testing.allocator.free(path);
+    var log = try Log.create(testing.io, path);
+    defer log.close(testing.io);
+    var inbox: Inbox = .{};
+    defer inbox.batch.deinit(testing.allocator);
+    var t: Tools = .{ .io = testing.io, .home = "/home/nobody", .cfg = .{ .model = "m", .base_url = "", .api_key = "" } };
+    defer t.progress.deinit(testing.allocator);
+    defer t.background.stop(testing.allocator);
+    t.background.inbox = &inbox;
+    t.background.log = &log;
+    _ = try t.progress.add(testing.allocator, testing.io, .agent, "foreground", 1, false);
+    var timing: @import("../sandbox.zig").RunTiming = .init(testing.io, .now(testing.io, .awake));
+    var host = t.host();
+    host.timing = &timing;
+    const result = try @import("../sandbox.zig").eval(testing.allocator, testing.io, "[await tools.bash({command: 'true', background: true}), await tools.agent({prompt: 'child', background: true})]", .{}, host, null);
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.ok);
+    try testing.expectEqualStrings("[{\"id\":\"b1\"},{\"id\":\"a2\"}]", result.text);
+    for (t.background.jobs.items) |job| {
+        if (job.thread) |thread| thread.join();
+        job.thread = null;
+        try testing.expect(job.done.load(.acquire));
+    }
+    try testing.expectEqual(@as(usize, 2), timing.count);
+    try testing.expectEqualStrings("b1", timing.entries[0].id.?);
+    try testing.expectEqualStrings("a2", timing.entries[1].id.?);
+    for (timing.entries[0..timing.count]) |call| try testing.expectEqual(@as(?bool, true), call.background);
+    try testing.expectEqualStrings("a1", t.progress.slots.items[0].value.id);
+    try testing.expectEqual(.done, t.progress.slots.items[1].value.state);
+    try testing.expectEqual(.failed, t.progress.slots.items[2].value.state);
+    try testing.expectEqual(@as(usize, 2), inbox.batch.items.items.len);
+    t.background.stop(testing.allocator);
+    try testing.expectEqualStrings("b1", timing.entries[0].id.?);
 }

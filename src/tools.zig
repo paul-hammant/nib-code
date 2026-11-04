@@ -213,15 +213,7 @@ pub const Tools = struct {
     pub fn host(t: *Tools) sandbox.Host {
         t.cancel.store(false, .release);
         t.llm_calls.store(0, .monotonic);
-        return .{ .ctx = t, .names = t.api().names, .call = call, .cancel = &t.cancel, .poll = poll, .admit = admit, .backgroundId = backgroundId };
-    }
-
-    fn backgroundId(ctx: *anyopaque, id: []const u8) ?[]const u8 {
-        const t: *Tools = @ptrCast(@alignCast(ctx));
-        t.background.mutex.lockUncancelable(t.io);
-        defer t.background.mutex.unlock(t.io);
-        for (t.background.jobs.items) |job| if (std.mem.eql(u8, job.id, id)) return job.id;
-        return null;
+        return .{ .ctx = t, .names = t.api().names, .call = call, .cancel = &t.cancel, .poll = poll, .admit = admit };
     }
 
     fn admit(ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8) !?[]u8 {

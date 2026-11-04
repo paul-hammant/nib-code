@@ -3,12 +3,14 @@ const provider = @import("../provider.zig");
 const Change = @import("../tools/diff.zig").Change;
 const Summary = @import("tool_summary.zig").Summary;
 
+pub const TaskIds = struct { agent: u64 = 0, bash: u64 = 0 };
+
 pub const Progress = struct {
-    agent: usize,
+    id: []const u8,
     run: usize = 0,
     kind: Background.Kind = .agent,
     elapsed_ms: u64 = 0,
-    background_id: ?[]const u8 = null,
+    background: bool = false,
     prompt: []const u8,
     state: enum { queued, working, done, failed, canceled, timed_out } = .working,
     step: u32 = 0,
@@ -23,13 +25,13 @@ pub const Progress = struct {
         errdefer freeStrings(gpa, used);
         const files = try cloneStrings(gpa, p.files);
         errdefer freeStrings(gpa, files);
-        const background_id = if (p.background_id) |id| try gpa.dupe(u8, id) else null;
-        return .{ .kind = p.kind, .elapsed_ms = p.elapsed_ms, .run = p.run, .background_id = background_id, .agent = p.agent, .prompt = prompt, .state = p.state, .step = p.step, .tools = used, .files = files, .usage = p.usage };
+        const id = try gpa.dupe(u8, p.id);
+        return .{ .kind = p.kind, .elapsed_ms = p.elapsed_ms, .run = p.run, .background = p.background, .id = id, .prompt = prompt, .state = p.state, .step = p.step, .tools = used, .files = files, .usage = p.usage };
     }
 
     pub fn deinit(p: *Progress, gpa: std.mem.Allocator) void {
         gpa.free(p.prompt);
-        if (p.background_id) |id| gpa.free(id);
+        gpa.free(p.id);
         freeStrings(gpa, p.tools);
         freeStrings(gpa, p.files);
         p.* = undefined;
