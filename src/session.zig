@@ -148,7 +148,7 @@ pub const Session = struct {
             .client = client,
             .cfg = cfg,
             .arena = .init(gpa),
-            .tools = .{ .io = io, .home = options.user_home, .depth = options.depth, .environ = options.environ, .cfg = cfg, .track_changes = true },
+            .tools = .{ .io = io, .home = options.user_home, .data_home = options.home, .depth = options.depth, .environ = options.environ, .cfg = cfg, .track_changes = true },
             .parent_session_id = options.parent_session_id,
             .options = options,
         };
@@ -222,6 +222,7 @@ pub const Session = struct {
         s.tools.progress.clear(s.gpa);
         s.inbox.batch.deinit(s.gpa);
         s.tools.discardChanges(s.gpa);
+        s.tools.file_state.deinit(s.gpa);
         if (s.recorder) |*recorder| recorder.deinit();
         s.log.close(s.io);
         s.history.deinit(s.gpa);
@@ -792,7 +793,10 @@ test "json-escape patch example survives JS parsing verbatim" {
     const example = text[std.mem.indexOf(u8, text, marker).? + marker.len ..];
     const code = try std.fmt.allocPrint(std.testing.allocator, "await tools.write({{path: '.zig-cache/tmp/{s}/f', content: {s}}})", .{ tmp.sub_path, example });
     defer std.testing.allocator.free(code);
-    var t: tools.Tools = .{ .io = std.testing.io, .home = "/home/nobody" };
+    const home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(home);
+    var t: tools.Tools = .{ .io = std.testing.io, .home = home };
+    defer t.file_state.deinit(std.testing.allocator);
     const result = try sandbox.eval(std.testing.allocator, std.testing.io, code, .{}, t.host(), null);
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(result.ok);
