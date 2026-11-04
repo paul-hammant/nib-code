@@ -30,11 +30,13 @@ def replay(path):
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if record.get("repair"):
+        if record.get("repair") or record.get("agent_session"):
             continue
         messages = [dict(message) for message in record["messages"]]
         for message in messages:
             message.pop("step_effort", None)
+            message.pop("tool_summary", None)
+            message.pop("step_calls_omitted", None)
             if "reasoning" in message:
                 reasoning = message.pop("reasoning")
                 assert reasoning["provider"] == "chat_completions"
@@ -260,16 +262,16 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         other = tmp / "other"
         other.mkdir()
         ask("no session", "-c", workdir=other, ok=False)
-        ask("one", workdir=other, window="4096")
-        result = ask("two", "--continue", workdir=other, window="4096")
+        ask("one", workdir=other, window="4352")
+        result = ask("two", "--continue", workdir=other, window="4352")
         assert b"compacted context:" in result.stderr
         compact_log = next(p for p in (tmp / "nib/sessions").glob("[0-9a-f]" * 32 + ".jsonl") if p != log)
         compacted, records = replay(compact_log)
         replacements = [r for r in records[1:] if r["messages"][0].get("content", "").startswith("Earlier session summary:")]
         assert len(replacements) == 1
-        assert replacements[0]["context_tokens"] <= 2048
+        assert replacements[0]["context_tokens"] <= 2176
         assert compacted[1]["content"].startswith("Earlier session summary:")
-        ask("three", "-c", workdir=other, window="4096")
+        ask("three", "-c", workdir=other, window="4352")
         assert read_requests(requests_path)[-2]["messages"] == compacted + [{"role": "user", "content": "three"}]
         def events(result):
             assert result.stderr == b"", result.stderr
@@ -277,6 +279,21 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
             parsed = [json.loads(line) for line in result.stdout.splitlines()]
             assert all(len(event) == 1 for event in parsed), parsed
             return parsed
+
+        summary_home = tmp / "summary-home"
+        (cwd / "summary.txt").write_text("old")
+        for prompt, expected in [
+                ("run_summary_test", {"counts": [{"name": "edit", "count": 1}, {"name": "bash", "count": 1}], "omitted": 0}),
+                ("run_summary_overflow", {"counts": [{"name": "read", "count": 200}], "omitted": 3})]:
+            summary_events = events(ask("--json", prompt, overrides={"NIB_HOME": str(summary_home)}))
+            run_end = next(event["run_end"] for event in summary_events if "run_end" in event)
+            assert run_end["tool_summary"] == expected, run_end
+            summary_id = summary_events[0]["start"]["session_id"]
+            summary_records = replay(summary_home / "sessions" / f"{summary_id}.jsonl")[1]
+            step = next(record for record in summary_records if record.get("calls"))
+            assert step["run_results"][0]["calls_omitted"] == expected["omitted"], step
+            assert step["messages"][-1]["tool_summary"] == expected, step
+        print("Run summary E2E passed: source text ignored, actual calls and bounded overflow")
 
         streamed = events(ask("--json", "-", input=b"stdin prompt\nsecond line"))
         session_id = streamed[0]["start"]["session_id"]
@@ -318,11 +335,26 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         assert missing["message"] == "MissingPrompt" and "timing" not in missing
         json_cwd = tmp / "json"
         json_cwd.mkdir()
-        compact_json = events(ask("json compact", "--json", workdir=json_cwd, window="4096"))
+        compact_json = events(ask("json compact", "--json", workdir=json_cwd, window="4352"))
         assert any("notice" in e for e in compact_json)
         assert [e["step"]["n"] for e in compact_json if "step" in e] == list(
             range(1, compact_json[-1]["end"]["steps"] + 1)), compact_json
         print("JSON E2E passed: NDJSON events, stdin, final text/usage/steps, resume, errors and notices")
+        for case, expected_ok, expected_output in (
+                ("run_drain_read_failure", False, "FileNotFound"),
+                ("run_drain_reject_continuation", False, "original rejection"),
+                ("run_drain_fulfill_continuation", True, "fulfilled")):
+            drain_cwd = tmp / case
+            drain_cwd.mkdir()
+            drained = events(ask("--json", case, workdir=drain_cwd,
+                                 overrides={"NIB_HOME": str(tmp / (case + "-home"))}))
+            runs = [event["run_end"] for event in drained if "run_end" in event]
+            assert len(runs) == 1, drained
+            assert runs[0]["ok"] is expected_ok, runs[0]
+            assert expected_output in runs[0]["output"], runs[0]
+            assert "stopped before completion" not in runs[0]["output"], runs[0]
+            assert (drain_cwd / "marker").read_text() == "finished\n", runs[0]
+        print("Run drain E2E passed: failed read leaves sibling bash running; reject/fulfill drain continuation calls")
         timing_home = tmp / "timing-home"
         timed = events(ask("--json", "timing", overrides={"NIB_HOME": str(timing_home)}))
         timed_id = timed[0]["start"]["session_id"]
@@ -357,6 +389,8 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
             assert "async agent({" not in request["messages"][0]["content"]
         run_output = next(e["run_end"]["output"] for e in delegated if "run_end" in e)
         returned = json.loads(run_output.removeprefix("result: "))
+        assert {child["id"] for child in returned} == {"a1", "a2"}, returned
+        assert all("session" not in child for child in returned), returned
         for child in returned:
             result = json.loads(child["text"].split("result: ", 1)[1])
             assert result["agent"] == "undefined" and "agent" not in result["keys"]
@@ -383,6 +417,7 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         failed_result = json.loads(failed_run["output"].removeprefix("result: "))
         assert isinstance(failed_result, dict), failed_result
         assert failed_result["ok"] is False and "HTTP 400" in failed_result["error"], failed_result
+        assert failed_result["id"] == "a1" and "session" not in failed_result, failed_result
         failed_child = failed_events[-1]["end"]
         assert "HTTP 400" in failed_child["text"]
         assert failed_child["usage"] == {"prompt_tokens": 9900, "completion_tokens": 50, "prompt_cache_hit_tokens": 256}
@@ -426,9 +461,14 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         assert not pending
         assert live.wait(timeout=5) == 0, live.stderr.read()
         assert len(updates) >= 6, updates
-        for agent in (1, 2):
-            samples = [(stamp, p) for stamp, p in updates if p["agent"] == agent]
-            assert samples and all(b[0] - a[0] >= .95 for a, b in zip(samples, samples[1:])), samples
+        assert {p["id"] for _, p in updates} == {"a1", "a2"}, updates
+        assert all(p["background"] is False and "agent" not in p and "background_id" not in p
+                   for _, p in updates), updates
+        for agent in ("a1", "a2"):
+            samples = [(stamp, p) for stamp, p in updates if p["id"] == agent]
+            assert samples and all(b[0] - a[0] >= .95 for a, b in zip(samples, samples[1:])
+                                   if b[1]["state"] in ("queued", "working")), samples
+            assert samples[-1][1]["state"] == "done", samples
             assert {p["prompt"] for _, p in samples} <= {"child progress alpha", "child progress beta"}
             assert any(p["step"] >= 3 for _, p in samples), samples
             assert any("edit" in p["tools"] and p["files"] == ["progress-" + p["prompt"].split()[-1] + ".txt"]
@@ -439,6 +479,8 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         assert final["usage"] == dict(prompt_tokens=33000, completion_tokens=170, prompt_cache_hit_tokens=832), final
         output = json.loads(next(e["run_end"]["output"] for e in seen if "run_end" in e).removeprefix("result: "))
         assert len(output) == 2
+        assert {child["id"] for child in output} == {p["id"] for _, p in updates}, (output, updates)
+        assert all("session" not in child for child in output), output
         for child in output:
             assert child["usage"] == dict(prompt_tokens=13200, completion_tokens=70, prompt_cache_hit_tokens=320), child
             assert "exit_code" in child["text"]
@@ -451,16 +493,21 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         assert timeout_run["ok"], timeout_run
         timeout_result = json.loads(timeout_run["output"].removeprefix("result: "))
         assert timeout_result["ok"] is False, timeout_result
-        assert set(timeout_result) == {"ok", "error", "text", "usage", "changes"}, timeout_result
+        assert set(timeout_result) == {"id", "ok", "error", "text", "usage", "changes"}, timeout_result
+        assert timeout_result["id"] == "a1", timeout_result
         timeout_message = timeout_result["error"]
-        match = re.search(r"stopped due to timeout after (\d+) ms \(limit 1600 ms\); child session id: ([0-9a-f]{32})", timeout_message)
+        match = re.search(r"stopped due to timeout after (\d+) ms \(limit 1600 ms\)", timeout_message)
         assert match and 1600 <= int(match[1]) < 4500, timeout_message
         assert "Files it changed may be incomplete; inspect them" in timeout_message, timeout_message
         assert partial_path.read_bytes() == b"partial"
         timed_pid = int(Path(str(partial_path) + ".pid").read_text())
         status = Path(f"/proc/{timed_pid}/stat")
         assert not status.exists() or status.read_text().split()[2] == "Z", status.read_text()
-        child_log = tmp / "nib/sessions" / f"{match[2]}.jsonl"
+        timeout_parent = timeout_events[0]["start"]["session_id"]
+        timeout_children = [p for p in (tmp / "nib/sessions").glob("[0-9a-f]" * 32 + ".jsonl")
+                            if replay(p)[1][0].get("parent_session_id") == timeout_parent]
+        assert len(timeout_children) == 1, timeout_children
+        child_log = timeout_children[0]
         child_history, _ = replay(child_log)
         assert child_history[-1]["content"].endswith("[interrupted: process terminated]"), child_history[-1]
         assert timeout_events[-1]["end"]["usage"]["prompt_tokens"] == 9900, timeout_events[-1]
@@ -471,7 +518,7 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         forced_result = json.loads(forced_run["output"].removeprefix("result: "))
         assert forced_result["ok"] is False, forced_result
         forced_message = forced_result["error"]
-        assert re.search(r"child session id: [0-9a-f]{32}", forced_message), forced_message
+        assert forced_result["id"] == "a1" and "session" not in forced_result, forced_result
         assert "stopped due to timeout" in forced_message and "may be incomplete" in forced_message, forced_message
         assert forced_timeout[-1]["end"]["usage"]["prompt_tokens"] == 9900, forced_timeout[-1]
         print("Subagent timeout E2E passed: explicit limit, elapsed time/id, incomplete-file warning, process cleanup and usage after forced termination")
@@ -566,11 +613,12 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         (cwd / "same.txt").write_text("x\n")
         edited = events(ask("--json", "edit_test"))
         end = next(e["run_end"] for e in edited if "run_end" in e)
-        assert end["changes"] == [{"path": "notes.txt", "added": 2, "removed": 0, "created": True, "diff": "+a\n+B\n"}], end
+        assert end["changes"] == [{"path": "notes.txt", "added": 3, "removed": 1, "created": True,
+                                   "diff": "+a\n+b\n…\n a\n-b\n+B\n"}], end
         (cwd / "notes.txt").write_text("a\nc\n")
         human = ask("edit_test")
-        assert b"changed notes.txt +1 \xe2\x88\x921" in human.stderr, human.stderr
-        print("Change E2E passed: edit/write changes per Run, diffed against the files before the Run, unchanged files omitted")
+        assert b"changed notes.txt +2 \xe2\x88\x922" in human.stderr, human.stderr
+        print("Change E2E passed: successful edit/write diffs accumulate per operation; unchanged calls are omitted")
 
         contents = ["你" * 16000, "x" * 48000]
         for name, content in zip(("bytes-a.txt", "bytes-b.txt"), contents):
@@ -683,7 +731,7 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         patches_home = tmp / "patches-home"
         ask("patch labels", overrides={"NIB_HOME": str(patches_home), "NIB_PATCHES_OFF": "all"})
         patches_header = replay(next((patches_home / "sessions").glob("[0-9a-f]" * 32 + ".jsonl")))[1][0]
-        patch_ids = re.findall(r'\.id = "([^"]+)"', (ROOT / "src/session.zig").read_text().split("fn patchLines", 1)[0])
+        patch_ids = re.findall(r'\.id = "([^"]+)"', (ROOT / "src/session/prompt.zig").read_text().split("fn patchLines", 1)[0])
         assert patches_header["patches_off"] == sorted(patch_ids), patches_header
         assert patches_header["system_sha"] != header["system_sha"]
         changed_base = patches_header["messages"][0]["content"].split(

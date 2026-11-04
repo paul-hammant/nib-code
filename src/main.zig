@@ -82,7 +82,7 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
     if (agent_input) {
         var input = std.Io.File.stdin().reader(init.io, &.{});
         const data = try input.interface.allocRemaining(init.arena.allocator(), .unlimited);
-        const envelope = try std.json.parseFromSliceLeaky(struct { prompt: []const u8, config: provider.Config }, init.arena.allocator(), data, .{});
+        const envelope = try std.json.parseFromSliceLeaky(@import("tools/agent/input.zig").Input, init.arena.allocator(), data, .{});
         cfg = envelope.config;
         prompt = envelope.prompt;
     } else {
@@ -177,6 +177,8 @@ fn onSignal(signal: std.posix.SIG) callconv(.c) void {
 
 fn errorMessage(err: anyerror) []const u8 {
     return switch (err) {
+        error.AgentSessionParentMismatch => "Cannot continue a session that is not a child of this parent session.",
+        error.SessionBusy => "Session is busy in another process; wait for its current task to finish.",
         error.InvalidSessionId => "Session ID must be exactly 32 lowercase hexadecimal characters.",
         error.InvalidReplayArguments => "Use nib replay <session-id> --run <step>:<run> [--script <file>] [--json], or nib replay <session-id> --all [--json].",
         error.ReplayMetadataNotFound => "No replay recording found for this Run; recording must be enabled when the original Run executes.",

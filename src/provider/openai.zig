@@ -1,6 +1,8 @@
 const std = @import("std");
 pub const default_model = "deepseek-flash";
 const sse = @import("sse.zig");
+const idle = @import("idle.zig");
+const body_reader = @import("body.zig");
 
 const Config = @import("../provider.zig").Config;
 const Message = @import("../provider.zig").Message;
@@ -56,6 +58,7 @@ pub fn stream(
     sink: Sink,
     cancel: *const std.atomic.Value(bool),
     detail: *?[]u8,
+    monitor: *idle.Monitor,
 ) !Reply {
     const url = try std.fmt.allocPrint(gpa, "{s}/chat/completions", .{cfg.base_url});
     defer gpa.free(url);
@@ -80,21 +83,26 @@ pub fn stream(
     try bw.writer.writeAll(body);
     try bw.end();
     try req.connection.?.flush();
+    monitor.attach(req.connection.?);
+    defer monitor.detach(req.connection.?);
 
     var response = try req.receiveHead(&.{});
 
     const buf = try gpa.alloc(u8, 64 * 1024);
     defer gpa.free(buf);
-    const reader = response.reader(buf);
+    const response_reader = response.reader(buf);
 
     if (response.head.status.class() != .success) {
         const status = @backingInt(response.head.status);
-        const text = reader.allocRemaining(gpa, .limited(64 * 1024)) catch "";
+        const text = response_reader.allocRemaining(gpa, .limited(64 * 1024)) catch "";
         defer if (text.len > 0) gpa.free(text);
         detail.* = try std.fmt.allocPrint(gpa, "HTTP {d}: {s}", .{ status, text });
         return if (status == 429 or status >= 500) error.HttpTransient else error.HttpStatus;
     }
 
+    var observed = try body_reader.Reader.init(gpa, response_reader, monitor, sink);
+    defer observed.deinit(gpa);
+    const reader = &observed.reader;
     var parser: sse.Parser = .{};
     defer parser.deinit(gpa);
     var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -118,7 +126,6 @@ pub fn stream(
             error.ReadFailed => return response.bodyErr() orelse err,
             else => return err,
         } orelse break;
-        try sink.received();
         const data = (try parser.feed(gpa, line)) orelse continue;
         if (std.mem.eql(u8, data, "[DONE]")) {
             done = true;

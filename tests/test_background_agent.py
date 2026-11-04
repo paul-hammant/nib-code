@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import select
 import signal
 import subprocess
 import sys
@@ -13,7 +14,9 @@ import threading
 import time
 import unittest
 
+from background_assertions import assert_background_bytes, root_records
 from mock_agent import USAGE, reply
+from change_helpers import call, checked_bash, wait_command
 from mock_llm_tool import content
 from test_agent import alive
 from test_interjections import Terminal, history
@@ -42,11 +45,19 @@ class Mock(http.server.ThreadingHTTPServer):
     def code(self):
         def agent(name, **options):
             return "tools.agent(" + json.dumps({"prompt": "child:" + name, **options}) + ")"
+        if self.case == "changes":
+            return ("await " + call("write", path="shared.txt", content="parent\nkeep\n") + "; " +
+                    "await " + agent("changes", background=True) + "; " +
+                    checked_bash(wait_command("child.written") +
+                                 " && printf 'external\nexternal-only\nkeep\n' > shared.txt && touch parent.written") +
+                    checked_bash(wait_command("child.run-ended")) + "'parent finished'")
         if self.case == "concurrency":
             return ("await " + agent("one", background=True) + "; await Promise.all([" +
                     agent("two") + ", " + agent("three", background=True) + "])")
-        if self.case in ("cancel", "limit"):
+        if self.case in ("cancel", "limit", "stop"):
             return "await " + agent("worker", background=True)
+        if self.case.startswith("injected_"):
+            return "await " + agent("one", background=True)
         if self.case == "fifo":
             return "await " + agent("one", background=True)
         if self.case == "boundary":
@@ -63,7 +74,8 @@ class Mock(http.server.ThreadingHTTPServer):
             return "await " + agent("long", background=True)
         if self.case == "timeout":
             return "await " + agent("worker", background=True, timeout_ms=2200)
-        return "await Promise.all([" + agent("one", background=True) + ", " + agent("two", background=True) + "])"
+        return ("const one = await " + agent("one", background=True) +
+                "; const two = await " + agent("two", background=True) + "; [one, two]")
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -78,6 +90,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with self.server.lock:
             step = sum(r["prompt"] == prompt for r in self.server.requests)
             self.server.requests.append(dict(prompt=prompt, body=body, messages=messages, step=step))
+        if (prompt == "initial" and self.server.case.startswith("injected_") and
+                any(content(m).startswith("[background ") for m in messages)):
+            if self.server.case == "injected_cancel":
+                self.server.parent_gate.wait(15)
+                return
+            data = json.dumps({"error": {"message": "injected request failed"}}).encode()
+            self.send_response(400)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         code, text = None, "complete"
         if prompt == "initial":
             if step == 0:
@@ -88,13 +111,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.server.parent_gate.wait(15)
                     if self.server.fifo_run:
                         code = "42"
-                if self.server.case == "limit":
+                if self.server.case in ("limit", "stop"):
                     wait_for(lambda: (self.server.cwd / "worker.started").exists())
+                    code = ("const stopped=await Promise.all([tools.stop({id:'a1'}),tools.stop({id:'a1'})]); "
+                            "const next=await tools.agent({prompt:'child:one'}); "
+                            "if(!next.ok)throw new Error('occupancy not released'); stopped"
+                            if self.server.case == "stop" else "42")
                 if self.server.case == "boundary":
                     code = "42"
             elif step == 2 and self.server.case == "boundary":
                 self.server.parent_gate.wait(15)
                 code, text = "console.log('z'.repeat(50000)); 43", "second continued step"
+        elif prompt == "child:changes":
+            if step == 0:
+                code = ("await " + call("write", path="shared.txt", content="child\nkeep\n") + "; " +
+                        "await " + call("write", path="child-only.txt", content="owned\n") + "; " +
+                        checked_bash("touch child.written; " + wait_command("parent.written")) +
+                        "'child wrote'")
+            else:
+                (self.server.cwd / "child.run-ended").touch()
+            text = "child complete"
         elif prompt == "child:error":
             data = json.dumps({"error": {"message": "background mock failure"}}).encode()
             self.send_response(400)
@@ -104,11 +140,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         elif prompt == "child:worker":
             if step == 0:
-                command = shlex.join([sys.executable, str(ROOT / "tests/mock_agent.py"), "--worker", "cancel", "worker"])
+                mode = "gate" if self.server.case == "limit" else "cancel"
+                command = shlex.join([sys.executable, str(ROOT / "tests/mock_agent.py"), "--worker", mode, "worker"])
                 code = "await tools.bash(" + json.dumps({"command": command}) + ")"
             text = "worker finished"
         elif prompt == "child:long":
-            text = "head:" + "z" * 50000 + ":tail"
+            text = "head:" + "中文🙂" * 2500 + ":tail"
         else:
             self.server.gates[prompt.split(":")[1]].wait(15)
             text = "done:" + prompt
@@ -152,8 +189,8 @@ class BackgroundTests:
         self.addCleanup(cleanup)
         return mock
 
-    def start(self):
-        process = subprocess.Popen([str(BIN), "ask", "--json", "initial"], cwd=self.cwd,
+    def start(self, *args):
+        process = subprocess.Popen([str(BIN), "ask", "--json", *(args or ("initial",))], cwd=self.cwd,
                                    env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
         def cleanup():
@@ -169,6 +206,7 @@ class BackgroundTests:
 
     def finish(self, process, ok=True):
         output, error = process.communicate(timeout=10)
+        output = getattr(process, "observed_output", b"").decode() + output
         self.assertEqual(error, "")
         self.assertEqual(process.returncode == 0, ok, output)
         events = [json.loads(line) for line in output.splitlines()]
@@ -178,8 +216,80 @@ class BackgroundTests:
     def log(self, events):
         return records(self.home / "sessions" / (events[0]["start"]["session_id"] + ".jsonl"))
 
+    def assert_accounting(self, mock, events=None):
+        log = self.log(events) if events is not None else root_records(self.home)
+        terminal = events[-1].get("end", events[-1].get("error")) if events is not None else None
+        return assert_background_bytes(self, log, mock.observed("initial"), terminal)
+
     def completions(self, messages):
         return [m for m in messages if content(m).startswith("[background agent ")]
+
+    def check_injected_request_aborted(self, cancel):
+        mock = self.mock("injected_cancel" if cancel else "injected_failure")
+        process = self.start()
+        wait_for(lambda: len(mock.observed("initial")) == 2)
+        mock.gates["one"].set()
+        wait_for(lambda: len(mock.observed("initial")) == 3)
+        self.assertTrue(any(content(m).startswith("[background ")
+                            for m in mock.observed("initial")[-1]["messages"]))
+        if cancel:
+            process.send_signal(signal.SIGINT)
+        events = self.finish(process, ok=False)
+        steps = self.assert_accounting(mock, events)
+        self.assertEqual(len(steps), 2)
+        self.assertEqual(steps[-1]["output_bytes"], 0)
+        self.assertEqual(events[-1]["error"]["timing"]["output_bytes"],
+                         sum(run["output_bytes"] for step in steps for run in step["run_results"]))
+
+    def test_failed_request_does_not_count_injected_result(self):
+        self.check_injected_request_aborted(cancel=False)
+
+    def test_canceled_request_does_not_count_injected_result(self):
+        self.check_injected_request_aborted(cancel=True)
+
+    def test_background_changes_are_isolated_from_parent_and_external_writes(self):
+        (self.cwd / "shared.txt").write_text("old\nkeep\n")
+        mock = self.mock("changes")
+        events = self.finish(self.start())
+        runs = [e["run_end"] for e in events if "run_end" in e]
+        self.assertEqual(len(runs), 1, runs)
+        self.assertTrue(runs[0]["ok"], runs)
+        self.assertEqual(runs[0]["changes"], [
+            {"path": "shared.txt", "added": 1, "removed": 1, "created": False,
+             "diff": "-old\n+parent\n keep\n"},
+        ])
+        completions = self.completions(mock.observed("initial")[-1]["messages"])
+        self.assertEqual(len(completions), 1, completions)
+        heading, encoded = content(completions[0]).split("\n", 1)
+        self.assertEqual(heading, "[background agent a1 finished]")
+        result = json.loads(encoded)
+        self.assertEqual(result["id"], "a1")
+        self.assertNotIn("session", result)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["changes"], [
+            {"path": "shared.txt", "added": 1, "removed": 1, "created": False},
+            {"path": "child-only.txt", "added": 1, "removed": 0, "created": True},
+        ])
+        self.assertTrue((self.cwd / "child.run-ended").exists())
+        self.assertEqual((self.cwd / "shared.txt").read_text(), "external\nexternal-only\nkeep\n")
+        self.assertEqual((self.cwd / "child-only.txt").read_text(), "owned\n")
+
+    def test_concurrent_stop_joins_background_agent_and_its_tools(self):
+        (self.home / "config.toml").write_text("[limits]\nagent_concurrency = 1\n")
+        mock = self.mock("stop")
+        mock.gates["one"].set()
+        events = self.finish(self.start())
+        runs = [e["run_end"] for e in events if "run_end" in e]
+        stopped = json.loads(runs[1]["output"].removeprefix("result: "))
+        self.assertEqual([item["id"] for item in stopped], ["a1", "a1"])
+        self.assertTrue(any(item["stopped"] for item in stopped))
+        completions = self.completions(mock.observed("initial")[-1]["messages"])
+        self.assertEqual(len(completions), 1)
+        result = json.loads(content(completions[0]).split("\n", 1)[1])
+        self.assertFalse(result["ok"])
+        pids = json.loads((self.cwd / "worker.started").read_text())
+        wait_for(lambda: all(not alive(pid) for pid in pids.values()))
+        self.assertEqual(len([e for e in events if e.get("background", {}).get("state") == "finished"]), 1)
 
     def test_returns_immediately_and_delivers_each_completion(self):
         mock = self.mock("basic")
@@ -205,7 +315,9 @@ class BackgroundTests:
             result = json.loads(encoded)
             self.assertTrue(result["ok"], result)
             self.assertEqual(result["changes"], [])
-            self.assertEqual(set(result), {"ok", "text", "changes"})
+            self.assertEqual(set(result), {"id", "ok", "text", "changes"})
+            self.assertEqual(result["id"], f"a{i}")
+            self.assertNotIn("session", result)
             self.assertNotIn("source", message)
             self.assertNotIn("background_id", message)
         progress = [e["background"] for e in events if "background" in e]
@@ -223,6 +335,7 @@ class BackgroundTests:
             body = request["body"]
             effort = body.get("reasoning", {}).get("effort") if self.provider == "codex" else body.get("reasoning_effort")
             self.assertEqual(effort, "high", body)
+        self.assert_accounting(mock, events)
 
     def child_logged(self, text):
         return any(text in path.read_text() for path in (self.home / "sessions").glob("?" * 32 + ".jsonl"))
@@ -234,10 +347,23 @@ class BackgroundTests:
         self.assertEqual([len(self.completions(r["messages"])) for r in mock.observed("initial")], [0, 0, 0])
         mock.gates["one"].set()
         wait_for(lambda: self.child_logged("done:child:one"))
+        fd, output = process.stdout.fileno(), b""
+        deadline = time.monotonic() + 5
+        seen = False
+        while time.monotonic() < deadline and not seen:
+            if select.select([fd], [], [], .1)[0]:
+                output += os.read(fd, 65536)
+                seen = any(event.get("progress", {}).get("state") == "done"
+                           and event["progress"].get("id") == "a1"
+                           for line in output.split(b"\n")[:-1] if line
+                           for event in [json.loads(line)])
+        process.observed_output = output
+        self.assertTrue(seen, output[-2000:])
         mock.parent_gate.set()
         events = self.finish(process)
         requests = mock.observed("initial")
-        self.assertEqual(len(requests), 4)
+        self.assertIn(len(requests), (4, 5))
+        self.assertTrue(all(not self.completions(r["messages"]) for r in requests[:-1]))
         self.assertEqual(len(self.completions(requests[-1]["messages"])), 1)
         runs = [e["run_end"] for e in events if "run_end" in e]
         self.assertEqual(len(runs), 3)
@@ -245,6 +371,7 @@ class BackgroundTests:
         self.assertLessEqual(len(runs[-1]["output"].encode()), 16 * 1024)
         logged = [m for r in self.log(events) for m in r.get("messages", []) if m.get("source") == "background" and m.get("background_kind") == "agent"]
         self.assertEqual([m["background_id"] for m in logged], ["a1"])
+        self.assert_accounting(mock, events)
 
     def test_launch_error_keeps_prior_agent(self):
         mock = self.mock("launch_error")
@@ -267,13 +394,14 @@ class BackgroundTests:
         self.assertEqual([e["background"]["state"] for e in events if "background" in e],
                          ["started", "finished"])
         self.assertEqual(len(self.completions(mock.observed("initial")[-1]["messages"])), 1)
+        self.assert_accounting(mock, events)
 
     def test_completion_order_follows_finish_order(self):
         mock = self.mock("basic")
         process = self.start()
         wait_for(lambda: len(mock.observed("initial")) == 2)
         mock.gates["two"].set()
-        wait_for(lambda: self.child_logged("done:child:two"))
+        wait_for(lambda: any(self.completions(r["messages"]) for r in mock.observed("initial")))
         mock.gates["one"].set()
         events = self.finish(process)
         completed = [e["background"]["id"] for e in events
@@ -301,6 +429,9 @@ class BackgroundTests:
         self.assertIn("head:", content(message))
         self.assertIn(":tail", content(message))
         self.assertEqual(events[-1]["end"]["text"], "complete")
+        self.assert_accounting(mock, events)
+        self.assertGreater(len(content(message).encode("utf-8")), len(content(message)))
+        self.assertIn("中文🙂", content(message))
 
     def test_foreground_and_background_share_concurrency(self):
         (self.home / "config.toml").write_text("[limits]\nagent_concurrency = 1\n")
@@ -323,8 +454,11 @@ class BackgroundTests:
         result = json.loads(content(completion).split("\n", 1)[1])
         self.assertFalse(result["ok"], result)
         self.assertTrue(result["error"])
-        self.assertEqual(set(result), {"ok", "text", "changes", "error"})
+        self.assertEqual(set(result), {"id", "ok", "text", "changes", "error"})
+        self.assertEqual(result["id"], "a1")
+        self.assertNotIn("session", result)
         self.assertFalse([e["background"] for e in events if e.get("background", {}).get("kind") == "agent" and e.get("background", {}).get("state") == "finished"][0]["ok"])
+        self.assert_accounting(mock, events)
 
     def worker_pids(self):
         path = self.cwd / "worker.started"
@@ -342,17 +476,69 @@ class BackgroundTests:
         self.finish(process)
         result = json.loads(content(self.completions(mock.observed("initial")[-1]["messages"])[0]).split("\n", 1)[1])
         self.assertFalse(result["ok"], result)
+        self.assertEqual(result["id"], "a1")
+        self.assertNotIn("session", result)
         self.assertRegex(result["error"].lower(), "timeout|timed.out")
         self.assert_stopped(pids)
 
-    def test_max_steps_cancels_pending(self):
+    def start_limited_wait(self):
         (self.home / "config.toml").write_text("[limits]\nmax_steps = 2\n")
-        self.mock("limit")
+        mock = self.mock("limit")
         process = self.start()
         pids = list(self.worker_pids())
+        root_log = wait_for(lambda: next((p for p in (self.home / "sessions").glob("?" * 32 + ".jsonl")
+                                         if records(p) and not records(p)[0].get("parent_session_id")), None))
+        wait_for(lambda: any(r.get("turn_step") == 2 for r in records(root_log)))
+        time.sleep(.1)
+        self.assertIsNone(process.poll())
+        self.assertEqual(len(mock.observed("initial")), 2)
+        self.assertTrue(all(alive(pid) for pid in pids))
+        self.assertFalse(self.completions([m for r in records(root_log) for m in r.get("messages", [])]))
+        return mock, process, pids, root_log
+
+    def test_max_steps_waits_and_persists_result_for_next_turn(self):
+        mock, process, pids, root_log = self.start_limited_wait()
+        (self.cwd / "worker.release").touch()
         events = self.finish(process, ok=False)
         self.assertIn("stopped after 2 steps", json.dumps(events[-1]))
+        self.assertEqual(events[-1]["error"]["steps"], 2)
+        self.assertEqual(len(mock.observed("initial")), 2)
         self.assert_stopped(pids)
+        self.assertTrue((self.cwd / "worker.done").exists())
+        self.assertFalse((self.cwd / "worker.term").exists())
+        completions = self.completions([m for r in records(root_log) for m in r.get("messages", [])])
+        self.assertEqual(len(completions), 1)
+        self.assertEqual((completions[0]["source"], completions[0]["background_id"]), ("background", "a1"))
+        result = json.loads(content(completions[0]).split("\n", 1)[1])
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["id"], "a1")
+        self.assertNotIn("session", result)
+        self.assertEqual(result["text"], "worker finished")
+        finished = [e["background"] for e in events if e.get("background", {}).get("state") == "finished"]
+        self.assertEqual([(e["id"], e["ok"]) for e in finished], [("a1", True)])
+        resumed = self.finish(self.start("--resume", root_log.stem, "next turn"))
+        self.assertEqual(resumed[-1]["end"]["text"], "complete")
+        self.assertEqual(len(mock.observed("initial")), 3)
+        self.assertEqual([content(m) for m in self.completions(mock.observed("initial")[-1]["messages"])],
+                         [content(completions[0])])
+
+    def check_cancel_at_max_steps(self, sig):
+        mock, process, pids, root_log = self.start_limited_wait()
+        process.send_signal(sig)
+        events = self.finish(process, ok=False)
+        self.assertIn("canceled", json.dumps(events[-1]).lower())
+        self.assertNotIn("stopped after", json.dumps(events[-1]))
+        self.assertEqual(len(mock.observed("initial")), 2)
+        self.assert_stopped(pids)
+        self.assertFalse((self.cwd / "worker.done").exists())
+        self.assertFalse(self.completions([m for r in records(root_log) for m in r.get("messages", [])]))
+        self.assertFalse(any(e.get("background", {}).get("state") == "finished" for e in events))
+
+    def test_sigint_cancels_max_steps_wait_and_kills_child(self):
+        self.check_cancel_at_max_steps(signal.SIGINT)
+
+    def test_sigterm_cancels_max_steps_wait_and_kills_child(self):
+        self.check_cancel_at_max_steps(signal.SIGTERM)
 
     def check_signal(self, sig):
         self.mock("cancel")
@@ -397,6 +583,44 @@ class ChatTests(BackgroundTests, unittest.TestCase):
         logged = [m for p in (self.home / "sessions").glob("?" * 32 + ".jsonl") for r in records(p)
                   for m in r.get("messages", []) if m.get("source") == "background" and m.get("background_kind") == "agent"]
         self.assertEqual([m["background_id"] for m in logged], ["a1"])
+        self.assert_accounting(mock)
+
+    def start_limited_terminal(self):
+        (self.home / "config.toml").write_text("[limits]\nmax_steps = 2\n")
+        mock = self.mock("limit")
+        terminal = Terminal(self.cwd, self.env)
+        self.addCleanup(terminal.close)
+        terminal.send("initial\r")
+        pids = list(self.worker_pids())
+        root_log = wait_for(lambda: next((p for p in (self.home / "sessions").glob("?" * 32 + ".jsonl")
+                                         if records(p) and not records(p)[0].get("parent_session_id")
+                                         and any(r.get("turn_step") == 2 for r in records(p))), None))
+        self.assertEqual(len(mock.observed("initial")), 2)
+        self.assertTrue(all(alive(pid) for pid in pids))
+        return mock, terminal, pids, root_log
+
+    def test_max_steps_result_is_visible_in_next_tui_turn(self):
+        mock, terminal, pids, root_log = self.start_limited_terminal()
+        (self.cwd / "worker.release").touch()
+        terminal.until(b"stopped after 2 steps")
+        self.assert_stopped(pids)
+        self.assertEqual(len(mock.observed("initial")), 2)
+        stored = self.completions([m for r in records(root_log) for m in r.get("messages", [])])
+        self.assertEqual(len(stored), 1)
+        terminal.send("next turn\r")
+        request = wait_for(lambda: next((r for r in mock.observed("initial")
+                                         if any(content(m) == "next turn" for m in r["messages"])), None))
+        self.assertEqual([content(m) for m in self.completions(request["messages"])], [content(stored[0])])
+        wait_for(lambda: any(m.get("content") == "complete" for r in records(root_log) for m in r.get("messages", [])))
+
+    def test_escape_cancels_max_steps_wait(self):
+        mock, terminal, pids, root_log = self.start_limited_terminal()
+        terminal.send("\x1b")
+        terminal.until(b"canceled")
+        self.assert_stopped(pids)
+        self.assertEqual(len(mock.observed("initial")), 2)
+        self.assertNotIn(b"stopped after 2 steps", terminal.read())
+        self.assertFalse(self.completions([m for r in records(root_log) for m in r.get("messages", [])]))
 
     def test_escape_cancels_pending(self):
         self.mock("cancel")

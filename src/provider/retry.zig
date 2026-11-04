@@ -287,3 +287,22 @@ test "buffered model callers can retry Chat deltas without weakening visible str
     try t.expectEqual(@as(u32, 2), state.calls);
     try t.expectEqual(@as(usize, 2), state.deltas);
 }
+
+test "idle timeout retries preserve visible streaming and replay-safe rules" {
+    const t = std.testing;
+    for ([_]p.Id{ .chat_completions, .codex }) |id| {
+        for ([_]bool{ false, true }) |emitted| {
+            for ([_]bool{ false, true }) |safe| {
+                var state: TestRequest = .{ .failure = error.StreamIdleTimeout, .emit_delta = emitted, .replay_safe = safe };
+                defer state.events.deinit(t.allocator);
+                if (id == .chat_completions and emitted and !safe) {
+                    try t.expectError(error.StreamIdleTimeout, state.run(id, false, TestRequest.noWait));
+                    try t.expectEqual(@as(u32, 1), state.calls);
+                } else {
+                    _ = try state.run(id, false, TestRequest.noWait);
+                    try t.expectEqual(@as(u32, 2), state.calls);
+                }
+            }
+        }
+    }
+}

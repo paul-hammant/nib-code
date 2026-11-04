@@ -38,7 +38,14 @@ def worker(mode, name):
             time.sleep(.01)
         os.kill(parent, signal.SIGKILL if mode == "crash" else signal.SIGTERM)
         return
-    time.sleep(3 if mode == "peer" else 30)
+    if mode == "gate":
+        deadline = time.monotonic() + 30
+        while not Path(name + ".release").exists():
+            if time.monotonic() > deadline:
+                raise RuntimeError("worker was not released")
+            time.sleep(.01)
+    else:
+        time.sleep(3 if mode == "peer" else 30)
     Path(name + ".done").write_text("completed")
 
 
@@ -48,8 +55,11 @@ def parent_code(case):
                 'tools.agent({prompt: "agent-child:limits-wait-" + i})))')
     if case == "limits-child":
         return 'await tools.agent({prompt: "agent-child:limits-loop"})'
-    if case == "limits-loop":
-        return '42'
+    if case in ("limits-loop", "limits-default"):
+        return "42"
+    if case == "limits-budget":
+        return ('const text = (await tools.read({path: "budget.txt"})).text; '
+                'if (text.length !== 50000) throw new Error("tool data was truncated"); text')
     if case == "changes":
         return 'await tools.agent({prompt: "agent-child:changes"})'
     if case.startswith("parallel:"):
@@ -185,7 +195,9 @@ def serve(port, logfile):
             if prompt == "agent-parent:limits-child" and step == 0:
                 Path(os.environ["NIB_HOME"], "config.toml").write_text("[limits]\nmax_steps = 0\n")
             if prompt.startswith("agent-parent:"):
-                code = parent_code(prompt.split(":", 1)[1]) if step == 0 or prompt == "agent-parent:limits-loop" else None
+                case = prompt.split(":", 1)[1]
+                continuing = case in ("limits-loop", "limits-budget") or (case == "limits-default" and step < 59)
+                code = parent_code(case) if step == 0 or continuing else None
                 text = "parent complete"
             else:
                 case = prompt.split(":", 1)[1]

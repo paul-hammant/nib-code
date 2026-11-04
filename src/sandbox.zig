@@ -2,8 +2,12 @@ const std = @import("std");
 const c = @import("qjs");
 const console = @import("sandbox/console.zig");
 const run_timing = @import("sandbox/timing.zig");
+const scheduler = @import("sandbox/scheduler.zig");
+const native = @import("sandbox/native.zig");
+const State = scheduler.State;
 pub const RunTiming = run_timing.Run;
 pub const tool_concurrency = 8;
+pub const max_stopped_bytes = 4096;
 
 pub const Recorder = @import("sandbox/record.zig").Recorder;
 pub const replay = @import("sandbox/replay.zig");
@@ -26,7 +30,7 @@ pub const VirtualResult = struct {
 };
 
 /// `JS_UNDEFINED` is a C compound-literal macro that translate-c cannot lower.
-const js_undefined: c.JSValue = .{ .u = .{ .uint64 = 0 }, .tag = c.JS_TAG_UNDEFINED };
+pub const js_undefined: c.JSValue = .{ .u = .{ .uint64 = 0 }, .tag = c.JS_TAG_UNDEFINED };
 
 pub const Limits = struct {
     memory_bytes: usize = 64 * 1024 * 1024,
@@ -41,6 +45,9 @@ pub const ToolResult = union(enum) {
     err: []u8,
 };
 
+// Tool workers publish session-owned IDs without changing the JavaScript return value.
+pub threadlocal var tool_identity: struct { id: ?[]const u8 = null, background: bool = false } = .{};
+
 pub const Host = struct {
     ctx: *anyopaque,
     names: []const []const u8,
@@ -54,7 +61,6 @@ pub const Host = struct {
     timing: ?*RunTiming = null,
     record: ?*Recorder = null,
     virtual: ?*Virtual = null,
-    backgroundId: ?*const fn (*anyopaque, []const u8) ?[]const u8 = null,
 };
 
 pub const LogEntry = console.Entry;
@@ -71,215 +77,13 @@ pub const Outcome = struct {
     log_tail_start: usize = 0,
     log_truncated: bool = false,
     tool_bytes: u64 = 0,
+    stopped: []const u8 = "",
 
     pub fn deinit(o: Outcome, gpa: std.mem.Allocator) void {
         gpa.free(o.text);
         gpa.free(o.logs);
         gpa.free(o.log_entries);
-    }
-};
-
-const State = struct {
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    host: ?Host,
-    logs: console.Capture,
-    js_remaining_ns: i96,
-    js_started: ?std.Io.Clock.Timestamp = null,
-    cancel: ?*const std.atomic.Value(bool),
-    oom: bool = false,
-    calls: std.ArrayList(?*Call) = .empty,
-    mutex: std.Io.Mutex = .init,
-    completed: std.Io.Condition = .init,
-    ready: ?*Call = null,
-    ready_tail: ?*Call = null,
-    creation_index: usize = 0,
-    tool_bytes: u64 = 0,
-
-    fn recordResult(st: *State, index: ?usize, bytes: usize) void {
-        st.tool_bytes += bytes;
-        if (st.host.?.timing) |t| t.result(index, bytes);
-    }
-
-    const Call = struct {
-        state: *State,
-        index: usize,
-        creation_index: usize,
-        string_result: bool = false,
-        name: []u8,
-        args: []u8,
-        settle: [2]c.JSValue,
-        thread: ?std.Thread = null,
-        result: ?ToolResult = null,
-        timing_index: ?usize = null,
-        next: ?*Call = null,
-
-        fn deinit(call: *Call, ctx: *c.JSContext) void {
-            const gpa = call.state.gpa;
-            if (call.result) |result| switch (result) {
-                inline else => |bytes| gpa.free(bytes),
-            };
-            for (call.settle) |value| c.JS_FreeValue(ctx, value);
-            gpa.free(call.name);
-            gpa.free(call.args);
-            gpa.destroy(call);
-        }
-
-        fn work(call: *Call) void {
-            const st = call.state;
-            const h = st.host.?;
-            const timing = if (call.timing_index != null) h.timing else null;
-            const start_ms = if (timing) |t| t.elapsed() else 0;
-            const result = h.call(h.ctx, st.gpa, call.name, call.args);
-            const end_ms = if (timing) |t| t.elapsed() else 0;
-            st.mutex.lockUncancelable(st.io);
-            defer st.mutex.unlock(st.io);
-            if (timing) |t| {
-                t.complete(call.timing_index.?, start_ms, end_ms, result == .ok);
-                // Background starts return exactly {"id":...}; skip parsing large foreground outputs.
-                if (result == .ok and std.mem.startsWith(u8, result.ok, "{\"id\":") and (std.mem.eql(u8, call.name, "agent") or std.mem.eql(u8, call.name, "bash"))) {
-                    const parsed = std.json.parseFromSlice(struct { id: ?[]const u8 = null }, st.gpa, result.ok, .{ .ignore_unknown_fields = true }) catch null;
-                    defer if (parsed) |p| p.deinit();
-                    if (parsed) |p| if (p.value.id) |id| {
-                        // The timing collector outlives this Run; Session owns the identifier.
-                        if (h.backgroundId) |lookup| t.entries[call.timing_index.?].id = lookup(h.ctx, id);
-                        t.entries[call.timing_index.?].background = true;
-                    };
-                }
-            }
-            call.result = result;
-            if (st.ready_tail) |tail| tail.next = call else st.ready = call;
-            st.ready_tail = call;
-            st.completed.signal(st.io);
-        }
-    };
-
-    fn beginJs(st: *State) void {
-        std.debug.assert(st.js_started == null);
-        st.js_started = .now(st.io, .awake);
-    }
-
-    fn endJs(st: *State) void {
-        const started = st.js_started.?;
-        st.js_remaining_ns -= started.durationTo(.now(st.io, .awake)).raw.toNanoseconds();
-        st.js_started = null;
-    }
-
-    fn stop(st: *State) void {
-        if (st.host) |h| if (h.cancel) |flag| flag.store(true, .release);
-    }
-
-    fn deinit(st: *State, ctx: *c.JSContext) void {
-        st.stop();
-        for (st.calls.items) |item| if (item) |call| if (call.thread) |thread| thread.join();
-        for (st.calls.items) |item| if (item) |call| call.deinit(ctx);
-        st.calls.deinit(st.gpa);
-    }
-
-    fn deliver(st: *State, ctx: *c.JSContext, call: *Call) !void {
-        const result = call.result.?;
-        if (st.host.?.record) |recorder| recorder.settle(call.creation_index, call.name, call.args, result);
-        st.recordResult(call.timing_index, switch (result) {
-            inline else => |bytes| bytes.len,
-        });
-        st.beginJs();
-        defer st.endJs();
-        const value = switch (result) {
-            .ok => |json| blk: {
-                if (call.string_result) break :blk c.JS_NewStringLen(ctx, json.ptr, json.len);
-                // QuickJS requires buf[len] == 0 even with an explicit length.
-                const source = try st.gpa.dupeSentinel(u8, json, 0);
-                defer st.gpa.free(source);
-                break :blk c.JS_ParseJSON(ctx, source.ptr, source.len, "<tool>");
-            },
-            .err => |msg| blk: {
-                const err = c.JS_NewError(ctx);
-                _ = c.JS_SetPropertyStr(ctx, err, "message", c.JS_NewStringLen(ctx, msg.ptr, msg.len));
-                break :blk err;
-            },
-        };
-        const rejected = result == .err or c.JS_IsException(value);
-        const arg = if (c.JS_IsException(value)) c.JS_GetException(ctx) else value;
-        const r = c.JS_Call(ctx, call.settle[@intFromBool(rejected)], js_undefined, 1, @constCast(&arg));
-        c.JS_FreeValue(ctx, r);
-        c.JS_FreeValue(ctx, arg);
-        st.calls.items[call.index] = null;
-        call.deinit(ctx);
-    }
-
-    fn jobs(st: *State, ctx: *c.JSContext, rt: *c.JSRuntime, promise: c.JSValue) !void {
-        var active: usize = 0;
-        var next: usize = 0;
-        while (true) {
-            if (st.host) |h| if (h.poll) |poll| try poll(h.ctx);
-            if (active == 0 and next == st.calls.items.len) {
-                st.calls.clearRetainingCapacity();
-                next = 0;
-            }
-            if (virtualStopped(st)) return;
-            if (isInterrupted(st) or c.JS_PromiseState(ctx, promise) == c.JS_PROMISE_REJECTED) {
-                st.stop();
-                return;
-            }
-            var pctx: ?*c.JSContext = null;
-            st.beginJs();
-            const n = c.JS_ExecutePendingJob(rt, &pctx);
-            st.endJs();
-            if (n < 0) return;
-            if (n > 0) continue;
-            if (st.host) |h| if (h.virtual) |v| {
-                if (v.stopped(v.ctx)) return;
-                var pending: std.ArrayList(usize) = .empty;
-                defer pending.deinit(st.gpa);
-                for (st.calls.items) |item| if (item) |call| try pending.append(st.gpa, call.creation_index);
-                if (pending.items.len == 0) return;
-                const selected = v.select(v.ctx, pending.items) orelse return;
-                for (st.calls.items) |item| {
-                    const call = item orelse continue;
-                    if (call.creation_index != selected) continue;
-                    const result = try v.result(v.ctx, st.gpa, selected);
-                    call.result = result.result;
-                    call.string_result = result.string_result;
-                    try st.deliver(ctx, call);
-                    break;
-                }
-                continue;
-            };
-            st.mutex.lockUncancelable(st.io);
-            const ready = st.ready;
-            if (ready) |call| st.ready = call.next;
-            if (st.ready == null) st.ready_tail = null;
-            st.mutex.unlock(st.io);
-            if (ready) |call| {
-                if (call.thread) |thread| thread.join();
-                call.thread = null;
-                active -= 1;
-                try st.deliver(ctx, call);
-            }
-            if (ready != null or c.JS_IsJobPending(rt)) continue;
-            while (next < st.calls.items.len and active < tool_concurrency) : (next += 1) {
-                const call = st.calls.items[next].?;
-                if (call.result != null) {
-                    st.mutex.lockUncancelable(st.io);
-                    if (st.ready_tail) |tail| tail.next = call else st.ready = call;
-                    st.ready_tail = call;
-                    st.mutex.unlock(st.io);
-                    active += 1;
-                    continue;
-                }
-                const timing = st.host.?.timing;
-                if (timing) |t| call.timing_index = t.reserve(call.name);
-                call.thread = std.Thread.spawn(.{}, Call.work, .{call}) catch |err| {
-                    if (timing) |t| t.undoReservation(call.timing_index, call.name);
-                    return err;
-                };
-                active += 1;
-            }
-            if (active == 0) return;
-            st.mutex.lockUncancelable(st.io);
-            if (st.ready == null) st.completed.waitTimeout(st.io, &st.mutex, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch {};
-            st.mutex.unlock(st.io);
-        }
+        gpa.free(o.stopped);
     }
 };
 
@@ -294,6 +98,8 @@ const prelude =
     \\  const out = (...a) => log(a.map(fmt).join(" ") + "\n");
     \\  globalThis.console = Object.freeze({ log: out, info: out, warn: out, error: out });
     \\  const call = async (name, args) => {
+    \\    if (name === "sleep" && (!Number.isInteger(args) || args < 0 || args > 2147483647))
+    \\      throw new Error("sleep: ms must be an integer in 0..2147483647");
     \\    if (name === "grep" && args?.pattern instanceof RegExp) {
     \\      const re = args.pattern;
     \\      args = { ...args, pattern: re.source, ...(re.ignoreCase && !Object.hasOwn(args, "ignore_case") ? { ignore_case: true } : {}) };
@@ -329,21 +135,21 @@ pub fn eval(
     defer c.JS_FreeRuntime(rt);
     c.JS_SetMemoryLimit(rt, limits.memory_bytes);
     c.JS_SetMaxStackSize(rt, limits.stack_bytes);
-    c.JS_SetInterruptHandler(rt, interrupt, &st);
+    c.JS_SetInterruptHandler(rt, native.interrupt, &st);
 
     const ctx = c.JS_NewContext(rt) orelse return error.OutOfMemory;
     defer c.JS_FreeContext(ctx);
     defer st.deinit(ctx);
     c.JS_SetContextOpaque(ctx, &st);
 
-    try install(gpa, ctx, host);
+    try native.install(gpa, ctx, host);
     {
         const v = c.JS_Eval(ctx, prelude, prelude.len, "<prelude>", c.JS_EVAL_TYPE_GLOBAL);
         defer c.JS_FreeValue(ctx, v);
         if (c.JS_IsException(v)) return error.PreludeFailed;
     }
 
-    if (host) |h| if (h.virtual) |v| try installVirtual(gpa, ctx, v);
+    if (host) |h| if (h.virtual) |v| try native.installVirtual(gpa, ctx, v);
 
     const src = try gpa.dupeSentinel(u8, code, 0);
     defer gpa.free(src);
@@ -354,13 +160,15 @@ pub fn eval(
     defer c.JS_FreeValue(ctx, promise);
 
     var ok = false;
+    var jobs_drained = true;
     var text: []u8 = undefined;
     if (c.JS_IsException(promise)) {
         st.beginJs();
         defer st.endJs();
-        text = try takeException(gpa, ctx);
+        text = try native.takeException(gpa, ctx);
     } else {
-        try st.jobs(ctx, rt, promise);
+        st.promise = promise;
+        jobs_drained = try st.jobs(ctx, rt);
         st.beginJs();
         defer st.endJs();
         switch (c.JS_PromiseState(ctx, promise)) {
@@ -370,29 +178,33 @@ pub fn eval(
                 // Async global eval resolves to `{ value: <completion value> }`.
                 const value = c.JS_GetPropertyStr(ctx, res, "value");
                 defer c.JS_FreeValue(ctx, value);
-                text = try toJson(gpa, ctx, value);
+                text = try native.toJson(gpa, ctx, value);
                 ok = true;
             },
             c.JS_PROMISE_REJECTED => {
                 const err = c.JS_PromiseResult(ctx, promise);
                 defer c.JS_FreeValue(ctx, err);
-                text = try describeError(gpa, ctx, err);
+                text = try native.describeError(gpa, ctx, err);
             },
             else => text = try gpa.dupe(u8, "Error: script is still awaiting something that can never settle"),
         }
     }
     errdefer gpa.free(text);
+    if (jobs_drained) _ = try st.jobs(ctx, rt);
     if (st.oom) return error.OutOfMemory;
 
-    if (isInterrupted(&st)) {
+    if (scheduler.isInterrupted(&st)) {
         ok = false;
         gpa.free(text);
         text = try gpa.dupe(u8, if (st.cancel != null and st.cancel.?.load(.acquire)) "Error: run canceled" else "Error: run timed out");
     }
+    const stopped = if (scheduler.isInterrupted(&st)) try st.stoppedCalls() else "";
+    errdefer gpa.free(stopped);
     const captured = try st.logs.snapshot(gpa);
     return .{
         .ok = ok,
         .tool_bytes = st.tool_bytes,
+        .stopped = stopped,
         .text = text,
         .logs = captured.logs,
         .log_entries = captured.entries,
@@ -403,157 +215,11 @@ pub fn eval(
     };
 }
 
-fn install(gpa: std.mem.Allocator, ctx: *c.JSContext, host: ?Host) !void {
-    const global = c.JS_GetGlobalObject(ctx);
-    defer c.JS_FreeValue(ctx, global);
-    _ = c.JS_SetPropertyStr(ctx, global, "__log", c.JS_NewCFunction2(ctx, nativeLog, "__log", 1, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, global, "__host", c.JS_NewCFunction2(ctx, nativeHost, "__host", 2, c.JS_CFUNC_generic, 0));
-    const names = try std.json.Stringify.valueAlloc(gpa, if (host) |h| h.names else &.{}, .{});
-    defer gpa.free(names);
-    _ = c.JS_SetPropertyStr(ctx, global, "__names", c.JS_NewStringLen(ctx, names.ptr, names.len));
-}
-
-fn virtualTime(ctx: ?*c.JSContext, _: c.JSValue, _: c_int, _: [*c]c.JSValue) callconv(.c) c.JSValue {
-    state(ctx).host.?.virtual.?.uses_time = true;
-    return js_undefined;
-}
-
-fn virtualRandom(ctx: ?*c.JSContext, _: c.JSValue, _: c_int, _: [*c]c.JSValue) callconv(.c) c.JSValue {
-    state(ctx).host.?.virtual.?.uses_random = true;
-    return js_undefined;
-}
-
-fn installVirtual(_: std.mem.Allocator, ctx: *c.JSContext, v: *Virtual) !void {
-    const global = c.JS_GetGlobalObject(ctx);
-    defer c.JS_FreeValue(ctx, global);
-    _ = c.JS_SetPropertyStr(ctx, global, "__replayEpoch", c.JS_NewFloat64(ctx, @floatFromInt(v.start_ms_epoch)));
-    _ = c.JS_SetPropertyStr(ctx, global, "__replayTime", c.JS_NewCFunction2(ctx, virtualTime, "time", 0, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, global, "__replayRandom", c.JS_NewCFunction2(ctx, virtualRandom, "random", 0, c.JS_CFUNC_generic, 0));
-    const source = @import("sandbox/virtual.zig").prelude;
-    const result = c.JS_Eval(ctx, source, source.len, "<virtual>", c.JS_EVAL_TYPE_GLOBAL);
-    defer c.JS_FreeValue(ctx, result);
-    if (c.JS_IsException(result)) return error.PreludeFailed;
-}
-
-fn state(ctx: ?*c.JSContext) *State {
-    return @ptrCast(@alignCast(c.JS_GetContextOpaque(ctx).?));
-}
-
-fn isInterrupted(st: *State) bool {
-    if (st.cancel) |flag| if (flag.load(.acquire)) return true;
-    const elapsed = if (st.js_started) |started| started.durationTo(.now(st.io, .awake)).raw.toNanoseconds() else 0;
-    return elapsed >= st.js_remaining_ns;
-}
-
-fn virtualStopped(st: *State) bool {
-    if (st.host) |h| if (h.virtual) |v| return v.stopped(v.ctx);
-    return false;
-}
-
-fn interrupt(_: ?*c.JSContext, opaque_ptr: ?*anyopaque) callconv(.c) c_int {
-    const st: *State = @ptrCast(@alignCast(opaque_ptr.?));
-    return @intFromBool(isInterrupted(st) or virtualStopped(st));
-}
-
-fn nativeLog(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
-    const st = state(ctx);
-    if (argc < 1) return js_undefined;
-    var len: usize = 0;
-    const p = c.JS_ToCStringLen2(ctx, &len, argv[0], false) orelse return js_undefined;
-    defer c.JS_FreeCString(ctx, p);
-    st.logs.append(st.gpa, p[0..len]) catch {
-        st.oom = true;
-    };
-    return js_undefined;
-}
-
-fn nativeHost(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
-    return enqueue(state(ctx), ctx.?, argc, argv) catch |err| {
-        if (err == error.ReplayDivergence) {
-            const reason = c.JS_NewError(ctx);
-            _ = c.JS_SetPropertyStr(ctx, reason, "message", c.JS_NewString(ctx, "replay diverged"));
-            return c.JS_Throw(ctx, reason);
-        }
-        return c.JS_ThrowOutOfMemory(ctx);
-    };
-}
-
-fn enqueue(st: *State, ctx: *c.JSContext, argc: c_int, argv: [*c]c.JSValue) !c.JSValue {
-    if (st.host == null or argc < 2) return error.InvalidHostCall;
-    const call = try st.gpa.create(State.Call);
-    errdefer st.gpa.destroy(call);
-    const name = try toStr(st.gpa, ctx, argv[0]);
-    errdefer st.gpa.free(name);
-    const args = try toStr(st.gpa, ctx, argv[1]);
-    errdefer st.gpa.free(args);
-    var settle: [2]c.JSValue = undefined;
-    const promise = c.JS_NewPromiseCapability(ctx, &settle);
-    if (c.JS_IsException(promise)) return error.OutOfMemory;
-    errdefer {
-        c.JS_FreeValue(ctx, promise);
-        for (settle) |v| c.JS_FreeValue(ctx, v);
-    }
-    call.* = .{ .state = st, .index = st.calls.items.len, .creation_index = st.creation_index, .name = name, .args = args, .settle = settle };
-    if (st.host.?.virtual) |v| {
-        v.create(v.ctx, st.creation_index, name, args);
-        if (v.stopped(v.ctx)) return error.ReplayDivergence;
-    } else if (st.host.?.admit) |admit| {
-        if (try admit(st.host.?.ctx, st.gpa, name)) |message| {
-            call.result = .{ .err = message };
-            if (st.host.?.timing) |t| {
-                call.timing_index = t.reserveEntry(name);
-                if (call.timing_index) |i| {
-                    const ms = t.elapsed();
-                    t.complete(i, ms, ms, false);
-                    t.entries[i].dispatched = false;
-                }
-            }
-        }
-    }
-    errdefer if (call.result) |result| switch (result) {
-        inline else => |bytes| st.gpa.free(bytes),
-    };
-    st.creation_index += 1;
-    try st.calls.append(st.gpa, call);
-    return promise;
-}
-
-fn takeException(gpa: std.mem.Allocator, ctx: *c.JSContext) ![]u8 {
-    const exc = c.JS_GetException(ctx);
-    defer c.JS_FreeValue(ctx, exc);
-    return describeError(gpa, ctx, exc);
-}
-
-fn toJson(gpa: std.mem.Allocator, ctx: *c.JSContext, val: c.JSValue) ![]u8 {
-    if (c.JS_IsUndefined(val)) return gpa.dupe(u8, "undefined");
-    const json = c.JS_JSONStringify(ctx, val, js_undefined, js_undefined);
-    defer c.JS_FreeValue(ctx, json);
-    if (c.JS_IsException(json) or c.JS_IsUndefined(json)) {
-        c.JS_FreeValue(ctx, c.JS_GetException(ctx));
-        return toStr(gpa, ctx, val);
-    }
-    return toStr(gpa, ctx, json);
-}
-
-fn describeError(gpa: std.mem.Allocator, ctx: *c.JSContext, exc: c.JSValue) ![]u8 {
-    const msg = try toStr(gpa, ctx, exc);
-    const stack = c.JS_GetPropertyStr(ctx, exc, "stack");
-    defer c.JS_FreeValue(ctx, stack);
-    if (c.JS_IsUndefined(stack)) return msg;
-    defer gpa.free(msg);
-    const st = try toStr(gpa, ctx, stack);
-    defer gpa.free(st);
-    return std.fmt.allocPrint(gpa, "{s}\n{s}", .{ msg, std.mem.trimEnd(u8, st, "\n") });
-}
-
-fn toStr(gpa: std.mem.Allocator, ctx: *c.JSContext, val: c.JSValue) ![]u8 {
-    var len: usize = 0;
-    const p = c.JS_ToCStringLen2(ctx, &len, val, false) orelse return gpa.dupe(u8, "<unprintable>");
-    defer c.JS_FreeCString(ctx, p);
-    return gpa.dupe(u8, p[0..len]);
-}
-
 const testing = std.testing;
+
+test {
+    _ = @import("sandbox/timer_test.zig");
+}
 
 fn run(code: []const u8, limits: Limits, host: ?Host) !Outcome {
     return eval(testing.allocator, testing.io, code, limits, host, null);
@@ -606,6 +272,7 @@ test "timeout interrupts an infinite loop" {
     defer r.deinit(testing.allocator);
     try testing.expect(!r.ok);
     try testing.expectEqualStrings("Error: run timed out", r.text);
+    try testing.expectEqualStrings("", r.stopped);
 }
 
 test "timeout also covers JS invoked by result and error conversion" {
@@ -643,6 +310,22 @@ test "tools route through the host, errors become exceptions" {
         "{\"a\":{\"tool\":\"echo\",\"args\":{\"x\":1}},\"b\":{\"tool\":\"echo\",\"args\":{}},\"msg\":\"fail: nope\",\"keys\":[\"echo\",\"fail\"]}",
         r.text,
     );
+}
+
+test "result and rejection conversion callbacks drain their tool calls" {
+    var dummy: u8 = 0;
+    for ([_][]const u8{
+        "({ toJSON() { tools.echo({x:1}).then(r => console.log('converted', r.args.x)); return 7; } })",
+        "throw { toString() { tools.echo({x:1}).then(r => console.log('converted', r.args.x)); return 'original'; } }",
+    }, [_]bool{ true, false }, [_][]const u8{ "7", "original" }) |code, ok, text| {
+        const result = try run(code, .{}, .{ .ctx = &dummy, .names = &.{"echo"}, .call = EchoHost.call });
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual(ok, result.ok);
+        try testing.expectEqualStrings(text, result.text);
+        try testing.expectEqualStrings("converted 1\n", result.logs);
+        try testing.expect(result.tool_bytes > 0);
+        try testing.expectEqualStrings("", result.stopped);
+    }
 }
 
 test "tool concurrency is bounded while excess calls queue" {
@@ -740,7 +423,7 @@ test "parallel native timings retain dispatch order and survive rejected JS with
     }
 }
 
-test "undispatched tools do not produce native timings" {
+test "tools queued before a top-level throw are still dispatched and billed" {
     var timing: RunTiming = .init(testing.io, .now(testing.io, .awake));
     var dummy: TimingHost = .{};
     const result = try run("tools.bash(); throw new Error('before dispatch')", .{}, .{
@@ -751,9 +434,9 @@ test "undispatched tools do not produce native timings" {
     });
     defer result.deinit(testing.allocator);
     try testing.expect(!result.ok);
-    try testing.expectEqual(@as(usize, 0), timing.count);
-    try testing.expectEqual(@as(u64, 0), result.tool_bytes);
-    try testing.expectEqual(@as(u64, 0), timing.tool_bytes);
+    try testing.expectEqual(@as(usize, 1), timing.count);
+    try testing.expectEqual(@as(u64, "{\"exit_code\":7}".len), result.tool_bytes);
+    try testing.expectEqual(result.tool_bytes, timing.tool_bytes);
 }
 
 const FileBytesHost = struct {
@@ -859,37 +542,128 @@ test "admission rejections count only the returned error text" {
     try testing.expectEqual(@as(u64, 0), timing.llm_calls);
 }
 
-test "workers completed only during rejection cleanup do not contribute result bytes" {
-    const CleanupHost = struct {
-        cancel: std.atomic.Value(bool) = .init(false),
-        reading: std.atomic.Value(bool) = .init(false),
-
-        fn call(ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8, _: []const u8) ToolResult {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            if (std.mem.eql(u8, name, "read")) {
-                self.reading.store(true, .release);
-                while (!self.cancel.load(.acquire)) std.Thread.yield() catch {};
-                return .{ .ok = gpa.dupe(u8, "{\"text\":\"not delivered\"}") catch unreachable };
+test "top-level rejection drains slow results and their continuations" {
+    const FailFast = struct {
+        fn call(ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8, args: []const u8) ToolResult {
+            if (std.mem.eql(u8, name, "fetch")) {
+                const host: *TimingHost = @ptrCast(@alignCast(ctx));
+                host.fetched.store(true, .release);
+                return .{ .err = gpa.dupe(u8, "fetch failed") catch unreachable };
             }
-            while (!self.reading.load(.acquire)) std.Thread.yield() catch {};
-            return .{ .err = gpa.dupe(u8, "failed🙂") catch unreachable };
+            return TimingHost.call(ctx, gpa, name, args);
         }
     };
-    var host: CleanupHost = .{};
+    var host: TimingHost = .{};
     var timing: RunTiming = .init(testing.io, .now(testing.io, .awake));
-    const result = try run("await Promise.all([tools.read(), tools.fetch()])", .{}, .{
+    var recorder = Recorder.init(testing.allocator, testing.io, "unused-record-test-path", true);
+    defer recorder.deinit();
+    recorder.begin(1, 0);
+    const result = try run(
+        \\const slow = tools.read().then(async r => {
+        \\  console.log('slow delivered', r.exit_code);
+        \\  const next = await tools.bash();
+        \\  console.log('continuation delivered', next.exit_code);
+        \\});
+        \\await Promise.all([slow, tools.fetch()]);
+    , .{}, .{
         .ctx = &host,
-        .names = &.{ "read", "fetch" },
-        .call = CleanupHost.call,
-        .cancel = &host.cancel,
+        .names = &.{ "read", "fetch", "bash" },
+        .call = FailFast.call,
         .timing = &timing,
+        .record = &recorder,
     });
     defer result.deinit(testing.allocator);
     try testing.expect(!result.ok);
-    try testing.expectEqual("failed🙂".len, result.tool_bytes);
+    try testing.expect(std.mem.startsWith(u8, result.text, "Error: fetch: fetch failed"));
+    try testing.expectEqualStrings("slow delivered 7\ncontinuation delivered 7\n", result.logs);
+    try testing.expectEqualStrings("", result.stopped);
+    try testing.expectEqual(@as(usize, 3), timing.count);
+    try testing.expectEqual(@as(u64, 2 * "{\"exit_code\":7}".len + "fetch failed".len), result.tool_bytes);
     try testing.expectEqual(result.tool_bytes, timing.tool_bytes);
-    try testing.expectEqual(@as(?u64, 0), timing.entries[0].result_bytes);
-    try testing.expectEqual(@as(?u64, "failed🙂".len), timing.entries[1].result_bytes);
+    try testing.expectEqual(@as(usize, 3), recorder.seq);
+    try testing.expect(!recorder.incomplete);
+}
+
+const StoppingHost = struct {
+    cancel: std.atomic.Value(bool) = .init(false),
+    user_cancel: std.atomic.Value(bool) = .init(false),
+    started: std.atomic.Value(usize) = .init(0),
+    stopped: std.atomic.Value(usize) = .init(0),
+
+    fn call(ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8, args: []const u8) ToolResult {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (std.mem.eql(u8, name, "read")) {
+            if (std.mem.indexOf(u8, args, "barrier") != null) {
+                while (self.started.load(.acquire) < 2 and !self.cancel.load(.acquire)) std.Thread.yield() catch {};
+            }
+            return .{ .ok = gpa.dupe(u8, "1") catch unreachable };
+        }
+        _ = self.started.fetchAdd(1, .release);
+        while (!self.cancel.load(.acquire)) std.Thread.yield() catch {};
+        _ = self.stopped.fetchAdd(1, .release);
+        return .{ .err = gpa.dupe(u8, "not delivered") catch unreachable };
+    }
+
+    fn cancelLater(self: *@This()) void {
+        while (self.started.load(.acquire) < 2 and !self.cancel.load(.acquire)) std.Thread.yield() catch {};
+        if (self.cancel.load(.acquire)) return;
+        std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(50), .clock = .awake }, testing.io) catch unreachable;
+        self.user_cancel.store(true, .release);
+    }
+};
+
+test "cancel and timeout stop only undelivered calls and preserve their creation indices" {
+    for ([_]bool{ false, true }) |timeout| {
+        var host: StoppingHost = .{};
+        const cancel_thread = if (!timeout) try std.Thread.spawn(.{}, StoppingHost.cancelLater, .{&host}) else null;
+        defer if (cancel_thread) |thread| thread.join();
+        var timing: RunTiming = .init(testing.io, .now(testing.io, .awake));
+        var recorder = Recorder.init(testing.allocator, testing.io, "unused-record-test-path", true);
+        defer recorder.deinit();
+        recorder.begin(1, 0);
+        const setup = "tools.bash(); await tools.read(); tools.agent(); await tools.read({barrier:true});";
+        const result = try eval(testing.allocator, testing.io, if (timeout) setup ++ "for (;;) {}" else setup ++ "await new Promise(() => {});", .{ .timeout_ms = if (timeout) 50 else 5000 }, .{
+            .ctx = &host,
+            .names = &.{ "bash", "read", "agent" },
+            .call = StoppingHost.call,
+            .cancel = &host.cancel,
+            .timing = &timing,
+            .record = &recorder,
+        }, &host.user_cancel);
+        defer result.deinit(testing.allocator);
+        try testing.expect(!result.ok);
+        try testing.expectEqualStrings(if (timeout) "Error: run timed out" else "Error: run canceled", result.text);
+        try testing.expectEqualStrings("[stopped before completion: bash #0, agent #2]", result.stopped);
+        try testing.expectEqual(@as(usize, 2), host.stopped.load(.acquire));
+        try testing.expectEqual(@as(u64, 2), result.tool_bytes);
+        try testing.expectEqual(result.tool_bytes, timing.tool_bytes);
+        try testing.expectEqual(@as(?u64, 0), timing.entries[0].result_bytes);
+        try testing.expectEqual(@as(?u64, 0), timing.entries[2].result_bytes);
+        try testing.expectEqual(@as(usize, 2), recorder.seq);
+        try testing.expect(recorder.incomplete);
+        const output = try @import("session/output.zig").format(testing.allocator, result);
+        defer testing.allocator.free(output);
+        try testing.expect(std.mem.endsWith(u8, output, result.stopped));
+    }
+}
+
+test "stopped facts include queued calls and bound oversized lists explicitly" {
+    var dummy: u8 = 0;
+    const result = try run("for (let i = 0; i < 1000; i++) tools.bash(); for (;;) {}", .{ .timeout_ms = 100 }, .{
+        .ctx = &dummy,
+        .names = &.{"bash"},
+        .call = EchoHost.call,
+    });
+    defer result.deinit(testing.allocator);
+    try testing.expect(!result.ok);
+    try testing.expectEqual(@as(u64, 0), result.tool_bytes);
+    try testing.expect(result.stopped.len <= max_stopped_bytes);
+    try testing.expect(std.mem.startsWith(u8, result.stopped, "[stopped before completion: bash #0, bash #1, "));
+    try testing.expect(std.mem.endsWith(u8, result.stopped, " more]"));
+    const listed = std.mem.count(u8, result.stopped, "bash #");
+    const suffix = try std.fmt.allocPrint(testing.allocator, ", ..., {d} more]", .{1000 - listed});
+    defer testing.allocator.free(suffix);
+    try testing.expect(std.mem.endsWith(u8, result.stopped, suffix));
 }
 
 test "record and virtual replay share settlement path including admission rejects and monotonic creation indices" {
@@ -956,12 +730,12 @@ test "record and virtual replay share settlement path including admission reject
     try testing.expectEqualStrings(actual.text, repeated.outcome.text);
 }
 
-test "eval exit records missing creations on errors but settled errors stay complete" {
+test "eval exit records all creations even on top-level errors" {
     const Case = struct { code: []const u8, incomplete: bool, delivered: usize };
     for ([_]Case{
-        .{ .code = "tools.bash(); throw new Error('pending')", .incomplete = true, .delivered = 0 },
-        .{ .code = "await tools.bash(); tools.bash(); throw new Error('tail pending')", .incomplete = true, .delivered = 1 },
-        .{ .code = "await Promise.all([tools.read(), tools.fetch()])", .incomplete = true, .delivered = 1 },
+        .{ .code = "tools.bash(); throw new Error('pending')", .incomplete = false, .delivered = 1 },
+        .{ .code = "await tools.bash(); tools.bash(); throw new Error('tail pending')", .incomplete = false, .delivered = 2 },
+        .{ .code = "await Promise.all([tools.read(), tools.fetch()])", .incomplete = false, .delivered = 2 },
         .{ .code = "await tools.bash(); throw new Error('settled')", .incomplete = false, .delivered = 1 },
         .{ .code = "await tools.fetch()", .incomplete = false, .delivered = 1 },
         .{ .code = "throw new Error('zero calls')", .incomplete = false, .delivered = 0 },

@@ -1,13 +1,18 @@
 const std = @import("std");
 const provider = @import("../provider.zig");
 const Change = @import("../tools/diff.zig").Change;
+const Summary = @import("tool_summary.zig").Summary;
+
+pub const TaskIds = struct { agent: u64 = 0, bash: u64 = 0 };
 
 pub const Progress = struct {
-    agent: usize,
+    id: []const u8,
     run: usize = 0,
+    invocation: usize = 0,
     kind: Background.Kind = .agent,
     elapsed_ms: u64 = 0,
-    background_id: ?[]const u8 = null,
+    background: bool = false,
+    detached: bool = false,
     prompt: []const u8,
     state: enum { queued, working, done, failed, canceled, timed_out } = .working,
     step: u32 = 0,
@@ -22,13 +27,13 @@ pub const Progress = struct {
         errdefer freeStrings(gpa, used);
         const files = try cloneStrings(gpa, p.files);
         errdefer freeStrings(gpa, files);
-        const background_id = if (p.background_id) |id| try gpa.dupe(u8, id) else null;
-        return .{ .kind = p.kind, .elapsed_ms = p.elapsed_ms, .run = p.run, .background_id = background_id, .agent = p.agent, .prompt = prompt, .state = p.state, .step = p.step, .tools = used, .files = files, .usage = p.usage };
+        const id = try gpa.dupe(u8, p.id);
+        return .{ .kind = p.kind, .elapsed_ms = p.elapsed_ms, .run = p.run, .invocation = p.invocation, .background = p.background, .detached = p.detached, .id = id, .prompt = prompt, .state = p.state, .step = p.step, .tools = used, .files = files, .usage = p.usage };
     }
 
     pub fn deinit(p: *Progress, gpa: std.mem.Allocator) void {
         gpa.free(p.prompt);
-        if (p.background_id) |id| gpa.free(id);
+        gpa.free(p.id);
         freeStrings(gpa, p.tools);
         freeStrings(gpa, p.files);
         p.* = undefined;
@@ -88,7 +93,7 @@ pub const Event = union(enum) {
     /// Slices are valid only during the callback.
     delta: struct { kind: provider.Kind, text: []const u8 },
     run_start: []const u8,
-    run_end: struct { ok: bool, output: []const u8, changes: []const Change = &.{} },
+    run_end: struct { ok: bool, output: []const u8, changes: []const Change = &.{}, tool_summary: ?Summary = null },
     retry: struct { attempt: u32, delay_ms: u64, reason: []const u8 },
     notice: []const u8,
     usage: provider.Usage,
@@ -127,3 +132,28 @@ pub const JsonEvent = union(enum) {
         try writer.flush();
     }
 };
+
+test "run_end JSON includes actual tool summary including empty counts" {
+    const t = std.testing;
+    const counts = [_]@import("tool_summary.zig").Count{
+        .{ .name = "bash", .count = 2 },
+        .{ .name = "read", .count = 1 },
+    };
+    const populated = try std.json.Stringify.valueAlloc(t.allocator, JsonEvent{ .event = .{ .run_end = .{
+        .ok = false,
+        .output = "failed",
+        .tool_summary = .{ .counts = &counts, .omitted = 3 },
+    } } }, .{ .emit_null_optional_fields = false });
+    defer t.allocator.free(populated);
+    try t.expectEqualStrings("{\"run_end\":{\"ok\":false,\"output\":\"failed\",\"changes\":[],\"tool_summary\":{\"counts\":[{\"name\":\"bash\",\"count\":2},{\"name\":\"read\",\"count\":1}],\"omitted\":3}}}", populated);
+    const empty = try std.json.Stringify.valueAlloc(t.allocator, JsonEvent{ .event = .{ .run_end = .{
+        .ok = true,
+        .output = "",
+        .tool_summary = .{},
+    } } }, .{ .emit_null_optional_fields = false });
+    defer t.allocator.free(empty);
+    try t.expectEqualStrings("{\"run_end\":{\"ok\":true,\"output\":\"\",\"changes\":[],\"tool_summary\":{\"counts\":[],\"omitted\":0}}}", empty);
+    const legacy = try std.json.Stringify.valueAlloc(t.allocator, JsonEvent{ .event = .{ .run_end = .{ .ok = true, .output = "" } } }, .{ .emit_null_optional_fields = false });
+    defer t.allocator.free(legacy);
+    try t.expectEqualStrings("{\"run_end\":{\"ok\":true,\"output\":\"\",\"changes\":[]}}", legacy);
+}

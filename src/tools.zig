@@ -13,10 +13,17 @@ const Tool = struct {
     root_only: bool = false,
     name: []const u8,
     doc: []const u8,
-    run: *const fn (t: *Tools, gpa: std.mem.Allocator, args: []const u8) anyerror!sandbox.ToolResult,
+    run: ?*const fn (t: *Tools, gpa: std.mem.Allocator, args: []const u8) anyerror!sandbox.ToolResult = null,
 };
 
 const all = [_]Tool{
+    .{
+        .name = "sleep",
+        .doc =
+        \\  // Wait ms (integer 0..2147483647); cancellable, no process/thread or tool slot. Counts Run wall time, not JS budget. Run drains even unawaited sleeps.
+        \\  async sleep(ms) {}, // → null
+        ,
+    },
     .{
         .name = "read",
         .run = files.read,
@@ -37,7 +44,7 @@ const all = [_]Tool{
         .name = "write",
         .run = files.write,
         .doc =
-        \\  // Create or overwrite a file, creating parent directories.
+        \\  // Create or overwrite a file, creating parents. Rejects overwrites changed since this session last read or wrote it.
         \\  async write({ path, content }) {}, // → { bytes }
         ,
     },
@@ -72,10 +79,19 @@ const all = [_]Tool{
         .name = "bash",
         .run = bash.bash,
         .doc =
-        \\  // Run bash in the working directory; stderr is merged into output. exit_code is null if killed.
-        \\  // Output is returned verbatim; over 16 MiB errors (redirect output to a file). Commands over 256 shell words, excluding heredoc bodies, are refused: write long scripts to a file with tools.write and run that file.
-        \\  // background returns {id} immediately; {exit_code,output} arrives as a message in a later Step. File changes during the command affect its result.
-        \\  async bash({ command, timeout_ms = 120000, background = false }) {}, // → { exit_code, output } or { id }
+        \\  // Bash in cwd; stderr merged. exit_code:null if killed. Returning kills its process group, including nohup/&.
+        \\  // Verbatim output; >16 MiB errors (redirect to file). >256 shell words excluding heredocs refused: write a script. File changes affect results.
+        \\  // background returns {id}; result in a later Step. detached requires background; survives normal Turns without waiting. Stop/timeout/Turn cancel or failure/Session exit cleans up.
+        \\  // A detached task ends when its shell exits; run servers in command foreground.
+        \\  async bash({ command, timeout_ms, background = false, detached = false }) {}, // → { exit_code, output } or { id }; timeout_ms default: detached 0 (unlimited), else 120000
+        ,
+    },
+    .{
+        .name = "stop",
+        .run = @import("tools/stop.zig").stop,
+        .doc =
+        \\  // Cancel and join one background bash/agent by id, cleaning up its process group. Completed tasks return stopped:false; unknown ids reject. Completion is still delivered once as a background message.
+        \\  async stop({ id }) {}, // → { id, stopped }
         ,
     },
     .{
@@ -93,9 +109,10 @@ const all = [_]Tool{
         .root_only = true,
         .run = subagent.agent,
         .doc =
-        \\  // Independent multi-step worker; same tools except agent, fresh context, only prompt shared. Observed coding tasks: 15-40 Steps, minutes, hundreds of thousands to millions of input tokens (incl. cache); varies by task/model/effort. Failures resolve ok:false (invalid args/user cancel reject); stopped children may leave partial files. changes: edit/write only; model/effort as in llm.
-        \\  // background returns {id} now, result as a message in a later Step; a reply without Run waits. Background edits share the workspace and may land mid-build.
-        \\  async agent({ prompt, timeout_ms = 1800000, model, effort, background = false }) {}, // → { ok, text, usage, changes, error? } or { id }
+        \\  // Independent multi-step worker; same tools except agent; only prompt shared. Observed coding tasks: 15-40 Steps, minutes, 100Ks to millions of prompt tokens incl. cache; varies by task/model/effort.
+        \\  // resume: task id (a1), keeps history; one in-flight call/agent. Failures resolve ok:false; invalid args/user cancel reject. Stopped children may leave files. usage/changes: this call only; edit/write deltas, not net. model/effort as llm.
+        \\  // background returns {id}, result in a later Step; reply without Run waits. Shared files may change mid-build.
+        \\  async agent({ prompt, resume, timeout_ms = 1800000, model, effort, background = false }) {}, // → { ok, id, text, usage, changes, error? } or { id }
         ,
     },
 };
@@ -131,6 +148,7 @@ pub const docs = root_api.docs;
 pub const Tools = struct {
     io: std.Io,
     home: []const u8,
+    data_home: ?[]const u8 = null,
     environ: ?*const std.process.Environ.Map = null,
     cfg: ?provider.Config = null,
     depth: u32 = 0,
@@ -138,6 +156,7 @@ pub const Tools = struct {
     agents_mutex: std.Io.Mutex = .init,
     agents_changed: std.Io.Condition = .init,
     agents_active: usize = 0,
+    agent_sessions: @import("tools/agent/sessions.zig").Registry = .{},
     background: @import("tools/background.zig").Background = .{},
     run_id: usize = 0,
     background_sink: ?struct { ctx: *anyopaque, emit: *const fn (*anyopaque, @import("session/events.zig").Background) anyerror!void } = null,
@@ -146,81 +165,26 @@ pub const Tools = struct {
     llm_calls: std.atomic.Value(usize) = .init(0),
     usage_sink: ?struct { ctx: *anyopaque, emit: *const fn (*anyopaque, provider.Usage) anyerror!void } = null,
     cancel: std.atomic.Value(bool) = .init(false),
-    paths_mutex: std.Io.Mutex = .init,
-    paths_changed: std.Io.Condition = .init,
-    paths: ?*PathLock = null,
-    /// Off in tests that call tools directly, so nothing is left to free.
+    file_state: @import("tools/file_state.zig").State = .{},
     track_changes: bool = false,
     changes_mutex: std.Io.Mutex = .init,
-    touched: std.ArrayList(Touched) = .empty,
+    changes: @import("tools/changes.zig").Tracker = .{},
 
-    const Touched = struct { path: []u8, before: ?[]u8 };
-
-    pub const PathLock = struct { path: []const u8, next: ?*PathLock = null };
-
-    pub fn lockPath(t: *Tools, lock: *PathLock) void {
-        t.paths_mutex.lockUncancelable(t.io);
-        defer t.paths_mutex.unlock(t.io);
-        while (true) {
-            var item = t.paths;
-            while (item) |p| : (item = p.next) if (std.mem.eql(u8, p.path, lock.path)) break;
-            if (item == null) break;
-            t.paths_changed.waitUncancelable(t.io, &t.paths_mutex);
-        }
-        lock.next = t.paths;
-        t.paths = lock;
-    }
-
-    pub fn unlockPath(t: *Tools, lock: *PathLock) void {
-        t.paths_mutex.lockUncancelable(t.io);
-        defer t.paths_mutex.unlock(t.io);
-        var link = &t.paths;
-        while (link.* != lock) link = &link.*.?.next;
-        link.* = lock.next;
-        t.paths_changed.broadcast(t.io);
-    }
-
-    /// Remembers a file as it was before the current Run first changed it.
-    pub fn noteBefore(t: *Tools, gpa: std.mem.Allocator, path: []const u8, before: ?[]const u8) !void {
+    pub fn noteChange(t: *Tools, gpa: std.mem.Allocator, path: []const u8, before: ?[]const u8, after: []const u8) !void {
         if (!t.track_changes) return;
         t.changes_mutex.lockUncancelable(t.io);
         defer t.changes_mutex.unlock(t.io);
-        for (t.touched.items) |x| if (std.mem.eql(u8, x.path, path)) return;
-        const p = try gpa.dupe(u8, path);
-        errdefer gpa.free(p);
-        const b = if (before) |data| try gpa.dupe(u8, data) else null;
-        errdefer if (b) |data| gpa.free(data);
-        try t.touched.append(gpa, .{ .path = p, .before = b });
+        try t.changes.record(gpa, path, before, after);
     }
 
-    /// What edit/write changed since the last call, compared with the files now. Result is allocated with `a`.
     pub fn takeChanges(t: *Tools, gpa: std.mem.Allocator, a: std.mem.Allocator) ![]const diff.Change {
-        defer t.discardChanges(gpa);
-        var scratch: std.heap.ArenaAllocator = .init(gpa);
-        defer scratch.deinit();
-        const cwd = try std.process.currentPathAlloc(t.io, scratch.allocator());
-        var out: std.ArrayList(diff.Change) = .empty;
-        for (t.touched.items) |x| {
-            _ = scratch.reset(.retain_capacity);
-            const s = scratch.allocator();
-            const after = std.Io.Dir.cwd().readFileAlloc(t.io, x.path, s, .limited(16 * 1024 * 1024)) catch |err| switch (err) {
-                error.FileNotFound => "",
-                else => continue,
-            };
-            const stat = try diff.compare(s, x.before orelse "", after);
-            if (stat.added == 0 and stat.removed == 0 and x.before != null) continue;
-            const shown = if (std.mem.startsWith(u8, x.path, cwd) and x.path.len > cwd.len and x.path[cwd.len] == '/') x.path[cwd.len + 1 ..] else x.path;
-            try out.append(a, .{ .path = try a.dupe(u8, shown), .added = stat.added, .removed = stat.removed, .created = x.before == null, .diff = try a.dupe(u8, stat.diff) });
-        }
-        return out.items;
+        const cwd = try std.process.currentPathAlloc(t.io, gpa);
+        defer gpa.free(cwd);
+        return t.changes.take(gpa, a, cwd);
     }
 
     pub fn discardChanges(t: *Tools, gpa: std.mem.Allocator) void {
-        for (t.touched.items) |x| {
-            gpa.free(x.path);
-            if (x.before) |b| gpa.free(b);
-        }
-        t.touched.clearAndFree(gpa);
+        t.changes.discard(gpa);
     }
 
     pub fn api(t: *const Tools) Api {
@@ -267,15 +231,7 @@ pub const Tools = struct {
     pub fn host(t: *Tools) sandbox.Host {
         t.cancel.store(false, .release);
         t.llm_calls.store(0, .monotonic);
-        return .{ .ctx = t, .names = t.api().names, .call = call, .cancel = &t.cancel, .poll = poll, .admit = admit, .backgroundId = backgroundId };
-    }
-
-    fn backgroundId(ctx: *anyopaque, id: []const u8) ?[]const u8 {
-        const t: *Tools = @ptrCast(@alignCast(ctx));
-        t.background.mutex.lockUncancelable(t.io);
-        defer t.background.mutex.unlock(t.io);
-        for (t.background.jobs.items) |job| if (std.mem.eql(u8, job.id, id)) return job.id;
-        return null;
+        return .{ .ctx = t, .names = t.api().names, .call = call, .cancel = &t.cancel, .poll = poll, .admit = admit };
     }
 
     fn admit(ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8) !?[]u8 {
@@ -303,7 +259,7 @@ pub const Tools = struct {
         const t: *Tools = @ptrCast(@alignCast(ctx));
         const r = for (all) |tool| {
             if (!enabled(tool, t.depth)) continue;
-            if (std.mem.eql(u8, name, tool.name)) break tool.run(t, gpa, args);
+            if (std.mem.eql(u8, name, tool.name)) break if (tool.run) |run_tool| run_tool(t, gpa, args) else error.SandboxOnlyTool;
         } else fail(gpa, "unknown tool", .{});
         return r catch |err| fail(gpa, "{s}", .{@errorName(err)}) catch .{ .err = &.{} };
     }
@@ -338,33 +294,7 @@ pub const Tools = struct {
 };
 
 pub fn normalizedPath(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-    const cwd = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(cwd);
-    const absolute = if (std.fs.path.isAbsolute(path)) try gpa.dupe(u8, path) else try std.fs.path.join(gpa, &.{ cwd, path });
-    defer gpa.free(absolute);
-    return canonicalPath(io, gpa, absolute);
-}
-
-fn canonicalPath(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const len = std.Io.Dir.cwd().realPathFile(io, path, &buffer) catch |err| {
-        if (err != error.FileNotFound) return err;
-        if (std.Io.Dir.cwd().readLink(io, path, &buffer)) |n| {
-            const target = if (std.fs.path.isAbsolute(buffer[0..n]))
-                try gpa.dupe(u8, buffer[0..n])
-            else
-                try std.fs.path.join(gpa, &.{ std.fs.path.dirname(path).?, buffer[0..n] });
-            defer gpa.free(target);
-            return canonicalPath(io, gpa, target);
-        } else |link_err| switch (link_err) {
-            error.FileNotFound, error.NotLink => {},
-            else => return link_err,
-        }
-        const parent = try canonicalPath(io, gpa, std.fs.path.dirname(path) orelse return err);
-        defer gpa.free(parent);
-        return std.fs.path.resolve(gpa, &.{ parent, std.fs.path.basename(path) });
-    };
-    return gpa.dupe(u8, buffer[0..len]);
+    return @import("tools/atomic_file.zig").canonicalPath(io, gpa, path);
 }
 
 pub fn fail(gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !sandbox.ToolResult {
@@ -375,7 +305,12 @@ const testing = std.testing;
 
 /// Calls a tool on a fresh root Tools, for tests.
 pub fn callTool(name: []const u8, args: []const u8) !sandbox.ToolResult {
-    var t: Tools = .{ .io = testing.io, .home = "/home/nobody" };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer testing.allocator.free(home);
+    var t: Tools = .{ .io = testing.io, .home = home };
+    defer t.file_state.deinit(testing.allocator);
     return Tools.call(&t, testing.allocator, name, args);
 }
 
@@ -457,7 +392,7 @@ test "child API filters agent from both docs and sandbox" {
     try testing.expect(std.mem.indexOf(u8, t.api().docs, "async agent({") == null);
     const result = try sandbox.eval(testing.allocator, testing.io, "[typeof tools.agent, Object.keys(tools)]", .{}, t.host(), null);
     defer result.deinit(testing.allocator);
-    try testing.expectEqualStrings("[\"undefined\",[\"read\",\"edit\",\"write\",\"grep\",\"glob\",\"fetch\",\"bash\",\"llm\"]]", result.text);
+    try testing.expectEqualStrings("[\"undefined\",[\"sleep\",\"read\",\"edit\",\"write\",\"grep\",\"glob\",\"fetch\",\"bash\",\"stop\",\"llm\"]]", result.text);
 }
 
 test "Run excludes tool waits without resetting the JS budget" {

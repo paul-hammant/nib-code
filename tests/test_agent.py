@@ -111,11 +111,17 @@ class AgentTests:
         runs = [e["run_end"] for e in events if "run_end" in e]
         self.assertEqual(len(runs), 1, events)
         self.assertTrue(runs[0]["ok"], runs[0])
-        return json.loads(runs[0]["output"].removeprefix("result: ")), events
+        result = json.loads(runs[0]["output"].removeprefix("result: "))
+        if isinstance(result, dict) and "ok" in result:
+            self.assertEqual(result["id"], "a1")
+            self.assertNotIn("session", result)
+        return result, events
 
     def assert_result(self, result, ok):
-        self.assertEqual(set(result), {"ok", "text", "usage", "changes"} | (set() if ok else {"error"}), result)
+        self.assertEqual(set(result), {"id", "ok", "text", "usage", "changes"} | (set() if ok else {"error"}), result)
         self.assertIs(result["ok"], ok)
+        self.assertRegex(result["id"], r"^a[1-9][0-9]*$")
+        self.assertNotIn("session", result)
         self.assertIsInstance(result["text"], str)
         self.assertEqual(set(result["usage"]), set(USAGE))
         self.assertIsInstance(result["changes"], list)
@@ -145,8 +151,7 @@ class AgentTests:
         self.assertEqual(len(changes), len(result["changes"]))
         self.assertEqual(changes, {
             "new.txt": {"path": "new.txt", "added": 3, "removed": 1, "created": True},
-            str(self.cwd / "existing.txt"): {"path": str(self.cwd / "existing.txt"),
-                                             "added": 2, "removed": 3, "created": False},
+            "existing.txt": {"path": "existing.txt", "added": 2, "removed": 3, "created": False},
             "failed-run.txt": {"path": "failed-run.txt", "added": 1, "removed": 0, "created": True}})
         self.assertEqual((self.cwd / "new.txt").read_text(), "a\nc\n")
         self.assertEqual((self.cwd / "existing.txt").read_text(), "final\n")
@@ -160,6 +165,7 @@ class AgentTests:
     def check_parallel(self, fault):
         results, events = self.ask("parallel:" + fault)
         self.assertEqual(len(results), 3)
+        self.assertCountEqual([r["id"] for r in results], ["a1", "a2", "a3"])
         self.assert_result(results[0], False)
         self.assertIn("prelude:" + fault, results[0]["text"])
         self.assertGreaterEqual(results[0]["usage"]["prompt_tokens"], 100)

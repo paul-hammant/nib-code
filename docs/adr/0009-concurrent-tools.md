@@ -5,13 +5,15 @@ date: 2026-11-01
 
 # Run 内工具调用真正并发，顺序按 JS 语义
 
-宿主函数立即返回一个 Promise，实际工作在线程上执行，完成后回到 Run 所在的线程 resolve（QuickJS 不是线程安全的）。执行顺序完全由脚本决定：`Promise.all` 就并行，依次 `await` 就串行。唯一的额外规则：对同一路径的 `edit` / `write` 按路径加锁。
+宿主函数立即返回一个 Promise；通常实际工作在线程上执行，完成后回到 Run 所在的线程 resolve（QuickJS 不是线程安全的）。`tools.sleep(ms)` 是例外：由 sandbox 原生事件循环计时器调度，不启动进程或线程、不占工具并发槽；等待、取消与 Run 排空语义见 [run-output.md](../run-output.md#run-内延时与轮询)。执行顺序完全由脚本决定：`Promise.all` 就并行，依次 `await` 就串行。唯一的额外规则：对同一路径的 `edit` / `write` 按路径加锁。
 
 **为什么：** 现在工具调用同步执行，`Promise.all` 结果正确但不并发。子 agent（[0010](0010-subagents.md)）要靠并行分派才有价值，并发是它的前提。顺序已经由代码表达，不需要再加规则。
 
 **被否决的方案：** DeepSeek Harness 的规则：只读操作并行，有副作用的操作按提交顺序串行（**二手**：第三方博客，未核实）。它让 `Promise.all` 的语义因工具而异，模型需要额外记住一条规则。
 
-**实现选择：** 每个 Run 最多 8 个工具工作线程，超出的调用留在 Run 队列；完成结果进入互斥锁保护的队列，Run 线程独自调用 QuickJS。没有 pending job 时最多等待 20 ms，再检查取消；等待工具的时间不消耗 JS 执行预算。停止时设置 `Tools.cancel`，已完成调用立即回收数据；停止时先 join 全部剩余线程，再释放调用数据和 QuickJS。路径锁覆盖 edit/write 的完整操作，已有路径解析符号链接，尚不存在的路径由最近存在的父目录规范化；不约束 bash 或其他进程的文件写入。
+**实现选择：** 每个 Run 最多 8 个工具工作线程，超出的调用留在 Run 队列；完成结果进入互斥锁保护的队列，Run 线程独自调用 QuickJS。没有 pending job 时最多等待 20 ms，再检查取消；等待工具的时间不消耗 JS 执行预算。顶层 Run Promise 无论 fulfill 还是 reject，都继续 drain 在途及排队工具、JS jobs，以及 continuation 新发起的调用，直到没有剩余工作；reject 时仍报告顶层 Promise 的原始拒绝原因。任意调用失败都不会取消其他调用，不限于子 agent。只有用户取消或 JS 执行超时才中止 Run 内工具并设置 `Tools.cancel`；中止时已完成调用立即回收数据，先 join 全部剩余线程，再释放调用数据和 QuickJS。路径锁覆盖 edit/write 的完整操作，已有路径解析符号链接，尚不存在的路径由最近存在的父目录规范化；不约束 bash 或其他进程的文件写入。
+
+因此 `Promise.all` 中一次 read 失败不会停止并行 bash 的写入；即使 Run 已经 reject，也要等待前台 agent 完成，承担其剩余等待时间与用量，用户仍可按 Esc 取消。用户取消或 JS 执行超时留下未完成调用时，Run 输出保留一行 `[stopped before completion: bash #0, agent #2]`，索引是该 Run 内全部工具调用的创建顺序，从 0 开始，不按工具类型分别编号。
 
 bash 的进程组启动、限时输出轮询、取消和回收移入 `src/tools/process.zig`，供后续子 agent 复用。调整了旧实现的一个漏洞：输出 EOF 后仍继续轮询进程退出，关闭输出的命令也能取消和超时。
 

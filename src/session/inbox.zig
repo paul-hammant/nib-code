@@ -25,7 +25,7 @@ pub const Batch = struct {
     }
 };
 
-pub const Item = struct { id: u64, text: []const u8, background: ?Background = null };
+pub const Item = struct { id: u64, text: []const u8, background: ?Background = null, detached: bool = false, invocation: usize = 0 };
 
 pub const Inbox = struct {
     mutex: std.Io.Mutex = .init,
@@ -43,7 +43,7 @@ pub const Inbox = struct {
         return id;
     }
 
-    pub fn enqueueBackground(q: *Inbox, gpa: std.mem.Allocator, io: std.Io, id: []const u8, kind: Background.Kind, state: @FieldType(Background, "state"), ok: ?bool, text: []const u8) !u64 {
+    pub fn enqueueBackground(q: *Inbox, gpa: std.mem.Allocator, io: std.Io, id: []const u8, kind: Background.Kind, state: @FieldType(Background, "state"), ok: ?bool, text: []const u8, detached: bool, invocation: usize) !u64 {
         q.mutex.lockUncancelable(io);
         defer q.mutex.unlock(io);
         const copy = try gpa.dupe(u8, text);
@@ -51,7 +51,7 @@ pub const Inbox = struct {
         const agent_id = try gpa.dupe(u8, id);
         errdefer gpa.free(agent_id);
         const message_id = q.next_id;
-        try q.batch.items.append(gpa, .{ .id = message_id, .text = copy, .background = .{ .id = agent_id, .kind = kind, .state = state, .ok = ok } });
+        try q.batch.items.append(gpa, .{ .id = message_id, .text = copy, .background = .{ .id = agent_id, .kind = kind, .state = state, .ok = ok }, .detached = detached, .invocation = invocation });
         q.next_id += 1;
         return message_id;
     }
@@ -70,17 +70,60 @@ pub const Inbox = struct {
         return batch;
     }
 
-    pub fn insert(q: *Inbox, gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, pending: *std.ArrayList(provider.Message)) !Batch {
+    pub fn takeUsers(q: *Inbox, gpa: std.mem.Allocator, io: std.Io) !Batch {
         q.mutex.lockUncancelable(io);
         defer q.mutex.unlock(io);
+        var users: Batch = .{};
+        errdefer users.items.deinit(gpa);
+        var count: usize = 0;
+        for (q.batch.items.items) |item| if (item.background == null) {
+            count += 1;
+        };
+        try users.items.ensureTotalCapacity(gpa, count);
+        var retained: usize = 0;
+        for (q.batch.items.items) |item| {
+            if (item.background == null) {
+                users.items.appendAssumeCapacity(item);
+            } else {
+                q.batch.items.items[retained] = item;
+                retained += 1;
+            }
+        }
+        q.batch.items.shrinkRetainingCapacity(retained);
+        return users;
+    }
+
+    pub fn insert(q: *Inbox, gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, pending: *std.ArrayList(provider.Message)) !Batch {
+        return q.insertSelected(gpa, io, arena, pending, false);
+    }
+
+    pub fn insertBackground(q: *Inbox, gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, pending: *std.ArrayList(provider.Message)) !Batch {
+        return q.insertSelected(gpa, io, arena, pending, true);
+    }
+
+    fn insertSelected(q: *Inbox, gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, pending: *std.ArrayList(provider.Message), background_only: bool) !Batch {
+        q.mutex.lockUncancelable(io);
+        defer q.mutex.unlock(io);
+        var selected: Batch = .{};
+        errdefer selected.items.deinit(gpa);
+        try selected.items.ensureTotalCapacity(gpa, q.batch.items.items.len);
         var messages: std.ArrayList(provider.Message) = .empty;
         defer messages.deinit(gpa);
-        for (q.batch.items.items) |item|
+        for (q.batch.items.items) |item| {
+            if (background_only and (item.background == null or item.detached)) continue;
+            selected.items.appendAssumeCapacity(item);
             try messages.append(gpa, .{ .role = "user", .content = try arena.dupe(u8, item.text), .source = if (item.background != null) .background else null, .background_kind = if (item.background) |b| b.kind else null, .background_ok = if (item.background) |b| b.ok else null, .background_id = if (item.background) |b| try arena.dupe(u8, b.id) else null });
+        }
         try pending.appendSlice(gpa, messages.items);
-        const batch = q.batch;
-        q.batch = .{};
-        return batch;
+        var retained: usize = 0;
+        for (q.batch.items.items) |item| {
+            if (background_only and (item.background == null or item.detached)) {
+                q.batch.items.items[retained] = item;
+                retained += 1;
+            }
+        }
+        q.batch.items.shrinkRetainingCapacity(retained);
+        return selected;
     }
 };
 
@@ -138,4 +181,78 @@ test "concurrent enqueue assigns FIFO ids without losing messages" {
     defer batch.deinit(t.allocator);
     try t.expectEqual(@as(usize, 100), batch.items.items.len);
     for (batch.items.items, 1..) |item, id| try t.expectEqual(@as(u64, id), item.id);
+}
+
+test "limit wait inserts background results and preserves queued user messages" {
+    const t = std.testing;
+    var q: Inbox = .{};
+    defer q.batch.deinit(t.allocator);
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    var pending: std.ArrayList(provider.Message) = .empty;
+    defer pending.deinit(t.allocator);
+    _ = try q.enqueue(t.allocator, t.io, "next user message");
+    _ = try q.enqueueBackground(t.allocator, t.io, "b1", .bash, .finished, true, "background result", false, 0);
+    _ = try q.enqueueBackground(t.allocator, t.io, "b2", .bash, .finished, true, "detached result", true, 0);
+    _ = try q.enqueue(t.allocator, t.io, "another user message");
+    var inserted = try q.insertBackground(t.allocator, t.io, arena.allocator(), &pending);
+    defer inserted.deinit(t.allocator);
+    try t.expectEqual(@as(usize, 1), inserted.items.items.len);
+    try t.expectEqual(@as(usize, 1), pending.items.len);
+    try t.expectEqualStrings("background result", pending.items[0].content.?);
+    try t.expect(pending.items[0].source.? == .background);
+    try t.expectEqual(@as(usize, 3), q.batch.items.items.len);
+    try t.expectEqualStrings("next user message", q.batch.items.items[0].text);
+    try t.expectEqualStrings("detached result", q.batch.items.items[1].text);
+    try t.expectEqualStrings("another user message", q.batch.items.items[2].text);
+    var next_step = try q.insert(t.allocator, t.io, arena.allocator(), &pending);
+    defer next_step.deinit(t.allocator);
+    try t.expectEqual(@as(usize, 3), next_step.items.items.len);
+    try t.expect(q.empty(t.io));
+}
+
+test "taking queued users preserves background results for exactly one later insertion" {
+    const t = std.testing;
+    var q: Inbox = .{};
+    defer q.batch.deinit(t.allocator);
+    _ = try q.enqueueBackground(t.allocator, t.io, "b1", .bash, .finished, true, "first result", false, 0);
+    const user_id = try q.enqueue(t.allocator, t.io, "next input");
+    _ = try q.enqueueBackground(t.allocator, t.io, "b2", .bash, .finished, false, "second result", false, 0);
+    var users = try q.takeUsers(t.allocator, t.io);
+    defer users.deinit(t.allocator);
+    try t.expectEqual(@as(usize, 1), users.items.items.len);
+    try t.expectEqual(user_id, users.items.items[0].id);
+    try t.expectEqualStrings("next input", users.items.items[0].text);
+    var again = try q.takeUsers(t.allocator, t.io);
+    defer again.deinit(t.allocator);
+    try t.expectEqual(@as(usize, 0), again.items.items.len);
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    var pending: std.ArrayList(provider.Message) = .empty;
+    defer pending.deinit(t.allocator);
+    var results = try q.insert(t.allocator, t.io, arena.allocator(), &pending);
+    defer results.deinit(t.allocator);
+    try t.expectEqual(@as(usize, 2), results.items.items.len);
+    try t.expectEqualStrings("b1", results.items.items[0].background.?.id);
+    try t.expectEqualStrings("b2", results.items.items[1].background.?.id);
+    try t.expectEqualStrings("first result", pending.items[0].content.?);
+    try t.expectEqualStrings("second result", pending.items[1].content.?);
+    var empty = try q.insert(t.allocator, t.io, arena.allocator(), &pending);
+    defer empty.deinit(t.allocator);
+    try t.expectEqual(@as(usize, 0), empty.items.items.len);
+    try t.expectEqual(@as(usize, 2), pending.items.len);
+}
+
+test "taking queued users leaves the inbox untouched on allocation failure" {
+    const t = std.testing;
+    var q: Inbox = .{};
+    defer q.batch.deinit(t.allocator);
+    _ = try q.enqueueBackground(t.allocator, t.io, "b1", .bash, .finished, true, "result", false, 0);
+    const id = try q.enqueue(t.allocator, t.io, "next input");
+    var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+    try t.expectError(error.OutOfMemory, q.takeUsers(failing.allocator(), t.io));
+    try t.expectEqual(@as(usize, 2), q.batch.items.items.len);
+    try t.expectEqualStrings("b1", q.batch.items.items[0].background.?.id);
+    try t.expectEqual(id, q.batch.items.items[1].id);
+    try t.expectEqualStrings("next input", q.batch.items.items[1].text);
 }

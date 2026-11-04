@@ -484,7 +484,7 @@ class AgentStats:
 class Timing:
     def __init__(self):
         self.values = {key: [] for key in ('step_ms', 'model_ms', 'run_ms', 'run_result_ms',
-                                         'first_data_ms', 'code_first_ms', 'code_span_ms', 'attempts')}
+                                         'first_data_ms', 'max_gap_ms', 'code_first_ms', 'code_span_ms', 'attempts')}
         self.effort = EffortStats()
         self.tools = {}
         self.bash = {}
@@ -492,7 +492,7 @@ class Timing:
 
     def add(self, record, sources, run_statuses=()):
         self.effort.add(record, run_statuses)
-        for key in ('model_ms', 'run_ms', 'first_data_ms', 'attempts'):
+        for key in ('model_ms', 'run_ms', 'first_data_ms', 'max_gap_ms', 'attempts'):
             if number(record.get(key)):
                 self.values[key].append(record[key])
         if number(record.get('ms')):
@@ -547,7 +547,9 @@ class Timing:
             return dict(count=len(values), total_ms=sum(values), median_ms=median(values))
         spans = self.values['code_span_ms']
         streamed = sum(span > 50 for span in spans)
-        return dict({key: distribution(values) for key, values in self.values.items()},
+        summaries = {key: distribution(values) for key, values in self.values.items()}
+        summaries['max_gap_ms']['max'] = max(self.values['max_gap_ms'], default=None)
+        return dict(summaries,
                     effort=self.effort.report(),
                     calls_steps=self.calls_steps, calls_omitted=self.calls_omitted,
                     tools={name: tool_summary(values) for name, values in sorted(self.tools.items())},
@@ -893,9 +895,10 @@ def text_report(report):
         lines.append('  无计时记录')
     timing = report['timing']
     lines.append('耗时构成 / 计时 Timing（ms，attempts 为次数；缺失字段不补零）：')
-    for name in ('step_ms', 'model_ms', 'run_ms', 'run_result_ms', 'first_data_ms', 'code_first_ms', 'code_span_ms', 'attempts'):
+    for name in ('step_ms', 'model_ms', 'run_ms', 'run_result_ms', 'first_data_ms', 'max_gap_ms', 'code_first_ms', 'code_span_ms', 'attempts'):
         item = timing[name]
-        lines.append(f"  {name}: samples={item['samples']} median={fmt(item['median'])} p90={fmt(item['p90'])}")
+        maximum = f" max={fmt(item['max'])}" if name == 'max_gap_ms' else ''
+        lines.append(f"  {name}: samples={item['samples']} median={fmt(item['median'])} p90={fmt(item['p90'])}{maximum}")
     effort = timing['effort']
     lines.append('  Step effort（顶层元数据）：')
     for level, item in effort['by_effort'].items():

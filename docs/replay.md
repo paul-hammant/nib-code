@@ -25,6 +25,8 @@ nib replay <session_id> --run 1:0 --script diagnose.js --json
 
 不带 `--script` 时运行主日志内保存的原始 Run 代码。每个工具调用按创建顺序匹配录制的 `index`、工具名和 JSON 参数；参数按结构比较，对象键顺序不重要，数组顺序重要。工具 Promise 按录制的 `seq` 顺序兑现或拒绝，复现并发代码观察到的结算顺序，而不是原来的墙钟耗时。第一次不匹配记录为 `divergence`，不继续尝试真实工具。
 
+`tools.sleep(ms)` 也按标准工具调用录制参数、返回值或拒绝；重放使用录制结果，不启动真实计时器、不等待指定毫秒数。它不会推进重放中固定的 `Date.now()`，因此轮询应有次数上限，不要只依赖墙钟截止时间。
+
 完成后，按正常 Run 输出规则格式化结果，并与主日志里对应的 tool 消息逐字节比较。调用匹配但最终输出不同也会报告分歧；因此 `match` 不只是“工具参数相同”。
 
 ### 诊断脚本
@@ -81,7 +83,7 @@ $NIB_HOME/sessions/<session_id>.calls.jsonl  旁路：工具调用与实际返�
 
 1 MiB 限制针对单项保留的原始文本，不是整行 JSONL 的编码体积；JSON 转义可能使行更大。参数保持完整，不设单独上限；暂不设整 Run 或会话总量上限、不自动轮转。Run 内先在内存累积，结束后同步写盘，大量调用仍会增加内存和磁盘占用。
 
-只在统一的工具结算交付路径录制结果，不记录 worker 已完成但未交回 JS 的真实结果。eval 退出时比较工具创建总数与已交付总数；不相等时在 `meta` 附 `incomplete: true`，即使缺少的是最大 `index`、现有调用行没有中间空洞，也能判断录制不完整。例如 `Promise.all` 中 read 拒绝时 bash 仍 pending，或创建工具后直接 throw。普通 `error` 本身不代表不完整：没有调用或全部调用已结算的 error 仍可判定匹配。缺项时报告 `incomplete=true`、`match=null`；重放发现的 `divergence` 保留供诊断，但不能把它视为确定分歧。
+只在统一的工具结算交付路径录制结果，不记录 worker 已完成但未交回 JS 的真实结果。eval 退出时比较工具创建总数与已交付总数；不相等时在 `meta` 附 `incomplete: true`，即使缺少的是最大 `index`、现有调用行没有中间空洞，也能判断录制不完整。用户取消或 JS 执行超时可能留下未交回的调用。普通 `error` 不会停止其他调用：`Promise.all` 中 read 拒绝时仍等待 bash 结算，创建工具后直接 throw 也继续 drain，因此这些错误 Run 的录制完整，仍可判定匹配。缺项时报告 `incomplete=true`、`match=null`；重放发现的 `divergence` 保留供诊断，但不能把它视为确定分歧。
 
 加载器可以先接收调用行，再由末尾的 `meta` 补齐该 Run。缺失 `meta`、缺失引用、截断的条目会令报告 `incomplete=true`；缺失元数据时不推测时间（内部占位为 0），不把基于不完整数据的运行宣称为完整匹配。`--all` 只遍历所有有旁路记录的 Run，包括只有元数据、没有调用的 Run；`total` 不含 `NIB_RECORD=off` 时未录制的 Run，不据此统计主日志里的全部 Run。录制上限不改变原 Run 内 JS 获得的数据，也不改变模型侧的 Run 展示预算，见 [run-output.md](run-output.md)。
 
