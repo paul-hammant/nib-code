@@ -181,8 +181,10 @@ pub const App = struct {
             .mouse => |m| {
                 if (m.type == .press) app.notice = null;
                 if (m.button == .wheel_up or m.button == .wheel_down) {
-                    app.selection.clear();
-                    app.scroll.pending += if (m.button == .wheel_up) @as(i64, -3) else 3;
+                    if (m.type == .press and !app.selection.active) {
+                        app.selection.clear();
+                        app.scroll.pending += if (m.button == .wheel_up) @as(i64, -3) else 3;
+                    }
                 } else if (app.selection.mouse(m, &app.vx.screen)) {
                     const text = try app.selection.text(gpa, &app.vx.screen);
                     defer gpa.free(text);
@@ -465,6 +467,50 @@ fn isNewline(key: vaxis.Key, pasting: bool) bool {
     const enter = vaxis.Key.enter;
     return (pasting and key.matches(enter, .{})) or key.matches(enter, .{ .shift = true }) or
         key.matches(enter, .{ .alt = true }) or key.matches('j', .{ .ctrl = true });
+}
+
+test "wheel does not interrupt a selection and resumes scrolling after release" {
+    const gpa = std.testing.allocator;
+    var vx: vaxis.Vaxis = undefined;
+    vx.screen = try vaxis.Screen.init(gpa, .{ .cols = 8, .rows = 3, .x_pixel = 0, .y_pixel = 0 });
+    defer vx.screen.deinit(gpa);
+    for (0..3) |col| {
+        vx.screen.writeCell(@intCast(col), 0, .{ .char = .{ .grapheme = "abc"[col .. col + 1], .width = 1 } });
+    }
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.vx = &vx;
+    app.selection = .{};
+    app.scroll = .{};
+    app.notice = null;
+    for ([_]vaxis.Mouse.Button{ .wheel_up, .wheel_down }) |button| {
+        _ = try app.handle(.{ .mouse = .{ .col = 0, .row = 0, .button = .left, .mods = .{}, .type = .press } });
+        const pressed = app.selection;
+        _ = try app.handle(.{ .mouse = .{ .col = 0, .row = 0, .button = button, .mods = .{}, .type = .press } });
+        try std.testing.expectEqualDeep(pressed, app.selection);
+        try std.testing.expectEqual(@as(i64, 0), app.scroll.pending);
+        _ = try app.handle(.{ .mouse = .{ .col = 2, .row = 0, .button = .left, .mods = .{}, .type = .drag } });
+        const dragged = app.selection;
+        for ([_]vaxis.Mouse.Type{ .press, .release, .drag, .motion }) |kind| {
+            _ = try app.handle(.{ .mouse = .{ .col = 7, .row = 2, .button = button, .mods = .{}, .type = kind } });
+            try std.testing.expectEqualDeep(dragged, app.selection);
+            try std.testing.expectEqual(@as(i64, 0), app.scroll.pending);
+        }
+        try std.testing.expect(app.selection.mouse(.{ .col = 2, .row = 0, .button = .left, .mods = .{}, .type = .release }, &vx.screen));
+        const text = try app.selection.text(gpa, &vx.screen);
+        defer gpa.free(text);
+        try std.testing.expectEqualStrings("abc", text);
+        const released = app.selection;
+        for ([_]vaxis.Mouse.Type{ .release, .drag, .motion }) |kind| {
+            _ = try app.handle(.{ .mouse = .{ .col = 7, .row = 2, .button = button, .mods = .{}, .type = kind } });
+            try std.testing.expectEqualDeep(released, app.selection);
+            try std.testing.expectEqual(@as(i64, 0), app.scroll.pending);
+        }
+        _ = try app.handle(.{ .mouse = .{ .col = 7, .row = 2, .button = button, .mods = .{}, .type = .press } });
+        try std.testing.expectEqualDeep(selection.Selection{}, app.selection);
+        try std.testing.expectEqual(@as(i64, if (button == .wheel_up) -3 else 3), app.scroll.pending);
+        app.scroll.pending = 0;
+    }
 }
 
 test "bracketed paste buffers newline and slash keys without executing them" {
