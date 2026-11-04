@@ -40,4 +40,14 @@
 
 ## Run 执行预算与取消
 
+顶层 Run Promise fulfill 或 reject 后都继续 drain：等待在途及排队工具完成，执行剩余 JS jobs，并接纳 continuation 新发起的工具调用，直到没有剩余工作。任意调用失败都不会取消其他调用（不只子 agent 失败）；顶层 reject 时，Run 最终仍报原始拒绝原因，不被后续完成或失败覆盖。因此 `Promise.all` 提前 reject 不代表并行副作用停止，失败的 Run 也可能继续写文件；前台 agent 仍需等待完成并计入用量，等待期间用户仍可按 Esc 取消。后台任务的跨 Run 生命周期见 [tool-delegation.md](tool-delegation.md)。
+
+只有用户取消或 JS 执行超时才中止 Run 内工具；工具自身超时只终止该调用，不取消其他调用。中止时如有未完成调用，Run 输出保留一行：
+
+```text
+[stopped before completion: bash #0, agent #2]
+```
+
+这里的索引按该 Run 内全部工具调用的创建顺序从 0 开始，不是各工具独立编号，也不是后台任务 id；已交回 JS 的调用不列入，未交回的调用（包括仍在排队或已产生结果但尚未交回的调用）按创建顺序列出。这行最多 4 KiB；清单过长时用 `..., N more` 明示剩余调用数，为错误和 console 保留空间。整行预留模型侧 16 KiB 输出预算，不会被正文截断，用于区分报错前已完成的副作用与可能留下半成品的调用。普通 fulfill/reject 的 drain 完成不会产生这行。
+
 Run 的默认 5 分钟超时只累计 QuickJS 执行片段（初始脚本、Promise jobs、工具结果解析/resolve、返回值序列化和错误转换），不计算等待工具完成的时间，也不在每次 await 后重置预算。它用于中断 JS 死循环；bash/fetch/agent 的执行时限由各自工具负责。等待时仍每 20 ms 检查取消，Esc/SIGINT/SIGTERM 不受计时暂停影响。

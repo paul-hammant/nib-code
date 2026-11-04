@@ -124,6 +124,15 @@ class H(http.server.BaseHTTPRequestHandler):
                 code = 'await Promise.all(Array.from({length: 6}, (_, i) => tools.agent({prompt: "child " + i})))'
             elif lastuser == 'delegate_probe':
                 code = 'await tools.agent({prompt: "child probe"})'
+            elif lastuser == 'run_drain_read_failure':
+                code = "await Promise.all([tools.bash({command:'sleep 2; echo finished > marker'}), tools.read({path:'nope.txt'})])"
+            elif lastuser in ('run_drain_reject_continuation', 'run_drain_fulfill_continuation'):
+                code = ('tools.bash({command: "sleep 0.1"}).then(async () => {'
+                        'await tools.bash({command: "sleep 0.1"});'
+                        'await tools.write({path: "marker", content: "finished\\n"});'
+                        '});')
+                code += ('throw new Error("original rejection");' if lastuser == 'run_drain_reject_continuation'
+                         else '"fulfilled";')
             elif lastuser == 'stats_missing':
                 code = 'await tools.bash({command: "nib_stats_nonexistent_command_42"})'
             elif lastuser == 'edit_test':

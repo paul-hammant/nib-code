@@ -4,6 +4,7 @@ const console = @import("sandbox/console.zig");
 const run_timing = @import("sandbox/timing.zig");
 pub const RunTiming = run_timing.Run;
 pub const tool_concurrency = 8;
+pub const max_stopped_bytes = 4096;
 
 pub const Recorder = @import("sandbox/record.zig").Recorder;
 pub const replay = @import("sandbox/replay.zig");
@@ -71,11 +72,13 @@ pub const Outcome = struct {
     log_tail_start: usize = 0,
     log_truncated: bool = false,
     tool_bytes: u64 = 0,
+    stopped: []const u8 = "",
 
     pub fn deinit(o: Outcome, gpa: std.mem.Allocator) void {
         gpa.free(o.text);
         gpa.free(o.logs);
         gpa.free(o.log_entries);
+        gpa.free(o.stopped);
     }
 };
 
@@ -169,6 +172,23 @@ const State = struct {
         if (st.host) |h| if (h.cancel) |flag| flag.store(true, .release);
     }
 
+    fn stoppedCalls(st: *State) ![]const u8 {
+        var out: std.Io.Writer.Allocating = .init(st.gpa);
+        defer out.deinit();
+        var remaining: usize = 0;
+        for (st.calls.items) |item| {
+            const call = item orelse continue;
+            if (remaining > 0 or out.written().len + call.name.len + 64 > max_stopped_bytes) {
+                remaining += 1;
+                continue;
+            }
+            try out.writer.print("{s}{s} #{d}", .{ if (out.written().len == 0) "[stopped before completion: " else ", ", call.name, call.creation_index });
+        }
+        if (remaining > 0) try out.writer.print("{s}..., {d} more", .{ if (out.written().len == 0) "[stopped before completion: " else ", ", remaining });
+        if (out.written().len > 0) try out.writer.writeByte(']');
+        return out.toOwnedSlice();
+    }
+
     fn deinit(st: *State, ctx: *c.JSContext) void {
         st.stop();
         for (st.calls.items) |item| if (item) |call| if (call.thread) |thread| thread.join();
@@ -207,7 +227,7 @@ const State = struct {
         call.deinit(ctx);
     }
 
-    fn jobs(st: *State, ctx: *c.JSContext, rt: *c.JSRuntime, promise: c.JSValue) !void {
+    fn jobs(st: *State, ctx: *c.JSContext, rt: *c.JSRuntime) !bool {
         var active: usize = 0;
         var next: usize = 0;
         while (true) {
@@ -216,24 +236,24 @@ const State = struct {
                 st.calls.clearRetainingCapacity();
                 next = 0;
             }
-            if (virtualStopped(st)) return;
-            if (isInterrupted(st) or c.JS_PromiseState(ctx, promise) == c.JS_PROMISE_REJECTED) {
+            if (virtualStopped(st)) return false;
+            if (isInterrupted(st)) {
                 st.stop();
-                return;
+                return false;
             }
             var pctx: ?*c.JSContext = null;
             st.beginJs();
             const n = c.JS_ExecutePendingJob(rt, &pctx);
             st.endJs();
-            if (n < 0) return;
+            if (n < 0) return false;
             if (n > 0) continue;
             if (st.host) |h| if (h.virtual) |v| {
-                if (v.stopped(v.ctx)) return;
+                if (v.stopped(v.ctx)) return false;
                 var pending: std.ArrayList(usize) = .empty;
                 defer pending.deinit(st.gpa);
                 for (st.calls.items) |item| if (item) |call| try pending.append(st.gpa, call.creation_index);
-                if (pending.items.len == 0) return;
-                const selected = v.select(v.ctx, pending.items) orelse return;
+                if (pending.items.len == 0) return true;
+                const selected = v.select(v.ctx, pending.items) orelse return false;
                 for (st.calls.items) |item| {
                     const call = item orelse continue;
                     if (call.creation_index != selected) continue;
@@ -275,7 +295,7 @@ const State = struct {
                 };
                 active += 1;
             }
-            if (active == 0) return;
+            if (active == 0) return true;
             st.mutex.lockUncancelable(st.io);
             if (st.ready == null) st.completed.waitTimeout(st.io, &st.mutex, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch {};
             st.mutex.unlock(st.io);
@@ -354,13 +374,14 @@ pub fn eval(
     defer c.JS_FreeValue(ctx, promise);
 
     var ok = false;
+    var jobs_drained = true;
     var text: []u8 = undefined;
     if (c.JS_IsException(promise)) {
         st.beginJs();
         defer st.endJs();
         text = try takeException(gpa, ctx);
     } else {
-        try st.jobs(ctx, rt, promise);
+        jobs_drained = try st.jobs(ctx, rt);
         st.beginJs();
         defer st.endJs();
         switch (c.JS_PromiseState(ctx, promise)) {
@@ -382,6 +403,7 @@ pub fn eval(
         }
     }
     errdefer gpa.free(text);
+    if (jobs_drained) _ = try st.jobs(ctx, rt);
     if (st.oom) return error.OutOfMemory;
 
     if (isInterrupted(&st)) {
@@ -389,10 +411,13 @@ pub fn eval(
         gpa.free(text);
         text = try gpa.dupe(u8, if (st.cancel != null and st.cancel.?.load(.acquire)) "Error: run canceled" else "Error: run timed out");
     }
+    const stopped = if (isInterrupted(&st)) try st.stoppedCalls() else "";
+    errdefer gpa.free(stopped);
     const captured = try st.logs.snapshot(gpa);
     return .{
         .ok = ok,
         .tool_bytes = st.tool_bytes,
+        .stopped = stopped,
         .text = text,
         .logs = captured.logs,
         .log_entries = captured.entries,
@@ -606,6 +631,7 @@ test "timeout interrupts an infinite loop" {
     defer r.deinit(testing.allocator);
     try testing.expect(!r.ok);
     try testing.expectEqualStrings("Error: run timed out", r.text);
+    try testing.expectEqualStrings("", r.stopped);
 }
 
 test "timeout also covers JS invoked by result and error conversion" {
@@ -643,6 +669,22 @@ test "tools route through the host, errors become exceptions" {
         "{\"a\":{\"tool\":\"echo\",\"args\":{\"x\":1}},\"b\":{\"tool\":\"echo\",\"args\":{}},\"msg\":\"fail: nope\",\"keys\":[\"echo\",\"fail\"]}",
         r.text,
     );
+}
+
+test "result and rejection conversion callbacks drain their tool calls" {
+    var dummy: u8 = 0;
+    for ([_][]const u8{
+        "({ toJSON() { tools.echo({x:1}).then(r => console.log('converted', r.args.x)); return 7; } })",
+        "throw { toString() { tools.echo({x:1}).then(r => console.log('converted', r.args.x)); return 'original'; } }",
+    }, [_]bool{ true, false }, [_][]const u8{ "7", "original" }) |code, ok, text| {
+        const result = try run(code, .{}, .{ .ctx = &dummy, .names = &.{"echo"}, .call = EchoHost.call });
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual(ok, result.ok);
+        try testing.expectEqualStrings(text, result.text);
+        try testing.expectEqualStrings("converted 1\n", result.logs);
+        try testing.expect(result.tool_bytes > 0);
+        try testing.expectEqualStrings("", result.stopped);
+    }
 }
 
 test "tool concurrency is bounded while excess calls queue" {
@@ -740,7 +782,7 @@ test "parallel native timings retain dispatch order and survive rejected JS with
     }
 }
 
-test "undispatched tools do not produce native timings" {
+test "tools queued before a top-level throw are still dispatched and billed" {
     var timing: RunTiming = .init(testing.io, .now(testing.io, .awake));
     var dummy: TimingHost = .{};
     const result = try run("tools.bash(); throw new Error('before dispatch')", .{}, .{
@@ -751,9 +793,9 @@ test "undispatched tools do not produce native timings" {
     });
     defer result.deinit(testing.allocator);
     try testing.expect(!result.ok);
-    try testing.expectEqual(@as(usize, 0), timing.count);
-    try testing.expectEqual(@as(u64, 0), result.tool_bytes);
-    try testing.expectEqual(@as(u64, 0), timing.tool_bytes);
+    try testing.expectEqual(@as(usize, 1), timing.count);
+    try testing.expectEqual(@as(u64, "{\"exit_code\":7}".len), result.tool_bytes);
+    try testing.expectEqual(result.tool_bytes, timing.tool_bytes);
 }
 
 const FileBytesHost = struct {
@@ -859,37 +901,128 @@ test "admission rejections count only the returned error text" {
     try testing.expectEqual(@as(u64, 0), timing.llm_calls);
 }
 
-test "workers completed only during rejection cleanup do not contribute result bytes" {
-    const CleanupHost = struct {
-        cancel: std.atomic.Value(bool) = .init(false),
-        reading: std.atomic.Value(bool) = .init(false),
-
-        fn call(ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8, _: []const u8) ToolResult {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            if (std.mem.eql(u8, name, "read")) {
-                self.reading.store(true, .release);
-                while (!self.cancel.load(.acquire)) std.Thread.yield() catch {};
-                return .{ .ok = gpa.dupe(u8, "{\"text\":\"not delivered\"}") catch unreachable };
+test "top-level rejection drains slow results and their continuations" {
+    const FailFast = struct {
+        fn call(ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8, args: []const u8) ToolResult {
+            if (std.mem.eql(u8, name, "fetch")) {
+                const host: *TimingHost = @ptrCast(@alignCast(ctx));
+                host.fetched.store(true, .release);
+                return .{ .err = gpa.dupe(u8, "fetch failed") catch unreachable };
             }
-            while (!self.reading.load(.acquire)) std.Thread.yield() catch {};
-            return .{ .err = gpa.dupe(u8, "failed🙂") catch unreachable };
+            return TimingHost.call(ctx, gpa, name, args);
         }
     };
-    var host: CleanupHost = .{};
+    var host: TimingHost = .{};
     var timing: RunTiming = .init(testing.io, .now(testing.io, .awake));
-    const result = try run("await Promise.all([tools.read(), tools.fetch()])", .{}, .{
+    var recorder = Recorder.init(testing.allocator, testing.io, "unused-record-test-path", true);
+    defer recorder.deinit();
+    recorder.begin(1, 0);
+    const result = try run(
+        \\const slow = tools.read().then(async r => {
+        \\  console.log('slow delivered', r.exit_code);
+        \\  const next = await tools.bash();
+        \\  console.log('continuation delivered', next.exit_code);
+        \\});
+        \\await Promise.all([slow, tools.fetch()]);
+    , .{}, .{
         .ctx = &host,
-        .names = &.{ "read", "fetch" },
-        .call = CleanupHost.call,
-        .cancel = &host.cancel,
+        .names = &.{ "read", "fetch", "bash" },
+        .call = FailFast.call,
         .timing = &timing,
+        .record = &recorder,
     });
     defer result.deinit(testing.allocator);
     try testing.expect(!result.ok);
-    try testing.expectEqual("failed🙂".len, result.tool_bytes);
+    try testing.expect(std.mem.startsWith(u8, result.text, "Error: fetch: fetch failed"));
+    try testing.expectEqualStrings("slow delivered 7\ncontinuation delivered 7\n", result.logs);
+    try testing.expectEqualStrings("", result.stopped);
+    try testing.expectEqual(@as(usize, 3), timing.count);
+    try testing.expectEqual(@as(u64, 2 * "{\"exit_code\":7}".len + "fetch failed".len), result.tool_bytes);
     try testing.expectEqual(result.tool_bytes, timing.tool_bytes);
-    try testing.expectEqual(@as(?u64, 0), timing.entries[0].result_bytes);
-    try testing.expectEqual(@as(?u64, "failed🙂".len), timing.entries[1].result_bytes);
+    try testing.expectEqual(@as(usize, 3), recorder.seq);
+    try testing.expect(!recorder.incomplete);
+}
+
+const StoppingHost = struct {
+    cancel: std.atomic.Value(bool) = .init(false),
+    user_cancel: std.atomic.Value(bool) = .init(false),
+    started: std.atomic.Value(usize) = .init(0),
+    stopped: std.atomic.Value(usize) = .init(0),
+
+    fn call(ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8, args: []const u8) ToolResult {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (std.mem.eql(u8, name, "read")) {
+            if (std.mem.indexOf(u8, args, "barrier") != null) {
+                while (self.started.load(.acquire) < 2 and !self.cancel.load(.acquire)) std.Thread.yield() catch {};
+            }
+            return .{ .ok = gpa.dupe(u8, "1") catch unreachable };
+        }
+        _ = self.started.fetchAdd(1, .release);
+        while (!self.cancel.load(.acquire)) std.Thread.yield() catch {};
+        _ = self.stopped.fetchAdd(1, .release);
+        return .{ .err = gpa.dupe(u8, "not delivered") catch unreachable };
+    }
+
+    fn cancelLater(self: *@This()) void {
+        while (self.started.load(.acquire) < 2 and !self.cancel.load(.acquire)) std.Thread.yield() catch {};
+        if (self.cancel.load(.acquire)) return;
+        std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(50), .clock = .awake }, testing.io) catch unreachable;
+        self.user_cancel.store(true, .release);
+    }
+};
+
+test "cancel and timeout stop only undelivered calls and preserve their creation indices" {
+    for ([_]bool{ false, true }) |timeout| {
+        var host: StoppingHost = .{};
+        const cancel_thread = if (!timeout) try std.Thread.spawn(.{}, StoppingHost.cancelLater, .{&host}) else null;
+        defer if (cancel_thread) |thread| thread.join();
+        var timing: RunTiming = .init(testing.io, .now(testing.io, .awake));
+        var recorder = Recorder.init(testing.allocator, testing.io, "unused-record-test-path", true);
+        defer recorder.deinit();
+        recorder.begin(1, 0);
+        const setup = "tools.bash(); await tools.read(); tools.agent(); await tools.read({barrier:true});";
+        const result = try eval(testing.allocator, testing.io, if (timeout) setup ++ "for (;;) {}" else setup ++ "await new Promise(() => {});", .{ .timeout_ms = if (timeout) 50 else 5000 }, .{
+            .ctx = &host,
+            .names = &.{ "bash", "read", "agent" },
+            .call = StoppingHost.call,
+            .cancel = &host.cancel,
+            .timing = &timing,
+            .record = &recorder,
+        }, &host.user_cancel);
+        defer result.deinit(testing.allocator);
+        try testing.expect(!result.ok);
+        try testing.expectEqualStrings(if (timeout) "Error: run timed out" else "Error: run canceled", result.text);
+        try testing.expectEqualStrings("[stopped before completion: bash #0, agent #2]", result.stopped);
+        try testing.expectEqual(@as(usize, 2), host.stopped.load(.acquire));
+        try testing.expectEqual(@as(u64, 2), result.tool_bytes);
+        try testing.expectEqual(result.tool_bytes, timing.tool_bytes);
+        try testing.expectEqual(@as(?u64, 0), timing.entries[0].result_bytes);
+        try testing.expectEqual(@as(?u64, 0), timing.entries[2].result_bytes);
+        try testing.expectEqual(@as(usize, 2), recorder.seq);
+        try testing.expect(recorder.incomplete);
+        const output = try @import("session/output.zig").format(testing.allocator, result);
+        defer testing.allocator.free(output);
+        try testing.expect(std.mem.endsWith(u8, output, result.stopped));
+    }
+}
+
+test "stopped facts include queued calls and bound oversized lists explicitly" {
+    var dummy: u8 = 0;
+    const result = try run("for (let i = 0; i < 1000; i++) tools.bash(); for (;;) {}", .{ .timeout_ms = 100 }, .{
+        .ctx = &dummy,
+        .names = &.{"bash"},
+        .call = EchoHost.call,
+    });
+    defer result.deinit(testing.allocator);
+    try testing.expect(!result.ok);
+    try testing.expectEqual(@as(u64, 0), result.tool_bytes);
+    try testing.expect(result.stopped.len <= max_stopped_bytes);
+    try testing.expect(std.mem.startsWith(u8, result.stopped, "[stopped before completion: bash #0, bash #1, "));
+    try testing.expect(std.mem.endsWith(u8, result.stopped, " more]"));
+    const listed = std.mem.count(u8, result.stopped, "bash #");
+    const suffix = try std.fmt.allocPrint(testing.allocator, ", ..., {d} more]", .{1000 - listed});
+    defer testing.allocator.free(suffix);
+    try testing.expect(std.mem.endsWith(u8, result.stopped, suffix));
 }
 
 test "record and virtual replay share settlement path including admission rejects and monotonic creation indices" {
@@ -956,12 +1089,12 @@ test "record and virtual replay share settlement path including admission reject
     try testing.expectEqualStrings(actual.text, repeated.outcome.text);
 }
 
-test "eval exit records missing creations on errors but settled errors stay complete" {
+test "eval exit records all creations even on top-level errors" {
     const Case = struct { code: []const u8, incomplete: bool, delivered: usize };
     for ([_]Case{
-        .{ .code = "tools.bash(); throw new Error('pending')", .incomplete = true, .delivered = 0 },
-        .{ .code = "await tools.bash(); tools.bash(); throw new Error('tail pending')", .incomplete = true, .delivered = 1 },
-        .{ .code = "await Promise.all([tools.read(), tools.fetch()])", .incomplete = true, .delivered = 1 },
+        .{ .code = "tools.bash(); throw new Error('pending')", .incomplete = false, .delivered = 1 },
+        .{ .code = "await tools.bash(); tools.bash(); throw new Error('tail pending')", .incomplete = false, .delivered = 2 },
+        .{ .code = "await Promise.all([tools.read(), tools.fetch()])", .incomplete = false, .delivered = 2 },
         .{ .code = "await tools.bash(); throw new Error('settled')", .incomplete = false, .delivered = 1 },
         .{ .code = "await tools.fetch()", .incomplete = false, .delivered = 1 },
         .{ .code = "throw new Error('zero calls')", .incomplete = false, .delivered = 0 },
