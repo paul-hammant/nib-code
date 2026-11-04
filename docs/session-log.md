@@ -82,6 +82,10 @@ assistant 消息的可选 `step_effort: {effort, source}` 保存界面元数据�
 
 会话统计：`python3 scripts/stats.py [日志文件或目录] [--since YYYY-MM-DD] [--cwd 目录] [--group-by version|system|patches] [--json]`，默认只读 `$NIB_HOME/sessions`（默认 `~/.nib/sessions`），用于发现故障和比较改动前后效果。文本和 JSON 均包含“耗时构成”：Step/model/run 的中位数与 p90、首段代码前等待和参数生成跨度、运行时各工具调用次数/总耗时/中位耗时，以及参数到达跨度严格大于 50 ms 的 run 比例；每项列出有效样本数，旧日志缺字段不补零。bash 耗时 Top 10 按保存的 JS 命令字面量前两个 shell 单词启发式分组，无法可靠关联的动态/多调用列为 unmatched，不把整个 bash 耗时分摊给 shell 子命令。
 
+“子会话已记录成本”（JSON `child_costs`）以每个带 `parent_session_id` 的入选子日志为一个样本，含前台与后台。`steps`、`model_ms`、`prompt_tokens`、`uncached_prompt_tokens` 分别统计每子会话完整 Step 数、累计模型时间（毫秒）、累计输入 token（含缓存）、累计未缓存输入 token 的中位数、p90 和样本数。未缓存量逐 Step 用 `prompt_tokens - prompt_cache_hit_tokens` 计算后累加，要求两字段均为非负整数且 cache 不大于 prompt；缺字段不补零，也不由两个分位数相减。`full_range_sessions` 要求非零完整 Step 且所有完整 Step 都入选；`--since` 截断的日志列入 `partial_range_sessions`，无完整 Step 的日志列入 `no_step_sessions`，两者不进入分布。计时与 token 各自要求该子会话所有完整 Step 对应字段有效，缺失或无效不补零，因此各指标 samples 可不同。只累计子日志自身 Step 字段，不叠加父会话 usage 或工具结果 usage；缓存输入已包含在 prompt 中。失败、取消或仍运行的子日志也可能入选，这些是已提交成本的下界，不代表成功任务或完整端到端耗时，更不是费用估算。
+
+`child_costs.by_parent_system` 通过 `parent_session_id` 查找本次输入日志中的父 header，按其 `system_sha` 分组。比较工具说明修改前后时传入含父、子日志的目录，查看此字段；只传子日志或父标签缺失/无效时归 `unknown`，不猜测或回退到子 `system_sha`。子会话隐藏 agent 工具，自身哈希不一定随 agent 说明改变。父 header 的查找不受记录日期或 cwd 筛选影响，仅用于标签关联；成本仍只来自入选子日志。现有 `--group-by system` 仍按各日志自己的哈希分组，和这里的父哈希分组不同。恢复会话保留原 header 和 system，仍归原实验组。
+
 “工具数据度量”（JSON `tool_data`）独立累计 Step 顶层 `tool_bytes`、`output_bytes` 的有效样本数和总字节，不与 Run/calls 相加，也不从其他层回填。`output_tool_ratio` 按 `run_results[]` 中两字段有效且 `tool_bytes>0` 的 Run，统计各自 `output_bytes/tool_bytes` 的中位数、p90（nearest-rank）和样本数，不是总量之比，比例可大于 1。工具占比按有效 `calls[].result_bytes` 的总和为分母，按 name 汇总字节和调用数；明细被省略时覆盖有限，不代表全部工具数据。旧日志缺失字段跳过，不补零；明细总字节为零时占比为 n/a。
 
 `--group-by version|system|patches` 分别按 header 的 `nib_version`、`system_sha`、`patches_off` 分组，总体报告保留，每组分别输出核心报告；JSON 使用 `group_by` 和 `groups`。缺失标签的旧日志归 `unknown`；新版 header 有版本或系统哈希但省略 `patches_off` 时归 `none`，补丁列表按排序后的集合分组。

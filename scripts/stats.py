@@ -300,6 +300,38 @@ def header_group(header, group_by):
     return value if isinstance(value, str) and value.strip() else 'unknown'
 
 
+class ChildCosts:
+    def __init__(self):
+        self.sessions = []
+
+    def add(self, steps, selected_steps, model_ms, prompt_tokens, uncached_prompt_tokens, parent_system):
+        self.sessions.append(dict(steps=steps, selected_steps=selected_steps,
+                                  model_ms=model_ms, prompt_tokens=prompt_tokens,
+                                  uncached_prompt_tokens=uncached_prompt_tokens, parent_system=parent_system))
+
+    def report(self):
+        def summary(sessions):
+            full = [s for s in sessions if s['steps'] and s['steps'] == s['selected_steps']]
+            result = dict(sessions=len(sessions), full_range_sessions=len(full),
+                          partial_range_sessions=sum(s['steps'] != s['selected_steps'] for s in sessions),
+                          no_step_sessions=sum(not s['steps'] for s in sessions),
+                          steps=distribution([s['steps'] for s in full]))
+            for field in ('model_ms', 'prompt_tokens', 'uncached_prompt_tokens'):
+                result[field] = distribution([sum(s[field]) for s in full
+                                              if len(s[field]) == s['steps']])
+            return result
+
+        groups = {}
+        for session in self.sessions:
+            groups.setdefault(session['parent_system'], []).append(session)
+        return dict(summary(self.sessions),
+                    by_parent_system={key: summary(sessions) for key, sessions in sorted(groups.items())},
+                    notes=["每个带 parent_session_id 的入选子日志一个样本，含前台/后台；只计已提交完整 Step，失败、取消或仍运行的日志也是已记录成本的下界，不推断完成状态。",
+                           "分布要求非零 Step 且所有完整 Step 都入选；--since 截断的子会话列 partial_range_sessions，不当作整次成本。model_ms/prompt_tokens/uncached_prompt_tokens 各自要求所有 Step 字段有效，缺失不补零，samples 表示覆盖；p90=nearest-rank。",
+                           "model_ms 为累计模型时间（含重试/退避），非墙钟耗时；prompt_tokens 为累计输入（含重复上下文和缓存），非费用，不加父会话 usage 或工具结果 usage；uncached_prompt_tokens=prompt_tokens-prompt_cache_hit_tokens，要求两字段为非负整数且 cache<=prompt。",
+                           "by_parent_system 通过 parent_session_id 关联本次输入日志的父 header.system_sha；父日志缺失或标签无效为 unknown，不回退到子 system_sha。--group-by 仍按每个日志自己的 header 分组。"])
+
+
 class EffortStats:
     def __init__(self):
         self.groups = {}
@@ -560,9 +592,18 @@ def records(path):
         return
 
 
-def summarize(paths, since=None, cwd=None, group_by=None):
+def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
     if group_by not in (None, 'version', 'system', 'patches'):
         raise ValueError('invalid group_by')
+    paths = list(paths)
+    if _systems is None:
+        _systems = {}
+        for path in paths:
+            if path.name.endswith('.calls.jsonl'):
+                continue
+            header = next(records(path), None)
+            if header and header.get('messages') and header['messages'][0]['role'] == 'system':
+                _systems[path.stem] = header_group(header, 'system')
     group_paths = {}
     adjacent_pairs = write_validation_pairs = file_pairs = disjoint_pairs = 0
     totals = dict(sessions=0, root_sessions=0, child_sessions=0, turns=0, steps=0, runs=0,
@@ -576,6 +617,7 @@ def summarize(paths, since=None, cwd=None, group_by=None):
     timing = Timing()
     tool_data = ToolData()
     agents = AgentStats()
+    child_costs = ChildCosts()
     errors = {name: {'count': 0, 'examples': []} for name in ERRORS}
     slowest, turn_steps, turn_times = [], [], []
 
@@ -611,6 +653,8 @@ def summarize(paths, since=None, cwd=None, group_by=None):
         length = header['from'] + len(header['messages'])
         current = None
         session_step = 0
+        child_selected_steps = 0
+        child_model_ms, child_prompt_tokens, child_uncached_prompt_tokens = [], [], []
         pending_agents = {}
         seen_agents = set()
 
@@ -668,6 +712,16 @@ def summarize(paths, since=None, cwd=None, group_by=None):
             if not is_step:
                 continue
             session_step += 1
+            if include and header.get('parent_session_id'):
+                child_selected_steps += 1
+                if number(record.get('model_ms')):
+                    child_model_ms.append(record['model_ms'])
+                child_usage = record.get('usage')
+                if isinstance(child_usage, dict) and number(child_usage.get('prompt_tokens')):
+                    child_prompt_tokens.append(child_usage['prompt_tokens'])
+                    cache = child_usage.get('prompt_cache_hit_tokens')
+                    if number(cache) and cache <= child_usage['prompt_tokens']:
+                        child_uncached_prompt_tokens.append(child_usage['prompt_tokens'] - cache)
             if current is not None:
                 current['full_steps'] += 1
                 current['complete'] = any(m['role'] == 'assistant' and not m.get('tool_calls') for m in messages)
@@ -754,6 +808,11 @@ def summarize(paths, since=None, cwd=None, group_by=None):
         if session_selected:
             totals['sessions'] += 1
             totals['child_sessions' if header.get('parent_session_id') else 'root_sessions'] += 1
+            if header.get('parent_session_id'):
+                parent_id = header['parent_session_id']
+                parent_system = _systems.get(parent_id, 'unknown') if isinstance(parent_id, str) else 'unknown'
+                child_costs.add(session_step, child_selected_steps, child_model_ms,
+                                child_prompt_tokens, child_uncached_prompt_tokens, parent_system)
     totals['runs_unknown'] = totals['runs'] - totals['runs_with_status']
     totals['run_failure_rate'] = totals['runs_failed'] / totals['runs_with_status'] if totals['runs_with_status'] else None
     totals['avg_steps_per_turn'] = sum(turn_steps) / len(turn_steps) if turn_steps else None
@@ -767,7 +826,7 @@ def summarize(paths, since=None, cwd=None, group_by=None):
     report = {'overall': totals, 'usage': usage, 'time_filter': time_filter, 'tools': dict(sorted(tool_counts.items())),
             'bash_top10': [{'command': k, 'count': v} for k, v in sorted(bash_counts.items(), key=lambda p: (-p[1], p[0]))[:10]],
             'errors': errors, 'slowest_steps': slowest, 'timing': timing.report(),
-            'tool_data': tool_data.report(),
+            'tool_data': tool_data.report(), 'child_costs': child_costs.report(),
             'agents': agents.report(), 'bash_calls': agents.report('bash'),
             'round_trips': dict(steps_per_turn=distribution(turn_steps),
                                write_to_validation=pair_summary(write_validation_pairs, adjacent_pairs),
@@ -783,7 +842,7 @@ def summarize(paths, since=None, cwd=None, group_by=None):
         report['group_by'] = group_by
         report['groups'] = {}
         for key, members in sorted(group_paths.items()):
-            group = summarize(members, since, cwd)
+            group = summarize(members, since, cwd, _systems=_systems)
             if group['overall']['sessions']:
                 report['groups'][key] = group
         report['notes'][0] += (' --group-by 按 header nib_version/system_sha/patches_off 分组，'
@@ -813,6 +872,14 @@ def text_report(report):
         lines.extend([f"{name} 调用：前台 {calls['foreground_calls']} / 后台 {calls['background_calls']}",
                       f"{'' if key == 'agents' else 'Bash '}后台期间主模型 Step: samples={overlap['samples']} median={fmt(overlap['median'])} p90={fmt(overlap['p90'])}"])
     lines.extend('  ' + note for note in report['agents']['notes'])
+    costs = report['child_costs']
+    lines.append('子会话已记录成本（每子会话；非费用）：')
+    for label, item in [('全部', costs)] + list(costs['by_parent_system'].items()):
+        lines.append(f"  parent_system={label}: sessions={item['sessions']} full_range={item['full_range_sessions']} partial_range={item['partial_range_sessions']} no_steps={item['no_step_sessions']}")
+        for field in ('steps', 'model_ms', 'prompt_tokens', 'uncached_prompt_tokens'):
+            value = item[field]
+            lines.append(f"    {field}: samples={value['samples']} median={fmt(value['median'])} p90={fmt(value['p90'])}")
+    lines.extend('  ' + note for note in costs['notes'])
     structure = report['round_trips']
     steps = structure['steps_per_turn']
     section = ["往返结构：", f"  每 Turn Step: samples={steps['samples']} median={fmt(steps['median'])} p90={fmt(steps['p90'])}"]
