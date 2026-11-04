@@ -16,7 +16,7 @@ changes 汇总子会话所有 Run（包括失败 Run）已收到的 `run_end.cha
 
 llm 与 agent 的 usage 都计入本轮累计用量；Esc/SIGINT/SIGTERM 取消在途及排队调用。
 
-子进程 NDJSON 在运行途中按完整行观察；最终输出仍按原路径解析和统计。进度使用受互斥锁保护、每个子 agent 仅保留最新快照的队列；工具线程只更新队列，不调用 Session sink。Run 线程在 sandbox 的 Promise/工具等待循环里约每 20 ms 尝试转发，转发不计入 JS 执行预算；eval 返回前已停止并 join 所有工具线程，之后清空队列。TUI 收到事件后复制数据到自身事件循环，正在运行的 agent Run 折叠显示进度汇总，ctrl+o 展开显示各子任务（prompt 前 40 个 Unicode 字符）；Run 结束恢复工具/耗时/改动摘要。
+子进程 NDJSON 在运行途中按完整行观察；最终输出仍按原路径解析和统计。进度使用受互斥锁保护、每个子 agent 仅保留最新快照的队列；工具线程只更新队列，不调用 Session sink。Run 线程在 sandbox 的 Promise/工具等待循环里约每 20 ms 尝试转发，转发不计入 JS 执行预算；eval 返回前已停止并 join 所有工具线程，之后清空队列。TUI 收到事件后复制数据到自身事件循环，在 agent Run 下方默认显示子任务树，每个子 agent 固定一行：`#编号 prompt 摘要 · 状态 · step N · 工具名 变更文件`，按编号排序并原地更新。prompt 最多预览前 40 个 Unicode 字符；窄屏优先缩短 prompt 和末尾文件信息，保留编号、状态、step 和工具名，不换行。ctrl+o 只切换 Run 代码、结果及 diff 的展开，不隐藏子任务树。Run 结束恢复工具/耗时/改动摘要，并保留最后收到的子任务状态；从历史恢复的 Run 不重建子任务树。工具名来自最近一次 Run，文件仅为 edit/write 报告的变更路径，不代表当前正在执行的命令或任务完成百分比。
 
 bash 与子会话复用进程组执行器，取消和超时会清理整组；子 nib 先收到 SIGTERM，有 500 ms 取消自身工具，之后强制终止。用量按已收到的累计快照统计，无法推知服务端尚未报告的 token。路径写锁只协调当前进程内的 edit/write，不协调独立子会话或 bash 的写入。
 
