@@ -8,11 +8,29 @@ const policy = @import("policy.zig");
 
 pub const foreground_progress_threshold_ms = 3000;
 
+const Args = struct {
+    command: []const u8,
+    timeout_ms: ?i64 = null,
+    background: bool = false,
+    detached: bool = false,
+
+    fn timeoutMs(a: Args) i64 {
+        return a.timeout_ms orelse if (a.detached) @as(i64, 0) else 120_000;
+    }
+
+    fn validationError(a: Args) ?[]const u8 {
+        if (a.detached and !a.background) return "detached requires background: true";
+        if (a.timeoutMs() < 0) return "timeout_ms must not be negative";
+        if (a.timeoutMs() == 0 and !a.detached) return "timeout_ms: 0 requires detached: true";
+        return null;
+    }
+};
+
 pub fn bash(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolResult {
-    const A = struct { command: []const u8, timeout_ms: i64 = 120_000, background: bool = false };
-    const a = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch
-        return fail(gpa, "expected {{ command: string, timeout_ms?: number, background?: boolean }}", .{});
+    const a = std.json.parseFromSlice(Args, gpa, args, .{ .ignore_unknown_fields = true }) catch
+        return fail(gpa, "expected {{ command: string, timeout_ms?: number, background?: boolean, detached?: boolean }}", .{});
     defer a.deinit();
+    if (a.value.validationError()) |message| return fail(gpa, "{s}", .{message});
 
     switch (policy.checkCredentials(a.value.command, t.codexHome())) {
         .allow => {},
@@ -33,15 +51,17 @@ pub fn bash(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
         };
         return .{ .ok = result };
     }
-    return execute(t, gpa, a.value.command, a.value.timeout_ms, &t.cancel, null);
+    return execute(t, gpa, a.value.command, a.value.timeoutMs(), &t.cancel, null);
 }
 
 pub fn executeBackground(t: *Tools, gpa: std.mem.Allocator, args: []const u8, cancel: *const std.atomic.Value(bool), progress: @import("../session/events.zig").Progress) !sandbox.ToolResult {
-    const parsed = try std.json.parseFromSlice(struct { command: []const u8, timeout_ms: i64 = 120_000 }, gpa, args, .{ .ignore_unknown_fields = true });
+    const parsed = try std.json.parseFromSlice(Args, gpa, args, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
+    if (parsed.value.validationError()) |message| return fail(gpa, "{s}", .{message});
     var value = progress;
     value.prompt = parsed.value.command;
-    return execute(t, gpa, value.prompt, parsed.value.timeout_ms, cancel, value);
+    value.detached = parsed.value.detached;
+    return execute(t, gpa, value.prompt, parsed.value.timeoutMs(), cancel, value);
 }
 
 fn execute(t: *Tools, gpa: std.mem.Allocator, command: []const u8, timeout_ms: i64, cancel: *const std.atomic.Value(bool), progress: ?@import("../session/events.zig").Progress) !sandbox.ToolResult {
@@ -293,4 +313,36 @@ test "foreground bash logs the visible call ID without changing its result" {
     try testing.expect(t.progress.slots.items[0].value.elapsed_ms >= 3000);
     t.progress.clear(testing.allocator);
     try testing.expectEqualStrings("b1", timing.entries[1].id.?);
+}
+
+test "bash validates detached and zero timeout before starting" {
+    const cases = .{
+        .{ "{\"command\":\"true\",\"detached\":true}", "detached requires background: true" },
+        .{ "{\"command\":\"true\",\"timeout_ms\":0}", "timeout_ms: 0 requires detached: true" },
+        .{ "{\"command\":\"true\",\"background\":true,\"timeout_ms\":0}", "timeout_ms: 0 requires detached: true" },
+        .{ "{\"command\":\"true\",\"background\":true,\"detached\":true,\"timeout_ms\":-1}", "timeout_ms must not be negative" },
+    };
+    inline for (cases) |case| {
+        const result = try callTool("bash", case[0]);
+        defer freeResult(result);
+        try testing.expectEqualStrings(case[1], result.err);
+    }
+}
+
+test "bash detached timeout defaults and overrides" {
+    try testing.expectEqual(@as(i64, 120_000), (Args{ .command = "true" }).timeoutMs());
+    try testing.expectEqual(@as(i64, 120_000), (Args{ .command = "true", .background = true }).timeoutMs());
+    const detached: Args = .{ .command = "true", .background = true, .detached = true };
+    try testing.expectEqual(@as(i64, 0), detached.timeoutMs());
+    try testing.expect(detached.validationError() == null);
+    const explicit: Args = .{ .command = "true", .background = true, .detached = true, .timeout_ms = 25 };
+    try testing.expectEqual(@as(i64, 25), explicit.timeoutMs());
+    try testing.expect(explicit.validationError() == null);
+    var t: Tools = .{ .io = testing.io, .home = "/home/nobody" };
+    defer t.progress.deinit(testing.allocator);
+    const progress = try t.progress.add(testing.allocator, testing.io, .bash, "sleep 5", 1, true);
+    var cancel: std.atomic.Value(bool) = .init(false);
+    const result = try executeBackground(&t, testing.allocator, "{\"command\":\"sleep 5\",\"background\":true,\"detached\":true,\"timeout_ms\":25}", &cancel, .{ .id = progress, .kind = .bash, .background = true, .prompt = "" });
+    defer freeResult(result);
+    try testing.expectEqualStrings("timed out after 25 ms", result.err);
 }

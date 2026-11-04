@@ -26,7 +26,7 @@
 
 ## 提交与中断
 
-会话日志位于 `$NIB_HOME/sessions/<ID>.jsonl`（默认 `~/.nib/sessions/`）。新写入的每条日志记录带 `at`（Unix 毫秒，追加时的墙上时钟时间），恢复兼容无时间戳的旧记录；`scripts/stats.py --since` 按记录时间筛选，无效或缺失 `at` 回退文件修改时间并报告数量。通常只在完整 Step 后提交；后台结果消息及其生命周期记录在下一次 Step 请求前独立提交；Step 上限耗尽时也会等待后台任务并独立提交结果，然后结束 Turn，不再请求模型。Codex 请求最终失败时另追加 `diagnostic: {error_name, message, attempts, step}` 诊断记录（message 保留服务端 code/reason），不提交用户消息或失败输出，不改变模型历史和 context_tokens，恢复时跳过；`scripts/stats.py` 将其计入 `errors.provider_failure`，不算 Step/token。取消（TUI 的 Esc、ask 收到 SIGTERM/SIGINT）时额外提交本轮用户消息和已流出的文本，TUI Esc / ask SIGINT 在末尾标记 `[interrupted by user]`，ask SIGTERM 标记 `[interrupted: process terminated]`，未完成的工具调用丢弃；恢复不重执行已提交的 Run；未完成 Step 可能已产生外部副作用，日志不回滚这些变化。
+会话日志位于 `$NIB_HOME/sessions/<ID>.jsonl`（默认 `~/.nib/sessions/`）。新写入的每条日志记录带 `at`（Unix 毫秒，追加时的墙上时钟时间），恢复兼容无时间戳的旧记录；`scripts/stats.py --since` 按记录时间筛选，无效或缺失 `at` 回退文件修改时间并报告数量。通常只在完整 Step 后提交；后台结果消息及其生命周期记录在下一次 Step 请求前独立提交；Step 上限耗尽时只等待普通后台任务并独立提交其结果，然后结束 Turn，不再请求模型；detached 结果保留到之后的 Step/Turn。Codex 请求最终失败时另追加 `diagnostic: {error_name, message, attempts, step}` 诊断记录（message 保留服务端 code/reason），不提交用户消息或失败输出，不改变模型历史和 context_tokens，恢复时跳过；`scripts/stats.py` 将其计入 `errors.provider_failure`，不算 Step/token。取消（TUI 的 Esc、ask 收到 SIGTERM/SIGINT）时额外提交本轮用户消息和已流出的文本，TUI Esc / ask SIGINT 在末尾标记 `[interrupted by user]`，ask SIGTERM 标记 `[interrupted: process terminated]`，未完成的工具调用丢弃；恢复不重执行已提交的 Run；未完成 Step 可能已产生外部副作用，日志不回滚这些变化。
 
 模型请求的两条线路共用 `src/provider/cancel.zig` 的 `std.Io.Select` 取消封装：请求任务实时写入 sink，另一个任务每 20 ms 检查 cancel 标志；取消时中断连接、发送或读取中的阻塞 I/O，并等待请求任务清理后返回 `error.Canceled`，无需等下一块数据。TUI Esc 与 ask SIGINT/SIGTERM 均走此路径，不设读超时，不改变重试策略；已流出的文本继续由原有 `commitInterrupted` 提交。
 
@@ -44,11 +44,11 @@
 
 ## 工具字节度量
 
-完整 Step 顶层另有可选 `tool_bytes`、`output_bytes`：`tool_bytes` 为该 Step 各 Run 的同名字段之和，`output_bytes` 为各 Run 的同名字段之和加上该 Step 请求前新插入的后台结果消息正文字节数；`run_results[]` 保存每个 Run 的可选 `tool_bytes`、`output_bytes`，不含后台结果消息。它们与现有 Step 顶层计时字段并列，不嵌套到 `timing` 对象。旧日志缺失字段仍可恢复，不把缺失当作零。
+完整 Step 顶层另有可选 `tool_bytes`、`output_bytes`：`tool_bytes` 为该 Step 各 Run 的同名字段之和，`output_bytes` 为各 Run 的同名字段之和加上首次计入该完整 Step 的后台结果消息正文字节数；`run_results[]` 保存每个 Run 的可选 `tool_bytes`、`output_bytes`，不含后台结果消息。它们与现有 Step 顶层计时字段并列，不嵌套到 `timing` 对象。旧日志缺失字段仍可恢复，不把缺失当作零。
 
 - `sandbox.Outcome.tool_bytes` 在宿主工具结果交给 JS 时累计：成功按序列化 JSON 的 UTF-8 字节数，错误按错误文本的 UTF-8 字节数计量。无论 JS 是否使用或 await 结果都计入；未产生交回 JS 的结果计 0。`agent` 只计父 Run 收到的返回对象，不累加子会话内部工具数据。
 - Run 的 `output_bytes` 是 `session/output.format` 格式化后交给模型的 tool result 实际 UTF-8 字节数，包含 16 KiB 预算内的截断标记、错误、`no output`、条目标签和分隔符等。harness 拒绝执行的 Run 也记录其返回文本的 `output_bytes`，`tool_bytes` 为 0。
-- 后台 agent/bash 启动时交回 JS 的 `{id}` 按普通工具结果计量；之后插入的结果消息不经过 Run，仅计入接收它的完整 Step 的 `output_bytes`，不增加 `tool_bytes` 或 `run_results[]` 的字节数。按实际消息正文的 UTF-8 字节数计量，包含 `[background ...]` 前缀、换行、截断后的 JSON 和截断标记；恢复后的 lost 消息同样计入。仅统计该 Step 新插入的后台消息，后续请求重带历史不重复计量，用户插话不计入。独立的消息提交和生命周期记录不写字节字段，避免与完整 Step 重复累计。若接收消息的 Step 失败或取消而未完整提交，其后台字节也不计入账单和 Step 统计；已提交的后台消息仍可恢复。
+- 后台 agent/bash 启动时交回 JS 的 `{id}` 按普通工具结果计量；之后插入的结果消息不经过 Run，仅计入接收它的完整 Step 的 `output_bytes`，不增加 `tool_bytes` 或 `run_results[]` 的字节数。按实际消息正文的 UTF-8 字节数计量，包含 `[background ...]` 前缀、换行、截断后的 JSON 和截断标记；恢复后的 lost 消息同样计入。每条结果只在首次接收它的完整 Step 计量一次；上限收尾已提交但尚无接收 Step、或接收请求失败/取消的结果，将字节结转到下一完整 Step。恢复时从追加的后台消息和完整 Step 记录重建未计量字节，不因退出丢失，后续请求重带历史不重复计量，用户插话不计入。独立的消息提交和生命周期记录不写字节字段，避免与完整 Step 重复累计。若接收消息的 Step 失败或取消而未完整提交，其后台字节也不计入账单和 Step 统计；已提交的后台消息仍可恢复。
 - `calls[]` 的 `dispatched` 默认为 true；入队前被限额拒绝的调用记录为 false，仍计入错误文本字节，但不增加原有的 llm/agent 实际调度次数。
 - `calls[]` 新增可选 `result_bytes`，口径与单次宿主调用贡献的 `tool_bytes` 相同。旧明细可为 null 或省略；新记录中取消时尚未结算的调用为 0。超过 200 条的明细仍按 `calls_omitted` 省略，不影响 Run/Step 的字节总数。
 

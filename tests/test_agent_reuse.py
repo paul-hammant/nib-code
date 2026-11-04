@@ -5,6 +5,7 @@
 import fcntl
 import http.server
 import json
+import shlex
 import signal
 import subprocess
 import sys
@@ -13,7 +14,8 @@ import unittest
 
 from mock_agent import USAGE, reply
 from mock_llm_tool import content
-from test_background_agent import BIN, BackgroundTests
+from test_agent import alive
+from test_background_agent import BIN, ROOT, BackgroundTests
 from test_llm import records, wait_for
 
 
@@ -56,6 +58,7 @@ class Mock(http.server.ThreadingHTTPServer):
     def __init__(self, parent, cwd):
         self.parent, self.cwd = parent, cwd
         self.requests, self.errors = [], []
+        self.on_request = lambda prompt, step: None
         self.lock = threading.Lock()
         self.holding = threading.Event()
         self.release = threading.Event()
@@ -92,13 +95,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                    for m in messages[last + 1:])
         with self.server.lock:
             self.server.requests.append(dict(prompt=prompt, messages=messages, body=body))
+        self.server.on_request(prompt, step)
         code, text = None, "done:" + prompt
         if prompt == "initial":
             code = self.server.parent(messages)
             text = "parent complete"
-        elif prompt in ("child:seed", "child:fail") and step == 0:
+        elif prompt in ("child:seed", "child:fail", "child:stop-one", "child:stop-two") and step == 0:
             code = ('console.log("child-history-marker"); await tools.write(' +
                     json.dumps({"path": "child-note.txt", "content": "kept\n"}) + ")")
+        elif prompt in ("child:stop-one", "child:stop-two"):
+            if step != 1:
+                raise AssertionError("stopped child tool unexpectedly completed: " + prompt)
+            command = shlex.join([sys.executable, str(ROOT / "tests/mock_agent.py"),
+                                  "--worker", "cancel", prompt.removeprefix("child:")])
+            code = "await tools.bash(" + json.dumps({"command": command}) + ")"
         elif prompt == "child:fail":
             data = json.dumps({"error": {"message": "reusable child mock failure"}}).encode()
             self.send_response(400)
@@ -525,6 +535,100 @@ class ReuseTests:
                 if e.get("background", {}).get("state") == "lost"]
         self.assertEqual([(e["id"], e["kind"]) for e in lost], [("a1", "agent")])
         self.assertFalse(mock.errors, mock.errors)
+
+    def check_stop_child_tool_reuse(self, background_resume):
+        state = {"stage": 0, "workers": {}, "resumes": []}
+
+        def running_worker(name):
+            path = self.cwd / (name + ".started")
+            wait_for(lambda: path.exists() and path.stat().st_size)
+            pids = json.loads(path.read_text())
+            self.assertTrue(all(alive(pid) for pid in pids.values()), pids)
+            self.assertFalse((self.cwd / (name + ".done")).exists())
+            state["workers"][name] = pids
+
+        def parent(messages):
+            if state["stage"] == 0:
+                state["stage"] = 1
+                return "await " + agent("stop-one", background=True)
+            if state["stage"] == 1:
+                running_worker("stop-one")
+                state.update(stage=2, child=self.child_log(), prefix=self.child_log().read_bytes())
+                self.assertFalse(completions(messages), messages)
+                resume = agent("stop-two", "a1", background=True) if background_resume else agent("next", "a1")
+                return ("const stopped = await tools.stop({id:'a1'}); "
+                        "const resumed = await " + resume + "; [stopped, resumed]")
+            if state["stage"] == 2 and background_resume:
+                state["stage"] = 3
+                done = completions(messages)
+                self.assertEqual(len(done), 1, done)
+                self.assert_result(done[0], ok=False)
+                running_worker("stop-two")
+                return ("const busy = await Promise.all([" + agent("forbidden", "a1") + "," +
+                        agent("forbidden", "a1", background=True) + "]); "
+                        "const stopped = await tools.stop({id:'a1'}); "
+                        "const resumed = await " + agent("next", "a1") +
+                        "; [busy, stopped, resumed]")
+            return None
+
+        def observe_resume(prompt, step):
+            if step == 0 and prompt in ("child:stop-two", "child:next"):
+                state["resumes"].append({
+                    "prompt": prompt, "child": self.child_log(),
+                    "workers": {name: {"alive": [alive(pid) for pid in pids.values()],
+                                       "term": (self.cwd / (name + ".term")).exists(),
+                                       "done": (self.cwd / (name + ".done")).exists()}
+                                for name, pids in state["workers"].items()}})
+
+        mock = self.mock(parent)
+        mock.on_request = observe_resume
+        events = self.finish(self.start())
+        outputs = self.outputs(events)
+        self.assertEqual(outputs[0], {"id": "a1"})
+        stopped, resumed = outputs[1]
+        self.assertEqual(stopped, {"id": "a1", "stopped": True})
+        if background_resume:
+            self.assertEqual(len(outputs), 3, outputs)
+            self.assertEqual(resumed, {"id": "a1"})
+            busy, stopped, resumed = outputs[2]
+            for contender in busy:
+                self.assert_failure(contender, "a1")
+                self.assertIn("busy", contender["error"].lower())
+            self.assertEqual(stopped, {"id": "a1", "stopped": True})
+        else:
+            self.assertEqual(len(outputs), 2, outputs)
+        self.assert_result(resumed)
+        self.assertEqual(resumed["text"], "done:child:next")
+        self.assert_usage(resumed, 1)
+        self.assertEqual(resumed["changes"], [])
+        prompts = ["stop-one", "stop-two"] if background_resume else ["stop-one"]
+        self.assert_history(mock, "next", prompts, interrupted=prompts)
+        self.assert_single_child_log(events, prompts + ["next"])
+        self.assertEqual(self.child_log(), state["child"])
+        self.assertTrue(state["child"].read_bytes().startswith(state["prefix"]))
+        self.assertEqual([r["prompt"] for r in state["resumes"]],
+                         (["child:stop-two"] if background_resume else []) + ["child:next"])
+        for observation in state["resumes"]:
+            self.assertEqual(observation["child"], state["child"], observation)
+            self.assertTrue(observation["workers"], observation)
+            for worker in observation["workers"].values():
+                self.assertFalse(any(worker["alive"]), observation)
+                self.assertFalse(worker["done"], observation)
+        done = completions(mock.observed("initial")[-1]["messages"])
+        self.assertEqual(len(done), len(prompts), done)
+        for result in done:
+            self.assert_result(result, ok=False)
+        lifecycle = [e["background"] for e in events if "background" in e]
+        self.assertEqual([(e["id"], e["state"]) for e in lifecycle],
+                         [("a1", "started")] * len(prompts) + [("a1", "finished")] * len(prompts))
+        self.assertFalse(mock.observed("child:forbidden"))
+        self.assertFalse(mock.errors, mock.errors)
+
+    def test_stop_background_child_tool_then_foreground_resume_in_same_run(self):
+        self.check_stop_child_tool_reuse(False)
+
+    def test_stopped_completion_keeps_resumed_background_busy_and_stop_targets_latest(self):
+        self.check_stop_child_tool_reuse(True)
 
     def check_canceled_continuation(self, background):
         mock = self.mock(self.script("await " + agent("seed")))

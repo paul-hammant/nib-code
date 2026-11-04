@@ -120,6 +120,7 @@ pub const Session = struct {
     interrupt_signal: ?*const std.atomic.Value(std.posix.SIG) = null,
     /// Next-request estimate: latest usage plus tool results, or the compacted history size.
     context_tokens: u64 = 0,
+    pending_background_bytes: u64 = 0,
     /// Automatic compaction is not retried until the context reaches this size.
     compact_backoff: u64 = 0,
     tools: tools.Tools,
@@ -136,8 +137,8 @@ pub const Session = struct {
     }
 
     /// The caller owns the batch. Take leftovers only after joining the Turn.
-    pub fn takeQueued(s: *Session) @import("session/inbox.zig").Batch {
-        return s.inbox.take(s.io);
+    pub fn takeQueued(s: *Session) !@import("session/inbox.zig").Batch {
+        return s.inbox.takeUsers(s.gpa, s.io);
     }
 
     pub const Options = struct { environ: ?*const std.process.Environ.Map = null, depth: u32 = 0, parent_session_id: ?[]const u8 = null, home: []const u8, user_home: []const u8, resume_id: ?[]const u8 = null, continue_latest: bool = false };
@@ -167,6 +168,7 @@ pub const Session = struct {
             } else try session_log.latest(io, a, directory, cwd);
             s.id = try a.dupe(u8, std.fs.path.stem(path));
             s.log = try session_log.Log.restore(io, gpa, a, path, &s.history, &s.context_tokens, options.parent_session_id);
+            s.pending_background_bytes = s.log.pending_background_bytes;
             errdefer s.log.close(io);
             try cfg.checkSession(s.log.provider, s.log.model);
             s.parent_session_id = s.log.parent_session_id;
@@ -209,7 +211,7 @@ pub const Session = struct {
             const id = lost.id;
             const text = try std.fmt.allocPrint(gpa, "[background {s} {s} lost: process ended]", .{ @tagName(lost.kind), id });
             defer gpa.free(text);
-            _ = try s.inbox.enqueueBackground(gpa, io, id, lost.kind, .lost, null, text);
+            _ = try s.inbox.enqueueBackground(gpa, io, id, lost.kind, .lost, null, text, false, 0);
         }
         return s;
     }
@@ -311,10 +313,9 @@ pub const Session = struct {
 
     pub fn turn(s: *Session, user_text: []const u8, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
         s.summary = .{};
-        s.tools.run_id = 0;
         s.tools.background.cancel.store(false, .release);
-        s.tools.background.inbox = &s.inbox;
-        s.tools.background.log = &s.log;
+        if (s.tools.background.inbox == null) s.tools.background.inbox = &s.inbox;
+        if (s.tools.background.log == null) s.tools.background.log = &s.log;
         var target: PollTarget = .{ .session = s, .sink = sink };
         s.tools.usage_sink = .{ .ctx = &target, .emit = PollTarget.usage };
         s.tools.progress.sink = .{ .ctx = &target, .emit = PollTarget.progress };
@@ -324,15 +325,16 @@ pub const Session = struct {
             s.summary.?.timing.wall_ms = @intCast(@max(started.untilNow(s.io).raw.toMilliseconds(), 0));
             sink.emit(sink.ctx, .{ .turn_end = s.summary.? }) catch {};
         }
+        var stop_background = true;
         defer {
-            s.tools.background.stop(s.gpa);
+            s.tools.background.finishTurn(s.gpa, s.io, stop_background);
             s.tools.progress.drain(s.io) catch {};
             s.usage.add(s.tools.takeUsage());
             s.summary.?.usage = s.usage;
             s.tools.usage_sink = null;
             s.tools.progress.sink = null;
             s.tools.background_sink = null;
-            s.tools.progress.clear(s.gpa);
+            if (!s.tools.background.anyPending(s.io)) s.tools.progress.clear(s.gpa);
         }
         errdefer {
             if (s.summary.?.status != .canceled) s.summary.?.status = if (cancel.load(.acquire)) .canceled else .failed;
@@ -351,8 +353,10 @@ pub const Session = struct {
                 s.summary.?.status = .canceled;
                 try s.commitInterrupted(pending.items, &partial);
             }
+            if (err == error.TooManySteps and !cancel.load(.acquire)) stop_background = false;
             return err;
         };
+        stop_background = cancel.load(.acquire);
     }
 
     const Partial = struct {
@@ -401,7 +405,7 @@ pub const Session = struct {
         for (inserted.items.items) |item| {
             if (item.background) |b| {
                 has_background = true;
-                s.tools.background.delivered(s.io, b.id);
+                s.tools.background.delivered(s.io, b.id, item.invocation);
                 var event = b;
                 event.result = if (std.mem.indexOfScalar(u8, item.text, '\n')) |nl| item.text[nl + 1 ..] else item.text;
                 try sink.emit(sink.ctx, .{ .background = event });
@@ -410,6 +414,9 @@ pub const Session = struct {
         if (has_background) {
             try s.commit(s.history.items.len, pending.items, s.context_tokens + estimateTokens(pending.items), null);
             pending.clearRetainingCapacity();
+            for (inserted.items.items) |item| if (item.background != null) {
+                s.pending_background_bytes += item.text.len;
+            };
             for (inserted.items.items) |item| if (item.background) |b|
                 try s.log.background(s.io, s.gpa, b, s.steps + 1);
         }
@@ -454,10 +461,7 @@ pub const Session = struct {
             try tools.Tools.poll(&s.tools);
             var inserted = try s.insertInbox(pending, sink, false);
             defer inserted.deinit(s.gpa);
-            var background_output_bytes: u64 = 0;
-            for (inserted.items.items) |item| if (item.background != null) {
-                background_output_bytes += item.text.len;
-            };
+            const background_output_bytes = s.pending_background_bytes;
             var request: std.ArrayList(provider.Message) = .empty;
             defer request.deinit(s.gpa);
             try request.appendSlice(s.gpa, s.history.items);
@@ -537,6 +541,7 @@ pub const Session = struct {
                 .output_bytes = run_timing.output_bytes + background_output_bytes,
                 .run_results = run_results.items,
             });
+            s.pending_background_bytes = 0;
             s.summary.?.steps += 1;
             s.summary.?.usage = s.usage;
             s.summary.?.timing.model_ms += model_ms;
@@ -612,7 +617,7 @@ pub const Session = struct {
         };
         var fwd: Forward = .{ .sink = sink, .gpa = s.gpa, .partial = partial, .io = s.io, .started = timing.started, .first_data_ms = first_data_ms, .session = s };
         const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .timing = timing };
-        if (!s.tools.background.pending(s.io))
+        if (!s.tools.background.anyPending(s.io))
             return provider.complete(s.gpa, s.arena.allocator(), s.client, request_cfg, s.id, messages, tools_json, null, provider_sink, cancel, detail, attempts, .{ .ctx = &fwd, .onEvent = Forward.onRetry });
         const Request = struct {
             fn work(session: *Session, cfg: provider.Config, history: []const provider.Message, ps: provider.Sink, flag: *const std.atomic.Value(bool), failure: *?[]u8, tries: *u32, observer: *Forward, done: *std.Io.Event) !provider.Reply {
@@ -644,13 +649,21 @@ pub const Session = struct {
     };
 
     pub fn run(s: *Session, code: []const u8, cancel: ?*const std.atomic.Value(bool)) !Ran {
-        return s.runTimed(code, cancel, null);
+        s.tools.background.cancel.store(false, .release);
+        if (s.tools.background.inbox == null) s.tools.background.inbox = &s.inbox;
+        if (s.tools.background.log == null) s.tools.background.log = &s.log;
+        errdefer s.tools.background.stop(s.gpa);
+        const ran = try s.runTimed(code, cancel, null);
+        errdefer ran.outcome.deinit(s.gpa);
+        try s.commit(s.history.items.len, &.{}, s.context_tokens, null);
+        if (cancel != null and cancel.?.load(.acquire)) s.tools.background.stop(s.gpa);
+        return ran;
     }
 
     fn runTimed(s: *Session, code: []const u8, cancel: ?*const std.atomic.Value(bool), timing: ?*sandbox.RunTiming) !Ran {
         defer s.usage.add(s.tools.takeUsage());
         defer s.tools.progress.drain(s.io) catch {};
-        if (!s.tools.background.pending(s.io)) s.tools.progress.clear(s.gpa);
+        if (!s.tools.background.anyPending(s.io)) s.tools.progress.clear(s.gpa);
         s.tools.run_id += 1;
         s.tools.discardChanges(s.gpa);
         var host = s.tools.host();

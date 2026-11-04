@@ -132,7 +132,7 @@ def history(home):
     messages = []
     for line in paths[0].read_text().splitlines():
         record = json.loads(line)
-        if "messages" in record:
+        if record.get("messages"):
             messages[record["from"]:] = record["messages"]
     return messages
 

@@ -128,6 +128,7 @@ fn loadMain(a: Allocator, data: []const u8) ![]Run {
         if (torn) return error.InvalidReplayLog;
         if (record.object.get("diagnostic")) |d| if (d != .null) continue;
         if (record.object.get("agent_session")) |mapping| if (mapping != .null) continue;
+        if (record.object.get("background")) |b| if (b != .null) continue;
         const messages: []const Value = if (record.object.get("messages")) |v| try array(v) else &.{};
         const from = if (record.object.get("from")) |v| try natural(v) else 0;
         if (from > length) return error.InvalidReplayLog;
@@ -399,6 +400,23 @@ test "raw main records count global assistant Steps across turns and compaction"
         try t.expectEqualStrings(code, r.code);
         try t.expectEqualStrings(expected, r.expected.?);
     }
+}
+
+test "background lifecycle records do not replace replay history" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const data =
+        \\{"messages":[{"role":"system","content":"s"}]}
+        \\{"from":0,"messages":[],"background":{"id":"b1","kind":"bash","state":"started"}}
+        \\{"from":1,"messages":[{"role":"assistant","tool_calls":[{"id":"r1","function":{"name":"run","arguments":"{\"code\":\"42\"}"}}]},{"role":"tool","tool_call_id":"r1","content":"42"}]}
+        \\{"from":0,"messages":[],"background":{"id":"b1","kind":"bash","state":"finished"}}
+        \\
+    ;
+    const runs = try loadMain(arena.allocator(), data);
+    try t.expectEqual(@as(usize, 1), runs.len);
+    try t.expectEqualStrings("42", runs[0].code);
+    try t.expectEqualStrings("42", runs[0].expected.?);
 }
 
 test "calls resolve session wide same_as and retain zero call metadata" {

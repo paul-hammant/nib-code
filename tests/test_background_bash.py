@@ -61,6 +61,8 @@ class Mock(http.server.ThreadingHTTPServer):
         self.child_gate = threading.Event()
         self.summary_seen = threading.Event()
         self.resume_launched = False
+        self.detached_turns = {}
+        self.extra_request = threading.Event()
         super().__init__(("127.0.0.1", 0), Handler)
 
     def observed(self, prompt="initial"):
@@ -72,6 +74,114 @@ class Mock(http.server.ThreadingHTTPServer):
         release = self.cwd / (name + ".release")
         return ("echo $$ > " + shlex.quote(str(started)) + "; while [ ! -f " +
                 shlex.quote(str(release)) + " ]; do sleep .02; done; echo " + name + "-done")
+
+    def group_command(self, name="worker"):
+        program = (
+            "import os,pathlib,subprocess,sys,time; "
+            "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)']); "
+            f"pathlib.Path({name + '-child.started'!r}).write_text(str(child.pid)); "
+            f"pathlib.Path({name + '.started'!r}).write_text(str(os.getpid())); "
+            f"release=pathlib.Path({name + '.release'!r}); "
+            "exec('while not release.exists(): time.sleep(.02)'); "
+            f"child.terminate(); child.wait(); print({name + '-done'!r}, flush=True)"
+        )
+        return shlex.join([sys.executable, "-c", program])
+
+    def service_command(self, with_child=False):
+        program = ""
+        if with_child:
+            program += (
+                "import pathlib,subprocess,sys; "
+                "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(300)']); "
+                "pathlib.Path('server-child.started').write_text(str(child.pid)); "
+            )
+        program += (
+            "import http.server,os,pathlib; "
+            "server=http.server.HTTPServer(('127.0.0.1',0),http.server.SimpleHTTPRequestHandler); "
+            "pathlib.Path('server.started').write_text(str(os.getpid())); "
+            "pathlib.Path('service.url').write_text('http://127.0.0.1:%d/health.txt'%server.server_port); "
+            "server.serve_forever()"
+        )
+        return shlex.join([sys.executable, "-c", program])
+
+    def detached_reply(self, users):
+        turn = next(u for u in reversed(users) if not u.startswith("[background "))
+        step = self.detached_turns.get(turn, 0)
+        self.detached_turns[turn] = step + 1
+        if turn == "initial":
+            if step == 0:
+                if self.case == "detached_service":
+                    code = ("const job=await " + bash(self.service_command(), detached=True) + "; " +
+                            "let ready; for(let i=0;i<100;i++){try{"
+                            "const url=(await tools.read({path:'service.url'})).text.trim(); "
+                            "const r=await tools.fetch({url,timeout_ms:500}); "
+                            "if(r.status===200){ready=r.text;break}}catch(e){} await tools.sleep(25)} "
+                            "if(!ready)throw new Error('service not ready'); ({job,ready})")
+                elif self.case == "detached_shell_exit":
+                    command = (self.service_command(with_child=True) + " & " +
+                               wait_command("shell.release") + "; echo shell-exited; exit 0")
+                    code = "await " + bash(command, detached=True, timeout_ms=0)
+                elif self.case == "detached_continuation":
+                    code = ("await " + bash(self.group_command(), detached=True) + "; " +
+                            call("bash", command=wait_command("worker.started")) + ".then(async()=>{"
+                            "const stopped=await tools.stop({id:'b1'}); "
+                            "console.log('continuation-stop',stopped)}); "
+                            "throw new Error('top-level rejected')")
+                elif self.case == "detached_limit_mixed":
+                    code = ("await " + bash("printf detached-limit", detached=True) + "; " +
+                            "await " + bash(self.waiting_command("ordinary")) + "; await tools.sleep(100)")
+                elif self.case == "detached_counters":
+                    code = ("await tools.bash({command:'sleep 3.2'}); "
+                            "await " + bash(self.group_command(), detached=True))
+                elif self.case == "detached_invalid":
+                    calls = [
+                        "tools.bash({command:'echo invalid',detached:true})",
+                        "tools.bash({command:'echo invalid',background:false,detached:true})",
+                        "tools.stop({id:'b999'})",
+                    ]
+                    code = ("const results=[]; for (const call of [" +
+                            ",".join("async()=>" + call for call in calls) +
+                            "]) { try { results.push({value:await call()}) } "
+                            "catch(e) { results.push({error:e.message}) } } results")
+                else:
+                    options = {"detached": True}
+                    if self.case != "detached_ask_default":
+                        options["timeout_ms"] = 0
+                    code = "const a=await " + bash(self.group_command(), **options) + "; "
+                    if self.case in ("detached_stop", "detached_cancel"):
+                        code += "const b=await " + bash(self.group_command("other"), detached=True) + "; [a,b]"
+                    else:
+                        code += "a"
+                return code, "detached started"
+            if step == 1 and self.case != "detached_invalid":
+                self.model_gate.wait(15)
+                if self.case == "detached_boundary":
+                    return "await tools.stop({id:'b1'}); 42", "detached continued"
+                if self.case == "detached_step_limit":
+                    return "42", "detached continued"
+            else:
+                self.extra_request.set()
+            return None, "initial complete"
+        if turn == "hold":
+            self.child_gate.wait(15)
+        if turn == "probe service" and step == 0:
+            return ("await tools.fetch({url:(await tools.read({path:'service.url'})).text.trim()})",
+                    "probing service")
+        if turn == "stop service" and step == 0:
+            return ("const stopped=await tools.stop({id:'b1'}); "
+                    "let error; try{await tools.fetch({url:(await tools.read({path:'service.url'})).text.trim(),"
+                    "timeout_ms:1000})}catch(e){error=e.message} ({stopped,error})", "stopping service")
+        if turn == "launch next" and step == 0:
+            return "await " + bash(self.group_command("other"), detached=True), "launching next"
+        if turn == "stop counters" and step == 0:
+            return "await Promise.all([tools.stop({id:'b2'}),tools.stop({id:'b3'})])", "stopping counters"
+        if turn == "stop concurrently" and step == 0:
+            return "await Promise.all([tools.stop({id:'b1'}),tools.stop({id:'b1'})])", "stopping concurrently"
+        if turn == "stop one" and step == 0:
+            return "await tools.stop({id:'b1'})", "stopping one"
+        if turn == "check stopped" and step == 0:
+            return "await tools.stop({id:'b1'})", "checking stopped"
+        return None, turn + " complete"
 
     def first_code(self):
         if self.case in ("changes_after_write", "changes_between_writes"):
@@ -198,6 +308,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 code, text = "await " + bash("echo child-bash-done"), "child started"
             else:
                 text = "child complete"
+        elif self.server.case.startswith("detached_"):
+            code, text = self.server.detached_reply(users)
         elif prompt == "initial":
             if "resume" in users:
                 if not self.server.resume_launched:
@@ -306,6 +418,360 @@ class BackgroundBashTests:
     def log(self, events):
         return records(self.home / "sessions" / (events[0]["start"]["session_id"] + ".jsonl"))
 
+    def marked_pids(self, name="worker"):
+        def pid(path):
+            text = path.read_text() if path.exists() else ""
+            return int(text) if text else None
+        return tuple(wait_for(lambda path=self.cwd / (part + ".started"): pid(path))
+                     for part in (name, name + "-child"))
+
+    def kill_marked_workers(self):
+        for path in self.cwd.glob("*.started"):
+            text = path.read_text()
+            if text and alive(int(text)):
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(int(text), signal.SIGKILL)
+
+    def detached_terminal(self):
+        self.addCleanup(self.kill_marked_workers)
+        terminal = Terminal(self.cwd, self.env)
+        self.addCleanup(terminal.close)
+        terminal.send("initial\r")
+        return terminal
+
+    def wait_final(self, text):
+        def finished():
+            messages = history(self.home)
+            return messages and messages[-1].get("content") == text
+        wait_for(finished)
+
+    def last_run_value(self):
+        message = next(m for m in reversed(history(self.home)) if m.get("role") == "tool")
+        return json.loads(content(message).removeprefix("result: "))
+
+    def completions(self, messages, id="b1"):
+        return [m for m in messages if content(m).startswith(f"[background bash {id} finished]\n")]
+
+    def test_detached_survives_turn_and_stop_joins_only_target_process_group(self):
+        mock = self.mock("detached_stop")
+        terminal = self.detached_terminal()
+        wait_for(lambda: len(mock.observed()) == 2)
+        target, other = self.marked_pids(), self.marked_pids("other")
+        mock.model_gate.set()
+        self.wait_final("initial complete")
+        self.assertEqual(self.last_run_value(), [{"id": "b1"}, {"id": "b2"}])
+        self.assertTrue(all(alive(pid) for pid in target + other))
+        terminal.send("stop one\r")
+        self.wait_final("stop one complete")
+        self.assertEqual(self.last_run_value(), {"id": "b1", "stopped": True})
+        self.assertTrue(all(not alive(pid) for pid in target))
+        self.assertTrue(all(alive(pid) for pid in other))
+        messages = history(self.home)
+        self.assertEqual(len(self.completions(messages)), 1)
+        result = json.loads(content(self.completion(messages)).split("\n", 1)[1])
+        self.assertTrue(result.get("error") or result.get("exit_code") not in (None, 0), result)
+        self.assertFalse(self.completions(messages, "b2"))
+        terminal.send("check stopped\r")
+        self.wait_final("check stopped complete")
+        self.assertEqual(self.last_run_value(), {"id": "b1", "stopped": False})
+        self.assertEqual(len(self.completions(history(self.home))), 1)
+        self.assertTrue(all(alive(pid) for pid in other))
+        terminal.close()
+        wait_for(lambda: all(not alive(pid) for pid in other))
+
+    def test_detached_idle_completion_is_delivered_next_turn_exactly_once(self):
+        mock = self.mock("detached_idle")
+        terminal = self.detached_terminal()
+        wait_for(lambda: len(mock.observed()) == 2)
+        pids = self.marked_pids()
+        mock.model_gate.set()
+        self.wait_final("initial complete")
+        self.assertTrue(all(alive(pid) for pid in pids))
+        rendered = len(terminal.read())
+        self.release()
+        wait_for(lambda: all(not alive(pid) for pid in pids))
+        self.assertFalse(mock.extra_request.wait(.3), "completion started an unsolicited idle Turn")
+
+        def terminal_state_visible():
+            delta = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", terminal.read()[rendered:])
+            # vaxis may reuse the leading d when replacing detached with done.
+            return b"one" in delta
+
+        wait_for(terminal_state_visible)
+        self.assertEqual(len(mock.observed()), 2)
+        self.assertFalse(self.completions(history(self.home)))
+        before = sum(r.get("output_bytes", 0) for r in root_records(self.home))
+        terminal.send("next\r")
+        self.wait_final("next complete")
+        request = mock.observed()[2]
+        self.assertEqual(len(self.completions(request["messages"])), 1)
+        result = json.loads(content(self.completion(request["messages"])).split("\n", 1)[1])
+        self.assertEqual(result, {"exit_code": 0, "output": "worker-done\n"})
+        terminal.send("check stopped\r")
+        self.wait_final("check stopped complete")
+        self.assertEqual(self.last_run_value(), {"id": "b1", "stopped": False})
+        self.assertEqual(len(self.completions(history(self.home))), 1)
+        for request in mock.observed()[2:]:
+            self.assertEqual(len(self.completions(request["messages"])), 1)
+        self.assert_accounting(mock)
+        after = sum(r.get("output_bytes", 0) for r in root_records(self.home))
+        stop_output = next(m for m in reversed(history(self.home)) if m.get("role") == "tool")
+        self.assertEqual(after - before,
+                         len(content(self.completion(request["messages"])).encode()) + len(content(stop_output).encode()))
+
+    def test_detached_completion_is_delivered_at_next_step(self):
+        mock = self.mock("detached_boundary")
+        terminal = self.detached_terminal()
+        wait_for(lambda: len(mock.observed()) == 2)
+        pids = self.marked_pids()
+        self.assertFalse(self.completions(mock.observed()[-1]["messages"]))
+        self.release()
+        wait_for(lambda: all(not alive(pid) for pid in pids))
+        mock.model_gate.set()
+        self.wait_final("initial complete")
+        self.assertEqual(len(mock.observed()), 3)
+        self.assertEqual(len(self.completions(mock.observed()[-1]["messages"])), 1)
+        self.assertEqual(len(self.completions(history(self.home))), 1)
+
+    def test_escape_cancels_detached_jobs_from_previous_turn(self):
+        mock = self.mock("detached_cancel")
+        terminal = self.detached_terminal()
+        wait_for(lambda: len(mock.observed()) == 2)
+        pids = self.marked_pids() + self.marked_pids("other")
+        mock.model_gate.set()
+        self.wait_final("initial complete")
+        self.assertTrue(all(alive(pid) for pid in pids))
+        terminal.send("hold\r")
+        wait_for(lambda: len(mock.observed()) == 3)
+        terminal.send("\x1b")
+        terminal.until(b"canceled")
+        wait_for(lambda: all(not alive(pid) for pid in pids))
+        mock.child_gate.set()
+
+    def ask_detached_cleanup(self, case):
+        mock = self.mock(case)
+        self.addCleanup(self.kill_marked_workers)
+        process = self.start()
+        wait_for(lambda: len(mock.observed()) == 2)
+        pids = self.marked_pids()
+        self.assertTrue(all(alive(pid) for pid in pids))
+        mock.model_gate.set()
+        events = self.finish(process, timeout=5)
+        self.assertEqual(events[-1]["end"]["text"], "initial complete")
+        self.assertEqual(len(mock.observed()), 2)
+        wait_for(lambda: all(not alive(pid) for pid in pids))
+        self.assertFalse((self.cwd / "worker.release").exists())
+
+    def test_ask_detached_zero_timeout_exits_without_waiting_and_cleans_up(self):
+        self.ask_detached_cleanup("detached_ask_zero")
+
+    def test_ask_detached_default_timeout_exits_without_waiting_and_cleans_up(self):
+        self.ask_detached_cleanup("detached_ask_default")
+
+    def test_detached_requires_background_and_stop_rejects_unknown_id(self):
+        self.mock("detached_invalid")
+        events = self.finish(self.start())
+        output = next(e["run_end"]["output"] for e in events if "run_end" in e)
+        results = json.loads(output.removeprefix("result: "))
+        self.assertEqual(len(results), 3)
+        self.assertTrue(all(result.get("error") for result in results), results)
+        for result in results[:2]:
+            self.assertIn("background", result["error"].lower())
+        self.assertFalse([e for e in events if "background" in e])
+        self.assertFalse(list(self.cwd.glob("*.started")))
+
+    def test_js_keeps_later_background_progress_attached_to_its_run(self):
+        mock = self.mock("detached_ask_default")
+        self.addCleanup(self.kill_marked_workers)
+        terminal = Terminal(self.cwd, self.env)
+        self.addCleanup(terminal.close)
+        terminal.send("/js await tools.write({path:'js.ready',content:'ready'})\r")
+        wait_for(lambda: (self.cwd / "js.ready").exists())
+        terminal.send("initial\r")
+        wait_for(lambda: len(mock.observed()) == 2)
+        pids = self.marked_pids()
+        terminal.until(b"b1 bash")
+        mock.model_gate.set()
+        self.wait_final("initial complete")
+        self.assertTrue(all(alive(pid) for pid in pids))
+        terminal.send("/new\r")
+        terminal.until(b"new session")
+        wait_for(lambda: all(not alive(pid) for pid in pids))
+
+    def test_js_foreground_bash_counter_is_persisted_for_resume(self):
+        mock = self.mock("detached_ask_default")
+        terminal = Terminal(self.cwd, self.env)
+        self.addCleanup(terminal.close)
+        terminal.send("/js await tools.bash({command:'sleep 3.1'}); "
+                      "await tools.write({path:'js.ready',content:'ready'})\r")
+        wait_for(lambda: (self.cwd / "js.ready").exists())
+        log = next((self.home / "sessions").glob("?" * 32 + ".jsonl"))
+        wait_for(lambda: any(r.get("task_ids", {}).get("bash") == 1 for r in records(log)))
+        terminal.close()
+        process = self.start("--resume", log.stem, "initial")
+        wait_for(lambda: len(mock.observed()) == 2)
+        mock.model_gate.set()
+        events = self.finish(process)
+        result = json.loads(next(e["run_end"]["output"] for e in events
+                                 if "run_end" in e).removeprefix("result: "))
+        self.assertEqual(result, {"id": "b2"})
+
+    def test_detached_http_service_is_ready_by_sleep_polling_and_stops_next_turn(self):
+        (self.cwd / "health.txt").write_text("detached-service-ready\n")
+        mock = self.mock("detached_service")
+        terminal = self.detached_terminal()
+        wait_for(lambda: len(mock.observed()) == 2)
+        pid = wait_for(lambda: int((self.cwd / "server.started").read_text() or 0)
+                       if (self.cwd / "server.started").exists() else None)
+        mock.model_gate.set()
+        self.wait_final("initial complete")
+        self.assertEqual(self.last_run_value(), {"job": {"id": "b1"}, "ready": "detached-service-ready\n"})
+        self.assertTrue(alive(pid))
+        terminal.send("probe service\r")
+        self.wait_final("probe service complete")
+        self.assertEqual(self.last_run_value()["status"], 200)
+        self.assertEqual(self.last_run_value()["text"], "detached-service-ready\n")
+        terminal.send("stop service\r")
+        self.wait_final("stop service complete")
+        result = self.last_run_value()
+        self.assertEqual(result["stopped"], {"id": "b1", "stopped": True})
+        self.assertTrue(result.get("error"), result)
+        self.assertFalse(alive(pid))
+        self.assertEqual(len(self.completions(history(self.home))), 1)
+        self.assert_accounting(mock)
+
+    def test_detached_shell_exit_cleans_server_descendants_and_delivers_once(self):
+        mock = self.mock("detached_shell_exit")
+        terminal = self.detached_terminal()
+        wait_for(lambda: len(mock.observed()) == 2)
+        pids = self.marked_pids("server")
+        mock.model_gate.set()
+        self.wait_final("initial complete")
+        self.assertEqual(self.last_run_value(), {"id": "b1"})
+        self.assertTrue(all(alive(pid) for pid in pids))
+        self.assertFalse(self.completions(history(self.home)))
+
+        started = time.monotonic()
+        (self.cwd / "shell.release").touch()
+        wait_for(lambda: all(not alive(pid) for pid in pids), timeout=3)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertIsNone(terminal.child.poll())
+        self.assertFalse(mock.extra_request.wait(.3), "shell exit started an unsolicited idle Turn")
+        self.assertFalse(self.completions(history(self.home)))
+
+        terminal.send("check stopped\r")
+        self.wait_final("check stopped complete")
+        self.assertEqual(self.last_run_value(), {"id": "b1", "stopped": False})
+        request = mock.observed()[2]
+        completions = self.completions(request["messages"])
+        self.assertEqual(len(completions), 1)
+        result = json.loads(content(completions[0]).split("\n", 1)[1])
+        self.assertEqual(result, {"exit_code": 0, "output": "shell-exited\n"})
+        self.assertEqual(len(self.completions(history(self.home))), 1)
+
+        terminal.send("next\r")
+        self.wait_final("next complete")
+        self.assertEqual(len(self.completions(history(self.home))), 1)
+        for request in mock.observed()[2:]:
+            self.assertEqual(len(self.completions(request["messages"])), 1)
+        self.assertTrue(all(not alive(pid) for pid in pids))
+        self.assert_accounting(mock)
+
+    def test_concurrent_stop_joins_detached_process_group_once(self):
+        mock = self.mock("detached_idle")
+        terminal = self.detached_terminal()
+        wait_for(lambda: len(mock.observed()) == 2)
+        pids = self.marked_pids()
+        mock.model_gate.set()
+        self.wait_final("initial complete")
+        terminal.send("stop concurrently\r")
+        self.wait_final("stop concurrently complete")
+        stopped = self.last_run_value()
+        self.assertEqual([r["id"] for r in stopped], ["b1", "b1"])
+        self.assertTrue(any(r["stopped"] for r in stopped), stopped)
+        self.assertTrue(all(not alive(pid) for pid in pids))
+        self.assertEqual(len(self.completions(history(self.home))), 1)
+        finished = [r["background"] for r in root_records(self.home)
+                    if r.get("background", {}).get("state") == "finished"]
+        self.assertEqual([r["id"] for r in finished], ["b1"])
+        self.assert_accounting(mock)
+
+    def test_stop_in_continuation_after_top_level_rejection_drains(self):
+        mock = self.mock("detached_continuation")
+        self.addCleanup(self.kill_marked_workers)
+        mock.model_gate.set()
+        events = self.finish(self.start(), timeout=5)
+        run = next(e["run_end"] for e in events if "run_end" in e)
+        self.assertFalse(run["ok"])
+        self.assertIn("top-level rejected", run["output"])
+        self.assertIn("continuation-stop", run["output"])
+        self.assertIn('"stopped":true', run["output"].replace(" ", ""))
+        self.assertTrue(all(not alive(pid) for pid in self.marked_pids()))
+        self.assertEqual(len(self.completions(mock.observed()[-1]["messages"])), 1)
+        self.assert_accounting(mock, events)
+
+    def test_detached_jobs_share_b_counter_across_turns_and_tree_labels(self):
+        mock = self.mock("detached_counters")
+        terminal = self.detached_terminal()
+        wait_for(lambda: len(mock.observed()) == 2)
+        pids = self.marked_pids()
+        terminal.until(b"b2 bash")
+
+        def detached_tree_visible():
+            screen = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", terminal.read())
+            return re.search(rb"b2 bash[^\n]*detached", screen)
+
+        wait_for(detached_tree_visible)
+        mock.model_gate.set()
+        self.wait_final("initial complete")
+        self.assertEqual(self.last_run_value(), {"id": "b2"})
+        terminal.send("launch next\r")
+        self.wait_final("launch next complete")
+        pids += self.marked_pids("other")
+        self.assertEqual(self.last_run_value(), {"id": "b3"})
+        self.assertTrue(all(alive(pid) for pid in pids))
+        terminal.until(b"b3 bash")
+        terminal.send("stop counters\r")
+        self.wait_final("stop counters complete")
+        self.assertEqual(self.last_run_value(), [{"id": "b2", "stopped": True},
+                                                 {"id": "b3", "stopped": True}])
+        self.assertTrue(all(not alive(pid) for pid in pids))
+        self.assert_accounting(mock)
+
+    def test_step_limit_does_not_wait_for_detached_jobs(self):
+        (self.home / "config.toml").write_text("[limits]\nmax_steps = 2\n")
+        mock = self.mock("detached_step_limit")
+        self.addCleanup(self.kill_marked_workers)
+        process = self.start()
+        wait_for(lambda: len(mock.observed()) == 2)
+        pids = self.marked_pids()
+        mock.model_gate.set()
+        events = self.finish(process, ok=False, timeout=5)
+        self.assertIn("stopped after 2 steps", json.dumps(events[-1]))
+        self.assertNotIn("waited for background tasks", json.dumps(events[-1]))
+        self.assertEqual(len(mock.observed()), 2)
+        self.assertTrue(all(not alive(pid) for pid in pids))
+
+    def test_limit_wait_retains_detached_completion_for_next_step_and_bills_it(self):
+        (self.home / "config.toml").write_text("[limits]\nmax_steps = 1\n")
+        mock = self.mock("detached_limit_mixed")
+        terminal = self.detached_terminal()
+        terminal.until(b"waiting for background tasks: bash b2")
+        self.assertEqual(len(mock.observed()), 1)
+        self.assertFalse(self.completions(history(self.home), "b1"))
+        self.release("ordinary")
+        terminal.until(b"stopped after 1 steps")
+        self.assertFalse(self.completions(history(self.home), "b1"))
+        terminal.send("next turn\r")
+        self.wait_final("next turn complete")
+        request = mock.observed()[-1]
+        self.assertEqual(len(self.completions(request["messages"], "b1")), 1)
+        rows = root_records(self.home)
+        step = [r for r in rows if "model_ms" in r][-1]
+        delivered = [content(m) for m in request["messages"]
+                     if content(m).startswith("[background ")]
+        self.assertEqual(step["output_bytes"], sum(len(m.encode()) for m in delivered))
+
     def assert_accounting(self, mock, events=None):
         log = self.log(events) if events is not None else root_records(self.home)
         terminal = events[-1].get("end", events[-1].get("error")) if events is not None else None
@@ -334,6 +800,23 @@ class BackgroundBashTests:
 
     def test_canceled_request_does_not_count_injected_result(self):
         self.check_injected_request_aborted(cancel=True)
+
+    def test_resume_bills_result_committed_before_failed_receiving_request_once(self):
+        mock = self.mock("injected_failure")
+        process = self.start()
+        wait_for(lambda: len(mock.observed()) == 2)
+        wait_for(lambda: (self.cwd / "worker.started").exists())
+        self.release()
+        failed = self.finish(process, ok=False)
+        session_id = failed[0]["start"]["session_id"]
+        stored = self.completion([m for r in self.log(failed) for m in r.get("messages", [])])
+        charge = len(content(stored).encode("utf-8"))
+        mock.case = "detached_resume_charge"
+        resumed = self.finish(self.start("--resume", session_id, "resume charge"))
+        self.assertEqual(resumed[-1]["end"]["timing"]["output_bytes"], charge)
+        self.assertEqual(len(self.completions(mock.observed()[-1]["messages"])), 1)
+        again = self.finish(self.start("--resume", session_id, "resume again"))
+        self.assertEqual(again[-1]["end"]["timing"]["output_bytes"], 0)
 
     def test_background_mutation_after_last_write_is_not_attributed(self):
         (self.cwd / "shared.txt").write_text("old\nkeep\n")

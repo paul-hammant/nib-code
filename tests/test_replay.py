@@ -162,6 +162,29 @@ class ReplayTests(unittest.TestCase):
         self.assertFalse((self.cwd / "sample.txt").exists())
         self.assertFalse((self.cwd / "side-effect").exists())
 
+    def test_detached_start_and_stop_are_recorded_and_replay_without_processes(self):
+        session = self.ask([
+            'const job = await tools.bash({command: "printf started > detached-side-effect; sleep 60", '
+            'background: true, detached: true}); await tools.sleep(100); '
+            'console.log(job, await tools.stop({id: job.id}));'
+        ])
+        calls = [r for r in jsonl(self.calls_path(session)) if "index" in r]
+        self.assertEqual([r["name"] for r in calls], ["bash", "sleep", "stop"])
+        self.assertEqual(json.loads(calls[0]["result"]), {"id": "b1"})
+        self.assertEqual(json.loads(calls[-1]["result"]), {"id": "b1", "stopped": True})
+        log = jsonl(self.home / "sessions" / f"{session}.jsonl")
+        timed = [c for row in log for c in row.get("calls", [])]
+        self.assertEqual([c["name"] for c in timed], ["bash", "sleep", "stop"])
+        self.assertTrue(all(c["ok"] and c["result_bytes"] > 0 for c in timed))
+        marker = self.cwd / "detached-side-effect"
+        marker.unlink(missing_ok=True)
+        before = len(self.mock.requests)
+        report = self.replay(session, "--all")
+        self.assertEqual(report["matched"], 1, report)
+        self.assertEqual(report["divergences"], 0, report)
+        self.assertFalse(marker.exists())
+        self.assertEqual(len(self.mock.requests), before)
+
     def test_explicit_step_limits_replay_from_run_metadata(self):
         config = self.home / "config.toml"
         for limit in (1, 2):

@@ -262,16 +262,16 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         other = tmp / "other"
         other.mkdir()
         ask("no session", "-c", workdir=other, ok=False)
-        ask("one", workdir=other, window="4096")
-        result = ask("two", "--continue", workdir=other, window="4096")
+        ask("one", workdir=other, window="4352")
+        result = ask("two", "--continue", workdir=other, window="4352")
         assert b"compacted context:" in result.stderr
         compact_log = next(p for p in (tmp / "nib/sessions").glob("[0-9a-f]" * 32 + ".jsonl") if p != log)
         compacted, records = replay(compact_log)
         replacements = [r for r in records[1:] if r["messages"][0].get("content", "").startswith("Earlier session summary:")]
         assert len(replacements) == 1
-        assert replacements[0]["context_tokens"] <= 2048
+        assert replacements[0]["context_tokens"] <= 2176
         assert compacted[1]["content"].startswith("Earlier session summary:")
-        ask("three", "-c", workdir=other, window="4096")
+        ask("three", "-c", workdir=other, window="4352")
         assert read_requests(requests_path)[-2]["messages"] == compacted + [{"role": "user", "content": "three"}]
         def events(result):
             assert result.stderr == b"", result.stderr
@@ -335,7 +335,7 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         assert missing["message"] == "MissingPrompt" and "timing" not in missing
         json_cwd = tmp / "json"
         json_cwd.mkdir()
-        compact_json = events(ask("json compact", "--json", workdir=json_cwd, window="4096"))
+        compact_json = events(ask("json compact", "--json", workdir=json_cwd, window="4352"))
         assert any("notice" in e for e in compact_json)
         assert [e["step"]["n"] for e in compact_json if "step" in e] == list(
             range(1, compact_json[-1]["end"]["steps"] + 1)), compact_json

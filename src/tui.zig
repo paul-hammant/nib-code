@@ -94,6 +94,7 @@ const Turn = struct {
     fn execute(t: *Turn, compact: bool, detail: *?[]u8) !void {
         const sink: Sink = .{ .ctx = t, .emit = emit, .onModelActivity = modelActivity, .onUserInserted = userInserted };
         if (compact) {
+            errdefer t.session.tools.background.stop(t.gpa);
             _ = try t.session.compact(sink, &t.cancel, detail);
         } else try t.session.turn(t.text, sink, &t.cancel, detail);
     }
@@ -268,7 +269,7 @@ pub fn run(init: std.process.Init, session: *Session) !void {
     if (app.cfg.missingKey()) try app.transcript.add(gpa, .err, "no API key: set DEEPSEEK_API_KEY (or NIB_API_KEY). /js <code> still works.");
 
     while (try app.handle(try loop.nextEvent())) {
-        ticker.busy.store(app.turn != null, .release);
+        ticker.busy.store(app.turn != null or app.session.tools.background.anyPending(io), .release);
         try app.render();
     }
 }
@@ -321,6 +322,11 @@ const App = struct {
         app.paste_buf.deinit(app.gpa);
     }
 
+    fn idleProgress(ctx: *anyopaque, progress: @import("session/events.zig").Progress) !void {
+        const app: *App = @ptrCast(@alignCast(ctx));
+        try app.transcript.progress(app.gpa, progress);
+    }
+
     /// False to quit.
     fn handle(app: *App, event: Event) !bool {
         const gpa = app.gpa;
@@ -352,7 +358,11 @@ const App = struct {
                     }
                 }
             },
-            .tick => {},
+            .tick => if (app.turn == null) {
+                app.session.tools.progress.sink = .{ .ctx = app, .emit = idleProgress };
+                defer app.session.tools.progress.sink = null;
+                try app.session.tools.progress.drain(app.io);
+            },
             .model_activity => |activity| {
                 if (activity.state == .started and app.activity.phase != .compacting) app.activity.set(app.io, .thinking);
                 app.activity.modelActivity(activity.state, activity.at);
@@ -562,6 +572,7 @@ const App = struct {
                 if (id != null and std.mem.eql(u8, id.?, session.id)) return app.transcript.add(gpa, .info, "already in this session");
                 session.reopen(id) catch |err| return app.report(.err, "could not open session: {s}", .{@errorName(err)});
                 app.transcript.clear(gpa);
+                app.background_count = 0;
                 try app.transcript.addHistory(gpa, session.history.items);
                 app.usage = .{};
                 app.steps = 0;
@@ -594,6 +605,7 @@ const App = struct {
             .js => {
                 if (arg.len == 0) return app.transcript.add(gpa, .err, "usage: /js <code>");
                 try app.transcript.add(gpa, .user, line);
+                defer app.transcript.next_run = session.tools.run_id;
                 const ran = try session.run(arg, null);
                 const r = ran.outcome;
                 app.usage = session.usage;
@@ -711,16 +723,17 @@ const App = struct {
         app.clearStepEffort();
         app.turn.?.finish();
         app.turn = null;
-        app.background_count = 0;
-        try app.transcript.clearBackgroundProgress(app.gpa);
-        app.transcript.next_run = 0;
+        if (!app.session.tools.background.anyPending(app.io)) {
+            app.background_count = 0;
+            try app.transcript.clearBackgroundProgress(app.gpa);
+        }
         app.usage = app.session.usage;
         app.steps = app.session.steps;
         app.context = app.session.context_tokens;
     }
 
     fn finishQueued(app: *App, send: bool) !void {
-        var batch = app.session.takeQueued();
+        var batch = try app.session.takeQueued();
         defer batch.deinit(app.gpa);
         if (batch.items.items.len == 0) return;
         const text = try batch.joined(app.gpa);

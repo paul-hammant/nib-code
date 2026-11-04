@@ -79,10 +79,19 @@ const all = [_]Tool{
         .name = "bash",
         .run = bash.bash,
         .doc =
-        \\  // Run bash in the working directory; stderr is merged into output. exit_code is null if killed.
-        \\  // Output is returned verbatim; over 16 MiB errors (redirect output to a file). Commands over 256 shell words, excluding heredoc bodies, are refused: write long scripts to a file with tools.write and run that file.
-        \\  // background returns {id} immediately; {exit_code,output} arrives as a message in a later Step. File changes during the command affect its result.
-        \\  async bash({ command, timeout_ms = 120000, background = false }) {}, // → { exit_code, output } or { id }
+        \\  // Bash in cwd; stderr merged. exit_code:null if killed. Returning kills its process group, including nohup/&.
+        \\  // Verbatim output; >16 MiB errors (redirect to file). >256 shell words excluding heredocs refused: write a script. File changes affect results.
+        \\  // background returns {id}; result in a later Step. detached requires background; survives normal Turns without waiting. Stop/timeout/Turn cancel or failure/Session exit cleans up.
+        \\  // A detached task ends when its shell exits; run servers in command foreground.
+        \\  async bash({ command, timeout_ms, background = false, detached = false }) {}, // → { exit_code, output } or { id }; timeout_ms default: detached 0 (unlimited), else 120000
+        ,
+    },
+    .{
+        .name = "stop",
+        .run = @import("tools/stop.zig").stop,
+        .doc =
+        \\  // Cancel and join one background bash/agent by id, cleaning up its process group. Completed tasks return stopped:false; unknown ids reject. Completion is still delivered once as a background message.
+        \\  async stop({ id }) {}, // → { id, stopped }
         ,
     },
     .{
@@ -383,7 +392,7 @@ test "child API filters agent from both docs and sandbox" {
     try testing.expect(std.mem.indexOf(u8, t.api().docs, "async agent({") == null);
     const result = try sandbox.eval(testing.allocator, testing.io, "[typeof tools.agent, Object.keys(tools)]", .{}, t.host(), null);
     defer result.deinit(testing.allocator);
-    try testing.expectEqualStrings("[\"undefined\",[\"sleep\",\"read\",\"edit\",\"write\",\"grep\",\"glob\",\"fetch\",\"bash\",\"llm\"]]", result.text);
+    try testing.expectEqualStrings("[\"undefined\",[\"sleep\",\"read\",\"edit\",\"write\",\"grep\",\"glob\",\"fetch\",\"bash\",\"stop\",\"llm\"]]", result.text);
 }
 
 test "Run excludes tool waits without resetting the JS budget" {

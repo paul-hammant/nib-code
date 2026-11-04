@@ -51,6 +51,7 @@ nib 面向越来越强的模型：给模型事实和能力，不替它做判断�
   - [0011 一个 Provider 接口，两种线路协议](adr/0011-provider-wire-protocols.md)
   - [0012 新增 grep、glob、fetch，搜索用 Zig 原生实现](adr/0012-search-and-fetch-tools.md)
   - [0013 tools.llm：轻量的单步 map 单元](adr/0013-llm-functions.md)
+  - [0014 会话级后台 bash 与按 id 停止](adr/0014-session-background-jobs.md)
 - [ask-json.md](ask-json.md)：`ask --json` 的 NDJSON 事件格式、进度与用量
 - [session-log.md](session-log.md)：会话日志、恢复/取消、计时字段与统计口径
 - [replay.md](replay.md)：工具结果录制、离线 Run 重放、诊断脚本与隐私边界

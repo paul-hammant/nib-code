@@ -66,6 +66,7 @@ pub const Log = struct {
     next_bash_id: u64 = 1,
     agent_sessions: []const AgentSession = &.{},
     lost_background: []const @import("events.zig").Background = &.{},
+    pending_background_bytes: u64 = 0,
     offset: u64,
     poisoned: bool = false,
     steps: usize = 0,
@@ -92,7 +93,7 @@ pub const Log = struct {
         if (expected_parent) |parent| {
             if (!std.mem.eql(u8, parent, restored.parent_session_id orelse "")) return error.AgentSessionParentMismatch;
         }
-        var log: Log = .{ .file = file, .offset = data.len, .parent_session_id = restored.parent_session_id, .provider = restored.provider, .model = restored.model, .steps = restored.steps, .next_agent_id = restored.next_agent_id, .next_bash_id = restored.next_bash_id, .agent_sessions = restored.agent_sessions, .lost_background = restored.lost_background };
+        var log: Log = .{ .file = file, .offset = data.len, .parent_session_id = restored.parent_session_id, .provider = restored.provider, .model = restored.model, .steps = restored.steps, .next_agent_id = restored.next_agent_id, .next_bash_id = restored.next_bash_id, .agent_sessions = restored.agent_sessions, .lost_background = restored.lost_background, .pending_background_bytes = restored.pending_background_bytes };
         if (restored.needs_repair) try log.append(io, a, .{ .repair = true });
         for (restored.background_repairs) |event| try log.append(io, a, .{ .background = event });
         if (restored.needs_repair or restored.background_repairs.len != 0) try log.file.sync(io);
@@ -198,10 +199,11 @@ fn restoreToolSummaries(a: std.mem.Allocator, history: []provider.Message, recor
     }
 }
 
-pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, history: *std.ArrayList(provider.Message), tokens: *u64) !struct { needs_repair: bool, steps: usize, parent_session_id: ?[]const u8, provider: provider.Id, model: ?[]const u8, next_agent_id: u64, next_bash_id: u64, agent_sessions: []const AgentSession, lost_background: []const @import("events.zig").Background, background_repairs: []const @import("events.zig").Background } {
+pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, history: *std.ArrayList(provider.Message), tokens: *u64) !struct { needs_repair: bool, steps: usize, parent_session_id: ?[]const u8, provider: provider.Id, model: ?[]const u8, next_agent_id: u64, next_bash_id: u64, agent_sessions: []const AgentSession, lost_background: []const @import("events.zig").Background, background_repairs: []const @import("events.zig").Background, pending_background_bytes: u64 } {
     var parent_session_id: ?[]const u8 = null;
     var next_agent_id: u64 = 1;
     var next_bash_id: u64 = 1;
+    var pending_background_bytes: u64 = 0;
     var agent_sessions: std.ArrayList(AgentSession) = .empty;
     defer agent_sessions.deinit(a);
     const Pending = struct { event: @import("events.zig").Background, delivered: bool = false };
@@ -271,7 +273,13 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
         if (r.diagnostic != null) continue;
         if (r.from > history.items.len) return error.InvalidSessionLog;
         try history.ensureTotalCapacity(gpa, r.from + r.messages.len);
-        if (r.from == history.items.len) steps += assistantCount(r.messages);
+        if (r.from == history.items.len) {
+            steps += assistantCount(r.messages);
+            for (r.messages) |message| if (message.source == .background) {
+                if (message.content) |text| pending_background_bytes += text.len;
+            };
+            if (r.model_ms != null) pending_background_bytes = 0;
+        }
         apply(history, r);
         try restoreToolSummaries(a, history.items, r);
         try validate(history.items);
@@ -287,7 +295,7 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
             try background_repairs.append(a, pending.event);
         } else try lost_background.append(a, pending.event);
     }
-    return .{ .steps = steps, .needs_repair = torn or data[data.len - 1] != '\n', .parent_session_id = parent_session_id, .provider = id, .model = model, .next_agent_id = next_agent_id, .next_bash_id = next_bash_id, .agent_sessions = try agent_sessions.toOwnedSlice(a), .lost_background = try lost_background.toOwnedSlice(a), .background_repairs = try background_repairs.toOwnedSlice(a) };
+    return .{ .steps = steps, .needs_repair = torn or data[data.len - 1] != '\n', .parent_session_id = parent_session_id, .provider = id, .model = model, .next_agent_id = next_agent_id, .next_bash_id = next_bash_id, .agent_sessions = try agent_sessions.toOwnedSlice(a), .lost_background = try lost_background.toOwnedSlice(a), .background_repairs = try background_repairs.toOwnedSlice(a), .pending_background_bytes = pending_background_bytes };
 }
 
 fn restoreId(id: []const u8, next_agent: *u64, next_bash: *u64) !void {
@@ -1028,5 +1036,120 @@ test "restore closes delivered FIFO entries before delivering a reused ID as los
                 try t.expectEqual(@as(u64, 1), log.next_bash_id);
             }
         }
+    }
+}
+
+test "replay carries unbilled background bytes across interrupted Turns and clears on a committed Step" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    var history: std.ArrayList(provider.Message) = .empty;
+    defer history.deinit(t.allocator);
+    var tokens: u64 = 0;
+    const waiting =
+        \\{"messages":[{"role":"system","content":"s"}]}
+        \\{"from":1,"messages":[{"role":"user","content":"你好🙂","source":"background","background_kind":"bash","background_id":"b1"}]}
+        \\{"from":2,"messages":[{"role":"assistant","content":"[interrupted by user]"}]}
+        \\
+    ;
+    const pending = try replay(t.allocator, arena.allocator(), waiting, &history, &tokens);
+    try t.expectEqual(@as(u64, "你好🙂".len), pending.pending_background_bytes);
+    history.clearRetainingCapacity();
+    const charged = try replay(t.allocator, arena.allocator(), waiting ++
+        \\{"from":3,"model_ms":0,"output_bytes":10,"messages":[{"role":"assistant","content":"received"}]}
+        \\
+    , &history, &tokens);
+    try t.expectEqual(@as(u64, 0), charged.pending_background_bytes);
+}
+
+test "pending background bytes count only appended UTF-8 content and clear only on full Steps" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const background: provider.Message = .{ .role = "user", .content = "你好🙂", .source = .background, .background_id = "b1", .background_kind = .bash };
+    const bytes: u64 = "你好🙂".len;
+    const cases = [_]struct { record: Record, pending: u64 }{
+        .{ .record = .{ .messages = &.{.{ .role = "system", .content = "base" }} }, .pending = 0 },
+        .{ .record = .{ .from = 1, .messages = &.{ background, .{ .role = "user", .content = "not background", .background_id = "b2", .background_kind = .bash }, .{ .role = "user", .source = .background }, .{ .role = "user", .content = "", .source = .background } } }, .pending = bytes },
+        .{ .record = .{ .messages = &.{ .{ .role = "system", .content = "base" }, background } }, .pending = bytes },
+        .{ .record = .{ .from = 1, .messages = &.{background}, .model_ms = 0 }, .pending = bytes },
+        .{ .record = .{ .from = 1, .messages = &.{.{ .role = "user", .content = "summary" }}, .model_ms = 1 }, .pending = bytes },
+        .{ .record = .{ .from = 2, .messages = &.{.{ .role = "assistant", .content = "[interrupted by user]" }}, .ms = 10, .output_bytes = bytes }, .pending = bytes },
+        .{ .record = .{ .diagnostic = .{ .error_name = "Canceled", .message = "interrupted", .attempts = 1, .step = 1 }, .model_ms = 0 }, .pending = bytes },
+        .{ .record = .{ .agent_session = .{ .id = "a1", .session = "child" }, .model_ms = 0 }, .pending = bytes },
+        .{ .record = .{ .background = .{ .id = "b1", .kind = .bash, .state = .finished }, .model_ms = 0 }, .pending = bytes },
+        .{ .record = .{ .from = 3, .messages = &.{background} }, .pending = bytes * 2 },
+        .{ .record = .{ .from = 4, .messages = &.{ background, .{ .role = "assistant", .content = "received" } }, .model_ms = 0 }, .pending = 0 },
+        .{ .record = .{ .messages = &.{ .{ .role = "system", .content = "base" }, background } }, .pending = 0 },
+        .{ .record = .{ .from = 2, .messages = &.{background} }, .pending = bytes },
+    };
+    var encoded: std.Io.Writer.Allocating = .init(a);
+    defer encoded.deinit();
+    for (cases) |case| {
+        try encoded.writer.print("{f}\n", .{std.json.fmt(case.record, .{ .emit_null_optional_fields = false })});
+        var history: std.ArrayList(provider.Message) = .empty;
+        var tokens: u64 = 0;
+        const restored = try replay(a, a, encoded.written(), &history, &tokens);
+        try t.expectEqual(case.pending, restored.pending_background_bytes);
+    }
+}
+
+test "restore preserves pending background bytes across snapshots and idempotent lifecycle repairs" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/pending.jsonl", .{tmp.sub_path});
+    const background: provider.Message = .{ .role = "user", .content = "你好🙂", .source = .background, .background_id = "a1", .background_kind = .agent, .background_ok = true };
+    {
+        var log = try Log.create(t.io, path);
+        defer log.close(t.io);
+        var history: std.ArrayList(provider.Message) = .empty;
+        var tokens: u64 = 0;
+        try log.commit(t.io, a, &history, &tokens, .{ .parent_session_id = "parent", .messages = &.{.{ .role = "system", .content = "base" }} });
+        try log.agentSession(t.io, a, .{ .id = "a1", .session = "child" });
+        try log.background(t.io, a, .{ .id = "a1", .kind = .agent, .state = .started }, 1);
+        try log.commit(t.io, a, &history, &tokens, .{ .from = 1, .messages = &.{background}, .context_tokens = 17 });
+        try log.commit(t.io, a, &history, &tokens, .{ .messages = &.{ .{ .role = "system", .content = "base" }, background }, .context_tokens = 17 });
+        try log.file.writePositionalAll(t.io, "{\"model_ms\":", log.offset);
+    }
+    var repaired: ?[]const u8 = null;
+    for (0..3) |_| {
+        var history: std.ArrayList(provider.Message) = .empty;
+        var tokens: u64 = 0;
+        var log = try Log.restore(t.io, a, a, path, &history, &tokens, "parent");
+        defer log.close(t.io);
+        try t.expectEqual(@as(u64, "你好🙂".len), log.pending_background_bytes);
+        try t.expectEqual(@as(usize, 0), log.lost_background.len);
+        try t.expectEqualDeep(&[_]AgentSession{.{ .id = "a1", .session = "child" }}, log.agent_sessions);
+        try t.expectEqual(@as(u64, 2), log.next_agent_id);
+        try t.expectEqual(@as(u64, 17), tokens);
+        const data = try tmp.dir.readFileAlloc(t.io, "pending.jsonl", a, .unlimited);
+        if (repaired) |previous| try t.expectEqualStrings(previous, data);
+        repaired = data;
+        var replayed: std.ArrayList(provider.Message) = .empty;
+        var replayed_tokens: u64 = 0;
+        const restored = try replay(a, a, data, &replayed, &replayed_tokens);
+        try t.expect(!restored.needs_repair);
+        try t.expectEqual(@as(usize, 0), restored.background_repairs.len);
+        try t.expectEqual(log.pending_background_bytes, restored.pending_background_bytes);
+    }
+    {
+        var history: std.ArrayList(provider.Message) = .empty;
+        var tokens: u64 = 0;
+        var log = try Log.restore(t.io, a, a, path, &history, &tokens, "parent");
+        defer log.close(t.io);
+        try log.commit(t.io, a, &history, &tokens, .{ .from = history.items.len, .messages = &.{.{ .role = "assistant", .content = "received" }}, .model_ms = 0 });
+    }
+    for (0..2) |_| {
+        var history: std.ArrayList(provider.Message) = .empty;
+        var tokens: u64 = 0;
+        var log = try Log.restore(t.io, a, a, path, &history, &tokens, "parent");
+        defer log.close(t.io);
+        try t.expectEqual(@as(u64, 0), log.pending_background_bytes);
+        try t.expectEqual(@as(usize, 0), log.lost_background.len);
     }
 }
