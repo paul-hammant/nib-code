@@ -238,6 +238,55 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(user, "unlimited prompt")
         self.assertEqual(jsonl(main)[0], original_header)
 
+    def test_sleep_records_and_replays_without_real_wait(self):
+        session = self.ask([
+            'const pending = tools.sleep(80); '
+            'console.log(await tools.sleep(5)); await pending; console.log("awake");'
+        ])
+        path = self.calls_path(session)
+        rows = jsonl(path)
+        calls = [r for r in rows if "index" in r]
+        self.assertEqual([(r["index"], r["seq"], r["name"], r["args"]) for r in calls],
+                         [(1, 0, "sleep", 5), (0, 1, "sleep", 80)])
+        self.assertTrue(all(r["ok"] for r in calls))
+        self.assertEqual(calls[0]["result"], "null")
+        self.assertEqual(calls[1]["result"], {"same_as": calls[0]["sha256"]})
+        report = self.replay(session, "--run", "1:0")
+        self.assertTrue(report["match"], report)
+        self.assertIn("awake", report["output"])
+        # Matching long recorded waits must not turn into real replay timers.
+        for row in rows:
+            if "index" in row:
+                row["args"] = 2147483647
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        script = self.cwd / "sleep.js"
+        script.write_text('console.log(await tools.sleep(2147483647)); '
+                          'await tools.sleep(2147483647); console.log("awake");')
+        report = self.replay(session, "--run", "1:0", "--script", str(script))
+        self.assertIn("awake", report["output"])
+        self.assertFalse(report["incomplete"], report)
+
+    def test_worker_and_expired_sleep_replay_preserve_microtask_checkpoints(self):
+        session = self.ask([
+            'const p = tools.bash({command: "printf ready"}); await tools.sleep(0); '
+            'let n = 0; for (let i = 0; i < 20000000; i++) n += i; '
+            'const q = tools.sleep(0); console.log(await Promise.race(['
+            'p.then(() => "worker").then(x => x).then(x => x), q.then(() => "timer")]));'
+        ])
+        report = self.replay(session, "--run", "1:0")
+        self.assertTrue(report["match"], report)
+        self.assertFalse(report["incomplete"], report)
+
+    def test_rejected_run_discards_sleep_without_fabricating_a_settlement(self):
+        session = self.ask(['tools.sleep(2147483647); throw new Error("stop");'])
+        rows = jsonl(self.calls_path(session))
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["meta"]["end"], "error")
+        self.assertTrue(rows[0]["meta"]["incomplete"])
+        report = self.replay(session, "--run", "1:0")
+        self.assertTrue(report["incomplete"], report)
+        self.assertIsNone(report["match"])
+
     def test_record_off_creates_no_calls_file(self):
         self.env["NIB_RECORD"] = "off"
         (self.cwd / "sample.txt").write_text("off probe")

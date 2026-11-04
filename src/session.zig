@@ -807,7 +807,7 @@ test "system prompt documents every tool in JavaScript" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "last expression and console.log output share 16 KiB per Run") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "tool results inside JS remain complete") != null);
     for (tools.names) |name| {
-        const call = try std.fmt.allocPrint(gpa, "async {s}({{", .{name});
+        const call = try std.fmt.allocPrint(gpa, "async {s}(", .{name});
         defer gpa.free(call);
         try std.testing.expect(std.mem.indexOf(u8, prompt, call) != null);
     }
