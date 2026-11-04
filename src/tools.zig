@@ -13,10 +13,17 @@ const Tool = struct {
     root_only: bool = false,
     name: []const u8,
     doc: []const u8,
-    run: *const fn (t: *Tools, gpa: std.mem.Allocator, args: []const u8) anyerror!sandbox.ToolResult,
+    run: ?*const fn (t: *Tools, gpa: std.mem.Allocator, args: []const u8) anyerror!sandbox.ToolResult = null,
 };
 
 const all = [_]Tool{
+    .{
+        .name = "sleep",
+        .doc =
+        \\  // Wait ms (integer 0..2147483647); cancellable, no process/thread or tool slot. Counts Run wall time, not JS budget. Run drains even unawaited sleeps.
+        \\  async sleep(ms) {}, // → null
+        ,
+    },
     .{
         .name = "read",
         .run = files.read,
@@ -303,7 +310,7 @@ pub const Tools = struct {
         const t: *Tools = @ptrCast(@alignCast(ctx));
         const r = for (all) |tool| {
             if (!enabled(tool, t.depth)) continue;
-            if (std.mem.eql(u8, name, tool.name)) break tool.run(t, gpa, args);
+            if (std.mem.eql(u8, name, tool.name)) break if (tool.run) |run_tool| run_tool(t, gpa, args) else error.SandboxOnlyTool;
         } else fail(gpa, "unknown tool", .{});
         return r catch |err| fail(gpa, "{s}", .{@errorName(err)}) catch .{ .err = &.{} };
     }
@@ -457,7 +464,7 @@ test "child API filters agent from both docs and sandbox" {
     try testing.expect(std.mem.indexOf(u8, t.api().docs, "async agent({") == null);
     const result = try sandbox.eval(testing.allocator, testing.io, "[typeof tools.agent, Object.keys(tools)]", .{}, t.host(), null);
     defer result.deinit(testing.allocator);
-    try testing.expectEqualStrings("[\"undefined\",[\"read\",\"edit\",\"write\",\"grep\",\"glob\",\"fetch\",\"bash\",\"llm\"]]", result.text);
+    try testing.expectEqualStrings("[\"undefined\",[\"sleep\",\"read\",\"edit\",\"write\",\"grep\",\"glob\",\"fetch\",\"bash\",\"llm\"]]", result.text);
 }
 
 test "Run excludes tool waits without resetting the JS budget" {

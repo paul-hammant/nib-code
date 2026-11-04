@@ -5,7 +5,7 @@ date: 2026-11-01
 
 # Run 内工具调用真正并发，顺序按 JS 语义
 
-宿主函数立即返回一个 Promise，实际工作在线程上执行，完成后回到 Run 所在的线程 resolve（QuickJS 不是线程安全的）。执行顺序完全由脚本决定：`Promise.all` 就并行，依次 `await` 就串行。唯一的额外规则：对同一路径的 `edit` / `write` 按路径加锁。
+宿主函数立即返回一个 Promise；通常实际工作在线程上执行，完成后回到 Run 所在的线程 resolve（QuickJS 不是线程安全的）。`tools.sleep(ms)` 是例外：由 sandbox 原生事件循环计时器调度，不启动进程或线程、不占工具并发槽；等待、取消与 Run 排空语义见 [run-output.md](../run-output.md#run-内延时与轮询)。执行顺序完全由脚本决定：`Promise.all` 就并行，依次 `await` 就串行。唯一的额外规则：对同一路径的 `edit` / `write` 按路径加锁。
 
 **为什么：** 现在工具调用同步执行，`Promise.all` 结果正确但不并发。子 agent（[0010](0010-subagents.md)）要靠并行分派才有价值，并发是它的前提。顺序已经由代码表达，不需要再加规则。
 

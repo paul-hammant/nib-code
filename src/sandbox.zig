@@ -2,6 +2,7 @@ const std = @import("std");
 const c = @import("qjs");
 const console = @import("sandbox/console.zig");
 const run_timing = @import("sandbox/timing.zig");
+const Timer = @import("sandbox/timer.zig").Timer;
 pub const RunTiming = run_timing.Run;
 pub const tool_concurrency = 8;
 
@@ -110,6 +111,7 @@ const State = struct {
         args: []u8,
         settle: [2]c.JSValue,
         thread: ?std.Thread = null,
+        timer: ?Timer = null,
         result: ?ToolResult = null,
         timing_index: ?usize = null,
         next: ?*Call = null,
@@ -172,7 +174,13 @@ const State = struct {
     fn deinit(st: *State, ctx: *c.JSContext) void {
         st.stop();
         for (st.calls.items) |item| if (item) |call| if (call.thread) |thread| thread.join();
-        for (st.calls.items) |item| if (item) |call| call.deinit(ctx);
+        for (st.calls.items) |item| if (item) |call| {
+            if (call.timer != null) {
+                if (st.host.?.timing) |t| if (call.timing_index) |i|
+                    t.complete(i, t.entries[i].start_ms, t.elapsed(), false);
+            }
+            call.deinit(ctx);
+        };
         st.calls.deinit(st.gpa);
     }
 
@@ -207,15 +215,33 @@ const State = struct {
         call.deinit(ctx);
     }
 
+    fn compactCalls(st: *State, next: *usize) void {
+        var len: usize = 0;
+        var dispatched: usize = 0;
+        for (st.calls.items, 0..) |item, index| if (item) |call| {
+            // Workers retain Call pointers; only the eval thread reads array indices.
+            call.index = len;
+            st.calls.items[len] = call;
+            len += 1;
+            if (index < next.*) dispatched += 1;
+        };
+        st.calls.items.len = len;
+        next.* = dispatched;
+    }
+
+    fn hasTimers(st: *State) bool {
+        for (st.calls.items) |item| if (item) |call| {
+            if (call.timer != null) return true;
+        };
+        return false;
+    }
+
     fn jobs(st: *State, ctx: *c.JSContext, rt: *c.JSRuntime, promise: c.JSValue) !void {
         var active: usize = 0;
         var next: usize = 0;
         while (true) {
             if (st.host) |h| if (h.poll) |poll| try poll(h.ctx);
-            if (active == 0 and next == st.calls.items.len) {
-                st.calls.clearRetainingCapacity();
-                next = 0;
-            }
+            st.compactCalls(&next);
             if (virtualStopped(st)) return;
             if (isInterrupted(st) or c.JS_PromiseState(ctx, promise) == c.JS_PROMISE_REJECTED) {
                 st.stop();
@@ -257,8 +283,10 @@ const State = struct {
                 try st.deliver(ctx, call);
             }
             if (ready != null or c.JS_IsJobPending(rt)) continue;
-            while (next < st.calls.items.len and active < tool_concurrency) : (next += 1) {
-                const call = st.calls.items[next].?;
+            while (next < st.calls.items.len) : (next += 1) {
+                const call = st.calls.items[next] orelse continue;
+                if (call.timer != null) continue;
+                if (active == tool_concurrency) break;
                 if (call.result != null) {
                     st.mutex.lockUncancelable(st.io);
                     if (st.ready_tail) |tail| tail.next = call else st.ready = call;
@@ -275,9 +303,26 @@ const State = struct {
                 };
                 active += 1;
             }
-            if (active == 0) return;
+            var wait_ms: i64 = 20;
+            var expired: ?*Call = null;
+            for (st.calls.items) |item| if (item) |call| {
+                if (call.timer) |timer| {
+                    const remaining = timer.remaining(st.io);
+                    wait_ms = @min(wait_ms, remaining);
+                    if (remaining == 0 and (expired == null or timer.before(expired.?.timer.?)))
+                        expired = call;
+                }
+            };
+            if (expired) |call| {
+                call.result = .{ .ok = try st.gpa.dupe(u8, "null") };
+                if (st.host.?.timing) |t| if (call.timing_index) |i|
+                    t.complete(i, t.entries[i].start_ms, t.elapsed(), true);
+                try st.deliver(ctx, call);
+            }
+            if (expired != null or c.JS_IsJobPending(rt)) continue;
+            if (active == 0 and !st.hasTimers()) return;
             st.mutex.lockUncancelable(st.io);
-            if (st.ready == null) st.completed.waitTimeout(st.io, &st.mutex, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch {};
+            if (st.ready == null) st.completed.waitTimeout(st.io, &st.mutex, .{ .duration = .{ .raw = .fromMilliseconds(wait_ms), .clock = .awake } }) catch {};
             st.mutex.unlock(st.io);
         }
     }
@@ -294,6 +339,8 @@ const prelude =
     \\  const out = (...a) => log(a.map(fmt).join(" ") + "\n");
     \\  globalThis.console = Object.freeze({ log: out, info: out, warn: out, error: out });
     \\  const call = async (name, args) => {
+    \\    if (name === "sleep" && (!Number.isInteger(args) || args < 0 || args > 2147483647))
+    \\      throw new Error("sleep: ms must be an integer in 0..2147483647");
     \\    if (name === "grep" && args?.pattern instanceof RegExp) {
     \\      const re = args.pattern;
     \\      args = { ...args, pattern: re.source, ...(re.ignoreCase && !Object.hasOwn(args, "ignore_case") ? { ignore_case: true } : {}) };
@@ -513,8 +560,22 @@ fn enqueue(st: *State, ctx: *c.JSContext, argc: c_int, argv: [*c]c.JSValue) !c.J
     errdefer if (call.result) |result| switch (result) {
         inline else => |bytes| st.gpa.free(bytes),
     };
+    if (st.host.?.virtual == null and call.result == null and std.mem.eql(u8, name, "sleep")) {
+        const ms = try std.json.parseFromSlice(u31, st.gpa, args, .{});
+        defer ms.deinit();
+        call.timer = .init(st.io, ms.value);
+    }
     st.creation_index += 1;
     try st.calls.append(st.gpa, call);
+    if (call.timer != null) {
+        if (st.host.?.timing) |t| {
+            call.timing_index = t.reserve(name);
+            if (call.timing_index) |i| {
+                const ms = t.elapsed();
+                t.complete(i, ms, ms, false);
+            }
+        }
+    }
     return promise;
 }
 
@@ -554,6 +615,10 @@ fn toStr(gpa: std.mem.Allocator, ctx: *c.JSContext, val: c.JSValue) ![]u8 {
 }
 
 const testing = std.testing;
+
+test {
+    _ = @import("sandbox/timer_test.zig");
+}
 
 fn run(code: []const u8, limits: Limits, host: ?Host) !Outcome {
     return eval(testing.allocator, testing.io, code, limits, host, null);

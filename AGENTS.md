@@ -27,7 +27,7 @@
 - `src/config.zig`：解析 `NIB_HOME/config.toml`、合并环境配置、解析用户目录与原子写回 effort。
 - `src/session.zig`：Session 引擎（Turn、Step、压缩、取消）；`session/` 下是日志、指令拼接、事件、Run 输出格式化。
 - `src/provider.zig`：Provider 接口与配置；`provider/` 下是各线路协议和 SSE 解析，`provider/timing.zig` 只负责 run 参数到达进度采样；首个接收活动时间由 Session 复用 Sink.onData 记录。
-- `src/sandbox.zig`：QuickJS Run 与宿主桥接；`sandbox/console.zig` 捕获有界 console 首尾，`sandbox/timing.zig` 在原生工具调度/完成路径记录 Run 内工具调用耗时与结果字节数；`sandbox/record.zig` 在同一个结算出口录制工具参数和结果，`sandbox/replay.zig` + `sandbox/virtual.zig` 用录制结果代替真实工具执行。
+- `src/sandbox.zig`：QuickJS Run 与宿主桥接、`tools.sleep(ms)` 原生事件循环计时器（不占工具线程；语义见 [docs/run-output.md](docs/run-output.md)）；`sandbox/console.zig` 捕获有界 console 首尾，`sandbox/timing.zig` 在原生工具调度/完成路径记录 Run 内工具调用耗时与结果字节数；`sandbox/record.zig` 在同一个结算出口录制工具参数和结果，`sandbox/replay.zig` + `sandbox/virtual.zig` 用录制结果代替真实工具执行。
 - `src/tools.zig`：工具表（给模型看的 JS 说明集中在这里）、`Tools` 共享状态与调度。`tools/` 下每个工具族一个入口文件，函数名即工具名：`files.zig`（read/edit/write）、`search.zig`（grep/glob）、`web.zig`（fetch）、`bash.zig`、`agent.zig`、`llm.zig`（进程内单步纯模型调用，限额也集中在这里）、`background.zig`（后台 agent/bash 任务，由 Session 持有，跨 Run 存活）；其余是它们的辅助模块。加工具：在 `tools/` 写入口函数，再在表里加一行。
 - `src/tui.zig`：TUI 事件循环（按键、`/` 指令分派、Session 事件、后台 Turn）；`tui/` 下：`transcript.zig`（对话条目与折叠）、`agent_tree.zig`（Run 下方的子 agent/后台任务状态树）、`viewport.zig`（滚动锚定）、`view.zig`（一帧的布局绘制）、`status.zig`（活动行与下边框元数据）、`menu.zig`（`/` 候选菜单）、`commands.zig`（指令表）、`reflect.zig` + `reflect.md`（/reflect 的提示词与 reflections.md 追加）、`editor.zig`（输入框、原子粘贴块与进程内草稿历史）、`long_text.zig`（长文本阈值与计数）、`markdown.zig`、`selection.zig`（鼠标选区、高亮与剪贴板复制）。
 - `tests/`：端到端测试和 mock 服务器；`scripts/`：辅助脚本。

@@ -40,4 +40,28 @@
 
 ## Run 执行预算与取消
 
-Run 的默认 5 分钟超时只累计 QuickJS 执行片段（初始脚本、Promise jobs、工具结果解析/resolve、返回值序列化和错误转换），不计算等待工具完成的时间，也不在每次 await 后重置预算。它用于中断 JS 死循环；bash/fetch/agent 的执行时限由各自工具负责。等待时仍每 20 ms 检查取消，Esc/SIGINT/SIGTERM 不受计时暂停影响。
+Run 的默认 5 分钟超时只累计 QuickJS 执行片段（初始脚本、Promise jobs、工具结果解析/resolve、返回值序列化和错误转换），不计算等待工具完成（包括 `tools.sleep`）的时间，也不在每次 await 后重置预算。它用于中断 JS 死循环；bash/fetch/agent 的执行时限由各自工具负责。等待时仍以不超过 20 ms 的间隔检查取消，Esc/SIGINT/SIGTERM 不受计时暂停影响。
+
+## Run 内延时与轮询
+
+`await tools.sleep(ms)` 返回 `null`；`ms` 必须是 `0..2147483647` 的整数（毫秒）。缺少参数、非数字、非有限值、小数或越界值都会使 Promise reject，不做类型转换。`0` 也走异步调度。
+
+延时由 sandbox 原生事件循环计时器完成，不启动进程或线程，也不占工具并发槽；优先用它代替 `bash` 执行 `sleep` 或 JS 忙等。等待本身不调用模型、不产生 token 用量，但仍增加 Run 的墙钟耗时；JS 执行预算在等待期间暂停，轮询中的 JS 执行仍累计，read/fetch 等调用仍有各自成本。
+
+例如轮询本地服务的 HTTP 状态，最多检查 10 次，相邻检查之间等待 1 秒；非 200 状态重试，连接等错误仍会 reject 并终止 Run：
+
+```js
+let ready = false;
+for (let attempt = 0; attempt < 10; attempt++) {
+  const result = await tools.fetch({url: "http://127.0.0.1:8080/health"});
+  if (result.status === 200) {
+    ready = true;
+    break;
+  }
+  if (attempt < 9) await tools.sleep(1000);
+}
+if (!ready) throw new Error("service not ready after 10 checks");
+console.log("service ready");
+```
+
+与其他已调度工具一样，正常结束 Run 前会排空待完成的 sleep，即使没有 `await`；它不是跨 Run 的后台任务。Run 出错或取消时会及时丢弃未到期计时器，不等延时结束；取消检查沿用上述不超过 20 ms 的间隔。sleep 走标准工具计时、结果字节统计和录制/重放路径；重放按录制结果结算，不实际等待，见 [replay.md](replay.md)。
