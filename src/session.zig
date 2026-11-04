@@ -9,6 +9,7 @@ const session_log = @import("session/log.zig");
 const instructions = @import("session/instructions.zig");
 const output_format = @import("session/output.zig");
 const effort = @import("session/effort.zig");
+const ToolSummary = @import("session/tool_summary.zig").Summary;
 
 pub const Event = @import("session/events.zig").Event;
 pub const ModelActivity = @import("session/events.zig").ModelActivity;
@@ -440,17 +441,19 @@ pub const Session = struct {
             for (reply.tool_calls, 0..) |call, run_index| {
                 run_timing.run_index = run_index;
                 const before_bytes = run_timing.tool_bytes;
+                const before_omitted = run_timing.omitted;
                 const result = try s.execute(call, sink, cancel, &run_timing);
                 run_timing.output_bytes += result.output.len;
                 effort.Pending.record(&next_effort, result.effort, result.ok);
                 run_ms += result.run_ms orelse 0;
                 try sink.emit(sink.ctx, .{ .usage = s.usage });
-                try pending.append(s.gpa, .{ .role = "tool", .content = result.output, .tool_call_id = call.id });
+                try pending.append(s.gpa, .{ .role = "tool", .content = result.output, .tool_call_id = call.id, .tool_summary = result.tool_summary });
                 try run_results.append(s.gpa, .{
                     .tool_call_id = call.id,
                     .ok = result.ok,
                     .run_ms = result.run_ms,
                     .tool_bytes = run_timing.tool_bytes - before_bytes,
+                    .calls_omitted = run_timing.omitted - before_omitted,
                     .output_bytes = result.output.len,
                 });
                 output_tokens += result.output.len / 3 + 1;
@@ -631,7 +634,7 @@ pub const Session = struct {
         }
     };
 
-    const Executed = struct { output: []const u8, ok: bool, run_ms: ?u64 = null, effort: ?effort.Declaration = null };
+    const Executed = struct { output: []const u8, ok: bool, run_ms: ?u64 = null, effort: ?effort.Declaration = null, tool_summary: ?ToolSummary = null };
 
     /// Output is arena-owned.
     fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const std.atomic.Value(bool), timing: *sandbox.RunTiming) !Executed {
@@ -647,14 +650,16 @@ pub const Session = struct {
         const code = if (args.value.code) |value| (if (value == .string) value.string else null) else null;
         if (code == null) return .{ .ok = false, .output = try a.dupe(u8, "error: arguments must be a JSON object { \"code\": string }"), .effort = args.value.effort };
         try sink.emit(sink.ctx, .{ .run_start = code.? });
+        const before_omitted = timing.omitted;
         const ran = try s.runTimed(code.?, cancel, timing);
         const o = ran.outcome;
         defer o.deinit(s.gpa);
 
         const output = try output_format.format(a, o);
         const run_ms = timing.elapsed();
-        try sink.emit(sink.ctx, .{ .run_end = .{ .ok = o.ok, .output = output, .changes = ran.changes } });
-        return .{ .output = output, .ok = o.ok, .run_ms = run_ms, .effort = args.value.effort };
+        const tool_summary = try ToolSummary.init(a, timing.entries[0..timing.count], timing.run_index, timing.omitted - before_omitted);
+        try sink.emit(sink.ctx, .{ .run_end = .{ .ok = o.ok, .output = output, .changes = ran.changes, .tool_summary = tool_summary } });
+        return .{ .output = output, .ok = o.ok, .run_ms = run_ms, .effort = args.value.effort, .tool_summary = tool_summary };
     }
 };
 
@@ -901,4 +906,71 @@ test "run schema exposes optional one-shot effort enum" {
     const values = parameters.object.get("properties").?.object.get("effort").?.object.get("enum").?.array.items;
     try t.expectEqual(@as(usize, 4), values.len);
     inline for (.{ "low", "medium", "high", "default" }, 0..) |value, index| try t.expectEqualStrings(value, values[index].string);
+}
+
+test "execute emits per-Run actual tool summaries including empty and overflow" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var client: std.http.Client = .{ .allocator = t.allocator, .io = t.io };
+    defer client.deinit();
+    const cfg: provider.Config = .{ .base_url = "invalid://local", .api_key = "mock", .model = "mock" };
+    var session = try Session.init(t.allocator, t.io, &client, cfg, .{ .home = root, .user_home = root });
+    defer session.deinit();
+    var cancel: std.atomic.Value(bool) = .init(false);
+    const Observe = struct {
+        summary: ?ToolSummary = null,
+        ok: bool = true,
+        starts: usize = 0,
+        ends: usize = 0,
+
+        fn emit(ctx: *anyopaque, event: Event) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (event) {
+                .run_start => self.starts += 1,
+                .run_end => |value| {
+                    try std.testing.expect(self.summary == null);
+                    try std.testing.expect(value.tool_summary != null);
+                    self.summary = try value.tool_summary.?.clone(std.testing.allocator);
+                    self.ok = value.ok;
+                    self.ends += 1;
+                },
+                else => {},
+            }
+        }
+    };
+    var observed: Observe = .{};
+    var timing: sandbox.RunTiming = .init(t.io, .now(t.io, .awake));
+    const failing = try std.fmt.allocPrint(a, "try {{ await tools.read({{path: \"{s}/missing\"}}); }} catch (_) {{}} throw new Error(\"failed Run\");", .{root});
+    for ([_][]const u8{ failing, "console.log(\"tools.write is not a call\")", failing }, 0..) |code, run_index| {
+        if (run_index == 2) {
+            while (timing.count < timing.entries.len) _ = timing.reserve("bash");
+            _ = timing.reserve("bash");
+            _ = timing.reserve("bash");
+        }
+        timing.run_index = run_index;
+        const arguments = try std.json.Stringify.valueAlloc(a, .{ .code = code }, .{});
+        const result = try session.execute(.{ .id = "run", .function = .{ .name = "run", .arguments = arguments } }, .{ .ctx = &observed, .emit = Observe.emit }, &cancel, &timing);
+        const summary = observed.summary.?;
+        defer {
+            summary.deinit(t.allocator);
+            observed.summary = null;
+        }
+        try t.expectEqual(run_index == 1, observed.ok);
+        try t.expectEqual(observed.ok, result.ok);
+        try t.expectEqual(@as(u64, if (run_index == 2) 1 else 0), summary.omitted);
+        if (run_index == 0) {
+            try t.expectEqual(@as(usize, 1), summary.counts.len);
+            try t.expectEqualStrings("read", summary.counts[0].name);
+            try t.expectEqual(@as(u64, 1), summary.counts[0].count);
+        } else {
+            try t.expectEqual(@as(usize, 0), summary.counts.len);
+        }
+    }
+    try t.expectEqual(@as(usize, 3), observed.starts);
+    try t.expectEqual(@as(usize, 3), observed.ends);
 }

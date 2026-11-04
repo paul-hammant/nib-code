@@ -7,6 +7,7 @@ pub const RunResult = struct {
     run_ms: ?u64 = null,
     tool_bytes: ?u64 = null,
     output_bytes: ?u64 = null,
+    calls_omitted: ?u64 = null,
 };
 
 pub const Diagnostic = struct {
@@ -149,6 +150,33 @@ fn apply(history: *std.ArrayList(provider.Message), record: Record) void {
     }
 }
 
+fn restoreToolSummaries(a: std.mem.Allocator, history: []provider.Message, record: Record) !void {
+    const calls = record.calls orelse return;
+    for (record.messages, record.from..) |assistant, message_index| {
+        const runs = assistant.tool_calls orelse continue;
+        var unassigned = record.calls_omitted orelse 0;
+        for (record.run_results orelse &.{}) |result| {
+            if (result.calls_omitted) |omitted| unassigned -|= omitted;
+        }
+        if (runs.len > 1 and unassigned > 0) history[message_index].step_calls_omitted = unassigned;
+        for (runs, 0..) |run, run_index| {
+            var omitted: u64 = if (runs.len == 1) record.calls_omitted orelse 0 else 0;
+            for (record.run_results orelse &.{}) |result| {
+                if (std.mem.eql(u8, result.tool_call_id, run.id)) {
+                    omitted = result.calls_omitted orelse omitted;
+                    break;
+                }
+            }
+            for (history[record.from..]) |*message| {
+                if (std.mem.eql(u8, message.role, "tool") and std.mem.eql(u8, message.tool_call_id orelse "", run.id)) {
+                    message.tool_summary = try @import("tool_summary.zig").Summary.init(a, calls, run_index, omitted);
+                    break;
+                }
+            }
+        }
+    }
+}
+
 pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, history: *std.ArrayList(provider.Message), tokens: *u64) !struct { needs_repair: bool, steps: usize, parent_session_id: ?[]const u8, provider: provider.Id, model: ?[]const u8, next_background_id: u64, lost_background: []const @import("events.zig").Background } {
     var parent_session_id: ?[]const u8 = null;
     var next_background_id: u64 = 1;
@@ -197,6 +225,7 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
         try history.ensureTotalCapacity(gpa, r.from + r.messages.len);
         if (r.from == history.items.len) steps += assistantCount(r.messages);
         apply(history, r);
+        try restoreToolSummaries(a, history.items, r);
         try validate(history.items);
         tokens.* = r.context_tokens;
     }

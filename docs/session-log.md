@@ -62,6 +62,12 @@ TUI 在每个 Turn 的内容后追加一行淡色账单，例如：
 
 Session 累计这些数据并通过 `turn_end` 按值传给 TUI，TUI 不跨线程读取统计；账单只是界面条目，不写入模型历史，恢复旧会话时不重建。`ask --json` 的 `end/error.timing` 与账单计时相同，详见 [ask-json.md](ask-json.md)。
 
+## Run 标题工具统计
+
+运行中的 TUI Run 标题从源码预估工具名称和次数；结束后改用 Session 的 `run_end.tool_summary: {counts: [{name, count}], omitted}`，只统计实际宿主调用（排除 `dispatched=false` 的准入拒绝，包含已派发但执行失败的调用），按首次调用顺序显示。Step 的 `calls[]` 最多保留 200 条，省略部分显示为 `+N`，不猜测工具名称。
+
+恢复时，主日志 `calls[].run_index` 对应同一 assistant 消息的 `tool_calls` 数组索引，再按 `tool_call_id` 关联结果。新的 `run_results[].calls_omitted` 保存各 Run 的省略次数；只有 Step 级 `calls_omitted` 的过渡日志，单 Run 时可直接归属；多 Run 时不猜测归属，以独立的 `tools +N · omitted calls (Run unknown)` 条目显示，assistant 消息的可选 `step_calls_omitted` 元数据保留这部分计数。无 `calls` 的旧日志保留源码预估。tool 结果消息的可选 `tool_summary` 是界面元数据，用于压缩重写后保留统计，不发送给 provider。
+
 ## Step effort 字段
 
 完整 Step 还记录可选 `effort`、`effort_source` 和 `effort_downgraded`。`effort` 是实际请求档位，未指定服务端档位为 `default`；`effort_source` 为 `model|default|guard`，分别表示模型声明生效、用户默认（含 Run 显式 default）、护栏回退。`effort_downgraded` 仅在模型声明实际低于用户有效档位时为 true；服务端 default 下接受的 low 也按降档声明计。等档声明来源可为 model，但不算降档。重试沿用同一档位，压缩不产生 Step effort 记录。旧日志缺字段仍可恢复。

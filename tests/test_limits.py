@@ -47,6 +47,8 @@ class LlmLimits(unittest.TestCase):
         self.assertIn("3", results[3]["error"])
         starts = self.starts()
         self.assertEqual(len(starts), 3, self.observed())
+        run_end = next(event["run_end"] for event in events if "run_end" in event)
+        self.assertEqual(run_end["tool_summary"], {"counts": [{"name": "llm", "count": 3}], "omitted": 0})
         self.assertEqual(max(e["active"] for e in starts), 2, self.observed())
         session = events[0]["start"]["session_id"]
         system = records(Path(self.env["NIB_HOME"]) / "sessions" / (session + ".jsonl"))[0]["messages"][0]["content"]
