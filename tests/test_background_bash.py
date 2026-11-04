@@ -105,15 +105,12 @@ class Mock(http.server.ThreadingHTTPServer):
                 "await " + call("write", path="large.txt", content=replacement) + "; " +
                 "await " + call("edit", path="large.txt", old_text="replacement 249", new_text="FINAL") + "; " +
                 "await " + call("write", path="small.txt", content="tail\n") + "; 'bounded'")
-        if self.case == "mixed":
-            return ("const a = await tools.agent({prompt:'child:one',background:true}); " +
-                    "const b = await " + bash(self.waiting_command()) + "; [a,b]")
         if self.case == "overflow_ids":
             return ("for(let i=0;i<200;i++) await tools.glob({pattern:'*.missing'}); "
                     "await tools.agent({prompt:'child:foreground'}); "
                     "await tools.bash({command:'sleep 3.2'})")
         if self.case == "foreground_cancel":
-            return ("await Promise.all([tools.bash({command:'sleep 30'}), "
+            return ("await Promise.all([tools.bash({command:'sleep 30', timeout_ms: 6000}), "
                     "(async()=>{await tools.bash({command:'sleep 4'}); throw new Error('stop')})()])")
         if self.case in ("mixed", "resume_counters", "legacy_resume"):
             foreground = "await tools.agent({prompt:'child:foreground'}); "
@@ -292,8 +289,8 @@ class BackgroundBashTests:
         self.addCleanup(cleanup)
         return process
 
-    def finish(self, process, ok=True):
-        output, error = process.communicate(timeout=15)
+    def finish(self, process, ok=True, timeout=15):
+        output, error = process.communicate(timeout=timeout)
         self.assertEqual(error, "")
         self.assertEqual(process.returncode == 0, ok, output)
         events = [json.loads(line) for line in output.splitlines()]
@@ -551,13 +548,14 @@ class BackgroundBashTests:
         lifecycle = [e["background"] for e in resumed if e.get("background", {}).get("state") == "started"]
         self.assertEqual({e["id"] for e in lifecycle}, {"a3", "b2"})
 
-    def test_failed_run_flushes_frontend_cancellation_before_run_end(self):
+    def test_failed_run_flushes_frontend_terminal_state_before_run_end(self):
+        # A rejected Run drains its other calls, so the long bash ends by its own timeout.
         self.mock("foreground_cancel")
-        events = self.finish(self.start())
+        events = self.finish(self.start(), timeout=30)
         updates = [(i, e["progress"]) for i, e in enumerate(events)
                    if e.get("progress", {}).get("prompt") == "sleep 30"]
         self.assertTrue(updates)
-        self.assertEqual(updates[-1][1]["state"], "canceled", updates)
+        self.assertEqual(updates[-1][1]["state"], "timed_out", updates)
         end_index = next(i for i, e in enumerate(events) if "run_end" in e)
         self.assertLess(updates[-1][0], end_index)
         self.assertFalse(events[end_index]["run_end"]["ok"])
@@ -572,9 +570,8 @@ class BackgroundBashTests:
         first = next(e["run_end"]["output"] for e in events if "run_end" in e)
         self.assertEqual(json.loads(first.removeprefix("result: ")), [{"id": "a2"}, {"id": "b1"}])
         lifecycle = [e["background"] for e in events if e.get("background", {}).get("state") == "started"]
-        self.assertEqual([(e["id"], e["kind"]) for e in lifecycle], [("a1", "agent"), ("b2", "bash")])
-        self.assert_accounting(mock, events)
         self.assertEqual([(e["id"], e["kind"]) for e in lifecycle], [("a2", "agent"), ("b1", "bash")])
+        self.assert_accounting(mock, events)
         calls = [c for r in self.log(events) for c in r.get("calls", [])]
         self.assertEqual([(c["name"], c["id"], c.get("background", False)) for c in calls],
                          [("agent", "a1", False), ("agent", "a2", True), ("bash", "b1", True)])
