@@ -109,9 +109,9 @@ const all = [_]Tool{
         .root_only = true,
         .run = subagent.agent,
         .doc =
-        \\  // Independent multi-step worker; same tools except agent; only prompt shared. Observed coding tasks: 15-40 Steps, minutes, 100Ks to millions of prompt tokens incl. cache; varies by task/model/effort.
-        \\  // resume: task id (a1), keeps history; one in-flight call/agent. Failures resolve ok:false; invalid args/user cancel reject. Stopped children may leave files. usage/changes: this call only; edit/write deltas, not net. model/effort as llm.
-        \\  // background returns {id}, result in a later Step; reply without Run waits. Shared files may change mid-build.
+        \\  // Worker; same tools except agent; only prompt shared. 105 children (mostly gpt-6.1-sol/high): median/p90 12/24 Steps, ~3/7 model min, ~300k/830k prompt incl.cache, ~43k/75k uncached (drives cost/latency); task-dependent.
+        \\  // resume: task id (a1), keeps history; one call/agent. Failures resolve ok:false; invalid args/user cancel reject. Stops may leave partial files. usage/changes: this call; edit/write deltas, not net. model/effort as llm.
+        \\  // background returns {id}, result in a later Step; reply without Run waits. Files may change mid-build.
         \\  async agent({ prompt, resume, timeout_ms = 1800000, model, effort, background = false }) {}, // → { ok, id, text, usage, changes, error? } or { id }
         ,
     },
@@ -502,13 +502,14 @@ test "generated llm options stay concise and follow provider catalog for both de
             const llm_start = std.mem.indexOf(u8, rendered, "  // Pure single-step").?;
             const signature = std.mem.indexOfPos(u8, rendered, llm_start, "  async llm(").?;
             const llm_end = std.mem.indexOfScalarPos(u8, rendered, signature, '\n').?;
-            try expectConciseComments(rendered[llm_start..llm_end]);
+            const llm_docs = rendered[llm_start..llm_end];
+            try expectConciseComments(llm_docs);
             try testing.expect(std.mem.indexOf(u8, rendered, "custom\\\"model\\n") != null);
             try testing.expectEqual(depth == 0, std.mem.indexOf(u8, rendered, "async agent({") != null);
             for (codex.models) |model| {
-                try testing.expectEqual(id == .codex, std.mem.indexOf(u8, rendered, model.id) != null);
+                try testing.expectEqual(id == .codex, std.mem.indexOf(u8, llm_docs, model.id) != null);
             }
-            try testing.expectEqual(id == .chat_completions, std.mem.indexOf(u8, rendered, chat.default_model) != null);
+            try testing.expectEqual(id == .chat_completions, std.mem.indexOf(u8, llm_docs, chat.default_model) != null);
             const source = try std.fmt.allocPrint(testing.allocator, "() => {{\n{s}}}", .{rendered});
             defer testing.allocator.free(source);
             const parsed = try sandbox.eval(testing.allocator, testing.io, source, .{}, null, null);
@@ -524,6 +525,8 @@ test "configured default model is not duplicated in the model choices" {
         var t: Tools = .{ .io = testing.io, .home = "/unused", .cfg = .{ .provider = id, .base_url = "", .api_key = "", .model = model } };
         const rendered = try t.documentation(testing.allocator);
         defer testing.allocator.free(rendered);
-        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, rendered, model));
+        const start = std.mem.indexOf(u8, rendered, "  // model: ").?;
+        const end = std.mem.indexOfScalarPos(u8, rendered, start, '\n').?;
+        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, rendered[start..end], model));
     }
 }

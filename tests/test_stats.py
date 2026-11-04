@@ -62,9 +62,12 @@ class StatsTest(unittest.TestCase):
             self.assertEqual(costs['steps'], dict(samples=2, median=2.5, p90=3))
             self.assertEqual(costs['model_ms'], dict(samples=2, median=15, p90=18))
             self.assertEqual(costs['prompt_tokens'], dict(samples=2, median=25, p90=30))
+            self.assertEqual(costs['uncached_prompt_tokens'], dict(samples=2, median=15, p90=18))
             self.assertEqual(set(costs['by_parent_system']), {'old', 'new'})
             self.assertEqual(costs['by_parent_system']['old']['prompt_tokens']['median'], 20)
             self.assertEqual(costs['by_parent_system']['new']['prompt_tokens']['median'], 30)
+            self.assertEqual(costs['by_parent_system']['old']['uncached_prompt_tokens']['median'], 12)
+            self.assertEqual(costs['by_parent_system']['new']['uncached_prompt_tokens']['median'], 18)
             self.assertEqual(report['groups']['same-child-system']['child_costs'], costs)
             orphan = stats.summarize([paths[1]])['child_costs']
             self.assertEqual(set(orphan['by_parent_system']), {'unknown'})
@@ -74,6 +77,7 @@ class StatsTest(unittest.TestCase):
             self.assertIn('子会话已记录成本', text)
             self.assertIn('parent_system=old', text)
             self.assertIn('parent_system=new', text)
+            self.assertIn('uncached_prompt_tokens: samples=2 median=15.00 p90=18.00', text)
 
     def test_child_costs_missing_invalid_zero_and_interrupted(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -109,7 +113,52 @@ class StatsTest(unittest.TestCase):
             self.assertEqual(costs['steps'], dict(samples=4, median=1, p90=2))
             self.assertEqual(costs['model_ms'], dict(samples=2, median=3, p90=6))
             self.assertEqual(costs['prompt_tokens'], dict(samples=2, median=5, p90=10))
+            self.assertEqual(costs['uncached_prompt_tokens'], dict(samples=1, median=6, p90=6))
             self.assertEqual(set(costs['by_parent_system']), {'unknown'})
+
+    def test_child_costs_uncached_requires_valid_pair_on_every_step(self):
+        cases = [
+            ({}, None),
+            (dict(prompt_tokens=10), None),
+            (dict(prompt_cache_hit_tokens=4), None),
+            (dict(prompt_tokens=True, prompt_cache_hit_tokens=0), None),
+            (dict(prompt_tokens=10, prompt_cache_hit_tokens=True), None),
+            (dict(prompt_tokens=10, prompt_cache_hit_tokens=-1), None),
+            (dict(prompt_tokens=10, prompt_cache_hit_tokens=1.5), None),
+            (dict(prompt_tokens=10, prompt_cache_hit_tokens='4'), None),
+            (dict(prompt_tokens=10, prompt_cache_hit_tokens=None), None),
+            (dict(prompt_tokens=10, prompt_cache_hit_tokens=11), None),
+            (dict(prompt_tokens=0, prompt_cache_hit_tokens=0), 0),
+            (dict(prompt_tokens=10, prompt_cache_hit_tokens=10), 0),
+            (dict(prompt_tokens=10, prompt_cache_hit_tokens=0), 10),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'child.jsonl'
+            for usage, expected in cases:
+                with self.subTest(usage=usage):
+                    rows = synthetic_log(path, [[None, None]], parent_session_id='parent')
+                    rows[-1]['usage'] = usage
+                    path.write_text('\n'.join(map(json.dumps, rows)) + '\n')
+                    costs = stats.summarize([path])['child_costs']
+                    value = None if expected is None else 6 + expected
+                    self.assertEqual(costs['uncached_prompt_tokens'],
+                                     dict(samples=int(expected is not None), median=value, p90=value))
+                    self.assertEqual(costs['model_ms']['samples'], 1)
+                    self.assertEqual(costs['prompt_tokens']['samples'],
+                                     int(stats.number(usage.get('prompt_tokens'))))
+
+    def test_child_costs_uncached_distributes_session_sums_not_step_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for index in range(1, 11):
+                path = Path(directory) / f'{index}.jsonl'
+                rows = synthetic_log(path, [[None] * index], parent_session_id='parent')
+                for row in rows[1:]:
+                    row['usage'] = dict(prompt_tokens=100 * index, prompt_cache_hit_tokens=100 * index - 1)
+                path.write_text('\n'.join(map(json.dumps, rows)) + '\n')
+                paths.append(path)
+            costs = stats.summarize(paths)['child_costs']
+            self.assertEqual(costs['uncached_prompt_tokens'], dict(samples=10, median=5.5, p90=9))
 
     def test_child_costs_since_partial_range_and_cwd(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -129,7 +178,7 @@ class StatsTest(unittest.TestCase):
             self.assertEqual(costs['sessions'], 1)
             self.assertEqual(costs['partial_range_sessions'], 1)
             self.assertEqual(costs['full_range_sessions'], 0)
-            for field in ('steps', 'model_ms', 'prompt_tokens'):
+            for field in ('steps', 'model_ms', 'prompt_tokens', 'uncached_prompt_tokens'):
                 self.assertEqual(costs[field], dict(samples=0, median=None, p90=None))
             self.assertEqual(set(costs['by_parent_system']), {'original'})
             self.assertEqual(stats.summarize([child], cwd=ROOT)['child_costs']['sessions'], 0)
