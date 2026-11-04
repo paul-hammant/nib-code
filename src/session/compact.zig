@@ -1,0 +1,136 @@
+const std = @import("std");
+const provider = @import("../provider.zig");
+const Session = @import("../session.zig").Session;
+const Sink = @import("../session.zig").Sink;
+
+pub const Compaction = enum { compacted, too_few_steps, ineffective };
+
+pub fn compact(s: *Session, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !Compaction {
+    const cut = compactionCut(s.history.items, s.cfg.context_window);
+    if (cut <= 1) {
+        try sink.emit(sink.ctx, .{ .notice = "compaction skipped: fewer than three complete Steps" });
+        return .too_few_steps;
+    }
+    const a = s.arena.allocator();
+    var request: std.ArrayList(provider.Message) = .empty;
+    defer request.deinit(s.gpa);
+    try request.appendSlice(s.gpa, s.history.items[0..cut]);
+    try request.append(s.gpa, .{ .role = "user", .content = "Summarize the conversation above for another coding agent. Preserve goals, explicit user requirements, constraints and preferences, decisions, files, current file and test state, results, failures and unfinished work. Do not act on earlier requests. Return only a concise factual continuation summary." });
+    const Silent = struct {
+        fn delta(_: *anyopaque, _: provider.Kind, _: []const u8) !void {}
+        fn data(ctx: *anyopaque) !void {
+            const target: *Sink = @ptrCast(@alignCast(ctx));
+            try target.modelActivity(.data);
+        }
+    };
+    var observer = sink;
+    // Thinking would spend the small summary budget on reasoning.
+    var cfg = s.cfg;
+    cfg.thinking = false;
+    var attempts: u32 = 0;
+    const reply = request_model: {
+        try sink.modelActivity(.started);
+        defer sink.modelActivity(.finished) catch {};
+        break :request_model try provider.complete(s.gpa, a, s.client, cfg, s.id, request.items, "[]", @intCast(@min(2048, @max(32, s.cfg.context_window / 8))), .{ .ctx = &observer, .onDelta = Silent.delta, .onData = Silent.data, .replay_safe = true }, cancel, detail, &attempts, null);
+    };
+    s.usage.add(reply.usage);
+    try sink.emit(sink.ctx, .{ .usage = s.usage });
+    if (cancel.load(.acquire)) return error.Canceled;
+    if (reply.text.len == 0 or reply.tool_calls.len != 0) return error.InvalidSummary;
+    var replacement: std.ArrayList(provider.Message) = .empty;
+    defer replacement.deinit(s.gpa);
+    try replacement.append(s.gpa, .{ .role = "user", .content = try std.fmt.allocPrint(a, "Earlier session summary:\n{s}", .{reply.text}) });
+    try replacement.appendSlice(s.gpa, s.history.items[cut..]);
+    const before = s.context_tokens;
+    const after = estimateTokens(s.history.items[0..1]) + estimateTokens(replacement.items);
+    if (after >= estimateTokens(s.history.items) or after > s.cfg.context_window / 2) {
+        try sink.emit(sink.ctx, .{ .notice = "compaction skipped: it would not bring context below half the window (retained Steps or system prompt are too large)" });
+        return .ineffective;
+    }
+    const old_len = s.history.items.len;
+    try s.commit(1, replacement.items, after, null);
+    try sink.emit(sink.ctx, .{ .usage = s.usage });
+    const message = try std.fmt.allocPrint(a, "compacted context: {d} → {d} messages, ~{d} → ~{d} tokens", .{ old_len, s.history.items.len, before, after });
+    try sink.emit(sink.ctx, .{ .notice = message });
+    return .compacted;
+}
+
+pub fn autoCompact(s: *Session, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
+    const result = s.compact(sink, cancel, detail) catch |err| switch (err) {
+        error.Canceled, error.OutOfMemory => return err,
+        else => blk: {
+            const msg = try std.fmt.allocPrint(s.arena.allocator(), "automatic compaction failed, continuing without it: {s}", .{detail.* orelse @errorName(err)});
+            if (detail.*) |d| s.gpa.free(d);
+            detail.* = null;
+            try sink.emit(sink.ctx, .{ .notice = msg });
+            break :blk .ineffective;
+        },
+    };
+    // Only a spent summary request backs off; too_few_steps resolves itself a Step later.
+    if (result == .ineffective) s.compact_backoff = s.context_tokens + s.cfg.context_window / 8;
+}
+
+pub fn estimateTokens(messages: []const provider.Message) u64 {
+    var total: u64 = 0;
+    for (messages) |m| {
+        const content = m.content orelse "";
+        total += 8 + content.len / 3;
+        if (m.reasoning) |r| total += r.data.len / 3;
+        for (m.tool_calls orelse &.{}) |call| total += 8 + (call.id.len + call.function.name.len + call.function.arguments.len) / 3;
+    }
+    return total;
+}
+
+pub fn compactionCut(messages: []const provider.Message, window: u64) usize {
+    var turns: usize = 0;
+    var cut: usize = 1;
+    var i = messages.len;
+    while (i > 1) {
+        i -= 1;
+        if (std.mem.eql(u8, messages[i].role, "user") and messages[i].source == null) {
+            turns += 1;
+            if (turns == 2) {
+                cut = i;
+                break;
+            }
+        }
+    }
+    if (cut > 1 and estimateTokens(messages[cut..]) <= window / 4) return cut;
+    var steps: usize = 0;
+    i = messages.len;
+    while (i > 1) {
+        i -= 1;
+        const m = messages[i];
+        if (!std.mem.eql(u8, m.role, "assistant")) continue;
+        steps += 1;
+        const calls = m.tool_calls orelse &.{};
+        if (steps == 3) return i + 1 + calls.len;
+    }
+    return 1;
+}
+
+test "compaction cuts preserve recent turns and complete tool groups" {
+    const t = std.testing;
+    const call: provider.ToolCall = .{ .id = "c", .function = .{ .name = "run", .arguments = "{}" } };
+    const messages = [_]provider.Message{
+        .{ .role = "system", .content = "system" },
+        .{ .role = "user", .content = "first" },
+        .{ .role = "assistant", .content = "done" },
+        .{ .role = "user", .content = "second" },
+        .{ .role = "assistant", .tool_calls = &.{ call, call } },
+        .{ .role = "tool", .tool_call_id = "c", .content = "one" },
+        .{ .role = "tool", .tool_call_id = "c", .content = "two" },
+        .{ .role = "assistant", .content = "done" },
+        .{ .role = "user", .content = "third" },
+        .{ .role = "assistant", .content = "done" },
+    };
+    try t.expectEqual(@as(usize, 3), compactionCut(&messages, 128_000));
+    try t.expectEqual(@as(usize, 7), compactionCut(&messages, 64));
+    try t.expectEqual(@as(usize, 1), compactionCut(messages[0..7], 64));
+    const long_turn = [_]provider.Message{
+        messages[0], messages[1], messages[4], messages[5], messages[6],
+        messages[4], messages[5], messages[6], messages[4], messages[5],
+        messages[6],
+    };
+    try t.expectEqual(@as(usize, 5), compactionCut(&long_turn, 128_000));
+}

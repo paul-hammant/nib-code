@@ -419,3 +419,24 @@ test "Step budget metadata leaves unlimited output unchanged and appends after t
     try t.expectEqualStrings(full, output[0..full.len]);
     try t.expectEqualStrings("\n[2 Steps left in this Turn]", output[full.len..]);
 }
+
+test "formatOutcome" {
+    const gpa = std.testing.allocator;
+    var logs = "a\nb\n".*;
+    var text = "1".*;
+    const ok = try format(gpa, .{ .ok = true, .text = &text, .logs = &logs });
+    defer gpa.free(ok);
+    try std.testing.expectEqualStrings("a\nb\nresult: 1", ok);
+    var err = "Error: x".*;
+    var none = "".*;
+    const bad = try format(gpa, .{ .ok = false, .text = &err, .logs = &none });
+    defer gpa.free(bad);
+    try std.testing.expectEqualStrings("Error: x", bad);
+    var undef = "undefined".*;
+    const logged = try format(gpa, .{ .ok = true, .text = &undef, .logs = &logs });
+    defer gpa.free(logged);
+    try std.testing.expectEqualStrings("a\nb", logged);
+    const silent = try format(gpa, .{ .ok = true, .text = &undef, .logs = &none });
+    defer gpa.free(silent);
+    try std.testing.expectEqualStrings("(no output)", silent);
+}
