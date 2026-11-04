@@ -6,6 +6,8 @@ pub const Call = struct {
     end_ms: u64,
     ok: bool,
     run_index: usize,
+    result_bytes: ?u64 = null,
+    dispatched: bool = true,
 };
 
 pub const Run = struct {
@@ -17,6 +19,8 @@ pub const Run = struct {
     omitted: u64 = 0,
     llm_calls: u64 = 0,
     agent_calls: u64 = 0,
+    tool_bytes: u64 = 0,
+    output_bytes: u64 = 0,
 
     pub fn init(io: std.Io, started: std.Io.Clock.Timestamp) Run {
         return .{ .io = io, .started = started };
@@ -30,6 +34,10 @@ pub const Run = struct {
     pub fn reserve(r: *Run, name: []const u8) ?usize {
         if (std.mem.eql(u8, name, "llm")) r.llm_calls += 1;
         if (std.mem.eql(u8, name, "agent")) r.agent_calls += 1;
+        return r.reserveEntry(name);
+    }
+
+    pub fn reserveEntry(r: *Run, name: []const u8) ?usize {
         if (r.count == r.entries.len) {
             r.omitted +|= 1;
             return null;
@@ -41,6 +49,7 @@ pub const Run = struct {
             .end_ms = 0,
             .ok = false,
             .run_index = r.run_index,
+            .result_bytes = 0,
         };
         r.count += 1;
         return index;
@@ -55,6 +64,11 @@ pub const Run = struct {
         } else {
             r.omitted -= 1;
         }
+    }
+
+    pub fn result(r: *Run, index: ?usize, bytes: usize) void {
+        r.tool_bytes += bytes;
+        if (index) |i| r.entries[i].result_bytes = bytes;
     }
 
     pub fn complete(r: *Run, index: usize, start_ms: u64, end_ms: u64, ok: bool) void {

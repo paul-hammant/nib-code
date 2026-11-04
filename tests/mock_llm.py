@@ -95,6 +95,16 @@ class H(http.server.BaseHTTPRequestHandler):
             try: ev({"choices":[{"delta":{"content":" never seen"}}]}); self.wfile.write(b'0\r\n\r\n')
             except OSError: pass
             return
+        elif last['role']=='user' and lastuser == 'tool_bytes_multi':
+            calls = [("run", json.dumps({"code": "await tools.read({path:'bytes-a.txt'}); 'a'"})),
+                     ("not_run", "{}"), ("run", "{"), ("run", "{}"),
+                     ("run", json.dumps({"code": "await tools.read({path:'bytes-b.txt'}); 'b'"}))]
+            if thinking: ev({"choices":[{"delta":{"reasoning_content":"Multiple runs."}}]})
+            ev({"choices":[{"delta":{"tool_calls":[
+                {"index":i, "id":f"bytes_{i}", "type":"function",
+                 "function":{"name":name, "arguments":args}}
+                for i, (name, args) in enumerate(calls)]}}],
+                "usage":{"prompt_tokens":prompt_tokens(100),"completion_tokens":10}})
         elif last['role']=='user' or (progress_child and completed_runs < 3):
             code = 'const r = await tools.bash({command: "echo hello from bash; printf \'a\\\\nb\\\\nc\\\\n\' | wc -l"});\nconsole.log("exit", r.exit_code);\nr.output.trim().split("\\n")'
             if lastuser.startswith('delegate_cancel '):
@@ -120,6 +130,9 @@ class H(http.server.BaseHTTPRequestHandler):
                 code = ('await tools.write({path: "notes.txt", content: "a\\nb\\n"});\n'
                         'await tools.edit({path: "notes.txt", old_text: "b", new_text: "B"});\n'
                         'await tools.write({path: "same.txt", content: "x\\n"}); "done"')
+            elif lastuser == 'tool_bytes_test':
+                code = ('await Promise.all([tools.read({path: "bytes-a.txt"}), tools.read({path: "bytes-b.txt"})]);'
+                        '"ok"')
             elif lastuser == 'output_limit_test':
                 code = ('const r = await tools.bash({command: "head -c 32768 /dev/zero | tr \'\\\\0\' x"});'
                         'if (r.output.length !== 32768) throw new Error("tool data was truncated"); r.output')

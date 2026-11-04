@@ -51,6 +51,8 @@ pub const Timing = struct {
     wall_ms: u64 = 0,
     model_ms: u64 = 0,
     run_ms: u64 = 0,
+    tool_bytes: u64 = 0,
+    output_bytes: u64 = 0,
     llm_calls: u64 = 0,
     agent_calls: u64 = 0,
 };

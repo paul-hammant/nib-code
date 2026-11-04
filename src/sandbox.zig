@@ -46,6 +46,8 @@ pub const Outcome = struct {
     log_head_bytes: usize = 0,
     log_tail_start: usize = 0,
     log_truncated: bool = false,
+    tool_bytes: u64 = 0,
+    output_bytes: u64 = 0,
 
     pub fn deinit(o: Outcome, gpa: std.mem.Allocator) void {
         gpa.free(o.text);
@@ -68,6 +70,12 @@ const State = struct {
     completed: std.Io.Condition = .init,
     ready: ?*Call = null,
     ready_tail: ?*Call = null,
+    tool_bytes: u64 = 0,
+
+    fn recordResult(st: *State, index: ?usize, bytes: usize) void {
+        st.tool_bytes += bytes;
+        if (st.host.?.timing) |t| t.result(index, bytes);
+    }
 
     const Call = struct {
         state: *State,
@@ -162,6 +170,9 @@ const State = struct {
                 st.beginJs();
                 defer st.endJs();
                 const result = call.result.?;
+                st.recordResult(call.timing_index, switch (result) {
+                    inline else => |bytes| bytes.len,
+                });
                 const value = switch (result) {
                     .ok => |json| blk: {
                         // QuickJS requires buf[len] == 0 even with an explicit length.
@@ -308,6 +319,7 @@ pub fn eval(
     const captured = try st.logs.snapshot(gpa);
     return .{
         .ok = ok,
+        .tool_bytes = st.tool_bytes,
         .text = text,
         .logs = captured.logs,
         .log_entries = captured.entries,
@@ -376,6 +388,14 @@ fn enqueue(st: *State, ctx: *c.JSContext, argc: c_int, argv: [*c]c.JSValue) !c.J
     if (st.host.?.admit) |admit| {
         if (try admit(st.host.?.ctx, st.gpa, name)) |message| {
             defer st.gpa.free(message);
+            const timing = st.host.?.timing;
+            const index = if (timing) |t| t.reserveEntry(name) else null;
+            if (timing) |t| if (index) |i| {
+                const ms = t.elapsed();
+                t.complete(i, ms, ms, false);
+                t.entries[i].dispatched = false;
+            };
+            st.recordResult(index, message.len);
             const reason = c.JS_NewError(ctx);
             _ = c.JS_SetPropertyStr(ctx, reason, "message", c.JS_NewStringLen(ctx, message.ptr, message.len));
             defer c.JS_FreeValue(ctx, reason);
@@ -575,6 +595,11 @@ test "native timings span evals and count omitted calls without treating exit co
     try testing.expect(second.ok);
     try testing.expectEqual(@as(usize, 200), timing.count);
     try testing.expectEqual(@as(u64, 5), timing.omitted);
+    const result_size = "{\"exit_code\":7}".len;
+    try testing.expectEqual(205 * result_size, timing.tool_bytes);
+    try testing.expectEqual(result_size, first.tool_bytes);
+    try testing.expectEqual(204 * result_size, second.tool_bytes);
+    for (timing.entries[0..timing.count]) |entry| try testing.expectEqual(@as(?u64, result_size), entry.result_bytes);
     try testing.expectEqual(@as(usize, 0), timing.entries[0].run_index);
     for (timing.entries[1..timing.count]) |entry| {
         try testing.expectEqual(@as(usize, 1), entry.run_index);
@@ -623,4 +648,143 @@ test "undispatched tools do not produce native timings" {
     defer result.deinit(testing.allocator);
     try testing.expect(!result.ok);
     try testing.expectEqual(@as(usize, 0), timing.count);
+    try testing.expectEqual(@as(u64, 0), result.tool_bytes);
+    try testing.expectEqual(@as(u64, 0), timing.tool_bytes);
+}
+
+const FileBytesHost = struct {
+    dir: std.Io.Dir,
+    const missing = "missing: 文件🙂";
+
+    fn call(ctx: *anyopaque, gpa: std.mem.Allocator, _: []const u8, args: []const u8) ToolResult {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const parsed = std.json.parseFromSlice(struct { path: []const u8 }, gpa, args, .{}) catch unreachable;
+        defer parsed.deinit();
+        const text = self.dir.readFileAlloc(testing.io, parsed.value.path, gpa, .limited(1024)) catch
+            return .{ .err = gpa.dupe(u8, missing) catch unreachable };
+        defer gpa.free(text);
+        return .{ .ok = serialize(gpa, text) catch unreachable };
+    }
+
+    fn serialize(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
+        return std.json.Stringify.valueAlloc(gpa, .{ .text = text, .next_offset = @as(?usize, null) }, .{});
+    }
+};
+
+test "tool bytes include both file results but output bytes only include the formatted short result" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = "第一份🙂\n";
+    const b = "second\nline\n";
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = a });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "b", .data = b });
+    const json_a = try FileBytesHost.serialize(testing.allocator, a);
+    defer testing.allocator.free(json_a);
+    const json_b = try FileBytesHost.serialize(testing.allocator, b);
+    defer testing.allocator.free(json_b);
+    var timing: RunTiming = .init(testing.io, .now(testing.io, .awake));
+    var host: FileBytesHost = .{ .dir = tmp.dir };
+    var result = try run("await Promise.all([tools.read({path:'a'}), tools.read({path:'b'})]); 'ok'", .{}, .{
+        .ctx = &host,
+        .names = &.{"read"},
+        .call = FileBytesHost.call,
+        .timing = &timing,
+    });
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.ok);
+    try testing.expectEqual(json_a.len + json_b.len, result.tool_bytes);
+    try testing.expectEqual(result.tool_bytes, timing.tool_bytes);
+    try testing.expectEqual(@as(?u64, json_a.len), timing.entries[0].result_bytes);
+    try testing.expectEqual(@as(?u64, json_b.len), timing.entries[1].result_bytes);
+    const output = try @import("session/output.zig").format(testing.allocator, &result);
+    defer testing.allocator.free(output);
+    try testing.expectEqualStrings("result: \"ok\"", output);
+    try testing.expectEqual(output.len, result.output_bytes);
+}
+
+test "rejected and unawaited settled calls contribute their UTF-8 result bytes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "unused🙂" });
+    const json = try FileBytesHost.serialize(testing.allocator, "unused🙂");
+    defer testing.allocator.free(json);
+    var host: FileBytesHost = .{ .dir = tmp.dir };
+    for ([_][]const u8{
+        "tools.read({path:'a'}); 'ok'",
+        "try { await tools.read({path:'missing'}); } catch (_) {} 'ok'",
+    }, [_]usize{ json.len, FileBytesHost.missing.len }) |code, expected| {
+        var timing: RunTiming = .init(testing.io, .now(testing.io, .awake));
+        const result = try run(code, .{}, .{
+            .ctx = &host,
+            .names = &.{"read"},
+            .call = FileBytesHost.call,
+            .timing = &timing,
+        });
+        defer result.deinit(testing.allocator);
+        try testing.expect(result.ok);
+        try testing.expectEqual(expected, result.tool_bytes);
+        try testing.expectEqual(expected, timing.tool_bytes);
+        try testing.expectEqual(@as(?u64, expected), timing.entries[0].result_bytes);
+    }
+}
+
+test "admission rejections count only the returned error text" {
+    const Rejected = struct {
+        fn call(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) ToolResult {
+            unreachable;
+        }
+        fn admit(_: *anyopaque, gpa: std.mem.Allocator, _: []const u8) anyerror!?[]u8 {
+            return try gpa.dupe(u8, "denied🙂");
+        }
+    };
+    var dummy: u8 = 0;
+    var timing: RunTiming = .init(testing.io, .now(testing.io, .awake));
+    const result = try run("await tools.llm().catch(() => 'caught')", .{}, .{
+        .ctx = &dummy,
+        .names = &.{"llm"},
+        .call = Rejected.call,
+        .admit = Rejected.admit,
+        .timing = &timing,
+    });
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.ok);
+    try testing.expectEqual("denied🙂".len, result.tool_bytes);
+    try testing.expectEqual(result.tool_bytes, timing.tool_bytes);
+    try testing.expectEqual(@as(?u64, "denied🙂".len), timing.entries[0].result_bytes);
+    try testing.expect(!timing.entries[0].ok);
+    try testing.expect(!timing.entries[0].dispatched);
+    try testing.expectEqual(@as(u64, 0), timing.llm_calls);
+}
+
+test "workers completed only during rejection cleanup do not contribute result bytes" {
+    const CleanupHost = struct {
+        cancel: std.atomic.Value(bool) = .init(false),
+        reading: std.atomic.Value(bool) = .init(false),
+
+        fn call(ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8, _: []const u8) ToolResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (std.mem.eql(u8, name, "read")) {
+                self.reading.store(true, .release);
+                while (!self.cancel.load(.acquire)) std.Thread.yield() catch {};
+                return .{ .ok = gpa.dupe(u8, "{\"text\":\"not delivered\"}") catch unreachable };
+            }
+            while (!self.reading.load(.acquire)) std.Thread.yield() catch {};
+            return .{ .err = gpa.dupe(u8, "failed🙂") catch unreachable };
+        }
+    };
+    var host: CleanupHost = .{};
+    var timing: RunTiming = .init(testing.io, .now(testing.io, .awake));
+    const result = try run("await Promise.all([tools.read(), tools.fetch()])", .{}, .{
+        .ctx = &host,
+        .names = &.{ "read", "fetch" },
+        .call = CleanupHost.call,
+        .cancel = &host.cancel,
+        .timing = &timing,
+    });
+    defer result.deinit(testing.allocator);
+    try testing.expect(!result.ok);
+    try testing.expectEqual("failed🙂".len, result.tool_bytes);
+    try testing.expectEqual(result.tool_bytes, timing.tool_bytes);
+    try testing.expectEqual(@as(?u64, 0), timing.entries[0].result_bytes);
+    try testing.expectEqual(@as(?u64, "failed🙂".len), timing.entries[1].result_bytes);
 }

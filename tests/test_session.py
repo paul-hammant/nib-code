@@ -67,6 +67,11 @@ def assert_timing(records, *, final_only=False):
         assert 0 <= step["first_data_ms"] <= step["model_ms"], step
         assert step["run_ms"] == sum(run["run_ms"] for run in step["run_results"]), step
         assert 0 <= step["run_ms"] <= step["ms"], step
+        assert step["tool_bytes"] == sum(run["tool_bytes"] for run in step["run_results"]), step
+        assert step["output_bytes"] == sum(run["output_bytes"] for run in step["run_results"]), step
+        assert step["tool_bytes"] == sum(call["result_bytes"] for call in step["calls"]), step
+        outputs = [m["content"] for m in step["messages"] if m["role"] == "tool"]
+        assert step["output_bytes"] == sum(len(text.encode("utf-8")) for text in outputs), step
     run_step, text_step = steps
     assert len(run_step["run_results"]) == 1, run_step
     call = next(call for message in run_step["messages"] for call in message.get("tool_calls", []))
@@ -102,18 +107,26 @@ def assert_timing(records, *, final_only=False):
 
 def assert_turn_timing(terminal, records, *, completed_steps=None):
     timing = terminal["timing"]
-    assert set(timing) == {"wall_ms", "model_ms", "run_ms", "llm_calls", "agent_calls"}, timing
+    assert set(timing) == {"wall_ms", "model_ms", "run_ms", "tool_bytes", "output_bytes", "llm_calls", "agent_calls"}, timing
     assert all(type(value) is int and value >= 0 for value in timing.values()), timing
     steps = [record for record in records if "model_ms" in record]
     count = terminal["steps"] if completed_steps is None else completed_steps
     steps = steps[-count:] if count else []
     assert len(steps) == count, (terminal, steps)
-    for key in ("model_ms", "run_ms"):
+    for step in steps:
+        for key in ("tool_bytes", "output_bytes"):
+            assert step[key] == sum(run[key] for run in step["run_results"]), step
+        if not step.get("calls_omitted"):
+            assert step["tool_bytes"] == sum(call["result_bytes"] for call in step["calls"]), step
+        for run, message in zip(step["run_results"], (m for m in step["messages"] if m["role"] == "tool")):
+            assert run["output_bytes"] == len(message["content"].encode("utf-8")), (run, message)
+    for key in ("model_ms", "run_ms", "tool_bytes", "output_bytes"):
         assert timing[key] == sum(step[key] for step in steps), (timing, steps)
     assert timing["wall_ms"] >= sum(step["ms"] for step in steps), (timing, steps)
     for name in ("llm", "agent"):
         assert timing[name + "_calls"] == sum(
-            call["name"] == name for step in steps for call in step.get("calls", [])), (timing, steps)
+            call["name"] == name and call.get("dispatched", True)
+            for step in steps for call in step.get("calls", [])), (timing, steps)
 
 
 with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
@@ -351,6 +364,11 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         child_logs = [p for p in (tmp / "nib/sessions").glob("*.jsonl")
                       if replay(p)[1][0].get("parent_session_id") == parent_id]
         assert len(child_logs) == 2
+        returned_bytes = sum(len(json.dumps(child, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+                             for child in returned)
+        child_bytes = sum(record.get("tool_bytes", 0) for path in child_logs for record in replay(path)[1])
+        assert child_bytes > 0
+        assert final["timing"]["tool_bytes"] == returned_bytes, (final, returned_bytes, child_bytes)
         before = len(read_requests(requests_path))
         many = events(ask("delegate_many", "--json"))[-1]["end"]
         assert many["usage"]["prompt_tokens"] == 46200
@@ -554,6 +572,34 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         assert b"changed notes.txt +1 \xe2\x88\x921" in human.stderr, human.stderr
         print("Change E2E passed: edit/write changes per Run, diffed against the files before the Run, unchanged files omitted")
 
+        contents = ["你" * 16000, "x" * 48000]
+        for name, content in zip(("bytes-a.txt", "bytes-b.txt"), contents):
+            (cwd / name).write_text(content)
+        measured = events(ask("--json", "tool_bytes_test"))
+        measured_id = measured[0]["start"]["session_id"]
+        _, measured_records = replay(tmp / "nib/sessions" / f"{measured_id}.jsonl")
+        terminal = measured[-1]["end"]
+        assert_turn_timing(terminal, measured_records)
+        expected = sum(len(json.dumps(dict(text=text, next_offset=None),
+                                      ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+                       for text in contents)
+        assert terminal["timing"]["tool_bytes"] == expected == 96060, terminal
+        assert terminal["timing"]["output_bytes"] == len('result: "ok"'.encode("utf-8")) == 12, terminal
+        assert read_requests(requests_path)[-1]["messages"][-1]["content"] == 'result: "ok"'
+        print("Tool bytes E2E passed: 96060 bytes processed in JS, only 12 bytes enter context")
+
+        multi = events(ask("--json", "tool_bytes_multi"))
+        multi_id = multi[0]["start"]["session_id"]
+        _, multi_records = replay(tmp / "nib/sessions" / f"{multi_id}.jsonl")
+        assert_turn_timing(multi[-1]["end"], multi_records)
+        multi_step = next(record for record in multi_records if record.get("run_results"))
+        results = multi_step["run_results"]
+        assert [run["ok"] for run in results] == [True, False, False, False, True], results
+        assert [run["tool_bytes"] for run in results] == [48030, 0, 0, 0, 48030], results
+        assert all(run["output_bytes"] > 0 for run in results), results
+        assert [call["run_index"] for call in multi_step["calls"]] == [0, 4], multi_step
+        print("Multi-Run bytes E2E passed: separate Run totals include harness rejection text")
+
         limited = events(ask("--json", "output_limit_test"))
         run_end = next(e["run_end"] for e in limited if "run_end" in e)
         assert run_end["ok"], run_end
@@ -563,6 +609,11 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         assert output.endswith('x' * 100 + '"\n'), output[-110:]
         requests = read_requests(requests_path)
         assert requests[-1]["messages"][-1]["content"] == output
+        limited_id = limited[0]["start"]["session_id"]
+        _, limited_records = replay(tmp / "nib/sessions" / f"{limited_id}.jsonl")
+        assert_turn_timing(limited[-1]["end"], limited_records)
+        assert limited[-1]["end"]["timing"]["output_bytes"] == len(output.encode("utf-8"))
+        assert limited[-1]["end"]["timing"]["tool_bytes"] > 32768
         print("Run output E2E passed: JS receives complete bash data; only model-facing output is truncated")
 
         middle = "你" * 12000 + "-middle-tail"

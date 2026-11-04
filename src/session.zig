@@ -392,12 +392,20 @@ pub const Session = struct {
             var output_tokens: u64 = 0;
             for (reply.tool_calls, 0..) |call, run_index| {
                 run_timing.run_index = run_index;
+                const before_bytes = run_timing.tool_bytes;
                 const result = try s.execute(call, sink, cancel, &run_timing);
+                run_timing.output_bytes += result.output.len;
                 effort.Pending.record(&next_effort, result.effort, result.ok);
                 run_ms += result.run_ms orelse 0;
                 try sink.emit(sink.ctx, .{ .usage = s.usage });
                 try pending.append(s.gpa, .{ .role = "tool", .content = result.output, .tool_call_id = call.id });
-                try run_results.append(s.gpa, .{ .tool_call_id = call.id, .ok = result.ok, .run_ms = result.run_ms });
+                try run_results.append(s.gpa, .{
+                    .tool_call_id = call.id,
+                    .ok = result.ok,
+                    .run_ms = result.run_ms,
+                    .tool_bytes = run_timing.tool_bytes - before_bytes,
+                    .output_bytes = result.output.len,
+                });
                 output_tokens += result.output.len / 3 + 1;
             }
             const tokens = reply.usage.prompt_tokens + reply.usage.completion_tokens + output_tokens;
@@ -420,12 +428,16 @@ pub const Session = struct {
                 .run_ms = run_ms,
                 .calls = run_timing.entries[0..run_timing.count],
                 .calls_omitted = run_timing.omitted,
+                .tool_bytes = run_timing.tool_bytes,
+                .output_bytes = run_timing.output_bytes,
                 .run_results = run_results.items,
             });
             s.summary.?.steps += 1;
             s.summary.?.usage = s.usage;
             s.summary.?.timing.model_ms += model_ms;
             s.summary.?.timing.run_ms += run_ms;
+            s.summary.?.timing.tool_bytes += run_timing.tool_bytes;
+            s.summary.?.timing.output_bytes += run_timing.output_bytes;
             s.summary.?.timing.llm_calls += run_timing.llm_calls;
             s.summary.?.timing.agent_calls += run_timing.agent_calls;
             pending.clearRetainingCapacity();
@@ -542,10 +554,10 @@ pub const Session = struct {
         s.tools.progress.sink = .{ .ctx = &progress_sink, .emit = Forward.progress };
         defer s.tools.progress.sink = null;
         const ran = try s.runTimed(code.?, cancel, timing);
-        const o = ran.outcome;
+        var o = ran.outcome;
         defer o.deinit(s.gpa);
 
-        const output = try output_format.format(a, o);
+        const output = try output_format.format(a, &o);
         const run_ms = timing.elapsed();
         try sink.emit(sink.ctx, .{ .run_end = .{ .ok = o.ok, .output = output, .changes = ran.changes } });
         return .{ .output = output, .ok = o.ok, .run_ms = run_ms, .effort = args.value.effort };
@@ -595,19 +607,23 @@ test "formatOutcome" {
     const gpa = std.testing.allocator;
     var logs = "a\nb\n".*;
     var text = "1".*;
-    const ok = try output_format.format(gpa, .{ .ok = true, .text = &text, .logs = &logs });
+    var ok_outcome: sandbox.Outcome = .{ .ok = true, .text = &text, .logs = &logs };
+    const ok = try output_format.format(gpa, &ok_outcome);
     defer gpa.free(ok);
     try std.testing.expectEqualStrings("a\nb\nresult: 1", ok);
     var err = "Error: x".*;
     var none = "".*;
-    const bad = try output_format.format(gpa, .{ .ok = false, .text = &err, .logs = &none });
+    var bad_outcome: sandbox.Outcome = .{ .ok = false, .text = &err, .logs = &none };
+    const bad = try output_format.format(gpa, &bad_outcome);
     defer gpa.free(bad);
     try std.testing.expectEqualStrings("Error: x", bad);
     var undef = "undefined".*;
-    const logged = try output_format.format(gpa, .{ .ok = true, .text = &undef, .logs = &logs });
+    var logged_outcome: sandbox.Outcome = .{ .ok = true, .text = &undef, .logs = &logs };
+    const logged = try output_format.format(gpa, &logged_outcome);
     defer gpa.free(logged);
     try std.testing.expectEqualStrings("a\nb", logged);
-    const silent = try output_format.format(gpa, .{ .ok = true, .text = &undef, .logs = &none });
+    var silent_outcome: sandbox.Outcome = .{ .ok = true, .text = &undef, .logs = &none };
+    const silent = try output_format.format(gpa, &silent_outcome);
     defer gpa.free(silent);
     try std.testing.expectEqualStrings("(no output)", silent);
 }

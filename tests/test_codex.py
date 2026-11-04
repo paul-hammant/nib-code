@@ -41,6 +41,11 @@ def assert_timing(records, *, final_only=False):
         assert 0 <= step["first_data_ms"] <= step["model_ms"], step
         assert step["run_ms"] == sum(run["run_ms"] for run in step["run_results"]), step
         assert 0 <= step["run_ms"] <= step["ms"], step
+        assert step["tool_bytes"] == sum(run["tool_bytes"] for run in step["run_results"]), step
+        assert step["output_bytes"] == sum(run["output_bytes"] for run in step["run_results"]), step
+        assert step["tool_bytes"] == sum(call["result_bytes"] for call in step["calls"]), step
+        outputs = [m["content"] for m in step["messages"] if m["role"] == "tool"]
+        assert step["output_bytes"] == sum(len(text.encode("utf-8")) for text in outputs), step
     run_step, text_step = steps
     assert len(run_step["run_results"]) == 1, run_step
     call = next(call for message in run_step["messages"] for call in message.get("tool_calls", []))

@@ -250,8 +250,23 @@ def test_escape_restores_draft(tmp):
         wait_for(lambda: finished(home, "resent-final"), "resubmitted restored input")
 
 
+def test_tool_bytes_bill(tmp):
+    code = "await Promise.all([tools.read({path:'a.txt'}), tools.read({path:'b.txt'})]); 'ok'"
+    with fixture(tmp, [Reply("reading", code=code), Reply("bytes-final")]) as (terminal, home, _):
+        (tmp / "a.txt").write_text("你" * 16000)
+        (tmp / "b.txt").write_text("x" * 48000)
+        terminal.send("measure tool bytes\r")
+        wait_for(lambda: finished(home, "bytes-final"), "byte measurement final Step")
+        terminal.until("96k→12 B".encode())
+        assert terminal.child.poll() is None
+        records = [json.loads(line) for path in (home / "sessions").glob("*.jsonl")
+                   for line in path.read_text().splitlines()]
+        assert sum(record.get("tool_bytes", 0) for record in records) == 96060
+        assert sum(record.get("output_bytes", 0) for record in records) == 12
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="nib-interjections-") as directory:
-        for test in (test_during_run_and_resume, test_after_final_step, test_escape_restores_draft):
+        for test in (test_during_run_and_resume, test_after_final_step, test_escape_restores_draft, test_tool_bytes_bill):
             test(Path(directory) / test.__name__)
             print(test.__name__ + ": ok")
