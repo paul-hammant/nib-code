@@ -109,10 +109,11 @@ const all = [_]Tool{
         .root_only = true,
         .run = subagent.agent,
         .doc =
-        \\  // Worker; same tools except agent; only prompt shared. 105 children (mostly gpt-6.1-sol/high): median/p90 12/24 Steps, ~3/7 model min, ~300k/830k prompt incl.cache, ~43k/75k uncached (drives cost/latency); task-dependent.
-        \\  // resume: task id (a1), keeps history; one call/agent. Failures resolve ok:false; invalid args/user cancel reject. Stops may leave partial files. usage/changes: this call; edit/write deltas, not net. model/effort as llm.
-        \\  // background returns {id}, result in a later Step; reply without Run waits. Files may change mid-build.
-        \\  async agent({ prompt, resume, timeout_ms = 1800000, model, effort, background = false }) {}, // → { ok, id, text, usage, changes, error? } or { id }
+        \\  // No nesting. New: clean/independent, starts over; 105-child medians: 6 read-only Steps/22% time, 12 total/~3min/~290k prompt.
+        \\  // fork: parent history+judgments/assumptions; cached first request, no reread; full history/Step. Other model/effort loses cache (Codex effort-separated; same-model history).
+        \\  // resume:a1; fork+resume rejects. One/agent; failures ok:false, args/cancel reject. usage/changes:this call, edit/write. Shared cwd/no worktree; locks/stale checks reject conflicts.
+        \\  // background:{id}, later Step; reply waits. Partial files possible.
+        \\  async agent({ prompt, resume, fork = false, timeout_ms = 1800000, model, effort, background = false }) {}, // → { ok, id, text, usage, changes, error? } or { id }
         ,
     },
 };
@@ -153,6 +154,8 @@ pub const Tools = struct {
     cfg: ?provider.Config = null,
     depth: u32 = 0,
     session_id: ?[]const u8 = null,
+    forked: bool = false,
+    fork_snapshot: ?@import("tools/agent/input.zig").Fork = null,
     agents_mutex: std.Io.Mutex = .init,
     agents_changed: std.Io.Condition = .init,
     agents_active: usize = 0,
@@ -188,7 +191,7 @@ pub const Tools = struct {
     }
 
     pub fn api(t: *const Tools) Api {
-        return if (t.depth == 0) root_api else child_api;
+        return if (t.depth == 0 or t.forked) root_api else child_api;
     }
 
     pub fn documentation(t: *const Tools, a: std.mem.Allocator) ![]u8 {
@@ -257,6 +260,8 @@ pub const Tools = struct {
 
     pub fn call(ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8, args: []const u8) sandbox.ToolResult {
         const t: *Tools = @ptrCast(@alignCast(ctx));
+        if (t.forked and std.mem.eql(u8, name, "agent"))
+            return fail(gpa, "agent is unavailable inside a forked sub-agent", .{}) catch .{ .err = &.{} };
         const r = for (all) |tool| {
             if (!enabled(tool, t.depth)) continue;
             if (std.mem.eql(u8, name, tool.name)) break if (tool.run) |run_tool| run_tool(t, gpa, args) else error.SandboxOnlyTool;
@@ -528,5 +533,28 @@ test "configured default model is not duplicated in the model choices" {
         const start = std.mem.indexOf(u8, rendered, "  // model: ").?;
         const end = std.mem.indexOfScalarPos(u8, rendered, start, '\n').?;
         try testing.expectEqual(@as(usize, 2), std.mem.count(u8, rendered[start..end], model));
+    }
+}
+
+test "fork keeps parent API bytes but rejects delegation at runtime" {
+    var root: Tools = .{ .io = testing.io, .home = "/unused" };
+    var child: Tools = .{ .io = testing.io, .home = "/unused", .depth = 1, .forked = true };
+    try testing.expectEqualStrings(root.api().docs, child.api().docs);
+    try testing.expectEqualSlices([]const u8, root.api().names, child.api().names);
+    const result = try sandbox.eval(testing.allocator, testing.io, "await tools.agent({prompt: 'nested'})", .{}, child.host(), null);
+    defer result.deinit(testing.allocator);
+    try testing.expect(!result.ok);
+    try testing.expect(std.mem.indexOf(u8, result.text, "agent is unavailable inside a forked sub-agent") != null);
+}
+
+test "fork and resume are conflicting parameters even when fork is false" {
+    var t: Tools = .{ .io = testing.io, .home = "/unused" };
+    for ([_][]const u8{ "true", "false" }) |flag| {
+        const args = try std.fmt.allocPrint(testing.allocator, "{{\"prompt\":\"task\",\"fork\":{s},\"resume\":\"a1\"}}", .{flag});
+        defer testing.allocator.free(args);
+        const result = Tools.call(&t, testing.allocator, "agent", args);
+        defer freeResult(result);
+        try testing.expect(result == .err);
+        try testing.expectEqualStrings("fork and resume cannot be passed together", result.err);
     }
 }

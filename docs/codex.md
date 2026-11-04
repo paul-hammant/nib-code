@@ -70,6 +70,12 @@ NIB_THINKING=on 默认用 medium；NIB_REASONING_EFFORT 可显式指定服务端
 
 **删除条件：** 如果之后按上述方法统计显示切换 effort 不再导致缓存失效，就删除 system 中这句提示，并同步更新对应测试与本文。
 
+## fork 与父缓存路由
+
+`tools.agent({ prompt, fork: true })` 创建独立子会话，但 Codex 请求的 `prompt_cache_key` 使用父会话的值，不改用新子会话 ID。fork 继承父会话压缩后的当前完整 history（含发起 fork 的当前 assistant 及 reasoning，之后补合成 tool results 和 user prompt），system/工具 schema 与父会话逐字节相同。共用 key 的目的，是让相同前缀的请求路由到同一缓存；**这是待实测假设，不是服务端命中保证**。目前没有真实 fork 对照实验确认缓存命中率、延迟或费用收益，不能把上面的相邻 Step effort 样本当成 fork 的证据。
+
+model/effort 默认继承父配置，也可显式覆盖；两者不同时不再具有父前缀的缓存复用优势，共用 key 不改变这一点。Codex fork 适用与 resume 相同的模型一致性检查，覆盖 model 不能将父历史中的加密推理条目跨模型使用。后续可在同 model/effort、相同父前缀下对照父 key 与独立 key，记录首请求的 `prompt_cache_hit_tokens / prompt_tokens`、未缓存输入及耗时；结果不支持路由收益时重新考虑共用 key。完整语义及置信度见 [委派工具](tool-delegation.md) 与 [ADR 0015](adr/0015-agent-fork.md)。
+
 ## 摘要与会话恢复
 
 摘要始终使用当前模型，保留原请求前缀和该模型的加密推理条目，以命中缓存并避免跨模型传递密文。能关闭推理时关闭，否则用 low。Codex 摘要不沿用 Chat Completions 的小额总输出限制：按 pi 的请求格式不发送 max_output_tokens，保留服务端正常输出额度；原 32–2048-token 预算只写进提示约束摘要文字，给推理留出空间（pi 目录 maxTokens 为 128000，实际限额仍由服务端决定）。空摘要、截断、压缩无效等失败，自动压缩发 notice 后继续；手动压缩报告错误。

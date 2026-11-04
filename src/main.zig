@@ -85,6 +85,7 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
         const envelope = try std.json.parseFromSliceLeaky(@import("tools/agent/input.zig").Input, init.arena.allocator(), data, .{});
         cfg = envelope.config;
         prompt = envelope.prompt;
+        options.fork = envelope.fork;
     } else {
         var config_detail: ?[]u8 = null;
         cfg = config.load(init.arena.allocator(), init.io, init.environ_map, options.home, &config_detail) catch |err| {

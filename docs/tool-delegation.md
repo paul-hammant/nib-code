@@ -1,6 +1,6 @@
 # tools.llm 与 tools.agent：调用与实现
 
-少量文件直接 read 最便宜，不调用模型。大量数据的单步判断、分类、抽取适合 llm，通常几秒；批量简单判断优先低成本模型和低 effort，强模型留给少量难题。agent 用于独立多步工作：几十行以上改动的提交前只读审查、先约定接口并划分负责文件的并行实现、需要大量读代码的调查；新建子会话从零读代码，接续保留已有历史，不代替 read 或 llm。延迟与成本只是量级提示，依任务、模型和 effort 变化，不是保证。
+少量文件直接 read 最便宜，不调用模型。大量数据的单步判断、分类、抽取适合 llm，通常几秒；批量简单判断优先低成本模型和低 effort，强模型留给少量难题。agent 用于独立多步工作：几十行以上改动的提交前只读审查、先约定接口并划分负责文件的并行实现、需要大量读代码的调查；默认新建子会话从零读代码，fork 继承当前父上下文，接续保留子会话已有历史，不代替 read 或 llm。延迟与成本只是量级提示，依任务、模型和 effort 变化，不是保证。
 
 成本参考来自本次统计时本机 `~/.nib/sessions` 的全部 105 个子会话（0.2.0 时期，以 `gpt-6.1-sol` / `high` 为主，含少量模型/effort 覆盖；旧日志部分元数据缺失），不再只用 [#37](https://github.com/yyydddkkk/nib-code/issues/37) 中的 6 个样本。统计命令：
 
@@ -19,7 +19,33 @@ python3 scripts/stats.py ~/.nib/sessions --json
 
 输入 token 是每次请求的累计量，含重复上下文；未缓存量逐 Step 用 `prompt_tokens - prompt_cache_hit_tokens` 计算，再按子会话累加。两者同时列出：未缓存部分通常是费用与延迟的主要驱动，但缓存输入也不等于免费，总 token 不是费用。模型时间不含工具执行，亦非端到端墙钟时间，因此这里实测的 p90 约 7 分钟，不沿用约 9 分钟的初始估计。缺字段不补零，表中各指标独立取有效样本，不应将不同指标的分位数相减；失败、取消日志只代表已记录成本的下界。
 
-`child_costs.by_parent_system` 按父会话 `system_sha` 区分工具说明修改前后的实验，口径见 [会话统计](session-log.md#会话统计)。
+这批 105 个新建子会话的开头约 6 个只读 Step 消耗约 22% 时间，完整任务约 12 Step、3 分钟、29 万级累计 prompt tokens。fork 复用父上下文的动机是减少重复调查；这不是 fork 的实测节省比例，继承更长 history 的成本与实际缓存收益仍待对照验证。
+
+### `child_costs` 分组与有效样本
+
+`child_costs` 以每个带 `parent_session_id` 的入选子日志为一个样本，含前台和后台；接续仍属于同一子日志，不按每次 agent 调用拆分。`child_costs.by_creation` 按子 header 的创建信息分组：
+
+| 组 | 判定口径 |
+| --- | --- |
+| `fork` | `forked_from` 是对象，含非空字符串 `session` 和非负整数 `message_count` |
+| `new` | header 缺少 `forked_from`，包括没有此字段的旧日志 |
+| `unknown` | 显式存在 `forked_from`，但结构或字段值无效 |
+
+只输出实际出现的组；不能把 `unknown` 或旧日志缺字段视为已验证的 fork 对照样本。`child_costs.by_parent_system` 按父会话 `system_sha` 区分工具说明修改前后的实验，每个父 system 组内也有同口径的 `by_creation`。父标签通过本次输入日志中的 `parent_session_id` 关联；父日志缺失或标签无效时归 `unknown`，不回退到子 system。
+
+全局、各父 system 组及各 `fork` / `new` / `unknown` 创建组均包含以下分布；每个指标分别输出 `{ samples, median, p90 }`，例如 `child_costs.by_creation.fork.first_request_cache_hit_rate.samples`：
+
+| JSON 指标 | 每子会话的取值与入样条件 |
+| --- | --- |
+| `steps`（Step） | 已提交完整 Step 数，不计 header 中继承的父历史 |
+| `model_ms` | 各完整 Step 的模型毫秒数之和，含重试/退避，不含工具执行，不是墙钟时间 |
+| `prompt_tokens`（prompt） | 各完整 Step 的输入 token 之和，含缓存与重复上下文，不是费用 |
+| `uncached_prompt_tokens`（uncached） | 逐 Step 的 `prompt_tokens - prompt_cache_hit_tokens` 之和；两字段均为非负整数且 cache ≤ prompt |
+| `first_request_cache_hit_rate` | 首个完整 Step 的 `prompt_cache_hit_tokens / prompt_tokens`，两字段有效、cache ≤ prompt 且 prompt > 0；逐子会话等权，不是汇总 token 后的比值 |
+
+这些分布仅纳入非零 Step、且所有完整 Step 都在筛选范围内的子会话。`sessions` 为入选子日志数，`full_range_sessions` 为上述全范围非零 Step 子会话数，`partial_range_sessions` 记录被 `--since` 等筛选截断的子会话，`no_step_sessions` 记录没有完整 Step 的子会话；后两类不进入分布，不能把截断片段当作整次成本。
+
+`model_ms`、prompt 和 uncached 各自要求该子会话所有完整 Step 的对应字段有效，缺失不补零，也不加父会话 usage 或工具结果中的 usage。首请求命中率只检查首个完整 Step，不因后续 Step 缺字段而排除，也不以之后的有效 usage 替代缺失的首 Step。`samples` 是各指标的有效子会话数，因此同组各指标可能不同；无有效样本时为 0，`median` / `p90` 为 null，p90 使用 nearest-rank。失败、取消或仍运行的日志仍只是已记录成本的下界。这些分组提供观测而非自动选择阈值；口径及其他筛选行为见 [会话统计](session-log.md#会话统计)。
 
 ## 接口与限额
 
@@ -27,13 +53,21 @@ Run 中可调用 `await tools.llm({ prompt, input, schema, model, effort })`，�
 
 llm 限额由 [config.toml 的 `[limits]`](config.md#limits) 配置：同进程并发调用默认 4，可配置，超出排队（不计请求超时）；每 Run 调用上限默认 100，可配置，超出时在沙箱入队前 reject；单次 prompt + 序列化 input 合计上限默认 256 KiB（UTF-8 字节），可配置，超出 reject，不截断。请求超时沿用 provider（当前无额外读超时），限流/临时错误复用 `src/provider/retry.zig` 的主会话重试、退避与服务端延迟提示。Esc/SIGINT/SIGTERM 同时取消在途和排队调用。各 Run 仍是无状态沙箱，中间结果用 JSON 文件传递，见 [ADR 0013](adr/0013-llm-functions.md)。
 
-根会话可调用 `await tools.agent({ prompt, resume, timeout_ms: 1800000, model, effort, background: false })`。resume 为可选字符串，可省略：不传则新建子会话；传入当前父会话的 agent 任务 id（如 `a1`），接续该任务对应的子会话历史和原始 system，并追加本次 prompt。仅新建时分配任务 id；接续沿用原任务 id，不分配新 id。例如 `resume: "a1"` 的前台结果、后台启动确认和完成消息、progress 事件及 TUI tree 均使用 `a1`。每次仍启动独立的 nib 子进程、运行一个 Turn；内部通过 `nib ask --resume <内部子会话 ID>` 恢复，不是常驻 worker。新子会话独立读取指令文件，不继承父会话历史。
+根会话可调用 `await tools.agent({ prompt, resume, fork, timeout_ms: 1800000, model, effort, background: false })`。fork 为可选 boolean，默认 false。resume 为可选字符串，可省略：不传则新建子会话（fork 决定是否继承父上下文）；传入当前父会话的 agent 任务 id（如 `a1`），接续该任务对应的子会话历史和原始 system，并追加本次 prompt。仅新建时分配任务 id；接续沿用原任务 id，不分配新 id。例如 `resume: "a1"` 的前台结果、后台启动确认和完成消息、progress 事件及 TUI tree 均使用 `a1`。每次仍启动独立的 nib 子进程、运行一个 Turn；内部通过 `nib ask --resume <内部子会话 ID>` 恢复，不是常驻 worker。默认新子会话独立读取指令文件，不继承父会话历史；`fork:true` 的区别如下。
+
+`fork:true` 继承父会话压缩后的当前完整 history，而不是从原始日志重建被压缩丢弃的内容；system 和工具 schema 与父会话逐字节相同。截取点包含发起 fork 的当前 assistant 消息，包括 reasoning（Codex 的加密推理条目也保留）和工具调用。子会话先为该 assistant 的工具调用补齐合成 tool results，再追加本次 prompt 作为 user 消息；这些合成结果不是父 Run 尚未完成的真实结果，也不会在子会话重跑父 Run。
+
+每次 fork 都新建独立子会话和新的 `aN` 任务 id，后续可用 `resume: "aN"` 接续；`fork` 与 `resume` 同时传入是参数错误（即使 `fork:false`），reject。fork 仍使用普通子 agent 的执行深度，不开放递归：虽然继承的 system/schema 仍描述 agent，运行时不能再调用 agent。子会话与父会话共享 cwd，没有独立 worktree；fork 也复制历史截取点已有的文件版本观察，继承内容不是未观察文件，直接 write 仍受过期检测；已有跨进程文件锁、原子替换和过期检测继续生效，但不提供工作区隔离，也不协调 bash 或用户编辑器的写入。
+
+文件版本观察只在新建 fork 时复制，不写入会话日志；与普通恢复一致，后续 resume 重新开始观察。
+
+fork 的 model/effort 可覆盖，默认继承产生当前 assistant 请求的实际有效配置（包括一次性的 Run effort），显式覆盖优先；只有 model 与 effort 都相同时才保留父前缀的缓存复用优势，改变任一项就失去这一优势。Codex fork 与 resume 使用相同的模型一致性约束：不能把父历史中的加密推理条目带到另一模型；覆盖 model 也不绕过此检查。Codex fork 的 `prompt_cache_key` 沿用父值，旨在路由到同一缓存；实际能否命中、节省多少仍是待实测假设，不是协议保证，见 [codex.md](codex.md#fork-与父缓存路由) 与 [ADR 0015](adr/0015-agent-fork.md)。
 
 前台成功返回 `{ ok: true, id, text, usage, changes }`；子会话超时、崩溃、非零退出或 NDJSON error 返回 `{ ok: false, id, error, text, usage, changes }`，不会 reject，也不会取消同一 Run 中的其他子 agent。id 为任务 id（接续时沿用原 id），不是内部子会话 ID；工具返回值、错误诊断和后台结果不向模型暴露内部子会话 ID。只有参数错误（包括 resume 格式错误）和用户取消（Esc/SIGINT/SIGTERM）仍 reject。text 成功时取 end.text；失败时保留已收到的最终文本（text delta，不含思考或工具代码），没有则为空串。error 保留失败原因、实际耗时（含终止宽限）、任务 id 和文件可能不完整的诊断。usage 和 changes 只统计本次调用，不重复累计子会话之前的历史。
 
 父会话日志持久化任务 id 到内部子会话 ID 的映射，恢复父会话时重建；模型只使用任务 id。只能接续当前父会话的 agent 任务：目标子会话日志的 `parent_session_id` 必须等于当前父会话 id；不存在的任务、非本会话 agent（包括非 agent 任务）或没有内部子会话映射的任务均返回 `ok:false`，不 reject；传入内部子会话 ID 也不能接续。父会话恢复后仍可接续其原有子会话，根会话或其他父会话的子会话不能接续，返回 `ok:false`。执行阶段在等待并发槽之前预留目标 agent；同一 agent 一次只允许一个在途调用（含排队、前台和后台），busy 时立即返回 `ok:false`，不排队、不分配新 id。预留在完成、失败或取消时释放，前台和后台共用；日志独占锁另外阻止跨进程同时接续，包括 CLI。失败、超时或取消不删除已有映射；内部子会话日志可恢复时仍可接续，尚未取得内部子会话 ID 的任务没有可接续映射。停止不回滚文件，日志或 changes 不保证包含中断前的全部改动。
 
-timeout_ms 可省略，默认 30 分钟，不计排队时间。model/effort 省略时继承父会话的当前有效配置，接续时也不改为沿用子会话上次覆盖值；覆盖只影响本次子调用，不影响父会话或切换 provider，effort 沿用现有校验与映射。恢复的 provider 必须与日志一致，Codex 模型也必须相同（见 [codex.md](codex.md)）；父会话当前模型与子会话原模型不同时，省略 model 的接续调用仍受此约束。同时运行的子会话上限默认 4，可配置（全部工具最多同时运行 8 个）。子会话沿用 cwd、有效 provider/模型配置及限额（通过 stdin 管道传递，子会话跳过配置文件读取；Codex 凭证各自读取）。内部环境变量 `NIB_AGENT_DEPTH` 从 0 递增，深度达到 1 时，工具说明与实际 JS API 都移除 agent。`NIB_PARENT_SESSION_ID` 写入新子会话日志首条记录的 `parent_session_id`。显式 `--resume` 子会话仍保留深度限制；`--continue` 跳过子会话。
+timeout_ms 可省略，默认 30 分钟，不计排队时间。model/effort 省略时继承父会话的当前有效配置，接续时也不改为沿用子会话上次覆盖值；覆盖只影响本次子调用，不影响父会话或切换 provider，effort 沿用现有校验与映射。恢复的 provider 必须与日志一致，Codex 模型也必须相同（见 [codex.md](codex.md)）；父会话当前模型与子会话原模型不同时，省略 model 的接续调用仍受此约束。同时运行的子会话上限默认 4，可配置（全部工具最多同时运行 8 个）。子会话沿用 cwd、有效 provider/模型配置及限额（通过 stdin 管道传递，子会话跳过配置文件读取；Codex 凭证各自读取）。内部环境变量 `NIB_AGENT_DEPTH` 从 0 递增，深度达到 1 时，默认新建子会话的工具说明与实际 JS API 都移除 agent；fork 为保留父请求前缀不改写说明/schema，但运行时同样不能调用 agent。`NIB_PARENT_SESSION_ID` 写入新子会话日志首条记录的 `parent_session_id`。显式 `--resume` 子会话仍保留深度限制；`--continue` 跳过子会话。
 
 `background` 可选，默认 false，保留上述前台等待行为。设为 true 时，调用在成功登记后台任务后立即返回 `{ id }` 启动确认；接续 `a1` 时仍为 `{ id: "a1" }`，busy、不存在或非本会话 agent 直接返回 `ok:false`，不登记后台任务。子会话由父会话持有，可跨 Run 继续工作；父模型可继续其他 Step，不需要额外的查询或等待工具。任务完成后，Session 在下一次主模型请求前，把 `[background agent <id> finished]` 和截断后的 `{ok,id,text,changes,error?}` JSON（id 与启动确认相同）作为 user 消息插入历史，不含 usage。结果不会在模型流式响应或 Run 执行中途插入，也不会当作用户新 Turn。若模型已给出无工具回答但仍有后台任务，Session 等待下一条 inbox 消息（后台结果或用户插话），按 FIFO 插入后发起新 Step；不必等待全部后台任务完成。
 
@@ -65,4 +99,4 @@ bash 与子会话复用标准库子进程等待和进程组执行器。所有 ba
 
 新会话构建 system 时，`src/tools.zig` 根据有效 provider 配置生成 llm 的模型列表：Codex 模型取自 `src/provider/codex.zig` 的目录；Chat Completions 至少提供 `src/provider/openai.zig` 的默认模型，另加入当前配置模型并去重。effort 说明只列常用的 low/medium/high，省略 model/effort 仍继承当前配置；完整档位与映射见 [config.md](config.md) 和 [codex.md](codex.md)。选择只在当前 provider 内进行，不隐式切换 provider。
 
-工具说明中的模型名按 JSON 字符串编码，不直接插入原始配置文本。根会话与子会话使用同一生成路径，但子会话隐藏 agent；恢复会话仍沿用日志原始 system，不改写历史。架构理由见 [ADR 0010](adr/0010-subagents.md) 与 [ADR 0013](adr/0013-llm-functions.md)。
+工具说明中的模型名按 JSON 字符串编码，不直接插入原始配置文本。根会话与默认新建子会话使用同一生成路径，但默认子会话隐藏 agent；fork 复用父 system/schema，不重新生成，agent 的不可递归边界由运行时执行。恢复会话仍沿用日志原始 system，不改写历史。架构理由见 [ADR 0010](adr/0010-subagents.md)、[ADR 0013](adr/0013-llm-functions.md) 与 [ADR 0015](adr/0015-agent-fork.md)。

@@ -27,6 +27,7 @@ pub const Background = struct {
         id: []u8,
         kind: BackgroundEvent.Kind,
         detached: bool = false,
+        fork_input: ?[]u8 = null,
         cancel: std.atomic.Value(bool) = .init(false),
         run: usize,
         invocation: usize = 0,
@@ -48,6 +49,8 @@ pub const Background = struct {
             job.join();
             job.gpa.free(job.args);
             job.gpa.free(job.prompt);
+            if (job.fork_input) |input| job.gpa.free(input);
+            job.fork_input = null;
             job.args = &.{};
             job.prompt = &.{};
         }
@@ -55,6 +58,8 @@ pub const Background = struct {
         fn destroy(job: *Job) void {
             job.gpa.free(job.args);
             job.gpa.free(job.prompt);
+            if (job.fork_input) |input| job.gpa.free(input);
+            job.fork_input = null;
             job.gpa.free(job.id);
             job.gpa.destroy(job);
         }
@@ -77,7 +82,7 @@ pub const Background = struct {
             const gpa = job.gpa;
             const t = job.t;
             const result = switch (job.kind) {
-                .agent => agent.execute(t, gpa, job.args, &job.cancel, job.id, job.run, true),
+                .agent => agent.execute(t, gpa, job.args, &job.cancel, job.id, job.run, true, job.fork_input),
                 .bash => @import("bash.zig").executeBackground(t, gpa, job.args, &job.cancel, .{ .id = job.id, .run = job.run, .background = true, .kind = .bash, .prompt = "" }),
             } catch |err| try @import("../tools.zig").fail(gpa, "{s}", .{@errorName(err)});
             defer switch (result) {
@@ -115,14 +120,14 @@ pub const Background = struct {
     };
 
     pub fn start(bg: *Background, t: *Tools, gpa: std.mem.Allocator, kind: BackgroundEvent.Kind, args: []const u8, prompt: []const u8) ![]u8 {
-        return bg.startWithId(t, gpa, kind, args, prompt, null);
+        return bg.startWithId(t, gpa, kind, args, prompt, null, null);
     }
 
-    pub fn startAgent(bg: *Background, t: *Tools, gpa: std.mem.Allocator, args: []const u8, prompt: []const u8, id: []const u8) ![]u8 {
-        return bg.startWithId(t, gpa, .agent, args, prompt, id);
+    pub fn startAgent(bg: *Background, t: *Tools, gpa: std.mem.Allocator, args: []const u8, prompt: []const u8, id: []const u8, fork_input: ?[]const u8) ![]u8 {
+        return bg.startWithId(t, gpa, .agent, args, prompt, id, fork_input);
     }
 
-    fn startWithId(bg: *Background, t: *Tools, gpa: std.mem.Allocator, kind: BackgroundEvent.Kind, args: []const u8, prompt: []const u8, task_id: ?[]const u8) ![]u8 {
+    fn startWithId(bg: *Background, t: *Tools, gpa: std.mem.Allocator, kind: BackgroundEvent.Kind, args: []const u8, prompt: []const u8, task_id: ?[]const u8, fork_input: ?[]const u8) ![]u8 {
         bg.lifecycle.lockUncancelable(t.io);
         defer bg.lifecycle.unlock(t.io);
         bg.mutex.lockUncancelable(t.io);
@@ -148,8 +153,10 @@ pub const Background = struct {
         errdefer gpa.free(prompt_copy);
         const result = try std.json.Stringify.valueAlloc(gpa, .{ .id = id }, .{});
         errdefer gpa.free(result);
+        const fork_copy = if (fork_input) |input| try gpa.dupe(u8, input) else null;
+        errdefer if (fork_copy) |input| gpa.free(input);
         try bg.jobs.ensureUnusedCapacity(gpa, 1);
-        job.* = .{ .t = t, .gpa = gpa, .args = copy, .prompt = prompt_copy, .id = id, .kind = kind, .detached = detached, .run = t.run_id, .invocation = t.progress.currentInvocation(t.io, id) };
+        job.* = .{ .t = t, .gpa = gpa, .args = copy, .prompt = prompt_copy, .id = id, .kind = kind, .detached = detached, .fork_input = fork_copy, .run = t.run_id, .invocation = t.progress.currentInvocation(t.io, id) };
         try log.background(t.io, gpa, .{ .id = id, .kind = kind, .state = .started }, bg.turn_step);
         @import("../sandbox.zig").tool_identity = .{ .id = progress_id, .background = true };
         bg.jobs.appendAssumeCapacity(job);
@@ -157,7 +164,7 @@ pub const Background = struct {
         if (kind == .bash) bg.bash_active += 1;
         job.thread = std.Thread.spawn(.{}, Job.work, .{job}) catch |err| {
             if (kind == .bash) bg.bash_active -= 1;
-            try t.progress.update(gpa, t.io, .{ .id = id, .run = job.run, .invocation = job.invocation, .kind = kind, .background = true, .detached = detached, .prompt = prompt, .state = .failed });
+            try t.progress.update(gpa, t.io, .{ .id = id, .run = job.run, .invocation = job.invocation, .kind = kind, .background = true, .detached = detached, .fork = if (kind == .agent) t.agent_sessions.isFork(t.io, id) else false, .prompt = prompt, .state = .failed });
             try job.deliver(.{ .err = @constCast(@errorName(err)) });
             if (kind == .agent) t.agent_sessions.release(t.io, id);
             job.done.store(true, .release);

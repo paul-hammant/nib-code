@@ -102,7 +102,7 @@ fn parse(a: Allocator, line: []const u8) !Value {
     return std.json.parseFromSliceLeaky(Value, a, line, .{ .allocate = .alloc_always }) catch return error.InvalidReplayLog;
 }
 
-// Replacement records contain retained assistant messages, not new Steps.
+// Replacement records and fork headers retain assistant messages, not new Steps.
 fn loadMain(a: Allocator, data: []const u8) ![]Run {
     var runs: std.ArrayList(Run) = .empty;
     var length: usize = 0;
@@ -137,6 +137,7 @@ fn loadMain(a: Allocator, data: []const u8) ![]Run {
         length = std.math.add(usize, from, messages.len) catch return error.InvalidReplayLog;
         records += 1;
         if (!appended) continue;
+        if (record.object.get("forked_from")) |fork| if (fork != .null) continue;
         for (messages, 0..) |message, m| {
             if (!std.mem.eql(u8, try string(try field(message, "role")), "assistant")) continue;
             step += 1;
@@ -399,6 +400,30 @@ test "raw main records count global assistant Steps across turns and compaction"
         try t.expectEqual(index, r.key.run);
         try t.expectEqualStrings(code, r.code);
         try t.expectEqualStrings(expected, r.expected.?);
+    }
+}
+
+test "fork headers do not contribute Steps or Runs across compaction and resume" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const data = "{\"parent_session_id\":\"parent\",\"forked_from\":{\"session\":\"parent\",\"message_count\":5},\"messages\":[{\"role\":\"system\",\"content\":\"system\"},{\"role\":\"user\",\"content\":\"parent task\"},{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"p1\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"code\\\":\\\"parent-first\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"p1\",\"content\":\"parent output\"},{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"p2\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"code\\\":\\\"parent-fork\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"p2\",\"content\":\"synthetic result\"}]}\n" ++
+        "{\"from\":6,\"messages\":[{\"role\":\"user\",\"content\":\"child task\"},{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"c1\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"code\\\":\\\"child-first\\\"}\"}},{\"id\":\"c2\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"code\\\":\\\"child-second\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"first\"},{\"role\":\"tool\",\"tool_call_id\":\"c2\",\"content\":\"second\"}]}\n" ++
+        "{\"from\":10,\"messages\":[{\"role\":\"assistant\",\"content\":\"child done\"}]}\n" ++
+        "{\"from\":1,\"messages\":[{\"role\":\"user\",\"content\":\"summary\"},{\"role\":\"assistant\",\"content\":\"retained child done\"}]}\n" ++
+        "{\"from\":3,\"forked_from\":null,\"messages\":[{\"role\":\"user\",\"content\":\"resume\"},{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"c3\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"code\\\":\\\"child-resumed\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"c3\",\"content\":\"resumed\"}]}\n";
+    const runs = try loadMain(arena.allocator(), data);
+    try t.expectEqual(@as(usize, 3), runs.len);
+    const steps = [_]usize{ 1, 1, 3 };
+    const indexes = [_]usize{ 0, 1, 0 };
+    const codes = [_][]const u8{ "child-first", "child-second", "child-resumed" };
+    const results = [_][]const u8{ "first", "second", "resumed" };
+    for (runs, steps, indexes, codes, results) |r, step, index, code, expected| {
+        try t.expectEqual(step, r.key.step);
+        try t.expectEqual(index, r.key.run);
+        try t.expectEqualStrings(code, r.code);
+        try t.expectEqualStrings(expected, r.expected.?);
+        try t.expect(r.child);
     }
 }
 

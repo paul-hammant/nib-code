@@ -21,6 +21,12 @@ pub const Diagnostic = struct {
 pub const AgentSession = struct {
     id: []const u8,
     session: []const u8,
+    fork: bool = false,
+};
+
+pub const ForkedFrom = struct {
+    session: []const u8,
+    message_count: usize,
 };
 
 pub const Record = struct {
@@ -53,6 +59,8 @@ pub const Record = struct {
     provider: ?provider.Id = null,
     model: ?[]const u8 = null,
     parent_session_id: ?[]const u8 = null,
+    cache_key: ?[]const u8 = null,
+    forked_from: ?ForkedFrom = null,
     from: usize = 0,
     messages: []const provider.Message = &.{},
     context_tokens: u64 = 0,
@@ -73,6 +81,8 @@ pub const Log = struct {
     provider: provider.Id = .chat_completions,
     model: ?[]const u8 = null,
     parent_session_id: ?[]const u8 = null,
+    cache_key: ?[]const u8 = null,
+    forked_from: ?ForkedFrom = null,
 
     pub fn create(io: std.Io, path: []const u8) !Log {
         return .{ .file = try std.Io.Dir.cwd().createFile(io, path, .{
@@ -93,7 +103,7 @@ pub const Log = struct {
         if (expected_parent) |parent| {
             if (!std.mem.eql(u8, parent, restored.parent_session_id orelse "")) return error.AgentSessionParentMismatch;
         }
-        var log: Log = .{ .file = file, .offset = data.len, .parent_session_id = restored.parent_session_id, .provider = restored.provider, .model = restored.model, .steps = restored.steps, .next_agent_id = restored.next_agent_id, .next_bash_id = restored.next_bash_id, .agent_sessions = restored.agent_sessions, .lost_background = restored.lost_background, .pending_background_bytes = restored.pending_background_bytes };
+        var log: Log = .{ .file = file, .offset = data.len, .parent_session_id = restored.parent_session_id, .cache_key = restored.cache_key, .forked_from = restored.forked_from, .provider = restored.provider, .model = restored.model, .steps = restored.steps, .next_agent_id = restored.next_agent_id, .next_bash_id = restored.next_bash_id, .agent_sessions = restored.agent_sessions, .lost_background = restored.lost_background, .pending_background_bytes = restored.pending_background_bytes };
         if (restored.needs_repair) try log.append(io, a, .{ .repair = true });
         for (restored.background_repairs) |event| try log.append(io, a, .{ .background = event });
         if (restored.needs_repair or restored.background_repairs.len != 0) try log.file.sync(io);
@@ -145,7 +155,7 @@ pub const Log = struct {
         if (record.from > history.items.len) return error.InvalidSessionLog;
         try history.ensureTotalCapacity(a, record.from + record.messages.len);
         try log.append(io, a, record);
-        if (record.from == history.items.len) log.steps += assistantCount(record.messages);
+        if (record.from == history.items.len and record.forked_from == null) log.steps += assistantCount(record.messages);
         apply(history, record);
         tokens.* = record.context_tokens;
         errdefer log.poisoned = true;
@@ -199,8 +209,10 @@ fn restoreToolSummaries(a: std.mem.Allocator, history: []provider.Message, recor
     }
 }
 
-pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, history: *std.ArrayList(provider.Message), tokens: *u64) !struct { needs_repair: bool, steps: usize, parent_session_id: ?[]const u8, provider: provider.Id, model: ?[]const u8, next_agent_id: u64, next_bash_id: u64, agent_sessions: []const AgentSession, lost_background: []const @import("events.zig").Background, background_repairs: []const @import("events.zig").Background, pending_background_bytes: u64 } {
+pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, history: *std.ArrayList(provider.Message), tokens: *u64) !struct { needs_repair: bool, steps: usize, parent_session_id: ?[]const u8, cache_key: ?[]const u8, forked_from: ?ForkedFrom, provider: provider.Id, model: ?[]const u8, next_agent_id: u64, next_bash_id: u64, agent_sessions: []const AgentSession, lost_background: []const @import("events.zig").Background, background_repairs: []const @import("events.zig").Background, pending_background_bytes: u64 } {
     var parent_session_id: ?[]const u8 = null;
+    var cache_key: ?[]const u8 = null;
+    var forked_from: ?ForkedFrom = null;
     var next_agent_id: u64 = 1;
     var next_bash_id: u64 = 1;
     var pending_background_bytes: u64 = 0;
@@ -224,6 +236,8 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
         };
         if (history.items.len == 0) {
             parent_session_id = r.parent_session_id;
+            cache_key = r.cache_key;
+            forked_from = r.forked_from;
             id = r.provider orelse .chat_completions;
         }
         if (r.model) |m| model = m;
@@ -273,7 +287,7 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
         if (r.diagnostic != null) continue;
         if (r.from > history.items.len) return error.InvalidSessionLog;
         try history.ensureTotalCapacity(gpa, r.from + r.messages.len);
-        if (r.from == history.items.len) {
+        if (r.from == history.items.len and r.forked_from == null) {
             steps += assistantCount(r.messages);
             for (r.messages) |message| if (message.source == .background) {
                 if (message.content) |text| pending_background_bytes += text.len;
@@ -295,7 +309,7 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
             try background_repairs.append(a, pending.event);
         } else try lost_background.append(a, pending.event);
     }
-    return .{ .steps = steps, .needs_repair = torn or data[data.len - 1] != '\n', .parent_session_id = parent_session_id, .provider = id, .model = model, .next_agent_id = next_agent_id, .next_bash_id = next_bash_id, .agent_sessions = try agent_sessions.toOwnedSlice(a), .lost_background = try lost_background.toOwnedSlice(a), .background_repairs = try background_repairs.toOwnedSlice(a), .pending_background_bytes = pending_background_bytes };
+    return .{ .steps = steps, .needs_repair = torn or data[data.len - 1] != '\n', .parent_session_id = parent_session_id, .cache_key = cache_key, .forked_from = forked_from, .provider = id, .model = model, .next_agent_id = next_agent_id, .next_bash_id = next_bash_id, .agent_sessions = try agent_sessions.toOwnedSlice(a), .lost_background = try lost_background.toOwnedSlice(a), .background_repairs = try background_repairs.toOwnedSlice(a), .pending_background_bytes = pending_background_bytes };
 }
 
 fn restoreId(id: []const u8, next_agent: *u64, next_bash: *u64) !void {
@@ -1151,5 +1165,33 @@ test "restore preserves pending background bytes across snapshots and idempotent
         defer log.close(t.io);
         try t.expectEqual(@as(u64, 0), log.pending_background_bytes);
         try t.expectEqual(@as(usize, 0), log.lost_background.len);
+    }
+}
+
+test "fork header retains provenance and cache across compaction without billing inherited Steps" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const records = [_]Record{
+        .{ .messages = &.{
+            .{ .role = "system", .content = "original system" },
+            .{ .role = "user", .content = "old background output", .source = .background, .background_id = "b1" },
+            .{ .role = "assistant", .content = "inherited assistant" },
+        }, .cache_key = "parent-cache", .forked_from = .{ .session = "parent-session", .message_count = 3 }, .context_tokens = 100 },
+        .{ .from = 3, .messages = &.{ .{ .role = "user", .content = "child prompt" }, .{ .role = "assistant", .content = "child answer" } }, .context_tokens = 200 },
+        .{ .from = 1, .messages = &.{.{ .role = "user", .content = "compacted child history" }}, .context_tokens = 50 },
+    };
+    var encoded: std.Io.Writer.Allocating = .init(a);
+    defer encoded.deinit();
+    for (records, 0..) |record, i| {
+        try encoded.writer.print("{f}\n", .{std.json.fmt(record, .{ .emit_null_optional_fields = false })});
+        var messages: std.ArrayList(provider.Message) = .empty;
+        var tokens: u64 = 0;
+        const restored = try replay(a, a, encoded.written(), &messages, &tokens);
+        try t.expectEqual(@as(usize, if (i == 0) 0 else 1), restored.steps);
+        try t.expectEqual(@as(u64, 0), restored.pending_background_bytes);
+        try t.expectEqualStrings("parent-cache", restored.cache_key.?);
+        try t.expectEqualDeep(records[0].forked_from, restored.forked_from);
     }
 }

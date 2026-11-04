@@ -4,7 +4,7 @@
 
 ## 常用命令
 
-- 构建：`zig build`；测试：`zig build test --summary all`；端到端（本地 mock，无真实 key）：`zig build` 后 `python3 tests/test_session.py`、`python3 tests/test_agent.py`、`python3 tests/test_agent_reuse.py`、`python3 tests/test_background_agent.py`、`python3 tests/test_background_bash.py`、`python3 tests/test_codex.py`、`python3 tests/test_llm.py`、`python3 tests/test_stats.py`、`python3 tests/test_effort.py`、`python3 tests/test_interjections.py`、`python3 tests/test_limits.py`、`python3 tests/test_replay.py`、`python3 tests/test_stream_idle.py`、`python3 tests/test_files.py`
+- 构建：`zig build`；测试：`zig build test --summary all`；端到端（本地 mock，无真实 key）：`zig build` 后 `python3 tests/test_session.py`、`python3 tests/test_agent.py`、`python3 tests/test_agent_reuse.py`、`python3 tests/test_agent_fork.py`、`python3 tests/test_background_agent.py`、`python3 tests/test_background_bash.py`、`python3 tests/test_codex.py`、`python3 tests/test_llm.py`、`python3 tests/test_stats.py`、`python3 tests/test_effort.py`、`python3 tests/test_interjections.py`、`python3 tests/test_limits.py`、`python3 tests/test_replay.py`、`python3 tests/test_stream_idle.py`、`python3 tests/test_files.py`
 - 安装到 `~/.local/bin/nib`：`zig build -Doptimize=ReleaseFast --prefix ~/.local`；版本号在 `build.zig.zon`，`nib --version` 查看。
 - 运行：`./zig-out/bin/nib`（TUI）、`nib ask '<prompt>'`、`nib js '<code>'`；TUI 用 `/compact` 手动压缩上下文。
 - 恢复：`nib -c` / `nib --continue`；`nib --resume <32位小写十六进制ID>`。`ask` 同样支持，选项可放在 prompt 前后。
@@ -16,7 +16,7 @@
 - provider、凭证、effort、配置与环境变量：[docs/config.md](docs/config.md)、[docs/codex.md](docs/codex.md)、[ADR 0011](docs/adr/0011-provider-wire-protocols.md)。
 - `ask --json` 的 NDJSON 格式：[docs/ask-json.md](docs/ask-json.md)。
 - 会话日志、恢复/取消语义、计时字段与统计口径：[docs/session-log.md](docs/session-log.md)。
-- `tools.llm({ prompt, input, schema, model, effort }) → { text, data, usage }`；`tools.agent({ prompt, resume?: string, timeout_ms, model, effort, background }) → { ok, id, text, usage, changes, error? }`（resume 使用当前父会话的 agent 任务 id，如 `a1`；接续沿用 `a1`，不分配新 id，前台结果、后台启动和完成、progress/tree 均使用该 id；同一 agent 一次只允许一个在途调用，busy、不存在或非本会话 agent 均返回 `ok:false`；不暴露内部子会话 ID；子会话失败为数据，仅参数错误/用户取消 reject；usage/changes 仅本次，changes 仅 edit/write）；agent 和 bash 传 `background: true` 时，成功登记后立即返回 `{ id }`，结果在之后的 Step 作为消息插入，agent 结果含同一 id：[接口、限额、用量与取消](docs/tool-delegation.md)。
+- `tools.llm({ prompt, input, schema, model, effort }) → { text, data, usage }`；`tools.agent({ prompt, resume?: string, fork?: boolean, timeout_ms, model, effort, background }) → { ok, id, text, usage, changes, error? }`（resume 使用当前父会话的 agent 任务 id，如 `a1`；接续沿用 `a1`，不分配新 id，前台结果、后台启动和完成、progress/tree 均使用该 id；同一 agent 一次只允许一个在途调用，busy、不存在或非本会话 agent 均返回 `ok:false`；不暴露内部子会话 ID；子会话失败为数据，仅参数错误/用户取消 reject；usage/changes 仅本次，changes 仅 edit/write）；agent 和 bash 传 `background: true` 时，成功登记后立即返回 `{ id }`，结果在之后的 Step 作为消息插入，agent 结果含同一 id：[接口、限额、用量与取消](docs/tool-delegation.md)。
 
 ## 代码地图
 
