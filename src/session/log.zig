@@ -18,9 +18,15 @@ pub const Diagnostic = struct {
     step: u32,
 };
 
+pub const AgentSession = struct {
+    id: []const u8,
+    session: []const u8,
+};
+
 pub const Record = struct {
     at: ?i64 = null,
     diagnostic: ?Diagnostic = null,
+    agent_session: ?AgentSession = null,
     background: ?@import("events.zig").Background = null,
     usage: ?provider.Usage = null,
     effort: ?[]const u8 = null,
@@ -58,6 +64,7 @@ pub const Log = struct {
     mutex: std.Io.Mutex = .init,
     next_agent_id: u64 = 1,
     next_bash_id: u64 = 1,
+    agent_sessions: []const AgentSession = &.{},
     lost_background: []const @import("events.zig").Background = &.{},
     offset: u64,
     poisoned: bool = false,
@@ -76,17 +83,19 @@ pub const Log = struct {
         }), .offset = 0 };
     }
 
-    pub fn restore(io: std.Io, gpa: std.mem.Allocator, a: std.mem.Allocator, path: []const u8, history: *std.ArrayList(provider.Message), tokens: *u64) !Log {
-        const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write, .lock = .exclusive, .lock_nonblocking = true });
+    pub fn restore(io: std.Io, gpa: std.mem.Allocator, a: std.mem.Allocator, path: []const u8, history: *std.ArrayList(provider.Message), tokens: *u64, expected_parent: ?[]const u8) !Log {
+        const file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write, .lock = .exclusive, .lock_nonblocking = true }) catch |err| return if (err == error.WouldBlock) error.SessionBusy else err;
         errdefer file.close(io);
         var reader = file.reader(io, &.{});
         const data = try reader.interface.allocRemaining(a, .unlimited);
         const restored = try replay(gpa, a, data, history, tokens);
-        var log: Log = .{ .file = file, .offset = data.len, .parent_session_id = restored.parent_session_id, .provider = restored.provider, .model = restored.model, .steps = restored.steps, .next_agent_id = restored.next_agent_id, .next_bash_id = restored.next_bash_id, .lost_background = restored.lost_background };
-        if (restored.needs_repair) {
-            try log.append(io, a, .{ .repair = true });
-            try log.file.sync(io);
+        if (expected_parent) |parent| {
+            if (!std.mem.eql(u8, parent, restored.parent_session_id orelse "")) return error.AgentSessionParentMismatch;
         }
+        var log: Log = .{ .file = file, .offset = data.len, .parent_session_id = restored.parent_session_id, .provider = restored.provider, .model = restored.model, .steps = restored.steps, .next_agent_id = restored.next_agent_id, .next_bash_id = restored.next_bash_id, .agent_sessions = restored.agent_sessions, .lost_background = restored.lost_background };
+        if (restored.needs_repair) try log.append(io, a, .{ .repair = true });
+        for (restored.background_repairs) |event| try log.append(io, a, .{ .background = event });
+        if (restored.needs_repair or restored.background_repairs.len != 0) try log.file.sync(io);
         return log;
     }
 
@@ -109,6 +118,14 @@ pub const Log = struct {
         log.mutex.lockUncancelable(io);
         defer log.mutex.unlock(io);
         try log.append(io, a, .{ .background = event, .turn_step = step });
+        errdefer log.poisoned = true;
+        try log.file.sync(io);
+    }
+
+    pub fn agentSession(log: *Log, io: std.Io, a: std.mem.Allocator, mapping: AgentSession) !void {
+        log.mutex.lockUncancelable(io);
+        defer log.mutex.unlock(io);
+        try log.append(io, a, .{ .agent_session = mapping });
         errdefer log.poisoned = true;
         try log.file.sync(io);
     }
@@ -181,11 +198,15 @@ fn restoreToolSummaries(a: std.mem.Allocator, history: []provider.Message, recor
     }
 }
 
-pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, history: *std.ArrayList(provider.Message), tokens: *u64) !struct { needs_repair: bool, steps: usize, parent_session_id: ?[]const u8, provider: provider.Id, model: ?[]const u8, next_agent_id: u64, next_bash_id: u64, lost_background: []const @import("events.zig").Background } {
+pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, history: *std.ArrayList(provider.Message), tokens: *u64) !struct { needs_repair: bool, steps: usize, parent_session_id: ?[]const u8, provider: provider.Id, model: ?[]const u8, next_agent_id: u64, next_bash_id: u64, agent_sessions: []const AgentSession, lost_background: []const @import("events.zig").Background, background_repairs: []const @import("events.zig").Background } {
     var parent_session_id: ?[]const u8 = null;
     var next_agent_id: u64 = 1;
     var next_bash_id: u64 = 1;
-    var pending_background: std.StringArrayHashMapUnmanaged(@import("events.zig").Background) = .empty;
+    var agent_sessions: std.ArrayList(AgentSession) = .empty;
+    defer agent_sessions.deinit(a);
+    const Pending = struct { event: @import("events.zig").Background, delivered: bool = false };
+    var pending_background: std.ArrayList(Pending) = .empty;
+    defer pending_background.deinit(a);
     var id: provider.Id = .chat_completions;
     var model: ?[]const u8 = null;
     var lines = std.mem.splitScalar(u8, data, '\n');
@@ -194,7 +215,8 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
     while (lines.next()) |line| {
         if (lines.peek() == null) break;
         if (line.len == 0) continue;
-        const r = parseRecord(a, line) catch {
+        const r = parseRecord(a, line) catch |err| {
+            if (err == error.OutOfMemory) return err;
             torn = true;
             continue;
         };
@@ -215,13 +237,36 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
             next_agent_id = @max(next_agent_id, std.math.add(u64, ids.agent, 1) catch return error.InvalidSessionLog);
             next_bash_id = @max(next_bash_id, std.math.add(u64, ids.bash, 1) catch return error.InvalidSessionLog);
         }
+        if (r.agent_session) |mapping| {
+            try restoreId(mapping.id, &next_agent_id, &next_bash_id);
+            try agent_sessions.append(a, mapping);
+            continue;
+        }
         if (r.background) |b| {
             try restoreId(b.id, &next_agent_id, &next_bash_id);
-            if (b.state == .started) try pending_background.put(a, b.id, b) else _ = pending_background.orderedRemove(b.id);
+            if (b.state == .started) {
+                try pending_background.append(a, .{ .event = b });
+            } else {
+                for (pending_background.items, 0..) |pending, i| {
+                    if (std.mem.eql(u8, pending.event.id, b.id)) {
+                        _ = pending_background.orderedRemove(i);
+                        break;
+                    }
+                }
+            }
             continue;
         }
         for (r.messages) |m| if (m.source == .background) {
-            if (m.background_id) |agent_id| _ = pending_background.orderedRemove(agent_id);
+            if (m.background_id) |background_id| {
+                for (pending_background.items) |*pending| {
+                    if (!pending.delivered and std.mem.eql(u8, pending.event.id, background_id)) {
+                        pending.delivered = true;
+                        // Finished deliveries carry ok; lost deliveries leave it null.
+                        pending.event = .{ .id = pending.event.id, .kind = pending.event.kind, .state = if (m.background_ok != null) .finished else .lost, .ok = m.background_ok };
+                        break;
+                    }
+                }
+            }
         };
         if (r.diagnostic != null) continue;
         if (r.from > history.items.len) return error.InvalidSessionLog;
@@ -233,7 +278,16 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
         tokens.* = r.context_tokens;
     }
     if (history.items.len == 0) return error.InvalidSessionLog;
-    return .{ .steps = steps, .needs_repair = torn or data[data.len - 1] != '\n', .parent_session_id = parent_session_id, .provider = id, .model = model, .next_agent_id = next_agent_id, .next_bash_id = next_bash_id, .lost_background = try a.dupe(@import("events.zig").Background, pending_background.values()) };
+    var lost_background: std.ArrayList(@import("events.zig").Background) = .empty;
+    defer lost_background.deinit(a);
+    var background_repairs: std.ArrayList(@import("events.zig").Background) = .empty;
+    defer background_repairs.deinit(a);
+    for (pending_background.items) |pending| {
+        if (pending.delivered) {
+            try background_repairs.append(a, pending.event);
+        } else try lost_background.append(a, pending.event);
+    }
+    return .{ .steps = steps, .needs_repair = torn or data[data.len - 1] != '\n', .parent_session_id = parent_session_id, .provider = id, .model = model, .next_agent_id = next_agent_id, .next_bash_id = next_bash_id, .agent_sessions = try agent_sessions.toOwnedSlice(a), .lost_background = try lost_background.toOwnedSlice(a), .background_repairs = try background_repairs.toOwnedSlice(a) };
 }
 
 fn restoreId(id: []const u8, next_agent: *u64, next_bash: *u64) !void {
@@ -408,7 +462,7 @@ test "commit and replay preserve safe history, compaction and torn tail" {
     log.close(t.io);
     var restored: std.ArrayList(provider.Message) = .empty;
     var tokens: u64 = 0;
-    log = try Log.restore(t.io, a, a, path, &restored, &tokens);
+    log = try Log.restore(t.io, a, a, path, &restored, &tokens, null);
     defer log.close(t.io);
     try t.expectEqualDeep(history.items, restored.items);
     try log.commit(t.io, a, &restored, &tokens, .{ .from = restored.items.len, .messages = &.{.{ .role = "assistant", .content = "next" }} });
@@ -606,6 +660,29 @@ test "Step effort restores from Record and survives compacted message snapshots"
     try t.expect(old.messages[0].step_effort == null);
 }
 
+test "child restore checks parent before repairing and keeps the session exclusively locked" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/child.jsonl", .{tmp.sub_path});
+    const data = "{\"parent_session_id\":\"parent\",\"messages\":[{\"role\":\"system\",\"content\":\"child system\"}]}\n{\"from\":";
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "child.jsonl", .data = data });
+    var history: std.ArrayList(provider.Message) = .empty;
+    var tokens: u64 = 0;
+    try t.expectError(error.AgentSessionParentMismatch, Log.restore(t.io, a, a, path, &history, &tokens, "other"));
+    try t.expectEqualStrings(data, try tmp.dir.readFileAlloc(t.io, "child.jsonl", a, .unlimited));
+    history = .empty;
+    var log = try Log.restore(t.io, a, a, path, &history, &tokens, "parent");
+    defer log.close(t.io);
+    try t.expectEqualStrings("parent", log.parent_session_id.?);
+    try t.expectEqualStrings("child system", history.items[0].content.?);
+    var concurrent: std.ArrayList(provider.Message) = .empty;
+    try t.expectError(error.SessionBusy, Log.restore(t.io, a, a, path, &concurrent, &tokens, "parent"));
+}
+
 test "replay restores independent ID maxima from every background state and foreground call" {
     const t = std.testing;
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
@@ -664,4 +741,292 @@ test "task ID high water survives omitted calls and later compacted snapshots" {
     const restored = try replay(a, a, data, &history, &tokens);
     try t.expectEqual(@as(u64, 8), restored.next_agent_id);
     try t.expectEqual(@as(u64, 13), restored.next_bash_id);
+}
+
+test "agent session mappings survive snapshots and compaction without changing history" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const mappings = [_]AgentSession{
+        .{ .id = "a17", .session = "child-17" },
+        .{ .id = "a3", .session = "child-3" },
+        .{ .id = "a21", .session = "child-21" },
+    };
+    const records = [_]Record{
+        .{ .messages = &.{.{ .role = "system", .content = "base" }}, .context_tokens = 10 },
+        .{ .agent_session = mappings[0] },
+        .{ .from = 1, .messages = &.{ .{ .role = "user", .content = "task" }, .{ .role = "assistant", .content = "answer" } }, .context_tokens = 100, .task_ids = .{ .agent = 8, .bash = 12 } },
+        .{ .messages = &.{ .{ .role = "system", .content = "base" }, .{ .role = "user", .content = "task" }, .{ .role = "assistant", .content = "answer" } }, .context_tokens = 100 },
+        .{ .agent_session = mappings[1] },
+        .{ .from = 1, .messages = &.{.{ .role = "user", .content = "summary" }}, .context_tokens = 20, .task_ids = .{ .agent = 2, .bash = 3 } },
+        .{ .agent_session = mappings[2] },
+    };
+    var encoded: std.Io.Writer.Allocating = .init(a);
+    defer encoded.deinit();
+    var expected: std.ArrayList(provider.Message) = .empty;
+    var mapping_count: usize = 0;
+    var expected_tokens: u64 = 0;
+    var expected_steps: usize = 0;
+    var next_agent: u64 = 1;
+    var next_bash: u64 = 1;
+    for (records) |record| {
+        try encoded.writer.print("{f}\n", .{std.json.fmt(record, .{ .emit_null_optional_fields = false })});
+        if (record.agent_session) |mapping| {
+            mapping_count += 1;
+            try restoreId(mapping.id, &next_agent, &next_bash);
+        } else {
+            try expected.ensureTotalCapacity(a, record.from + record.messages.len);
+            if (record.from == expected.items.len) expected_steps += assistantCount(record.messages);
+            apply(&expected, record);
+            expected_tokens = record.context_tokens;
+        }
+        if (record.task_ids) |ids| {
+            next_agent = @max(next_agent, ids.agent + 1);
+            next_bash = @max(next_bash, ids.bash + 1);
+        }
+        var history: std.ArrayList(provider.Message) = .empty;
+        var tokens: u64 = 0;
+        const restored = try replay(a, a, encoded.written(), &history, &tokens);
+        try t.expectEqualDeep(expected.items, history.items);
+        try t.expectEqual(expected_tokens, tokens);
+        try t.expectEqualDeep(mappings[0..mapping_count], restored.agent_sessions);
+        try t.expectEqual(next_agent, restored.next_agent_id);
+        try t.expectEqual(next_bash, restored.next_bash_id);
+        try t.expectEqual(expected_steps, restored.steps);
+    }
+}
+
+test "agentSession append restores mappings and ID high water across repeated resumes" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/parent.jsonl", .{tmp.sub_path});
+    const mappings = [_]AgentSession{
+        .{ .id = "a9", .session = "child-9" },
+        .{ .id = "a4", .session = "child-4" },
+        .{ .id = "a27", .session = "child-27" },
+    };
+    {
+        var log = try Log.create(t.io, path);
+        defer log.close(t.io);
+        try t.expectEqual(@as(usize, 0), log.agent_sessions.len);
+        var history: std.ArrayList(provider.Message) = .empty;
+        var tokens: u64 = 0;
+        try log.commit(t.io, a, &history, &tokens, .{ .messages = &.{.{ .role = "system", .content = "base" }}, .context_tokens = 40, .task_ids = .{ .agent = 20, .bash = 30 } });
+        try log.agentSession(t.io, a, mappings[0]);
+        try log.commit(t.io, a, &history, &tokens, .{ .messages = try a.dupe(provider.Message, history.items), .context_tokens = 12 });
+    }
+    {
+        var history: std.ArrayList(provider.Message) = .empty;
+        var tokens: u64 = 0;
+        var log = try Log.restore(t.io, a, a, path, &history, &tokens, null);
+        defer log.close(t.io);
+        try t.expectEqualDeep(mappings[0..1], log.agent_sessions);
+        try t.expectEqual(@as(u64, 21), log.next_agent_id);
+        try t.expectEqual(@as(u64, 31), log.next_bash_id);
+        try t.expectEqual(@as(u64, 12), tokens);
+        try t.expectEqual(@as(usize, 1), history.items.len);
+        try log.agentSession(t.io, a, mappings[1]);
+        try log.commit(t.io, a, &history, &tokens, .{ .messages = &.{ .{ .role = "system", .content = "base" }, .{ .role = "user", .content = "summary" } }, .context_tokens = 8, .task_ids = .{ .agent = 2, .bash = 3 } });
+        try log.agentSession(t.io, a, mappings[2]);
+    }
+    var history: std.ArrayList(provider.Message) = .empty;
+    var tokens: u64 = 0;
+    var log = try Log.restore(t.io, a, a, path, &history, &tokens, null);
+    defer log.close(t.io);
+    try t.expectEqualDeep(&mappings, log.agent_sessions);
+    try t.expectEqual(@as(u64, 28), log.next_agent_id);
+    try t.expectEqual(@as(u64, 31), log.next_bash_id);
+    try t.expectEqual(@as(u64, 8), tokens);
+    try t.expectEqual(@as(usize, 2), history.items.len);
+    try t.expectEqualStrings("base", history.items[0].content.?);
+    try t.expectEqualStrings("summary", history.items[1].content.?);
+    log.poisoned = true;
+    try t.expectError(error.SessionLogFailed, log.agentSession(t.io, a, .{ .id = "a99", .session = "not-written" }));
+}
+
+test "replay matches reused background IDs in FIFO order for finished and lost events" {
+    const t = std.testing;
+    const Background = @import("events.zig").Background;
+    const first: Background = .{ .id = "a1", .kind = .agent, .state = .started, .result = "first" };
+    const other: Background = .{ .id = "b1", .kind = .bash, .state = .started };
+    const second: Background = .{ .id = "a1", .kind = .agent, .state = .started, .result = "second" };
+    for ([_]@FieldType(Background, "state"){ .finished, .lost }) |terminal| {
+        for ([_]bool{ false, true }) |delivered| {
+            var arena: std.heap.ArenaAllocator = .init(t.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var encoded: std.Io.Writer.Allocating = .init(a);
+            defer encoded.deinit();
+            const records = [_]Record{
+                .{ .messages = &.{.{ .role = "system", .content = "base" }}, .context_tokens = 10 },
+                .{ .agent_session = .{ .id = "a1", .session = "child" } },
+                .{ .background = first },
+                .{ .background = other },
+                .{ .background = second },
+            };
+            for (records) |record| try encoded.writer.print("{f}\n", .{std.json.fmt(record, .{ .emit_null_optional_fields = false })});
+            var history: std.ArrayList(provider.Message) = .empty;
+            var tokens: u64 = 0;
+            const started = try replay(a, a, encoded.written(), &history, &tokens);
+            try t.expectEqualDeep(&[_]Background{ first, other, second }, started.lost_background);
+            try t.expectEqual(@as(usize, 0), started.background_repairs.len);
+            if (delivered) {
+                const message: Record = .{ .from = 1, .messages = &.{.{ .role = "user", .content = "first done", .source = .background, .background_id = "a1" }}, .context_tokens = 20 };
+                try encoded.writer.print("{f}\n", .{std.json.fmt(message, .{ .emit_null_optional_fields = false })});
+                history.clearRetainingCapacity();
+                const committed = try replay(a, a, encoded.written(), &history, &tokens);
+                try t.expectEqualDeep(&[_]Background{ other, second }, committed.lost_background);
+                try t.expectEqualDeep(&[_]Background{.{ .id = first.id, .kind = first.kind, .state = .lost }}, committed.background_repairs);
+            }
+            const end: Record = .{ .background = .{ .id = "a1", .kind = .agent, .state = terminal } };
+            try encoded.writer.print("{f}\n", .{std.json.fmt(end, .{ .emit_null_optional_fields = false })});
+            history.clearRetainingCapacity();
+            const restored = try replay(a, a, encoded.written(), &history, &tokens);
+            try t.expectEqualDeep(&[_]Background{ other, second }, restored.lost_background);
+            try t.expectEqual(@as(usize, 0), restored.background_repairs.len);
+            try t.expectEqualDeep(&[_]AgentSession{.{ .id = "a1", .session = "child" }}, restored.agent_sessions);
+            try t.expectEqual(@as(u64, 2), restored.next_agent_id);
+            try t.expectEqual(@as(u64, 2), restored.next_bash_id);
+            try t.expectEqual(@as(u64, if (delivered) 20 else 10), tokens);
+            try t.expectEqual(@as(usize, if (delivered) 2 else 1), history.items.len);
+        }
+    }
+}
+
+test "restore after background message commit without finished does not redeliver lost" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/background.jsonl", .{tmp.sub_path});
+    const started: @import("events.zig").Background = .{ .id = "a1", .kind = .agent, .state = .started };
+    {
+        var log = try Log.create(t.io, path);
+        defer log.close(t.io);
+        var history: std.ArrayList(provider.Message) = .empty;
+        var tokens: u64 = 0;
+        try log.commit(t.io, a, &history, &tokens, .{ .messages = &.{.{ .role = "system", .content = "base" }} });
+        try log.background(t.io, a, started, 1);
+        try log.commit(t.io, a, &history, &tokens, .{ .from = 1, .messages = &.{.{ .role = "user", .content = "first done", .source = .background, .background_id = "a1" }} });
+    }
+    for (0..2) |attempt| {
+        var history: std.ArrayList(provider.Message) = .empty;
+        var tokens: u64 = 0;
+        var log = try Log.restore(t.io, a, a, path, &history, &tokens, null);
+        defer log.close(t.io);
+        try t.expectEqual(@as(usize, 0), log.lost_background.len);
+        try t.expectEqual(@as(usize, 2), history.items.len);
+        if (attempt == 1) try log.background(t.io, a, started, 2);
+    }
+    {
+        var history: std.ArrayList(provider.Message) = .empty;
+        var tokens: u64 = 0;
+        var log = try Log.restore(t.io, a, a, path, &history, &tokens, null);
+        defer log.close(t.io);
+        try t.expectEqualDeep(&[_]@import("events.zig").Background{started}, log.lost_background);
+        try log.background(t.io, a, .{ .id = "a1", .kind = .agent, .state = .finished }, 1);
+    }
+    {
+        var history: std.ArrayList(provider.Message) = .empty;
+        var tokens: u64 = 0;
+        var log = try Log.restore(t.io, a, a, path, &history, &tokens, null);
+        defer log.close(t.io);
+        try t.expectEqual(@as(usize, 0), log.lost_background.len);
+        try log.commit(t.io, a, &history, &tokens, .{ .from = 2, .messages = &.{.{ .role = "user", .content = "second done", .source = .background, .background_id = "a1" }} });
+    }
+    var history: std.ArrayList(provider.Message) = .empty;
+    var tokens: u64 = 0;
+    var log = try Log.restore(t.io, a, a, path, &history, &tokens, null);
+    defer log.close(t.io);
+    try t.expectEqual(@as(usize, 0), log.lost_background.len);
+    try t.expectEqual(@as(usize, 3), history.items.len);
+    try t.expectEqual(@as(u64, 2), log.next_agent_id);
+}
+
+test "restore closes delivered FIFO entries before delivering a reused ID as lost" {
+    const t = std.testing;
+    const Background = @import("events.zig").Background;
+    const first: Background = .{ .id = "a1", .kind = .agent, .state = .started, .result = "old invocation" };
+    const second: Background = .{ .id = "a1", .kind = .agent, .state = .started, .result = "new invocation" };
+    for ([_]?bool{ true, false, null }) |ok| {
+        for ([_]bool{ false, true }) |torn| {
+            var tmp = t.tmpDir(.{});
+            defer tmp.cleanup();
+            var arena: std.heap.ArenaAllocator = .init(t.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/fifo.jsonl", .{tmp.sub_path});
+            var original: std.ArrayList(provider.Message) = .empty;
+            var original_tokens: u64 = 0;
+            {
+                var log = try Log.create(t.io, path);
+                defer log.close(t.io);
+                try log.commit(t.io, a, &original, &original_tokens, .{ .parent_session_id = "parent", .messages = &.{ .{ .role = "system", .content = "base" }, .{ .role = "assistant", .content = "ready" } }, .context_tokens = 12 });
+                try log.background(t.io, a, first, 1);
+                try log.background(t.io, a, second, 2);
+                try log.commit(t.io, a, &original, &original_tokens, .{ .from = original.items.len, .messages = &.{.{ .role = "user", .content = "opaque result, not lifecycle text", .source = .background, .background_id = "a1", .background_kind = .agent, .background_ok = ok }}, .context_tokens = 37 });
+                if (torn) try log.file.writePositionalAll(t.io, "{\"background\":", log.offset);
+            }
+            const before = try tmp.dir.readFileAlloc(t.io, "fifo.jsonl", a, .unlimited);
+            var history: std.ArrayList(provider.Message) = .empty;
+            var tokens: u64 = 0;
+            try t.expectError(error.AgentSessionParentMismatch, Log.restore(t.io, a, a, path, &history, &tokens, "other"));
+            try t.expectEqualStrings(before, try tmp.dir.readFileAlloc(t.io, "fifo.jsonl", a, .unlimited));
+            history = .empty;
+            const terminal: Background = .{ .id = "a1", .kind = .agent, .state = if (ok != null) .finished else .lost, .ok = ok };
+            {
+                var log = try Log.restore(t.io, a, a, path, &history, &tokens, "parent");
+                defer log.close(t.io);
+                try t.expectEqualDeep(&[_]Background{second}, log.lost_background);
+                try t.expectEqualDeep(original.items, history.items);
+                try t.expectEqual(original_tokens, tokens);
+                try t.expectEqual(@as(usize, 1), log.steps);
+                try t.expectEqual(@as(u64, 2), log.next_agent_id);
+                const repaired = try tmp.dir.readFileAlloc(t.io, "fifo.jsonl", a, .unlimited);
+                try t.expect(std.mem.startsWith(u8, repaired, before));
+                const end = std.mem.trimEnd(u8, repaired, "\n");
+                const last = try parseRecord(a, end[std.mem.lastIndexOfScalar(u8, end, '\n').? + 1 ..]);
+                try t.expectEqualDeep(terminal, last.background.?);
+                try t.expectEqual(@as(usize, 0), last.messages.len);
+                var replayed: std.ArrayList(provider.Message) = .empty;
+                var replayed_tokens: u64 = 0;
+                const result = try replay(a, a, repaired, &replayed, &replayed_tokens);
+                try t.expect(!result.needs_repair);
+                try t.expectEqual(@as(usize, 0), result.background_repairs.len);
+                try t.expectEqualDeep(&[_]Background{second}, result.lost_background);
+                try t.expectEqualDeep(original.items, replayed.items);
+                try t.expectEqual(original_tokens, replayed_tokens);
+                try t.expectEqual(@as(usize, 1), result.steps);
+            }
+            const repaired = try tmp.dir.readFileAlloc(t.io, "fifo.jsonl", a, .unlimited);
+            history = .empty;
+            {
+                var log = try Log.restore(t.io, a, a, path, &history, &tokens, "parent");
+                defer log.close(t.io);
+                try t.expectEqualStrings(repaired, try tmp.dir.readFileAlloc(t.io, "fifo.jsonl", a, .unlimited));
+                try t.expectEqualDeep(&[_]Background{second}, log.lost_background);
+                try log.commit(t.io, a, &history, &tokens, .{ .from = history.items.len, .messages = &.{.{ .role = "user", .content = "new invocation lost", .source = .background, .background_id = "a1", .background_kind = .agent }}, .context_tokens = 43 });
+                try log.background(t.io, a, .{ .id = "a1", .kind = .agent, .state = .lost }, 2);
+            }
+            const delivered = history.items;
+            for (0..2) |_| {
+                history = .empty;
+                var log = try Log.restore(t.io, a, a, path, &history, &tokens, "parent");
+                defer log.close(t.io);
+                try t.expectEqual(@as(usize, 0), log.lost_background.len);
+                try t.expectEqualDeep(delivered, history.items);
+                try t.expectEqual(@as(u64, 43), tokens);
+                try t.expectEqual(@as(usize, 1), log.steps);
+                try t.expectEqual(@as(u64, 2), log.next_agent_id);
+                try t.expectEqual(@as(u64, 1), log.next_bash_id);
+            }
+        }
+    }
 }

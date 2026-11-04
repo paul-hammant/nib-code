@@ -100,9 +100,10 @@ const all = [_]Tool{
         .root_only = true,
         .run = subagent.agent,
         .doc =
-        \\  // Independent multi-step worker; same tools except agent; starts from scratch: thousands of tokens, tens of seconds or more. Only prompt is shared. Failures resolve ok:false (invalid args and user cancel reject); stopped children may leave partial files. changes: cumulative edit/write deltas (not net). model/effort as in llm.
-        \\  // background returns {id} now; the result arrives as a message in a later Step, and a reply without Run waits for it. Background edits share the workspace and can land at any time, even mid-build.
-        \\  async agent({ prompt, timeout_ms = 1800000, model, effort, background = false }) {}, // → { ok, text, usage, changes, error? } or { id }
+        \\  // Independent multi-step worker; same tools except agent; starts from scratch and reads code itself: thousands of tokens, tens of seconds or more. Only prompt is shared.
+        \\  // resume: task id (a1); retains history. One in-flight task per agent. Failures resolve ok:false; invalid args/user cancel reject. Stopped children may leave partial files. usage/changes: this call only; edit/write deltas (not net). model/effort as llm.
+        \\  // background returns {id}; result arrives in a later Step; reply without Run waits. Shared files may change mid-build.
+        \\  async agent({ prompt, resume, timeout_ms = 1800000, model, effort, background = false }) {}, // → { ok, id, text, usage, changes, error? } or { id }
         ,
     },
 };
@@ -146,6 +147,7 @@ pub const Tools = struct {
     agents_mutex: std.Io.Mutex = .init,
     agents_changed: std.Io.Condition = .init,
     agents_active: usize = 0,
+    agent_sessions: @import("tools/agent/sessions.zig").Registry = .{},
     background: @import("tools/background.zig").Background = .{},
     run_id: usize = 0,
     background_sink: ?struct { ctx: *anyopaque, emit: *const fn (*anyopaque, @import("session/events.zig").Background) anyerror!void } = null,

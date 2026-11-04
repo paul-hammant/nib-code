@@ -8,23 +8,50 @@ const JsonEvent = @import("../session/events.zig").JsonEvent;
 const process = @import("process.zig");
 const Progress = @import("../session/events.zig").Progress;
 
+const Args = struct { prompt: []const u8, @"resume": ?[]const u8 = null, timeout_ms: i64 = 1_800_000, model: ?[]const u8 = null, effort: ?[]const u8 = null, background: bool = false };
+
 pub fn agent(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolResult {
-    const a = std.json.parseFromSlice(struct { prompt: []const u8, timeout_ms: i64 = 1_800_000, model: ?[]const u8 = null, effort: ?[]const u8 = null, background: bool = false }, gpa, args, .{ .ignore_unknown_fields = true }) catch
-        return fail(gpa, "expected {{ prompt: string, timeout_ms?: number, model?: string, effort?: string, background?: boolean }}", .{});
+    const a = std.json.parseFromSlice(Args, gpa, args, .{ .ignore_unknown_fields = true }) catch
+        return fail(gpa, "expected {{ prompt: string, resume?: string, timeout_ms?: number, model?: string, effort?: string, background?: boolean }}", .{});
     defer a.deinit();
+    const raw = try std.json.parseFromSlice(std.json.Value, gpa, args, .{});
+    defer raw.deinit();
+    if (raw.value.object.get("resume")) |value| {
+        if (value != .string) return fail(gpa, "resume must be a string", .{});
+    }
     if (a.value.timeout_ms <= 0) return fail(gpa, "timeout_ms must be positive", .{});
     var cfg = t.cfg orelse return error.AgentConfigUnavailable;
     if (a.value.model) |model| cfg.model = model;
     if (a.value.effort) |effort| try cfg.setEffort(effort);
-    if (a.value.background)
-        return .{ .ok = try t.background.start(t, gpa, .agent, args, a.value.prompt) };
-    const id = try t.progress.add(gpa, t.io, .agent, a.value.prompt, t.run_id, false);
+    const id = if (a.value.@"resume") |requested| block: {
+        const reserved = t.agent_sessions.reserve(t.io, requested) catch |err| {
+            const out: Output = .{ .id = requested };
+            return out.result(gpa, 0, @errorName(err), null);
+        };
+        break :block reserved;
+    } else block: {
+        const allocated = try t.progress.add(gpa, t.io, .agent, a.value.prompt, t.run_id, a.value.background);
+        try t.agent_sessions.add(gpa, t.io, allocated, null, true);
+        break :block allocated;
+    };
+    var transferred = false;
+    errdefer if (!transferred) t.agent_sessions.release(t.io, id);
+    if (a.value.@"resume" != null)
+        try t.progress.restart(gpa, t.io, .{ .id = id, .prompt = a.value.prompt, .run = t.run_id, .background = a.value.background, .state = .queued });
+    if (a.value.background) {
+        const result = try t.background.startAgent(t, gpa, args, a.value.prompt, id);
+        transferred = true;
+        return .{ .ok = result };
+    }
     sandbox.tool_identity = .{ .id = id };
+    transferred = true;
     return execute(t, gpa, args, &t.cancel, id, t.run_id, false);
 }
 
 pub fn execute(t: *Tools, gpa: std.mem.Allocator, args: []const u8, cancel: *const std.atomic.Value(bool), id: []const u8, run_id: usize, background: bool) !sandbox.ToolResult {
-    const a = try std.json.parseFromSlice(struct { prompt: []const u8, timeout_ms: i64 = 1_800_000, model: ?[]const u8 = null, effort: ?[]const u8 = null }, gpa, args, .{ .ignore_unknown_fields = true });
+    defer if (!background) t.agent_sessions.release(t.io, id);
+    const session = t.agent_sessions.session(t.io, id);
+    const a = try std.json.parseFromSlice(Args, gpa, args, .{ .ignore_unknown_fields = true });
     defer a.deinit();
     var cfg = t.cfg orelse return error.AgentConfigUnavailable;
     if (a.value.model) |model| cfg.model = model;
@@ -32,7 +59,8 @@ pub fn execute(t: *Tools, gpa: std.mem.Allocator, args: []const u8, cancel: *con
     var tracker: Tracker = .{
         .t = t,
         .arena = .init(gpa),
-        .value = .{ .id = id, .run = run_id, .background = background, .prompt = a.value.prompt },
+        .value = .{ .id = id, .run = run_id, .invocation = t.progress.currentInvocation(t.io, id), .background = background, .prompt = a.value.prompt },
+        .output = .{ .id = id, .requested_session = session },
     };
     defer tracker.arena.deinit();
     defer t.addUsage(tracker.output.usage);
@@ -40,6 +68,10 @@ pub fn execute(t: *Tools, gpa: std.mem.Allocator, args: []const u8, cancel: *con
     defer {
         tracker.value.state = state;
         tracker.publish();
+    }
+    if (cancel.load(.acquire)) {
+        state = .canceled;
+        return error.Canceled;
     }
     t.agents_mutex.lockUncancelable(t.io);
     while (t.agents_active >= cfg.limits.agent_concurrency and !cancel.load(.acquire))
@@ -70,7 +102,7 @@ pub fn execute(t: *Tools, gpa: std.mem.Allocator, args: []const u8, cancel: *con
     defer gpa.free(input);
     const started = std.Io.Clock.awake.now(t.io);
     const result = process.run(gpa, t.io, .{
-        .spawn = .{ .argv = &.{ executable, "ask", "--json", "--agent-input", "-" }, .environ_map = &env, .stdout = .pipe, .stderr = .ignore },
+        .spawn = .{ .argv = if (session) |child| &.{ executable, "ask", "--json", "--agent-input", "--resume", child, "-" } else &.{ executable, "ask", "--json", "--agent-input", "-" }, .environ_map = &env, .stdout = .pipe, .stderr = .ignore },
         .input = input,
         .cancel = cancel,
         .timeout_ms = a.value.timeout_ms,
@@ -113,6 +145,8 @@ const Output = struct {
     usage: provider.Usage = .{},
     changes: std.ArrayList(Change) = .empty,
     child_id: ?[]const u8 = null,
+    requested_session: ?[]const u8 = null,
+    id: []const u8 = "",
     steps: ?u32 = null,
     ended: bool = false,
     failure: ?[]const u8 = null,
@@ -127,6 +161,9 @@ const Output = struct {
         if (obj.contains("start")) {
             if (out.child_id != null) return error.InvalidAgentOutput;
             const event = try std.json.parseFromValueLeaky(JsonEvent, temp, value, .{});
+            if (out.requested_session) |id| {
+                if (!std.mem.eql(u8, id, event.start.session_id)) return error.InvalidAgentOutput;
+            }
             out.child_id = try a.dupe(u8, event.start.session_id);
         }
         if (obj.get("delta")) |delta| {
@@ -174,13 +211,13 @@ const Output = struct {
     fn result(out: *const Output, gpa: std.mem.Allocator, elapsed_ms: i64, reason: ?[]const u8, timeout_ms: ?i64) !sandbox.ToolResult {
         if (reason) |message| {
             const detail = if (timeout_ms) |limit|
-                try std.fmt.allocPrint(gpa, "subagent stopped due to timeout after {d} ms (limit {d} ms); child session id: {s}. Files it changed may be incomplete; inspect them before continuing.", .{ elapsed_ms, limit, out.child_id orelse "unavailable (no start event)" })
+                try std.fmt.allocPrint(gpa, "subagent stopped due to timeout after {d} ms (limit {d} ms); task id: {s}. Files it changed may be incomplete; inspect them before continuing.", .{ elapsed_ms, limit, out.id })
             else
-                try std.fmt.allocPrint(gpa, "subagent: {s} after {d} ms; child session id: {s}. Files it changed may be incomplete; inspect them before continuing.", .{ message, elapsed_ms, out.child_id orelse "unavailable (no start event)" });
+                try std.fmt.allocPrint(gpa, "subagent: {s} after {d} ms; task id: {s}. Files it changed may be incomplete; inspect them before continuing.", .{ message, elapsed_ms, out.id });
             defer gpa.free(detail);
-            return .{ .ok = try std.json.Stringify.valueAlloc(gpa, .{ .ok = false, .@"error" = detail, .text = out.text.items, .usage = out.usage, .changes = out.changes.items }, .{}) };
+            return .{ .ok = try std.json.Stringify.valueAlloc(gpa, .{ .ok = false, .id = out.id, .@"error" = detail, .text = out.text.items, .usage = out.usage, .changes = out.changes.items }, .{}) };
         }
-        return .{ .ok = try std.json.Stringify.valueAlloc(gpa, .{ .ok = true, .text = out.text.items, .usage = out.usage, .changes = out.changes.items }, .{}) };
+        return .{ .ok = try std.json.Stringify.valueAlloc(gpa, .{ .ok = true, .id = out.id, .text = out.text.items, .usage = out.usage, .changes = out.changes.items }, .{}) };
     }
 };
 
@@ -205,9 +242,27 @@ const Tracker = struct {
     }
 
     fn capture(tr: *Tracker, bytes: []const u8) void {
+        const had_session = tr.output.child_id != null;
         tr.output.observe(tr.arena.child_allocator, tr.arena.allocator(), bytes) catch |err| {
             tr.output.failure = @errorName(err);
         };
+        if (!had_session) if (tr.output.child_id) |session| {
+            tr.bindSession(session) catch |err| {
+                tr.output.failure = @errorName(err);
+            };
+        };
+    }
+
+    fn bindSession(tr: *Tracker, session: []const u8) !void {
+        const t = tr.t;
+        const gpa = tr.arena.child_allocator;
+        if (t.agent_sessions.session(t.io, tr.value.id)) |known| {
+            if (!std.mem.eql(u8, known, session)) return error.AgentSessionMismatch;
+            return;
+        }
+        const log = t.background.log orelse return error.AgentLogUnavailable;
+        try log.agentSession(t.io, gpa, .{ .id = tr.value.id, .session = session });
+        try t.agent_sessions.bind(gpa, t.io, tr.value.id, session);
     }
 
     fn observe(tr: *Tracker, bytes: []const u8) !void {
@@ -279,6 +334,7 @@ test "child progress counts Steps rather than Runs and ignores compaction snapsh
     const testing = std.testing;
     var t: Tools = .{ .io = testing.io, .home = "/unused" };
     defer t.progress.deinit(testing.allocator);
+    defer t.agent_sessions.deinit(testing.allocator);
     var tr: Tracker = .{
         .t = &t,
         .arena = .init(testing.allocator),
@@ -318,16 +374,24 @@ test "agent output retains only returned data and terminal text overrides deltas
     const testing = std.testing;
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    var out: Output = .{};
+    var out: Output = .{ .id = "a1" };
     for (0..500) |_| try out.observe(testing.allocator, arena.allocator(), "{\"delta\":{\"kind\":\"reasoning\",\"text\":\"ignored reasoning\"}}");
     try testing.expectEqual(@as(usize, 0), arena.queryCapacity());
     try out.observe(testing.allocator, arena.allocator(), "{\"delta\":{\"kind\":\"text\",\"text\":\"partial\"}}");
     try testing.expectEqualStrings("partial", out.text.items);
     try out.observe(testing.allocator, arena.allocator(), "{\"run_end\":{\"changes\":[{\"path\":\"a\",\"added\":2,\"removed\":1,\"created\":true,\"diff\":\"not retained\"}]}}");
     try testing.expectEqualStrings("a", out.changes.items[0].path);
+    try out.observe(testing.allocator, arena.allocator(), "{\"start\":{\"session_id\":\"0123456789abcdef0123456789abcdef\"}}");
     try out.observe(testing.allocator, arena.allocator(), "{\"end\":{\"text\":\"final\",\"usage\":{\"prompt_tokens\":10},\"steps\":2}}");
     try testing.expectEqualStrings("final", out.text.items);
     try testing.expectEqual(@as(u64, 10), out.usage.prompt_tokens);
+    const result = try out.result(testing.allocator, 1, null, null);
+    defer tools.freeResult(result);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, result.ok, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.object.get("ok").?.bool);
+    try testing.expectEqualStrings("a1", parsed.value.object.get("id").?.string);
+    try testing.expect(!parsed.value.object.contains("session"));
 }
 
 test "agent failure without output is data and queued user cancellation rejects" {
@@ -341,9 +405,10 @@ test "agent failure without output is data and queued user cancellation rejects"
     const obj = parsed.value.object;
     try testing.expect(!obj.get("ok").?.bool);
     try testing.expectEqualStrings("", obj.get("text").?.string);
-    try testing.expect(std.mem.indexOf(u8, obj.get("error").?.string, "unavailable (no start event)") != null);
+    try testing.expect(!obj.contains("session"));
     var t: Tools = .{ .io = testing.io, .home = "/unused", .cfg = .{ .model = "m", .base_url = "", .api_key = "" }, .agents_active = 4 };
     defer t.progress.deinit(testing.allocator);
+    defer t.agent_sessions.deinit(testing.allocator);
     t.cancel.store(true, .release);
     try testing.expectError(error.Canceled, agent(&t, testing.allocator, "{\"prompt\":\"cancelled\"}"));
     try testing.expectEqual(@as(usize, 4), t.agents_active);
@@ -353,6 +418,7 @@ test "foreground agent records its ID even when startup fails and continues acro
     const testing = std.testing;
     var t: Tools = .{ .io = testing.io, .home = "/unused", .cfg = .{ .model = "m", .base_url = "", .api_key = "" } };
     defer t.progress.deinit(testing.allocator);
+    defer t.agent_sessions.deinit(testing.allocator);
     var timing: sandbox.RunTiming = .init(testing.io, .now(testing.io, .awake));
     var host = t.host();
     host.timing = &timing;
@@ -368,4 +434,29 @@ test "foreground agent records its ID even when startup fails and continues acro
     try testing.expectEqualStrings("a2", timing.entries[1].id.?);
     try testing.expectEqual(@as(?bool, false), timing.entries[0].background);
     try testing.expectEqual(@as(u64, 1), t.progress.next_bash_id);
+}
+
+test "execute publishes the reserved invocation on foreground and background cancellation" {
+    const testing = std.testing;
+    var t: Tools = .{ .io = testing.io, .home = "/unused", .run_id = 1, .cfg = .{ .model = "m", .base_url = "", .api_key = "" } };
+    defer t.progress.deinit(testing.allocator);
+    defer t.agent_sessions.deinit(testing.allocator);
+    const id = try t.progress.add(testing.allocator, t.io, .agent, "first", 1, false);
+    try t.agent_sessions.add(testing.allocator, t.io, id, "child-session", true);
+    const first = t.progress.currentInvocation(t.io, id);
+    t.cancel.store(true, .release);
+    try testing.expectError(error.Canceled, execute(&t, testing.allocator, "{\"prompt\":\"first\"}", &t.cancel, id, 1, false));
+    try t.progress.restart(testing.allocator, t.io, .{ .id = id, .run = 1, .prompt = "second", .background = true, .state = .queued });
+    _ = try t.agent_sessions.reserve(t.io, id);
+    defer t.agent_sessions.release(t.io, id);
+    const second = t.progress.currentInvocation(t.io, id);
+    try testing.expect(second > first);
+    try testing.expectError(error.Canceled, execute(&t, testing.allocator, "{\"prompt\":\"second\",\"resume\":\"a1\",\"background\":true}", &t.cancel, id, 1, true));
+    try testing.expectEqual(@as(usize, 2), t.progress.slots.items.len);
+    for (t.progress.slots.items, [_]usize{ first, second }, [_]bool{ false, true }) |slot, invocation, background| {
+        try testing.expectEqualStrings("a1", slot.value.id);
+        try testing.expectEqual(invocation, slot.value.invocation);
+        try testing.expectEqual(background, slot.value.background);
+        try testing.expectEqual(.canceled, slot.value.state);
+    }
 }

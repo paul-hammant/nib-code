@@ -258,6 +258,8 @@ class BackgroundTests:
         heading, encoded = content(completions[0]).split("\n", 1)
         self.assertEqual(heading, "[background agent a1 finished]")
         result = json.loads(encoded)
+        self.assertEqual(result["id"], "a1")
+        self.assertNotIn("session", result)
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["changes"], [
             {"path": "shared.txt", "added": 1, "removed": 1, "created": False},
@@ -291,7 +293,9 @@ class BackgroundTests:
             result = json.loads(encoded)
             self.assertTrue(result["ok"], result)
             self.assertEqual(result["changes"], [])
-            self.assertEqual(set(result), {"ok", "text", "changes"})
+            self.assertEqual(set(result), {"id", "ok", "text", "changes"})
+            self.assertEqual(result["id"], f"a{i}")
+            self.assertNotIn("session", result)
             self.assertNotIn("source", message)
             self.assertNotIn("background_id", message)
         progress = [e["background"] for e in events if "background" in e]
@@ -416,7 +420,9 @@ class BackgroundTests:
         result = json.loads(content(completion).split("\n", 1)[1])
         self.assertFalse(result["ok"], result)
         self.assertTrue(result["error"])
-        self.assertEqual(set(result), {"ok", "text", "changes", "error"})
+        self.assertEqual(set(result), {"id", "ok", "text", "changes", "error"})
+        self.assertEqual(result["id"], "a1")
+        self.assertNotIn("session", result)
         self.assertFalse([e["background"] for e in events if e.get("background", {}).get("kind") == "agent" and e.get("background", {}).get("state") == "finished"][0]["ok"])
         self.assert_accounting(mock, events)
 
@@ -436,6 +442,8 @@ class BackgroundTests:
         self.finish(process)
         result = json.loads(content(self.completions(mock.observed("initial")[-1]["messages"])[0]).split("\n", 1)[1])
         self.assertFalse(result["ok"], result)
+        self.assertEqual(result["id"], "a1")
+        self.assertNotIn("session", result)
         self.assertRegex(result["error"].lower(), "timeout|timed.out")
         self.assert_stopped(pids)
 
@@ -469,6 +477,8 @@ class BackgroundTests:
         self.assertEqual((completions[0]["source"], completions[0]["background_id"]), ("background", "a1"))
         result = json.loads(content(completions[0]).split("\n", 1)[1])
         self.assertTrue(result["ok"], result)
+        self.assertEqual(result["id"], "a1")
+        self.assertNotIn("session", result)
         self.assertEqual(result["text"], "worker finished")
         finished = [e["background"] for e in events if e.get("background", {}).get("state") == "finished"]
         self.assertEqual([(e["id"], e["ok"]) for e in finished], [("a1", True)])

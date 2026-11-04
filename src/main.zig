@@ -177,6 +177,8 @@ fn onSignal(signal: std.posix.SIG) callconv(.c) void {
 
 fn errorMessage(err: anyerror) []const u8 {
     return switch (err) {
+        error.AgentSessionParentMismatch => "Cannot continue a session that is not a child of this parent session.",
+        error.SessionBusy => "Session is busy in another process; wait for its current task to finish.",
         error.InvalidSessionId => "Session ID must be exactly 32 lowercase hexadecimal characters.",
         error.InvalidReplayArguments => "Use nib replay <session-id> --run <step>:<run> [--script <file>] [--json], or nib replay <session-id> --all [--json].",
         error.ReplayMetadataNotFound => "No replay recording found for this Run; recording must be enabled when the original Run executes.",

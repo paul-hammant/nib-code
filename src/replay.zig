@@ -127,6 +127,7 @@ fn loadMain(a: Allocator, data: []const u8) ![]Run {
         }
         if (torn) return error.InvalidReplayLog;
         if (record.object.get("diagnostic")) |d| if (d != .null) continue;
+        if (record.object.get("agent_session")) |mapping| if (mapping != .null) continue;
         const messages: []const Value = if (record.object.get("messages")) |v| try array(v) else &.{};
         const from = if (record.object.get("from")) |v| try natural(v) else 0;
         if (from > length) return error.InvalidReplayLog;
@@ -381,6 +382,7 @@ test "raw main records count global assistant Steps across turns and compaction"
     defer arena.deinit();
     const data = "{\"messages\":[{\"role\":\"system\",\"content\":\"s\"},{\"role\":\"user\",\"content\":\"one\"}]}\n" ++
         "{\"from\":2,\"turn_step\":1,\"messages\":[{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"a\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"code\\\":\\\"first\\\"}\"}},{\"id\":\"x\",\"function\":{\"name\":\"other\",\"arguments\":\"{\\\"code\\\":\\\"ignored\\\"}\"}},{\"id\":\"b\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"code\\\":\\\"second\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"a\",\"content\":\"one\"},{\"role\":\"tool\",\"tool_call_id\":\"x\",\"content\":\"unknown\"},{\"role\":\"tool\",\"tool_call_id\":\"b\",\"content\":\"two\"}]}\n" ++
+        "{\"agent_session\":{\"id\":\"a1\",\"session\":\"0123456789abcdef0123456789abcdef\"}}\n" ++
         "{\"from\":6,\"turn_step\":2,\"messages\":[{\"role\":\"assistant\",\"content\":\"done\"}]}\n" ++
         "{\"from\":7,\"turn_step\":1,\"messages\":[{\"role\":\"user\",\"content\":\"two\"},{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"c\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"code\\\":\\\"third\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"c\",\"content\":\"three\"}]}\n" ++
         "{\"from\":1,\"messages\":[{\"role\":\"user\",\"content\":\"summary\"},{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"c\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"code\\\":\\\"third\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"c\",\"content\":\"three\"}]}\n" ++

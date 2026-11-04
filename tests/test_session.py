@@ -30,7 +30,7 @@ def replay(path):
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if record.get("repair"):
+        if record.get("repair") or record.get("agent_session"):
             continue
         messages = [dict(message) for message in record["messages"]]
         for message in messages:
@@ -389,6 +389,8 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
             assert "async agent({" not in request["messages"][0]["content"]
         run_output = next(e["run_end"]["output"] for e in delegated if "run_end" in e)
         returned = json.loads(run_output.removeprefix("result: "))
+        assert {child["id"] for child in returned} == {"a1", "a2"}, returned
+        assert all("session" not in child for child in returned), returned
         for child in returned:
             result = json.loads(child["text"].split("result: ", 1)[1])
             assert result["agent"] == "undefined" and "agent" not in result["keys"]
@@ -415,6 +417,7 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         failed_result = json.loads(failed_run["output"].removeprefix("result: "))
         assert isinstance(failed_result, dict), failed_result
         assert failed_result["ok"] is False and "HTTP 400" in failed_result["error"], failed_result
+        assert failed_result["id"] == "a1" and "session" not in failed_result, failed_result
         failed_child = failed_events[-1]["end"]
         assert "HTTP 400" in failed_child["text"]
         assert failed_child["usage"] == {"prompt_tokens": 9900, "completion_tokens": 50, "prompt_cache_hit_tokens": 256}
@@ -476,6 +479,8 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         assert final["usage"] == dict(prompt_tokens=33000, completion_tokens=170, prompt_cache_hit_tokens=832), final
         output = json.loads(next(e["run_end"]["output"] for e in seen if "run_end" in e).removeprefix("result: "))
         assert len(output) == 2
+        assert {child["id"] for child in output} == {p["id"] for _, p in updates}, (output, updates)
+        assert all("session" not in child for child in output), output
         for child in output:
             assert child["usage"] == dict(prompt_tokens=13200, completion_tokens=70, prompt_cache_hit_tokens=320), child
             assert "exit_code" in child["text"]
@@ -488,16 +493,21 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         assert timeout_run["ok"], timeout_run
         timeout_result = json.loads(timeout_run["output"].removeprefix("result: "))
         assert timeout_result["ok"] is False, timeout_result
-        assert set(timeout_result) == {"ok", "error", "text", "usage", "changes"}, timeout_result
+        assert set(timeout_result) == {"id", "ok", "error", "text", "usage", "changes"}, timeout_result
+        assert timeout_result["id"] == "a1", timeout_result
         timeout_message = timeout_result["error"]
-        match = re.search(r"stopped due to timeout after (\d+) ms \(limit 1600 ms\); child session id: ([0-9a-f]{32})", timeout_message)
+        match = re.search(r"stopped due to timeout after (\d+) ms \(limit 1600 ms\)", timeout_message)
         assert match and 1600 <= int(match[1]) < 4500, timeout_message
         assert "Files it changed may be incomplete; inspect them" in timeout_message, timeout_message
         assert partial_path.read_bytes() == b"partial"
         timed_pid = int(Path(str(partial_path) + ".pid").read_text())
         status = Path(f"/proc/{timed_pid}/stat")
         assert not status.exists() or status.read_text().split()[2] == "Z", status.read_text()
-        child_log = tmp / "nib/sessions" / f"{match[2]}.jsonl"
+        timeout_parent = timeout_events[0]["start"]["session_id"]
+        timeout_children = [p for p in (tmp / "nib/sessions").glob("[0-9a-f]" * 32 + ".jsonl")
+                            if replay(p)[1][0].get("parent_session_id") == timeout_parent]
+        assert len(timeout_children) == 1, timeout_children
+        child_log = timeout_children[0]
         child_history, _ = replay(child_log)
         assert child_history[-1]["content"].endswith("[interrupted: process terminated]"), child_history[-1]
         assert timeout_events[-1]["end"]["usage"]["prompt_tokens"] == 9900, timeout_events[-1]
@@ -508,7 +518,7 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         forced_result = json.loads(forced_run["output"].removeprefix("result: "))
         assert forced_result["ok"] is False, forced_result
         forced_message = forced_result["error"]
-        assert re.search(r"child session id: [0-9a-f]{32}", forced_message), forced_message
+        assert forced_result["id"] == "a1" and "session" not in forced_result, forced_result
         assert "stopped due to timeout" in forced_message and "may be incomplete" in forced_message, forced_message
         assert forced_timeout[-1]["end"]["usage"]["prompt_tokens"] == 9900, forced_timeout[-1]
         print("Subagent timeout E2E passed: explicit limit, elapsed time/id, incomplete-file warning, process cleanup and usage after forced termination")

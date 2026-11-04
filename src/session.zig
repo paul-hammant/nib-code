@@ -155,6 +155,7 @@ pub const Session = struct {
         };
         errdefer s.arena.deinit();
         errdefer s.history.deinit(gpa);
+        errdefer s.tools.agent_sessions.deinit(gpa);
         const a = s.arena.allocator();
         const cwd = try std.process.currentPathAlloc(io, a);
         const directory = try std.fs.path.join(a, &.{ options.home, "sessions" });
@@ -165,7 +166,7 @@ pub const Session = struct {
                 break :blk try std.fmt.allocPrint(a, "{s}/{s}.jsonl", .{ directory, id });
             } else try session_log.latest(io, a, directory, cwd);
             s.id = try a.dupe(u8, std.fs.path.stem(path));
-            s.log = try session_log.Log.restore(io, gpa, a, path, &s.history, &s.context_tokens);
+            s.log = try session_log.Log.restore(io, gpa, a, path, &s.history, &s.context_tokens, options.parent_session_id);
             errdefer s.log.close(io);
             try cfg.checkSession(s.log.provider, s.log.model);
             s.parent_session_id = s.log.parent_session_id;
@@ -194,10 +195,14 @@ pub const Session = struct {
                 .patches_off = try disabledPatches(a, options.environ),
             });
         }
+        errdefer s.log.close(io);
         const recording = if (options.environ) |env| !std.mem.eql(u8, env.get("NIB_RECORD") orelse "", "off") else true;
         const calls_path = try std.fmt.allocPrint(a, "{s}/{s}.calls.jsonl", .{ directory, s.id });
         s.recorder = sandbox.Recorder.init(gpa, io, calls_path, recording);
+        errdefer if (s.recorder) |*recorder| recorder.deinit();
         s.tools.session_id = s.id;
+        for (s.log.agent_sessions) |entry|
+            try s.tools.agent_sessions.add(gpa, io, entry.id, entry.session, false);
         s.tools.progress.next_agent_id = s.log.next_agent_id;
         s.tools.progress.next_bash_id = s.log.next_bash_id;
         for (s.log.lost_background) |lost| {
@@ -223,6 +228,7 @@ pub const Session = struct {
     pub fn deinit(s: *Session) void {
         s.tools.background.stop(s.gpa);
         s.tools.progress.deinit(s.gpa);
+        s.tools.agent_sessions.deinit(s.gpa);
         s.inbox.batch.deinit(s.gpa);
         s.tools.discardChanges(s.gpa);
         s.tools.file_state.deinit(s.gpa);
@@ -1074,4 +1080,32 @@ test "execute emits per-Run actual tool summaries including empty and overflow" 
     }
     try t.expectEqual(@as(usize, 3), observed.starts);
     try t.expectEqual(@as(usize, 3), observed.ends);
+}
+
+test "allocation failures while restoring agent mappings release the session log lock" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(t.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer t.allocator.free(root);
+    const id = "0123456789abcdef0123456789abcdef";
+    const path = try std.fmt.allocPrint(t.allocator, "{s}/sessions/{s}.jsonl", .{ root, id });
+    defer t.allocator.free(path);
+    try tmp.dir.createDir(t.io, "sessions", .default_dir);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "sessions/" ++ id ++ ".jsonl", .data = "{\"messages\":[{\"role\":\"system\",\"content\":\"original system\"}]}\n{\"agent_session\":{\"id\":\"a1\",\"session\":\"child\"}}\n" });
+    var client: std.http.Client = .{ .allocator = t.allocator, .io = t.io };
+    defer client.deinit();
+    const Check = struct {
+        fn run(gpa: std.mem.Allocator, home: []const u8, log_path: []const u8, http: *std.http.Client) !void {
+            const cfg: provider.Config = .{ .base_url = "invalid://local", .api_key = "mock", .model = "mock" };
+            var session = Session.init(gpa, std.testing.io, http, cfg, .{ .home = home, .user_home = home, .resume_id = id }) catch |err| {
+                const file = try std.Io.Dir.cwd().openFile(std.testing.io, log_path, .{ .mode = .read_write, .lock = .exclusive, .lock_nonblocking = true });
+                file.close(std.testing.io);
+                return err;
+            };
+            defer session.deinit();
+            try std.testing.expectEqual(@as(usize, 1), session.tools.agent_sessions.entries.items.len);
+        }
+    };
+    try t.checkAllAllocationFailures(t.allocator, Check.run, .{ root, path, &client });
 }

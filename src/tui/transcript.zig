@@ -28,6 +28,7 @@ pub const Entry = struct {
     /// For `.run`: see `ChangeText`.
     changes: ChangeText = .{},
     agents: std.ArrayList(Progress) = .empty,
+    invocations: std.ArrayList(Invocation) = .empty,
     run_number: usize = 0,
     tool_summary: ?ToolSummary = null,
     task_id: ?[]const u8 = null,
@@ -42,6 +43,14 @@ pub const Entry = struct {
     open: bool = false,
     cached: ?struct { width: u16, len: usize, open: bool, rows: u16 } = null,
 
+    const Invocation = struct {
+        id: []const u8,
+        kind: BackgroundKind,
+        invocation: usize,
+        background: bool,
+        result: ?bool = null,
+    };
+
     pub fn deinit(e: *Entry, gpa: std.mem.Allocator) void {
         if (e.task_id) |id| gpa.free(id);
         if (e.step_effort) |effort| gpa.free(effort.effort);
@@ -52,6 +61,8 @@ pub const Entry = struct {
         e.changes.deinit(gpa);
         for (e.agents.items) |*p| p.deinit(gpa);
         e.agents.deinit(gpa);
+        for (e.invocations.items) |call| gpa.free(call.id);
+        e.invocations.deinit(gpa);
         e.agent_tree.deinit(gpa);
     }
 
@@ -253,6 +264,9 @@ pub const Transcript = struct {
     /// ctrl+o state; streamed collapsible entries start in it.
     expanded: bool = false,
     next_run: usize = 0,
+    pending_results: std.ArrayList(PendingResult) = .empty,
+
+    const PendingResult = struct { id: []const u8, kind: BackgroundKind, ok: bool };
 
     pub fn deinit(t: *Transcript, gpa: std.mem.Allocator) void {
         t.clear(gpa);
@@ -263,6 +277,9 @@ pub const Transcript = struct {
         for (t.entries.items) |*e| e.deinit(gpa);
         t.entries.clearRetainingCapacity();
         t.next_run = 0;
+        t.clearPendingResults(gpa, 0);
+        t.pending_results.deinit(gpa);
+        t.pending_results = .empty;
     }
 
     pub fn add(t: *Transcript, gpa: std.mem.Allocator, kind: Kind, text: []const u8) !void {
@@ -274,7 +291,7 @@ pub const Transcript = struct {
     }
 
     pub fn backgroundResult(t: *Transcript, gpa: std.mem.Allocator, kind: BackgroundKind, id: []const u8, ok: bool, result: []const u8) !void {
-        try t.settleBackgroundProgress(gpa, id, ok);
+        try t.settleBackgroundProgress(gpa, kind, id, ok);
         var e: Entry = .{ .kind = .background, .run = if (ok) .ok else .failed, .open = t.expanded };
         errdefer e.deinit(gpa);
         e.task_id = try gpa.dupe(u8, id);
@@ -305,7 +322,7 @@ pub const Transcript = struct {
     }
 
     pub fn lostBackground(t: *Transcript, gpa: std.mem.Allocator, kind: BackgroundKind, id: []const u8, result: []const u8) !void {
-        try t.settleBackgroundProgress(gpa, id, false);
+        try t.settleBackgroundProgress(gpa, kind, id, false);
         var e: Entry = .{ .kind = .background, .run = .failed, .open = t.expanded };
         errdefer e.deinit(gpa);
         e.task_id = try gpa.dupe(u8, id);
@@ -314,22 +331,38 @@ pub const Transcript = struct {
         try t.entries.append(gpa, e);
     }
 
-    fn settleBackgroundProgress(t: *Transcript, gpa: std.mem.Allocator, id: []const u8, ok: bool) !void {
+    fn settleBackgroundProgress(t: *Transcript, gpa: std.mem.Allocator, kind: BackgroundKind, id: []const u8, ok: bool) !void {
+        // Results have only task IDs; registration order is the delivery FIFO.
         for (t.entries.items) |*e| {
             if (e.kind != .run) continue;
-            for (e.agents.items) |*p| {
-                if (!std.mem.eql(u8, p.id, id)) continue;
-                settleProgress(p, ok);
+            for (e.invocations.items) |*call| {
+                if (!call.background or call.result != null or call.kind != kind or !std.mem.eql(u8, call.id, id)) continue;
+                call.result = ok;
+                for (e.agents.items) |*p| {
+                    if (p.invocation == call.invocation and std.mem.eql(u8, p.id, id)) settleProgress(p, ok);
+                }
                 try e.refreshAgents(gpa);
                 try e.refreshLabel(gpa);
                 e.cached = null;
+                return;
             }
         }
+        const copy = try gpa.dupe(u8, id);
+        errdefer gpa.free(copy);
+        try t.pending_results.append(gpa, .{ .id = copy, .kind = kind, .ok = ok });
+    }
+
+    fn clearPendingResults(t: *Transcript, gpa: std.mem.Allocator, from: usize) void {
+        for (t.pending_results.items[from..]) |result| gpa.free(result.id);
+        t.pending_results.shrinkRetainingCapacity(from);
     }
 
     pub fn clearBackgroundProgress(t: *Transcript, gpa: std.mem.Allocator) !void {
         for (t.entries.items) |*e| {
             if (e.kind != .run) continue;
+            for (e.invocations.items) |*call| {
+                if (call.result == null) call.background = false;
+            }
             var changed = false;
             var i: usize = 0;
             while (i < e.agents.items.len) {
@@ -408,9 +441,9 @@ pub const Transcript = struct {
     pub fn progress(t: *Transcript, gpa: std.mem.Allocator, p: Progress) !void {
         const e = target: {
             for (t.entries.items) |*entry| {
-                if (entry.kind != .run) continue;
-                for (entry.agents.items) |current| {
-                    if (std.mem.eql(u8, current.id, p.id)) break :target entry;
+                if (entry.kind != .run or (p.run != 0 and entry.run_number != p.run)) continue;
+                for (entry.invocations.items) |call| {
+                    if (call.invocation == p.invocation and std.mem.eql(u8, call.id, p.id)) break :target entry;
                 }
             }
             if (p.run != 0) {
@@ -424,17 +457,30 @@ pub const Transcript = struct {
             }
             break :target t.lastRunning() orelse return;
         };
+        const call = registered: {
+            for (e.invocations.items) |*call| {
+                if (call.invocation == p.invocation and std.mem.eql(u8, call.id, p.id)) break :registered call;
+            }
+            const id = try gpa.dupe(u8, p.id);
+            errdefer gpa.free(id);
+            try e.invocations.append(gpa, .{ .id = id, .kind = p.kind, .invocation = p.invocation, .background = p.background });
+            break :registered &e.invocations.items[e.invocations.items.len - 1];
+        };
+        if (call.background and call.result == null) {
+            for (t.pending_results.items, 0..) |result, i| {
+                if (result.kind != p.kind or !std.mem.eql(u8, result.id, p.id)) continue;
+                call.result = result.ok;
+                gpa.free(t.pending_results.orderedRemove(i).id);
+                break;
+            }
+        }
+        for (e.agents.items) |current| {
+            if (std.mem.eql(u8, current.id, p.id) and current.invocation > p.invocation) return;
+        }
         var copy = try p.clone(gpa);
         var transferred = false;
         errdefer if (!transferred) copy.deinit(gpa);
-        for (t.entries.items) |entry| {
-            if (entry.task_id) |id| {
-                if (std.mem.eql(u8, id, p.id)) {
-                    settleProgress(&copy, entry.run == .ok);
-                    break;
-                }
-            }
-        }
+        if (call.result) |ok| settleProgress(&copy, ok);
         for (e.agents.items) |*current| {
             if (!std.mem.eql(u8, current.id, p.id)) continue;
             current.deinit(gpa);
@@ -470,6 +516,8 @@ pub const Transcript = struct {
     }
 
     pub fn addHistory(t: *Transcript, gpa: std.mem.Allocator, history: []const provider.Message) !void {
+        const pending_start = t.pending_results.items.len;
+        defer t.clearPendingResults(gpa, pending_start);
         var runs: std.StringHashMap(usize) = .init(gpa);
         defer runs.deinit();
         for (history) |m| {
@@ -1377,4 +1425,179 @@ test "background failures without output preview the error and keep complete JSO
     try t.backgroundResult(gpa, .bash, "b1", false, result);
     try testing.expectEqualStrings("b1 bash · failed · timed out after 4000 ms", t.entries.items[0].label.items);
     try testing.expectEqualStrings(result, t.entries.items[0].text.items);
+}
+
+test "foreground agent reuse creates a new Run row and late progress stays in the old tree" {
+    const gpa = testing.allocator;
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    try t.startRun(gpa, "tools.agent({})");
+    try t.progress(gpa, .{ .id = "a1", .run = 1, .prompt = "first", .state = .done, .step = 2 });
+    try t.endRun(gpa, true, "done", 100, .{});
+    try t.startRun(gpa, "tools.agent({resume:'a1'})");
+    try t.progress(gpa, .{ .id = "a1", .run = 2, .prompt = "resume", .step = 1 });
+    try testing.expectEqual(@as(usize, 1), t.entries.items[0].agents.items.len);
+    try testing.expectEqual(@as(usize, 1), t.entries.items[1].agents.items.len);
+    try testing.expectEqualStrings("  └─ a1 first · done · step 2", t.entries.items[0].agent_tree.rows.items[0].text);
+    try testing.expectEqualStrings("  └─ a1 resume · working · step 1", t.entries.items[1].agent_tree.rows.items[0].text);
+    try t.progress(gpa, .{ .id = "a1", .run = 1, .prompt = "first", .state = .done, .step = 3 });
+    try testing.expectEqualStrings("  └─ a1 first · done · step 3", t.entries.items[0].agent_tree.rows.items[0].text);
+    try testing.expectEqualStrings("  └─ a1 resume · working · step 1", t.entries.items[1].agent_tree.rows.items[0].text);
+    try t.progress(gpa, .{ .id = "a1", .run = 2, .prompt = "resume", .state = .done, .step = 4 });
+    try testing.expectEqualStrings("  └─ a1 resume · done · step 4", t.entries.items[1].agent_tree.rows.items[0].text);
+}
+
+test "delivered background agent results do not settle foreground or background reuse" {
+    const gpa = testing.allocator;
+    for ([_]bool{ false, true }) |background| {
+        var t: Transcript = .{};
+        defer t.deinit(gpa);
+        try t.startRun(gpa, "tools.agent({background:true})");
+        try t.progress(gpa, .{ .id = "a1", .run = 1, .prompt = "first", .background = true, .state = .done, .step = 2 });
+        try t.endRun(gpa, true, "started", 100, .{});
+        try t.backgroundResult(gpa, .agent, "a1", false, "{}");
+        try t.startRun(gpa, "tools.agent({resume:'a1'})");
+        try t.progress(gpa, .{ .id = "a1", .run = 2, .prompt = "resume", .background = background, .step = 1 });
+        try testing.expectEqualStrings("  └─ a1 first · failed · step 2", t.entries.items[0].agent_tree.rows.items[0].text);
+        try testing.expectEqual(@as(usize, 1), t.entries.items[2].agents.items.len);
+        try testing.expectEqual(.working, t.entries.items[2].agents.items[0].state);
+        try testing.expectEqual(background, t.entries.items[2].agents.items[0].background);
+        try t.progress(gpa, .{ .id = "a1", .run = 1, .prompt = "first", .background = true, .state = .done, .step = 3 });
+        try testing.expectEqualStrings("  └─ a1 first · failed · step 3", t.entries.items[0].agent_tree.rows.items[0].text);
+        try testing.expect(!t.entries.items[0].agents.items[0].background);
+        try testing.expectEqual(@as(u32, 1), t.entries.items[2].agents.items[0].step);
+        try testing.expectEqual(.working, t.entries.items[2].agents.items[0].state);
+        if (background) {
+            try t.backgroundResult(gpa, .agent, "a1", true, "{}");
+            try t.progress(gpa, .{ .id = "a1", .run = 2, .prompt = "resume", .background = true, .step = 4 });
+            try testing.expectEqualStrings("  └─ a1 resume · done · step 4", t.entries.items[2].agent_tree.rows.items[0].text);
+            try testing.expect(!t.entries.items[2].agents.items[0].background);
+            try testing.expectEqualStrings("  └─ a1 first · failed · step 3", t.entries.items[0].agent_tree.rows.items[0].text);
+        }
+    }
+}
+
+test "delayed background results settle only the oldest undelivered invocation of a reused ID" {
+    const gpa = testing.allocator;
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    try t.startRun(gpa, "tools.agent({background:true})");
+    try t.progress(gpa, .{ .id = "a1", .run = 1, .prompt = "first", .background = true, .state = .done, .step = 2 });
+    try t.endRun(gpa, true, "started", 100, .{});
+    try t.startRun(gpa, "tools.agent({resume:'a1',background:true})");
+    try t.progress(gpa, .{ .id = "a1", .run = 2, .prompt = "resume", .background = true, .step = 1 });
+    try t.endRun(gpa, true, "started", 100, .{});
+    try t.backgroundResult(gpa, .agent, "a1", false, "{}");
+    try testing.expect(!t.entries.items[0].agents.items[0].background);
+    try testing.expect(t.entries.items[1].agents.items[0].background);
+    try testing.expectEqual(.working, t.entries.items[1].agents.items[0].state);
+    try t.progress(gpa, .{ .id = "a1", .run = 1, .prompt = "first", .background = true, .state = .done, .step = 3 });
+    try testing.expectEqualStrings("  └─ a1 first · failed · step 3", t.entries.items[0].agent_tree.rows.items[0].text);
+    try testing.expectEqualStrings("  └─ a1 resume · background · step 1", t.entries.items[1].agent_tree.rows.items[0].text);
+    try t.backgroundResult(gpa, .agent, "a1", true, "{}");
+    try testing.expectEqualStrings("  └─ a1 resume · done · step 1", t.entries.items[1].agent_tree.rows.items[0].text);
+    try testing.expectEqualStrings("  └─ a1 first · failed · step 3", t.entries.items[0].agent_tree.rows.items[0].text);
+    try t.progress(gpa, .{ .id = "a1", .run = 2, .prompt = "resume", .background = true, .state = .done, .step = 5 });
+    try testing.expectEqualStrings("  └─ a1 resume · done · step 5", t.entries.items[1].agent_tree.rows.items[0].text);
+}
+
+test "restored background results cannot settle a reused ID in a new Run" {
+    const gpa = testing.allocator;
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    try t.addHistory(gpa, &.{.{ .role = "user", .source = .background, .background_kind = .agent, .background_id = "a1", .content = "[background agent a1 finished]\n{\"ok\":true}" }});
+    try t.startRun(gpa, "tools.agent({resume:'a1',background:true})");
+    try t.progress(gpa, .{ .id = "a1", .run = 1, .prompt = "resume", .background = true });
+    try testing.expect(t.entries.items[1].agents.items[0].background);
+    try testing.expectEqual(.working, t.entries.items[1].agents.items[0].state);
+    try testing.expectEqualStrings("  └─ a1 resume · background · step 0", t.entries.items[1].agent_tree.rows.items[0].text);
+}
+
+test "same Run foreground and background reuse keep invocation results separate from the latest row" {
+    const gpa = testing.allocator;
+    for ([_]bool{ false, true }) |first_background| {
+        for ([_]bool{ false, true }) |second_background| {
+            var t: Transcript = .{};
+            defer t.deinit(gpa);
+            try t.startRun(gpa, "reuse a1");
+            try t.progress(gpa, .{ .id = "a1", .invocation = 1, .run = 1, .prompt = "first", .background = first_background, .state = .done, .step = 8 });
+            try t.progress(gpa, .{ .id = "a1", .invocation = 2, .run = 1, .prompt = "second", .background = second_background, .step = 1 });
+            if (first_background) try t.backgroundResult(gpa, .agent, "a1", false, "{}");
+            try testing.expectEqual(@as(usize, 2), t.entries.items[0].invocations.items.len);
+            try testing.expectEqual(@as(usize, 1), t.entries.items[0].agents.items.len);
+            try testing.expectEqual(.working, t.entries.items[0].agents.items[0].state);
+            try testing.expectEqual(second_background, t.entries.items[0].agents.items[0].background);
+            try t.progress(gpa, .{ .id = "a1", .invocation = 1, .run = 1, .prompt = "late first", .background = first_background, .state = .failed, .step = 9 });
+            try testing.expectEqualStrings("second", t.entries.items[0].agents.items[0].prompt);
+            if (second_background) try t.backgroundResult(gpa, .agent, "a1", true, "{}");
+            try t.progress(gpa, .{ .id = "a1", .invocation = 2, .run = 1, .prompt = "second", .background = second_background, .state = .done, .step = 2 });
+            try testing.expectEqualStrings("  └─ a1 second · done · step 2", t.entries.items[0].agent_tree.rows.items[0].text);
+            try testing.expect(!t.entries.items[0].agents.items[0].background);
+        }
+    }
+}
+
+test "same Run background results consume a FIFO with sticky per invocation success and failure" {
+    const gpa = testing.allocator;
+    for ([_]bool{ false, true }) |first_ok| {
+        for ([_]bool{ false, true }) |result_first| {
+            var t: Transcript = .{};
+            defer t.deinit(gpa);
+            try t.startRun(gpa, "two background calls");
+            if (result_first) {
+                try t.backgroundResult(gpa, .agent, "a1", first_ok, "{}");
+                try t.backgroundResult(gpa, .agent, "a1", !first_ok, "{}");
+            }
+            try t.progress(gpa, .{ .id = "a1", .invocation = 11, .run = 1, .prompt = "first", .background = true, .state = .done });
+            try t.progress(gpa, .{ .id = "a1", .invocation = 12, .run = 1, .prompt = "second", .background = true, .state = .done });
+            if (!result_first) {
+                try t.backgroundResult(gpa, .agent, "a1", first_ok, "{}");
+                try testing.expect(t.entries.items[0].agents.items[0].background);
+                try t.backgroundResult(gpa, .agent, "a1", !first_ok, "{}");
+            }
+            try testing.expectEqual(@as(?bool, first_ok), t.entries.items[0].invocations.items[0].result);
+            try testing.expectEqual(@as(?bool, !first_ok), t.entries.items[0].invocations.items[1].result);
+            try t.progress(gpa, .{ .id = "a1", .invocation = 11, .run = 1, .prompt = "late first", .background = true, .state = .done, .step = 99 });
+            try t.progress(gpa, .{ .id = "a1", .invocation = 12, .run = 1, .prompt = "second", .background = true, .state = .done, .step = 3 });
+            const row = t.entries.items[0].agents.items[0];
+            try testing.expectEqual(@as(usize, 12), row.invocation);
+            try testing.expectEqual(@as(u32, 3), row.step);
+            try testing.expectEqual(@as(@FieldType(Progress, "state"), if (first_ok) .failed else .done), row.state);
+            try testing.expect(!row.background);
+            try testing.expectEqual(@as(usize, 0), t.pending_results.items.len);
+        }
+    }
+}
+
+test "two coalesced background invocations in one drain register before ID only results settle" {
+    const gpa = testing.allocator;
+    const Queue = @import("../tools/progress.zig").Queue;
+    const Sink = struct {
+        transcript: *Transcript,
+        fn emit(ctx: *anyopaque, value: Progress) !void {
+            const sink: *@This() = @ptrCast(@alignCast(ctx));
+            try sink.transcript.progress(std.testing.allocator, value);
+        }
+    };
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    try t.startRun(gpa, "background then resume in one Run");
+    var sink: Sink = .{ .transcript = &t };
+    var q: Queue = .{ .sink = .{ .ctx = &sink, .emit = Sink.emit } };
+    defer q.deinit(gpa);
+    const id = try q.add(gpa, testing.io, .agent, "first", 1, true);
+    const first = q.currentInvocation(testing.io, id);
+    try q.update(gpa, testing.io, .{ .id = id, .invocation = first, .run = 1, .prompt = "first", .background = true, .state = .done });
+    try q.restart(gpa, testing.io, .{ .id = id, .run = 1, .prompt = "second", .background = true, .state = .queued });
+    const second = q.currentInvocation(testing.io, id);
+    try q.update(gpa, testing.io, .{ .id = id, .invocation = second, .run = 1, .prompt = "second", .background = true, .state = .failed });
+    try t.backgroundResult(gpa, .agent, id, true, "{}");
+    try q.drain(testing.io);
+    try testing.expectEqual(@as(usize, 2), t.entries.items[0].invocations.items.len);
+    try testing.expectEqual(@as(?bool, true), t.entries.items[0].invocations.items[0].result);
+    try testing.expectEqual(@as(?bool, null), t.entries.items[0].invocations.items[1].result);
+    try testing.expect(t.entries.items[0].agents.items[0].background);
+    try t.backgroundResult(gpa, .agent, id, false, "{}");
+    try testing.expectEqualStrings("  └─ a1 second · failed · step 0", t.entries.items[0].agent_tree.rows.items[0].text);
+    try testing.expect(!t.entries.items[0].agents.items[0].background);
 }
