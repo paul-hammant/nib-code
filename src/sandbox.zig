@@ -41,6 +41,9 @@ pub const ToolResult = union(enum) {
     err: []u8,
 };
 
+// Tool workers publish session-owned IDs without changing the JavaScript return value.
+pub threadlocal var tool_identity: struct { id: ?[]const u8 = null, background: bool = false } = .{};
+
 pub const Host = struct {
     ctx: *anyopaque,
     names: []const []const u8,
@@ -54,7 +57,6 @@ pub const Host = struct {
     timing: ?*RunTiming = null,
     record: ?*Recorder = null,
     virtual: ?*Virtual = null,
-    backgroundId: ?*const fn (*anyopaque, []const u8) ?[]const u8 = null,
 };
 
 pub const LogEntry = console.Entry;
@@ -130,21 +132,16 @@ const State = struct {
             const h = st.host.?;
             const timing = if (call.timing_index != null) h.timing else null;
             const start_ms = if (timing) |t| t.elapsed() else 0;
+            tool_identity = .{};
             const result = h.call(h.ctx, st.gpa, call.name, call.args);
             const end_ms = if (timing) |t| t.elapsed() else 0;
             st.mutex.lockUncancelable(st.io);
             defer st.mutex.unlock(st.io);
             if (timing) |t| {
                 t.complete(call.timing_index.?, start_ms, end_ms, result == .ok);
-                // Background starts return exactly {"id":...}; skip parsing large foreground outputs.
-                if (result == .ok and std.mem.startsWith(u8, result.ok, "{\"id\":") and (std.mem.eql(u8, call.name, "agent") or std.mem.eql(u8, call.name, "bash"))) {
-                    const parsed = std.json.parseFromSlice(struct { id: ?[]const u8 = null }, st.gpa, result.ok, .{ .ignore_unknown_fields = true }) catch null;
-                    defer if (parsed) |p| p.deinit();
-                    if (parsed) |p| if (p.value.id) |id| {
-                        // The timing collector outlives this Run; Session owns the identifier.
-                        if (h.backgroundId) |lookup| t.entries[call.timing_index.?].id = lookup(h.ctx, id);
-                        t.entries[call.timing_index.?].background = true;
-                    };
+                if (tool_identity.id) |id| {
+                    t.entries[call.timing_index.?].id = id;
+                    t.entries[call.timing_index.?].background = tool_identity.background;
                 }
             }
             call.result = result;

@@ -18,10 +18,12 @@ pub fn agent(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolR
     if (a.value.effort) |effort| try cfg.setEffort(effort);
     if (a.value.background)
         return .{ .ok = try t.background.start(t, gpa, .agent, args, a.value.prompt) };
-    return execute(t, gpa, args, &t.cancel, try t.progress.add(gpa, t.io, a.value.prompt), t.run_id, null);
+    const id = try t.progress.add(gpa, t.io, .agent, a.value.prompt, t.run_id, false);
+    sandbox.tool_identity = .{ .id = id };
+    return execute(t, gpa, args, &t.cancel, id, t.run_id, false);
 }
 
-pub fn execute(t: *Tools, gpa: std.mem.Allocator, args: []const u8, cancel: *const std.atomic.Value(bool), progress: usize, run_id: usize, background_id: ?[]const u8) !sandbox.ToolResult {
+pub fn execute(t: *Tools, gpa: std.mem.Allocator, args: []const u8, cancel: *const std.atomic.Value(bool), id: []const u8, run_id: usize, background: bool) !sandbox.ToolResult {
     const a = try std.json.parseFromSlice(struct { prompt: []const u8, timeout_ms: i64 = 1_800_000, model: ?[]const u8 = null, effort: ?[]const u8 = null }, gpa, args, .{ .ignore_unknown_fields = true });
     defer a.deinit();
     var cfg = t.cfg orelse return error.AgentConfigUnavailable;
@@ -30,7 +32,7 @@ pub fn execute(t: *Tools, gpa: std.mem.Allocator, args: []const u8, cancel: *con
     var tracker: Tracker = .{
         .t = t,
         .arena = .init(gpa),
-        .value = .{ .agent = progress, .run = run_id, .background_id = background_id, .prompt = a.value.prompt },
+        .value = .{ .id = id, .run = run_id, .background = background, .prompt = a.value.prompt },
     };
     defer tracker.arena.deinit();
     defer t.addUsage(tracker.output.usage);
@@ -276,11 +278,11 @@ const Tracker = struct {
 test "child progress counts Steps rather than Runs and ignores compaction snapshots" {
     const testing = std.testing;
     var t: Tools = .{ .io = testing.io, .home = "/unused" };
-    defer t.progress.clear(testing.allocator);
+    defer t.progress.deinit(testing.allocator);
     var tr: Tracker = .{
         .t = &t,
         .arena = .init(testing.allocator),
-        .value = .{ .agent = try t.progress.add(testing.allocator, testing.io, "child"), .prompt = "child" },
+        .value = .{ .id = try t.progress.add(testing.allocator, testing.io, .agent, "child", 0, false), .prompt = "child" },
     };
     defer tr.arena.deinit();
     try tr.observe("{\"delta\":{}}");
@@ -341,8 +343,29 @@ test "agent failure without output is data and queued user cancellation rejects"
     try testing.expectEqualStrings("", obj.get("text").?.string);
     try testing.expect(std.mem.indexOf(u8, obj.get("error").?.string, "unavailable (no start event)") != null);
     var t: Tools = .{ .io = testing.io, .home = "/unused", .cfg = .{ .model = "m", .base_url = "", .api_key = "" }, .agents_active = 4 };
-    defer t.progress.clear(testing.allocator);
+    defer t.progress.deinit(testing.allocator);
     t.cancel.store(true, .release);
     try testing.expectError(error.Canceled, agent(&t, testing.allocator, "{\"prompt\":\"cancelled\"}"));
     try testing.expectEqual(@as(usize, 4), t.agents_active);
+}
+
+test "foreground agent records its ID even when startup fails and continues across Runs" {
+    const testing = std.testing;
+    var t: Tools = .{ .io = testing.io, .home = "/unused", .cfg = .{ .model = "m", .base_url = "", .api_key = "" } };
+    defer t.progress.deinit(testing.allocator);
+    var timing: sandbox.RunTiming = .init(testing.io, .now(testing.io, .awake));
+    var host = t.host();
+    host.timing = &timing;
+    for (0..2) |_| {
+        t.cancel.store(false, .release);
+        const result = try sandbox.eval(testing.allocator, testing.io, "await tools.agent({prompt: 'child'})", .{}, host, null);
+        defer result.deinit(testing.allocator);
+        try testing.expect(!result.ok);
+        try testing.expectEqual(.failed, t.progress.slots.items[0].value.state);
+        t.progress.clear(testing.allocator);
+    }
+    try testing.expectEqualStrings("a1", timing.entries[0].id.?);
+    try testing.expectEqualStrings("a2", timing.entries[1].id.?);
+    try testing.expectEqual(@as(?bool, false), timing.entries[0].background);
+    try testing.expectEqual(@as(u64, 1), t.progress.next_bash_id);
 }

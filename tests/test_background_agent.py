@@ -63,7 +63,8 @@ class Mock(http.server.ThreadingHTTPServer):
             return "await " + agent("long", background=True)
         if self.case == "timeout":
             return "await " + agent("worker", background=True, timeout_ms=2200)
-        return "await Promise.all([" + agent("one", background=True) + ", " + agent("two", background=True) + "])"
+        return ("const one = await " + agent("one", background=True) +
+                "; const two = await " + agent("two", background=True) + "; [one, two]")
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -273,7 +274,8 @@ class BackgroundTests:
         process = self.start()
         wait_for(lambda: len(mock.observed("initial")) == 2)
         mock.gates["two"].set()
-        wait_for(lambda: self.child_logged("done:child:two"))
+        wait_for(lambda: len(mock.observed("initial")) == 3)
+        self.assertEqual(len(self.completions(mock.observed("initial")[-1]["messages"])), 1)
         mock.gates["one"].set()
         events = self.finish(process)
         completed = [e["background"]["id"] for e in events

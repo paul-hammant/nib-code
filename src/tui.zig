@@ -906,19 +906,19 @@ test "background events own their payload and maintain running count" {
     app.transcript = .{};
     app.background_count = 0;
     defer app.transcript.deinit(t.allocator);
-    var id = [_]u8{ 'b', 'g', '_', '1' };
+    var id = [_]u8{ 'a', '1' };
     try Turn.emit(&turn, .{ .background = .{ .id = &id, .kind = .agent, .state = .started } });
-    id[3] = '2';
+    id[1] = '2';
     const started = (try loop.tryEvent()).?;
-    try t.expectEqualStrings("bg_1", started.background.id);
+    try t.expectEqualStrings("a1", started.background.id);
     _ = try app.handle(started);
     try t.expectEqual(@as(usize, 1), app.background_count);
     try t.expectEqual(@as(usize, 0), app.transcript.entries.items.len);
-    try Turn.emit(&turn, .{ .background = .{ .id = "bg_1", .kind = .agent, .state = .finished, .ok = true, .result = "{\"ok\":true,\"text\":\"done\"}" } });
+    try Turn.emit(&turn, .{ .background = .{ .id = "a1", .kind = .agent, .state = .finished, .ok = true, .result = "{\"ok\":true,\"text\":\"done\"}" } });
     _ = try app.handle((try loop.tryEvent()).?);
     try t.expectEqual(@as(usize, 0), app.background_count);
     try t.expectEqual(EntryKind.background, app.transcript.entries.items[0].kind);
-    try t.expectEqualStrings("bg agent bg_1 · ok=true · done", app.transcript.entries.items[0].label.items);
+    try t.expectEqualStrings("a1 agent · ok · done", app.transcript.entries.items[0].label.items);
 }
 
 test "Step events own effort and Runs keep their generating Step metadata" {
