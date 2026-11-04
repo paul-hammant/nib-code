@@ -207,3 +207,17 @@ test "bash rejects output over 16 MiB and kills the process group" {
     try testing.expectEqualStrings("output exceeds 16 MiB; redirect output to a file", r.err);
     try testing.expect(start.durationTo(std.Io.Clock.awake.now(testing.io)).toMilliseconds() < 5000);
 }
+
+test "bash does not wait for background jobs inheriting stdout or stderr" {
+    const start = std.Io.Clock.awake.now(testing.io);
+    const r = try callTool("bash", "{\"command\":\"sleep 8 & echo started; echo error >&2; exit 3\",\"timeout_ms\":2000}");
+    defer freeResult(r);
+    try testing.expectEqualStrings("{\"exit_code\":3,\"output\":\"started\\nerror\\n\"}", r.ok);
+    try testing.expect(start.durationTo(std.Io.Clock.awake.now(testing.io)).toMilliseconds() < 1000);
+}
+
+test "bash returns when a silent background job holds stdout" {
+    const r = try callTool("bash", "{\"command\":\"sleep 8 & exit 0\",\"timeout_ms\":1000}");
+    defer freeResult(r);
+    try testing.expectEqualStrings("{\"exit_code\":0,\"output\":\"\"}", r.ok);
+}
