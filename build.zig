@@ -32,7 +32,15 @@ pub fn build(b: *std.Build) void {
     const vaxis_dep = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
 
     const options = b.addOptions();
-    options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    const version = @import("build.zig.zon").version;
+    options.addOption([]const u8, "version", version);
+    // Git refs are external to Zig's configuration cache, including worktree refs.
+    b.graph.poisonCache();
+    const commit = switch (b.runFallible(&.{ "git", "rev-parse", "--short", "HEAD" }, .{ .cwd = .{ .path = b.root.joinString(b.allocator, "") catch @panic("OOM") }, .stderr_behavior = .ignore })) {
+        .success => |output| std.mem.trim(u8, output, " \r\n"),
+        else => "",
+    };
+    options.addOption([]const u8, "nib_version", if (commit.len == 0) version else b.fmt("{s}+{s}", .{ version, commit }));
 
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

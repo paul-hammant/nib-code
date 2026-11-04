@@ -195,6 +195,10 @@ def test_during_run_and_resume(tmp):
         before = history(home)
         assert [m["role"] for m in before] == ["system", "user", "assistant", "tool", "user", "user", "assistant"]
         terminal.close()
+        report = json.loads(subprocess.check_output(["python3", str(ROOT / "scripts/stats.py"),
+                                                     str(home / "sessions"), "--json"]))
+        assert report["overall"]["turns"] == 1, report["overall"]
+        assert report["round_trips"]["steps_per_turn"] == dict(samples=1, median=2, p90=2)
         # The same Session log must replay identically through ask --json, without new event types.
         result = subprocess.run([str(BIN), "ask", "--json", "-c", "after resume"], cwd=tmp, env=env,
                                 capture_output=True, timeout=10)

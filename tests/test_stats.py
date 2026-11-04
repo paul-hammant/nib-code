@@ -16,7 +16,304 @@ sys.dont_write_bytecode = True
 SPEC.loader.exec_module(stats)
 
 
+def synthetic_log(path, turns, **metadata):
+    records = [dict({'from': 0}, cwd=str(path.parent), messages=[dict(role='system', content='base')], **metadata)]
+    length = 1
+    for steps in turns:
+        if not steps:
+            records.append(dict({'from': length}, messages=[dict(role='user', content='empty')]))
+            length += 1
+        for index, codes in enumerate(steps):
+            messages = [dict(role='user', content='request')] if index == 0 else []
+            if codes is None:
+                messages.append(dict(role='assistant', content='done'))
+                calls = []
+            else:
+                codes = codes if isinstance(codes, list) else [codes]
+                calls = [dict(id=f'r{length}_{i}', function=dict(name='run', arguments=json.dumps(dict(code=code))))
+                         for i, code in enumerate(codes)]
+                messages.append(dict(role='assistant', tool_calls=calls))
+                messages.extend(dict(role='tool', tool_call_id=call['id'], content='ok') for call in calls)
+            records.append(dict({'from': length}, messages=messages, ms=10, model_ms=6,
+                                usage=dict(prompt_tokens=10, completion_tokens=2, prompt_cache_hit_tokens=4),
+                                run_results=[dict(tool_call_id=call['id'], ok=True) for call in calls]))
+            length += len(messages)
+    path.write_text('\n'.join(map(json.dumps, records)) + '\n')
+    return records
+
+
 class StatsTest(unittest.TestCase):
+    def assertRoundTrips(self, actual, expected):
+        self.assertEqual(len(actual["notes"]), 2)
+        self.assertEqual({key: value for key, value in actual.items() if key != "notes"}, expected)
+
+    def test_round_trips_exact_counts_and_cli(self):
+        def write(path):
+            return 'tools.write({path: ' + json.dumps(path) + ', content: "x"})'
+
+        def bash(command):
+            return 'tools.bash({command: ' + json.dumps(command) + '})'
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'pairs.jsonl'
+            synthetic_log(path, [
+                [write('a'), [write('b'), write('c')], [write('b'), write('d')],
+                 'tools.edit({path: dynamic, old_text: "x", new_text: "y"})',
+                 write('e'), [bash('zig build'), bash('git diff --stat')], None],
+                [write('z'), [write('z'), bash('cargo test')], 'tools.bash({command: dynamic})',
+                 bash('zig build && rm -rf out'), [bash('zig test x.zig'), 'tools.read({path: "x"})'],
+                 write('q'), [bash('zig fmt --check x.zig'), bash('cargo check')]],
+                [bash('git diff'), write('b'), write('./b'), [write('c'), write('a')], None]])
+            before = path.read_bytes()
+            report = stats.summarize([path])
+            expected = dict(steps_per_turn=dict(samples=3, median=7, p90=7),
+                            write_to_validation=dict(count=2, pairs=16, ratio=.125),
+                            disjoint_write_files=dict(count=2, pairs=5, ratio=.4))
+            self.assertRoundTrips(report['round_trips'], expected)
+            self.assertEqual(report['overall']['steps'], 19)
+            cli = ['python3', str(ROOT / 'scripts/stats.py'), str(path)]
+            result = json.loads(subprocess.check_output(cli + ['--json']))
+            self.assertRoundTrips(result['round_trips'], expected)
+            text = subprocess.check_output(cli).decode()
+            self.assertIn('往返结构：', text)
+            self.assertIn('每 Turn Step: samples=3 median=7.00 p90=7.00', text)
+            self.assertIn('写→仅验证: 2/16 = 12.50%', text)
+            self.assertIn('连续写不同文件（不相交）: 2/5 = 40.00%', text)
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_turn_step_keeps_interjections_in_the_same_turn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "interjections.jsonl"
+            write_a = 'tools.write({path: "a", content: "x"})'
+            write_b = 'tools.write({path: "b", content: "x"})'
+            verify = 'tools.bash({command: "zig build"})'
+            records = synthetic_log(path, [[write_a, verify, write_b, write_a, None], [None]])
+            for record, ordinal in zip(records[1:], [1, 2, 3, 4, 5, 1]):
+                record["turn_step"] = ordinal
+                if ordinal in (2, 4):
+                    record["messages"].insert(0, dict(role="user", content="interjection"))
+            offset = 1
+            for record in records[1:]:
+                record["from"] = offset
+                offset += len(record["messages"])
+            path.write_text("\n".join(map(json.dumps, records)) + "\n")
+            report = stats.summarize([path])
+            self.assertEqual(report["overall"]["turns"], 2)
+            self.assertEqual(report["round_trips"]["steps_per_turn"], dict(samples=2, median=3, p90=5))
+            self.assertEqual(report["round_trips"]["write_to_validation"], dict(count=1, pairs=4, ratio=.25))
+            self.assertEqual(report["round_trips"]["disjoint_write_files"], dict(count=1, pairs=1, ratio=1))
+
+    def test_structure_literal_paths_and_conservative_validation(self):
+        valid_commands = ['zig build', 'zig test x.zig', 'zig fmt x.zig', 'cargo check',
+                          'cargo test --all', 'git diff --stat', 'pytest -q', 'diff a b',
+                          'python3 tests/test_stats.py', 'python3 -m unittest',
+                          'go test ./...', 'make check', 'A=1 /usr/bin/git diff']
+        for command in valid_commands:
+            with self.subTest(command=command):
+                code = 'tools.bash({command: ' + json.dumps(command) + '})'
+                self.assertTrue(stats.step_structure([code])['validation'])
+        invalid_codes = ['tools.bash({command: command})',
+                         'tools.bash({command: "zig build" + args})',
+                         'tools.bash({command: `zig ${action}`})',
+                         'tools.bash({command: "zig build $ARGS"})',
+                         'tools.bash({command: "zig build; rm x"})',
+                         'tools.bash({command: "zig build && zig test x"})',
+                         'tools.bash({command: "zig build > result"})',
+                         'tools.bash({command: "git status"})',
+                         'tools.bash({command: "echo test"})',
+                         'tools.bash({command: "python3 arbitrary.py"})',
+                         'tools.bash({command: "zig build"}); tools.read({path: "a"})',
+                         'tools.bash({command: "zig build"}); tools.write({path: "a", content: "x"})',
+                         'tools.bash({command: "zig build"}); tools.bash({command: cmd})',
+                         'tools.bash({command: "zig build", ...opts})',
+                         'tools.bash({command: "zig build", command: cmd})',
+                         'tools[method]({command: "zig build"})',
+                         'tools.bash({command: "zig build"}); runners[mode]()',
+                         'tools.bash({command: "zig build"}); helper()',
+                         'tools.bash({command: "zig build"}); const x = `${helper()}`',
+                         'const text = "tools.bash({command: zig})"; // tools.bash({})',
+                         '', None]
+        for code in invalid_codes:
+            with self.subTest(code=code):
+                self.assertFalse(stats.step_structure([code])['validation'])
+        self.assertFalse(stats.step_structure(['tools.bash({command: "zig build"})', None])['validation'])
+        complete = stats.step_structure([
+            '// tools.write({path: "ignored"})\n'
+            'tools.edit({new_text: {a: [1, 2]}, path: "./x/../a", old_text: "x"});'
+            "tools.write({'path': 'b', content: `plain`})"], '/project')
+        self.assertEqual(complete, dict(writes=True, paths={'/project/a', '/project/b'}, validation=False))
+        mixed = stats.step_structure(['tools.write({path: "a"}); tools.bash({command: "git diff"})'])
+        self.assertEqual(mixed, dict(writes=True, paths={'a'}, validation=False))
+        incomplete = ['tools.write({path: p, content: "x"})',
+                      'tools.edit({old_text: "a", new_text: "b"})',
+                      'tools.write({path: "a" + suffix, content: "x"})',
+                      'tools.write({path: `a${suffix}`, content: "x"})',
+                      'tools.write({path: "a", ...options})',
+                      'tools.write({path: "a", path: "b"})',
+                      'tools.write({[key]: "b", path: "a"})',
+                      'tools.write(options)',
+                      'tools.write({path: "a"}); runners[mode]()']
+        for code in incomplete:
+            with self.subTest(code=code):
+                item = stats.step_structure([code])
+                self.assertTrue(item['writes'])
+                self.assertIsNone(item['paths'])
+                self.assertFalse(item['validation'])
+        item = stats.step_structure(['const text = "tools.write({path: a})"; /* tools.edit({}) */'])
+        self.assertEqual(item, dict(writes=False, paths=None, validation=False))
+
+    def test_javascript_literal_path_escapes_and_safe_wrappers(self):
+        for literal, expected in [(r"'src\/a.js'", 'src/a.js'), (r"'a\"b'", 'a"b'),
+                                  (r"'a\'b'", "a'b"), (r"'\u4e2d\u6587'", '中文'),
+                                  (r"'\ud83d\ude00'", '😀'), (r"'a\\b'", 'a\\b'),
+                                  (r"'a\x62'", None), (r"'a\q'", None)]:
+            with self.subTest(literal=literal):
+                self.assertEqual(stats.literal_string(literal), expected)
+        code = 'console.log(await Promise.all([tools.bash({command: "zig build"}), tools.bash({command: "git diff"})]))'
+        self.assertTrue(stats.step_structure([code])['validation'])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'escapes.jsonl'
+            synthetic_log(path, [[r"tools.write({path: 'src\/a.js', content: 'x'})",
+                                  "tools.write({path: 'src/a.js', content: 'x'})"]])
+            self.assertEqual(stats.summarize([path])['round_trips']['disjoint_write_files'],
+                             dict(count=0, pairs=1, ratio=0))
+
+    def test_turn_distribution_empty_and_session_boundaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'turns.jsonl'
+            synthetic_log(path, [[None] * n for n in range(1, 11)] + [[]])
+            report = stats.summarize([path])['round_trips']
+            self.assertEqual(report['steps_per_turn'], dict(samples=11, median=5, p90=9))
+            self.assertEqual(report['write_to_validation'], dict(count=0, pairs=45, ratio=0))
+            self.assertEqual(report['disjoint_write_files'], dict(count=0, pairs=0, ratio=None))
+            a, b = Path(directory) / 'a.jsonl', Path(directory) / 'b.jsonl'
+            synthetic_log(a, [['tools.write({path: "a", content: "x"})']])
+            synthetic_log(b, [['tools.bash({command: "zig build"})']])
+            self.assertEqual(stats.summarize([a, b])['round_trips']['write_to_validation'],
+                             dict(count=0, pairs=0, ratio=None))
+        empty = stats.summarize([])
+        self.assertEqual(empty['round_trips']['steps_per_turn'], dict(samples=0, median=None, p90=None))
+        self.assertIn('写→仅验证: 0/0 = n/a', stats.text_report(empty))
+
+    def test_group_by_header_mixed_versions_systems_patches_and_cli(self):
+        write_a = 'tools.write({path: "a", content: "x"})'
+        write_b = 'tools.edit({path: "b", old_text: "x", new_text: "y"})'
+        verify = 'tools.bash({command: "zig build"})'
+        fixtures = [
+            ('legacy', {}, [write_a, verify, None]),
+            ('modern', dict(nib_version='1.0', system_sha='shaA'), [write_a, write_b, verify, None]),
+            ('patched', dict(nib_version='1.0', system_sha='shaB', patches_off=['b', 'a']), [write_a, verify]),
+            ('reordered', dict(nib_version='2.0', system_sha='shaA', patches_off=['a', 'b', 'a']), [None]),
+            ('system_only', dict(system_sha='shaB'), [write_a, verify]),
+            ('version_only', dict(nib_version='2.0'), [None]),
+            ('empty', dict(patches_off=[]), [None]),
+            ('invalid', dict(nib_version=False, system_sha=7, patches_off=None), [None]),
+            ('old_second', {}, [None])]
+        expected_members = dict(
+            version={'1.0': ['modern', 'patched'], '2.0': ['reordered', 'version_only'],
+                     'unknown': ['legacy', 'system_only', 'empty', 'invalid', 'old_second']},
+            system={'shaA': ['modern', 'reordered'], 'shaB': ['patched', 'system_only'],
+                    'unknown': ['legacy', 'version_only', 'empty', 'invalid', 'old_second']},
+            patches={'none': ['modern', 'system_only', 'version_only', 'empty'],
+                     '["a", "b"]': ['patched', 'reordered'], 'unknown': ['legacy', 'invalid', 'old_second']})
+        with tempfile.TemporaryDirectory() as directory:
+            paths = {}
+            for name, metadata, steps in fixtures:
+                paths[name] = Path(directory) / (name + '.jsonl')
+                synthetic_log(paths[name], [steps], **metadata)
+            for group_by, members in expected_members.items():
+                with self.subTest(group_by=group_by):
+                    report = stats.summarize(sorted(paths.values()), group_by=group_by)
+                    self.assertEqual(report['group_by'], group_by)
+                    self.assertEqual(set(report['groups']), set(members))
+                    self.assertEqual(report['overall']['sessions'], 9)
+                    self.assertEqual(report['overall']['steps'], 16)
+                    self.assertEqual(report['usage']['total_tokens'], 192)
+                    self.assertEqual(report['round_trips']['write_to_validation'], dict(count=4, pairs=7, ratio=4/7))
+                    self.assertEqual(report['round_trips']['disjoint_write_files'], dict(count=1, pairs=1, ratio=1))
+                    for key, names in members.items():
+                        group = report['groups'][key]
+                        self.assertEqual(group, stats.summarize(sorted(paths[name] for name in names)))
+                        self.assertEqual(group['overall']['sessions'], len(names))
+                        self.assertEqual(group['usage']['cache_hit_rate'], .4)
+                        self.assertEqual(group['timing']['step_ms']['median'], 10)
+                    cli = ['python3', str(ROOT / 'scripts/stats.py'), directory, '--group-by', group_by]
+                    self.assertEqual(json.loads(subprocess.check_output(cli + ['--json'])), report)
+                    text = subprocess.check_output(cli).decode()
+                    self.assertIn('分组 group_by=' + group_by, text)
+                    for key in members:
+                        self.assertIn(f'=== {group_by}={key} ===', text)
+                    self.assertEqual(text.count('每 Turn Step:'), len(members) + 1)
+                    self.assertEqual(text.count('写→仅验证:'), len(members) + 1)
+            version = stats.summarize(paths.values(), group_by='version')['groups']['1.0']
+            self.assertRoundTrips(version['round_trips'], dict(
+                steps_per_turn=dict(samples=2, median=3, p90=4),
+                write_to_validation=dict(count=2, pairs=4, ratio=.5),
+                disjoint_write_files=dict(count=1, pairs=1, ratio=1)))
+            patches = stats.summarize(paths.values(), group_by='patches')['groups']
+            self.assertEqual(patches['none']['overall']['steps'], 8)
+            self.assertEqual(patches['none']['round_trips']['steps_per_turn'], dict(samples=4, median=1.5, p90=4))
+            self.assertEqual(patches['unknown']['overall']['steps'], 5)
+            for path in paths.values():
+                os.utime(path, (0, 0))
+            empty = stats.summarize(paths.values(), since=date(2099, 1, 1), group_by='patches')
+            self.assertEqual(empty['groups'], {})
+            self.assertIn('无入选分组', stats.text_report(empty))
+            self.assertEqual(stats.summarize(paths.values(), cwd=ROOT, group_by='version')['groups'], {})
+        for metadata, expected in [({}, 'unknown'), ({'nib_version': ''}, 'unknown'),
+                                   ({'system_sha': 's'}, 'none'), ({'nib_version': 'v'}, 'none'),
+                                   ({'patches_off': ''}, 'none'), ({'patches_off': [3]}, 'unknown'),
+                                   ({'patches_off': {}}, 'unknown'), ({'patches_off': 'one'}, 'one')]:
+            self.assertEqual(stats.header_group(metadata, 'patches'), expected)
+        with self.assertRaises(ValueError):
+            stats.summarize([], group_by='invalid')
+        cli = ['python3', str(ROOT / 'scripts/stats.py'), '--group-by', 'invalid']
+        self.assertEqual(subprocess.run(cli, capture_output=True).returncode, 2)
+
+    def test_adjacency_since_gaps_compaction_interruption_and_unknown_runs(self):
+        write = 'tools.write({path: "a", content: "x"})'
+        verify = 'tools.bash({command: "zig build"})'
+        old = int(datetime(2025, 1, 1, 12).timestamp() * 1000)
+        new = int(datetime(2025, 1, 2, 12).timestamp() * 1000)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'gaps.jsonl'
+            records = synthetic_log(path, [[write, verify, write, verify]], nib_version='new')
+            for record, at in zip(records, [old, new, old, new, new]):
+                record['at'] = at
+            path.write_text('\n'.join(map(json.dumps, records)))
+            report = stats.summarize([path], since=date(2025, 1, 2), group_by='patches')
+            self.assertEqual(set(report['groups']), {'none'})
+            expected = dict(steps_per_turn=dict(samples=1, median=3, p90=3),
+                            write_to_validation=dict(count=1, pairs=1, ratio=1),
+                            disjoint_write_files=dict(count=0, pairs=0, ratio=None))
+            self.assertRoundTrips(report['round_trips'], expected)
+            self.assertRoundTrips(report['groups']['none']['round_trips'], expected)
+            records = synthetic_log(path, [[write, verify, None]])
+            records.insert(2, dict(records[1]))
+            records[2]['messages'] = [dict(role='user', content='summary')] + records[1]['messages'][1:]
+            path.write_text('\n'.join(map(json.dumps, records)))
+            result = stats.summarize([path])
+            self.assertEqual(result['overall']['steps'], 3)
+            self.assertEqual(result['round_trips']['write_to_validation'], dict(count=1, pairs=2, ratio=.5))
+            records = synthetic_log(path, [[write, verify]])
+            interrupted = dict({'from': records[2]['from']},
+                               messages=[dict(role='assistant', content='[interrupted by user]')])
+            records[2]['from'] += 1
+            records.insert(2, interrupted)
+            path.write_text('\n'.join(map(json.dumps, records)))
+            result = stats.summarize([path])
+            self.assertEqual(result['overall']['steps'], 2)
+            self.assertEqual(result['round_trips']['write_to_validation'], dict(count=0, pairs=0, ratio=None))
+            records = synthetic_log(path, [[write, verify]])
+            records[-1]['messages'][0]['tool_calls'].append(dict(id='other', function=dict(name='other', arguments='{}')))
+            path.write_text('\n'.join(map(json.dumps, records)))
+            self.assertEqual(stats.summarize([path])['round_trips']['write_to_validation'],
+                             dict(count=0, pairs=1, ratio=0))
+            records = synthetic_log(path, [[write, [verify, None]]])
+            path.write_text('\n'.join(map(json.dumps, records)))
+            self.assertEqual(stats.summarize([path])['round_trips']['write_to_validation'],
+                             dict(count=0, pairs=1, ratio=0))
+
     def test_legacy_corrupt_compaction_and_filters(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / ('a' * 32 + '.jsonl')
