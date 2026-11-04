@@ -65,6 +65,7 @@ fn checkDepth(command: []const u8, home: []const u8, depth: u8) Verdict {
     const words = split(command, &buf, bodies) orelse return .{ .deny = too_long };
 
     var fetched = false;
+    var runs_shell = false;
     var start: usize = 0;
     while (start < words.len) {
         var end = start;
@@ -86,6 +87,7 @@ fn checkDepth(command: []const u8, home: []const u8, depth: u8) Verdict {
             return .{ .deny = "recursive rm of a protected path" };
 
         if (in(&shells, cmd) or std.mem.eql(u8, cmd, "eval")) {
+            runs_shell = true;
             if (fetched) return .{ .deny = "piping a downloaded script into a shell" };
             for (argv[1..], 1..) |a, i| {
                 if (a.substitutes_fetch) return .{ .deny = "running a downloaded script" };
@@ -99,6 +101,11 @@ fn checkDepth(command: []const u8, home: []const u8, depth: u8) Verdict {
         if (in(&fetchers, cmd) and sep == .pipe) fetched = true;
         if (sep != .pipe) fetched = false;
     }
+    // A heredoc may be a shell's stdin script; when a shell runs here, its bodies are commands, not data.
+    if (runs_shell) for (bodies) |body| switch (checkDepth(command[body.start..body.end], home, depth + 1)) {
+        .allow => {},
+        .deny => |why| return .{ .deny = why },
+    };
     return .allow;
 }
 
@@ -454,6 +461,14 @@ fn in(list: []const []const u8, s: []const u8) bool {
 }
 
 const testing = std.testing;
+
+test "heredocs fed to a shell are checked as scripts" {
+    try expectDenied("bash <<'EOF'\nsudo reboot\nEOF");
+    try expectDenied("sh -s <<EOF\nrm -rf /\nEOF");
+    try expectDenied("cat <<'A' | bash\nsudo true\nA");
+    try expectAllowed("bash <<'EOF'\necho hi\nEOF");
+    try expectAllowed("python3 - <<'EOF'\nprint('sudo reboot')\nEOF");
+}
 
 fn expectDenied(cmd: []const u8) !void {
     switch (check(cmd, "/home/u")) {
