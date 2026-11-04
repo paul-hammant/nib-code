@@ -104,6 +104,136 @@ def distribution(values):
                 p90=values[(9 * len(values) + 9) // 10 - 1] if values else None)
 
 
+def validation_first_words(command):
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|()')
+        lexer.whitespace_split = True
+        words = []
+        for token in lexer:
+            if token and all(c in ';&|()' for c in token):
+                break
+            if not words and (re.match(r'^[A-Za-z_][\w]*=', token) or token in ('env', 'sudo', 'command', 'exec', '!')):
+                continue
+            if re.search(r'[$`<>]', token):
+                return None
+            words.append(Path(token).name if not words else token)
+            if len(words) == 2:
+                break
+        return ' '.join(words) or None
+    except ValueError:
+        return None
+
+
+SHELL_TOKEN = re.compile(r'''(?:\d+)?(?:<<<|<<-?|>>|[<>]&|<>|>\||[<>])|[;&|()]|(?:[^\s;&|()<>\\'"]|\\.|'(?:[^']*)'|"(?:\\.|[^"\\])*")+''', re.S)
+SHELL_REDIRECT = re.compile(r'(?:\d+)?(?:<<<|<<-?|>>|[<>]&|<>|>\||[<>])')
+
+
+def bash_first_words(command):
+    words, redirect = [], False
+    for match in SHELL_TOKEN.finditer(command):
+        raw = match[0]
+        if SHELL_REDIRECT.fullmatch(raw):
+            redirect = True
+            continue
+        if redirect:
+            redirect = False
+            continue
+        if raw in ('(', ')'):
+            continue
+        if raw in (';', '&', '|'):
+            return None
+        try:
+            token, = shlex.split(raw)
+        except ValueError:
+            return None
+        if not words and (re.match(r'^[A-Za-z_][\w]*=', token) or token in ('env', 'sudo', 'command', 'exec', '!')):
+            continue
+        if re.search(r'[$`]', token):
+            return None
+        words.append(Path(token).name if not words else token)
+        if len(words) == 2:
+            break
+    return ' '.join(words) or None
+
+
+def shell_segments(command):
+    segment, quote, depth, index = [], None, 0, 0
+    heredocs = []
+    while index < len(command):
+        char = command[index]
+        if char == '\\' and quote != "'":
+            if index + 1 < len(command):
+                if command[index + 1] != '\n':
+                    segment.extend(command[index:index + 2])
+                index += 2
+                continue
+        if quote:
+            segment.append(char)
+            if char == quote:
+                quote = None
+        elif char in ("'", '"', '`'):
+            quote = char
+            segment.append(char)
+        elif char == '#' and (not segment or segment[-1].isspace()):
+            while index < len(command) and command[index] != '\n':
+                index += 1
+            continue
+        elif command[index:index + 2] == '>|':
+            segment.extend('>|')
+            index += 2
+            continue
+        elif (command[index:index + 2] == '<<' and command[index:index + 3] != '<<<'
+              and (index == 0 or command[index - 1] != '<')):
+            strip_tabs = command[index + 2:index + 3] == '-'
+            lexer = shlex.shlex(command[index + 2 + strip_tabs:], posix=True, punctuation_chars=';&|()<>')
+            lexer.whitespace_split = True
+            try:
+                delimiter = lexer.get_token()
+            except ValueError:
+                yield ''
+                return
+            if not delimiter:
+                yield ''
+                return
+            heredocs.append((delimiter, strip_tabs))
+            segment.append(char)
+        elif command[index:index + 2] == '$(':
+            depth += 1
+            segment.extend('$(')
+            index += 2
+            continue
+        elif depth:
+            depth += (char == '(') - (char == ')')
+            segment.append(char)
+        elif char in ';|\n' or command[index:index + 2] == '&&':
+            if ''.join(segment).strip():
+                yield ''.join(segment)
+            segment = []
+            if command[index:index + 2] in ('&&', '||', '|&'):
+                index += 1
+        else:
+            segment.append(char)
+        if char == '\n' and heredocs and not quote and not depth:
+            while heredocs and index < len(command):
+                end = command.find('\n', index + 1)
+                end = len(command) if end < 0 else end
+                line = command[index + 1:end]
+                delimiter, strip_tabs = heredocs[0]
+                if (line.lstrip('\t') if strip_tabs else line) == delimiter:
+                    heredocs.pop(0)
+                index = end
+        index += 1
+    if quote or depth or heredocs:
+        yield ''
+    elif ''.join(segment).strip():
+        yield ''.join(segment)
+
+
+def bash_command_group(command):
+    groups = [bash_first_words(segment) for segment in shell_segments(command)]
+    return ' → '.join(groups) if groups and all(groups) else None
+
+
 def bash_timing_group(code):
     if TOOL_CALL.findall(code).count('bash') != 1:
         return None
@@ -123,23 +253,35 @@ def bash_timing_group(code):
             with warnings.catch_warnings():
                 warnings.simplefilter('ignore', (SyntaxWarning, DeprecationWarning))
                 command = json.loads(literal) if literal.startswith('"') else ast.literal_eval(literal)
-        lexer = shlex.shlex(without_heredocs(command).replace('\n', ';'), posix=True, punctuation_chars=';&|()')
-        lexer.whitespace_split = True
-        words = []
-        for token in lexer:
-            if token and all(c in ';&|()' for c in token):
-                break
-            if not words and (re.match(r'^[A-Za-z_][\w]*=', token) or token in ('env', 'sudo', 'command', 'exec', '!')):
-                continue
-            if re.search(r'[$`<>]', token):
-                return None
-            words.append(Path(token).name if not words else token)
-            if len(words) == 2:
-                break
-        return ' '.join(words) or None
+        return bash_command_group(command)
     except (ValueError, SyntaxError):
         return None
 
+
+def recorded_bash_commands(path):
+    runs = {}
+    try:
+        with path.with_suffix('.calls.jsonl').open(encoding='utf-8', errors='replace') as stream:
+            for line in stream:
+                try:
+                    call = json.loads(line)
+                except (ValueError, RecursionError):
+                    continue
+                if not isinstance(call, dict) or call.get('name') != 'bash':
+                    continue
+                step, run, index = (call.get(key) for key in ('step', 'run', 'index'))
+                if not all(number(value) for value in (step, run, index)):
+                    continue
+                args = call.get('args')
+                command = args.get('command') if isinstance(args, dict) else None
+                runs.setdefault((step, run), []).append((index, command))
+    except OSError:
+        pass
+    steps = {}
+    for (step, run), calls in runs.items():
+        if len({index for index, _ in calls}) == len(calls):
+            steps.setdefault(step, {})[run] = [command for _, command in sorted(calls, key=lambda c: c[0])]
+    return steps
 
 JS_TOKEN = re.compile(r'''\s+|//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|[A-Za-z_$][\w$]*|[^\s]''', re.S)
 
@@ -220,7 +362,7 @@ def validation_command(command):
             return False
     except ValueError:
         return False
-    group = bash_timing_group('tools.bash({command: ' + json.dumps(command) + '})')
+    group = validation_first_words(command)
     if not group:
         return False
     words = group.split()
@@ -303,6 +445,7 @@ def header_group(header, group_by):
 class EffortStats:
     def __init__(self):
         self.groups = {}
+        self.cache_transitions = {}
 
     def add(self, record, run_statuses):
         effort = record.get('effort')
@@ -326,6 +469,23 @@ class EffortStats:
             counts['steps_with_failed_run'] += any(ok is False for ok in run_statuses)
             counts['steps_with_unknown_run_status'] += any(ok is None for ok in run_statuses)
 
+    def add_transition(self, previous, record, header):
+        if previous is None:
+            return
+        for step in (previous, record):
+            effort, usage = step.get('effort'), step.get('usage')
+            if (not isinstance(effort, str) or not effort.strip() or not isinstance(usage, dict)
+                    or not all(number(usage.get(key)) for key in CACHE_TOKEN_KEYS)):
+                return
+        usage = record['usage']
+        if usage['prompt_tokens'] <= 0:
+            return
+        group = tuple(header.get(key) if isinstance(header.get(key), str) and header[key].strip()
+                      else 'unknown' for key in ('provider', 'model'))
+        transitions = self.cache_transitions.setdefault(group, dict(same_effort=[], different_effort=[]))
+        kind = 'same_effort' if previous['effort'] == record['effort'] else 'different_effort'
+        transitions[kind].append(usage['prompt_cache_hit_tokens'] / usage['prompt_tokens'])
+
     def report(self):
         def downgrade_summary(counts):
             result = {key: counts[key] for key in ('steps', 'steps_with_runs', 'steps_with_failed_run',
@@ -341,7 +501,14 @@ class EffortStats:
                 cache_hit_rate=group['prompt_cache_hit_tokens'] / group['prompt_tokens']
                                if group['prompt_tokens'] else None,
                 downgraded=downgrade_summary(group['downgraded']))
-        return dict(by_effort=groups, downgraded=downgrade_summary(total))
+        def cache_summary(values):
+            return dict(samples=len(values), median=median(values) if values else None,
+                        mean=sum(values) / len(values) if values else None)
+
+        return dict(by_effort=groups, downgraded=downgrade_summary(total),
+                    cache_transitions=[dict(provider=provider, model=model,
+                        **{kind: cache_summary(values) for kind, values in transitions.items()})
+                        for (provider, model), transitions in sorted(self.cache_transitions.items())])
 
 
 class ToolData:
@@ -457,8 +624,9 @@ class Timing:
         self.tools = {}
         self.bash = {}
         self.calls_steps = self.calls_omitted = self.bash_unmatched = 0
+        self.bash_sources = Counter(recorded=0, static=0)
 
-    def add(self, record, sources, run_statuses=()):
+    def add(self, record, sources, run_statuses=(), recorded_commands=None):
         self.effort.add(record, run_statuses)
         for key in ('model_ms', 'run_ms', 'first_data_ms', 'max_gap_ms', 'attempts'):
             if number(record.get(key)):
@@ -487,9 +655,18 @@ class Timing:
         self.calls_steps += 1
         bash_per_run = Counter(c.get('run_index') for c in calls
                                if isinstance(c, dict) and c.get('name') == 'bash' and number(c.get('run_index')))
+        recorded_commands = recorded_commands or {}
+        bash_ordinals = Counter()
+        ambiguous_runs = {c.get('run_index') for c in calls if isinstance(c, dict)
+                          and c.get('name') == 'bash' and c.get('dispatched') is False
+                          and number(c.get('run_index'))}
         for call in calls:
             if not isinstance(call, dict):
                 continue
+            index = call.get('run_index')
+            ordinal = bash_ordinals[index] if number(index) else 0
+            if call.get('name') == 'bash' and number(index):
+                bash_ordinals[index] += 1
             name, start, end = call.get('name'), call.get('start_ms'), call.get('end_ms')
             if not isinstance(name, str) or not name or not number(start) or not number(end) or end < start:
                 continue
@@ -497,9 +674,15 @@ class Timing:
             self.tools.setdefault(name, []).append(duration)
             if name != 'bash':
                 continue
-            index = call.get('run_index')
             group = None
-            if number(index) and index < len(results) and bash_per_run[index] == 1:
+            group_source = 'static'
+            recorded = recorded_commands.get(index) if number(index) else None
+            if (recorded is not None and len(recorded) == bash_per_run[index]
+                    and (len(recorded) == 1 or index not in ambiguous_runs)
+                    and isinstance(recorded[ordinal], str)):
+                group = bash_command_group(recorded[ordinal])
+                group_source = 'recorded'
+            elif number(index) and index < len(results) and bash_per_run[index] == 1:
                 result = results[index]
                 call_id = result.get('tool_call_id') if isinstance(result, dict) else None
                 source = sources.get(call_id) if isinstance(call_id, str) else None
@@ -509,6 +692,7 @@ class Timing:
                 self.bash_unmatched += 1
             else:
                 self.bash.setdefault(group, []).append(duration)
+                self.bash_sources[group_source] += 1
 
     def report(self):
         def tool_summary(values):
@@ -523,7 +707,8 @@ class Timing:
                     tools={name: tool_summary(values) for name, values in sorted(self.tools.items())},
                     streaming=dict(samples=len(spans), over_50_ms=streamed,
                                    ratio=streamed / len(spans) if spans else None),
-                    bash=dict(heuristic=True, matched_calls=sum(map(len, self.bash.values())),
+                    bash=dict(heuristic=True, sources=dict(self.bash_sources),
+                              matched_calls=sum(map(len, self.bash.values())),
                               unmatched_calls=self.bash_unmatched,
                               top10=[dict(command=name, **tool_summary(values)) for name, values in
                                      sorted(self.bash.items(), key=lambda p: (-sum(p[1]), p[0]))[:10]]))
@@ -611,6 +796,8 @@ def summarize(paths, since=None, cwd=None, group_by=None):
         length = header['from'] + len(header['messages'])
         current = None
         session_step = 0
+        recorded_steps = 0
+        recorded_commands = recorded_bash_commands(path)
         pending_agents = {}
         seen_agents = set()
 
@@ -624,6 +811,8 @@ def summarize(paths, since=None, cwd=None, group_by=None):
 
         for record in log:
             include = selected(record)
+            if not include and current is not None:
+                current['previous_effort'] = None
             has_at = number(record.get('at'))
             diagnostic = isinstance(record.get('diagnostic'), dict)
             lifecycle = isinstance(record.get('background') or record.get('background_agent'), dict)
@@ -632,7 +821,11 @@ def summarize(paths, since=None, cwd=None, group_by=None):
                 replacement = record['from'] < length
                 length = record['from'] + len(messages)
                 if replacement:
+                    if current is not None:
+                        current['previous_effort'] = None
                     continue
+                recorded_step = recorded_steps + 1
+                recorded_steps += sum(m['role'] == 'assistant' for m in messages)
             if include:
                 session_selected = True
                 time_filter['selected_records_with_at' if has_at else 'selected_records_using_mtime'] += 1
@@ -649,7 +842,8 @@ def summarize(paths, since=None, cwd=None, group_by=None):
             new_turn = (turn_step == 1 if explicit_turn else any(m['role'] == 'user' and m.get('source') not in ('background', 'background_agent') for m in messages))
             if new_turn or (explicit_turn and current is None):
                 finish_turn()
-                current = dict(steps=0, full_steps=0, timed=0, ms=0, complete=False, selected=False, previous=None)
+                current = dict(steps=0, full_steps=0, timed=0, ms=0, complete=False, selected=False,
+                               previous=None, previous_effort=None)
             if current is not None and include:
                 current['selected'] = True
             interrupted = False
@@ -660,6 +854,7 @@ def summarize(paths, since=None, cwd=None, group_by=None):
                     interrupted = True
                     if current is not None:
                         current['previous'] = None
+                        current['previous_effort'] = None
             is_step = any(m['role'] == 'assistant' for m in messages) and not interrupted
             if interrupted:
                 pending_agents.clear()
@@ -738,9 +933,11 @@ def summarize(paths, since=None, cwd=None, group_by=None):
                             matched = True
                     if not matched and (ok is False or candidates):
                         error('other_failure', candidates[0] if candidates else text, path.stem)
-            timing.add(record, sources, run_statuses)
+            timing.add(record, sources, run_statuses, recorded_commands.get(recorded_step))
             tool_data.add(record)
             if current is not None:
+                timing.effort.add_transition(current['previous_effort'], record, header)
+                current['previous_effort'] = record
                 structure = step_structure(step_codes, header.get('cwd') if isinstance(header.get('cwd'), str) else None)
                 previous = current['previous']
                 if previous is not None:
@@ -777,7 +974,7 @@ def summarize(paths, since=None, cwd=None, group_by=None):
             'notes': ["仅统计入选记录；失败率只用显式 run_results；token=prompt+completion（不重复加缓存），缓存率以 prompt 为分母；错误可重叠，工具/命令数为静态估计。",
                       "Turn 平均耗时只含已结束、全部 Step 入选且有 ms 的 Turn；--since 按记录 at（本地日期），缺失或无效 at 回退到文件修改时间。",
                       f"时间来源：{time_filter['selected_records_with_at']} 条按 at，{time_filter['selected_records_using_mtime']} 条回退文件时间（其中 {time_filter['selected_steps_using_mtime']} 个完整 Step）；计时仅有效字段、缺失不补零；p90=nearest-rank；first_data_ms 是首次收到任何流数据，非内容 token；model_ms 含重试/退避。",
-                      "run_ms 为 Step 内 Run 总耗时，run_result_ms 为单 Run；code_first_ms 为首段代码等待，code_span_ms=last-first，streaming 为 >50 ms 比例；calls 含失败、并行耗时可重叠；bash 计时按字面量首两词启发式分组，无法关联列 unmatched，非 shell 子命令耗时。timing.effort.by_effort 按完整 Step 顶层 effort 分组，缺 effort 跳过、缺计时仍计 Step；缓存率为有效 prompt/cache 成对字段的总和之比。各组及 timing.effort.downgraded：effort_source=model 且（effort_downgraded=true 或缺失/null）视为降档（已知等档应记录 false）；run_failure_rate=steps_with_failed_run/steps_with_runs，仅关联本 Step 模型响应产生的 Run，任一显式 ok=false 即失败；未知状态仍入分母，并列 steps_with_unknown_run_status；无 Run 不入分母。"]}
+                      "run_ms 为 Step 内 Run 总耗时，run_result_ms 为单 Run；code_first_ms 为首段代码等待，code_span_ms=last-first，streaming 为 >50 ms 比例；calls 含失败、并行耗时可重叠；bash 计时按 &&/||/;/|/换行拆段（不拆引号、heredoc 正文），各段首两词以 → 连接；优先关联 calls.jsonl 的实际 args.command，旧日志回退静态字面量；timing.bash.sources 计成功分组的 recorded/static 条数，无法关联或分组列 unmatched，耗时仍为整个 bash、非子命令耗时；写→仅验证等静态指标口径不变。timing.effort.by_effort 按完整 Step 顶层 effort 分组，缺 effort 跳过、缺计时仍计 Step；缓存率为有效 prompt/cache 成对字段的总和之比。timing.effort.cache_transitions 按 header provider/model（缺失为 unknown）分组，比较同 Turn 相邻入选完整 Step 的 effort 相同/不同，统计后一步 cache/prompt 的 samples/median/mean（逐 Step 等权，非 token 加权）；两步缺 effort 或有效 prompt/cache 跳过，后步 prompt 必须大于零，不跨过滤/取消/压缩断点，不补零。各组及 timing.effort.downgraded：effort_source=model 且（effort_downgraded=true 或缺失/null）视为降档（已知等档应记录 false）；run_failure_rate=steps_with_failed_run/steps_with_runs，仅关联本 Step 模型响应产生的 Run，任一显式 ok=false 即失败；未知状态仍入分母，并列 steps_with_unknown_run_status；无 Run 不入分母。"]}
 
     if group_by is not None:
         report['group_by'] = group_by
@@ -843,6 +1040,14 @@ def text_report(report):
         lines.append(f"      downgraded steps={down['steps']}; 本 Step Run 失败 {down['steps_with_failed_run']}/{down['steps_with_runs']} = {pct(down['run_failure_rate'])}（状态未知 Step={down['steps_with_unknown_run_status']}）")
     if not effort['by_effort']:
         lines.append('    无 effort 记录')
+    lines.append('    effort 缓存转换（同 Turn 相邻完整入选 Step；后一步 cache/prompt）：')
+    for item in effort['cache_transitions']:
+        lines.append(f"      provider={item['provider']} model={item['model']}")
+        for kind in ('same_effort', 'different_effort'):
+            summary = item[kind]
+            lines.append(f"        {kind}: samples={summary['samples']} median={pct(summary['median'])} mean={pct(summary['mean'])}")
+    if not effort['cache_transitions']:
+        lines.append('      无有效转换样本')
     down = effort['downgraded']
     lines.append(f"  降档 Step 合计 {down['steps']}；本 Step Run 失败 {down['steps_with_failed_run']}/{down['steps_with_runs']} = {pct(down['run_failure_rate'])}（状态未知 Step={down['steps_with_unknown_run_status']}）")
     streaming = timing['streaming']
@@ -853,7 +1058,7 @@ def text_report(report):
     if not timing['tools']:
         lines.append('    无计时记录')
     bash = timing['bash']
-    lines.append(f"  bash 计时 Top 10（heuristic 字面量首两个单词；matched={bash['matched_calls']}, unmatched={bash['unmatched_calls']}）：")
+    lines.append(f"  bash 计时 Top 10（heuristic 各段首两词 →；录制={bash['sources']['recorded']}, 静态={bash['sources']['static']}; matched={bash['matched_calls']}, unmatched={bash['unmatched_calls']}）：")
     for item in bash['top10']:
         lines.append(f"    {item['command']}: count={item['count']} total={item['total_ms']} ms median={fmt(item['median_ms'])} ms")
     if not bash['top10']:

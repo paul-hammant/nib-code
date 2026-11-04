@@ -80,7 +80,7 @@ assistant 消息的可选 `step_effort: {effort, source}` 保存界面元数据�
 
 ## 会话统计
 
-会话统计：`python3 scripts/stats.py [日志文件或目录] [--since YYYY-MM-DD] [--cwd 目录] [--group-by version|system|patches] [--json]`，默认只读 `$NIB_HOME/sessions`（默认 `~/.nib/sessions`），用于发现故障和比较改动前后效果。文本和 JSON 均包含“耗时构成”：Step/model/run 的中位数与 p90、首段代码前等待和参数生成跨度、运行时各工具调用次数/总耗时/中位耗时，以及参数到达跨度严格大于 50 ms 的 run 比例；每项列出有效样本数，旧日志缺字段不补零。bash 耗时 Top 10 按保存的 JS 命令字面量前两个 shell 单词启发式分组，无法可靠关联的动态/多调用列为 unmatched，不把整个 bash 耗时分摊给 shell 子命令。
+会话统计：`python3 scripts/stats.py [日志文件或目录] [--since YYYY-MM-DD] [--cwd 目录] [--group-by version|system|patches] [--json]`，默认只读 `$NIB_HOME/sessions`（默认 `~/.nib/sessions`），用于发现故障和比较改动前后效果。文本和 JSON 均包含“耗时构成”：Step/model/run 的中位数与 p90、首段代码前等待和参数生成跨度、运行时各工具调用次数/总耗时/中位耗时，以及参数到达跨度严格大于 50 ms 的 run 比例；每项列出有效样本数，旧日志缺字段不补零。bash 耗时 Top 10（JSON `timing.bash.top10`）按 shell 命令中的 `&&`、`||`、`;`、`|` 和换行拆段，不拆引号和 heredoc 正文；将每段前两个 shell 单词按顺序用 ` → ` 连接，例如 `zig fmt x && zig build test` 归为 `zig fmt → zig build`，单段保持原分组。标签仍是启发式，耗时为整个 bash 调用，不推算各段耗时或实际走过的分支。优先取同目录 `<id>.calls.jsonl` 中实际的 `args.command`，按会话 Step、Run 及 bash 调用顺序关联（录制以创建顺序 index 排序，不用结算顺序 seq；多 bash 须数量一致且无未调度项），无法可靠关联时回退旧的静态 JS 字面量启发式。`timing.bash.sources.recorded` / `static` 分别是成功分组的两种来源条数，二者之和为 `matched_calls`；无法关联或无法分组的计时调用列为 `unmatched_calls`。录制不改变静态工具/命令计数或“写→仅验证”等往返结构指标。
 
 “工具数据度量”（JSON `tool_data`）独立累计 Step 顶层 `tool_bytes`、`output_bytes` 的有效样本数和总字节，不与 Run/calls 相加，也不从其他层回填。`output_tool_ratio` 按 `run_results[]` 中两字段有效且 `tool_bytes>0` 的 Run，统计各自 `output_bytes/tool_bytes` 的中位数、p90（nearest-rank）和样本数，不是总量之比，比例可大于 1。工具占比按有效 `calls[].result_bytes` 的总和为分母，按 name 汇总字节和调用数；明细被省略时覆盖有限，不代表全部工具数据。旧日志缺失字段跳过，不补零；明细总字节为零时占比为 n/a。
 
@@ -93,6 +93,8 @@ JSON `agents` 和 `bash_calls` 分别统计 agent、bash 的前台/后台调用�
 “往返结构”（JSON `round_trips`）包含每 Turn 入选 Step 数的中位数/p90（nearest-rank、含零步 Turn），写→仅验证相邻对次数/全部相邻对，以及连续写的不同文件对次数/有效连续写对；每项给出样本数。相邻对限同一 Turn，不跨过滤或取消断点；验证沿用 bash 首两词启发式（build/test/fmt/check/diff 等），多 Run/调用必须全部是可识别验证 bash，动态或复合 shell 保守跳过。写路径只取直接 edit/write 的完整字面量，按 cwd 规范化；两步文件集合不相交才计“不同文件”，缺失/动态路径跳过，不推断 bash 的文件副作用。
 
 耗时构成的 `timing.effort.by_effort` 按完整 Step 的顶层 effort 分组，列出 Step 数、model_ms 分布（含中位数和样本数）、prompt/cache token 总量与缓存命中率。缺 effort 的旧记录跳过，缺计时仍计 Step；缓存率为有效 prompt/cache 成对字段的总和之比，不是各 Step 比例的平均。
+
+`timing.effort.cache_transitions` 按会话 header 的 provider/model 分组（各字段缺失或无效时为 `unknown`），分别给出同一 Turn 内相邻完整入选 Step 的 effort 相同（`same_effort`）或不同（`different_effort`）时，后一步缓存命中率 `prompt_cache_hit_tokens / prompt_tokens` 的 `samples`、`median` 和 `mean`。这是逐 Step 等权的中位数/算术平均，不是 token 总和之比；无样本时为 0/null/null。两步均须有非空 effort 及有效非负整数 prompt/cache 字段，不要求 completion 字段；后一步 prompt 必须大于零。缺失/无效 Step 不补零，也不跨过它与更早的 Step 配对；不跨 Turn、会话、过滤、取消或压缩替换断点。已有 `by_effort` 的缓存率口径不变。此项用于持续观察不同 provider/model 下 effort 切换与缓存命中的关系，不将分组差异直接当成因果结论。
 
 各档 `downgraded` 及跨档 `timing.effort.downgraded` 给出降档后的 Run 失败率：分母是有 Run 的降档 Step 数，分子是该 Step 响应后执行的任一 Run 显式 `ok=false` 的 Step 数，不关联后一个 Step，也不把无 Run 的最终回答放入分母。未知 Run 状态仍入分母并单列 `steps_with_unknown_run_status`。降档按 `effort_source=model` 且 `effort_downgraded=true` 判定；缺少后一字段的过渡记录按 model 来源推断，显式 false 排除等档声明。
 
