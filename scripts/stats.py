@@ -353,7 +353,7 @@ def literal_properties(tokens, start):
 
 
 def validation_command(command):
-    if not command or re.search(r'[$`<>\\\n]', command):
+    if not isinstance(command, str) or not command or re.search(r'[$`<>\\\n]', command):
         return False
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|()')
@@ -370,10 +370,13 @@ def validation_command(command):
     subcommand = words[1] if len(words) > 1 else ''
     families = {'zig': {'build', 'test', 'fmt', 'ast-check'},
                 'cargo': {'build', 'test', 'fmt', 'check', 'clippy'},
-                'git': {'diff'}, 'go': {'build', 'test', 'fmt', 'vet'},
+                'git': {'status', 'diff', 'log', 'fetch', 'show'}, 'go': {'build', 'test', 'fmt', 'vet'},
                 'npm': {'test'}, 'npx': {'tsc'},
                 'make': {'test', 'check', 'build', 'lint', 'fmt'}}
-    if executable in {'diff', 'pytest', 'py.test', 'mypy', 'tsc', 'check', 'fmt'}:
+    if executable == 'gh':
+        return bool(re.match(r'^\s*gh\s+pr\s+(?:view|checks)(?:\s|$)', command))
+    if executable in {'diff', 'pytest', 'py.test', 'mypy', 'tsc', 'check', 'fmt',
+                      'tail', 'cat', 'ls', 'head', 'pwd'}:
         return True
     if executable == 'ruff':
         return subcommand in {'check', 'format'}
@@ -382,7 +385,7 @@ def validation_command(command):
     return subcommand in families.get(executable, set())
 
 
-def step_structure(codes, cwd=None):
+def step_structure(codes, cwd=None, *, allow_read=False, allow_empty=False):
     writes, complete, validation, calls = False, True, True, 0
     paths = set()
     for code in codes:
@@ -391,6 +394,12 @@ def step_structure(codes, cwd=None):
             continue
         tokens = [m[0] for m in JS_TOKEN.finditer(code)
                   if not m[0].isspace() and not m[0].startswith(('//', '/*'))]
+        if allow_read and (any(token in {'if', 'else', 'for', 'while', 'switch', 'case',
+                                         'function', 'class', 'try', 'catch', 'throw', 'return', '?'}
+                               for token in tokens)
+                           or any(tokens[index:index + 2] in (['=', '>'], ['&', '&'], ['|', '|'])
+                                  for index in range(len(tokens) - 1))):
+            validation = False
         safe_calls = {('console', '.', 'log'), ('JSON', '.', 'stringify'), ('JSON', '.', 'parse'),
                       ('Promise', '.', 'all'), ('Promise', '.', 'allSettled')}
         for index, token in enumerate(tokens):
@@ -421,10 +430,65 @@ def step_structure(codes, cwd=None):
                     paths.add(os.path.normpath(os.path.join(cwd or '', path)))
             elif name not in ('read', 'grep', 'glob', 'bash', 'fetch'):
                 complete = False
-            if name != 'bash' or properties is None or not validation_command(properties.get('command')):
-                validation = False
+            if not (allow_read and name == 'read'):
+                if name != 'bash' or properties is None or not validation_command(properties.get('command')):
+                    validation = False
     return dict(writes=writes, paths=paths if writes and complete else None,
-                validation=bool(calls) and validation)
+                validation=(bool(calls) or allow_empty) and validation)
+
+
+def complete_recorded_calls(path):
+    runs, metadata = {}, {}
+    try:
+        with path.with_suffix(".calls.jsonl").open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                try:
+                    call = json.loads(line)
+                except (ValueError, RecursionError):
+                    continue
+                if not isinstance(call, dict):
+                    continue
+                key = call.get("step"), call.get("run")
+                if not all(number(value) for value in key):
+                    continue
+                if isinstance(call.get("meta"), dict):
+                    metadata.setdefault(key, []).append(call["meta"])
+                elif number(call.get("index")):
+                    args = call.get("args")
+                    command = args.get("command") if isinstance(args, dict) else None
+                    runs.setdefault(key, []).append(dict(index=call["index"], name=call.get("name"),
+                                                         args=dict(command=command)))
+    except OSError:
+        return {}
+    complete = {}
+    for key, metas in metadata.items():
+        if len(metas) != 1 or metas[0].get("incomplete") or metas[0].get("end") not in ("ok", "error"):
+            continue
+        calls = sorted(runs.get(key, []), key=lambda call: call["index"])
+        if [call["index"] for call in calls] == list(range(len(calls))):
+            complete[key] = calls
+    return complete
+
+
+def mechanical_step(codes, recorded_step, recordings):
+    valid, calls = True, 0
+    sources, static_codes = set(), []
+    for run, code in enumerate(codes):
+        recorded = recordings.get((recorded_step, run)) if isinstance(code, str) else None
+        if recorded is None:
+            sources.add("static")
+            static_codes.append(code)
+        else:
+            sources.add("recorded")
+            calls += len(recorded)
+            for call in recorded:
+                name, args = call.get("name"), call.get("args")
+                if name != "read" and not (name == "bash" and isinstance(args, dict)
+                                            and validation_command(args.get("command"))):
+                    valid = False
+    source = next(iter(sources)) if len(sources) == 1 else "mixed" if sources else "static"
+    structure = step_structure(static_codes, allow_read=True, allow_empty=bool(calls))
+    return valid and structure["validation"], source
 
 
 def header_group(header, group_by):
@@ -791,6 +855,9 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
                 _systems[path.stem] = header_group(header, 'system')
     group_paths = {}
     adjacent_pairs = write_validation_pairs = file_pairs = disjoint_pairs = 0
+    mechanical = dict(count=0, samples=0, ms=0, sample_ms=0, timed_samples=0, timed_count=0,
+                      sources=dict(recorded=0, static=0, mixed=0),
+                      hit_sources=dict(recorded=0, static=0, mixed=0))
     totals = dict(sessions=0, root_sessions=0, child_sessions=0, turns=0, steps=0, runs=0,
                   runs_failed=0, runs_with_status=0, runs_unknown=0, steps_with_usage=0,
                   steps_with_ms=0, timed_turns=0)
@@ -842,6 +909,7 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
         child_model_ms, child_prompt_tokens, child_uncached_prompt_tokens = [], [], []
         recorded_steps = 0
         recorded_commands = recorded_bash_commands(path)
+        mechanical_recordings = complete_recorded_calls(path)
         pending_agents = {}
         seen_agents = set()
 
@@ -857,6 +925,7 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
             include = selected(record)
             if not include and current is not None:
                 current['previous_effort'] = None
+                current['mechanical_previous'] = None
             has_at = number(record.get('at'))
             diagnostic = isinstance(record.get('diagnostic'), dict)
             lifecycle = isinstance(record.get('background') or record.get('background_agent'), dict)
@@ -867,6 +936,7 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
                 if replacement:
                     if current is not None:
                         current['previous_effort'] = None
+                        current['mechanical_previous'] = None
                     continue
                 recorded_step = recorded_steps + 1
                 recorded_steps += sum(m['role'] == 'assistant' for m in messages)
@@ -887,7 +957,7 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
             if new_turn or (explicit_turn and current is None):
                 finish_turn()
                 current = dict(steps=0, full_steps=0, timed=0, ms=0, complete=False, selected=False,
-                               previous=None, previous_effort=None)
+                               previous=None, previous_effort=None, mechanical_previous=None)
             if current is not None and include:
                 current['selected'] = True
             interrupted = False
@@ -899,6 +969,7 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
                     if current is not None:
                         current['previous'] = None
                         current['previous_effort'] = None
+                        current['mechanical_previous'] = None
             is_step = any(m['role'] == 'assistant' for m in messages) and not interrupted
             if interrupted:
                 pending_agents.clear()
@@ -1001,6 +1072,23 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
                         file_pairs += 1
                         disjoint_pairs += previous['paths'].isdisjoint(structure['paths'])
                 current['previous'] = structure
+                previous_mechanical = current['mechanical_previous']
+                position = turn_step if explicit_turn else current['full_steps']
+                if (position > 1 and previous_mechanical is not None
+                        and previous_mechanical['position'] == position - 1
+                        and previous_mechanical['ok']):
+                    hit, source = mechanical_step(step_codes, recorded_step, mechanical_recordings)
+                    mechanical['samples'] += 1
+                    mechanical['sources'][source] += 1
+                    mechanical['count'] += hit
+                    mechanical['hit_sources'][source] += hit
+                    if number(ms):
+                        mechanical['timed_samples'] += 1
+                        mechanical['sample_ms'] += ms
+                        mechanical['timed_count'] += hit
+                        mechanical['ms'] += ms if hit else 0
+                current['mechanical_previous'] = dict(
+                    position=position, ok=bool(run_statuses) and all(ok is True for ok in run_statuses))
         finish_turn()
         if session_selected:
             totals['sessions'] += 1
@@ -1017,6 +1105,8 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
     totals['avg_turn_ms'] = sum(turn_times) / len(turn_times) if turn_times else None
     usage['total_tokens'] = usage['prompt_tokens'] + usage['completion_tokens']
     usage['cache_hit_rate'] = usage['prompt_cache_hit_tokens'] / usage['prompt_tokens'] if usage['prompt_tokens'] else None
+    mechanical['ratio'] = mechanical['count'] / mechanical['samples'] if mechanical['samples'] else None
+    mechanical['time_ratio'] = mechanical['ms'] / mechanical['sample_ms'] if mechanical['sample_ms'] else None
     def pair_summary(count, pairs):
         return dict(count=count, pairs=pairs, ratio=count / pairs if pairs else None)
 
@@ -1027,13 +1117,15 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
             'agents': agents.report(), 'bash_calls': agents.report('bash'),
             'round_trips': dict(steps_per_turn=distribution(turn_steps),
                                write_to_validation=pair_summary(write_validation_pairs, adjacent_pairs),
+                               mechanical_followups=mechanical,
                                disjoint_write_files=pair_summary(disjoint_pairs, file_pairs),
-                               notes=["Step 分布按入选 Turn（含零步；旧日志按 user 估算边界）；相邻对限同 Turn、不跨过滤/取消断点。写→验证分母为全部相邻对，后步仅含静态验证 bash，沿用首两词启发式。",
+                               notes=["机械收尾样本为同 Turn 相邻 Step，后步 turn_step>1（旧日志按 Turn 内序号估算），前步至少一个 Run 且全部显式 ok=true；不跨过滤、取消或压缩替换。命中后步仅调用 bash/read，全部 bash 复用写→仅验证的验证/状态启发式；无调用不命中。ratio=count/samples；time_ratio=命中且有 ms 的后步耗时/样本中有 ms 的后步耗时，缺计时不补零。完整逐 Run 录制优先使用实际工具和 args.command，缺失/不完整回退静态提取；sources/hit_sources 按样本/命中 Step 计 recorded/static/mixed（部分 Run 回退）。",
+                                      "Step 分布按入选 Turn（含零步；旧日志按 user 估算边界）；相邻对限同 Turn、不跨过滤/取消断点。写→验证分母为全部相邻对，后步仅含静态验证 bash，沿用首两词启发式。",
                                       "连续写以双方直接 edit/write 的完整字面量路径为样本（按 cwd 规范化）；文件集合不相交才计不同文件。动态/未知调用跳过；不推断 bash 副作用，fmt 也归验证。"]),
             'notes': ["仅统计入选记录；失败率只用显式 run_results；token=prompt+completion（不重复加缓存），缓存率以 prompt 为分母；错误可重叠，工具/命令数为静态估计。",
                       "Turn 平均耗时只含已结束、全部 Step 入选且有 ms 的 Turn；--since 按记录 at（本地日期），缺失或无效 at 回退到文件修改时间。",
                       f"时间来源：{time_filter['selected_records_with_at']} 条按 at，{time_filter['selected_records_using_mtime']} 条回退文件时间（其中 {time_filter['selected_steps_using_mtime']} 个完整 Step）；计时仅有效字段、缺失不补零；p90=nearest-rank；first_data_ms 是首次收到任何流数据，非内容 token；model_ms 含重试/退避。",
-                      "run_ms 为 Step 内 Run 总耗时，run_result_ms 为单 Run；code_first_ms 为首段代码等待，code_span_ms=last-first，streaming 为 >50 ms 比例；calls 含失败、并行耗时可重叠；bash 计时按 &&/||/;/|/换行拆段（不拆引号、heredoc 正文），各段首两词以 → 连接；优先关联 calls.jsonl 的实际 args.command，旧日志回退静态字面量；timing.bash.sources 计成功分组的 recorded/static 条数，无法关联或分组列 unmatched，耗时仍为整个 bash、非子命令耗时；写→仅验证等静态指标口径不变。timing.effort.by_effort 按完整 Step 顶层 effort 分组，缺 effort 跳过、缺计时仍计 Step；缓存率为有效 prompt/cache 成对字段的总和之比。timing.effort.cache_transitions 按 header provider/model（缺失为 unknown）分组，比较同 Turn 相邻入选完整 Step 的 effort 相同/不同，统计后一步 cache/prompt 的 samples/median/mean（逐 Step 等权，非 token 加权）；两步缺 effort 或有效 prompt/cache 跳过，后步 prompt 必须大于零，不跨过滤/取消/压缩断点，不补零。各组及 timing.effort.downgraded：effort_source=model 且（effort_downgraded=true 或缺失/null）视为降档（已知等档应记录 false）；run_failure_rate=steps_with_failed_run/steps_with_runs，仅关联本 Step 模型响应产生的 Run，任一显式 ok=false 即失败；未知状态仍入分母，并列 steps_with_unknown_run_status；无 Run 不入分母。"]}
+                      "run_ms 为 Step 内 Run 总耗时，run_result_ms 为单 Run；code_first_ms 为首段代码等待，code_span_ms=last-first，streaming 为 >50 ms 比例；calls 含失败、并行耗时可重叠；bash 计时按 &&/||/;/|/换行拆段（不拆引号、heredoc 正文），各段首两词以 → 连接；优先关联 calls.jsonl 的实际 args.command，旧日志回退静态字面量；timing.bash.sources 计成功分组的 recorded/static 条数，无法关联或分组列 unmatched，耗时仍为整个 bash、非子命令耗时；写→仅验证仍只用静态提取，但共享分类器现也认可 git status/log/fetch/show、gh pr view/checks、tail/cat/ls/head/pwd；这些状态命令可使其命中数增加，read 仍不算仅验证。timing.effort.by_effort 按完整 Step 顶层 effort 分组，缺 effort 跳过、缺计时仍计 Step；缓存率为有效 prompt/cache 成对字段的总和之比。timing.effort.cache_transitions 按 header provider/model（缺失为 unknown）分组，比较同 Turn 相邻入选完整 Step 的 effort 相同/不同，统计后一步 cache/prompt 的 samples/median/mean（逐 Step 等权，非 token 加权）；两步缺 effort 或有效 prompt/cache 跳过，后步 prompt 必须大于零，不跨过滤/取消/压缩断点，不补零。各组及 timing.effort.downgraded：effort_source=model 且（effort_downgraded=true 或缺失/null）视为降档（已知等档应记录 false）；run_failure_rate=steps_with_failed_run/steps_with_runs，仅关联本 Step 模型响应产生的 Run，任一显式 ok=false 即失败；未知状态仍入分母，并列 steps_with_unknown_run_status；无 Run 不入分母。"]}
 
     if group_by is not None:
         report['group_by'] = group_by
@@ -1083,6 +1175,10 @@ def text_report(report):
     for name, label in (('write_to_validation', '写→仅验证'), ('disjoint_write_files', '连续写不同文件（不相交）')):
         item = structure[name]
         section.append(f"  {label}: {item['count']}/{item['pairs']} = {pct(item['ratio'])}（samples={item['pairs']}）")
+    followups = structure["mechanical_followups"]
+    section.append(f"  成功后的机械收尾 Step（mechanical follow-ups）: {followups['count']}/{followups['samples']} = {pct(followups['ratio'])}；Step 时间 {followups['ms']}/{followups['sample_ms']} ms = {pct(followups['time_ratio'])}（计时 {followups['timed_count']}/{followups['timed_samples']}）")
+    for key, label in (("sources", "样本来源"), ("hit_sources", "命中来源")):
+        section.append(f"    {label}: " + ", ".join(f"{name}={count}" for name, count in followups[key].items()))
     section.extend("  " + note for note in structure['notes'])
     lines[4:4] = section
     lines.append('错误分类：')
