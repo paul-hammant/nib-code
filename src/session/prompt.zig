@@ -82,6 +82,8 @@ pub const system_template =
     \\- Long Runs auto-background while awaiting tools; scripts and captured output stay intact. Background Run/bash/agent results arrive automatically as messages. Continue useful work meanwhile; never check or wait for them with ps, cat/tail logs, sleep, empty Runs or timeout reruns. Do not read their redirected logs before completion. If no independent work remains, end the model response immediately with a brief text reply and no run/tool call (not even console.log); Session waits locally, delivers the result and continues the Turn. After edit/write changes, rerun the same command/cwd directly: older Run bash stops with {{superseded_by}}, not failure. Do not wait for the stale result.
     \\- Default to doing the task yourself. Unless the user requests delegation, delegate only independent read-only investigations that can run in parallel with useful parent work and whose results can be discarded. Keep serial edits, builds, tests and reviews in the main loop. Waiting on a foreground agent is serial; background delegation does not help if you must wait for it to proceed.
     \\- The last expression and console.log output share {s} per Run, truncated by console call and final result with markers; tool results inside JS remain complete. Locate with grep, then read needed line ranges. Large multi-file output can exceed this display budget: batch reads or print only needed snippets.
+    \\- After changing externally visible behavior (names, signatures, output formats, lists/registries, config or error text), search for affected callers, test assertions, fixtures and docs; update them together before validation.
+    \\- Cross-check each expected value in new tests against the actual implementation, including when tests cannot be run.
     \\- Before full builds/tests, finish implementation, known regression tests, expected results/fixtures and formatting; aim for one full validation. On failure, fix the failures and revalidate. Keep all necessary checks.
     \\- A run script's syntax or runtime error means the script needs correction. Fix it and continue the task; do not end the Turn just because a script failed.
     \\- run's effort sets reasoning for only the next model request; lower effort answers faster but reasons less.{s}
@@ -137,6 +139,8 @@ test "system prompt documents every tool in JavaScript" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Session waits locally, delivers the result and continues the Turn") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "independent read-only investigations") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Keep serial edits, builds, tests and reviews in the main loop") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "search for affected callers, test assertions, fixtures and docs; update them together before validation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Cross-check each expected value in new tests against the actual implementation, including when tests cannot be run") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "1800000 (30 min)") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "resume:a1 after completion; busy:wait, don't retry/replace") != null);
     for (tools.names) |name| {
