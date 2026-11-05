@@ -21,7 +21,7 @@ const all = [_]Tool{
         .name = "sleep",
         .doc =
         \\  // Wait ms (integer 0..2147483647); cancellable, no process/thread or tool slot. Counts Run wall time, not JS budget. Run drains even unawaited sleeps.
-        \\  // For timed delays such as service readiness. Never sleep to wait for background bash/agent/Run results; with no independent work, reply briefly without tools and Session waits for delivery.
+        \\  // For timed delays such as service readiness. Background Run/bash/agent results arrive automatically as messages; never sleep or poll for them. No independent work: brief reply without tools; Session waits.
         \\  async sleep(ms) {}, // → null
         ,
     },
@@ -80,11 +80,12 @@ const all = [_]Tool{
         .name = "bash",
         .run = bash.bash,
         .doc =
-        \\  // Bash in cwd; merged stderr. Group killed on return, including nohup/&. Killed:exit_code:null.
-        \\  // Output >16 MiB errors: redirect to file. >256 shell words (except heredocs): write a script.
-        \\  // background:{id}, later result. detached requires background; survives Turns, ends with shell. stop/timeout/cancel/failure/exit cleans up.
-        \\  // Long Runs auto-background; await unchanged. No sleep/polling/reruns. No independent work: brief reply without tools; Session waits.
-        \\  async bash({ command, timeout_ms, background = false, detached = false }) {}, // → { exit_code, output } or { id }; timeout_ms default: detached 0 (unlimited), else 1800000 (30 min), including auto-background Runs
+        \\  // cwd; merged stderr. Group killed on return (nohup/& too); killed:exit_code:null.
+        \\  // >16 MiB errors: redirect; otherwise capture test output. >256 words except heredocs: script.
+        \\  // background:{id}, auto-message. detached needs background; spans Turns, ends with shell; stop/timeout/cancel/failure/exit cleans up.
+        \\  // Auto-background keeps await/output. No ps/cat/tail/sleep/timeout reruns or pending log reads. No other work:reply without tools; Session waits.
+        \\  // Example: await tools.bash({command: "zig build test --summary all"})
+        \\  async bash({ command, timeout_ms, background = false, detached = false }) {}, // → { exit_code, output } or { id }; timeout_ms: detached 0, else 1800000 (30 min)
         ,
     },
     .{
@@ -111,9 +112,9 @@ const all = [_]Tool{
         .run = subagent.agent,
         .doc =
         \\  // Default: work yourself. Unless requested, delegate only parallel independent read-only investigations with discardable results.
-        \\  // Serial edits/builds/tests/reviews stay in parent. Foreground waiting is serial. No nesting; shared cwd, partial files possible.
+        \\  // Serial edits/builds/tests/reviews:parent. No nesting; shared cwd, partial files possible.
         \\  // fork:parent history; model/effort switch loses cache. resume:a1 after completion; busy:wait, don't retry/replace. fork+resume rejects.
-        \\  // background:{id}, auto-result. No sleep/polling; no independent work:brief reply without tools; Session waits. Failure:ok:false; args/cancel reject.
+        \\  // background:{id}, auto-delivered result message. No ps/log reads/sleep/reruns to check/wait. No independent work:brief reply without tools; Session waits. Failure:ok:false; args/cancel reject.
         \\  async agent({ prompt, resume, fork = false, timeout_ms = 1800000, model, effort, background = false }) {}, // → { ok, id, text, usage, changes, error? } or { id }
         ,
     },
@@ -479,13 +480,28 @@ test "llm map documentation example reaches the host byte for byte" {
     const rendered = try t.documentation(testing.allocator);
     defer testing.allocator.free(rendered);
     const marker = "// Example: ";
-    const start = std.mem.indexOf(u8, rendered, marker).? + marker.len;
+    const llm_start = std.mem.indexOf(u8, rendered, "  // Pure single-step").?;
+    const start = std.mem.indexOfPos(u8, rendered, llm_start, marker).? + marker.len;
     const end = std.mem.indexOfScalarPos(u8, rendered, start, '\n').?;
     var dummy: u8 = 0;
     const result = try sandbox.eval(testing.allocator, testing.io, rendered[start..end], .{}, .{ .ctx = &dummy, .names = &.{"llm"}, .call = EchoLlm.call }, null);
     defer result.deinit(testing.allocator);
     try testing.expect(result.ok);
     try testing.expectEqualStrings("[{\"prompt\":\"Classify the input\",\"input\":\"yes\"},{\"prompt\":\"Classify the input\",\"input\":\"no\"}]", result.text);
+}
+
+test "bash documentation example keeps test output captured byte for byte" {
+    const doc = for (all) |tool| {
+        if (std.mem.eql(u8, tool.name, "bash")) break tool.doc;
+    } else unreachable;
+    const marker = "Example: ";
+    const start = std.mem.indexOf(u8, doc, marker).? + marker.len;
+    const end = std.mem.indexOfScalarPos(u8, doc, start, '\n').?;
+    var dummy: u8 = 0;
+    const result = try sandbox.eval(testing.allocator, testing.io, doc[start..end], .{}, .{ .ctx = &dummy, .names = &.{"bash"}, .call = EchoLlm.call }, null);
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.ok);
+    try testing.expectEqualStrings("{\"command\":\"zig build test --summary all\"}", result.text);
 }
 
 test "grep documentation RegExp example reaches the host byte for byte" {

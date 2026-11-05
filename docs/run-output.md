@@ -100,7 +100,7 @@ console.log("service ready");
 
 ## 长 Run 自动转后台
 
-模型发起的 Run 超过 `[limits].run_background_after_ms`（默认 10000 ms）且沙箱仍在等待工具或 sleep 时，整个 Run 自动转后台，分配会话级 `r1…` ID。当前 Step 收到明确的“仍在执行、稍后投递最终输出、只做确实独立的工作、不要轮询或重跑”通知。它是成功登记的通知，不代表脚本执行成功。连续执行的 JS 不在中途转后台，仍受 JS 执行预算限制；工具等待和主线程轮询以约 20 ms 为粒度。
+模型发起的 Run 超过 `[limits].run_background_after_ms`（默认 10000 ms）且沙箱仍在等待工具或 sleep 时，整个 Run 自动转后台，分配会话级 `r1…` ID。当前 Step 收到明确通知：捕获的输出保留，完成后自动作为消息投递；只做独立工作，不用 ps、cat/tail 日志、sleep、空 Run 或 timeout 重跑检查/等待，也不提前读取重定向日志。测试输出默认直接捕获，只有超过 16 MiB 上限时才重定向。它是成功登记的通知，不代表脚本执行成功。连续执行的 JS 不在中途转后台，仍受 JS 执行预算限制；工具等待和主线程轮询以约 20 ms 为粒度。
 
 原 Sandbox、Promise、工具参数与结果保持原样：`const r = await tools.bash(...); if (r.exit_code) ...` 的 continuation 仍收到完整 `{exit_code,output}`，不会收到任务 ID。顶层 fulfill/reject 的 drain、JS 执行预算、工具超时和输出捕获上限均保持原语义。阈值之前与之后的 console 一起捕获，只在最终结果中展示一次；提前通知不展示部分 console。
 

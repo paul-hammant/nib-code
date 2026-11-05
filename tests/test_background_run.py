@@ -4,8 +4,10 @@ import http.server
 import json
 import os
 from pathlib import Path
+import shlex
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -55,7 +57,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             code = "await tools.sleep(150); 'resumed-result'" if index == 0 else None
         elif index == 0:
             if case == "wait":
-                code = "await tools.fetch(" + json.dumps({"url": f"http://127.0.0.1:{self.server.server_port}/work"}) + "); 'wait-result'"
+                script = ("import sys, urllib.request; print('stdout-before', flush=True); "
+                          "print(urllib.request.urlopen(" + repr(f"http://127.0.0.1:{self.server.server_port}/work") + ").read().decode(), flush=True); "
+                          "print('stderr-after', file=sys.stderr)")
+                code = "await tools.bash(" + json.dumps({"command": shlex.join([sys.executable, "-c", script])}) + ")"
             elif case == "timeout":
                 code = "await tools.bash(" + json.dumps({"command": "echo $$ > worker.pid; sleep 30", "timeout_ms": 500}) + ")"
             elif case in ("cancel", "crash", "stop"):
@@ -149,7 +154,9 @@ class BackgroundRunTests(unittest.TestCase):
         self.assertEqual(completion["tool_bytes"], sum(c["result_bytes"] for c in completion["calls"]))
         runs = [e["run_end"] for e in events if "run_end" in e]
         self.assertIn("continuing in background as r1", runs[0]["output"])
-        self.assertIn("do not sleep, poll or rerun it", runs[0]["output"])
+        self.assertIn("captured output is preserved and will arrive automatically as a message", runs[0]["output"])
+        self.assertIn("no ps, cat/tail logs, sleep, empty Runs or timeout reruns to check/wait", runs[0]["output"])
+        self.assertIn("Do not read its redirected logs before completion", runs[0]["output"])
         self.assertNotIn("before-yield", runs[0]["output"])
         self.assertEqual(runs[0]["changes"], [])
         self.assertEqual([c["path"] for c in runs[1]["changes"]], ["independent.txt"])
@@ -205,7 +212,11 @@ class BackgroundRunTests(unittest.TestCase):
         self.assertEqual(events[-1]["end"]["text"], "done")
         messages = self.server.requests[-1]["messages"]
         self.assertEqual(messages[-2]["content"], "Waiting.")
-        self.assertIn("wait-result", messages[-1]["content"])
+        completion = json.loads(messages[-1]["content"].split("\n", 1)[1].removeprefix("result: "))
+        self.assertEqual(completion, {"exit_code": 0, "output": "stdout-before\nwait-result\nstderr-after\n"})
+        self.assertFalse([c for r in rows for c in r.get("calls", [])])
+        self.assertEqual([c["name"] for c in self.results(rows)[0]["background_run"]["calls"]], ["bash"])
+        self.assertNotIn("stdout-before", next(e["run_end"]["output"] for e in events if "run_end" in e))
         self.assertNotIn("waiting", messages[-2])
 
     def test_completed_resume_does_not_redeliver_results(self):

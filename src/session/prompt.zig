@@ -79,7 +79,7 @@ pub const system_template =
     \\Writing scripts:
     \\- Top-level `await` works. Each Step is a full model round trip, usually 10 s or more; one Run can read several files, make all independent edits, then build and test, returning only what you need (such as failures).
 ++ std.fmt.comptimePrint("\n- Tool calls started without awaiting each one (e.g. Promise.all) run concurrently, up to {d} at a time; commands chained inside one bash call (&&, ;) run one after another.\n", .{sandbox.tool_concurrency}) ++
-    \\- Long Runs auto-background while awaiting tools; scripts/outputs stay intact. For all background bash/agent/Run tasks, do only independent work; never use tools.sleep or polling to wait for results, and do not rerun pending work. If no independent work remains, reply briefly without calling tools; Session waits locally, delivers the result and continues the Turn. Avoid changing files the task may use; reread after completion.
+    \\- Long Runs auto-background while awaiting tools; scripts and captured output stay intact. Background Run/bash/agent results arrive automatically as messages. Do only independent work meanwhile; never check or wait for them with ps, cat/tail logs, sleep, empty Runs or timeout reruns. Do not read their redirected logs before completion. If no independent work remains, reply briefly without calling tools; Session waits locally, delivers the result and continues the Turn. Avoid changing files the task may use; reread after completion.
     \\- Default to doing the task yourself. Unless the user requests delegation, delegate only independent read-only investigations that can run in parallel with useful parent work and whose results can be discarded. Keep serial edits, builds, tests and reviews in the main loop. Waiting on a foreground agent is serial; background delegation does not help if you must wait for it to proceed.
     \\- The last expression and console.log output share 16 KiB per Run, truncated by console call and final result with markers; filter in JS first; tool results inside JS remain complete.
     \\- run's effort sets reasoning for only the next model request; lower effort answers faster but reasons less.{s}
@@ -127,11 +127,12 @@ test "system prompt documents every tool in JavaScript" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "last expression and console.log output share 16 KiB per Run") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "tool results inside JS remain complete") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "failures).\n- Tool calls started without awaiting each one (e.g. Promise.all) run concurrently, up to 8 at a time;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "never use tools.sleep or polling to wait for results") != null);
+    for ([_][]const u8{ "Background Run/bash/agent results arrive automatically as messages", "ps, cat/tail logs, sleep, empty Runs or timeout reruns", "Do not read their redirected logs before completion" }) |text|
+        try std.testing.expect(std.mem.indexOf(u8, prompt, text) != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Session waits locally, delivers the result and continues the Turn") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "independent read-only investigations") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Keep serial edits, builds, tests and reviews in the main loop") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "1800000 (30 min), including auto-background Runs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "1800000 (30 min)") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "resume:a1 after completion; busy:wait, don't retry/replace") != null);
     for (tools.names) |name| {
         const call = try std.fmt.allocPrint(gpa, "async {s}(", .{name});
