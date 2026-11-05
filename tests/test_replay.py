@@ -562,7 +562,11 @@ class ReplayTests(unittest.TestCase):
             self.assertEqual([(r["step"], r["run"]) for r in rows if "meta" in r],
                              [(1, 0), (3, 0)])
             self.assertTrue(path.read_bytes().startswith(retained))
-            self.assertEqual(main.read_bytes(), committed)
+            current = main.read_bytes()
+            self.assertTrue(current.startswith(committed))
+            additions = [json.loads(line) for line in current[len(committed):].splitlines()]
+            self.assertTrue(additions)
+            self.assertTrue(all(r.get("bash") and not r["messages"] for r in additions))
         finally:
             os.killpg(proc.pid, signal.SIGKILL)
             proc.communicate(timeout=10)

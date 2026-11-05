@@ -77,7 +77,7 @@ timeout_ms 可省略，默认 30 分钟，不计排队时间。model/effort 省�
 
 后台任务与前台调用共用 agent 并发限额、模型/effort 配置、超时和取消路径；同一父会话的各 Run 不会因各自沙箱退出而取消后台任务。父 Turn 取消或失败、Session 退出时停止并清理未完成任务，不留下脱离父会话的子进程；恢复会话保留已写入日志的结果，未完成任务不会重启，而是插入 `[background agent <id> lost: process ended]`。后台 agent 的启动/结果插入通过 `background` 事件报告，见 [ask-json.md](ask-json.md)；结果消息的日志来源标记与统计口径见 [session-log.md](session-log.md)。
 
-`tools.bash({command, background: true})` 同样立即返回含 `id` 的启动确认；后台 bash 独立于 agent 并发限额。agent 与 bash 分别使用会话级编号 `a1、a2…` 和 `b1、b2…`：前后台 agent 仅在新建时分配，接续不递增编号、沿用原 id，后台 bash 在启动时分配，前台 bash 仅运行超过 3 秒、开始显示进度时分配。计数跨 Run/Turn 保留；恢复时根据日志中的任务 id 分别取各前缀最大值继续编号，兼容旧的共用计数日志且不补空号。后台 bash 最多同时运行 8 个，超出时立即 reject 并给出明确错误，不排队；子 agent 内也可使用。结果在下一次主模型请求前作为带来源标记的 user 消息插入，恢复未完成任务时插入 lost 消息。后台 bash 的生命周期也通过 `background` 事件报告。
+`tools.bash({command, background: true})` 同样立即返回含 `id` 的启动确认；后台 bash 独立于 agent 并发限额。agent 与 bash 分别使用会话级编号 `a1、a2…` 和 `b1、b2…`：前后台 agent 仅在新建时分配，接续不递增编号、沿用原 id，所有 bash 在启动时分配，前台 bash 仍只在运行超过 3 秒时显示进度。计数跨 Run/Turn 保留；恢复时根据日志中的任务 id 分别取各前缀最大值继续编号，兼容旧的共用计数日志且不补空号。后台 bash 最多同时运行 8 个，超出时立即 reject 并给出明确错误，不排队；子 agent 内也可使用。结果在下一次主模型请求前作为带来源标记的 user 消息插入，恢复未完成任务时插入 lost 消息。后台 bash 的生命周期也通过 `background` 事件报告。
 
 `tools.bash({command, background: true, detached: true})` 是会话级任务：跨 Run 和正常 Turn 存活，最终回答和 Step 上限收尾只等待普通后台任务，不等待 detached；停止提示只列实际等待的任务。detached 要求 `background:true`，默认 `timeout_ms:0`（无截止时间），也可显式指定正数超时；普通前台/后台 bash 默认 1800000 ms（30 分钟），Run 自动转后台不重置或缩短这个截止时间，显式正数 timeout_ms 始终优先。默认值的依据与清理边界见 [run-output.md](run-output.md#bash-执行时限)。它与其他 bash 共用 b 计数器、并发和输出上限。完成时只入 inbox，空闲时不自动发起 Turn；下一次 Step/Turn 消费一次。Turn 取消/失败、Session 退出或切换清理全部任务；ask 回答后退出 Session，因此不跨 ask 进程保活。恢复会话不重启进程，沿用 lost 消息。
 
@@ -112,3 +112,11 @@ bash 与子会话复用标准库子进程等待和进程组执行器。所有 ba
 `tools.stop` 同时接受其他后台 Run 的 `rN`；Run 不能 stop 自己。后台 Run 非 detached，最终回答和 Step 上限仍等待结果送达。Run 的后续代码也可以启动显式后台 bash/agent，沿用其各自的普通或 detached 语义。只有 Session 主线程向 sink 转发进度/用量/结果；后台沙箱与工具线程不调用前台 sink。
 
 无工具调用的文本回复在仍有普通后台任务时一定提交为 waiting Step 并进入本地等待；不看文本长短、不识别“等待”关键词。一个 Step 的全部 Run 都成功、没有输出且没有任何实际宿主工具调用（例如空 Run 或仅打印空行）时，同样等待，不额外请求模型。有计算输出或实际调用过工具的 Run 仍按正常工作处理，不能把任意 git/read/stop 调用自动当作等待。后台结果或用户插话到达后再继续；detached 任务保持跨 Turn 语义。
+
+## 同一命令取代过时执行
+
+同一 Session 的 bash 启动时，只要仍在运行的旧 bash 属于更早的 Run、命令字符串及启动 cwd 完全相同，且旧 bash 启动后本 Session 的 edit/write 确实修改过文件，就自动停止旧 bash 的进程组。无需先等旧验证结果；修改后可直接再次启动同一验证。命令不按语言或用途分类，不解析 shell 的 cd、参数或重定向。相同 Run 内的并行调用不互相取代，无修改的重复调用不取代、不缓存结果；新旧任一方显式 detached 都不参与。
+
+旧调用 resolve 为 `{superseded_by:"bN"}`，没有 exit_code、output 或 error：它表示已被更新的同一验证取代，不表示验证通过或失败。后台 bash 的消息带 `background_ok:true`；自动后台 Run 的 await 拿到同样的数据，脚本继续执行，Run 最终状态由脚本决定。需要检查退出码的脚本可用 `if (!r.superseded_by && r.exit_code !== 0) ...`；无条件检查退出码的旧脚本仍可能自行抛错。只取代该 bash，不停止整个 Run 或其余工具，继续脚本仍可产生副作用。
+
+修改代数在成功 edit/write 后推进，最多读取 16 MiB 比较旧内容；无效 edit、失败写入、已确认内容相同的覆盖不计。旧内容超过读取上限或不可读时，成功 write 保守地计为修改。它是 Session 级记录，不推断文件依赖，因此任何 edit/write 都可能使旧命令过时；bash 自身副作用、用户编辑、其他 Session/子 agent 的写入无法据此识别。进程组清理沿用 stop/取消路径，20 ms 轮询观察停止标志，新执行不等旧进程自然退出。停止前已产生的文件或其他副作用不会回滚。

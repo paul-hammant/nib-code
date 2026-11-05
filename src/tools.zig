@@ -81,13 +81,14 @@ const all = [_]Tool{
         .name = "bash",
         .run = bash.bash,
         .doc =
-        \\  // cwd; merged stderr; group killed on return (nohup/& too); killed:exit_code:null.
+        \\  // cwd; merged stderr; group cleanup (nohup/& too).
         \\  // >16 MiB:redirect. >256 words except heredocs:script.
-        \\  // background:{id}, auto-message. detached needs background, spans Turns/shell lifetime; stop/timeout/cancel/failure/exit cleans up.
-        \\  // Auto-bg keeps await/output. No polling/pending logs. Idle:reply; Session waits.
-        \\  // Full checks:code, known regression tests, fixtures/expectations, fmt first; fix failures, revalidate.
-        \\  // Example: await tools.bash({command: "zig build test --summary all"})
-        \\  async bash({ command, timeout_ms, background = false, detached = false }) {}, // → { exit_code, output } or { id }; timeout_ms: detached 0, else 1800000 (30 min)
+        \\  // background:{id}, auto-message. detached requires background, spans Turns; stop/timeout/cancel/exit cleans up.
+        \\  // Auto-bg keeps await/output. No polling/logs. Idle:reply to wait.
+        \\  // After edit/write, rerun same command/cwd: older Run stops, returns {superseded_by}, not failure; no detached.
+        \\  // Full checks:finish code/tests/fixtures/fmt; fix and rerun.
+        \\  // Example: await tools.bash({command: "sh checks.sh"})
+        \\  async bash({ command, timeout_ms, background = false, detached = false }) {}, // → { exit_code, output }, { superseded_by } or { id }; timeout_ms: 1800000 (30 min), detached:0
         ,
     },
     .{
@@ -205,6 +206,7 @@ pub const Tools = struct {
     usage_sink: ?struct { ctx: *anyopaque, emit: *const fn (*anyopaque, provider.Usage) anyerror!void } = null,
     cancel: std.atomic.Value(bool) = .init(false),
     file_state: @import("tools/file_state.zig").State = .{},
+    bash_commands: @import("tools/bash/registry.zig").Registry = .{},
     track_changes: bool = false,
     changes_mutex: std.Io.Mutex = .init,
     changes: @import("tools/changes.zig").Tracker = .{},
@@ -227,6 +229,7 @@ pub const Tools = struct {
     }
 
     pub fn noteChange(t: *Tools, gpa: std.mem.Allocator, path: []const u8, before: ?[]const u8, after: []const u8) !void {
+        if (before == null or !std.mem.eql(u8, before.?, after)) t.bash_commands.changed(t.io);
         if (!t.track_changes) return;
         t.changes_mutex.lockUncancelable(t.io);
         defer t.changes_mutex.unlock(t.io);
@@ -369,6 +372,7 @@ pub fn callTool(name: []const u8, args: []const u8) !sandbox.ToolResult {
     defer testing.allocator.free(home);
     var t: Tools = .{ .io = testing.io, .home = home };
     defer t.file_state.deinit(testing.allocator);
+    defer t.progress.deinit(testing.allocator);
     return Tools.call(&t, testing.allocator, name, args);
 }
 
@@ -388,6 +392,7 @@ test "tool docs are valid JavaScript" {
 
 test "Promise.all runs bash concurrently and await remains sequential" {
     var t: Tools = .{ .io = testing.io, .home = "/home/nobody" };
+    defer t.progress.deinit(testing.allocator);
     const clock = std.Io.Clock.awake;
     const start = clock.now(testing.io);
     const parallel = try sandbox.eval(testing.allocator, testing.io,
@@ -413,6 +418,7 @@ test "cancel and deadline join running tools and discard queued calls" {
         }
     };
     var t: Tools = .{ .io = testing.io, .home = "/home/nobody" };
+    defer t.progress.deinit(testing.allocator);
     var flag: std.atomic.Value(bool) = .init(false);
     const thread = try std.Thread.spawn(.{}, Cancel.work, .{ testing.io, &flag });
     defer thread.join();
@@ -455,6 +461,7 @@ test "child API filters agent from both docs and sandbox" {
 
 test "Run excludes tool waits without resetting the JS budget" {
     var t: Tools = .{ .io = testing.io, .home = "/home/nobody" };
+    defer t.progress.deinit(testing.allocator);
     const waited = try sandbox.eval(testing.allocator, testing.io,
         \\const a = await tools.bash({command: "sleep 0.3; printf first"});
         \\const b = await tools.bash({command: "sleep 0.3; printf second"});
@@ -503,7 +510,7 @@ test "bash documentation example keeps test output captured byte for byte" {
     const result = try sandbox.eval(testing.allocator, testing.io, doc[start..end], .{}, .{ .ctx = &dummy, .names = &.{"bash"}, .call = EchoLlm.call }, null);
     defer result.deinit(testing.allocator);
     try testing.expect(result.ok);
-    try testing.expectEqualStrings("{\"command\":\"zig build test --summary all\"}", result.text);
+    try testing.expectEqualStrings("{\"command\":\"sh checks.sh\"}", result.text);
 }
 
 test "grep documentation RegExp example reaches the host byte for byte" {

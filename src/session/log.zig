@@ -36,6 +36,7 @@ pub const Record = struct {
     diagnostic: ?Diagnostic = null,
     agent_session: ?AgentSession = null,
     background: ?@import("events.zig").Background = null,
+    bash: ?@import("../tools/bash/registry.zig").Event = null,
     usage: ?provider.Usage = null,
     effort: ?[]const u8 = null,
     effort_source: ?provider.EffortSource = null,
@@ -145,6 +146,12 @@ pub const Log = struct {
         try log.append(io, a, .{ .background = event, .turn_step = step });
         errdefer log.poisoned = true;
         try log.file.sync(io);
+    }
+
+    pub fn bash(log: *Log, io: std.Io, a: std.mem.Allocator, event: @import("../tools/bash/registry.zig").Event) !void {
+        log.mutex.lockUncancelable(io);
+        defer log.mutex.unlock(io);
+        try log.append(io, a, .{ .bash = event });
     }
 
     pub fn agentSession(log: *Log, io: std.Io, a: std.mem.Allocator, mapping: AgentSession) !void {
@@ -315,6 +322,10 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
                 }
             }
         };
+        if (r.bash) |event| {
+            try restoreId(event.id, &next_agent_id, &next_bash_id, &next_run_id);
+            continue;
+        }
         if (r.diagnostic != null) continue;
         if (r.from > history.items.len) return error.InvalidSessionLog;
         try history.ensureTotalCapacity(gpa, r.from + r.messages.len);
@@ -755,19 +766,23 @@ test "replay restores independent ID maxima from every background state and fore
             .{ .name = "bash", .id = "b6", .background = false, .start_ms = 0, .end_ms = 1, .ok = true, .run_index = 0 },
         } },
         .{ .from = 1, .messages = &.{.{ .role = "user", .content = "compacted" }} },
+        .{ .bash = .{ .id = "b20", .run = 1, .state = .started } },
+        .{ .bash = .{ .id = "b20", .run = 1, .state = .superseded, .superseded_by = "b21", .elapsed_ms = 5 } },
+        .{ .bash = .{ .id = "b21", .run = 2, .state = .started } },
     };
     for (records) |record| try encoded.writer.print("{f}\n", .{std.json.fmt(record, .{ .emit_null_optional_fields = false })});
     var history: std.ArrayList(provider.Message) = .empty;
     var tokens: u64 = 0;
     const restored = try replay(a, a, encoded.written(), &history, &tokens);
     try t.expectEqual(@as(u64, 11), restored.next_agent_id);
-    try t.expectEqual(@as(u64, 13), restored.next_bash_id);
+    try t.expectEqual(@as(u64, 22), restored.next_bash_id);
+    try t.expectEqualStrings("compacted", history.items[1].content.?);
     try t.expectEqual(@as(usize, 1), restored.lost_background.len);
     try t.expectEqualStrings("a3", restored.lost_background[0].id);
     var progress: @import("../tools/progress.zig").Queue = .{ .next_agent_id = restored.next_agent_id, .next_bash_id = restored.next_bash_id };
     defer progress.deinit(t.allocator);
     try t.expectEqualStrings("a11", try progress.add(t.allocator, t.io, .agent, "resumed", 1, false));
-    try t.expectEqualStrings("b13", try progress.add(t.allocator, t.io, .bash, "resumed", 1, true));
+    try t.expectEqualStrings("b22", try progress.add(t.allocator, t.io, .bash, "resumed", 1, true));
 }
 
 test "ID restoration rejects overflow rather than wrapping the session counter" {

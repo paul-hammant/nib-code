@@ -108,7 +108,7 @@ pub const Background = struct {
             const ok = switch (job.kind) {
                 .run => unreachable,
                 .agent => parsed.value.object.get("ok").?.bool,
-                .bash => if (parsed.value.object.get("exit_code")) |code| code == .integer and code.integer == 0 else false,
+                .bash => if (parsed.value.object.get("exit_code")) |code| code == .integer and code.integer == 0 else parsed.value.object.contains("superseded_by"),
             };
             const prefix = try std.fmt.allocPrint(gpa, "[background {s} {s} finished]\n", .{ @tagName(job.kind), job.id });
             defer gpa.free(prefix);

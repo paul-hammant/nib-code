@@ -129,6 +129,7 @@ fn loadMain(a: Allocator, data: []const u8) ![]Run {
         if (record.object.get("diagnostic")) |d| if (d != .null) continue;
         if (record.object.get("agent_session")) |mapping| if (mapping != .null) continue;
         if (record.object.get("background")) |b| if (b != .null) continue;
+        if (record.object.get("bash")) |b| if (b != .null) continue;
         const messages: []const Value = if (record.object.get("messages")) |v| try array(v) else &.{};
         const from = if (record.object.get("from")) |v| try natural(v) else 0;
         if (from > length) return error.InvalidReplayLog;
@@ -447,8 +448,10 @@ test "background lifecycle records do not replace replay history" {
     const data =
         \\{"messages":[{"role":"system","content":"s"}]}
         \\{"from":0,"messages":[],"background":{"id":"b1","kind":"bash","state":"started"}}
+        \\{"bash":{"id":"b1","run":1,"state":"started","command":"check","cwd":"/a"}}
         \\{"from":1,"messages":[{"role":"assistant","tool_calls":[{"id":"r1","function":{"name":"run","arguments":"{\"code\":\"42\"}"}}]},{"role":"tool","tool_call_id":"r1","content":"42"}]}
         \\{"from":0,"messages":[],"background":{"id":"b1","kind":"bash","state":"finished"}}
+        \\{"bash":{"id":"b1","run":1,"state":"superseded","superseded_by":"b2","elapsed_ms":20}}
         \\
     ;
     const runs = try loadMain(arena.allocator(), data);

@@ -838,6 +838,9 @@ def records(path):
                 if isinstance(diagnostic, dict) and isinstance(diagnostic.get('message'), str):
                     yield record
                     continue
+                if isinstance(record.get('bash'), dict) and record['bash'].get('state') in ('started', 'finished', 'superseded'):
+                    yield record
+                    continue
                 event = record.get('background') or record.get('background_agent')
                 if (isinstance(event, dict) and isinstance(event.get('id'), str)
                         and event.get('state') in ('started', 'finished', 'lost')):
@@ -897,6 +900,7 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
     tool_counts, bash_counts = Counter(), Counter()
     timing = Timing()
     tool_data = ToolData()
+    bash_superseded = 0
     agents = AgentStats()
     child_costs = ChildCosts()
     errors = {name: {'count': 0, 'examples': []} for name in ERRORS}
@@ -958,6 +962,13 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
                 current['previous_effort'] = None
                 current['mechanical_previous'] = None
             has_at = number(record.get('at'))
+            if isinstance(record.get('bash'), dict):
+                if include and record['bash'].get('state') == 'superseded':
+                    bash_superseded += 1
+                if include:
+                    session_selected = True
+                    time_filter['selected_records_with_at' if has_at else 'selected_records_using_mtime'] += 1
+                continue
             diagnostic = isinstance(record.get('diagnostic'), dict)
             lifecycle = isinstance(record.get('background') or record.get('background_agent'), dict)
             if not diagnostic and not lifecycle:
@@ -1151,6 +1162,7 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
         return dict(count=count, pairs=pairs, ratio=count / pairs if pairs else None)
 
     report = {'overall': totals, 'usage': usage, 'time_filter': time_filter, 'tools': dict(sorted(tool_counts.items())),
+            'bash_superseded': bash_superseded,
             'bash_top10': [{'command': k, 'count': v} for k, v in sorted(bash_counts.items(), key=lambda p: (-p[1], p[0]))[:10]],
             'errors': errors, 'slowest_steps': slowest, 'timing': timing.report(),
             'tool_data': tool_data.report(), 'child_costs': child_costs.report(),
@@ -1196,6 +1208,7 @@ def text_report(report):
              f"每 Turn 平均 {fmt(t['avg_steps_per_turn'])} Step；平均耗时 {fmt(t['avg_turn_ms'], ' ms')}（完整计时 {t['timed_turns']}/{t['turns']} Turn，{t['steps_with_ms']} Step）",
              '工具（静态调用点）：' + (', '.join(f'{k} {v}' for k, v in report['tools'].items()) or '无'),
              'bash 命令 Top 10：' + (', '.join(f"{v['command']} {v['count']}" for v in report['bash_top10']) or '无')]
+    lines.append(f"Bash 被取代次数：{report['bash_superseded']}")
     for name, key in (('Agent', 'agents'), ('Bash', 'bash_calls'), ('Run', 'background_runs')):
         calls = report[key]
         overlap = calls['background_steps']

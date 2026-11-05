@@ -1108,9 +1108,9 @@ class BackgroundBashTests:
         self.assertEqual((process.returncode, output, error, pending), (0, "", "", b""))
         self.assertIn("end", events[-1])
         self.assertFalse(any("background" in e for e in events))
-        self.assert_progress_ids(events, {"b1": ("bash", False), "b2": ("bash", False)})
+        self.assert_progress_ids(events, {"b1": ("bash", False), "b3": ("bash", False)})
         completed = {}
-        for id in ("b1", "b2"):
+        for id in ("b1", "b3"):
             samples = [(stamp, p) for stamp, p in updates if p["id"] == id]
             elapsed = [p["elapsed_ms"] for _, p in samples]
             self.assertGreaterEqual(len(samples), 2, samples)
@@ -1122,9 +1122,9 @@ class BackgroundBashTests:
             self.assertGreaterEqual(elapsed[-1], 4900, samples)
             completed[id] = samples[-1]
         self.assertGreaterEqual(updates[0][0], 2.8, updates)
-        self.assertLess(completed["b1"][0], next(stamp for stamp, p in updates if p["id"] == "b2"))
+        self.assertLess(completed["b1"][0], next(stamp for stamp, p in updates if p["id"] == "b3"))
         calls = [c for r in self.log(events) for c in r.get("calls", []) if c["name"] == "bash"]
-        self.assertEqual([c.get("id") for c in calls], ["b1", None, "b2"])
+        self.assertEqual([c.get("id") for c in calls], ["b1", "b2", "b3"])
         self.assertTrue(all(not c.get("background", False) for c in calls))
         self.assertTrue(all(c["ok"] for c in calls))
         for call in (calls[0], calls[2]):

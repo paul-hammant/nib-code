@@ -56,6 +56,23 @@ def mechanical_metric(count, samples, *, ms=None, sample_ms=None, timed_count=No
 
 
 class StatsTest(unittest.TestCase):
+    def test_bash_lifecycle_does_not_replace_history_and_counts_supersession(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'root.jsonl'
+            rows = synthetic_log(path, [[None]])
+            expected = stats.summarize([path])
+            rows[1:1] = [dict(at=100 + i, bash=dict(id='b1', run=1, state=state, **extra))
+                         for i, (state, extra) in enumerate([
+                             ('started', dict(command='anything', cwd='/a')),
+                             ('superseded', dict(superseded_by='b2', elapsed_ms=12)),
+                             ('finished', dict(elapsed_ms=15))])]
+            path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            actual = stats.summarize([path])
+            self.assertEqual(actual['bash_superseded'], 1)
+            self.assertEqual(actual['overall'], expected['overall'])
+            self.assertIn('Bash 被取代次数：1', stats.text_report(actual))
+
+
     def test_child_costs_parent_system_groups_and_cli(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)

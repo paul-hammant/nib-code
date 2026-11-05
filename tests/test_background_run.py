@@ -53,7 +53,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.server.requests.append(request)
         case = self.server.case
         code = None
-        if case == "resume":
+        if case.startswith("replace-"):
+            mode = case.removeprefix("replace-")
+            delay = "30" if mode in ("run", "bash", "detached") else ".4"
+            command = "echo $$ >> workers.pid; if [ ! -e started ]; then touch started; sleep " + delay + "; fi; printf checked"
+            if mode == "cancel":
+                command = "echo $$ >> workers.pid; sleep 30"
+            if index == 0:
+                options = dict(command=command)
+                if mode in ("bash", "detached"):
+                    options["background"] = True
+                if mode == "detached":
+                    options["detached"] = True
+                code = ("await tools.write({path:'source.txt',content:'before'}); "
+                        "const r=await tools.bash(" + json.dumps(options) + "); "
+                        "console.log('await-resolved',r); r")
+            elif index == 1:
+                wait_for(lambda: (self.server.cwd / ("workers.pid" if mode == "cancel" else "started")).exists())
+                change = ""
+                if mode != "unchanged":
+                    change = "await tools.write({path:'source.txt',content:" + json.dumps("before" if mode == "noop" else "after") + "}); "
+                if mode == "different":
+                    command += " "
+                code = change + "await tools.bash(" + json.dumps(dict(command=command)) + ")"
+            elif mode == "cancel":
+                self.server.followup.set()
+                self.server.release.wait(10)
+        elif case == "resume":
             code = "await tools.sleep(150); 'resumed-result'" if index == 0 else None
         elif index == 0:
             if case in ("wait", "empty-wait", "stop-reason"):
@@ -141,6 +167,68 @@ class BackgroundRunTests(unittest.TestCase):
 
     def results(self, rows):
         return [m for r in rows for m in r.get("messages", []) if m.get("background_kind") == "run"]
+
+    def test_changed_command_supersedes_explicit_bash_and_automatic_run(self):
+        for mode in ("run", "bash"):
+            with self.subTest(mode=mode):
+                self.server.case = "replace-" + mode
+                self.server.requests.clear()
+                for name in ("started", "workers.pid"):
+                    (self.cwd / name).unlink(missing_ok=True)
+                _, rows, session = self.finish(self.launch())
+                lifecycle = [r["bash"] for r in rows if "bash" in r]
+                replaced = [r for r in lifecycle if r["state"] == "superseded"]
+                self.assertEqual(len(replaced), 1)
+                self.assertEqual((replaced[0]["id"], replaced[0]["superseded_by"]), ("b1", "b2"))
+                self.assertLess(replaced[0]["elapsed_ms"], 3000)
+                messages = [m for r in rows for m in r.get("messages", []) if m.get("source") == "background"]
+                old = next(m for m in messages if m.get("background_kind") == ("run" if mode == "run" else "bash"))
+                self.assertTrue(old["background_ok"])
+                self.assertIn('"superseded_by":"b2"', old["content"])
+                self.assertNotIn('"error"', old["content"])
+                if mode == "run":
+                    self.assertIn("await-resolved", old["content"])
+                    self.assertTrue(old["background_run"]["calls"][1]["ok"])
+                for pid in (self.cwd / "workers.pid").read_text().splitlines():
+                    wait_for(lambda: not alive(int(pid)))
+                stats = json.loads(subprocess.check_output([sys.executable, str(ROOT / "scripts/stats.py"), str(self.home / "sessions" / (session + ".jsonl")), "--json"]))
+                self.assertEqual(stats["bash_superseded"], 1)
+                self.assertEqual(stats["overall"]["runs_failed"], 0)
+
+    def test_cancel_after_supersession_cleans_both_process_groups(self):
+        self.server.case = "replace-cancel"
+        process = self.launch()
+        self.addCleanup(process.wait, timeout=5)
+        self.addCleanup(process.kill)
+        self.assertTrue(self.server.followup.wait(5))
+        wait_for(lambda: (self.cwd / "workers.pid").exists() and len((self.cwd / "workers.pid").read_text().splitlines()) == 2)
+        pids = [int(pid) for pid in (self.cwd / "workers.pid").read_text().splitlines()]
+        wait_for(lambda: not alive(pids[0]))
+        process.send_signal(signal.SIGINT)
+        stdout, _ = process.communicate(timeout=5)
+        self.server.release.set()
+        for pid in pids:
+            wait_for(lambda: not alive(pid))
+        session = json.loads(stdout.splitlines()[0])["start"]["session_id"]
+        rows = [json.loads(line) for line in (self.home / "sessions" / (session + ".jsonl")).read_text().splitlines()]
+        self.assertEqual(sum(r.get("bash", {}).get("state") == "superseded" for r in rows), 1)
+        self.assertEqual(sum(r.get("bash", {}).get("state") == "finished" for r in rows), 2)
+
+    def test_unchanged_noop_different_and_detached_are_not_superseded(self):
+        for mode in ("unchanged", "noop", "different", "detached"):
+            with self.subTest(mode=mode):
+                self.server.case = "replace-" + mode
+                self.server.requests.clear()
+                for name in ("started", "workers.pid"):
+                    (self.cwd / name).unlink(missing_ok=True)
+                _, rows, _ = self.finish(self.launch())
+                self.assertFalse(any(r.get("bash", {}).get("state") == "superseded" for r in rows))
+                if mode != "detached":
+                    old = self.results(rows)[0]
+                    self.assertTrue(old["background_ok"])
+                    self.assertIn('"exit_code":0', old["content"])
+                for pid in (self.cwd / "workers.pid").read_text().splitlines():
+                    wait_for(lambda: not alive(int(pid)))
 
     def test_empty_runs_wait_and_missing_stop_reason_keeps_work(self):
         for case in ("empty-wait", "stop-reason"):

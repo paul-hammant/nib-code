@@ -98,18 +98,18 @@ pub fn write(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolR
         if (t.file_state.changed(t.io, path, stat))
             return fail(gpa, "{s} changed since this session last read or wrote it (by bash, a background agent, or the user); read it again before overwriting", .{v.path});
     }
-    var can_track = t.track_changes;
-    const before = if (can_track) dir.readFileAlloc(t.io, path, gpa, .limited(16 * 1024 * 1024)) catch |err| before: {
+    var can_track = true;
+    const before = dir.readFileAlloc(t.io, path, gpa, .limited(16 * 1024 * 1024)) catch |err| before: {
         if (err != error.FileNotFound) can_track = false;
         break :before null;
-    } else null;
+    };
     defer if (before) |data| gpa.free(data);
     if (std.fs.path.dirname(path)) |parent| dir.createDirPath(t.io, parent) catch |err|
         return fail(gpa, "{s}: {s}", .{ parent, @errorName(err) });
     const written = atomic_file.replace(t.io, gpa, path, v.content, .{}) catch |err|
         return fail(gpa, "{s}: {s}", .{ v.path, @errorName(err) });
     try t.file_state.remember(t.io, gpa, path, written);
-    if (can_track) try t.noteChange(gpa, path, before, v.content);
+    if (can_track) try t.noteChange(gpa, path, before, v.content) else t.bash_commands.changed(t.io);
     return .{ .ok = try std.fmt.allocPrint(gpa, "{{\"bytes\":{d}}}", .{v.content.len}) };
 }
 
@@ -382,17 +382,20 @@ test "change tracking omits no-ops and failed calls but reports empty creation" 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     try trackedCall(&t, "write", .{ .path = path, .content = "" });
+    try testing.expectEqual(@as(u64, 1), t.bash_commands.revision);
     const created = try t.takeChanges(testing.allocator, arena.allocator());
     try testing.expectEqual(@as(usize, 1), created.len);
     try testing.expect(created[0].created);
     try testing.expectEqual(@as(usize, 0), created[0].added);
     try testing.expectEqualStrings("", created[0].diff);
     try trackedCall(&t, "write", .{ .path = path, .content = "" });
+    try testing.expectEqual(@as(u64, 1), t.bash_commands.revision);
     const args = try std.json.Stringify.valueAlloc(testing.allocator, .{ .path = path, .old_text = "missing", .new_text = "new" }, .{});
     defer testing.allocator.free(args);
     const result = Tools.call(&t, testing.allocator, "edit", args);
     defer freeResult(result);
     try testing.expect(result == .err);
+    try testing.expectEqual(@as(u64, 1), t.bash_commands.revision);
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "f", .data = "external\n" });
     try testing.expectEqual(@as(usize, 0), (try t.takeChanges(testing.allocator, arena.allocator())).len);
 }

@@ -13,6 +13,25 @@ pub const Queue = struct {
 
     const Slot = struct { value: Progress, dirty: bool = true, sent: ?std.Io.Timestamp = null };
 
+    pub fn reserveBash(q: *Queue, gpa: std.mem.Allocator, io: std.Io) ![]const u8 {
+        q.mutex.lockUncancelable(io);
+        defer q.mutex.unlock(io);
+        if (q.next_bash_id == std.math.maxInt(u64)) return error.IdExhausted;
+        const id = try std.fmt.allocPrint(gpa, "b{d}", .{q.next_bash_id});
+        errdefer gpa.free(id);
+        try q.ids.append(gpa, id);
+        q.next_bash_id += 1;
+        return id;
+    }
+
+    pub fn show(q: *Queue, gpa: std.mem.Allocator, io: std.Io, value: Progress) !void {
+        q.mutex.lockUncancelable(io);
+        defer q.mutex.unlock(io);
+        var copy = try value.clone(gpa);
+        errdefer copy.deinit(gpa);
+        try q.slots.append(gpa, .{ .value = copy });
+    }
+
     // IDs outlive cleared progress slots because Step call logs can span several Runs.
     pub fn add(q: *Queue, gpa: std.mem.Allocator, io: std.Io, kind: @FieldType(Progress, "kind"), prompt: []const u8, run: usize, background: bool) ![]const u8 {
         return q.addTask(gpa, io, kind, prompt, run, background, false);
