@@ -139,6 +139,7 @@ class ReuseTests:
         thread = threading.Thread(target=mock.serve_forever, daemon=True)
         thread.start()
         self.env["NIB_BASE_URL"] = "http://127.0.0.1:" + str(mock.server_port)
+        self.env["NIB_CODEX_TRANSPORT"] = "sse"
 
         def cleanup():
             mock.release.set()

@@ -90,7 +90,7 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
         port = sock.getsockname()[1]
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("NIB_", "DEEPSEEK_", "OPENAI_", "CODEX_"))}
-    env.update(NIB_PROVIDER="codex", NIB_BASE_URL=f"http://127.0.0.1:{port}",
+    env.update(NIB_PROVIDER="codex", NIB_CODEX_TRANSPORT="sse", NIB_BASE_URL=f"http://127.0.0.1:{port}",
                CODEX_HOME=str(auth_path.parent), HOME=str(tmp), NIB_HOME=str(tmp / "nib"), XDG_DATA_HOME=str(tmp / "data"),
                XDG_CONFIG_HOME=str(tmp / "config"))
     cwd = tmp / "project"

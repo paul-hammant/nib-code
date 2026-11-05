@@ -34,7 +34,7 @@ const Settings = struct {
     base_url: ?[]const u8 = null,
     context_window: ?u64 = null,
     model_line: usize = 1,
-    transport: provider.Transport = .sse,
+    transport: provider.Transport = .websocket,
     run_tool: @FieldType(provider.Config, "codex_run_tool") = .custom,
     reasoning_summary: @FieldType(provider.Config, "reasoning_summary") = .off,
 };
@@ -730,11 +730,13 @@ test "Codex transport defaults, TOML selection and environment precedence" {
     var env: Env = .init(t.allocator);
     defer env.deinit();
     var detail: ?[]u8 = null;
-    try t.expectEqual(provider.Transport.sse, (try resolve(a, &env, "", "config.toml", &detail)).codex_transport);
-    const text = "[codex]\ntransport = \"websocket\"\n";
+    try t.expectEqual(provider.Transport.websocket, (try resolve(a, &env, "", "config.toml", &detail)).codex_transport);
+    const text = "[codex]\ntransport = \"sse\"\n";
+    try t.expectEqual(provider.Transport.sse, (try resolve(a, &env, text, "config.toml", &detail)).codex_transport);
+    try env.put("NIB_CODEX_TRANSPORT", "websocket");
     try t.expectEqual(provider.Transport.websocket, (try resolve(a, &env, text, "config.toml", &detail)).codex_transport);
     try env.put("NIB_CODEX_TRANSPORT", "sse");
-    try t.expectEqual(provider.Transport.sse, (try resolve(a, &env, text, "config.toml", &detail)).codex_transport);
+    try t.expectEqual(provider.Transport.sse, (try resolve(a, &env, "", "config.toml", &detail)).codex_transport);
     try env.put("NIB_CODEX_TRANSPORT", "invalid");
     try t.expectError(error.InvalidConfig, resolve(a, &env, text, "config.toml", &detail));
     try t.expectError(error.InvalidConfig, parse(a, a, "[codex]\ntransport = \"invalid\"\n", "config.toml", &detail));

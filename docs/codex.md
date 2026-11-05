@@ -122,16 +122,16 @@ zig build -Doptimize=ReleaseFast
 ```
 
 
-## Responses WebSocket 原型
+## Responses WebSocket 传输
 
-默认仍用 HTTP POST + SSE；显式启用：
+默认使用 Responses WebSocket，配置为：
 
 ```toml
 [codex]
 transport = "websocket"
 ```
 
-或 `NIB_CODEX_TRANSPORT=websocket nib ask '任务'`；`sse` 强制原线路，环境变量优先于文件。默认保留 SSE 的原因：这里只用虚构凭证和本地 mock 验证，未验证真实 ChatGPT 登录网关的 WS 兼容性。配置随有效 Config 传给子会话；`tools.llm` 单次调用持有独立的临时状态，不共享主 Session 的 socket。
+设 `NIB_CODEX_TRANSPORT=sse nib ask '任务'` 或 `[codex] transport = "sse"` 可强制 HTTP POST + SSE，环境变量优先于文件。握手/协议失败后本 Session 自动降级 SSE。默认值与已验证的 v7 bench 配置一致；其余默认值为 custom Run、16 KiB 展示预算、关闭 reasoning summary。配置随有效 Config 传给子会话；`tools.llm` 单次调用持有独立的临时状态，不共享主 Session 的 socket。
 
 ### 协议与来源
 
@@ -139,7 +139,7 @@ transport = "websocket"
 
 - [codex-client/src/provider.rs](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/codex-client/src/provider.rs#L91)：Responses 路径不变，http/https 对应 ws/wss。nib 在 `https://chatgpt.com/backend-api/codex/responses` 发 GET Upgrade，经 TLS 后读写 WS 帧；本地 mock 用 http。
 - [core/src/client.rs](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/client.rs#L1635)：非 input 字段相同，当前 input 以上次 input 加完成输出为前缀，才续接。请求继续带 store:false、prompt_cache_key、reasoning.encrypted_content；握手采用 `OpenAI-Beta: responses_websockets=2026-02-06`、Authorization、chatgpt-account-id、originator、session-id、x-client-request-id，`x-codex-routing-hint` 为 `model=<model>`（未启用 fast，不加 tier）。
-- [codex-api/src/common.rs](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/codex-api/src/common.rs#L333)：每个文本消息为扁平的 `{"type":"response.create", ...}`，不是外包 response 对象。`previous_response_id` 与缩短后的 input 一起发送；`generate:false` 只用于预热。原型不实现可选预热，因此首请求包含握手耗时。
+- [codex-api/src/common.rs](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/codex-api/src/common.rs#L333)：每个文本消息为扁平的 `{"type":"response.create", ...}`，不是外包 response 对象。`previous_response_id` 与缩短后的 input 一起发送；`generate:false` 只用于预热。nib 不实现可选预热，因此首请求包含握手耗时。
 - [codex-api/src/endpoint/responses_websocket.rs](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/codex-api/src/endpoint/responses_websocket.rs)：沿用 Responses JSON 事件；顶层 error 可含 status/status_code 和嵌套 error.code/message。previous_response_not_found、websocket_connection_limit_reached 可恢复。turn-state 从握手响应头或 [response.metadata.headers](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/codex-api/src/sse/responses.rs#L214) 获取，后续同 Turn 请求放在 client_metadata["x-codex-turn-state"]。每个新 Turn 清空旧 token。
 - [core/src/session/startup_prewarm.rs](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/session/startup_prewarm.rs)：官方有后台预热/交接；其等待策略不直接照搬到 nib。
 

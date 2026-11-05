@@ -261,7 +261,7 @@ def run_case(tmp, mode, *, resume=None, home=None, extra=None):
             ("1" if mode == "request-progress" else "3") + "\n")
     env = {k: v for k, v in os.environ.items() if not k.startswith(("NIB_", "CODEX_"))}
     env.update(NIB_HOME=str(home), CODEX_HOME=str(tmp / "auth"), NIB_PROVIDER="codex", NIB_MODEL="gpt-6.1-terra",
-               NIB_BASE_URL=f"http://127.0.0.1:{server.server_port}", NIB_CODEX_TRANSPORT="websocket",
+               NIB_BASE_URL=f"http://127.0.0.1:{server.server_port}",
                NIB_REASONING_EFFORT="medium")
     if extra:
         env.update(extra)

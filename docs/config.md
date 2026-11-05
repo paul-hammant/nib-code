@@ -27,7 +27,7 @@ base_url = "https://chatgpt.com/backend-api"
 context_window = 500000
 reasoning_summary = "off" # auto 开启可读推理摘要
 run_tool = "custom" # function 回退到 JSON code/effort 工具
-transport = "sse" # websocket 为显式启用的 Responses WS 原型
+transport = "websocket" # 握手/协议失败后本 Session 降级 SSE；sse 强制 HTTP
 
 [chat_completions]
 model = "deepseek-flash"
@@ -101,7 +101,7 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 | `NIB_HOME` | 用户目录，默认 `~/.nib`；不改变 Codex 凭证位置 |
 | `NIB_PROVIDER` | `codex` / `chat_completions` |
 | `NIB_BASE_URL` | 当前 provider 的服务地址 |
-| `NIB_CODEX_TRANSPORT` | Codex 传输：`sse`（默认）或 `websocket`；覆盖 `[codex].transport`，握手/协议失败后本 Session 降级 SSE，见 [Codex 传输](codex.md#responses-websocket-原型) |
+| `NIB_CODEX_TRANSPORT` | Codex 传输：`websocket`（默认）或 `sse`；覆盖 `[codex].transport`，握手/协议失败后本 Session 降级 SSE，见 [Codex 传输](codex.md#responses-websocket-传输) |
 | `NIB_CODEX_RUN_TOOL` | `custom`（默认，直接发送 JS）或 `function`（JSON code/effort）；覆盖 `[codex].run_tool`，不改写既有历史类型，Chat Completions 始终使用 function |
 | `NIB_REASONING_SUMMARY` | `off`（默认，不发送 summary）或 `auto`；覆盖 `[codex].reasoning_summary`，不改变 effort 和加密 reasoning 回传 |
 | `NIB_RUN_OUTPUT_BYTES` | 模型展示预算字节数，16384–16777216；覆盖 `[limits].run_output_bytes`，默认 16384；不改变 JS 数据与 console 捕获上限 |

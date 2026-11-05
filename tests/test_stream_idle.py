@@ -44,7 +44,7 @@ class StreamIdleTests:
         self.addCleanup(self.stop_server)
         self.env = {key: value for key, value in os.environ.items()
                     if not key.startswith(("NIB_", "DEEPSEEK_", "OPENAI_", "CODEX_", "MOCK_"))}
-        self.env.update(NIB_PROVIDER=self.provider, NIB_API_KEY="fake-idle-key",
+        self.env.update(NIB_PROVIDER=self.provider, NIB_CODEX_TRANSPORT="sse", NIB_API_KEY="fake-idle-key",
                         NIB_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
                         NIB_MODEL="mock-idle-model", NIB_REASONING_EFFORT="high",
                         NIB_CONTEXT_WINDOW="128000", NIB_HOME=str(self.home),
