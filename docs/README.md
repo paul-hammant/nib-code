@@ -30,7 +30,7 @@ nib 面向越来越强的模型：给模型事实和能力，不替它做判断�
 
 仍然需要的，属于设计本身：模型看不到的事实（限额、成本、耗时、截断、出错时实际收到的输入），扩展能力的机制（llm、agent、逐 Step effort、插话），边界（不可逆和对外操作、凭证、不可信的外部内容），用户的策略（预算、上限、是否自动发布），以及对过时信息的纠正（例如 Run 失败或用户插话后，此前声明的降档失效）。
 
-为当下做的妥协同样有价值，但必须可识别、可度量、可删除。妥协分三类：模型补丁（当前模型会犯的错）、实现妥协（我们的实现还不够好）、写死的策略（本应由用户配置的值）。每一项都登记在 [compromises.md](compromises.md)，写明位置、原因、观察信号和删除条件；没有登记的妥协不进代码。提示词里的模型补丁集中在 `src/session.zig` 的 `patches`，可用 `NIB_PATCHES_OFF` 关闭，以便用 `scripts/stats.py` 对比是否仍然需要。
+为当下做的妥协同样有价值，但必须可识别、可度量、可删除。妥协分三类：模型补丁（当前模型会犯的错）、实现妥协（我们的实现还不够好）、写死的策略（本应由用户配置的值）。每一项都登记在 [compromises.md](compromises.md)，写明位置、原因、观察信号和删除条件；没有登记的妥协不进代码。提示词里的模型补丁集中在 `src/session/prompt.zig` 的 `patches`，可用 `NIB_PATCHES_OFF` 关闭，以便用 `scripts/stats.py` 对比是否仍然需要。
 
 写工具说明和系统提示时，陈述事实和代价，由模型权衡；不写"什么时候该用"。
 
@@ -51,7 +51,11 @@ nib 面向越来越强的模型：给模型事实和能力，不替它做判断�
   - [0011 一个 Provider 接口，两种线路协议](adr/0011-provider-wire-protocols.md)
   - [0012 新增 grep、glob、fetch，搜索用 Zig 原生实现](adr/0012-search-and-fetch-tools.md)
   - [0013 tools.llm：轻量的单步 map 单元](adr/0013-llm-functions.md)
-  - [0014 会话级后台 bash 与按 id 停止](adr/0014-session-background-jobs.md)
+  - [0014 会话级后台任务与按 id 停止](adr/0014-session-background-jobs.md)
+  - [0015 agent fork：复用父上下文](adr/0015-agent-fork.md)
+  - [0016 新的同一命令取代过时 bash](adr/0016-superseded-bash.md)
+  - [0017 Codex 默认 WebSocket，续接状态可丢弃](adr/0017-codex-websocket.md)
+  - [0018 Codex custom Run 复用现有执行与历史](adr/0018-custom-run.md)
 - [ask-json.md](ask-json.md)：`ask --json` 的 NDJSON 事件格式、进度与用量
 - [session-log.md](session-log.md)：会话日志、恢复/取消、计时字段与统计口径
 - [replay.md](replay.md)：工具结果录制、离线 Run 重放、诊断脚本与隐私边界

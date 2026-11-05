@@ -21,7 +21,7 @@ _Avoid_: round。注意：pi 的 `turn_start` 指的是单次模型调用，相�
 _Avoid_: iteration, turn
 
 **Subagent**（子 agent）：
-父 Session 委派一个任务后创建的独立 Session，完成一个 Turn 后把最终回答与用量交还父 Session。任务上下文由委派的 prompt 表达，不继承父 Session 的对话历史。
+父 Session 委派任务后创建的独立 Session，完成一个 Turn 后把最终回答与用量交还父 Session。默认由任务 prompt 提供上下文；fork 继承父会话当前上下文，resume 在同一子会话中继续。
 _Avoid_: worker（仅指工具工作线程）, 常驻 agent
 
 ## 执行
@@ -29,6 +29,14 @@ _Avoid_: worker（仅指工具工作线程）, 常驻 agent
 **Run**：
 模型写的一段代码在一个全新 Sandbox 里的一次执行。也是模型 API 层面唯一的调用入口。
 _Avoid_: eval, cell, code-mode call, PTC call
+
+**Background Run**（后台 Run）：
+等待工具的长 Run 自动转后台后继续原脚本，完成结果延后交付；转后台通知只表示成功登记。它仍是同一次 Run，不是新脚本或子会话。
+_Avoid_: background agent（指子 agent）, detached Run
+
+**Superseded execution**（被取代的执行）：
+本 Session 修改文件后，新启动的同一 bash 命令取代较早 Run 的活动执行。被取代只表示旧执行停止，不表示验证通过或失败，也不终止原 Run 的后续代码。
+_Avoid_: 验证通过, 验证失败（描述取代本身时）
 
 **Sandbox**（沙箱）：
 一次 Run 所在的隔离执行环境，除 Tool 之外没有任何宿主能力，Run 结束即销毁。

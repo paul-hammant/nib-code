@@ -95,11 +95,11 @@ model/effort 默认继承父配置，也可显式覆盖；两者不同时不再�
 
 凭证缺失、格式错误或 401 会给出登录提示。401 只重新读取文件并重试一次，让 Codex CLI 已刷新的凭证生效；仍失败请运行 `codex` 重新登录。nib 不使用 refresh_token。凭证不进入会话日志、argv 或子进程环境。tools.agent 从 stdin 接收有效配置，跳过配置文件读取，各自读取 auth.json；bash 不继承常见密钥环境变量。read/edit/write 拒绝凭证文件，bash 拒绝引用凭证目录；这些是防误操作保护，不是系统沙箱，详见 [ADR 0006](adr/0006-deny-dangerous-commands.md)。
 
-## 推理摘要与流活动
+## 流活动
 
-发送 `reasoning` 配置时同时请求 `summary: auto`，服务端提供的推理摘要沿用 reasoning delta 展示；未显式配置推理时不额外发送 reasoning。加密推理条目原样回传；新日志同时保留服务端有序输出，避免 commentary 和 reasoning 交错时重排前缀，见 [会话日志](session-log.md#step-传输字段)。
+推理摘要默认关闭，可按[推理摘要配置](#推理摘要)开启。加密推理条目原样回传；日志同时保留服务端有序输出，避免 commentary 和 reasoning 交错时重排前缀，见 [会话日志](session-log.md#step-传输字段)。
 
-TUI 在模型请求期间记录最后收到 SSE 行的时间，包括文本、推理摘要、工具参数、output_item 事件和心跳。连续 30 秒没有数据时，活动行追加 `· no data Ns`，收到新数据后清除。Turn 对连续数据的 TUI 活动通知按 1 秒节流，请求开始和结束仍立即通知；静默后收到数据会立即清除提示。这个计时独立于 thinking/writing 的阶段时长；Run 执行和重试等待不计入，每次请求重新计时，压缩请求同样显示。静默提示不表示连接已经断开，也不触发读超时或重试；仍可按 Esc 取消。活动通知仅用于 TUI，不新增 ask NDJSON 事件或日志内容。
+TUI 在模型请求期间记录最后收到传输数据的时间，包括文本、推理摘要、工具参数、output_item 事件和心跳。连续 30 秒没有数据时，活动行追加 `· no data Ns`，收到新数据后清除。Turn 对连续数据的 TUI 活动通知按 1 秒节流，请求开始和结束仍立即通知；静默后收到数据会立即清除提示。这个计时独立于 thinking/writing 的阶段时长；Run 执行和重试等待不计入，每次请求重新计时，压缩请求同样显示。静默提示不表示连接已经断开，也不触发读超时或重试；仍可按 Esc 取消。活动通知仅用于 TUI，不新增 ask NDJSON 事件或日志内容。
 
 ## 流失败与重试
 
@@ -147,40 +147,23 @@ transport = "websocket"
 
 ### 生命周期、失败与限制
 
-每个 Session 串行使用一个独占 WS 连接；后台 agent 是独立子进程，fork/resume 不复制连接或 response id。上一响应成功后保存非 input 属性、已发送的完整 input 和规范化后的服务端有序输出。完整输出按顺序随 Session 日志保存：message 规范化为 role/content/phase（含空消息），function_call 保留 type/call_id/name/arguments，reasoning 保留原条目。后续请求回放同一有序输出，不从合并后的展示文本重建；恢复和 fork 同样保序。实际前缀不匹配或未知输出条目时发送完整 input。无服务端 id 时也发完整 input。压缩前后清除续接，effort/instructions/tools/schema 等改变时由属性匹配拒绝续接；凭证、模型、端点或缓存 key 改变时关闭旧连接。
+每个 Session 串行使用一个独占 WS 连接；后台 agent 是独立子进程，fork/resume 不复制连接或 response id。上一响应成功后保存非 input 属性、已发送的完整 input 和规范化后的服务端有序输出。完整输出按顺序随 Session 日志保存：message 规范化为 role/content/phase（含空消息），function_call 保留 type/call_id/name/arguments，custom_tool_call 保留 type/call_id/name/input，reasoning 保留原条目。后续请求回放同一有序输出，不从合并后的展示文本重建；恢复和 fork 同样保序。实际前缀不匹配或未知输出条目时发送完整 input。无服务端 id 时也发完整 input。压缩前后清除续接，effort/instructions/tools/schema 等改变时由属性匹配拒绝续接；凭证、模型、端点或缓存 key 改变时关闭旧连接。
 
 previous_response_not_found 在尚未输出 delta 的增量请求上只补发一次完整 input；不重复执行 Run。完整重发仍失败时交回错误。websocket_connection_limit_reached、断流、空闲超时沿用最多 5 次重试，下次新连接发完整 input。只有明确的握手失败（含不支持升级或无效 accept）、WS 协议或超大帧错误记住 Session 级 SSE 降级；连接错误和响应内容校验失败保持 WS 重试，不因 InvalidResponse 改用 SSE。每次降级立即持久化原因、时间及协议诊断；发生于可见 delta 后先走已有重试清理 partial，再请求 SSE，因此 UI 仍可能显示失败尝试的片段，日志只提交成功结果。
 
 沿用 provider/cancel.zig 的取消并 join：Esc/SIGINT 中断阻塞 I/O，丢弃连接，后续 Turn 全量发送。取消不等待 close 握手；正常收到 close 回复 close 后重连。空闲超时使用 provider/idle.zig，在 TLS/HTTP 缓冲之下监测读操作，帧、ping/pong、元数据均算字节活动；另外以 120 秒限制无内容停顿，以 300 秒限制单次尝试，总超时不受心跳或持续摘要延长。三个值均可配置，见 [config.md](config.md)。
 
-帧层支持随机客户端 mask、短/16/64 位长度、文本分片、ping/pong/close、UTF-8 与控制帧校验。服务端单消息上限 16 MiB；超过或收到二进制/扩展帧则降级 SSE，不截断数据。不协商压缩/扩展。TLS、证书与代理行为复用 std.http.Client；真实 TLS/代理/长空闲重连、网关是否要求额外头（例如不同客户端 originator、User-Agent 或账号策略）尚未验证，不能声称已追平 Codex CLI 性能。没有连接池并发复用，一个 Session 同时只允许现有的一个主模型请求。
+帧层支持随机客户端 mask、短/16/64 位长度、文本分片、ping/pong/close、UTF-8 与控制帧校验。服务端单消息上限 16 MiB；超过或收到二进制/扩展帧则降级 SSE，不截断数据。不协商压缩/扩展。TLS、证书与代理行为复用 std.http.Client；本机真实 ChatGPT 网关已验证 custom Run 与增量续接，v7 也已用于正式 bench，这不覆盖所有代理、长空闲连接与账号策略。没有连接池并发复用，一个 Session 同时只允许现有的一个主模型请求。传输决策见 [ADR 0017](adr/0017-codex-websocket.md)。
 
 后台 Run 完成消息只追加到已提交历史末尾；等待回复的本地 waiting 标记不进入线上 input，因此后续可只发后台 user 消息。前缀不一致仍全量发送。后台等待不运行流空闲计时器；服务器关闭闲置连接时，下一 Step 走已有重试，新连接清除 previous response 并发送完整历史。
 
 本地测试：`python3 tests/test_codex_websocket.py` 覆盖增量、前缀/配置变化、缺失 response 重发、握手/协议降级、帧分片和 ping/pong、turn-state、重连、fork、恢复、SIGINT、Esc 后继续、跨 Turn 复用、后台等待期间无额外请求、后台消息的增量/前缀回退、闲置连接关闭重连及空闲超时、心跳/元数据无内容超时、持续推理请求总超时、交错多条消息的精确增量续接。日志与统计字段见 [session-log.md](session-log.md#step-传输字段)。
 
-### 用 nib-bench 对比
+### 比较实际传输
 
-`/home/yang/myself/nib-bench/bench.py` 固定 `gpt-6.1-terra`、`medium`、service_tier=default；nib 省略 service_tier，不开启 fast。该脚本会清理外部 NIB_* 环境变量，因此不能仅在启动 bench 前 export transport。给同一 ReleaseFast 二进制加两个薄启动脚本，脚本只分别设置 `NIB_CODEX_TRANSPORT=sse` 和 `websocket` 再 exec 该绝对路径；其余配置完全相同。例：
+性能对照使用同一 ReleaseFast 二进制、模型和 effort；记录源码提交、包装器及实际二进制哈希。bench 会清理外部 NIB_* 环境变量，传输对照需由包装器分别设置 `NIB_CODEX_TRANSPORT=sse` / `websocket`。新建独立 Session、交错运行，并分开观察冷首步和后续 Step。
 
-```sh
-# 在本 nib worktree 中构建，记录提交与真实二进制哈希
-zig build -Doptimize=ReleaseFast
-git rev-parse HEAD
-sha256sum zig-out/bin/nib
-# /tmp/nib-sse 与 /tmp/nib-websocket 均需 chmod +x
-# 两个脚本分别为：#!/bin/sh；下一行如下（替换实际绝对路径）
-# NIB_CODEX_TRANSPORT=sse exec /absolute/worktree/zig-out/bin/nib "$@"
-# NIB_CODEX_TRANSPORT=websocket exec /absolute/worktree/zig-out/bin/nib "$@"
-python3 /home/yang/myself/nib-bench/bench.py \
-  --source "$PWD" --agents nib@sse=/tmp/nib-sse nib@websocket=/tmp/nib-websocket \
-  --tasks suffix grep-column console-tail bash-amp timers \
-  --repeats 5 --concurrency 1 --seed 20261104 --batch-id codex-transport --dry-run
-```
-
-确认生成的随机分块计划后，另行去掉 `--dry-run` 才会请求模型（本次未执行）。使用新 batch-id，避免覆盖旧结果；保留 wrapper 内容、真实二进制 SHA、nib commit，bench 记录的 binary_sha256 对 wrapper 求哈希，不能替代真实二进制校验。两组独立 Session，不共享服务端 response。交错顺序、同任务同 effort、并发 1 可降低机器负载/账号限流的干扰；至少 5 轮，冷首步与同 Turn 后续步分别比较，并单独检查降级率。
-
-对两个 agent 的 runs/*/nibhome/sessions 主日志分别运行 `scripts/stats.py <目录...> --group-by transport --json`，比较 model_ms、first_data_ms、code_first_ms 的 median/p90/samples，并核对 incremental、input_items/input_bytes、transport_fallback。不要只按配置标签判断实际线路，也不要把包含握手失败成本的 SSE 降级 Step 当作纯 SSE 对照。任务成功率、Step 数、token/cache 与总墙钟仍用 bench 自身结果一起检查；性能结论需要真实实验，mock 耗时不代表收益。
+`python3 scripts/stats.py <日志目录> --group-by transport --json` 可比较实际线路的 model_ms、first_data_ms、code_first_ms，并核对 incremental、input_items/input_bytes、transport_fallback；按 full_reason 分组可观察全量发送的原因。降级 SSE 的 Step 包含先前 WS 成本，不是纯 SSE 对照。任务成功率、Step、token/cache 和总墙钟一起判断；mock 耗时不证明性能收益。详细口径见 [日志](session-log.md#step-传输字段)。
 
 ## 推理摘要
 
@@ -188,7 +171,7 @@ python3 /home/yang/myself/nib-bench/bench.py \
 
 要恢复可读摘要，配置 `[codex] reasoning_summary = "auto"`（写成段内键），或设置 `NIB_REASONING_SUMMARY=auto`；`off` 显式关闭，环境优先。即使 effort 交由服务端默认，`auto` 也会发送 `reasoning:{summary:"auto"}`。
 
-本地 request-flags 实验的三个固定请求点中，仅移除 summary 后首工具参数提前约 3.1 s（95% CI 2.7–3.8 s），reasoning tokens 未见稳定下降；这不保证整个任务等量提速，持久 WS 收益仍需另测。详见 [speed-v5.md](speed-v5.md)。
+关闭摘要的依据是本地 request-flags 对照中首工具参数更早到达，reasoning tokens 未见稳定下降；这不是关闭推理，也不保证整个任务等量提速。实验数据保存在相邻 `nib-speed-notes/`，默认值可按用户对可读摘要的偏好调整。
 
 ## custom Run 工具
 
@@ -198,4 +181,4 @@ python3 /home/yang/myself/nib-bench/bench.py \
 
 内部和主日志继续以 `tool_calls[].function.arguments` 的 JSON `{code}` 承载可执行源码，custom 调用额外以 `type:"custom"` 区分；原始 Responses output 同样保留。Run 执行、fork、恢复与离线 replay 共用已有链路。参数到达计时记录线上载荷：custom 是原始 JS input 的 UTF-8 字节，function 是 JSON arguments 字节；两者不能直接按规范化 JSON 长度比较。
 
-Run 语法或运行错误的模型输出会提示修正脚本并继续任务；SyntaxError 保留 QuickJS `<run>:行:列`，追加附近最多 200 字节的 UTF-8 源码行片段。这些提示不强制模型继续，也不能解决所有提前结束行为。证据、取舍与验证见 [speed-v6.md](speed-v6.md)。协议参照 [OpenAI custom tools](https://developers.openai.com/api/docs/guides/function-calling#custom-tools) 和本地 Codex CLI 0.166 trace。
+Run 语法或运行错误的模型输出会提示修正脚本并继续任务；SyntaxError 保留 QuickJS `<run>:行:列`，追加附近最多 200 字节的 UTF-8 源码行片段。这些提示不强制模型继续，也不能解决所有提前结束行为。历史、effort 与转义取舍见 [ADR 0018](adr/0018-custom-run.md)。协议参照 [OpenAI custom tools](https://developers.openai.com/api/docs/guides/function-calling#custom-tools) 和本地 Codex CLI 0.166 trace。

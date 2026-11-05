@@ -107,7 +107,7 @@ bash 与子会话复用标准库子进程等待和进程组执行器。所有 ba
 
 ## 自动后台 Run
 
-长 Run 不依赖模型主动传 `background:true`；达到默认 10 秒的可配置阈值并仍在等工具时，整个脚本继续执行，模型先收到 `rN` 通知。已 await 的工具返回类型不变，console 和 edit/write changes 延后一起交付。后台 Run 与其他 Run 共享 cwd 和文件观察状态；只做独立工作，不轮询、不重跑、不同时修改相关文件。详细的并发上限、文件冲突边界、取消、展示预算与恢复语义见 [run-output.md](run-output.md#长-run-自动转后台)。
+长 Run 不依赖模型主动传 `background:true`；达到默认 10 秒的可配置阈值并仍在等工具时，整个脚本继续执行，模型先收到 `rN` 通知。已 await 的工具返回类型不变，console 和 edit/write changes 延后一起交付。后台 Run 与其他 Run 共享 cwd 和文件观察状态；模型可继续工作，无需轮询完成结果，edit/write 后重跑同一命令会按下节语义取代旧执行。详细的并发上限、文件冲突边界、取消、展示预算与恢复语义见 [run-output.md](run-output.md#长-run-自动转后台)。
 
 `tools.stop` 同时接受其他后台 Run 的 `rN`；Run 不能 stop 自己。后台 Run 非 detached，最终回答和 Step 上限仍等待结果送达。Run 的后续代码也可以启动显式后台 bash/agent，沿用其各自的普通或 detached 语义。只有 Session 主线程向 sink 转发进度/用量/结果；后台沙箱与工具线程不调用前台 sink。
 
@@ -119,4 +119,4 @@ bash 与子会话复用标准库子进程等待和进程组执行器。所有 ba
 
 旧调用 resolve 为 `{superseded_by:"bN"}`，没有 exit_code、output 或 error：它表示已被更新的同一验证取代，不表示验证通过或失败。后台 bash 的消息带 `background_ok:true`；自动后台 Run 的 await 拿到同样的数据，脚本继续执行，Run 最终状态由脚本决定。需要检查退出码的脚本可用 `if (!r.superseded_by && r.exit_code !== 0) ...`；无条件检查退出码的旧脚本仍可能自行抛错。只取代该 bash，不停止整个 Run 或其余工具，继续脚本仍可产生副作用。
 
-修改代数在成功 edit/write 后推进，最多读取 16 MiB 比较旧内容；无效 edit、失败写入、已确认内容相同的覆盖不计。旧内容超过读取上限或不可读时，成功 write 保守地计为修改。它是 Session 级记录，不推断文件依赖，因此任何 edit/write 都可能使旧命令过时；bash 自身副作用、用户编辑、其他 Session/子 agent 的写入无法据此识别。进程组清理沿用 stop/取消路径，20 ms 轮询观察停止标志，新执行不等旧进程自然退出。停止前已产生的文件或其他副作用不会回滚。
+修改代数在成功 edit/write 后推进，与界面 changes 统计是否启用无关；最多读取 16 MiB 比较旧内容，无效 edit、失败写入、已确认内容相同的覆盖不计，创建空文件也计。旧内容超过读取上限或不可读时，成功 write 保守地计为修改。它是 Session 级记录，不推断文件依赖，因此任何 edit/write 都可能使旧命令过时；bash 自身副作用、用户编辑、其他 Session/子 agent 的写入无法据此识别。进程组清理沿用 stop/取消路径，20 ms 轮询观察停止标志，新执行不等旧进程自然退出。匹配的全部旧命令各取代一次；后台并发准入限额仍正常检查。停止前已产生的文件或其他副作用不会回滚。设计取舍见 [ADR 0016](adr/0016-superseded-bash.md)，独立启动/取代事件及统计见 [日志](session-log.md#bash-启动与取代事件)。

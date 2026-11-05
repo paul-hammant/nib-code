@@ -72,7 +72,9 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 
 自动转后台阈值沿用 `[limits]` 配置和子会话继承，不增加环境变量或 CLI 开关。设成较大值可用于前台对照实验。`nib js`、TUI `/js` 和离线 replay 保持同步执行；运行中的 JS 片段不会因墙钟阈值被切断。语义见 [run-output.md](run-output.md#长-run-自动转后台)。
 
-三个截止时间同时约束主模型请求、`tools.llm` 和压缩摘要请求，适用于 WS 和 SSE，每次重试重新计时。总请求截止时间覆盖连接、发送、读头及读取响应；另外两个截止时间在接收流时检查。空闲超时复用连接中断的重试上限和退避；Chat Completions 已输出可见增量时仍不自动重放，缓冲结果的 `tools.llm` 与摘要可以安全重试。默认阈值的正式批次分布、一手来源和局限见 [speed-v4.md](speed-v4.md)。
+三个截止时间同时约束主模型请求、`tools.llm` 和压缩摘要请求，适用于 WS 和 SSE，每次重试重新计时。总请求截止时间覆盖连接、发送、读头及读取响应；另外两个截止时间在接收流时检查。空闲超时复用连接中断的重试上限和退避；Chat Completions 已输出可见增量时仍不自动重放，缓冲结果的 `tools.llm` 与摘要可以安全重试。
+
+字节活动不能区分有效进展与心跳，持续摘要也不能证明请求会结束，因此分别限制字节空闲、内容空闲和单次请求总时长。120/300 秒的内容/请求默认值给 2026-11-05 已观察到的最长首代码等待和单次成功请求各留约两倍余量；合法的长静默推理或超长请求仍可能被中断，可按实际任务调高。300 秒总上限是 nib 的选择，不是 Codex CLI 默认值：参考版本 [rust-v0.166.0](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/codex-client/src/provider.rs#L86) 未设置 stream request 总 timeout。重试会重新计时，最多 5 次尝试加退避，整个 Step 仍可能等待约 25 分钟。逐次诊断见 [日志](session-log.md#step-传输字段)。
 
 `run_output_bytes` 可由 `NIB_RUN_OUTPUT_BYTES` 覆盖；其余限额没有环境变量或 CLI 覆盖；随有效配置经 stdin 传给子会话，子会话不读取配置文件。`max_steps` 未设置时子会话同样为 `null`，显式设置时继承该上限。sandbox 内全部工具最多 8 并发是线程调度实现，不由此小节控制。
 
