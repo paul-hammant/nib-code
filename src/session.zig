@@ -34,6 +34,7 @@ pub const Session = struct {
     io: std.Io,
     client: *std.http.Client,
     cfg: provider.Config,
+    codex_state: provider.CodexState = .{},
     /// Owns every string in `history`.
     arena: std.heap.ArenaAllocator,
     history: std.ArrayList(provider.Message) = .empty,
@@ -186,6 +187,7 @@ pub const Session = struct {
     }
 
     pub fn deinit(s: *Session) void {
+        s.codex_state.reset(s.gpa);
         s.tools.background.stop(s.gpa);
         s.tools.progress.deinit(s.gpa);
         s.tools.agent_sessions.deinit(s.gpa);
@@ -210,6 +212,10 @@ pub const Session = struct {
     const execute = runner.execute;
 
     pub fn turn(s: *Session, user_text: []const u8, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
+        if (s.codex_state.socket) |*socket| {
+            if (socket.turn_state) |value| s.gpa.free(value);
+            socket.turn_state = null;
+        }
         s.summary = .{};
         s.tools.background.cancel.store(false, .release);
         if (s.tools.background.inbox == null) s.tools.background.inbox = &s.inbox;
@@ -448,6 +454,11 @@ pub const Session = struct {
                 .turn_step = @intCast(step_index + 1),
                 .ms = ms,
                 .model_ms = model_ms,
+                .transport = @tagName(s.codex_state.last.transport),
+                .incremental = s.codex_state.last.incremental,
+                .input_items = if (s.codex_state.last.transport == .websocket) s.codex_state.last.input_items else null,
+                .input_bytes = if (s.codex_state.last.transport == .websocket) s.codex_state.last.input_bytes else null,
+                .transport_fallback = s.codex_state.last.fallback_reason,
                 .effort = decision.metadata.effort,
                 .effort_source = decision.metadata.source,
                 .effort_downgraded = decision.downgraded,
@@ -538,7 +549,7 @@ pub const Session = struct {
             }
         };
         var fwd: Forward = .{ .sink = sink, .gpa = s.gpa, .partial = partial, .io = s.io, .started = timing.started, .first_data_ms = first_data_ms, .session = s };
-        const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .timing = timing };
+        const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .timing = timing, .codex_state = &s.codex_state };
         if (!s.tools.background.anyPending(s.io))
             return provider.complete(s.gpa, s.arena.allocator(), s.client, request_cfg, s.cache_key, messages, prompt.tools_json, null, provider_sink, cancel, detail, attempts, .{ .ctx = &fwd, .onEvent = Forward.onRetry });
         const Request = struct {

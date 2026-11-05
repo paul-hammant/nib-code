@@ -855,8 +855,13 @@ def records(path):
         return
 
 
-def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
-    if group_by not in (None, 'version', 'system', 'patches'):
+def transport_group(record):
+    value = record.get('transport')
+    return value if value in ('sse', 'websocket') else 'unknown'
+
+
+def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _transport=None):
+    if group_by not in (None, 'version', 'system', 'patches', 'transport'):
         raise ValueError('invalid group_by')
     paths = list(paths)
     if _systems is None:
@@ -908,12 +913,13 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
         if cwd is not None and (not isinstance(header.get('cwd'), str) or
                                 Path(header['cwd']).expanduser().resolve() != cwd):
             continue
-        if group_by is not None:
+        if group_by is not None and group_by != 'transport':
             group_paths.setdefault(header_group(header, group_by), []).append(path)
 
         def selected(record):
             at = record.get('at')
-            return cutoff_ms is None or (at if number(at) else mtime_ms) >= cutoff_ms
+            return ((cutoff_ms is None or (at if number(at) else mtime_ms) >= cutoff_ms)
+                    and (_transport is None or transport_group(record) == _transport))
 
         session_selected = selected(header)
         length = header['from'] + len(header['messages'])
@@ -1012,6 +1018,8 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
                 if current is not None:
                     current['previous'] = None
                 continue
+            if group_by == 'transport':
+                group_paths.setdefault(transport_group(record), set()).add(path)
             totals['steps'] += 1
             if not has_at:
                 time_filter['selected_steps_using_mtime'] += 1
@@ -1153,10 +1161,11 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
         report['group_by'] = group_by
         report['groups'] = {}
         for key, members in sorted(group_paths.items()):
-            group = summarize(members, since, cwd, _systems=_systems)
+            group = summarize(members, since, cwd, _systems=_systems,
+                              _transport=key if group_by == 'transport' else None)
             if group['overall']['sessions']:
                 report['groups'][key] = group
-        report['notes'][0] += (' --group-by 按 header nib_version/system_sha/patches_off 分组，'
+        report['notes'][0] += (' --group-by transport 按完整 Step 的实际线路分组，同会话可在多个组出现；缺字段归 unknown；按记录筛选，不把混合线路 Turn 当作完整墙钟样本。其他分组 按 header nib_version/system_sha/patches_off 分组，'
             '缺失/无效值为 unknown；patches_off 缺失但 nib_version 或 system_sha 有效时为 none，'
             '显式空补丁集也为 none；补丁数组按去重排序的集合分组，每组重新汇总完整核心报告。')
     return report
@@ -1282,7 +1291,7 @@ def main():
     parser.add_argument('paths', nargs='*', type=Path, help='session JSONL files or directories')
     parser.add_argument('--since', type=date.fromisoformat, metavar='YYYY-MM-DD', help='record date, inclusive, local time; legacy records fall back to file modification time')
     parser.add_argument('--cwd', type=Path, help='exact session working directory')
-    parser.add_argument('--group-by', choices=('version', 'system', 'patches'), help='group core reports by session header metadata')
+    parser.add_argument('--group-by', choices=('version', 'system', 'patches', 'transport'), help='group by session metadata or actual Step transport')
     parser.add_argument('--json', action='store_true', help='emit JSON instead of text')
     args = parser.parse_args()
     inputs = args.paths or [Path(os.environ.get('NIB_HOME', '~/.nib')).expanduser() / 'sessions']

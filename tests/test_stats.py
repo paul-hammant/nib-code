@@ -1930,5 +1930,35 @@ class StatsTest(unittest.TestCase):
         self.assertEqual(list(stats.commands("tools.bash({command: 'echo 你好'})")), ['echo'])
 
 
+class TransportTests(unittest.TestCase):
+    def test_mixed_transport_groups_steps_and_latency_without_filling_legacy_gaps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'mixed.jsonl'
+            rows = synthetic_log(path, [["1", "2", None]])
+            for row, transport, model_ms, first_ms, code_ms in zip(
+                    rows[1:], ('websocket', 'sse', None), (20, 80, 30), (2, 8, None), (5, 15, None)):
+                row['model_ms'] = model_ms
+                if transport:
+                    row.update(transport=transport, first_data_ms=first_ms,
+                               code=[dict(first_ms=code_ms, last_ms=code_ms + 1)])
+            path.write_text('\n'.join(map(json.dumps, rows)) + '\n')
+            report = stats.summarize([path], group_by='transport')
+            self.assertEqual(report['overall']['steps'], 3)
+            self.assertEqual(set(report['groups']), {'websocket', 'sse', 'unknown'})
+            for name, expected in [('websocket', (20, 2, 5)), ('sse', (80, 8, 15))]:
+                group = report['groups'][name]
+                self.assertEqual(group['overall']['steps'], 1)
+                for field, value in zip(('model_ms', 'first_data_ms', 'code_first_ms'), expected):
+                    self.assertEqual(group['timing'][field]['median'], value)
+                    self.assertEqual(group['timing'][field]['samples'], 1)
+            legacy = report['groups']['unknown']['timing']
+            self.assertEqual(legacy['first_data_ms']['samples'], 0)
+            self.assertEqual(legacy['code_first_ms']['samples'], 0)
+            self.assertIn('transport=websocket', stats.text_report(report))
+            output = subprocess.check_output([sys.executable, str(ROOT / 'scripts/stats.py'), str(path),
+                                              '--group-by', 'transport', '--json'])
+            self.assertEqual(json.loads(output)['groups']['sse']['overall']['steps'], 1)
+
+
 if __name__ == '__main__':
     unittest.main()

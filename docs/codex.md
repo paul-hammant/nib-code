@@ -120,3 +120,62 @@ python3 tests/test_session.py
 python3 tests/test_codex.py
 zig build -Doptimize=ReleaseFast
 ```
+
+
+## Responses WebSocket 原型
+
+默认仍用 HTTP POST + SSE；显式启用：
+
+```toml
+[codex]
+transport = "websocket"
+```
+
+或 `NIB_CODEX_TRANSPORT=websocket nib ask '任务'`；`sse` 强制原线路，环境变量优先于文件。默认保留 SSE 的原因：这里只用虚构凭证和本地 mock 验证，未验证真实 ChatGPT 登录网关的 WS 兼容性。配置随有效 Config 传给子会话；`tools.llm` 单次调用持有独立的临时状态，不共享主 Session 的 socket。
+
+### 协议与来源
+
+以官方 [openai/codex rust-v0.166.0](https://github.com/openai/codex/tree/rust-v0.166.0) 为准：
+
+- [codex-client/src/provider.rs](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/codex-client/src/provider.rs#L91)：Responses 路径不变，http/https 对应 ws/wss。nib 在 `https://chatgpt.com/backend-api/codex/responses` 发 GET Upgrade，经 TLS 后读写 WS 帧；本地 mock 用 http。
+- [core/src/client.rs](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/client.rs#L1635)：非 input 字段相同，当前 input 以上次 input 加完成输出为前缀，才续接。请求继续带 store:false、prompt_cache_key、reasoning.encrypted_content；握手采用 `OpenAI-Beta: responses_websockets=2026-02-06`、Authorization、chatgpt-account-id、originator、session-id、x-client-request-id，`x-codex-routing-hint` 为 `model=<model>`（未启用 fast，不加 tier）。
+- [codex-api/src/common.rs](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/codex-api/src/common.rs#L333)：每个文本消息为扁平的 `{"type":"response.create", ...}`，不是外包 response 对象。`previous_response_id` 与缩短后的 input 一起发送；`generate:false` 只用于预热。原型不实现可选预热，因此首请求包含握手耗时。
+- [codex-api/src/endpoint/responses_websocket.rs](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/codex-api/src/endpoint/responses_websocket.rs)：沿用 Responses JSON 事件；顶层 error 可含 status/status_code 和嵌套 error.code/message。previous_response_not_found、websocket_connection_limit_reached 可恢复。turn-state 从握手响应头或 [response.metadata.headers](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/codex-api/src/sse/responses.rs#L214) 获取，后续同 Turn 请求放在 client_metadata["x-codex-turn-state"]。每个新 Turn 清空旧 token。
+- [core/src/session/startup_prewarm.rs](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/session/startup_prewarm.rs)：官方有后台预热/交接；其等待策略不直接照搬到 nib。
+
+本机 jcode 的 ws_input.rs / openai_ws_connect.rs 与 pi 的 getCachedWebSocketInputDelta 用于交叉参考；发生分歧以该官方 tag 为准。
+
+### 生命周期、失败与限制
+
+每个 Session 串行使用一个独占 WS 连接；后台 agent 是独立子进程，fork/resume 不复制连接或 response id。上一响应成功后保存非 input 属性、已发送的完整 input 和规范化后的服务端输出。message 仅保留本地历史实际承载的 role/content/phase；function_call 比较 type/call_id/name/arguments；reasoning 保留原条目。多个消息合并、输出顺序差异、未知输出条目等不能精确匹配时，发送完整 input。无服务端 id 时也发完整 input。压缩前后清除续接，effort/instructions/tools/schema 等改变时由属性匹配拒绝续接；凭证、模型、端点或缓存 key 改变时关闭旧连接。
+
+previous_response_not_found 在尚未输出 delta 的增量请求上只补发一次完整 input；不重复执行 Run。完整重发仍失败时交回错误。websocket_connection_limit_reached、断流、空闲超时沿用最多 5 次重试，下次新连接发完整 input。握手失败（含不支持升级或无效 accept）和协议/非法事件错误记住 Session 级 SSE 降级；发生于可见 delta 后先走已有重试清理 partial，再请求 SSE，因此 UI 仍可能显示失败尝试的片段，日志只提交成功结果。
+
+沿用 provider/cancel.zig 的取消并 join：Esc/SIGINT 中断阻塞 I/O，丢弃连接，后续 Turn 全量发送。取消不等待 close 握手；正常收到 close 回复 close 后重连。空闲超时使用 provider/idle.zig，在 TLS/HTTP 缓冲之下监测读操作，帧、ping/pong、元数据均算接收活动。
+
+帧层支持随机客户端 mask、短/16/64 位长度、文本分片、ping/pong/close、UTF-8 与控制帧校验。服务端单消息上限 16 MiB；超过或收到二进制/扩展帧则降级 SSE，不截断数据。不协商压缩/扩展。TLS、证书与代理行为复用 std.http.Client；真实 TLS/代理/长空闲重连、网关是否要求额外头（例如不同客户端 originator、User-Agent 或账号策略）尚未验证，不能声称已追平 Codex CLI 性能。没有连接池并发复用，一个 Session 同时只允许现有的一个主模型请求。
+
+本地测试：`python3 tests/test_codex_websocket.py` 覆盖增量、前缀/配置变化、缺失 response 重发、握手/协议降级、帧分片和 ping/pong、turn-state、重连、fork、恢复、SIGINT、Esc 后继续、跨 Turn 复用及空闲超时。日志与统计字段见 [session-log.md](session-log.md#step-传输字段)。
+
+### 用 nib-bench 对比
+
+`/home/yang/myself/nib-bench/bench.py` 固定 `gpt-6.1-terra`、`medium`、service_tier=default；nib 省略 service_tier，不开启 fast。该脚本会清理外部 NIB_* 环境变量，因此不能仅在启动 bench 前 export transport。给同一 ReleaseFast 二进制加两个薄启动脚本，脚本只分别设置 `NIB_CODEX_TRANSPORT=sse` 和 `websocket` 再 exec 该绝对路径；其余配置完全相同。例：
+
+```sh
+# 在本 nib worktree 中构建，记录提交与真实二进制哈希
+zig build -Doptimize=ReleaseFast
+git rev-parse HEAD
+sha256sum zig-out/bin/nib
+# /tmp/nib-sse 与 /tmp/nib-websocket 均需 chmod +x
+# 两个脚本分别为：#!/bin/sh；下一行如下（替换实际绝对路径）
+# NIB_CODEX_TRANSPORT=sse exec /absolute/worktree/zig-out/bin/nib "$@"
+# NIB_CODEX_TRANSPORT=websocket exec /absolute/worktree/zig-out/bin/nib "$@"
+python3 /home/yang/myself/nib-bench/bench.py \
+  --source "$PWD" --agents nib@sse=/tmp/nib-sse nib@websocket=/tmp/nib-websocket \
+  --tasks suffix grep-column console-tail bash-amp timers \
+  --repeats 5 --concurrency 1 --seed 20261104 --batch-id codex-transport --dry-run
+```
+
+确认生成的随机分块计划后，另行去掉 `--dry-run` 才会请求模型（本次未执行）。使用新 batch-id，避免覆盖旧结果；保留 wrapper 内容、真实二进制 SHA、nib commit，bench 记录的 binary_sha256 对 wrapper 求哈希，不能替代真实二进制校验。两组独立 Session，不共享服务端 response。交错顺序、同任务同 effort、并发 1 可降低机器负载/账号限流的干扰；至少 5 轮，冷首步与同 Turn 后续步分别比较，并单独检查降级率。
+
+对两个 agent 的 runs/*/nibhome/sessions 主日志分别运行 `scripts/stats.py <目录...> --group-by transport --json`，比较 model_ms、first_data_ms、code_first_ms 的 median/p90/samples，并核对 incremental、input_items/input_bytes、transport_fallback。不要只按配置标签判断实际线路，也不要把包含握手失败成本的 SSE 降级 Step 当作纯 SSE 对照。任务成功率、Step 数、token/cache 与总墙钟仍用 bench 自身结果一起检查；性能结论需要真实实验，mock 耗时不代表收益。

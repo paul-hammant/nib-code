@@ -19,6 +19,8 @@ Codex 摘要不沿用原来的 32–2048-token 总输出限制：跟随 pi 不�
 
 子 agent 通过匿名 stdin 管道收到 prompt 和有效 Config，跳过配置文件读取，不通过 argv 或环境传 API key；Codex Config 的 api_key 为空，各进程独立读取登录文件。所有工具子进程的密钥环境清理和凭证路径拒绝见 [0006](0006-deny-dangerous-commands.md)。
 
+**可选 WebSocket 传输（2026-11-04）：** Responses 保留同一线路协议，Codex 可通过 `[codex].transport` / `NIB_CODEX_TRANSPORT` 显式选择 WS，默认 SSE。Zig 0.17 标准库只有 HTTP 连接与升级所需接口，没有 WS 客户端；最小 RFC 6455 帧层复用 `std.http.Client` 的 TCP、代理、TLS/证书校验和池内连接所有权。Session 持有独占连接和可丢弃续接状态，日志始终保存完整历史。只有同连接、上次完成、非 input 参数相同、完整 input 包含上次 input + 输出前缀时，才发送 previous_response_id 与增量 input。压缩/取消/断线清除续接，恢复/fork 建独立状态；握手或协议错误在本 Session 记住 SSE 降级。协议证据、测试和边界见 [Codex 传输原型](../codex.md#responses-websocket-原型)。不引入预热线程。
+
 **为什么：** 第二种协议的序列化、推理延续、认证和事件格式差异由实现承载，Session 无需了解协议；沿用现有日志提交和工具模型，不增加 OAuth 生命周期、模型发现服务或第二份会话存储。
 
 **证据与边界（2026-11-01）：** 本机 pi 一手源码 `packages/ai/src/api/openai-codex-responses.ts`、`openai-responses-shared.ts`、`catalog/providers/openai-codex.ts`、`catalog/families/openai.ts`；[OpenAI Responses 条目文档](https://developers.openai.com/api/reference/resources/conversations/subresources/items/methods/create) 说明使用 output_item.done 的 encrypted_content 继续无状态会话。本地 Responses mock 验证请求头、文本、工具往返、两条推理数据、多轮恢复、摘要、子 agent、usage、401 和凭证隔离。模型列表是源码快照，不代表所有账号都可用；未知模型需显式设置 `context_window` 或 NIB_CONTEXT_WINDOW。

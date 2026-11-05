@@ -34,6 +34,7 @@ const Settings = struct {
     base_url: ?[]const u8 = null,
     context_window: ?u64 = null,
     model_line: usize = 1,
+    transport: provider.Transport = .sse,
 };
 const Span = struct { start: usize, end: usize };
 const File = struct {
@@ -188,7 +189,7 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
                 if (std.mem.eql(u8, key, name)) break :blk i;
             }
             return p.bad("unknown limits key '{s}'", .{key});
-        } else if (std.mem.eql(u8, key, "model")) 0 else if (std.mem.eql(u8, key, "base_url")) 1 else if (std.mem.eql(u8, key, "context_window")) 2 else return p.bad("unknown provider key '{s}'", .{key});
+        } else if (std.mem.eql(u8, key, "model")) 0 else if (std.mem.eql(u8, key, "base_url")) 1 else if (std.mem.eql(u8, key, "context_window")) 2 else if (section == .codex and std.mem.eql(u8, key, "transport")) 3 else return p.bad("unknown provider key '{s}'", .{key});
         const group: usize = if (section) |id| @as(usize, @backingInt(id)) + 1 else 0;
         if (seen[group][index]) return p.bad("duplicate key '{s}'", .{key});
         seen[group][index] = true;
@@ -230,6 +231,8 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
             } else if (index == 0) {
                 settings.model = decoded;
                 settings.model_line = p.line;
+            } else if (index == 3) {
+                settings.transport = std.meta.stringToEnum(provider.Transport, decoded) orelse return p.bad("transport must be websocket or sse", .{});
             } else settings.base_url = decoded;
         }
         const tail = std.mem.trimStart(u8, value[consumed..], " \t");
@@ -266,6 +269,10 @@ pub fn resolve(a: Allocator, env: *const Env, text: []const u8, path: []const u8
         return err;
     } else 1_000_000;
     var cfg: provider.Config = .{ .provider = id, .api_key = "", .base_url = "", .model = "", .context_window = context_window, .limits = file.limits };
+    cfg.codex_transport = if (env.get("NIB_CODEX_TRANSPORT")) |v| std.meta.stringToEnum(provider.Transport, v) orelse {
+        detail.* = try a.dupe(u8, "NIB_CODEX_TRANSPORT: expected websocket or sse");
+        return error.InvalidConfig;
+    } else file.codex_settings.transport;
     if (env.get("NIB_THINKING") == null and env.get("NIB_REASONING_EFFORT") == null) {
         if (file.effort) |v| try cfg.setEffort(v);
     }
@@ -655,4 +662,23 @@ test "effort replacement preserves config symlink and permissions" {
     try t.expectEqualStrings("effort = \"high\"\n", text);
     var it = tmp.dir.iterate();
     while (try it.next(t.io)) |entry| try t.expect(!std.mem.startsWith(u8, entry.name, ".nib-"));
+}
+
+test "Codex transport defaults, TOML selection and environment precedence" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: Env = .init(t.allocator);
+    defer env.deinit();
+    var detail: ?[]u8 = null;
+    try t.expectEqual(provider.Transport.sse, (try resolve(a, &env, "", "config.toml", &detail)).codex_transport);
+    const text = "[codex]\ntransport = \"websocket\"\n";
+    try t.expectEqual(provider.Transport.websocket, (try resolve(a, &env, text, "config.toml", &detail)).codex_transport);
+    try env.put("NIB_CODEX_TRANSPORT", "sse");
+    try t.expectEqual(provider.Transport.sse, (try resolve(a, &env, text, "config.toml", &detail)).codex_transport);
+    try env.put("NIB_CODEX_TRANSPORT", "invalid");
+    try t.expectError(error.InvalidConfig, resolve(a, &env, text, "config.toml", &detail));
+    try t.expectError(error.InvalidConfig, parse(a, a, "[codex]\ntransport = \"invalid\"\n", "config.toml", &detail));
+    try t.expectError(error.InvalidConfig, parse(a, a, "[chat_completions]\ntransport = \"websocket\"\n", "config.toml", &detail));
 }

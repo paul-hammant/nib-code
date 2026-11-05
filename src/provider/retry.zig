@@ -77,7 +77,7 @@ fn completeWith(
     while (true) : (attempt += 1) {
         attempts.* = attempt;
         var fwd: Forward = .{ .sink = sink };
-        const forwarded: p.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .timing = sink.timing };
+        const forwarded: p.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .timing = sink.timing, .codex_state = sink.codex_state };
         return response: {
             try Sink.emit(retry_sink, .started);
             defer Sink.emit(retry_sink, .finished) catch {};

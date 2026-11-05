@@ -11,6 +11,9 @@ pub const RetrySink = retry.Sink;
 pub const max_attempts = retry.max_attempts;
 pub const ModelTiming = model_timing.Model;
 
+pub const CodexState = @import("provider/codex_ws.zig").State;
+pub const Transport = enum { sse, websocket };
+
 pub const Id = enum { chat_completions, codex };
 
 pub const Limits = struct {
@@ -26,6 +29,7 @@ pub const Limits = struct {
 pub const Config = struct {
     limits: Limits = .{},
     provider: Id = .chat_completions,
+    codex_transport: Transport = .sse,
     codex_home: ?[]const u8 = null,
     base_url: []const u8,
     api_key: []const u8,
@@ -138,6 +142,7 @@ pub const Sink = struct {
     /// Only buffered callers may replay Chat deltas after a transient failure.
     replay_safe: bool = false,
     timing: ?*model_timing.Model = null,
+    codex_state: ?*CodexState = null,
     ctx: *anyopaque,
     onDelta: *const fn (ctx: *anyopaque, kind: Kind, text: []const u8) anyerror!void,
     onData: ?*const fn (ctx: *anyopaque) anyerror!void = null,
@@ -167,6 +172,7 @@ pub fn stream(
         .chat_completions => cancelable.run(client.io, cancel, chat.stream, .{ gpa, out, client, cfg, messages, tools_json, max_tokens, sink, cancel, detail, &monitor }),
         .codex => cancelable.run(client.io, cancel, codex.stream, .{ gpa, out, client, cfg, cache_key, messages, tools_json, max_tokens, sink, cancel, detail, &monitor }),
     } catch |err| {
+        if (cfg.provider == .codex) if (sink.codex_state) |state| state.reset(gpa);
         if (cancel.load(.acquire)) return error.Canceled;
         return monitor.failure(gpa, detail, err);
     };

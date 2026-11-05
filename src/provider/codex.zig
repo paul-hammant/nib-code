@@ -3,6 +3,8 @@ const p = @import("../provider.zig");
 const sse = @import("sse.zig");
 const idle = @import("idle.zig");
 const body_reader = @import("body.zig");
+const websocket = @import("websocket.zig");
+const ws_state = @import("codex_ws.zig");
 
 const Model = struct { id: []const u8, context_window: u64, can_disable_reasoning: bool = true };
 pub const models = [_]Model{
@@ -62,6 +64,118 @@ fn authError(gpa: std.mem.Allocator, detail: *?[]u8, message: []const u8) !std.j
 }
 
 pub fn stream(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.Client, cfg: p.Config, cache_key: []const u8, messages: []const p.Message, tools_json: []const u8, max_tokens: ?u32, sink: p.Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, monitor: *idle.Monitor) !p.Reply {
+    var local: ws_state.State = .{};
+    defer local.reset(gpa);
+    const state = sink.codex_state orelse &local;
+    state.last = .{ .fallback_reason = state.degraded };
+    if (cfg.codex_transport == .websocket and state.degraded == null) {
+        var forward: WsForward = .{ .sink = sink };
+        return streamWebSocket(gpa, out, client, cfg, cache_key, messages, tools_json, max_tokens, &forward, cancel, detail, monitor, state) catch |err| {
+            state.reset(gpa);
+            if (err == error.Canceled or err == error.OutOfMemory or cancel.load(.acquire) or monitor.read_failure != null) return err;
+            if (!fallbackError(err)) return err;
+            state.degrade(gpa, @errorName(err));
+            if (detail.*) |d| gpa.free(d);
+            detail.* = null;
+            if (forward.emitted) return error.WebSocketFallback;
+            return streamSse(gpa, out, client, cfg, cache_key, messages, tools_json, max_tokens, sink, cancel, detail, monitor);
+        };
+    }
+    return streamSse(gpa, out, client, cfg, cache_key, messages, tools_json, max_tokens, sink, cancel, detail, monitor);
+}
+
+const WsForward = struct {
+    sink: p.Sink,
+    emitted: bool = false,
+    fn delta(ctx: *anyopaque, kind: p.Kind, text: []const u8) !void {
+        const f: *@This() = @ptrCast(@alignCast(ctx));
+        f.emitted = true;
+        try f.sink.onDelta(f.sink.ctx, kind, text);
+    }
+    fn data(ctx: *anyopaque) !void {
+        const f: *@This() = @ptrCast(@alignCast(ctx));
+        try f.sink.received();
+    }
+};
+
+fn fallbackError(err: anyerror) bool {
+    return switch (err) {
+        error.WebSocketHandshake,
+        error.WebSocketProtocol,
+        error.WebSocketMessageTooLarge,
+        error.InvalidResponse,
+        error.SyntaxError,
+        error.UnexpectedToken,
+        error.MissingField,
+        => true,
+        else => false,
+    };
+}
+
+fn streamWebSocket(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.Client, cfg: p.Config, cache_key: []const u8, messages: []const p.Message, tools_json: []const u8, max_tokens: ?u32, forward: *WsForward, cancel: *const std.atomic.Value(bool), detail: *?[]u8, monitor: *idle.Monitor, state: *ws_state.State) anyerror!p.Reply {
+    const sink: p.Sink = .{ .ctx = forward, .onDelta = WsForward.delta, .onData = WsForward.data, .timing = forward.sink.timing, .codex_state = state };
+    errdefer state.reset(gpa);
+    const body = try requestBody(gpa, cfg, cache_key, messages, tools_json, max_tokens);
+    defer gpa.free(body);
+    const auth = try credentials(gpa, client.io, cfg, detail);
+    defer auth.deinit();
+    const bearer = try std.fmt.allocPrint(gpa, "Bearer {s}", .{auth.value.tokens.access_token});
+    defer gpa.free(bearer);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for ([_][]const u8{ cfg.base_url, cfg.model, cache_key, bearer, auth.value.tokens.account_id }) |part| {
+        hash.update(part);
+        hash.update(&.{0});
+    }
+    var scope: [32]u8 = undefined;
+    hash.final(&scope);
+    if (state.scope) |old| if (!std.mem.eql(u8, &old, &scope)) {
+        state.reset(gpa);
+    };
+    if (state.socket == null) {
+        const url = try std.fmt.allocPrint(gpa, "{s}/codex/responses", .{std.mem.trimEnd(u8, cfg.base_url, "/")});
+        defer gpa.free(url);
+        if (std.mem.indexOfAny(u8, cfg.model, "\r\n") != null) return error.WebSocketHandshake;
+        const routing = try std.fmt.allocPrint(gpa, "model={s}", .{cfg.model});
+        defer gpa.free(routing);
+        state.socket = websocket.Connection.open(gpa, client, url, &.{
+            .{ .name = "authorization", .value = bearer },
+            .{ .name = "chatgpt-account-id", .value = auth.value.tokens.account_id },
+            .{ .name = "OpenAI-Beta", .value = "responses_websockets=2026-02-06" },
+            .{ .name = "originator", .value = "nib" },
+            .{ .name = "session-id", .value = cache_key },
+            .{ .name = "x-client-request-id", .value = cache_key },
+            .{ .name = "x-codex-routing-hint", .value = routing },
+        }, monitor) catch |err| {
+            if (err == error.Canceled or err == error.OutOfMemory or monitor.read_failure != null) return err;
+            return error.WebSocketHandshake;
+        };
+        state.scope = scope;
+    }
+    const socket = &state.socket.?;
+    monitor.attach(socket.connection);
+    defer monitor.detach(socket.connection);
+    var observed = try body_reader.Reader.init(gpa, socket.connection.reader(), monitor, sink);
+    defer observed.deinit(gpa);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    for (0..2) |attempt| {
+        const payload = try state.payload(arena.allocator(), body, attempt != 0);
+        try socket.send(1, payload);
+        return readEvents(gpa, out, &observed.reader, sink, cancel, detail, socket, body) catch |err| {
+            if (err == error.PreviousResponseNotFound and attempt == 0 and state.last.incremental and !forward.emitted) {
+                state.clearPrevious(gpa);
+                state.last.fallback_reason = "previous_response_not_found";
+                if (detail.*) |d| gpa.free(d);
+                detail.* = null;
+                continue;
+            }
+            return if (err == error.PreviousResponseNotFound) error.ProviderFailed else err;
+        };
+    }
+    unreachable;
+}
+
+fn streamSse(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.Client, cfg: p.Config, cache_key: []const u8, messages: []const p.Message, tools_json: []const u8, max_tokens: ?u32, sink: p.Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, monitor: *idle.Monitor) !p.Reply {
     const body = try requestBody(gpa, cfg, cache_key, messages, tools_json, max_tokens);
     defer gpa.free(body);
     const url = try std.fmt.allocPrint(gpa, "{s}/codex/responses", .{std.mem.trimEnd(u8, cfg.base_url, "/")});
@@ -184,6 +298,8 @@ const StreamError = struct {
 };
 const ResponseEvent = struct {
     type: []const u8,
+    @"error": ?StreamError = null,
+    headers: ?std.json.Value = null,
     code: ?std.json.Value = null,
     message: ?[]const u8 = null,
     status: ?u16 = null,
@@ -192,6 +308,7 @@ const ResponseEvent = struct {
     output_index: usize = 0,
     item: ?std.json.Value = null,
     response: ?struct {
+        id: ?[]const u8 = null,
         status: ?[]const u8 = null,
         @"error": ?StreamError = null,
         incomplete_details: ?struct { reason: ?[]const u8 = null } = null,
@@ -204,6 +321,10 @@ const ResponseEvent = struct {
 };
 
 fn readStream(gpa: std.mem.Allocator, out: std.mem.Allocator, reader: *std.Io.Reader, sink: p.Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !p.Reply {
+    return readEvents(gpa, out, reader, sink, cancel, detail, null, "");
+}
+
+fn readEvents(gpa: std.mem.Allocator, out: std.mem.Allocator, reader: *std.Io.Reader, sink: p.Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, socket: ?*websocket.Connection, body: []const u8) anyerror!p.Reply {
     var parser: sse.Parser = .{};
     defer parser.deinit(gpa);
     var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -219,15 +340,29 @@ fn readStream(gpa: std.mem.Allocator, out: std.mem.Allocator, reader: *std.Io.Re
     defer line.deinit();
     while (true) {
         if (cancel.load(.acquire)) return error.Canceled;
-        line.clearRetainingCapacity();
-        _ = reader.streamDelimiter(&line.writer, '\n') catch |err| switch (err) {
-            error.EndOfStream => return incompleteResponse(gpa, detail),
-            error.WriteFailed => return error.OutOfMemory,
-            else => return err,
+        const data = if (socket) |ws| try ws.message(reader, &line) else data: {
+            line.clearRetainingCapacity();
+            _ = reader.streamDelimiter(&line.writer, '\n') catch |err| switch (err) {
+                error.EndOfStream => return incompleteResponse(gpa, detail),
+                error.WriteFailed => return error.OutOfMemory,
+                else => return err,
+            };
+            reader.toss(1);
+            break :data (try parser.feed(gpa, line.written())) orelse continue;
         };
-        reader.toss(1);
-        const data = (try parser.feed(gpa, line.written())) orelse continue;
         const ev = std.json.parseFromSliceLeaky(ResponseEvent, a, data, .{ .ignore_unknown_fields = true }) catch return error.InvalidResponse;
+        if (socket) |ws| if (ws.turn_state == null and std.mem.eql(u8, ev.type, "response.metadata")) {
+            if (ev.headers) |headers| if (headers == .object) {
+                var it = headers.object.iterator();
+                while (it.next()) |entry| {
+                    if (!std.ascii.eqlIgnoreCase(entry.key_ptr.*, "x-codex-turn-state")) continue;
+                    var value = entry.value_ptr.*;
+                    while (value == .array and value.array.items.len > 0) value = value.array.items[0];
+                    if (value == .string and std.mem.indexOfAny(u8, value.string, "\r\n") == null) ws.turn_state = try gpa.dupe(u8, value.string);
+                    break;
+                }
+            };
+        };
         if (sink.timing) |timing| observeTiming(timing, ev);
         if (std.mem.eql(u8, ev.type, "response.output_text.delta") or std.mem.eql(u8, ev.type, "response.refusal.delta")) {
             const delta = ev.delta orelse return error.InvalidResponse;
@@ -251,6 +386,7 @@ fn readStream(gpa: std.mem.Allocator, out: std.mem.Allocator, reader: *std.Io.Re
                 return streamFailure(gpa, ev, detail);
             };
             if (pending != 0) return incompleteResponse(gpa, detail);
+            if (socket != null) if (sink.codex_state) |state| try state.remember(gpa, body, response.id, items.items);
             if (response.usage) |u| usage = .{ .prompt_tokens = u.input_tokens, .completion_tokens = u.output_tokens, .prompt_cache_hit_tokens = if (u.input_tokens_details) |d| d.cached_tokens else 0 };
             break;
         }
@@ -301,6 +437,11 @@ fn incompleteResponse(gpa: std.mem.Allocator, detail: *?[]u8) anyerror {
 
 fn streamFailure(gpa: std.mem.Allocator, ev: ResponseEvent, detail: *?[]u8) anyerror {
     var failure: StreamError = .{ .code = ev.code, .message = ev.message, .status = ev.status, .status_code = ev.status_code };
+    if (ev.@"error") |err| {
+        failure = err;
+        failure.status = failure.status orelse ev.status;
+        failure.status_code = failure.status_code orelse ev.status_code;
+    }
     var reason: ?[]const u8 = null;
     if (ev.response) |response| {
         if (response.@"error") |err| failure = err;
@@ -326,6 +467,8 @@ fn streamFailure(gpa: std.mem.Allocator, ev: ResponseEvent, detail: *?[]u8) anye
         }
     }
     detail.* = std.fmt.allocPrint(gpa, "Codex stream failed: {s}: {s}; the Step was not committed.", .{ code, shown }) catch return error.OutOfMemory;
+    if (std.mem.eql(u8, code, "previous_response_not_found")) return error.PreviousResponseNotFound;
+    if (std.mem.eql(u8, code, "websocket_connection_limit_reached")) return error.WebSocketConnectionLimit;
     return if (fatal) error.ProviderFailed else if (limited) error.RateLimited else error.ProviderTransient;
 }
 
@@ -624,4 +767,10 @@ test "tool-free JSON requests move system to instructions and use strict named s
             try t.expect(!object.contains("text"));
         }
     }
+}
+
+test "WebSocket protocol fallback keeps cancellation and transient failures on their existing paths" {
+    const t = std.testing;
+    for ([_]anyerror{ error.WebSocketHandshake, error.WebSocketProtocol, error.WebSocketMessageTooLarge, error.InvalidResponse }) |err| try t.expect(fallbackError(err));
+    for ([_]anyerror{ error.Canceled, error.OutOfMemory, error.StreamIdleTimeout, error.RateLimited, error.ProviderFailed, error.WebSocketClosed, error.WebSocketConnectionLimit }) |err| try t.expect(!fallbackError(err));
 }
