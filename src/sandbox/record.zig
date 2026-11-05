@@ -29,6 +29,7 @@ pub const Recorder = struct {
     step: usize = 0,
     run: usize = 0,
     start_ms_epoch: i64 = 0,
+    run_output_bytes: usize = 16 * 1024,
     seq: usize = 0,
     incomplete: bool = false,
     buffer: std.ArrayList(u8) = .empty,
@@ -212,7 +213,7 @@ pub const Recorder = struct {
     }
 
     fn flush(r: *Recorder, end: End) !void {
-        try r.line(.{ .step = r.step, .run = r.run, .meta = .{ .start_ms_epoch = r.start_ms_epoch, .end = @tagName(end), .incomplete = if (r.incomplete) @as(?bool, true) else null } });
+        try r.line(.{ .step = r.step, .run = r.run, .meta = .{ .start_ms_epoch = r.start_ms_epoch, .run_output_bytes = r.run_output_bytes, .end = @tagName(end), .incomplete = if (r.incomplete) @as(?bool, true) else null } });
         const target = r.parent orelse r;
         target.mutex.lockUncancelable(r.io);
         defer target.mutex.unlock(r.io);

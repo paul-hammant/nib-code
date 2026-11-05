@@ -140,3 +140,11 @@ Step/Turn 的 `run_ms`、`tool_bytes`、llm/agent 调用数只计前台已结算
 完整 Step 的 `model_attempts` 按外层尝试依次保存 start_ms/end_ms（均相对 Step 开始）、error_name/detail、transport/incremental/full_reason、fallback_reason/fallback_at/fallback_detail、bytes/content_bytes、first_content_ms/last_content_ms/max_content_gap_ms 和 max_gap_ms。content_bytes 只计非空文本、reasoning 摘要和工具参数增量；bytes 是接收响应体的字节，不含握手头。相邻尝试的 start_ms 减去前次 end_ms 可见退避。失败耗尽时 diagnostic 同样保存该数组；成功 Step 顶层 max_content_gap_ms 是最后尝试的内容间隔，不包含首次等待和重试退避。缺失的可选值省略，不补零。总超时覆盖所有 I/O，收集每次尝试前先取消并 join 请求，下一尝试才可复用 sink 和分配器。
 
 Codex 新响应的 `reasoning.includes_output:true` 表示 `reasoning.data` 是服务端完整、有序的 output 数组，包含 reasoning、message 和 function_call；展示仍用 content/tool_calls，回传只用该数组，避免重复发送。reasoning 加密条目不改写。旧日志没有标记时，沿用旧格式（data 仅推理数组）的回放方式。fork 深拷贝该标记和 data；估算 token 时只计算完整数组一次。
+
+## 实际后台执行区间（speed-v5）
+
+后台 bash 的 finished 事件新增可选 `execution:{start_ms_epoch,end_ms_epoch}`（Unix 毫秒）：开始在 spawn 前采样，结束在 wait 返回时采样，不包含结果送达的延迟。失败在 spawn 前发生时省略 execution。取消／超时仍以进程 wait 完成为结束。此字段出现在主日志和 `ask --json` 生命周期事件中；agent 不冒用 bash 进程区间。
+
+自动后台 Run 的 `completion`／消息 `background_run` 新增同形的 `execution`，从 Run 创建到执行线程结算，包含自动转后台之前的等待；其 calls 的 start/end 仍相对原 Run 开始。执行区间不等于纯工具执行：关键路径应把 calls 偏移加到 execution.start_ms_epoch，再取实际调用区间并集，不能直接把 Run／后台注册到结果送达的整段当工具区间。
+
+旧日志可从 calls footer 的 `meta.start_ms_epoch` 得到 Run 锚点，从 completion.calls 得到完整调用（含转后台前部分）；显式后台 bash 只能从注册时间及终态 progress.elapsed_ms 近似恢复，缺少精确结束值时必须注明估计／未知，不能用送达时间冒充实际完成。

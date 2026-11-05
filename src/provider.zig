@@ -26,12 +26,14 @@ pub const Limits = struct {
     stream_content_timeout_s: usize = 120,
     request_timeout_s: usize = 300,
     run_background_after_ms: usize = 10000,
+    run_output_bytes: usize = 16 * 1024,
 };
 
 pub const Config = struct {
     limits: Limits = .{},
     provider: Id = .chat_completions,
     codex_transport: Transport = .sse,
+    reasoning_summary: enum { off, auto } = .off,
     codex_home: ?[]const u8 = null,
     base_url: []const u8,
     api_key: []const u8,

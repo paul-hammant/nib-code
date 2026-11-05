@@ -284,7 +284,7 @@ fn requestBody(gpa: std.mem.Allocator, cfg: p.Config, cache_key: []const u8, mes
     for (tools, 0..) |tool, i| try tool_writer.writer.print("{s}{f}", .{ if (i == 0) @as([]const u8, "") else ",", std.json.fmt(.{ .type = "function", .name = tool.function.name, .description = tool.function.description, .parameters = tool.function.parameters, .strict = false }, .{}) });
     try tool_writer.writer.writeByte(']');
     const effort = reasoningEffort(cfg);
-    const reasoning = if (effort) |value| try std.fmt.allocPrint(a, ",\"reasoning\":{{\"effort\":{f},\"summary\":\"auto\"}}", .{std.json.fmt(value, .{})}) else "";
+    const reasoning = if (effort != null or cfg.reasoning_summary == .auto) try std.fmt.allocPrint(a, ",\"reasoning\":{f}", .{std.json.fmt(.{ .effort = effort, .summary = if (cfg.reasoning_summary == .auto) @as(?[]const u8, "auto") else null }, .{ .emit_null_optional_fields = false })}) else "";
     const format = if (cfg.output_schema) |schema|
         try std.fmt.allocPrint(a, ",\"text\":{f}", .{std.json.fmt(.{ .format = .{ .type = "json_schema", .name = "result", .strict = true, .schema = schema } }, .{})})
     else
@@ -568,7 +568,7 @@ test "Codex reasoning mapping and readable summaries" {
     try t.expect(!modelInfo("gpt-6.1-sol").?.can_disable_reasoning);
 }
 
-test "Codex request body requests summaries exactly when reasoning is sent" {
+test "Codex request body defaults to no summary and supports opt in" {
     const t = std.testing;
     const cases = [_]struct {
         model: []const u8 = default_model,
@@ -583,7 +583,7 @@ test "Codex request body requests summaries exactly when reasoning is sent" {
         .{ .model = "gpt-6.1-terra", .thinking = false, .expected_effort = "none" },
         .{ .effort = "none", .expected_effort = "none" },
     };
-    for (cases) |case| {
+    for (cases) |case| for ([_]@FieldType(p.Config, "reasoning_summary"){ .off, .auto }) |summary| {
         const cfg: p.Config = .{
             .provider = .codex,
             .model = case.model,
@@ -591,6 +591,7 @@ test "Codex request body requests summaries exactly when reasoning is sent" {
             .base_url = "",
             .thinking = case.thinking,
             .reasoning_effort = case.effort,
+            .reasoning_summary = summary,
         };
         const body = try requestBody(t.allocator, cfg, "cache-key", &.{}, "[]", null);
         defer t.allocator.free(body);
@@ -598,15 +599,16 @@ test "Codex request body requests summaries exactly when reasoning is sent" {
         defer parsed.deinit();
         const root = parsed.value.object;
         try t.expect(!root.contains("summary"));
-        if (case.expected_effort) |effort| {
+        try t.expect(!root.get("store").?.bool);
+        try t.expectEqualStrings("reasoning.encrypted_content", root.get("include").?.array.items[0].string);
+        if (case.expected_effort != null or summary == .auto) {
             const reasoning = root.get("reasoning").?.object;
-            try t.expectEqual(@as(usize, 2), reasoning.count());
-            try t.expectEqualStrings(effort, reasoning.get("effort").?.string);
-            try t.expectEqualStrings("auto", reasoning.get("summary").?.string);
+            if (case.expected_effort) |effort| try t.expectEqualStrings(effort, reasoning.get("effort").?.string) else try t.expect(!reasoning.contains("effort"));
+            if (summary == .auto) try t.expectEqualStrings("auto", reasoning.get("summary").?.string) else try t.expect(!reasoning.contains("summary"));
         } else {
             try t.expect(!root.contains("reasoning"));
         }
-    }
+    };
 }
 
 test "Codex request body carries the session cache key" {

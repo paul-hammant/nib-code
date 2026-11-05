@@ -4,7 +4,7 @@ from pathlib import Path
 import unittest
 
 from test_llm import LlmTests, records
-from test_agent import AgentTests
+from test_agent import AgentTests, BIN
 from mock_llm_tool import content
 
 
@@ -154,6 +154,23 @@ class AgentLimits(unittest.TestCase):
     def test_five_steps_system_countdown_and_no_sixth_request(self):
         events, outputs = self.limited_turn("limits-loop", 5)
         self.assert_five_step_countdown(events, outputs)
+
+    def test_configured_run_output_budget(self):
+        (self.cwd / "budget.txt").write_text("x" * 50000)
+        self.env["NIB_RUN_OUTPUT_BYTES"] = "32768"
+        events, outputs = self.limited_turn("limits-budget", 1)
+        payload = outputs[0].removesuffix("\n[0 Steps left in this Turn]")
+        self.assertGreater(len(payload.encode()), 16 * 1024)
+        self.assertLessEqual(len(payload.encode()), 32 * 1024)
+        self.assertIn("omitted", payload)
+        system = self.session_log(events)[0]["messages"][0]["content"]
+        self.assertIn("share 32 KiB per Run", system)
+        session = events[0]["start"]["session_id"]
+        import subprocess
+        replay = subprocess.run([str(BIN), "replay", session, "--all", "--json"],
+                                env=self.env, cwd=self.cwd, capture_output=True, text=True, timeout=20)
+        self.assertEqual(replay.returncode, 0, replay.stdout + replay.stderr)
+        self.assertEqual(json.loads(replay.stdout)["matched"], 1)
 
     def test_countdown_is_outside_run_output_budget(self):
         (self.cwd / "budget.txt").write_text("x" * 50000)

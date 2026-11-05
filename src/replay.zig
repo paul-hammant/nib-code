@@ -192,6 +192,7 @@ fn loadMain(a: Allocator, data: []const u8) ![]Run {
 const Recording = struct {
     key: Key,
     start_ms_epoch: i64,
+    run_output_bytes: usize = output.max_bytes,
     entries: std.ArrayList(core.Entry) = .empty,
     end: ?End = null,
     incomplete: bool = false,
@@ -219,6 +220,10 @@ fn loadCalls(a: Allocator, data: []const u8) ![]Recording {
             const start = try field(meta, "start_ms_epoch");
             if (start != .integer) return error.InvalidReplayLog;
             r.start_ms_epoch = start.integer;
+            if (meta.object.get("run_output_bytes")) |limit| {
+                r.run_output_bytes = try natural(limit);
+                if (r.run_output_bytes < 16384 or r.run_output_bytes > 16777216) return error.InvalidReplayLog;
+            }
             if (meta.object.get("incomplete")) |incomplete| {
                 if (incomplete != .bool) return error.InvalidReplayLog;
                 r.incomplete = r.incomplete or incomplete.bool;
@@ -287,7 +292,7 @@ const Report = struct {
 fn replayOne(a: Allocator, io: std.Io, original: Run, recording: Recording, script: ?[]const u8) !Report {
     const evaluated = try core.executeSession(a, io, script orelse original.code, recording.entries.items, recording.start_ms_epoch, recording.end orelse .ok, script != null, original.child);
     defer evaluated.deinit(a);
-    const text = try output.stepLimitOutput(a, try output.format(a, evaluated.outcome), original.remaining_steps);
+    const text = try output.stepLimitOutput(a, try output.format(a, evaluated.outcome, recording.run_output_bytes), original.remaining_steps);
     const incomplete = recording.incomplete or evaluated.incomplete or original.expected == null;
     const determined = script == null and !incomplete and recording.end != .timeout and recording.end != .cancelled;
     const equal = if (original.expected) |expected| std.mem.eql(u8, expected, text) else false;

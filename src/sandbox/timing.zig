@@ -1,5 +1,14 @@
 const std = @import("std");
 
+pub const Execution = struct {
+    start_ms_epoch: i64 = 0,
+    end_ms_epoch: i64 = 0,
+
+    pub fn now(io: std.Io) i64 {
+        return @intCast(@divFloor(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
+    }
+};
+
 pub const Call = struct {
     name: []const u8,
     start_ms: u64,

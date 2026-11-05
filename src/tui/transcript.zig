@@ -515,6 +515,7 @@ test "thinking stays hidden in streamed and restored transcripts" {
     t.clear(gpa);
     try t.addHistory(gpa, &.{
         .{ .role = "user", .content = "hi" },
+        .{ .role = "assistant", .reasoning = .{ .provider = .codex, .data = "[{\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"opaque\"}]" } },
         .{ .role = "assistant", .reasoning = .{ .provider = .chat_completions, .data = "hidden thinking" }, .tool_calls = &.{.{ .id = "1", .function = .{ .name = "run", .arguments = "{\"code\":\"tools.bash({})\"}" } }} },
         .{ .role = "tool", .tool_call_id = "1", .content = "out" },
         .{ .role = "assistant", .content = "answer", .reasoning = .{ .provider = .codex, .data = "[{\"summary\":[{\"text\":\"hidden summary\"}]}]" } },

@@ -910,6 +910,13 @@ class BackgroundBashTests:
         self.assertEqual([(e["id"], e["kind"], e["state"]) for e in lifecycle],
                          [("b1", "bash", "started"), ("b1", "bash", "finished")])
         self.assertTrue(all("result" not in e for e in lifecycle))
+        execution = lifecycle[-1]["execution"]
+        self.assertGreater(execution["start_ms_epoch"], 0)
+        self.assertGreater(execution["end_ms_epoch"], execution["start_ms_epoch"])
+        finished = [r for r in root_records(self.home) if r.get("background", {}).get("state") == "finished"]
+        self.assertEqual(finished[-1]["background"]["execution"], execution)
+        self.assertLessEqual(execution["end_ms_epoch"], finished[-1]["at"])
+
         log = self.log(events)
         stored = [m for r in log for m in r.get("messages", []) if m.get("source") == "background"]
         self.assertEqual([(m["background_kind"], m["background_id"]) for m in stored], [("bash", "b1")])

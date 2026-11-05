@@ -34,7 +34,7 @@
 
 ## 工具与代码约定
 
-工具返回给 JS 的是完整数据，不能为保护模型上下文而悄悄截断或往正文里添加提示；否则 `read → JS 替换 → write` 会把截断标记写回文件，造成数据损坏。模型侧整个 Run 共用 16 KiB 展示预算，不改变 Run 内的数据；工具显式分页/有界结果、console 捕获上限及 Run 执行超时见 [docs/run-output.md](docs/run-output.md)。
+工具返回给 JS 的是完整数据，不能为保护模型上下文而悄悄截断或往正文里添加提示；否则 `read → JS 替换 → write` 会把截断标记写回文件，造成数据损坏。模型侧整个 Run 共用展示预算（默认 16 KiB，可配置），不改变 Run 内的数据；工具显式分页/有界结果、console 捕获上限及 Run 执行超时见 [docs/run-output.md](docs/run-output.md)。
 
 搜索优先用 tools.grep/tools.glob，不在 bash 里调 rg/find/grep。写包含反引号、`${` 或反斜杠的文件/命令文本时，用 JSON 转义的双引号 JS 字符串，不用模板字符串或 String.raw；工具表的示例由 sandbox 测试逐字节验证。
 

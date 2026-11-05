@@ -100,7 +100,7 @@ pub fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const 
     defer o.deinit(s.gpa);
 
     const remaining_steps = if (s.cfg.limits.max_steps) |limit| limit -| s.steps else null;
-    const output = try output_format.stepLimitOutput(a, try output_format.format(a, o), remaining_steps);
+    const output = try output_format.stepLimitOutput(a, try output_format.format(a, o, s.cfg.limits.run_output_bytes), remaining_steps);
     const run_ms = timing.elapsed();
     const tool_summary = try ToolSummary.init(a, timing.entries[0..timing.count], timing.run_index, timing.omitted - before_omitted);
     try sink.emit(sink.ctx, .{ .run_end = .{ .ok = o.ok, .output = output, .changes = ran.?.changes, .tool_summary = tool_summary } });

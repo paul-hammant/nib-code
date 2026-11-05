@@ -484,7 +484,7 @@ test "tool bytes include both file results but output bytes only include the for
     try testing.expectEqual(result.tool_bytes, timing.tool_bytes);
     try testing.expectEqual(@as(?u64, json_a.len), timing.entries[0].result_bytes);
     try testing.expectEqual(@as(?u64, json_b.len), timing.entries[1].result_bytes);
-    const output = try @import("session/output.zig").format(testing.allocator, result);
+    const output = try @import("session/output.zig").format(testing.allocator, result, @import("session/output.zig").max_bytes);
     defer testing.allocator.free(output);
     try testing.expectEqualStrings("result: \"ok\"", output);
 }
@@ -642,7 +642,7 @@ test "cancel and timeout stop only undelivered calls and preserve their creation
         try testing.expectEqual(@as(?u64, 0), timing.entries[2].result_bytes);
         try testing.expectEqual(@as(usize, 2), recorder.seq);
         try testing.expect(recorder.incomplete);
-        const output = try @import("session/output.zig").format(testing.allocator, result);
+        const output = try @import("session/output.zig").format(testing.allocator, result, @import("session/output.zig").max_bytes);
         defer testing.allocator.free(output);
         try testing.expect(std.mem.endsWith(u8, output, result.stopped));
     }

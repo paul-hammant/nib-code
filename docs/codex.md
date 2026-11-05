@@ -181,3 +181,11 @@ python3 /home/yang/myself/nib-bench/bench.py \
 确认生成的随机分块计划后，另行去掉 `--dry-run` 才会请求模型（本次未执行）。使用新 batch-id，避免覆盖旧结果；保留 wrapper 内容、真实二进制 SHA、nib commit，bench 记录的 binary_sha256 对 wrapper 求哈希，不能替代真实二进制校验。两组独立 Session，不共享服务端 response。交错顺序、同任务同 effort、并发 1 可降低机器负载/账号限流的干扰；至少 5 轮，冷首步与同 Turn 后续步分别比较，并单独检查降级率。
 
 对两个 agent 的 runs/*/nibhome/sessions 主日志分别运行 `scripts/stats.py <目录...> --group-by transport --json`，比较 model_ms、first_data_ms、code_first_ms 的 median/p90/samples，并核对 incremental、input_items/input_bytes、transport_fallback。不要只按配置标签判断实际线路，也不要把包含握手失败成本的 SSE 降级 Step 当作纯 SSE 对照。任务成功率、Step 数、token/cache 与总墙钟仍用 bench 自身结果一起检查；性能结论需要真实实验，mock 耗时不代表收益。
+
+## 推理摘要
+
+默认不发送 `reasoning.summary`，保留 effort、`include:["reasoning.encrypted_content"]`、`store:false` 及历史 reasoning；SSE 和 WebSocket 共用请求构造。没有摘要时 TUI 不增加空块，`ask --json` 不产生空的 reasoning delta；加密 reasoning 仍用于续接。
+
+要恢复可读摘要，配置 `[codex] reasoning_summary = "auto"`（写成段内键），或设置 `NIB_REASONING_SUMMARY=auto`；`off` 显式关闭，环境优先。即使 effort 交由服务端默认，`auto` 也会发送 `reasoning:{summary:"auto"}`。
+
+本地 request-flags 实验的三个固定请求点中，仅移除 summary 后首工具参数提前约 3.1 s（95% CI 2.7–3.8 s），reasoning tokens 未见稳定下降；这不保证整个任务等量提速，持久 WS 收益仍需另测。详见 [speed-v5.md](speed-v5.md)。

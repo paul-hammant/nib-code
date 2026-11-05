@@ -170,7 +170,7 @@ pub const Session = struct {
             const id = lost.id;
             const text = try std.fmt.allocPrint(gpa, "[background {s} {s} lost: process ended]", .{ @tagName(lost.kind), id });
             defer gpa.free(text);
-            _ = try s.inbox.enqueueBackground(gpa, io, id, lost.kind, .lost, null, text, false, 0);
+            _ = try s.inbox.enqueueBackground(gpa, io, id, lost.kind, .lost, null, text, false, 0, null);
         }
         return s;
     }

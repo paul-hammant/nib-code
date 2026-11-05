@@ -173,6 +173,10 @@ class BackgroundRunTests(unittest.TestCase):
         self.assertIn('"exit_code":0', result["content"])
         self.assertIn("bash-result", result["content"])
         completion = result["background_run"]
+        execution = completion["execution"]
+        self.assertGreater(execution["start_ms_epoch"], 0)
+        self.assertGreaterEqual(execution["end_ms_epoch"], execution["start_ms_epoch"])
+        self.assertAlmostEqual(execution["end_ms_epoch"] - execution["start_ms_epoch"], completion["run_ms"], delta=100)
         self.assertEqual((completion["step"], completion["run_index"]), (1, 0))
         self.assertEqual([c["path"] for c in completion["changes"]], ["late.txt"])
         self.assertEqual([c["name"] for c in completion["calls"]], ["bash", "write"])

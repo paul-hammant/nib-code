@@ -11,6 +11,7 @@ pub const Job = struct {
     input_arena: std.heap.ArenaAllocator,
     join_mutex: std.Io.Mutex = .init,
     elapsed_ms: u64 = 0,
+    execution: @import("../sandbox/timing.zig").Execution = .{},
     scope: RunScope,
     cancel: std.atomic.Value(bool) = .init(false),
     code: []const u8,
@@ -33,6 +34,7 @@ pub const Job = struct {
         job.* = .{ .gpa = gpa, .t = t, .input_arena = .init(gpa), .scope = .{ .tools = t, .id = t.run_id }, .code = "", .step = step, .timing = .init(t.io, .now(t.io, .awake)) };
         errdefer job.destroy();
         job.timing.run_index = index;
+        job.execution.start_ms_epoch = @import("../sandbox/timing.zig").Execution.now(t.io);
         const a = job.input_arena.allocator();
         job.code = try a.dupe(u8, code);
         if (t.fork_snapshot) |fork| {
@@ -43,7 +45,10 @@ pub const Job = struct {
             copy.file_versions = versions;
             job.scope.fork = copy;
         }
-        if (recorder) |r| job.recorder = try r.fork(step, index);
+        if (recorder) |r| {
+            job.recorder = try r.fork(step, index);
+            job.recorder.?.run_output_bytes = if (t.cfg) |cfg| cfg.limits.run_output_bytes else output.max_bytes;
+        }
         job.thread = try std.Thread.spawn(.{}, work, .{job});
         return job;
     }
@@ -54,7 +59,10 @@ pub const Job = struct {
             job.completed.set(job.t.io);
         }
         defer job.input_arena.deinit();
-        defer job.elapsed_ms = job.timing.elapsed();
+        defer {
+            job.elapsed_ms = job.timing.elapsed();
+            job.execution.end_ms_epoch = @import("../sandbox/timing.zig").Execution.now(job.t.io);
+        }
         var host = job.scope.host();
         host.timing = &job.timing;
         host.waiting = &job.waiting;
@@ -95,6 +103,6 @@ pub const Job = struct {
         const o = job.outcome.?;
         const cwd = try std.process.currentPathAlloc(job.t.io, job.gpa);
         defer job.gpa.free(cwd);
-        return .{ .step = job.step, .run_index = job.timing.run_index, .ok = o.ok, .output = try output.format(a, o), .run_ms = job.elapsed_ms, .tool_bytes = job.timing.tool_bytes, .calls = job.timing.entries[0..job.timing.count], .calls_omitted = job.timing.omitted, .changes = try job.scope.changes.take(job.gpa, a, cwd) };
+        return .{ .execution = job.execution, .step = job.step, .run_index = job.timing.run_index, .ok = o.ok, .output = try output.format(a, o, if (job.t.cfg) |cfg| cfg.limits.run_output_bytes else output.max_bytes), .run_ms = job.elapsed_ms, .tool_bytes = job.timing.tool_bytes, .calls = job.timing.entries[0..job.timing.count], .calls_omitted = job.timing.omitted, .changes = try job.scope.changes.take(job.gpa, a, cwd) };
     }
 };

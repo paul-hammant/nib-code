@@ -146,7 +146,8 @@ class ReplayTests(unittest.TestCase):
             run_rows = [r for r in rows if (r["step"], r["run"]) == key]
             self.assertEqual(sum("meta" in r for r in run_rows), 1)
             self.assertEqual(set(run_rows[-1]), {"step", "run", "meta"})
-            self.assertEqual(set(run_rows[-1]["meta"]), {"start_ms_epoch", "end"})
+            self.assertEqual(set(run_rows[-1]["meta"]), {"start_ms_epoch", "run_output_bytes", "end"})
+            self.assertEqual(run_rows[-1]["meta"]["run_output_bytes"], 16384)
         (self.cwd / "sample.txt").unlink()
         (self.cwd / "side-effect").unlink()
         before = len(self.mock.requests)

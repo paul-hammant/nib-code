@@ -29,6 +29,7 @@ const all = [_]Tool{
         .name = "read",
         .run = files.read,
         .doc =
+        \\  // Locate with grep first, then read needed line ranges; batch large multi-file output or print snippets to stay within the Run display budget.
         \\  // Read requested lines of a UTF-8 file (max 16 MiB) verbatim. offset is 1-based; next_offset is null at EOF.
         \\  async read({ path, offset = 1, limit = 2000 }) {}, // → { text, next_offset }
         ,
@@ -80,10 +81,11 @@ const all = [_]Tool{
         .name = "bash",
         .run = bash.bash,
         .doc =
-        \\  // cwd; merged stderr. Group killed on return (nohup/& too); killed:exit_code:null.
-        \\  // >16 MiB errors: redirect; otherwise capture test output. >256 words except heredocs: script.
-        \\  // background:{id}, auto-message. detached needs background; spans Turns, ends with shell; stop/timeout/cancel/failure/exit cleans up.
-        \\  // Auto-background keeps await/output. No ps/cat/tail/sleep/timeout reruns or pending log reads. No other work:reply without tools; Session waits.
+        \\  // cwd; merged stderr; group killed on return (nohup/& too); killed:exit_code:null.
+        \\  // >16 MiB:redirect. >256 words except heredocs:script.
+        \\  // background:{id}, auto-message. detached needs background, spans Turns/shell lifetime; stop/timeout/cancel/failure/exit cleans up.
+        \\  // Auto-bg keeps await/output. No polling/pending logs. Idle:reply; Session waits.
+        \\  // Full checks:code, known regression tests, fixtures/expectations, fmt first; fix failures, revalidate.
         \\  // Example: await tools.bash({command: "zig build test --summary all"})
         \\  async bash({ command, timeout_ms, background = false, detached = false }) {}, // → { exit_code, output } or { id }; timeout_ms: detached 0, else 1800000 (30 min)
         ,

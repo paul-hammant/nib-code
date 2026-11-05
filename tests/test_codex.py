@@ -130,7 +130,7 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
             assert ("end" if ok else "error") in events[-1], events
             return events
 
-        summaries = ask("plain text", "--effort", "high", overrides={"NIB_THINKING": "off"})
+        summaries = ask("plain text", "--effort", "high", overrides={"NIB_THINKING": "off", "NIB_REASONING_SUMMARY": "auto"})
         assert requests()[-1]["body"]["reasoning"] == {"effort": "high", "summary": "auto"}
         reasoning_deltas = [e["delta"]["text"] for e in summaries if e.get("delta", {}).get("kind") == "reasoning"]
         assert reasoning_deltas == ["Mock ", "reaso", "ning."] * 2, summaries
@@ -176,13 +176,15 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
         assert reasoning["provider"] == "codex"
         items = [item for item in json.loads(reasoning["data"]) if item["type"] == "reasoning"]
         assert len(items) == 2 and all(item["encrypted_content"].startswith("fake-encrypted-") for item in items)
-        assert items[0]["summary"] == [{"type": "summary_text", "text": "Mock reasoning."}]
+        assert items[0]["summary"] == []
+        assert not any(e.get("delta", {}).get("kind") == "reasoning" for e in plain)
+        assert requests()[-1]["body"]["reasoning"] == {"effort": "high"}
         ask("plain text", "--resume", session)
         assert_cache_key(requests()[-1:], session)
         assert all(item in requests()[-1]["body"]["input"] for item in items), (items, requests()[-1]["body"]["input"])
         assert next(item for item in requests()[-1]["body"]["input"] if item.get("role") == "assistant")["phase"] == "final_answer"
         disabled = ask("plain text", overrides={"NIB_MODEL": "gpt-6.1-terra", "NIB_THINKING": "off"})
-        assert requests()[-1]["body"]["reasoning"] == {"effort": "none", "summary": "auto"}
+        assert requests()[-1]["body"]["reasoning"] == {"effort": "none"}
         assert not any(e.get("delta", {}).get("kind") == "reasoning" for e in disabled)
 
         before = len(requests())

@@ -80,6 +80,7 @@ pub const TurnSummary = struct {
 pub const ModelActivity = enum { started, data, finished };
 
 pub const RunCompletion = struct {
+    execution: ?@import("../sandbox/timing.zig").Execution = null,
     step: usize,
     run_index: usize,
     ok: bool,
@@ -92,6 +93,7 @@ pub const RunCompletion = struct {
 };
 
 pub const Background = struct {
+    execution: ?@import("../sandbox/timing.zig").Execution = null,
     id: []const u8,
     kind: Kind,
     state: enum { started, finished, lost },
@@ -130,7 +132,7 @@ pub const JsonEvent = union(enum) {
         switch (value) {
             .event => |event| if (event == .background) {
                 const b = event.background;
-                try writer.write(.{ .background = .{ .id = b.id, .kind = b.kind, .state = b.state, .ok = b.ok, .completion = b.completion } });
+                try writer.write(.{ .background = .{ .id = b.id, .kind = b.kind, .state = b.state, .ok = b.ok, .completion = b.completion, .execution = b.execution } });
             } else try writer.write(event),
             inline else => |payload, tag| {
                 try writer.beginObject();

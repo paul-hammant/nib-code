@@ -3,6 +3,25 @@ const sandbox = @import("../sandbox.zig");
 
 pub const max_bytes = 16 * 1024;
 
+test "configured display budget leaves JS data intact" {
+    const t = std.testing;
+    const text = try t.allocator.alloc(u8, 24 * 1024);
+    defer t.allocator.free(text);
+    @memset(text, 'x');
+    const outcome: sandbox.Outcome = .{ .ok = true, .text = text, .logs = @constCast("") };
+    const small = try format(t.allocator, outcome, max_bytes);
+    defer t.allocator.free(small);
+    const large = try format(t.allocator, outcome, 32 * 1024);
+    defer t.allocator.free(large);
+    try t.expect(small.len <= max_bytes);
+    try t.expect(std.mem.indexOf(u8, small, "bytes omitted") != null);
+    try t.expectEqualStrings(text, large["result: ".len..]);
+    try t.expectEqual(@as(usize, 24 * 1024), outcome.text.len);
+    const message = try formatMessage(t.allocator, "[background bash b1 finished]\n", text, 32 * 1024);
+    defer t.allocator.free(message);
+    try t.expect(std.mem.endsWith(u8, message, text));
+}
+
 const Entry = struct {
     first: usize,
     last: usize,
@@ -25,9 +44,9 @@ const Entry = struct {
     }
 };
 
-pub fn format(gpa: std.mem.Allocator, o: sandbox.Outcome) ![]u8 {
-    if (o.stopped.len == 0) return renderLimit(gpa, o, max_bytes);
-    const body = try renderLimit(gpa, o, max_bytes - o.stopped.len - 1);
+pub fn format(gpa: std.mem.Allocator, o: sandbox.Outcome, limit: usize) ![]u8 {
+    if (o.stopped.len == 0) return renderLimit(gpa, o, limit);
+    const body = try renderLimit(gpa, o, limit - o.stopped.len - 1);
     defer gpa.free(body);
     return std.fmt.allocPrint(gpa, "{s}\n{s}", .{ body, o.stopped });
 }
@@ -38,8 +57,8 @@ pub fn stepLimitOutput(a: std.mem.Allocator, output: []const u8, remaining_steps
     return std.fmt.allocPrint(a, "{s}\n[{d} Steps left in this Turn]", .{ output, remaining });
 }
 
-pub fn formatMessage(gpa: std.mem.Allocator, prefix: []const u8, json: []const u8) ![]u8 {
-    const payload = try renderLimit(gpa, .{ .ok = false, .text = @constCast(json), .logs = @constCast("") }, max_bytes - prefix.len);
+pub fn formatMessage(gpa: std.mem.Allocator, prefix: []const u8, json: []const u8, limit: usize) ![]u8 {
+    const payload = try renderLimit(gpa, .{ .ok = false, .text = @constCast(json), .logs = @constCast("") }, limit - prefix.len);
     defer gpa.free(payload);
     return std.fmt.allocPrint(gpa, "{s}{s}", .{ prefix, payload });
 }
@@ -153,7 +172,7 @@ fn evaluate(code: []const u8, limits: sandbox.Limits) !sandbox.Outcome {
 test "three console entries retain labels and exact omission bytes" {
     const o = try evaluate("console.log('first'); console.log('middle:' + 'z'.repeat(40000) + ':middle-end'); console.log('last');", .{});
     defer o.deinit(testing.allocator);
-    const out = try format(testing.allocator, o);
+    const out = try format(testing.allocator, o, max_bytes);
     defer testing.allocator.free(out);
     try testing.expect(out.len <= max_bytes);
     try testing.expectEqual(@as(usize, 3), o.log_entries.len);
@@ -169,7 +188,7 @@ test "three console entries retain labels and exact omission bytes" {
 test "console capture limit preserves later entries and exact omission counts" {
     const o = try evaluate("console.log('first'); console.log('middle:' + 'z'.repeat(90000)); console.log('last');", .{});
     defer o.deinit(testing.allocator);
-    const out = try format(testing.allocator, o);
+    const out = try format(testing.allocator, o, max_bytes);
     defer testing.allocator.free(out);
     try testing.expect(out.len <= max_bytes);
     try testing.expect(o.log_truncated);
@@ -185,7 +204,7 @@ test "console capture limit preserves later entries and exact omission counts" {
 test "many console entries have bounded metadata and a numbered omission range" {
     const o = try evaluate("for (let i = 0; i < 10000; i++) console.log('x');", .{});
     defer o.deinit(testing.allocator);
-    const out = try format(testing.allocator, o);
+    const out = try format(testing.allocator, o, max_bytes);
     defer testing.allocator.free(out);
     try testing.expect(out.len <= max_bytes);
     try testing.expectEqual(sandbox.max_log_entries + 1, o.log_entries.len);
@@ -196,7 +215,7 @@ test "many console entries have bounded metadata and a numbered omission range" 
 test "small outputs remain unchanged even with more than 64 console calls" {
     const o = try evaluate("for (let i = 0; i < 100; i++) console.log('x');", .{});
     defer o.deinit(testing.allocator);
-    const out = try format(testing.allocator, o);
+    const out = try format(testing.allocator, o, max_bytes);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings(std.mem.trimEnd(u8, o.logs, "\n"), out);
 }
@@ -205,7 +224,7 @@ test "UTF-8 cuts count all omitted bytes including capture loss" {
     for ([_]usize{ 65536, 16385, 1, 0 }) |capture| {
         const o = try evaluate("console.log('你'.repeat(30000));", .{ .max_log_bytes = capture });
         defer o.deinit(testing.allocator);
-        const out = try format(testing.allocator, o);
+        const out = try format(testing.allocator, o, max_bytes);
         defer testing.allocator.free(out);
         try testing.expect(out.len <= max_bytes);
         try testing.expect(std.unicode.utf8ValidateSlice(out));
@@ -226,7 +245,7 @@ test "completion and errors have their own entry and cannot be crowded out by lo
     for (codes, 0..) |code, i| {
         const o = try evaluate(code, .{});
         defer o.deinit(testing.allocator);
-        const out = try format(testing.allocator, o);
+        const out = try format(testing.allocator, o, max_bytes);
         defer testing.allocator.free(out);
         try testing.expect(out.len <= max_bytes);
         try testing.expect(std.mem.indexOf(u8, out, if (o.ok) "(result)" else "(error)") != null);
@@ -251,7 +270,7 @@ test "exact output budget boundaries for console and completion" {
             defer testing.allocator.free(source);
             const o = try evaluate(source, .{});
             defer o.deinit(testing.allocator);
-            const out = try format(testing.allocator, o);
+            const out = try format(testing.allocator, o, max_bytes);
             defer testing.allocator.free(out);
             try testing.expect(out.len <= max_bytes);
             if (size <= max_bytes) {
@@ -268,7 +287,7 @@ test "four-byte UTF-8 capture boundaries" {
     for (0..8) |capture| {
         const o = try evaluate("console.log('😀'.repeat(30000));", .{ .max_log_bytes = capture });
         defer o.deinit(testing.allocator);
-        const out = try format(testing.allocator, o);
+        const out = try format(testing.allocator, o, max_bytes);
         defer testing.allocator.free(out);
         try testing.expect(out.len <= max_bytes);
         try testing.expect(std.unicode.utf8ValidateSlice(out));
@@ -282,7 +301,7 @@ test "four-byte UTF-8 capture boundaries" {
 test "console entry boundaries are calls rather than arguments or lines" {
     const o = try evaluate("console.log('left', {n: 1}, 'a\\nb'); console.warn('z'.repeat(40000)); console.error('right');", .{});
     defer o.deinit(testing.allocator);
-    const out = try format(testing.allocator, o);
+    const out = try format(testing.allocator, o, max_bytes);
     defer testing.allocator.free(out);
     try testing.expect(std.mem.startsWith(u8, out, "[entry 1 of 3 (console)]\nleft {\"n\":1} a\nb\n[entry 2 of 3 (console)]\n"));
     try testing.expect(std.mem.endsWith(u8, out, "[entry 3 of 3 (console)]\nright\n"));
@@ -302,7 +321,7 @@ test "oversized single call and cumulative calls preserve real head and tail" {
         try testing.expect(std.mem.endsWith(u8, o.logs, "-FINAL-SENTINEL\n"));
         try testing.expect(o.log_head_bytes + o.logs.len - o.log_tail_start <= 65536);
         try testing.expect(o.log_entries.len <= sandbox.max_log_entries + 1);
-        const out = try format(testing.allocator, o);
+        const out = try format(testing.allocator, o, max_bytes);
         defer testing.allocator.free(out);
         try testing.expect(out.len <= max_bytes);
         try testing.expect(std.unicode.utf8ValidateSlice(out));
@@ -318,7 +337,7 @@ test "bounded call metadata plus completion preserves original numbering" {
         defer testing.allocator.free(code);
         const o = try evaluate(code, .{});
         defer o.deinit(testing.allocator);
-        const out = try format(testing.allocator, o);
+        const out = try format(testing.allocator, o, max_bytes);
         defer testing.allocator.free(out);
         try testing.expect(out.len <= max_bytes);
         try testing.expect(std.unicode.utf8ValidateSlice(out));
@@ -345,7 +364,7 @@ test "stopped line follows small output without changing the body" {
         defer original.deinit(testing.allocator);
         var o = original;
         o.stopped = stopped;
-        const out = try format(testing.allocator, o);
+        const out = try format(testing.allocator, o, max_bytes);
         defer testing.allocator.free(out);
         try testing.expectEqualStrings(case[1] ++ "\n" ++ stopped, out);
     }
@@ -363,7 +382,7 @@ test "stopped line reserves budget at exact body boundaries" {
             .text = @constCast("undefined"),
             .logs = logs,
             .stopped = stopped,
-        });
+        }, max_bytes);
         defer testing.allocator.free(out);
         try testing.expect(out.len <= max_bytes);
         try testing.expect(std.mem.endsWith(u8, out, "\n" ++ stopped));
@@ -393,7 +412,7 @@ test "maximum stopped line survives huge console errors and many entries" {
         defer original.deinit(testing.allocator);
         var o = original;
         o.stopped = &stopped;
-        const out = try format(testing.allocator, o);
+        const out = try format(testing.allocator, o, max_bytes);
         defer testing.allocator.free(out);
         try testing.expect(out.len <= max_bytes);
         try testing.expect(std.mem.endsWith(u8, out, &stopped));
@@ -424,19 +443,19 @@ test "formatOutcome" {
     const gpa = std.testing.allocator;
     var logs = "a\nb\n".*;
     var text = "1".*;
-    const ok = try format(gpa, .{ .ok = true, .text = &text, .logs = &logs });
+    const ok = try format(gpa, .{ .ok = true, .text = &text, .logs = &logs }, max_bytes);
     defer gpa.free(ok);
     try std.testing.expectEqualStrings("a\nb\nresult: 1", ok);
     var err = "Error: x".*;
     var none = "".*;
-    const bad = try format(gpa, .{ .ok = false, .text = &err, .logs = &none });
+    const bad = try format(gpa, .{ .ok = false, .text = &err, .logs = &none }, max_bytes);
     defer gpa.free(bad);
     try std.testing.expectEqualStrings("Error: x", bad);
     var undef = "undefined".*;
-    const logged = try format(gpa, .{ .ok = true, .text = &undef, .logs = &logs });
+    const logged = try format(gpa, .{ .ok = true, .text = &undef, .logs = &logs }, max_bytes);
     defer gpa.free(logged);
     try std.testing.expectEqualStrings("a\nb", logged);
-    const silent = try format(gpa, .{ .ok = true, .text = &undef, .logs = &none });
+    const silent = try format(gpa, .{ .ok = true, .text = &undef, .logs = &none }, max_bytes);
     defer gpa.free(silent);
     try std.testing.expectEqualStrings("(no output)", silent);
 }

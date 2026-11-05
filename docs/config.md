@@ -25,6 +25,7 @@ effort = "high"
 model = "gpt-6.1-sol"
 base_url = "https://chatgpt.com/backend-api"
 context_window = 500000
+reasoning_summary = "off" # auto 开启可读推理摘要
 transport = "sse" # websocket 为显式启用的 Responses WS 原型
 
 [chat_completions]
@@ -42,13 +43,14 @@ stream_idle_timeout_s = 300
 stream_content_timeout_s = 120
 request_timeout_s = 300
 run_background_after_ms = 10000
+run_output_bytes = 16384
 ```
 
 只使用当前 provider 的段落；切换 provider 不需要改写另一段。环境和配置文件均未指定时，默认 provider 为 `codex`，默认模型 `gpt-6.1-sol`、窗口 500000 tokens；使用本机 Codex 登录，无需 API key。Codex 窗口随模型变化，未知模型需要显式提供 `context_window` 或 `NIB_CONTEXT_WINDOW`。模型、恢复和凭证边界见 [codex.md](codex.md) 与 [ADR 0011](adr/0011-provider-wire-protocols.md)。
 
 DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 `DEEPSEEK_API_KEY`（或 `NIB_API_KEY`），默认模型 `deepseek-flash`、窗口 1000000 tokens；其他默认值见上例。
 
-这是无额外依赖的 TOML 子集：支持空行、`#` 注释、单行双引号字符串（支持 `\"`、`\\`、`\n` 转义）、十进制整数（可带符号、下划线分组）和 true/false 布尔值；当前配置键只使用字符串和正整数，布尔值会报告类型错误。仅接受顶层 `provider`、`effort`，`[codex]` / `[chat_completions]` 下的 `model`、`base_url`、`context_window`，`[codex]` 还接受 `transport = "sse"|"websocket"`，以及下述 `[limits]` 键。不支持数组、嵌套表、多行字符串等完整 TOML 语法；未知键、重复键/段落和格式错误会报配置文件路径与行号，不静默忽略。
+这是无额外依赖的 TOML 子集：支持空行、`#` 注释、单行双引号字符串（支持 `\"`、`\\`、`\n` 转义）、十进制整数（可带符号、下划线分组）和 true/false 布尔值；当前配置键只使用字符串和正整数，布尔值会报告类型错误。仅接受顶层 `provider`、`effort`，`[codex]` / `[chat_completions]` 下的 `model`、`base_url`、`context_window`，`[codex]` 还接受 `transport = "sse"|"websocket"`、`reasoning_summary = "off"|"auto"`，以及下述 `[limits]` 键。不支持数组、嵌套表、多行字符串等完整 TOML 语法；未知键、重复键/段落和格式错误会报配置文件路径与行号，不静默忽略。
 
 ## [limits]
 
@@ -56,6 +58,7 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 
 | 键 | 含义 | 默认值 | 范围 |
 | --- | --- | --- | --- |
+| `run_output_bytes` | 每个 Run／后台结果消息的模型展示字节预算，不改变 JS 内工具数据 | 16384 | 16384–16777216 |
 | `llm_concurrency` | `tools.llm` 每进程同时进行的请求数，超出排队 | 4 | 1–64 |
 | `llm_calls_per_run` | 每个 Run 的 `tools.llm` 调用上限，超出 reject | 100 | 1–10000 |
 | `llm_input_kib` | 单次 prompt + 序列化 input 的 UTF-8 字节上限（KiB），超出 reject，不截断 | 256 | 1–65536 |
@@ -70,9 +73,9 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 
 三个截止时间同时约束主模型请求、`tools.llm` 和压缩摘要请求，适用于 WS 和 SSE，每次重试重新计时。总请求截止时间覆盖连接、发送、读头及读取响应；另外两个截止时间在接收流时检查。空闲超时复用连接中断的重试上限和退避；Chat Completions 已输出可见增量时仍不自动重放，缓冲结果的 `tools.llm` 与摘要可以安全重试。默认阈值的正式批次分布、一手来源和局限见 [speed-v4.md](speed-v4.md)。
 
-这些限额没有环境变量或 CLI 覆盖；随有效配置经 stdin 传给子会话，子会话不读取配置文件。`max_steps` 未设置时子会话同样为 `null`，显式设置时继承该上限。sandbox 内全部工具最多 8 并发是线程调度实现，不由此小节控制。
+`run_output_bytes` 可由 `NIB_RUN_OUTPUT_BYTES` 覆盖；其余限额没有环境变量或 CLI 覆盖；随有效配置经 stdin 传给子会话，子会话不读取配置文件。`max_steps` 未设置时子会话同样为 `null`，显式设置时继承该上限。sandbox 内全部工具最多 8 并发是线程调度实现，不由此小节控制。
 
-显式设置 `max_steps` 时，新会话的 system prompt 会写明每个 Turn 的上限；剩余不多于 3 个 Step 时，每个 Run 输出末尾追加剩余步数（不计入 16 KiB 输出预算）。耗尽后不再请求模型；正在运行的后台 agent/bash 会先完成，结果按现有格式写进历史和日志，下一 Turn 可见。Turn 仍以 `TooManySteps` / `stopped after N steps` 结束；若等待了任务，提示会列出任务类型与 ID。等待期间 Esc 仍会立即取消 Turn 并停止后台任务。未设置时不添加这些提示，也不限制 Step 数。恢复会话保留原始 system；若当前配置与其中记录的上限不同，会在每个 Turn 的用户输入前附加当前预算事实，避免沿用过期上限。
+显式设置 `max_steps` 时，新会话的 system prompt 会写明每个 Turn 的上限；剩余不多于 3 个 Step 时，每个 Run 输出末尾追加剩余步数（不计入配置的 Run 展示预算）。耗尽后不再请求模型；正在运行的后台 agent/bash 会先完成，结果按现有格式写进历史和日志，下一 Turn 可见。Turn 仍以 `TooManySteps` / `stopped after N steps` 结束；若等待了任务，提示会列出任务类型与 ID。等待期间 Esc 仍会立即取消 Turn 并停止后台任务。未设置时不添加这些提示，也不限制 Step 数。恢复会话保留原始 system；若当前配置与其中记录的上限不同，会在每个 Turn 的用户输入前附加当前预算事实，避免沿用过期上限。
 
 配置文件不存秘密，也不接受 API key、token、密码或凭证字段。Chat Completions 的 key 使用 `NIB_API_KEY` / `DEEPSEEK_API_KEY`；Codex 使用现有登录文件。不要把秘密放进 URL。
 
@@ -81,7 +84,7 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 从高到低：
 
 1. CLI `--effort <level>`（TUI 启动和 `ask` 都支持）。
-2. 环境变量：`NIB_PROVIDER`、`NIB_MODEL`、`NIB_BASE_URL`、`NIB_CONTEXT_WINDOW`、`NIB_THINKING`、`NIB_REASONING_EFFORT`、`NIB_CODEX_TRANSPORT`。
+2. 环境变量：`NIB_PROVIDER`、`NIB_MODEL`、`NIB_BASE_URL`、`NIB_CONTEXT_WINDOW`、`NIB_THINKING`、`NIB_REASONING_EFFORT`、`NIB_CODEX_TRANSPORT`、`NIB_REASONING_SUMMARY`、`NIB_RUN_OUTPUT_BYTES`。
 3. `$NIB_HOME/config.toml`。
 4. 内置默认值。
 
@@ -98,6 +101,8 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 | `NIB_PROVIDER` | `codex` / `chat_completions` |
 | `NIB_BASE_URL` | 当前 provider 的服务地址 |
 | `NIB_CODEX_TRANSPORT` | Codex 传输：`sse`（默认）或 `websocket`；覆盖 `[codex].transport`，握手/协议失败后本 Session 降级 SSE，见 [Codex 传输](codex.md#responses-websocket-原型) |
+| `NIB_REASONING_SUMMARY` | `off`（默认，不发送 summary）或 `auto`；覆盖 `[codex].reasoning_summary`，不改变 effort 和加密 reasoning 回传 |
+| `NIB_RUN_OUTPUT_BYTES` | 模型展示预算字节数，16384–16777216；覆盖 `[limits].run_output_bytes`，默认 16384；不改变 JS 数据与 console 捕获上限 |
 | `NIB_MODEL` | 当前 provider 的模型 |
 | `NIB_CONTEXT_WINDOW` | 上下文窗口 tokens，DeepSeek 默认 1000000 |
 | `NIB_THINKING` | `on` / `off`，不设时用服务端默认（若无其他推理配置） |

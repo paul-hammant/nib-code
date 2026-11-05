@@ -37,6 +37,7 @@ pub const Background = struct {
         announced: bool = false,
         delivered: bool = false,
         failure: ?anyerror = null,
+        execution: @import("../sandbox/timing.zig").Execution = .{},
 
         fn join(job: *Job) void {
             if (job.thread) |thread| {
@@ -85,7 +86,7 @@ pub const Background = struct {
             const result = switch (job.kind) {
                 .agent => agent.execute(t, gpa, job.args, &job.cancel, job.id, job.run, true, job.fork_input),
                 .run => unreachable,
-                .bash => @import("bash.zig").executeBackground(t, gpa, job.args, &job.cancel, .{ .id = job.id, .run = job.run, .background = true, .kind = .bash, .prompt = "" }),
+                .bash => @import("bash.zig").executeBackground(t, gpa, job.args, &job.cancel, .{ .id = job.id, .run = job.run, .background = true, .kind = .bash, .prompt = "" }, &job.execution),
             } catch |err| try @import("../tools.zig").fail(gpa, "{s}", .{@errorName(err)});
             defer switch (result) {
                 inline else => |bytes| gpa.free(bytes),
@@ -111,14 +112,14 @@ pub const Background = struct {
             };
             const prefix = try std.fmt.allocPrint(gpa, "[background {s} {s} finished]\n", .{ @tagName(job.kind), job.id });
             defer gpa.free(prefix);
-            const formatted = try output.formatMessage(gpa, prefix, json);
+            const formatted = try output.formatMessage(gpa, prefix, json, if (t.cfg) |cfg| cfg.limits.run_output_bytes else output.max_bytes);
             defer gpa.free(formatted);
             if (job.kind == .agent) {
                 t.agent_sessions.mutex.lockUncancelable(t.io);
                 defer t.agent_sessions.mutex.unlock(t.io);
-                _ = try t.background.inbox.?.enqueueBackground(gpa, t.io, job.id, job.kind, .finished, ok, formatted, job.detached, job.invocation);
+                _ = try t.background.inbox.?.enqueueBackground(gpa, t.io, job.id, job.kind, .finished, ok, formatted, job.detached, job.invocation, if (job.execution.end_ms_epoch > 0) job.execution else null);
                 t.agent_sessions.releaseLocked(job.id);
-            } else _ = try t.background.inbox.?.enqueueBackground(gpa, t.io, job.id, job.kind, .finished, ok, formatted, job.detached, job.invocation);
+            } else _ = try t.background.inbox.?.enqueueBackground(gpa, t.io, job.id, job.kind, .finished, ok, formatted, job.detached, job.invocation, if (job.execution.end_ms_epoch > 0) job.execution else null);
         }
     };
 
@@ -269,7 +270,7 @@ pub const Background = struct {
             };
             const text = try std.fmt.allocPrint(job.gpa, "[background run {s} finished]\n{s}", .{ job.id, completion.output });
             defer job.gpa.free(text);
-            _ = try bg.inbox.?.enqueueCompletion(job.gpa, io, job.id, .run, .finished, completion.ok, text, false, 0, completion);
+            _ = try bg.inbox.?.enqueueCompletion(job.gpa, io, job.id, .run, .finished, completion.ok, text, false, 0, completion, completion.execution);
             job.collected = true;
             job.releaseExecution();
         }

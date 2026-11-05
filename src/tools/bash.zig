@@ -51,20 +51,20 @@ pub fn bash(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
         };
         return .{ .ok = result };
     }
-    return execute(t, gpa, a.value.command, a.value.timeoutMs(), t.cancelFlag(), null);
+    return execute(t, gpa, a.value.command, a.value.timeoutMs(), t.cancelFlag(), null, null);
 }
 
-pub fn executeBackground(t: *Tools, gpa: std.mem.Allocator, args: []const u8, cancel: *const std.atomic.Value(bool), progress: @import("../session/events.zig").Progress) !sandbox.ToolResult {
+pub fn executeBackground(t: *Tools, gpa: std.mem.Allocator, args: []const u8, cancel: *const std.atomic.Value(bool), progress: @import("../session/events.zig").Progress, execution: ?*@import("../sandbox/timing.zig").Execution) !sandbox.ToolResult {
     const parsed = try std.json.parseFromSlice(Args, gpa, args, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     if (parsed.value.validationError()) |message| return fail(gpa, "{s}", .{message});
     var value = progress;
     value.prompt = parsed.value.command;
     value.detached = parsed.value.detached;
-    return execute(t, gpa, value.prompt, parsed.value.timeoutMs(), cancel, value);
+    return execute(t, gpa, value.prompt, parsed.value.timeoutMs(), cancel, value, execution);
 }
 
-fn execute(t: *Tools, gpa: std.mem.Allocator, command: []const u8, timeout_ms: i64, cancel: *const std.atomic.Value(bool), progress: ?@import("../session/events.zig").Progress) !sandbox.ToolResult {
+fn execute(t: *Tools, gpa: std.mem.Allocator, command: []const u8, timeout_ms: i64, cancel: *const std.atomic.Value(bool), progress: ?@import("../session/events.zig").Progress, execution: ?*@import("../sandbox/timing.zig").Execution) !sandbox.ToolResult {
     var tracker: Tracker = .{ .t = t, .gpa = gpa, .command = command, .value = progress, .started = .now(t.io, .awake) };
     var state: @FieldType(@import("../session/events.zig").Progress, "state") = .failed;
     defer tracker.finish(state);
@@ -79,7 +79,7 @@ fn execute(t: *Tools, gpa: std.mem.Allocator, command: []const u8, timeout_ms: i
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .ignore,
-    }, .cancel = cancel, .timeout_ms = timeout_ms, .on_tick = .{ .ctx = &tracker, .emit = Tracker.observe }, .max_output_bytes = 16 * 1024 * 1024 }) catch |err| return switch (err) {
+    }, .execution = execution, .cancel = cancel, .timeout_ms = timeout_ms, .on_tick = .{ .ctx = &tracker, .emit = Tracker.observe }, .max_output_bytes = 16 * 1024 * 1024 }) catch |err| return switch (err) {
         error.OutputLimit => fail(gpa, "output exceeds 16 MiB; redirect output to a file", .{}),
         else => err,
     };
@@ -348,7 +348,10 @@ test "bash has a finite 30 minute default and honors explicit timeouts in every 
     defer t.progress.deinit(testing.allocator);
     const progress = try t.progress.add(testing.allocator, testing.io, .bash, "sleep 5", 1, true);
     var cancel: std.atomic.Value(bool) = .init(false);
-    const result = try executeBackground(&t, testing.allocator, "{\"command\":\"sleep 5\",\"background\":true,\"detached\":true,\"timeout_ms\":25}", &cancel, .{ .id = progress, .kind = .bash, .background = true, .prompt = "" });
+    var execution: @import("../sandbox/timing.zig").Execution = .{};
+    const result = try executeBackground(&t, testing.allocator, "{\"command\":\"sleep 5\",\"background\":true,\"detached\":true,\"timeout_ms\":25}", &cancel, .{ .id = progress, .kind = .bash, .background = true, .prompt = "" }, &execution);
     defer freeResult(result);
     try testing.expectEqualStrings("timed out after 25 ms", result.err);
+    try testing.expect(execution.start_ms_epoch > 0);
+    try testing.expect(execution.end_ms_epoch >= execution.start_ms_epoch + 25);
 }

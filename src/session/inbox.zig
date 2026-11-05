@@ -47,11 +47,11 @@ pub const Inbox = struct {
         return id;
     }
 
-    pub fn enqueueBackground(q: *Inbox, gpa: std.mem.Allocator, io: std.Io, id: []const u8, kind: Background.Kind, state: @FieldType(Background, "state"), ok: ?bool, text: []const u8, detached: bool, invocation: usize) !u64 {
-        return q.enqueueCompletion(gpa, io, id, kind, state, ok, text, detached, invocation, null);
+    pub fn enqueueBackground(q: *Inbox, gpa: std.mem.Allocator, io: std.Io, id: []const u8, kind: Background.Kind, state: @FieldType(Background, "state"), ok: ?bool, text: []const u8, detached: bool, invocation: usize, execution: ?@import("../sandbox/timing.zig").Execution) !u64 {
+        return q.enqueueCompletion(gpa, io, id, kind, state, ok, text, detached, invocation, null, execution);
     }
 
-    pub fn enqueueCompletion(q: *Inbox, gpa: std.mem.Allocator, io: std.Io, id: []const u8, kind: Background.Kind, state: @FieldType(Background, "state"), ok: ?bool, text: []const u8, detached: bool, invocation: usize, completion: ?@import("events.zig").RunCompletion) !u64 {
+    pub fn enqueueCompletion(q: *Inbox, gpa: std.mem.Allocator, io: std.Io, id: []const u8, kind: Background.Kind, state: @FieldType(Background, "state"), ok: ?bool, text: []const u8, detached: bool, invocation: usize, completion: ?@import("events.zig").RunCompletion, execution: ?@import("../sandbox/timing.zig").Execution) !u64 {
         q.mutex.lockUncancelable(io);
         defer q.mutex.unlock(io);
         const copy = try gpa.dupe(u8, text);
@@ -65,7 +65,7 @@ pub const Inbox = struct {
             break :blk try cloneCompletion(owned.?.allocator(), value);
         } else null;
         const message_id = q.next_id;
-        try q.batch.items.append(gpa, .{ .id = message_id, .text = copy, .background = .{ .id = agent_id, .kind = kind, .state = state, .ok = ok, .completion = copy_completion }, .detached = detached, .invocation = invocation, .completion_arena = owned });
+        try q.batch.items.append(gpa, .{ .id = message_id, .text = copy, .background = .{ .id = agent_id, .kind = kind, .state = state, .ok = ok, .completion = copy_completion, .execution = execution }, .detached = detached, .invocation = invocation, .completion_arena = owned });
         q.next_id += 1;
         return message_id;
     }
@@ -206,8 +206,8 @@ test "limit wait inserts background results and preserves queued user messages" 
     var pending: std.ArrayList(provider.Message) = .empty;
     defer pending.deinit(t.allocator);
     _ = try q.enqueue(t.allocator, t.io, "next user message");
-    _ = try q.enqueueBackground(t.allocator, t.io, "b1", .bash, .finished, true, "background result", false, 0);
-    _ = try q.enqueueBackground(t.allocator, t.io, "b2", .bash, .finished, true, "detached result", true, 0);
+    _ = try q.enqueueBackground(t.allocator, t.io, "b1", .bash, .finished, true, "background result", false, 0, null);
+    _ = try q.enqueueBackground(t.allocator, t.io, "b2", .bash, .finished, true, "detached result", true, 0, null);
     _ = try q.enqueue(t.allocator, t.io, "another user message");
     var inserted = try q.insertBackground(t.allocator, t.io, arena.allocator(), &pending);
     defer inserted.deinit(t.allocator);
@@ -229,9 +229,9 @@ test "taking queued users preserves background results for exactly one later ins
     const t = std.testing;
     var q: Inbox = .{};
     defer q.batch.deinit(t.allocator);
-    _ = try q.enqueueBackground(t.allocator, t.io, "b1", .bash, .finished, true, "first result", false, 0);
+    _ = try q.enqueueBackground(t.allocator, t.io, "b1", .bash, .finished, true, "first result", false, 0, null);
     const user_id = try q.enqueue(t.allocator, t.io, "next input");
-    _ = try q.enqueueBackground(t.allocator, t.io, "b2", .bash, .finished, false, "second result", false, 0);
+    _ = try q.enqueueBackground(t.allocator, t.io, "b2", .bash, .finished, false, "second result", false, 0, null);
     var users = try q.takeUsers(t.allocator, t.io);
     defer users.deinit(t.allocator);
     try t.expectEqual(@as(usize, 1), users.items.items.len);
@@ -261,7 +261,7 @@ test "taking queued users leaves the inbox untouched on allocation failure" {
     const t = std.testing;
     var q: Inbox = .{};
     defer q.batch.deinit(t.allocator);
-    _ = try q.enqueueBackground(t.allocator, t.io, "b1", .bash, .finished, true, "result", false, 0);
+    _ = try q.enqueueBackground(t.allocator, t.io, "b1", .bash, .finished, true, "result", false, 0, null);
     const id = try q.enqueue(t.allocator, t.io, "next input");
     var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
     try t.expectError(error.OutOfMemory, q.takeUsers(failing.allocator(), t.io));
