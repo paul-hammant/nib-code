@@ -163,8 +163,10 @@ pub fn normalize(a: std.mem.Allocator, item: std.json.Value) !?std.json.Value {
     if (kind != .string) return null;
     if (std.mem.eql(u8, kind.string, "reasoning")) return item;
     var object: std.json.ObjectMap = .empty;
-    if (std.mem.eql(u8, kind.string, "function_call")) {
-        for ([_][]const u8{ "type", "call_id", "name", "arguments" }) |key| try object.put(a, key, item.object.get(key) orelse return null);
+    if (std.mem.eql(u8, kind.string, "function_call") or std.mem.eql(u8, kind.string, "custom_tool_call")) {
+        for ([_][]const u8{ "type", "call_id", "name" }) |key| try object.put(a, key, item.object.get(key) orelse return null);
+        const key: []const u8 = if (std.mem.eql(u8, kind.string, "function_call")) "arguments" else "input";
+        try object.put(a, key, item.object.get(key) orelse return null);
     } else if (std.mem.eql(u8, kind.string, "message")) {
         const content = item.object.get("content") orelse return null;
         if (content != .array) return null;

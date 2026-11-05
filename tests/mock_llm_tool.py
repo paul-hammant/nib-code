@@ -205,12 +205,22 @@ EFFORT_PLAN = [
 ]
 
 
+def codex_run(body, arguments, call_id):
+    custom = any(t.get("type") == "custom" and t.get("name") == "run" for t in body.get("tools", []))
+    if custom:
+        code = arguments["code"]
+        if "effort" in arguments:
+            code = "// @run: " + json.dumps({"effort": arguments["effort"]}) + "\n" + code
+        return dict(type="custom_tool_call", name="run", call_id=call_id, input=code)
+    return dict(type="function_call", name="run", call_id=call_id, arguments=json.dumps(arguments, ensure_ascii=False))
+
+
 def serve_effort(handler, body, provider):
     messages = body.get("input", []) if provider == "codex" else body.get("messages", [])
     users = [i for i, message in enumerate(messages) if message.get("role") == "user"]
     if not users or content(messages[users[-1]]) != "effort schedule":
         return False
-    outputs = sum(message.get("type") == "function_call_output" or message.get("role") == "tool"
+    outputs = sum(message.get("type") in ("function_call_output", "custom_tool_call_output") or message.get("role") == "tool"
                   for message in messages[users[-1] + 1:])
     step = 0
     while step < len(EFFORT_PLAN) and outputs >= len(EFFORT_PLAN[step]):
@@ -241,12 +251,13 @@ def serve_effort(handler, body, provider):
         event("response.created", response={"id": response_id, "status": "in_progress", "output": []})
         output = []
         for index, arguments in enumerate(runs):
-            item = {"id": f"effort_fc_{step}_{index}", "type": "function_call",
-                    "call_id": f"effort_call_{step}_{index}", "name": "run",
-                    "arguments": json.dumps(arguments), "status": "completed"}
-            event("response.output_item.added", output_index=index, item={**item, "arguments": "", "status": "in_progress"})
-            event("response.function_call_arguments.delta", output_index=index, item_id=item["id"], delta=item["arguments"])
-            event("response.function_call_arguments.done", output_index=index, item_id=item["id"], arguments=item["arguments"])
+            item = dict(codex_run(body, arguments, f"effort_call_{step}_{index}"),
+                        id=f"effort_fc_{step}_{index}", status="completed")
+            key = "input" if item["type"] == "custom_tool_call" else "arguments"
+            kind = "custom_tool_call_input" if key == "input" else "function_call_arguments"
+            event("response.output_item.added", output_index=index, item={**item, key: "", "status": "in_progress"})
+            event(f"response.{kind}.delta", output_index=index, item_id=item["id"], delta=item[key])
+            event(f"response.{kind}.done", output_index=index, item_id=item["id"], **{key: item[key]})
             event("response.output_item.done", output_index=index, item=item)
             output.append(item)
         if not runs:

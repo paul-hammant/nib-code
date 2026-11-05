@@ -9,7 +9,7 @@ date: 2026-11-01
 
 Codex 通过 `$CODEX_HOME/auth.json`（默认 `~/.codex/auth.json`）运行时读取 `tokens.access_token/account_id`，发送到 `https://chatgpt.com/backend-api/codex/responses`。请求带 Authorization、chatgpt-account-id、OpenAI-Beta 和 originator，使用 instructions、store:false、流式 input 和 `include:["reasoning.encrypted_content"]`。遇到 401，重新读取文件并只重试一次；再次失败提示运行 codex 登录。不实现 OAuth，也不刷新、轮换或保存共享 refresh_token。认证错误不输出响应正文或凭证解析内容。
 
-Message 的 reasoning 是带 provider 标记的延续数据：Chat Completions 保存原始 reasoning_content，Responses 保存完整已完成 reasoning items 的 JSON（含 encrypted_content）。恢复界面从这些条目提取摘要，不显示密文。assistant phase 也保留。工具参数取 output_item.done 的完整值，避免执行尚未结束的参数。completed 才提交 Step；incomplete、failed、截断按错误性质重试或报错，保留服务端 code/message。Codex 可在已流出 delta 后重试，失败 partial 不提交；不重试或重试耗尽时只追加独立诊断，不进入模型历史。重试分类、退避和诊断格式见 [Codex 使用说明](../codex.md#流失败与重试)。两种协议都映射成既有 Usage，包含缓存命中。
+Message 的 reasoning 是带 provider 标记的延续数据：Chat Completions 保存原始 reasoning_content，Responses 保存完整已完成 reasoning items 的 JSON（含 encrypted_content）。恢复界面从这些条目提取摘要，不显示密文。assistant phase 也保留。Codex 默认使用 custom `run`（Lark grammar、直接 JS input），配置可回退 function；Chat Completions 保持 function。旧 function 历史原样保留，新旧结果按调用类型配对，不为了当前工具定义转换已有历史。内部 custom 以 `type:"custom"` 加规范化 `{code}` 复用 Session/日志/replay；effort 用可选首行 `// @run: {"effort":"low"}`。详情见 [speed-v6](../speed-v6.md)。工具参数取 output_item.done 的完整值，避免执行尚未结束的参数。completed 才提交 Step；incomplete、failed、截断按错误性质重试或报错，保留服务端 code/message。Codex 可在已流出 delta 后重试，失败 partial 不提交；不重试或重试耗尽时只追加独立诊断，不进入模型历史。重试分类、退避和诊断格式见 [Codex 使用说明](../codex.md#流失败与重试)。两种协议都映射成既有 Usage，包含缓存命中。
 
 Session log 首条记录包含 provider/model，每次提交记下本次模型。跨 provider 恢复明确拒绝，不尝试转换历史；Codex 恢复也拒绝不同模型，避免加密推理条目跨模型；Chat Completions 仍按当前配置选模型。旧日志缺 provider 时视为 Chat Completions，旧 reasoning_content 在重放时迁移，不改写文件。
 

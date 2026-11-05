@@ -33,6 +33,7 @@ pub const Config = struct {
     limits: Limits = .{},
     provider: Id = .chat_completions,
     codex_transport: Transport = .sse,
+    codex_run_tool: enum { custom, function } = .custom,
     reasoning_summary: enum { off, auto } = .off,
     codex_home: ?[]const u8 = null,
     base_url: []const u8,

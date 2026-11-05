@@ -191,6 +191,11 @@ pub fn eval(
         }
     }
     errdefer gpa.free(text);
+    if (!ok and std.mem.startsWith(u8, text, "SyntaxError:")) {
+        const annotated = try syntaxContext(gpa, text, code);
+        gpa.free(text);
+        text = annotated;
+    }
     if (jobs_drained) _ = try st.jobs(ctx, rt);
     if (st.oom) return error.OutOfMemory;
 
@@ -217,6 +222,42 @@ pub fn eval(
 }
 
 const testing = std.testing;
+
+fn syntaxContext(a: std.mem.Allocator, message: []const u8, code: []const u8) ![]u8 {
+    const marker = "<run>:";
+    const start = std.mem.indexOf(u8, message, marker) orelse return a.dupe(u8, message);
+    var location = std.mem.tokenizeAny(u8, message[start + marker.len ..], ":\r\n )");
+    const line = std.fmt.parseInt(usize, location.next() orelse return a.dupe(u8, message), 10) catch return a.dupe(u8, message);
+    const column = std.fmt.parseInt(usize, location.next() orelse "1", 10) catch 1;
+    var lines = std.mem.splitScalar(u8, code, '\n');
+    var number: usize = 0;
+    while (lines.next()) |source| {
+        number += 1;
+        if (number != line) continue;
+        var first = @min(column -| 1, source.len) -| 80;
+        while (first < source.len and (source[first] & 0xc0) == 0x80) first += 1;
+        var last = @min(source.len, first + 200);
+        while (last > first and last < source.len and (source[last] & 0xc0) == 0x80) last -= 1;
+        return std.fmt.allocPrint(a, "{s}\nsource line {d}: {s}{s}{s}", .{ message, line, if (first > 0) @as([]const u8, "…") else "", source[first..last], if (last < source.len) @as([]const u8, "…") else "" });
+    }
+    return a.dupe(u8, message);
+}
+
+test "syntax errors include original source location and a bounded UTF-8 line" {
+    const r = try eval(testing.allocator, testing.io, "const ok = 1;\nconst broken = \"oops\n\";", .{}, null, null);
+    defer r.deinit(testing.allocator);
+    try testing.expect(!r.ok);
+    try testing.expect(std.mem.indexOf(u8, r.text, "<run>:2:") != null);
+    try testing.expect(std.mem.indexOf(u8, r.text, "source line 2: const broken = \"oops") != null);
+    const code = try testing.allocator.alloc(u8, 900);
+    defer testing.allocator.free(code);
+    for (0..300) |i| @memcpy(code[i * 3 ..][0..3], "你");
+    const message = "SyntaxError: bad\n    at <run>:1:500";
+    const bounded = try syntaxContext(testing.allocator, message, code);
+    defer testing.allocator.free(bounded);
+    try testing.expect(bounded.len < 300);
+    try testing.expect(std.unicode.utf8ValidateSlice(bounded));
+}
 
 test {
     _ = @import("sandbox/timer_test.zig");

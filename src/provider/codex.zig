@@ -260,7 +260,15 @@ fn requestBody(gpa: std.mem.Allocator, cfg: p.Config, cache_key: []const u8, mes
             if (r.includes_output) continue;
         };
         if (std.mem.eql(u8, m.role, "tool")) {
-            try w.print("{s}{f}", .{ separator, std.json.fmt(.{ .type = "function_call_output", .call_id = m.tool_call_id, .output = m.content orelse "" }, .{}) });
+            const custom = blk: {
+                for (messages[0..index]) |previous| {
+                    for (previous.tool_calls orelse &.{}) |call| {
+                        if (m.tool_call_id != null and std.mem.eql(u8, call.id, m.tool_call_id.?)) break :blk std.mem.eql(u8, call.type, "custom");
+                    }
+                }
+                break :blk false;
+            };
+            try w.print("{s}{f}", .{ separator, std.json.fmt(.{ .type = if (custom) @as([]const u8, "custom_tool_call_output") else "function_call_output", .call_id = m.tool_call_id, .output = m.content orelse "" }, .{}) });
             separator = ",";
             continue;
         }
@@ -273,7 +281,12 @@ fn requestBody(gpa: std.mem.Allocator, cfg: p.Config, cache_key: []const u8, mes
             separator = ",";
         };
         for (m.tool_calls orelse &.{}) |call| {
-            try w.print("{s}{f}", .{ separator, std.json.fmt(.{ .type = "function_call", .call_id = call.id, .name = call.function.name, .arguments = call.function.arguments }, .{}) });
+            if (std.mem.eql(u8, call.type, "custom")) {
+                const args = try std.json.parseFromSliceLeaky(struct { code: []const u8 }, a, call.function.arguments, .{ .ignore_unknown_fields = true });
+                try w.print("{s}{f}", .{ separator, std.json.fmt(.{ .type = "custom_tool_call", .call_id = call.id, .name = call.function.name, .input = args.code }, .{}) });
+            } else {
+                try w.print("{s}{f}", .{ separator, std.json.fmt(.{ .type = "function_call", .call_id = call.id, .name = call.function.name, .arguments = call.function.arguments }, .{}) });
+            }
             separator = ",";
         }
     }
@@ -281,7 +294,14 @@ fn requestBody(gpa: std.mem.Allocator, cfg: p.Config, cache_key: []const u8, mes
     const tools = try std.json.parseFromSliceLeaky([]const struct { function: struct { name: []const u8, description: []const u8, parameters: std.json.Value } }, a, tools_json, .{ .ignore_unknown_fields = true });
     var tool_writer: std.Io.Writer.Allocating = .init(a);
     try tool_writer.writer.writeByte('[');
-    for (tools, 0..) |tool, i| try tool_writer.writer.print("{s}{f}", .{ if (i == 0) @as([]const u8, "") else ",", std.json.fmt(.{ .type = "function", .name = tool.function.name, .description = tool.function.description, .parameters = tool.function.parameters, .strict = false }, .{}) });
+    for (tools, 0..) |tool, i| {
+        if (i != 0) try tool_writer.writer.writeByte(',');
+        if (cfg.codex_run_tool == .custom and std.mem.eql(u8, tool.function.name, "run")) {
+            try tool_writer.writer.print("{f}", .{std.json.fmt(.{ .type = "custom", .name = "run", .description = custom_run_description, .format = .{ .type = "grammar", .syntax = "lark", .definition = custom_run_grammar } }, .{})});
+        } else {
+            try tool_writer.writer.print("{f}", .{std.json.fmt(.{ .type = "function", .name = tool.function.name, .description = tool.function.description, .parameters = tool.function.parameters, .strict = false }, .{})});
+        }
+    }
     try tool_writer.writer.writeByte(']');
     const effort = reasoningEffort(cfg);
     const reasoning = if (effort != null or cfg.reasoning_summary == .auto) try std.fmt.allocPrint(a, ",\"reasoning\":{f}", .{std.json.fmt(.{ .effort = effort, .summary = if (cfg.reasoning_summary == .auto) @as(?[]const u8, "auto") else null }, .{ .emit_null_optional_fields = false })}) else "";
@@ -294,12 +314,24 @@ fn requestBody(gpa: std.mem.Allocator, cfg: p.Config, cache_key: []const u8, mes
     , .{ std.json.fmt(cfg.model, .{}), std.json.fmt(cache_key, .{}), std.json.fmt(instructions, .{}), input.written(), if (tools.len == 0) "" else try std.fmt.allocPrint(a, ",\"tools\":{s}", .{tool_writer.written()}), reasoning, format });
 }
 
+const custom_run_description = "Run JavaScript in a fresh sandbox using the tools API described in the system prompt. Send raw JavaScript, not JSON, a quoted string or markdown fences. Top-level await is allowed; the last expression's value is returned. Optional first line: // @run: {\"effort\":\"low\"}. Effort low|medium|high|default applies only to the next model request after a successful Run; omission keeps the user setting.";
+
+const custom_run_grammar =
+    \\start: pragma_source | plain_source
+    \\pragma_source: PRAGMA_LINE NEWLINE SOURCE
+    \\plain_source: SOURCE
+    \\PRAGMA_LINE: /[ \t]*\/\/ @run:[^\r\n]*/
+    \\NEWLINE: /\r?\n/
+    \\SOURCE: /[\s\S]+/
+;
+
 const Output = struct {
     type: []const u8,
     phase: ?[]const u8 = null,
     call_id: ?[]const u8 = null,
     name: ?[]const u8 = null,
     arguments: ?[]const u8 = null,
+    input: ?[]const u8 = null,
 };
 const StreamError = struct {
     code: ?std.json.Value = null,
@@ -360,7 +392,10 @@ fn readEvents(gpa: std.mem.Allocator, out: std.mem.Allocator, reader: *std.Io.Re
         if (cancel.load(.acquire)) return error.Canceled;
         if (sink.monitor) |monitor| try monitor.check();
         stage = "parse";
-        const data = if (socket) |ws| try ws.message(reader, &line) else data: {
+        const data = if (socket) |ws| ws.message(reader, &line) catch |err| {
+            detail.* = try std.fmt.allocPrint(gpa, "Codex WebSocket read failed: {s}; last event={s}, output_index={d}", .{ @errorName(err), event_type, event_index });
+            return err;
+        } else data: {
             line.clearRetainingCapacity();
             _ = reader.streamDelimiter(&line.writer, '\n') catch |err| switch (err) {
                 error.EndOfStream => return incompleteResponse(gpa, detail),
@@ -370,7 +405,10 @@ fn readEvents(gpa: std.mem.Allocator, out: std.mem.Allocator, reader: *std.Io.Re
             reader.toss(1);
             break :data (try parser.feed(gpa, line.written())) orelse continue;
         };
-        const ev = std.json.parseFromSliceLeaky(ResponseEvent, a, data, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return error.InvalidResponse;
+        const ev = std.json.parseFromSliceLeaky(ResponseEvent, a, data, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| {
+            detail.* = try std.fmt.allocPrint(gpa, "Codex event decode failed: {s}; last event={s}, output_index={d}", .{ @errorName(err), event_type, event_index });
+            return error.InvalidResponse;
+        };
         event_type = ev.type;
         event_index = ev.output_index;
         stage = "event";
@@ -378,7 +416,7 @@ fn readEvents(gpa: std.mem.Allocator, out: std.mem.Allocator, reader: *std.Io.Re
             if (ev.delta) |delta| {
                 if (std.mem.eql(u8, ev.type, "response.output_text.delta") or std.mem.eql(u8, ev.type, "response.refusal.delta") or
                     std.mem.eql(u8, ev.type, "response.reasoning_summary_text.delta") or std.mem.eql(u8, ev.type, "response.reasoning_text.delta") or
-                    std.mem.eql(u8, ev.type, "response.function_call_arguments.delta")) monitor.content(delta.len);
+                    std.mem.eql(u8, ev.type, "response.function_call_arguments.delta") or std.mem.eql(u8, ev.type, "response.custom_tool_call_input.delta")) monitor.content(delta.len);
             }
         }
         if (socket) |ws| if (ws.turn_state == null and std.mem.eql(u8, ev.type, "response.metadata")) {
@@ -437,24 +475,27 @@ fn readEvents(gpa: std.mem.Allocator, out: std.mem.Allocator, reader: *std.Io.Re
             if (value.phase) |v| phase = try out.dupe(u8, v);
         } else if (std.mem.eql(u8, value.type, "reasoning")) {
             try reasoning.append(gpa, item);
-        } else if (std.mem.eql(u8, value.type, "function_call")) {
+        } else if (std.mem.eql(u8, value.type, "function_call") or std.mem.eql(u8, value.type, "custom_tool_call")) {
             if (calls.items.len >= 64) return error.TooManyToolCalls;
             if (sink.timing) |timing| timing.bind(index, calls.items.len);
-            try calls.append(gpa, .{ .id = try out.dupe(u8, value.call_id orelse return error.InvalidResponse), .function = .{ .name = try out.dupe(u8, value.name orelse return error.InvalidResponse), .arguments = try out.dupe(u8, value.arguments orelse return error.InvalidResponse) } });
+            const custom = std.mem.eql(u8, value.type, "custom_tool_call");
+            const arguments = if (custom) try std.json.Stringify.valueAlloc(out, .{ .code = value.input orelse return error.InvalidResponse }, .{}) else try out.dupe(u8, value.arguments orelse return error.InvalidResponse);
+            try calls.append(gpa, .{ .id = try out.dupe(u8, value.call_id orelse return error.InvalidResponse), .type = if (custom) "custom" else "function", .function = .{ .name = try out.dupe(u8, value.name orelse return error.InvalidResponse), .arguments = arguments } });
         }
     }
     return .{ .text = try out.dupe(u8, text.items), .phase = phase, .reasoning = if (replayable and items.items.len > 0) .{ .provider = .codex, .data = try std.json.Stringify.valueAlloc(out, items.items, .{}), .includes_output = true } else if (reasoning.items.len > 0) .{ .provider = .codex, .data = try std.json.Stringify.valueAlloc(out, reasoning.items, .{}) } else null, .tool_calls = try out.dupe(p.ToolCall, calls.items), .usage = usage };
 }
 
 fn observeTiming(timing: *p.ModelTiming, ev: ResponseEvent) void {
-    if (std.mem.eql(u8, ev.type, "response.function_call_arguments.delta")) {
+    if (std.mem.eql(u8, ev.type, "response.function_call_arguments.delta") or std.mem.eql(u8, ev.type, "response.custom_tool_call_input.delta")) {
         if (ev.delta) |delta| timing.arguments(ev.output_index, delta.len);
     } else if (std.mem.eql(u8, ev.type, "response.output_item.added") or std.mem.eql(u8, ev.type, "response.output_item.done")) {
         const item = ev.item orelse return;
         if (item != .object) return;
         const kind = item.object.get("type") orelse return;
-        if (kind != .string or !std.mem.eql(u8, kind.string, "function_call")) return;
-        const args = item.object.get("arguments") orelse return;
+        if (kind != .string) return;
+        const key: []const u8 = if (std.mem.eql(u8, kind.string, "function_call")) "arguments" else if (std.mem.eql(u8, kind.string, "custom_tool_call")) "input" else return;
+        const args = item.object.get(key) orelse return;
         if (args != .string) return;
         if (std.mem.eql(u8, ev.type, "response.output_item.added")) {
             timing.arguments(ev.output_index, args.string.len);
@@ -622,6 +663,43 @@ test "Codex request body carries the session cache key" {
     try t.expectEqualStrings(cache_key, parsed.value.object.get("prompt_cache_key").?.string);
 }
 
+test "Codex custom and legacy history retain their wire types across tool configuration changes" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const code = "// @run: {\"effort\":\"low\"}\nconst text = `line one\n${1}\\path`; text";
+    const args = try std.json.Stringify.valueAlloc(a, .{ .code = code }, .{});
+    const old_args = "{\"code\":\"42\",\"effort\":\"high\"}";
+    const custom: p.ToolCall = .{ .id = "new", .type = "custom", .function = .{ .name = "run", .arguments = args } };
+    const raw = try std.json.Stringify.valueAlloc(a, .{.{ .type = "custom_tool_call", .id = "server-id", .status = "completed", .call_id = "new", .name = "run", .input = code }}, .{});
+    for ([_]@FieldType(p.Config, "codex_run_tool"){ .custom, .function }) |mode| for ([_]bool{ false, true }) |includes_output| {
+        const messages = [_]p.Message{
+            .{ .role = "assistant", .tool_calls = &.{.{ .id = "old", .function = .{ .name = "run", .arguments = old_args } }} },
+            .{ .role = "tool", .tool_call_id = "old", .content = "42" },
+            .{ .role = "assistant", .tool_calls = &.{custom}, .reasoning = if (includes_output) .{ .provider = .codex, .data = raw, .includes_output = true } else null },
+            .{ .role = "tool", .tool_call_id = "new", .content = "result" },
+        };
+        const cfg: p.Config = .{ .provider = .codex, .model = default_model, .api_key = "", .base_url = "", .codex_run_tool = mode };
+        const body = try requestBody(a, cfg, "key", &messages, @import("../session/prompt.zig").tools_json, null);
+        const root = (try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{})).object;
+        const input = root.get("input").?.array.items;
+        try t.expectEqual(@as(usize, 4), input.len);
+        inline for (.{ "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output" }, 0..) |kind, i| try t.expectEqualStrings(kind, input[i].object.get("type").?.string);
+        try t.expectEqualStrings(old_args, input[0].object.get("arguments").?.string);
+        try t.expectEqualStrings(code, input[2].object.get("input").?.string);
+        try t.expect(!input[2].object.contains("id") and !input[2].object.contains("status"));
+        const tool = root.get("tools").?.array.items[0].object;
+        try t.expectEqualStrings(@tagName(mode), tool.get("type").?.string);
+        if (mode == .custom) {
+            try t.expectEqualStrings(custom_run_grammar, tool.get("format").?.object.get("definition").?.string);
+            try t.expect(!tool.contains("parameters"));
+        } else {
+            try t.expect(tool.contains("parameters") and !tool.get("strict").?.bool);
+        }
+    };
+}
+
 fn expectStreamFailure(json: []const u8, expected: anyerror, code: []const u8, message: []const u8) !void {
     const t = std.testing;
     const Sink = struct {
@@ -653,6 +731,20 @@ test "Codex stream errors preserve reasons and distinguish retryable failures" {
     const t = std.testing;
     for ([_][]const u8{ "context_length_exceeded", "insufficient_quota", "usage_not_included", "invalid_prompt", "invalid_request_error" }) |code| try t.expect(fatalStreamCode(code));
     for ([_][]const u8{ "server_error", "overloaded", "service_unavailable", "unknown" }) |code| try t.expect(!fatalStreamCode(code));
+}
+
+test "Codex malformed events report the decoder failure without event contents" {
+    const t = std.testing;
+    const Sink = struct {
+        fn delta(_: *anyopaque, _: p.Kind, _: []const u8) !void {}
+    };
+    var reader: std.Io.Reader = .fixed("data: {\"type\":\"response.custom_tool_call_input.delta\",\"delta\":42,\"private\":\"hidden\"}\n\n");
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var detail: ?[]u8 = null;
+    defer if (detail) |value| t.allocator.free(value);
+    try t.expectError(error.InvalidResponse, readStream(t.allocator, t.allocator, &reader, .{ .ctx = &cancel, .onDelta = Sink.delta }, &cancel, &detail));
+    try t.expect(std.mem.indexOf(u8, detail.?, "Codex event decode failed: UnexpectedToken") != null);
+    try t.expect(std.mem.indexOf(u8, detail.?, "hidden") == null);
 }
 
 test "Codex errors bound UTF-8 messages and retain rate-limit hints beyond the cutoff" {

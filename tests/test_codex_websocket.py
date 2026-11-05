@@ -16,6 +16,8 @@ import sys
 
 sys.dont_write_bytecode = True
 
+from mock_llm_tool import codex_run
+
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "zig-out/bin/nib"
 
@@ -156,7 +158,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.event("response.metadata", headers={"X-Codex-Turn-State": "event-turn"})
                 self.wfile.write(frame(b"ping", opcode=9))
                 self.wfile.flush()
-                events, output = response(full, f"resp-{conn}-{count}", server.mode)
+                events, output = response(full, f"resp-{conn}-{count}", server.mode, body)
                 for ev in events:
                     data = json.dumps(ev, ensure_ascii=False).encode()
                     # UTF-8 text split across frames, with an interleaved control frame.
@@ -180,7 +182,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         self.server.posts += 1
         self.server.requests.append(dict(transport="sse", body=body))
-        events, _ = response(body["input"], "sse-response", self.server.mode)
+        events, _ = response(body["input"], "sse-response", self.server.mode, body)
         data = "".join("data: " + json.dumps(ev) + "\n\n" for ev in events).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -189,8 +191,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
-def response(inputs, response_id, mode):
-    tools = [i for i in inputs if i.get("type") == "function_call_output"]
+def response(inputs, response_id, mode, body):
+    tools = [i for i in inputs if i.get("type") in ("function_call_output", "custom_tool_call_output")]
     prompt = next((i["content"] for i in reversed(inputs) if i.get("role") == "user"), "")
     summary = "Summarize the conversation above" in prompt
     if not tools and not summary and prompt != "resumed":
@@ -201,7 +203,7 @@ def response(inputs, response_id, mode):
             args["code"] = 'console.log(await tools.agent({prompt: "resumed", fork: true}))'
         if mode == "effort":
             args["effort"] = "low"
-        item = dict(type="function_call", id="fc1", status="completed", call_id="call1", name="run", arguments=json.dumps(args))
+        item = dict(codex_run(body, args, "call1"), id="fc1", status="completed")
     else:
         text = "finished🙂" if not summary else "Earlier summary"
         if mode.startswith("background") and "background-result" not in prompt:
@@ -213,7 +215,9 @@ def response(inputs, response_id, mode):
     if item["type"] == "message":
         events.append(dict(type="response.output_text.delta", output_index=0, delta=item["content"][0]["text"]))
     else:
-        events.append(dict(type="response.function_call_arguments.delta", output_index=0, delta=item["arguments"]))
+        key = "input" if item["type"] == "custom_tool_call" else "arguments"
+        kind = "custom_tool_call_input" if key == "input" else "function_call_arguments"
+        events.append(dict(type=f"response.{kind}.delta", output_index=0, delta=item[key]))
     events += [dict(type="response.output_item.done", output_index=0, item=item),
                dict(type="response.completed", response=dict(id=response_id, status="completed", output=[item],
                      usage=dict(input_tokens=100, output_tokens=10, input_tokens_details=dict(cached_tokens=50))))]
@@ -227,14 +231,14 @@ def response(inputs, response_id, mode):
             events.append(dict(type="response.output_item.added", output_index=index, item=value))
             if value["type"] == "message":
                 events.append(dict(type="response.output_text.delta", output_index=index, delta=value["content"][0]["text"]))
-            elif value["type"] == "function_call":
-                events.append(dict(type="response.function_call_arguments.delta", output_index=index, delta=value["arguments"]))
+            elif value["type"] in ("function_call", "custom_tool_call"):
+                events.append(dict(type=f"response.{kind}.delta", output_index=index, delta=value[key]))
             events.append(dict(type="response.output_item.done", output_index=index, item=value))
         events.append(dict(type="response.completed", response=dict(id=response_id, status="completed", output=output,
                            usage=dict(input_tokens=100, output_tokens=10))))
         return events, output
     # Empty output messages and unsupported items exercise distinct continuation paths.
-    if (mode in ("prefix", "unsupported") and item["type"] == "function_call") or (mode == "background-prefix" and item.get("content", [{}])[0].get("text") == "Waiting."):
+    if (mode in ("prefix", "unsupported") and item["type"] in ("function_call", "custom_tool_call")) or (mode == "background-prefix" and item.get("content", [{}])[0].get("text") == "Waiting."):
         empty = dict(type="message", role="assistant", content=[]) if mode != "unsupported" else dict(type="future_output")
         events.insert(-1, dict(type="response.output_item.done", output_index=1, item=empty))
         return events, [item, empty]
@@ -332,7 +336,7 @@ def main():
         assert server.connections == 1 and len(server.requests) == 2
         first, second = [r["body"] for r in server.requests]
         assert "previous_response_id" not in first and second["previous_response_id"] == "resp-1-1"
-        assert [i["type"] for i in second["input"]] == ["function_call_output"]
+        assert [i["type"] for i in second["input"]] == ["custom_tool_call_output"]
         assert second["client_metadata"]["x-codex-turn-state"] == "mock-turn"
         assert server.pongs >= 1
         assert [s["incremental"] for s in steps] == [False, True], steps
@@ -360,8 +364,8 @@ def main():
                 assert step["incremental"] == ("previous_response_id" in request["body"])
         resumed, resumed_steps, _, _ = run_case(tmp, "normal", resume=session, home=home)
         assert "previous_response_id" not in resumed.requests[0]["body"]
-        assert any(i.get("type") == "function_call" for i in resumed.requests[0]["body"]["input"])
-        assert any(i.get("type") == "function_call_output" for i in resumed.requests[0]["body"]["input"])
+        assert any(i.get("type") == "custom_tool_call" for i in resumed.requests[0]["body"]["input"])
+        assert any(i.get("type") == "custom_tool_call_output" for i in resumed.requests[0]["body"]["input"])
         assert resumed_steps[-1]["incremental"] is False
         for mode in ("ordered", "prefix", "unsupported", "effort", "content-heartbeats", "content-metadata", "request-progress", "content-progress", "invalid-response"):
             server, steps, _, _ = run_case(tmp, mode)

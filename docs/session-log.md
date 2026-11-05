@@ -6,6 +6,8 @@
 
 新会话按基础指令、全局 `$NIB_HOME/AGENTS.md`（默认 `~/.nib/AGENTS.md`）、项目 `AGENTS.md` 的顺序拼接 system，后者优先。项目目录是从 cwd 向上遇到的第一个 `.git` 标记所在目录；没有则用 cwd。只读取 `AGENTS.md`。恢复会话沿用日志中的原始 system，之后修改指令文件只影响新会话。
 
+Codex custom Run 在 `tool_calls` 中记录 `type:"custom"`，`function.arguments` 仍是 JSON `{code}`，其中 code 是完整原始 JS（含可选 effort 首行）；旧记录缺省为 function。恢复和 replay 不需要迁移日志。Responses 原始 output、调用与结果的协议类型以及参数进度的字节口径见 [Codex custom Run](codex.md#custom-run-工具)。
+
 ## 工具录制与离线重放
 
 主日志 `$NIB_HOME/sessions/<session_id>.jsonl` 保存模型消息和 Step；独立的 `<session_id>.calls.jsonl` 保存 Run 内工具的实际返回值与拒绝信息，权限为 `0600`。旁路录制默认开启，可关闭；主日志格式与恢复不依赖它。`nib replay` 只在新沙箱内重跑已保存的 JavaScript，以录制结果替代真实工具，不请求模型、不执行 bash 或文件写入。

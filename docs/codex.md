@@ -189,3 +189,13 @@ python3 /home/yang/myself/nib-bench/bench.py \
 要恢复可读摘要，配置 `[codex] reasoning_summary = "auto"`（写成段内键），或设置 `NIB_REASONING_SUMMARY=auto`；`off` 显式关闭，环境优先。即使 effort 交由服务端默认，`auto` 也会发送 `reasoning:{summary:"auto"}`。
 
 本地 request-flags 实验的三个固定请求点中，仅移除 summary 后首工具参数提前约 3.1 s（95% CI 2.7–3.8 s），reasoning tokens 未见稳定下降；这不保证整个任务等量提速，持久 WS 收益仍需另测。详见 [speed-v5.md](speed-v5.md)。
+
+## custom Run 工具
+
+默认使用 Responses custom 工具，模型直接输出 JavaScript，省去 function 参数里 JSON 字符串的额外转义。工具使用 Lark grammar（`SOURCE: /[\s\S]+/`），接受可选首行 `// @run: {"effort":"low"}`；grammar 只限定外层形式，不校验 JavaScript 语法。effort 的用户上限、单次生效和失败护栏不变，见 [配置](config.md#逐-step-effort-调度)。`[codex] run_tool = "function"` 或 `NIB_CODEX_RUN_TOOL=function` 回退到旧 function 工具；Chat Completions 保持原协议。
+
+历史按每次调用自身类型编码：新 custom 调用和结果为 `custom_tool_call` / `custom_tool_call_output`，旧 function 调用和结果保持 `function_call` / `function_call_output`。恢复旧日志时不把旧 JSON code/effort 转成 custom；反向回退时也不改写已有 custom。这样保留原参数字节、加密 reasoning 和缓存前缀，只在本次工具定义变化处产生预期差异。恢复本来就新建连接并发送完整历史；同连接工具配置不变时，规范化的 custom output 能参与既有 WS 前缀判断，后续仍只发送增量结果。
+
+内部和主日志继续以 `tool_calls[].function.arguments` 的 JSON `{code}` 承载可执行源码，custom 调用额外以 `type:"custom"` 区分；原始 Responses output 同样保留。Run 执行、fork、恢复与离线 replay 共用已有链路。参数到达计时记录线上载荷：custom 是原始 JS input 的 UTF-8 字节，function 是 JSON arguments 字节；两者不能直接按规范化 JSON 长度比较。
+
+Run 语法或运行错误的模型输出会提示修正脚本并继续任务；SyntaxError 保留 QuickJS `<run>:行:列`，追加附近最多 200 字节的 UTF-8 源码行片段。这些提示不强制模型继续，也不能解决所有提前结束行为。证据、取舍与验证见 [speed-v6.md](speed-v6.md)。协议参照 [OpenAI custom tools](https://developers.openai.com/api/docs/guides/function-calling#custom-tools) 和本地 Codex CLI 0.166 trace。

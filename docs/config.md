@@ -26,6 +26,7 @@ model = "gpt-6.1-sol"
 base_url = "https://chatgpt.com/backend-api"
 context_window = 500000
 reasoning_summary = "off" # auto 开启可读推理摘要
+run_tool = "custom" # function 回退到 JSON code/effort 工具
 transport = "sse" # websocket 为显式启用的 Responses WS 原型
 
 [chat_completions]
@@ -50,7 +51,7 @@ run_output_bytes = 16384
 
 DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 `DEEPSEEK_API_KEY`（或 `NIB_API_KEY`），默认模型 `deepseek-flash`、窗口 1000000 tokens；其他默认值见上例。
 
-这是无额外依赖的 TOML 子集：支持空行、`#` 注释、单行双引号字符串（支持 `\"`、`\\`、`\n` 转义）、十进制整数（可带符号、下划线分组）和 true/false 布尔值；当前配置键只使用字符串和正整数，布尔值会报告类型错误。仅接受顶层 `provider`、`effort`，`[codex]` / `[chat_completions]` 下的 `model`、`base_url`、`context_window`，`[codex]` 还接受 `transport = "sse"|"websocket"`、`reasoning_summary = "off"|"auto"`，以及下述 `[limits]` 键。不支持数组、嵌套表、多行字符串等完整 TOML 语法；未知键、重复键/段落和格式错误会报配置文件路径与行号，不静默忽略。
+这是无额外依赖的 TOML 子集：支持空行、`#` 注释、单行双引号字符串（支持 `\"`、`\\`、`\n` 转义）、十进制整数（可带符号、下划线分组）和 true/false 布尔值；当前配置键只使用字符串和正整数，布尔值会报告类型错误。仅接受顶层 `provider`、`effort`，`[codex]` / `[chat_completions]` 下的 `model`、`base_url`、`context_window`，`[codex]` 还接受 `transport = "sse"|"websocket"`、`reasoning_summary = "off"|"auto"`、`run_tool = "custom"|"function"`，以及下述 `[limits]` 键。不支持数组、嵌套表、多行字符串等完整 TOML 语法；未知键、重复键/段落和格式错误会报配置文件路径与行号，不静默忽略。
 
 ## [limits]
 
@@ -84,7 +85,7 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 从高到低：
 
 1. CLI `--effort <level>`（TUI 启动和 `ask` 都支持）。
-2. 环境变量：`NIB_PROVIDER`、`NIB_MODEL`、`NIB_BASE_URL`、`NIB_CONTEXT_WINDOW`、`NIB_THINKING`、`NIB_REASONING_EFFORT`、`NIB_CODEX_TRANSPORT`、`NIB_REASONING_SUMMARY`、`NIB_RUN_OUTPUT_BYTES`。
+2. 环境变量：`NIB_PROVIDER`、`NIB_MODEL`、`NIB_BASE_URL`、`NIB_CONTEXT_WINDOW`、`NIB_THINKING`、`NIB_REASONING_EFFORT`、`NIB_CODEX_TRANSPORT`、`NIB_CODEX_RUN_TOOL`、`NIB_REASONING_SUMMARY`、`NIB_RUN_OUTPUT_BYTES`。
 3. `$NIB_HOME/config.toml`。
 4. 内置默认值。
 
@@ -101,6 +102,7 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 | `NIB_PROVIDER` | `codex` / `chat_completions` |
 | `NIB_BASE_URL` | 当前 provider 的服务地址 |
 | `NIB_CODEX_TRANSPORT` | Codex 传输：`sse`（默认）或 `websocket`；覆盖 `[codex].transport`，握手/协议失败后本 Session 降级 SSE，见 [Codex 传输](codex.md#responses-websocket-原型) |
+| `NIB_CODEX_RUN_TOOL` | `custom`（默认，直接发送 JS）或 `function`（JSON code/effort）；覆盖 `[codex].run_tool`，不改写既有历史类型，Chat Completions 始终使用 function |
 | `NIB_REASONING_SUMMARY` | `off`（默认，不发送 summary）或 `auto`；覆盖 `[codex].reasoning_summary`，不改变 effort 和加密 reasoning 回传 |
 | `NIB_RUN_OUTPUT_BYTES` | 模型展示预算字节数，16384–16777216；覆盖 `[limits].run_output_bytes`，默认 16384；不改变 JS 数据与 console 捕获上限 |
 | `NIB_MODEL` | 当前 provider 的模型 |
@@ -120,7 +122,7 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 
 ## 逐 Step effort 调度
 
-主模型可调用 `run({code: "...", effort: "low"})`，可选值为 `low|medium|high|default`。声明针对看到本次 Run 结果之后的**下一次主模型 Step 请求**，仅生效一次；后续未再次声明则恢复用户设置。同一 Step 多个 Run 取最后一个声明，未声明的 Run 不覆盖它。`default` 显式恢复用户设置。机械性的下一步适合 low，重新设计或疑难排查不宜降档。
+Codex 默认 custom `run` 直接接收 JS；可选首行 `// @run: {"effort":"low"}` 声明 effort，下一行开始正文。该行保留在源码和日志中；只识别第一行，格式或档位无效时返回可修正的 Run 错误。Chat Completions 或 Codex `run_tool = "function"` 仍调用 `run({code: "...", effort: "low"})`。可选值为 `low|medium|high|default`。声明针对看到本次 Run 结果之后的**下一次主模型 Step 请求**，仅生效一次；后续未再次声明则恢复用户设置。同一 Step 多个 Run 取最后一个声明，未声明的 Run 不覆盖它。`default` 显式恢复用户设置。机械性的下一步适合 low，重新设计或疑难排查不宜降档。
 
 护栏由 Session 统一决定：
 

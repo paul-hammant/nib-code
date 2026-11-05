@@ -45,10 +45,10 @@ const Entry = struct {
 };
 
 pub fn format(gpa: std.mem.Allocator, o: sandbox.Outcome, limit: usize) ![]u8 {
-    if (o.stopped.len == 0) return renderLimit(gpa, o, limit);
-    const body = try renderLimit(gpa, o, limit - o.stopped.len - 1);
+    const suffix = if (o.stopped.len > 0) o.stopped else if (!o.ok) "[Run script failed. Correct the script and continue the task; this error is not a reason to end the Turn.]" else return renderLimit(gpa, o, limit);
+    const body = try renderLimit(gpa, o, limit - suffix.len - 1);
     defer gpa.free(body);
-    return std.fmt.allocPrint(gpa, "{s}\n{s}", .{ body, o.stopped });
+    return std.fmt.allocPrint(gpa, "{s}\n{s}", .{ body, suffix });
 }
 
 pub fn stepLimitOutput(a: std.mem.Allocator, output: []const u8, remaining_steps: ?usize) ![]const u8 {
@@ -450,7 +450,8 @@ test "formatOutcome" {
     var none = "".*;
     const bad = try format(gpa, .{ .ok = false, .text = &err, .logs = &none }, max_bytes);
     defer gpa.free(bad);
-    try std.testing.expectEqualStrings("Error: x", bad);
+    try std.testing.expect(std.mem.startsWith(u8, bad, "Error: x\n"));
+    try std.testing.expect(std.mem.indexOf(u8, bad, "Correct the script and continue the task") != null);
     var undef = "undefined".*;
     const logged = try format(gpa, .{ .ok = true, .text = &undef, .logs = &logs }, max_bytes);
     defer gpa.free(logged);

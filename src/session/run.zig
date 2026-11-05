@@ -85,6 +85,8 @@ pub fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const 
 
     const code = if (args.value.code) |value| (if (value == .string) value.string else null) else null;
     if (code == null) return .{ .ok = false, .output = try a.dupe(u8, "error: arguments must be a JSON object { \"code\": string }"), .effort = args.value.effort };
+    const declaration = if (std.mem.eql(u8, call.type, "custom")) effort.fromCode(s.gpa, code.?) catch
+        return .{ .ok = false, .output = "error: invalid first-line // @run: pragma; use {\"effort\":\"low|medium|high|default\"}. Fix the script and continue the task." } else args.value.effort;
     try sink.emit(sink.ctx, .{ .run_start = code.? });
     const before_omitted = timing.omitted;
     const started: std.Io.Clock.Timestamp = .now(s.io, .awake);
@@ -104,7 +106,7 @@ pub fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const 
     const run_ms = timing.elapsed();
     const tool_summary = try ToolSummary.init(a, timing.entries[0..timing.count], timing.run_index, timing.omitted - before_omitted);
     try sink.emit(sink.ctx, .{ .run_end = .{ .ok = o.ok, .output = output, .changes = ran.?.changes, .tool_summary = tool_summary } });
-    return .{ .output = output, .ok = o.ok, .empty = std.mem.eql(u8, o.text, "undefined") and std.mem.trim(u8, o.logs, " \t\r\n").len == 0, .run_ms = run_ms, .effort = args.value.effort, .remaining_steps = remaining_steps, .tool_summary = tool_summary };
+    return .{ .output = output, .ok = o.ok, .empty = std.mem.eql(u8, o.text, "undefined") and std.mem.trim(u8, o.logs, " \t\r\n").len == 0, .run_ms = run_ms, .effort = declaration, .remaining_steps = remaining_steps, .tool_summary = tool_summary };
 }
 
 fn executeTimed(s: *Session, code: []const u8, cancel: *const std.atomic.Value(bool), timing: *sandbox.RunTiming) !?Ran {

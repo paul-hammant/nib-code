@@ -35,8 +35,10 @@ const Settings = struct {
     context_window: ?u64 = null,
     model_line: usize = 1,
     transport: provider.Transport = .sse,
+    run_tool: @FieldType(provider.Config, "codex_run_tool") = .custom,
     reasoning_summary: @FieldType(provider.Config, "reasoning_summary") = .off,
 };
+
 const Span = struct { start: usize, end: usize };
 const File = struct {
     top_end: usize = 0,
@@ -190,7 +192,7 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
                 if (std.mem.eql(u8, key, name)) break :blk i;
             }
             return p.bad("unknown limits key '{s}'", .{key});
-        } else if (std.mem.eql(u8, key, "model")) 0 else if (std.mem.eql(u8, key, "base_url")) 1 else if (std.mem.eql(u8, key, "context_window")) 2 else if (section == .codex and std.mem.eql(u8, key, "transport")) 3 else if (section == .codex and std.mem.eql(u8, key, "reasoning_summary")) 4 else return p.bad("unknown provider key '{s}'", .{key});
+        } else if (std.mem.eql(u8, key, "model")) 0 else if (std.mem.eql(u8, key, "base_url")) 1 else if (std.mem.eql(u8, key, "context_window")) 2 else if (section == .codex and std.mem.eql(u8, key, "transport")) 3 else if (section == .codex and std.mem.eql(u8, key, "reasoning_summary")) 4 else if (section == .codex and std.mem.eql(u8, key, "run_tool")) 5 else return p.bad("unknown provider key '{s}'", .{key});
         const group: usize = if (section) |id| @as(usize, @backingInt(id)) + 1 else 0;
         if (seen[group][index]) return p.bad("duplicate key '{s}'", .{key});
         seen[group][index] = true;
@@ -240,6 +242,8 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
                 settings.transport = std.meta.stringToEnum(provider.Transport, decoded) orelse return p.bad("transport must be websocket or sse", .{});
             } else if (index == 4) {
                 settings.reasoning_summary = std.meta.stringToEnum(@FieldType(provider.Config, "reasoning_summary"), decoded) orelse return p.bad("reasoning_summary must be off or auto", .{});
+            } else if (index == 5) {
+                settings.run_tool = std.meta.stringToEnum(@FieldType(provider.Config, "codex_run_tool"), decoded) orelse return p.bad("run_tool must be custom or function", .{});
             } else settings.base_url = decoded;
         }
         const tail = std.mem.trimStart(u8, value[consumed..], " \t");
@@ -280,6 +284,10 @@ pub fn resolve(a: Allocator, env: *const Env, text: []const u8, path: []const u8
         detail.* = try a.dupe(u8, "NIB_CODEX_TRANSPORT: expected websocket or sse");
         return error.InvalidConfig;
     } else file.codex_settings.transport;
+    cfg.codex_run_tool = if (env.get("NIB_CODEX_RUN_TOOL")) |v| std.meta.stringToEnum(@FieldType(provider.Config, "codex_run_tool"), v) orelse {
+        detail.* = try a.dupe(u8, "NIB_CODEX_RUN_TOOL: expected custom or function");
+        return error.InvalidConfig;
+    } else file.codex_settings.run_tool;
     cfg.reasoning_summary = if (env.get("NIB_REASONING_SUMMARY")) |v| std.meta.stringToEnum(@FieldType(provider.Config, "reasoning_summary"), v) orelse {
         detail.* = try a.dupe(u8, "NIB_REASONING_SUMMARY: expected off or auto");
         return error.InvalidConfig;
@@ -731,4 +739,24 @@ test "Codex transport defaults, TOML selection and environment precedence" {
     try t.expectError(error.InvalidConfig, resolve(a, &env, text, "config.toml", &detail));
     try t.expectError(error.InvalidConfig, parse(a, a, "[codex]\ntransport = \"invalid\"\n", "config.toml", &detail));
     try t.expectError(error.InvalidConfig, parse(a, a, "[chat_completions]\ntransport = \"websocket\"\n", "config.toml", &detail));
+}
+
+test "Codex Run tool defaults custom with validated file and environment fallback" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: Env = .init(a);
+    var detail: ?[]u8 = null;
+    try t.expectEqual(.custom, (try resolve(a, &env, "", "config.toml", &detail)).codex_run_tool);
+    const text = "[codex]\nrun_tool = \"function\"";
+    try t.expectEqual(.function, (try resolve(a, &env, text, "config.toml", &detail)).codex_run_tool);
+    try env.put("NIB_CODEX_RUN_TOOL", "custom");
+    try t.expectEqual(.custom, (try resolve(a, &env, text, "config.toml", &detail)).codex_run_tool);
+    try env.put("NIB_CODEX_RUN_TOOL", "invalid");
+    try t.expectError(error.InvalidConfig, resolve(a, &env, text, "config.toml", &detail));
+    try env.put("NIB_CODEX_RUN_TOOL", "custom");
+    for ([_][]const u8{ "[codex]\nrun_tool = \"invalid\"", "[codex]\nrun_tool = true", "[codex]\nrun_tool = \"custom\"\nrun_tool = \"function\"", "[chat_completions]\nrun_tool = \"custom\"" }) |bad| {
+        try t.expectError(error.InvalidConfig, resolve(a, &env, bad, "config.toml", &detail));
+    }
 }
