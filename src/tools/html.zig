@@ -393,13 +393,26 @@ fn language(attrs: []const u8) []const u8 {
 }
 
 const entities = std.StaticStringMap([]const u8).initComptime(.{
-    .{ "amp", "&" },     .{ "lt", "<" },      .{ "gt", ">" },      .{ "quot", "\"" },
-    .{ "apos", "'" },    .{ "nbsp", " " },    .{ "mdash", "—" },   .{ "ndash", "–" },
-    .{ "hellip", "…" },  .{ "copy", "©" },    .{ "reg", "®" },     .{ "trade", "™" },
-    .{ "lsquo", "‘" },   .{ "rsquo", "’" },   .{ "ldquo", "“" },   .{ "rdquo", "”" },
-    .{ "times", "×" },   .{ "middot", "·" },  .{ "bull", "•" },    .{ "rarr", "→" },
-    .{ "larr", "←" },    .{ "laquo", "«" },   .{ "raquo", "»" },   .{ "zwj", "" },
-    .{ "zwnj", "" },
+    .{ "amp", "&" },  .{ "lt", "<" },   .{ "gt", ">" }, .{ "quot", "\"" },
+    .{ "apos", "'" }, .{ "nbsp", " " },
+    .{ "mdash", "—" },
+    .{ "ndash", "–" },
+    .{ "hellip", "…" },
+    .{ "copy", "©" },
+    .{ "reg", "®" },
+    .{ "trade", "™" },
+    .{ "lsquo", "‘" },
+    .{ "rsquo", "’" },
+    .{ "ldquo", "“" },
+    .{ "rdquo", "”" },
+    .{ "times", "×" },
+    .{ "middot", "·" },
+    .{ "bull", "•" },
+    .{ "rarr", "→" },
+    .{ "larr", "←" },
+    .{ "laquo", "«" },
+    .{ "raquo", "»" },
+    .{ "zwj", "" },   .{ "zwnj", "" },
 });
 
 fn decode(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
