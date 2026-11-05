@@ -15,6 +15,8 @@ import threading
 import time
 import unittest
 
+from background_assertions import stop_result
+
 import mock_agent
 from background_assertions import assert_background_bytes, root_records
 from change_helpers import call, checked_bash, wait_command
@@ -124,7 +126,7 @@ class Mock(http.server.ThreadingHTTPServer):
                 elif self.case == "detached_continuation":
                     code = ("await " + bash(self.group_command(), detached=True) + "; " +
                             call("bash", command=wait_command("worker.started")) + ".then(async()=>{"
-                            "const stopped=await tools.stop({id:'b1'}); "
+                            "const stopped=await tools.stop({id:'b1',reason:'mock requested cancellation'}); "
                             "console.log('continuation-stop',stopped)}); "
                             "throw new Error('top-level rejected')")
                 elif self.case == "detached_limit_mixed":
@@ -137,7 +139,7 @@ class Mock(http.server.ThreadingHTTPServer):
                     calls = [
                         "tools.bash({command:'echo invalid',detached:true})",
                         "tools.bash({command:'echo invalid',background:false,detached:true})",
-                        "tools.stop({id:'b999'})",
+                        "tools.stop({id:'b999',reason:'mock requested cancellation'})",
                     ]
                     code = ("const results=[]; for (const call of [" +
                             ",".join("async()=>" + call for call in calls) +
@@ -156,7 +158,7 @@ class Mock(http.server.ThreadingHTTPServer):
             if step == 1 and self.case != "detached_invalid":
                 self.model_gate.wait(15)
                 if self.case == "detached_boundary":
-                    return "await tools.stop({id:'b1'}); 42", "detached continued"
+                    return "await tools.stop({id:'b1',reason:'mock requested cancellation'}); 42", "detached continued"
                 if self.case == "detached_step_limit":
                     return "42", "detached continued"
             else:
@@ -168,19 +170,19 @@ class Mock(http.server.ThreadingHTTPServer):
             return ("await tools.fetch({url:(await tools.read({path:'service.url'})).text.trim()})",
                     "probing service")
         if turn == "stop service" and step == 0:
-            return ("const stopped=await tools.stop({id:'b1'}); "
+            return ("const stopped=await tools.stop({id:'b1',reason:'mock requested cancellation'}); "
                     "let error; try{await tools.fetch({url:(await tools.read({path:'service.url'})).text.trim(),"
                     "timeout_ms:1000})}catch(e){error=e.message} ({stopped,error})", "stopping service")
         if turn == "launch next" and step == 0:
             return "await " + bash(self.group_command("other"), detached=True), "launching next"
         if turn == "stop counters" and step == 0:
-            return "await Promise.all([tools.stop({id:'b2'}),tools.stop({id:'b3'})])", "stopping counters"
+            return "await Promise.all([tools.stop({id:'b2',reason:'mock requested cancellation'}),tools.stop({id:'b3',reason:'mock requested cancellation'})])", "stopping counters"
         if turn == "stop concurrently" and step == 0:
-            return "await Promise.all([tools.stop({id:'b1'}),tools.stop({id:'b1'})])", "stopping concurrently"
+            return "await Promise.all([tools.stop({id:'b1',reason:'mock requested cancellation'}),tools.stop({id:'b1',reason:'mock requested cancellation'})])", "stopping concurrently"
         if turn == "stop one" and step == 0:
-            return "await tools.stop({id:'b1'})", "stopping one"
+            return "await tools.stop({id:'b1',reason:'mock requested cancellation'})", "stopping one"
         if turn == "check stopped" and step == 0:
-            return "await tools.stop({id:'b1'})", "checking stopped"
+            return "await tools.stop({id:'b1',reason:'mock requested cancellation'})", "checking stopped"
         return None, turn + " complete"
 
     def first_code(self):
@@ -463,7 +465,7 @@ class BackgroundBashTests:
         self.assertTrue(all(alive(pid) for pid in target + other))
         terminal.send("stop one\r")
         self.wait_final("stop one complete")
-        self.assertEqual(self.last_run_value(), {"id": "b1", "stopped": True})
+        self.assertEqual(self.last_run_value(), stop_result("b1", True))
         self.assertTrue(all(not alive(pid) for pid in target))
         self.assertTrue(all(alive(pid) for pid in other))
         messages = history(self.home)
@@ -473,7 +475,7 @@ class BackgroundBashTests:
         self.assertFalse(self.completions(messages, "b2"))
         terminal.send("check stopped\r")
         self.wait_final("check stopped complete")
-        self.assertEqual(self.last_run_value(), {"id": "b1", "stopped": False})
+        self.assertEqual(self.last_run_value(), stop_result("b1", False))
         self.assertEqual(len(self.completions(history(self.home))), 1)
         self.assertTrue(all(alive(pid) for pid in other))
         terminal.close()
@@ -509,7 +511,7 @@ class BackgroundBashTests:
         self.assertEqual(result, {"exit_code": 0, "output": "worker-done\n"})
         terminal.send("check stopped\r")
         self.wait_final("check stopped complete")
-        self.assertEqual(self.last_run_value(), {"id": "b1", "stopped": False})
+        self.assertEqual(self.last_run_value(), stop_result("b1", False))
         self.assertEqual(len(self.completions(history(self.home))), 1)
         for request in mock.observed()[2:]:
             self.assertEqual(len(self.completions(request["messages"])), 1)
@@ -634,7 +636,7 @@ class BackgroundBashTests:
         terminal.send("stop service\r")
         self.wait_final("stop service complete")
         result = self.last_run_value()
-        self.assertEqual(result["stopped"], {"id": "b1", "stopped": True})
+        self.assertEqual(result["stopped"], stop_result("b1", True))
         self.assertTrue(result.get("error"), result)
         self.assertFalse(alive(pid))
         self.assertEqual(len(self.completions(history(self.home))), 1)
@@ -661,7 +663,7 @@ class BackgroundBashTests:
 
         terminal.send("check stopped\r")
         self.wait_final("check stopped complete")
-        self.assertEqual(self.last_run_value(), {"id": "b1", "stopped": False})
+        self.assertEqual(self.last_run_value(), stop_result("b1", False))
         request = mock.observed()[2]
         completions = self.completions(request["messages"])
         self.assertEqual(len(completions), 1)
@@ -733,8 +735,8 @@ class BackgroundBashTests:
         terminal.until(b"b3 bash")
         terminal.send("stop counters\r")
         self.wait_final("stop counters complete")
-        self.assertEqual(self.last_run_value(), [{"id": "b2", "stopped": True},
-                                                 {"id": "b3", "stopped": True}])
+        self.assertEqual(self.last_run_value(), [stop_result("b2", True),
+                                                 stop_result("b3", True)])
         self.assertTrue(all(not alive(pid) for pid in pids))
         self.assert_accounting(mock)
 
@@ -908,11 +910,21 @@ class BackgroundBashTests:
         self.assertEqual([(e["id"], e["kind"], e["state"]) for e in lifecycle],
                          [("b1", "bash", "started"), ("b1", "bash", "finished")])
         self.assertTrue(all("result" not in e for e in lifecycle))
+        execution = lifecycle[-1]["execution"]
+        self.assertGreater(execution["start_ms_epoch"], 0)
+        self.assertGreater(execution["end_ms_epoch"], execution["start_ms_epoch"])
+        finished = [r for r in root_records(self.home) if r.get("background", {}).get("state") == "finished"]
+        self.assertEqual(finished[-1]["background"]["execution"], execution)
+        self.assertLessEqual(execution["end_ms_epoch"], finished[-1]["at"])
+
         log = self.log(events)
         stored = [m for r in log for m in r.get("messages", []) if m.get("source") == "background"]
         self.assertEqual([(m["background_kind"], m["background_id"]) for m in stored], [("bash", "b1")])
         calls = [c for r in log for c in r.get("calls", []) if c["name"] == "bash"]
         self.assertEqual([(c["background"], c["id"]) for c in calls], [(True, "b1")])
+        self.assertEqual(len(mock.observed()), 3)
+        self.assertTrue(any(m.get("waiting") for r in log for m in r.get("messages", [])))
+        self.assertFalse(any(c["name"] == "sleep" for r in log for c in r.get("calls", [])))
         self.assert_accounting(mock, events)
 
     def test_two_steps_and_next_boundary(self):
@@ -1023,7 +1035,7 @@ class BackgroundBashTests:
         step = next(r for r in rows if r.get("calls_omitted"))
         self.assertEqual((len(step["calls"]), step["calls_omitted"]), (200, 2))
         self.assertTrue(all("id" not in c for c in step["calls"]))
-        self.assertEqual(step["task_ids"], {"agent": 1, "bash": 1})
+        self.assertEqual(step["task_ids"], {"agent": 1, "bash": 1, "run": 0})
         self.assert_progress_ids(events, {"a1": ("agent", False), "b1": ("bash", False)})
         mock.child_gate.set()
         resumed = self.finish(self.start("--resume", events[0]["start"]["session_id"], "resume"))
@@ -1067,6 +1079,7 @@ class BackgroundBashTests:
         self.assertEqual({m["background_id"] for m in logged}, {"a2", "b1"})
 
     def test_foreground_bash_delays_progress_and_keeps_two_completed_ids(self):
+        (self.home / "config.toml").write_text("[limits]\nrun_background_after_ms = 30000\n")
         self.mock("foreground_bash")
         started = time.monotonic()
         process = self.start()
@@ -1095,9 +1108,9 @@ class BackgroundBashTests:
         self.assertEqual((process.returncode, output, error, pending), (0, "", "", b""))
         self.assertIn("end", events[-1])
         self.assertFalse(any("background" in e for e in events))
-        self.assert_progress_ids(events, {"b1": ("bash", False), "b2": ("bash", False)})
+        self.assert_progress_ids(events, {"b1": ("bash", False), "b3": ("bash", False)})
         completed = {}
-        for id in ("b1", "b2"):
+        for id in ("b1", "b3"):
             samples = [(stamp, p) for stamp, p in updates if p["id"] == id]
             elapsed = [p["elapsed_ms"] for _, p in samples]
             self.assertGreaterEqual(len(samples), 2, samples)
@@ -1109,9 +1122,9 @@ class BackgroundBashTests:
             self.assertGreaterEqual(elapsed[-1], 4900, samples)
             completed[id] = samples[-1]
         self.assertGreaterEqual(updates[0][0], 2.8, updates)
-        self.assertLess(completed["b1"][0], next(stamp for stamp, p in updates if p["id"] == "b2"))
+        self.assertLess(completed["b1"][0], next(stamp for stamp, p in updates if p["id"] == "b3"))
         calls = [c for r in self.log(events) for c in r.get("calls", []) if c["name"] == "bash"]
-        self.assertEqual([c.get("id") for c in calls], ["b1", None, "b2"])
+        self.assertEqual([c.get("id") for c in calls], ["b1", "b2", "b3"])
         self.assertTrue(all(not c.get("background", False) for c in calls))
         self.assertTrue(all(c["ok"] for c in calls))
         for call in (calls[0], calls[2]):

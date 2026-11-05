@@ -34,7 +34,11 @@ const Settings = struct {
     base_url: ?[]const u8 = null,
     context_window: ?u64 = null,
     model_line: usize = 1,
+    transport: provider.Transport = .websocket,
+    run_tool: @FieldType(provider.Config, "codex_run_tool") = .custom,
+    reasoning_summary: @FieldType(provider.Config, "reasoning_summary") = .off,
 };
+
 const Span = struct { start: usize, end: usize };
 const File = struct {
     top_end: usize = 0,
@@ -148,7 +152,7 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
     const Section = enum { chat_completions, codex, limits };
     var section: ?Section = null;
     var seen_sections: [3]bool = @splat(false);
-    var seen: [4][6]bool = @splat(@splat(false));
+    var seen: [4][10]bool = @splat(@splat(false));
     var offset: usize = 0;
     while (offset < text.len) : (p.line += 1) {
         const end = if (std.mem.indexOfScalarPos(u8, text, offset, '\n')) |n| n + 1 else text.len;
@@ -183,12 +187,12 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
         const index: usize = if (section == null)
             if (std.mem.eql(u8, key, "provider")) 0 else if (std.mem.eql(u8, key, "effort")) 1 else return p.bad("unknown top-level key '{s}'", .{key})
         else if (section == .limits) blk: {
-            const names = .{ "llm_concurrency", "llm_calls_per_run", "llm_input_kib", "agent_concurrency", "max_steps", "stream_idle_timeout_s" };
+            const names = .{ "llm_concurrency", "llm_calls_per_run", "llm_input_kib", "agent_concurrency", "max_steps", "stream_idle_timeout_s", "run_background_after_ms", "stream_content_timeout_s", "request_timeout_s", "run_output_bytes" };
             inline for (names, 0..) |name, i| {
                 if (std.mem.eql(u8, key, name)) break :blk i;
             }
             return p.bad("unknown limits key '{s}'", .{key});
-        } else if (std.mem.eql(u8, key, "model")) 0 else if (std.mem.eql(u8, key, "base_url")) 1 else if (std.mem.eql(u8, key, "context_window")) 2 else return p.bad("unknown provider key '{s}'", .{key});
+        } else if (std.mem.eql(u8, key, "model")) 0 else if (std.mem.eql(u8, key, "base_url")) 1 else if (std.mem.eql(u8, key, "context_window")) 2 else if (section == .codex and std.mem.eql(u8, key, "transport")) 3 else if (section == .codex and std.mem.eql(u8, key, "reasoning_summary")) 4 else if (section == .codex and std.mem.eql(u8, key, "run_tool")) 5 else return p.bad("unknown provider key '{s}'", .{key});
         const group: usize = if (section) |id| @as(usize, @backingInt(id)) + 1 else 0;
         if (seen[group][index]) return p.bad("duplicate key '{s}'", .{key});
         seen[group][index] = true;
@@ -198,8 +202,9 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
         const parsed = try p.value(value, &consumed);
         if (section == .limits) {
             if (parsed != .integer) return p.bad("{s} must be an integer", .{key});
-            const maxima = [_]usize{ 64, 10000, 65536, 64, 100000, 3600 };
-            if (parsed.integer < 1 or parsed.integer > maxima[index]) return p.bad("{s} must be between 1 and {d}", .{ key, maxima[index] });
+            const maxima = [_]usize{ 64, 10000, 65536, 64, 100000, 3600, 3600000, 3600, 3600, 16 * 1024 * 1024 };
+            const minimum: usize = if (index == 9) 16 * 1024 else 1;
+            if (parsed.integer < minimum or parsed.integer > maxima[index]) return p.bad("{s} must be between {d} and {d}", .{ key, minimum, maxima[index] });
             const n: usize = @intCast(parsed.integer);
             switch (index) {
                 0 => file.limits.llm_concurrency = n,
@@ -208,6 +213,10 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
                 3 => file.limits.agent_concurrency = n,
                 4 => file.limits.max_steps = n,
                 5 => file.limits.stream_idle_timeout_s = n,
+                6 => file.limits.run_background_after_ms = n,
+                7 => file.limits.stream_content_timeout_s = n,
+                8 => file.limits.request_timeout_s = n,
+                9 => file.limits.run_output_bytes = n,
                 else => unreachable,
             }
         } else if (section != null and index == 2) {
@@ -229,6 +238,12 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
             } else if (index == 0) {
                 settings.model = decoded;
                 settings.model_line = p.line;
+            } else if (index == 3) {
+                settings.transport = std.meta.stringToEnum(provider.Transport, decoded) orelse return p.bad("transport must be websocket or sse", .{});
+            } else if (index == 4) {
+                settings.reasoning_summary = std.meta.stringToEnum(@FieldType(provider.Config, "reasoning_summary"), decoded) orelse return p.bad("reasoning_summary must be off or auto", .{});
+            } else if (index == 5) {
+                settings.run_tool = std.meta.stringToEnum(@FieldType(provider.Config, "codex_run_tool"), decoded) orelse return p.bad("run_tool must be custom or function", .{});
             } else settings.base_url = decoded;
         }
         const tail = std.mem.trimStart(u8, value[consumed..], " \t");
@@ -265,6 +280,26 @@ pub fn resolve(a: Allocator, env: *const Env, text: []const u8, path: []const u8
         return err;
     } else 1_000_000;
     var cfg: provider.Config = .{ .provider = id, .api_key = "", .base_url = "", .model = "", .context_window = context_window, .limits = file.limits };
+    cfg.codex_transport = if (env.get("NIB_CODEX_TRANSPORT")) |v| std.meta.stringToEnum(provider.Transport, v) orelse {
+        detail.* = try a.dupe(u8, "NIB_CODEX_TRANSPORT: expected websocket or sse");
+        return error.InvalidConfig;
+    } else file.codex_settings.transport;
+    cfg.codex_run_tool = if (env.get("NIB_CODEX_RUN_TOOL")) |v| std.meta.stringToEnum(@FieldType(provider.Config, "codex_run_tool"), v) orelse {
+        detail.* = try a.dupe(u8, "NIB_CODEX_RUN_TOOL: expected custom or function");
+        return error.InvalidConfig;
+    } else file.codex_settings.run_tool;
+    cfg.reasoning_summary = if (env.get("NIB_REASONING_SUMMARY")) |v| std.meta.stringToEnum(@FieldType(provider.Config, "reasoning_summary"), v) orelse {
+        detail.* = try a.dupe(u8, "NIB_REASONING_SUMMARY: expected off or auto");
+        return error.InvalidConfig;
+    } else file.codex_settings.reasoning_summary;
+    if (env.get("NIB_RUN_OUTPUT_BYTES")) |v| {
+        const n = std.fmt.parseInt(usize, v, 10) catch 0;
+        if (n < 16 * 1024 or n > 16 * 1024 * 1024) {
+            detail.* = try a.dupe(u8, "NIB_RUN_OUTPUT_BYTES: expected 16384..16777216 bytes");
+            return error.InvalidConfig;
+        }
+        cfg.limits.run_output_bytes = n;
+    }
     if (env.get("NIB_THINKING") == null and env.get("NIB_REASONING_EFFORT") == null) {
         if (file.effort) |v| try cfg.setEffort(v);
     }
@@ -611,8 +646,8 @@ test "limits defaults, bounds and diagnostics" {
     try t.expectEqualDeep(defaults, (try resolve(a, &env, "[limits]\n", "config.toml", &detail)).limits);
     try t.expectEqual(@as(?usize, null), (try resolve(a, &env, "[limits]\nllm_concurrency = 8\n", "config.toml", &detail)).limits.max_steps);
     try t.expectEqual(@as(?usize, 50), (try resolve(a, &env, "[limits]\nmax_steps = 50\n", "config.toml", &detail)).limits.max_steps);
-    const names = [_][]const u8{ "llm_concurrency", "llm_calls_per_run", "llm_input_kib", "agent_concurrency", "max_steps", "stream_idle_timeout_s" };
-    const maxima = [_]usize{ 64, 10000, 65536, 64, 100000, 3600 };
+    const names = [_][]const u8{ "llm_concurrency", "llm_calls_per_run", "llm_input_kib", "agent_concurrency", "max_steps", "stream_idle_timeout_s", "run_background_after_ms", "stream_content_timeout_s", "request_timeout_s" };
+    const maxima = [_]usize{ 64, 10000, 65536, 64, 100000, 3600, 3600000, 3600, 3600 };
     for (names, maxima) |name, max| {
         for ([_]usize{ 1, max }) |n| {
             const text = try std.fmt.allocPrint(a, "[limits]\n{s} = {d}\n", .{ name, n });
@@ -637,6 +672,37 @@ test "limits defaults, bounds and diagnostics" {
     }
 }
 
+test "summary and Run display budget file and environment precedence" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: Env = .init(a);
+    var detail: ?[]u8 = null;
+    const defaults = try resolve(a, &env, "", "config.toml", &detail);
+    try t.expectEqual(.off, defaults.reasoning_summary);
+    try t.expectEqual(@as(usize, 16384), defaults.limits.run_output_bytes);
+    const text = "[codex]\nreasoning_summary = \"auto\"\n[limits]\nrun_output_bytes = 32768\n";
+    const file = try resolve(a, &env, text, "config.toml", &detail);
+    try t.expectEqual(.auto, file.reasoning_summary);
+    try t.expectEqual(@as(usize, 32768), file.limits.run_output_bytes);
+    try env.put("NIB_REASONING_SUMMARY", "off");
+    try env.put("NIB_RUN_OUTPUT_BYTES", "65536");
+    const overridden = try resolve(a, &env, text, "config.toml", &detail);
+    try t.expectEqual(.off, overridden.reasoning_summary);
+    try t.expectEqual(@as(usize, 65536), overridden.limits.run_output_bytes);
+    for ([_][]const u8{ "0", "16383", "16777217", "many" }) |value| {
+        try env.put("NIB_RUN_OUTPUT_BYTES", value);
+        try t.expectError(error.InvalidConfig, resolve(a, &env, text, "config.toml", &detail));
+    }
+    _ = env.swapRemove("NIB_RUN_OUTPUT_BYTES");
+    try env.put("NIB_REASONING_SUMMARY", "invalid");
+    try t.expectError(error.InvalidConfig, resolve(a, &env, text, "config.toml", &detail));
+    for ([_][]const u8{ "[codex]\nreasoning_summary = \"invalid\"", "[limits]\nrun_output_bytes = 16383", "[limits]\nrun_output_bytes = 16777217", "[limits]\nrun_output_bytes = true" }) |invalid| {
+        try t.expectError(error.InvalidConfig, parse(a, a, invalid, "config.toml", &detail));
+    }
+}
+
 test "effort replacement preserves config symlink and permissions" {
     const t = std.testing;
     var tmp = t.tmpDir(.{ .iterate = true });
@@ -654,4 +720,45 @@ test "effort replacement preserves config symlink and permissions" {
     try t.expectEqualStrings("effort = \"high\"\n", text);
     var it = tmp.dir.iterate();
     while (try it.next(t.io)) |entry| try t.expect(!std.mem.startsWith(u8, entry.name, ".nib-"));
+}
+
+test "Codex transport defaults, TOML selection and environment precedence" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: Env = .init(t.allocator);
+    defer env.deinit();
+    var detail: ?[]u8 = null;
+    try t.expectEqual(provider.Transport.websocket, (try resolve(a, &env, "", "config.toml", &detail)).codex_transport);
+    const text = "[codex]\ntransport = \"sse\"\n";
+    try t.expectEqual(provider.Transport.sse, (try resolve(a, &env, text, "config.toml", &detail)).codex_transport);
+    try env.put("NIB_CODEX_TRANSPORT", "websocket");
+    try t.expectEqual(provider.Transport.websocket, (try resolve(a, &env, text, "config.toml", &detail)).codex_transport);
+    try env.put("NIB_CODEX_TRANSPORT", "sse");
+    try t.expectEqual(provider.Transport.sse, (try resolve(a, &env, "", "config.toml", &detail)).codex_transport);
+    try env.put("NIB_CODEX_TRANSPORT", "invalid");
+    try t.expectError(error.InvalidConfig, resolve(a, &env, text, "config.toml", &detail));
+    try t.expectError(error.InvalidConfig, parse(a, a, "[codex]\ntransport = \"invalid\"\n", "config.toml", &detail));
+    try t.expectError(error.InvalidConfig, parse(a, a, "[chat_completions]\ntransport = \"websocket\"\n", "config.toml", &detail));
+}
+
+test "Codex Run tool defaults custom with validated file and environment fallback" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: Env = .init(a);
+    var detail: ?[]u8 = null;
+    try t.expectEqual(.custom, (try resolve(a, &env, "", "config.toml", &detail)).codex_run_tool);
+    const text = "[codex]\nrun_tool = \"function\"";
+    try t.expectEqual(.function, (try resolve(a, &env, text, "config.toml", &detail)).codex_run_tool);
+    try env.put("NIB_CODEX_RUN_TOOL", "custom");
+    try t.expectEqual(.custom, (try resolve(a, &env, text, "config.toml", &detail)).codex_run_tool);
+    try env.put("NIB_CODEX_RUN_TOOL", "invalid");
+    try t.expectError(error.InvalidConfig, resolve(a, &env, text, "config.toml", &detail));
+    try env.put("NIB_CODEX_RUN_TOOL", "custom");
+    for ([_][]const u8{ "[codex]\nrun_tool = \"invalid\"", "[codex]\nrun_tool = true", "[codex]\nrun_tool = \"custom\"\nrun_tool = \"function\"", "[chat_completions]\nrun_tool = \"custom\"" }) |bad| {
+        try t.expectError(error.InvalidConfig, resolve(a, &env, bad, "config.toml", &detail));
+    }
 }

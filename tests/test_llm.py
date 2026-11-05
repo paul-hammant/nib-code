@@ -62,7 +62,7 @@ class LlmTests:
             port = sock.getsockname()[1]
         cls.env = {key: value for key, value in os.environ.items()
                    if not key.startswith(("NIB_", "DEEPSEEK_", "OPENAI_", "CODEX_", "MOCK_"))}
-        cls.env.update(NIB_PROVIDER=cls.provider, NIB_API_KEY="fake-llm-key",
+        cls.env.update(NIB_PROVIDER=cls.provider, NIB_CODEX_TRANSPORT="sse", NIB_API_KEY="fake-llm-key",
                        NIB_BASE_URL=f"http://127.0.0.1:{port}", NIB_MODEL="mock-parent-model",
                        NIB_REASONING_EFFORT="high", NIB_CONTEXT_WINDOW="128000",
                        NIB_HOME=str(home), CODEX_HOME=str(auth), HOME=str(cls.tmp),

@@ -7,6 +7,25 @@ pub const Code = struct {
     progress: []const [2]u64,
 };
 
+pub const Attempt = struct {
+    start_ms: u64,
+    end_ms: u64,
+    error_name: ?[]const u8 = null,
+    detail: ?[]const u8 = null,
+    transport: []const u8,
+    incremental: bool,
+    full_reason: ?[]const u8 = null,
+    fallback_reason: ?[]const u8 = null,
+    fallback_at: ?i64 = null,
+    fallback_detail: ?[]const u8 = null,
+    bytes: u64,
+    content_bytes: u64,
+    first_content_ms: ?u64 = null,
+    last_content_ms: ?u64 = null,
+    max_content_gap_ms: ?u64 = null,
+    max_gap_ms: ?u64 = null,
+};
+
 pub const Model = struct {
     io: std.Io,
     started: std.Io.Clock.Timestamp,
@@ -14,6 +33,13 @@ pub const Model = struct {
     used: usize = 0,
     max_gap_ms: ?u64 = null,
     last_byte_ms: ?u64 = null,
+    bytes: u64 = 0,
+    content_bytes: u64 = 0,
+    first_content_ms: ?u64 = null,
+    last_content_ms: ?u64 = null,
+    max_content_gap_ms: ?u64 = null,
+    attempts: [@import("retry.zig").max_attempts]Attempt = undefined,
+    attempt_count: usize = 0,
 
     const Slot = struct {
         index: usize = 0,
@@ -52,10 +78,47 @@ pub const Model = struct {
         m.used = 0;
         m.max_gap_ms = null;
         m.last_byte_ms = null;
+        m.bytes = 0;
+        m.content_bytes = 0;
+        m.first_content_ms = null;
+        m.last_content_ms = null;
+        m.max_content_gap_ms = null;
     }
 
-    pub fn received(m: *Model) void {
+    pub fn received(m: *Model, bytes: usize) void {
+        m.bytes += bytes;
         m.receivedAt(m.elapsed());
+    }
+
+    pub fn content(m: *Model, bytes: usize) void {
+        const ms = m.elapsed();
+        m.content_bytes += bytes;
+        if (m.first_content_ms == null) m.first_content_ms = ms;
+        if (m.last_content_ms) |last| m.max_content_gap_ms = @max(m.max_content_gap_ms orelse 0, ms -| last);
+        m.last_content_ms = ms;
+    }
+
+    pub fn finishAttempt(m: *Model, a: std.mem.Allocator, start_ms: u64, err: ?anyerror, detail: ?[]const u8, state: ?*@import("codex_ws.zig").State) !void {
+        const info = if (state) |s| s.last else @import("codex_ws.zig").Info{};
+        m.attempts[m.attempt_count] = .{
+            .start_ms = start_ms,
+            .end_ms = m.elapsed(),
+            .error_name = if (err) |e| @errorName(e) else null,
+            .detail = if (detail) |d| try a.dupe(u8, d) else null,
+            .transport = @tagName(info.transport),
+            .incremental = info.incremental,
+            .full_reason = info.full_reason,
+            .fallback_reason = info.fallback_reason,
+            .fallback_at = info.fallback_at,
+            .fallback_detail = if (info.fallback_detail) |d| try a.dupe(u8, d) else null,
+            .bytes = m.bytes,
+            .content_bytes = m.content_bytes,
+            .first_content_ms = m.first_content_ms,
+            .last_content_ms = m.last_content_ms,
+            .max_content_gap_ms = m.max_content_gap_ms,
+            .max_gap_ms = m.max_gap_ms,
+        };
+        m.attempt_count += 1;
     }
 
     fn receivedAt(m: *Model, ms: u64) void {
@@ -63,7 +126,7 @@ pub const Model = struct {
         m.last_byte_ms = ms;
     }
 
-    fn elapsed(m: *const Model) u64 {
+    pub fn elapsed(m: *const Model) u64 {
         return @intCast(@max(m.started.untilNow(m.io).raw.toMilliseconds(), 0));
     }
 

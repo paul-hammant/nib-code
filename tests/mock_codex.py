@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 
-from mock_llm_tool import run_code as llm_run_code, serve as serve_llm, serve_effort
+from mock_llm_tool import run_code as llm_run_code, serve as serve_llm, serve_effort, codex_run
 
 LOG = open(sys.argv[2], "a")
 LOCK = threading.Lock()
@@ -117,7 +117,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         last = inputs[-1] if inputs else {}
         if summary:
             text = "" if summary_empty else "Earlier work: completed mock tools. Continue the current user request."
-        elif last.get("type") == "function_call_output":
+        elif (last.get("type") in ("function_call_output", "custom_tool_call_output")
+              and not (prompt in ("syntax recovery", "runtime recovery") and "Run script failed" in last["output"])):
             text = "Tool returned: " + last["output"]
         elif prompt.startswith("stream ") or prompt in ("plain text", "large reasoning", "child probe", "rotate auth", "reject auth", "stream incomplete", "stream failed", "stream truncated"):
             text = "Mock text complete."
@@ -134,17 +135,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         'await tools.write({path: "timing.txt", content: "计时🙂"}); '
                         'await tools.read({path: "timing.txt"})')
             code = llm_run_code(prompt) or code
-            arguments = json.dumps({"code": code}, ensure_ascii=prompt not in ("timing", "timing final only"))
+            if prompt in ("syntax recovery", "runtime recovery"):
+                if last.get("type") in ("function_call_output", "custom_tool_call_output"):
+                    code = 'await tools.write({path: "recovered.txt", content: "fixed"}); "recovered"'
+                else:
+                    code = 'const broken = "oops\n";' if prompt == "syntax recovery" else 'throw new Error("runtime probe")'
             index = len(output)
-            item = {"id": f"fc_{number}", "type": "function_call", "call_id": f"call_{number}",
-                    "name": "run", "arguments": arguments, "status": "completed"}
+            item = dict(codex_run(body, {"code": code}, f"call_{number}"), id=f"fc_{number}", status="completed")
+            key = "input" if item["type"] == "custom_tool_call" else "arguments"
+            kind = "custom_tool_call_input" if key == "input" else "function_call_arguments"
+            arguments = item[key]
             if prompt != "timing final only":
-                event("response.output_item.added", output_index=index, item={**item, "arguments": "", "status": "in_progress"})
+                event("response.output_item.added", output_index=index, item={**item, key: "", "status": "in_progress"})
                 for offset in range(0, len(arguments), 7):
-                    event("response.function_call_arguments.delta", item_id=item["id"], output_index=index, delta=arguments[offset:offset + 7])
+                    event(f"response.{kind}.delta", item_id=item["id"], output_index=index, delta=arguments[offset:offset + 7])
                     if prompt == "timing":
                         time.sleep(.01)
-                event("response.function_call_arguments.done", item_id=item["id"], output_index=index, arguments=arguments)
+                event(f"response.{kind}.done", item_id=item["id"], output_index=index, **{key: arguments})
             event("response.output_item.done", output_index=index, item=item)
             output.append(item)
             text = None

@@ -37,7 +37,7 @@ pub fn complete(
     attempts: *u32,
     retry_sink: ?Sink,
 ) !p.Reply {
-    return completeWith(p.stream, sleep, gpa, out, client, cfg, cache_key, messages, tools_json, max_tokens, sink, cancel, detail, attempts, retry_sink);
+    return completeWith(p.stream, if (@import("builtin").is_test) noWait else sleep, gpa, out, client, cfg, cache_key, messages, tools_json, max_tokens, sink, cancel, detail, attempts, retry_sink);
 }
 
 const Forward = struct {
@@ -47,6 +47,11 @@ const Forward = struct {
     fn onData(ctx: *anyopaque) !void {
         const f: *@This() = @ptrCast(@alignCast(ctx));
         try f.sink.received();
+    }
+
+    fn onFallback(ctx: *anyopaque, info: @import("codex_ws.zig").Info) !void {
+        const f: *@This() = @ptrCast(@alignCast(ctx));
+        try f.sink.fallback(info);
     }
 
     fn onDelta(ctx: *anyopaque, kind: p.Kind, text: []const u8) !void {
@@ -77,12 +82,14 @@ fn completeWith(
     while (true) : (attempt += 1) {
         attempts.* = attempt;
         var fwd: Forward = .{ .sink = sink };
-        const forwarded: p.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .timing = sink.timing };
-        return response: {
+        const forwarded: p.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .onFallback = Forward.onFallback, .timing = sink.timing, .codex_state = sink.codex_state };
+        const attempt_start = if (sink.timing) |timing| timing.elapsed() else 0;
+        const result = response: {
             try Sink.emit(retry_sink, .started);
             defer Sink.emit(retry_sink, .finished) catch {};
             break :response request(gpa, out, client, cfg, cache_key, messages, tools_json, max_tokens, forwarded, cancel, detail);
         } catch |err| {
+            if (sink.timing) |timing| try timing.finishAttempt(out, attempt_start, err, detail.*, sink.codex_state);
             if (err == error.Canceled or cancel.load(.acquire)) return err;
             const is_codex = cfg.provider == .codex;
             if ((!is_codex and fwd.emitted and !sink.replay_safe) or attempt == max_attempts or !transient(err)) {
@@ -99,7 +106,13 @@ fn completeWith(
             try wait(client.io, delay_ms, cancel);
             continue;
         };
+        if (sink.timing) |timing| try timing.finishAttempt(out, attempt_start, null, null, sink.codex_state);
+        return result;
     }
+}
+
+fn noWait(_: std.Io, _: u64, cancel: *const std.atomic.Value(bool)) !void {
+    if (cancel.load(.acquire)) return error.Canceled;
 }
 
 fn transient(err: anyerror) bool {
@@ -185,10 +198,6 @@ const TestRequest = struct {
         try state.events.append(std.testing.allocator, value);
     }
 
-    fn noWait(_: std.Io, _: u64, cancel: *const std.atomic.Value(bool)) !void {
-        if (cancel.load(.acquire)) return error.Canceled;
-    }
-
     fn run(state: *@This(), id: p.Id, quiet: bool, comptime wait: anytype) !p.Reply {
         const t = std.testing;
         var client: std.http.Client = .{ .allocator = t.allocator, .io = t.io };
@@ -212,7 +221,7 @@ test "shared retry forwards data and orders activity before exponential retry no
     for ([_]p.Id{ .chat_completions, .codex }) |id| {
         var state: TestRequest = .{ .failures = 2 };
         defer state.events.deinit(t.allocator);
-        const reply = try state.run(id, false, TestRequest.noWait);
+        const reply = try state.run(id, false, noWait);
         try t.expectEqualStrings("done", reply.text);
         try t.expectEqual(@as(u64, 7), reply.usage.completion_tokens);
         try t.expectEqual(@as(u32, 3), state.calls);
@@ -229,11 +238,11 @@ test "shared retry only replays emitted deltas for Codex" {
         var state: TestRequest = .{ .emit_delta = true };
         defer state.events.deinit(t.allocator);
         if (id == .codex) {
-            _ = try state.run(id, false, TestRequest.noWait);
+            _ = try state.run(id, false, noWait);
             try t.expectEqual(@as(u32, 2), state.calls);
             try t.expectEqual(@as(usize, 2), state.deltas);
         } else {
-            try t.expectError(error.HttpTransient, state.run(id, false, TestRequest.noWait));
+            try t.expectError(error.HttpTransient, state.run(id, false, noWait));
             try t.expectEqual(@as(u32, 1), state.calls);
             try t.expectEqual(@as(usize, 1), state.deltas);
             try t.expectEqual(error.HttpTransient, state.failed.?);
@@ -246,7 +255,7 @@ test "shared retry limits attempts and preserves terminal errors and detail" {
     for ([_]anyerror{ error.HttpTransient, error.HttpStatus, error.InvalidCredentials, error.ProviderFailed, error.OutOfMemory, error.TooManyToolCalls, error.Canceled }) |err| {
         var state: TestRequest = .{ .failures = max_attempts, .failure = err };
         defer state.events.deinit(t.allocator);
-        try t.expectError(err, state.run(.codex, false, TestRequest.noWait));
+        try t.expectError(err, state.run(.codex, false, noWait));
         try t.expectEqual(@as(u32, if (err == error.HttpTransient) max_attempts else 1), state.calls);
         if (err == error.Canceled) {
             try t.expectEqual(@as(?anyerror, null), state.failed);
@@ -260,11 +269,11 @@ test "shared retry accepts Codex Retry-After detail and supports a silent caller
     const t = std.testing;
     var state: TestRequest = .{ .failure = error.RateLimited, .message = "try again in 0.25s" };
     defer state.events.deinit(t.allocator);
-    _ = try state.run(.codex, false, TestRequest.noWait);
+    _ = try state.run(.codex, false, noWait);
     try t.expectEqual(@as(u64, 250), state.delays[0]);
     var quiet: TestRequest = .{ .emit_delta = true };
     defer quiet.events.deinit(t.allocator);
-    _ = try quiet.run(.codex, true, TestRequest.noWait);
+    _ = try quiet.run(.codex, true, noWait);
     try t.expectEqual(@as(u32, 2), quiet.calls);
     try t.expectEqual(@as(usize, 2), quiet.received);
     try t.expectEqual(@as(usize, 0), quiet.events.items.len);
@@ -283,7 +292,7 @@ test "buffered model callers can retry Chat deltas without weakening visible str
     const t = std.testing;
     var state: TestRequest = .{ .emit_delta = true, .replay_safe = true };
     defer state.events.deinit(t.allocator);
-    _ = try state.run(.chat_completions, true, TestRequest.noWait);
+    _ = try state.run(.chat_completions, true, noWait);
     try t.expectEqual(@as(u32, 2), state.calls);
     try t.expectEqual(@as(usize, 2), state.deltas);
 }
@@ -296,10 +305,10 @@ test "idle timeout retries preserve visible streaming and replay-safe rules" {
                 var state: TestRequest = .{ .failure = error.StreamIdleTimeout, .emit_delta = emitted, .replay_safe = safe };
                 defer state.events.deinit(t.allocator);
                 if (id == .chat_completions and emitted and !safe) {
-                    try t.expectError(error.StreamIdleTimeout, state.run(id, false, TestRequest.noWait));
+                    try t.expectError(error.StreamIdleTimeout, state.run(id, false, noWait));
                     try t.expectEqual(@as(u32, 1), state.calls);
                 } else {
-                    _ = try state.run(id, false, TestRequest.noWait);
+                    _ = try state.run(id, false, noWait);
                     try t.expectEqual(@as(u32, 2), state.calls);
                 }
             }

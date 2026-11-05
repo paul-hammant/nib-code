@@ -19,15 +19,15 @@ pub fn agent(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolR
     if (t.depth != 0 or t.forked) return fail(gpa, "{s}", .{if (t.forked) "agent is unavailable inside a forked sub-agent" else "agent is unavailable inside a sub-agent"});
     if (raw.value.object.contains("fork") and raw.value.object.contains("resume"))
         return fail(gpa, "fork and resume cannot be passed together", .{});
-    if (a.value.fork and t.fork_snapshot == null) return fail(gpa, "fork requires a current conversation history", .{});
+    if (a.value.fork and t.forkSnapshot() == null) return fail(gpa, "fork requires a current conversation history", .{});
     if (raw.value.object.get("resume")) |value| {
         if (value != .string) return fail(gpa, "resume must be a string", .{});
     }
     if (a.value.timeout_ms <= 0) return fail(gpa, "timeout_ms must be positive", .{});
     var cfg = t.cfg orelse return error.AgentConfigUnavailable;
     if (a.value.fork) {
-        cfg.thinking = t.fork_snapshot.?.thinking;
-        cfg.reasoning_effort = t.fork_snapshot.?.reasoning_effort;
+        cfg.thinking = t.forkSnapshot().?.thinking;
+        cfg.reasoning_effort = t.forkSnapshot().?.reasoning_effort;
     }
     if (a.value.model) |model| cfg.model = model;
     if (a.value.effort) |effort| try cfg.setEffort(effort);
@@ -38,7 +38,7 @@ pub fn agent(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolR
         };
         break :block reserved;
     } else block: {
-        const allocated = try t.progress.addAgent(gpa, t.io, a.value.prompt, t.run_id, a.value.background, a.value.fork);
+        const allocated = try t.progress.addAgent(gpa, t.io, a.value.prompt, t.runId(), a.value.background, a.value.fork);
         try t.agent_sessions.add(gpa, t.io, allocated, null, true);
         t.agent_sessions.setFork(t.io, allocated, a.value.fork);
         break :block allocated;
@@ -46,9 +46,9 @@ pub fn agent(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolR
     var transferred = false;
     errdefer if (!transferred) t.agent_sessions.release(t.io, id);
     if (a.value.@"resume" != null)
-        try t.progress.restart(gpa, t.io, .{ .id = id, .prompt = a.value.prompt, .run = t.run_id, .background = a.value.background, .fork = t.agent_sessions.isFork(t.io, id), .state = .queued });
+        try t.progress.restart(gpa, t.io, .{ .id = id, .prompt = a.value.prompt, .run = t.runId(), .background = a.value.background, .fork = t.agent_sessions.isFork(t.io, id), .state = .queued });
     const fork_input = if (a.value.fork) blk: {
-        var copy = t.fork_snapshot.?;
+        var copy = t.forkSnapshot().?;
         copy.id = id;
         break :blk try std.json.Stringify.valueAlloc(gpa, @import("agent/input.zig").Input{ .prompt = a.value.prompt, .config = cfg, .fork = copy }, .{});
     } else null;
@@ -60,7 +60,7 @@ pub fn agent(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolR
     }
     sandbox.tool_identity = .{ .id = id };
     transferred = true;
-    return execute(t, gpa, args, &t.cancel, id, t.run_id, false, fork_input);
+    return execute(t, gpa, args, t.cancelFlag(), id, t.runId(), false, fork_input);
 }
 
 pub fn execute(t: *Tools, gpa: std.mem.Allocator, args: []const u8, cancel: *const std.atomic.Value(bool), id: []const u8, run_id: usize, background: bool, fork_input: ?[]const u8) !sandbox.ToolResult {
@@ -186,7 +186,10 @@ const Output = struct {
             if (d.kind == .text) try out.text.appendSlice(a, d.text);
         }
         if (obj.get("usage")) |usage| out.usage = try std.json.parseFromValueLeaky(provider.Usage, temp, usage, .{ .ignore_unknown_fields = true });
-        if (obj.get("run_end")) |run| {
+        const completed_run = obj.get("run_end") orelse if (obj.get("background")) |b| (if (b == .object) b.object.get("completion") else null) else null;
+        if (completed_run) |run| {
+            if (run == .null) return;
+
             const r = try std.json.parseFromValueLeaky(struct { changes: []const Change = &.{} }, temp, run, .{ .ignore_unknown_fields = true });
             for (r.changes) |change| {
                 for (out.changes.items) |*known| {
@@ -321,7 +324,10 @@ const Tracker = struct {
             tr.value.tools = used.items;
             tr.value.files = &.{};
         }
-        if (obj.get("run_end")) |run| {
+        const completed_run = obj.get("run_end") orelse if (obj.get("background")) |b| (if (b == .object) b.object.get("completion") else null) else null;
+        if (completed_run) |run| {
+            if (run == .null) return;
+
             const r = try std.json.parseFromValue(struct { changes: []const struct { path: []const u8 } = &.{} }, gpa, run, .{ .ignore_unknown_fields = true });
             defer r.deinit();
             var files: std.ArrayList([]const u8) = .empty;
@@ -396,6 +402,8 @@ test "agent output retains only returned data and terminal text overrides deltas
     try testing.expectEqualStrings("partial", out.text.items);
     try out.observe(testing.allocator, arena.allocator(), "{\"run_end\":{\"changes\":[{\"path\":\"a\",\"added\":2,\"removed\":1,\"created\":true,\"diff\":\"not retained\"}]}}");
     try testing.expectEqualStrings("a", out.changes.items[0].path);
+    try out.observe(testing.allocator, arena.allocator(), "{\"background\":{\"kind\":\"run\",\"completion\":{\"changes\":[{\"path\":\"a\",\"added\":3,\"removed\":0}]}}}");
+    try testing.expectEqual(@as(usize, 5), out.changes.items[0].added);
     try out.observe(testing.allocator, arena.allocator(), "{\"start\":{\"session_id\":\"0123456789abcdef0123456789abcdef\"}}");
     try out.observe(testing.allocator, arena.allocator(), "{\"end\":{\"text\":\"final\",\"usage\":{\"prompt_tokens\":10},\"steps\":2}}");
     try testing.expectEqualStrings("final", out.text.items);

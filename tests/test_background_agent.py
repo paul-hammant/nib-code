@@ -113,7 +113,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         code = "42"
                 if self.server.case in ("limit", "stop"):
                     wait_for(lambda: (self.server.cwd / "worker.started").exists())
-                    code = ("const stopped=await Promise.all([tools.stop({id:'a1'}),tools.stop({id:'a1'})]); "
+                    code = ("const stopped=await Promise.all([tools.stop({id:'a1',reason:'mock requested cancellation'}),tools.stop({id:'a1',reason:'mock requested cancellation'})]); "
                             "const next=await tools.agent({prompt:'child:one'}); "
                             "if(!next.ok)throw new Error('occupancy not released'); stopped"
                             if self.server.case == "stop" else "42")
@@ -419,6 +419,11 @@ class BackgroundTests:
         mock.gates["one"].set()
         events = self.finish(process)
         self.assertEqual(events[-1]["end"]["text"], "complete")
+        self.assertEqual(len(mock.observed("initial")), 3)
+        self.assertEqual([e["notice"] for e in events if "notice" in e], ["early final"])
+        log = self.log(events)
+        self.assertTrue(any(m.get("waiting") for r in log for m in r.get("messages", [])))
+        self.assertFalse(any(c["name"] == "sleep" for r in log for c in r.get("calls", [])))
 
     def test_large_result_message_uses_output_budget(self):
         mock = self.mock("long")

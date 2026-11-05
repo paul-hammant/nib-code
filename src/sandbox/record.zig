@@ -19,6 +19,8 @@ pub const max_result_bytes = 1024 * 1024;
 
 pub const Recorder = struct {
     gpa: std.mem.Allocator,
+    parent: ?*Recorder = null,
+    mutex: std.Io.Mutex = .init,
     io: std.Io,
     path: []const u8,
     enabled: bool,
@@ -27,16 +29,27 @@ pub const Recorder = struct {
     step: usize = 0,
     run: usize = 0,
     start_ms_epoch: i64 = 0,
+    run_output_bytes: usize = 16 * 1024,
     seq: usize = 0,
     incomplete: bool = false,
     buffer: std.ArrayList(u8) = .empty,
-    seen: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
+    seen: std.AutoHashMapUnmanaged([32]u8, usize) = .empty,
     file: ?std.Io.File = null,
     offset: u64 = 0,
     loaded: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, path: []const u8, enabled: bool) Recorder {
         return .{ .gpa = gpa, .io = io, .path = if (enabled) gpa.dupe(u8, path) catch &.{} else &.{}, .enabled = enabled };
+    }
+
+    pub fn fork(r: *Recorder, step: usize, run: usize) !Recorder {
+        r.mutex.lockUncancelable(r.io);
+        defer r.mutex.unlock(r.io);
+        if (r.enabled and !r.loaded) r.restore(step) catch r.fail();
+        var child: Recorder = .{ .gpa = r.gpa, .io = r.io, .path = &.{}, .enabled = r.enabled, .loaded = true, .parent = r };
+        errdefer child.deinit();
+        child.begin(step, run);
+        return child;
     }
 
     pub fn deinit(r: *Recorder) void {
@@ -47,6 +60,15 @@ pub const Recorder = struct {
     }
 
     fn fail(r: *Recorder) void {
+        if (r.parent) |parent| {
+            parent.mutex.lockUncancelable(r.io);
+            defer parent.mutex.unlock(r.io);
+            parent.fail();
+            r.enabled = false;
+            r.active = false;
+            r.warned = true;
+            return;
+        }
         r.enabled = false;
         r.active = false;
         if (!r.warned) {
@@ -64,7 +86,7 @@ pub const Recorder = struct {
 
     pub fn begin(r: *Recorder, step: usize, run: usize) void {
         if (!r.enabled) return;
-        if (r.path.len == 0) return r.fail();
+        if (r.path.len == 0 and r.parent == null) return r.fail();
         if (!r.loaded) r.restore(step) catch return r.fail();
         r.buffer.clearRetainingCapacity();
         r.step = step;
@@ -89,11 +111,12 @@ pub const Recorder = struct {
         var line_buffer: std.Io.Writer.Allocating = .init(r.gpa);
         defer line_buffer.deinit();
         var offset: u64 = 0;
+        var retained: u64 = 0;
         while (true) {
             line_buffer.clearRetainingCapacity();
             _ = reader.interface.streamDelimiter(&line_buffer.writer, '\n') catch |err| switch (err) {
                 error.EndOfStream => {
-                    if (line_buffer.written().len != 0) return error.IncompleteRecording;
+                    if (line_buffer.written().len != 0 and retained == offset) return error.IncompleteRecording;
                     break;
                 },
                 else => return err,
@@ -105,19 +128,24 @@ pub const Recorder = struct {
             const Hash = struct { step: usize, ok: ?bool = null, sha256: ?[]const u8 = null };
             const parsed = try std.json.parseFromSlice(Hash, r.gpa, line_buffer.written(), .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
-            if (parsed.value.step >= step) {
-                try file.setLength(r.io, start);
-                try file.sync(r.io);
-                r.offset = start;
-                break;
+            if (parsed.value.step >= step) continue;
+            if (retained != start) {
+                try file.writePositionalAll(r.io, line_buffer.written(), retained);
+                try file.writePositionalAll(r.io, "\n", retained + line_buffer.written().len);
             }
+            retained += line_buffer.written().len + 1;
             if (parsed.value.ok == true) if (parsed.value.sha256) |hash| {
                 var key: [32]u8 = undefined;
                 if (hash.len != 64) return error.InvalidRecordingHash;
                 _ = try std.fmt.hexToBytes(&key, hash);
-                try r.seen.put(r.gpa, key, {});
+                try r.seen.put(r.gpa, key, parsed.value.step);
             };
         }
+        if (retained != r.offset) {
+            try file.setLength(r.io, retained);
+            try file.sync(r.io);
+        }
+        r.offset = retained;
     }
 
     pub fn evalEnd(r: *Recorder, created: usize) void {
@@ -143,7 +171,16 @@ pub const Recorder = struct {
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
         const hex = std.fmt.bytesToHex(digest, .lower);
-        const duplicate = if (ok) (try r.seen.getOrPut(r.gpa, digest)).found_existing else false;
+        const duplicate = if (ok) blk: {
+            if (r.parent) |parent| {
+                parent.mutex.lockUncancelable(r.io);
+                defer parent.mutex.unlock(r.io);
+                if (parent.seen.get(digest)) |step| if (step <= r.step) break :blk true;
+            }
+            const entry = try r.seen.getOrPut(r.gpa, digest);
+            if (!entry.found_existing) entry.value_ptr.* = r.step;
+            break :blk entry.found_existing;
+        } else false;
         var len = @min(bytes.len, max_result_bytes);
         if (len < bytes.len) while (len > 0 and bytes[len] & 0xc0 == 0x80) {
             len -= 1;
@@ -176,16 +213,27 @@ pub const Recorder = struct {
     }
 
     fn flush(r: *Recorder, end: End) !void {
-        try r.line(.{ .step = r.step, .run = r.run, .meta = .{ .start_ms_epoch = r.start_ms_epoch, .end = @tagName(end), .incomplete = if (r.incomplete) @as(?bool, true) else null } });
-        if (r.file == null) {
-            const file = try std.Io.Dir.cwd().createFile(r.io, r.path, .{ .read = true, .truncate = false, .permissions = .fromMode(0o600), .lock = .exclusive, .lock_nonblocking = true });
-            r.file = file;
+        try r.line(.{ .step = r.step, .run = r.run, .meta = .{ .start_ms_epoch = r.start_ms_epoch, .run_output_bytes = r.run_output_bytes, .end = @tagName(end), .incomplete = if (r.incomplete) @as(?bool, true) else null } });
+        const target = r.parent orelse r;
+        target.mutex.lockUncancelable(r.io);
+        defer target.mutex.unlock(r.io);
+        if (!target.enabled) return error.RecordingDisabled;
+        if (target.file == null) {
+            const file = try std.Io.Dir.cwd().createFile(r.io, target.path, .{ .read = true, .truncate = false, .permissions = .fromMode(0o600), .lock = .exclusive, .lock_nonblocking = true });
+            target.file = file;
             try file.setPermissions(r.io, .fromMode(0o600));
-            r.offset = (try file.stat(r.io)).size;
+            target.offset = (try file.stat(r.io)).size;
         }
-        try r.file.?.writePositionalAll(r.io, r.buffer.items, r.offset);
-        try r.file.?.sync(r.io);
-        r.offset += r.buffer.items.len;
+        try target.file.?.writePositionalAll(r.io, r.buffer.items, target.offset);
+        try target.file.?.sync(r.io);
+        target.offset += r.buffer.items.len;
+        if (r.parent != null) {
+            var keys = r.seen.keyIterator();
+            while (keys.next()) |key| {
+                const entry = try target.seen.getOrPut(r.gpa, key.*);
+                entry.value_ptr.* = if (entry.found_existing) @min(entry.value_ptr.*, r.step) else r.step;
+            }
+        }
     }
 };
 
@@ -429,4 +477,34 @@ test "eval end counts creations including missing highest index and is allocatio
     try t.expect(r.warned and !r.enabled);
     r.evalEnd(2);
     r.finish(.@"error");
+}
+
+test "concurrent Run recorders flush in completion order and restore retains earlier Steps" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(t.allocator, ".zig-cache/tmp/{s}/calls.jsonl", .{tmp.sub_path});
+    defer t.allocator.free(path);
+    var root = Recorder.init(t.allocator, t.io, path, true);
+    defer root.deinit();
+    var first = try root.fork(1, 0);
+    defer first.deinit();
+    var orphan = try root.fork(3, 0);
+    defer orphan.deinit();
+    orphan.capture(0, "read", "{}", true, "same");
+    orphan.finish(.ok);
+    first.capture(0, "read", "{}", true, "same");
+    first.finish(.ok);
+    root.file.?.close(t.io);
+    root.file = null;
+    var restored = Recorder.init(t.allocator, t.io, path, true);
+    defer restored.deinit();
+    var next = try restored.fork(2, 0);
+    defer next.deinit();
+    next.capture(0, "read", "{}", true, "same");
+    next.finish(.ok);
+    const bytes = try tmp.dir.readFileAlloc(t.io, "calls.jsonl", t.allocator, .unlimited);
+    defer t.allocator.free(bytes);
+    try t.expect(std.mem.indexOf(u8, bytes, "\"step\":3") == null);
+    try t.expect(std.mem.indexOf(u8, bytes, "\"step\":1") != null);
+    try t.expect(std.mem.indexOf(u8, bytes, "\"same_as\":") != null);
 }

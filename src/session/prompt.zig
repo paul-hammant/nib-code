@@ -79,7 +79,11 @@ pub const system_template =
     \\Writing scripts:
     \\- Top-level `await` works. Each Step is a full model round trip, usually 10 s or more; one Run can read several files, make all independent edits, then build and test, returning only what you need (such as failures).
 ++ std.fmt.comptimePrint("\n- Tool calls started without awaiting each one (e.g. Promise.all) run concurrently, up to {d} at a time; commands chained inside one bash call (&&, ;) run one after another.\n", .{sandbox.tool_concurrency}) ++
-    \\- The last expression and console.log output share 16 KiB per Run, truncated by console call and final result with markers; filter in JS first; tool results inside JS remain complete.
+    \\- Long Runs auto-background while awaiting tools; scripts and captured output stay intact. Background Run/bash/agent results arrive automatically as messages. Continue useful work meanwhile; never check or wait for them with ps, cat/tail logs, sleep, empty Runs or timeout reruns. Do not read their redirected logs before completion. If no independent work remains, end the model response immediately with a brief text reply and no run/tool call (not even console.log); Session waits locally, delivers the result and continues the Turn. After edit/write changes, rerun the same command/cwd directly: older Run bash stops with {{superseded_by}}, not failure. Do not wait for the stale result.
+    \\- Default to doing the task yourself. Unless the user requests delegation, delegate only independent read-only investigations that can run in parallel with useful parent work and whose results can be discarded. Keep serial edits, builds, tests and reviews in the main loop. Waiting on a foreground agent is serial; background delegation does not help if you must wait for it to proceed.
+    \\- The last expression and console.log output share {s} per Run, truncated by console call and final result with markers; tool results inside JS remain complete. Locate with grep, then read needed line ranges. Large multi-file output can exceed this display budget: batch reads or print only needed snippets.
+    \\- Before full builds/tests, finish implementation, known regression tests, expected results/fixtures and formatting; aim for one full validation. On failure, fix the failures and revalidate. Keep all necessary checks.
+    \\- A run script's syntax or runtime error means the script needs correction. Fix it and continue the task; do not end the Turn just because a script failed.
     \\- run's effort sets reasoning for only the next model request; lower effort answers faster but reasons less.{s}
     \\{s}
     \\When the task is done, answer the user directly without calling the tool.
@@ -93,7 +97,10 @@ pub fn renderSystem(a: std.mem.Allocator, cwd: []const u8, host: *const tools.To
     const lines = try patchLines(a, environ);
     defer a.free(lines);
     const effort_cache = if (host.cfg != null and host.cfg.?.provider == .codex) "\n- " ++ codex_effort_cache_fact else "";
-    return std.fmt.allocPrint(a, system_template, .{ cwd, docs, effort_cache, lines });
+    const bytes = if (host.cfg) |cfg| cfg.limits.run_output_bytes else @import("output.zig").max_bytes;
+    const budget = if (bytes % 1024 == 0) try std.fmt.allocPrint(a, "{d} KiB", .{bytes / 1024}) else try std.fmt.allocPrint(a, "{d} bytes", .{bytes});
+    defer a.free(budget);
+    return std.fmt.allocPrint(a, system_template, .{ cwd, docs, budget, effort_cache, lines });
 }
 
 pub fn turnBudgetText(a: std.mem.Allocator, system: []const u8, max_steps: ?usize, user_text: []const u8) ![]const u8 {
@@ -125,11 +132,27 @@ test "system prompt documents every tool in JavaScript" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "last expression and console.log output share 16 KiB per Run") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "tool results inside JS remain complete") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "failures).\n- Tool calls started without awaiting each one (e.g. Promise.all) run concurrently, up to 8 at a time;") != null);
+    for ([_][]const u8{ "Background Run/bash/agent results arrive automatically as messages", "ps, cat/tail logs, sleep, empty Runs or timeout reruns", "Do not read their redirected logs before completion" }) |text|
+        try std.testing.expect(std.mem.indexOf(u8, prompt, text) != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Session waits locally, delivers the result and continues the Turn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "independent read-only investigations") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Keep serial edits, builds, tests and reviews in the main loop") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "1800000 (30 min)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "resume:a1 after completion; busy:wait, don't retry/replace") != null);
     for (tools.names) |name| {
         const call = try std.fmt.allocPrint(gpa, "async {s}(", .{name});
         defer gpa.free(call);
         try std.testing.expect(std.mem.indexOf(u8, prompt, call) != null);
     }
+}
+
+test "system prompt renders configured Run display budget" {
+    const t = std.testing;
+    var host: tools.Tools = .{ .io = t.io, .home = "/unused", .cfg = .{ .base_url = "", .api_key = "", .model = "m", .limits = .{ .run_output_bytes = 32768 } } };
+    const system = try renderSystem(t.allocator, "/work", &host, null);
+    defer t.allocator.free(system);
+    try t.expect(std.mem.indexOf(u8, system, "share 32 KiB per Run") != null);
+    try t.expect(std.mem.indexOf(u8, system, "known regression tests, expected results/fixtures and formatting") != null);
 }
 
 test "only Codex system prompts include effort cache facts, independent of patches" {

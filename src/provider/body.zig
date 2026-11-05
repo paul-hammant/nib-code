@@ -26,10 +26,11 @@ pub const Reader = struct {
 
     fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         const r: *Reader = @fieldParentPtr("reader", reader);
+        r.monitor.check() catch return error.ReadFailed;
         const n = try r.input.stream(writer, limit);
         if (n > 0) {
             r.monitor.last = .now(r.monitor.io, .awake);
-            if (r.sink.timing) |model| model.received();
+            if (r.sink.timing) |model| model.received(n);
             r.sink.received() catch |err| {
                 r.monitor.read_failure = err;
                 return error.ReadFailed;

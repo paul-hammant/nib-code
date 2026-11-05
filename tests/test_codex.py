@@ -27,7 +27,7 @@ def replay(path):
     for line in path.read_text().splitlines():
         record = json.loads(line)
         records.append(record)
-        if not record.get("repair") and not record.get("diagnostic"):
+        if not record.get("repair") and not record.get("diagnostic") and not record.get("bash"):
             history[record["from"]:] = record["messages"]
     return history, records
 
@@ -60,7 +60,7 @@ def assert_timing(records, *, final_only=False):
     assert code["first_ms"] - run_step["first_data_ms"] >= 80, run_step
     progress = code["progress"]
     assert progress and progress[0][0] == code["first_ms"] and progress[-1][0] == code["last_ms"], code
-    assert progress[-1][1] == len(arguments.encode("utf-8")), code
+    assert progress[-1][1] == len(json.loads(arguments)["code"].encode("utf-8")), code
     assert all(a[0] <= b[0] and a[1] < b[1] for a, b in zip(progress, progress[1:])), code
     if final_only:
         assert code["first_ms"] == code["last_ms"] and len(progress) == 1, code
@@ -90,7 +90,7 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
         port = sock.getsockname()[1]
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("NIB_", "DEEPSEEK_", "OPENAI_", "CODEX_"))}
-    env.update(NIB_PROVIDER="codex", NIB_BASE_URL=f"http://127.0.0.1:{port}",
+    env.update(NIB_PROVIDER="codex", NIB_CODEX_TRANSPORT="sse", NIB_BASE_URL=f"http://127.0.0.1:{port}",
                CODEX_HOME=str(auth_path.parent), HOME=str(tmp), NIB_HOME=str(tmp / "nib"), XDG_DATA_HOME=str(tmp / "data"),
                XDG_CONFIG_HOME=str(tmp / "config"))
     cwd = tmp / "project"
@@ -130,7 +130,7 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
             assert ("end" if ok else "error") in events[-1], events
             return events
 
-        summaries = ask("plain text", "--effort", "high", overrides={"NIB_THINKING": "off"})
+        summaries = ask("plain text", "--effort", "high", overrides={"NIB_THINKING": "off", "NIB_REASONING_SUMMARY": "auto"})
         assert requests()[-1]["body"]["reasoning"] == {"effort": "high", "summary": "auto"}
         reasoning_deltas = [e["delta"]["text"] for e in summaries if e.get("delta", {}).get("kind") == "reasoning"]
         assert reasoning_deltas == ["Mock ", "reaso", "ning."] * 2, summaries
@@ -164,8 +164,10 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
         assert "reasoning.encrypted_content" in body["include"]
         assert "messages" not in body
         tool = body["tools"][0]
-        assert tool["type"] == "function" and tool["name"] == "run" and tool["strict"] is False
-        assert "description" in tool and "parameters" in tool and "function" not in tool
+        assert tool["type"] == "custom" and tool["name"] == "run"
+        assert tool["format"]["type"] == "grammar" and tool["format"]["syntax"] == "lark"
+        assert "SOURCE: /[\\s\\S]+/" in tool["format"]["definition"]
+        assert "parameters" not in tool and "function" not in tool
         session = plain[0]["start"]["session_id"]
         assert_cache_key([request], session)
         history, records = replay(tmp / f"nib/sessions/{session}.jsonl")
@@ -174,15 +176,17 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
         assert records[0]["system_sha"] == hashlib.sha256(base.encode()).hexdigest()[:12]
         reasoning = history[-1]["reasoning"]
         assert reasoning["provider"] == "codex"
-        items = json.loads(reasoning["data"])
+        items = [item for item in json.loads(reasoning["data"]) if item["type"] == "reasoning"]
         assert len(items) == 2 and all(item["encrypted_content"].startswith("fake-encrypted-") for item in items)
-        assert items[0]["summary"] == [{"type": "summary_text", "text": "Mock reasoning."}]
+        assert items[0]["summary"] == []
+        assert not any(e.get("delta", {}).get("kind") == "reasoning" for e in plain)
+        assert requests()[-1]["body"]["reasoning"] == {"effort": "high"}
         ask("plain text", "--resume", session)
         assert_cache_key(requests()[-1:], session)
-        assert all(item in requests()[-1]["body"]["input"] for item in items)
+        assert all(item in requests()[-1]["body"]["input"] for item in items), (items, requests()[-1]["body"]["input"])
         assert next(item for item in requests()[-1]["body"]["input"] if item.get("role") == "assistant")["phase"] == "final_answer"
         disabled = ask("plain text", overrides={"NIB_MODEL": "gpt-6.1-terra", "NIB_THINKING": "off"})
-        assert requests()[-1]["body"]["reasoning"] == {"effort": "none", "summary": "auto"}
+        assert requests()[-1]["body"]["reasoning"] == {"effort": "none"}
         assert not any(e.get("delta", {}).get("kind") == "reasoning" for e in disabled)
 
         before = len(requests())
@@ -212,9 +216,9 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
         assert tool_id != session
         assert_cache_key(steps, tool_id)
         second_input = steps[1]["body"]["input"]
-        call = next(item for item in second_input if item.get("type") == "function_call")
-        result = next(item for item in second_input if item.get("type") == "function_call_output")
-        assert result["call_id"] == call["call_id"] and json.loads(call["arguments"])["code"]
+        call = next(item for item in second_input if item.get("type") == "custom_tool_call")
+        result = next(item for item in second_input if item.get("type") == "custom_tool_call_output")
+        assert result["call_id"] == call["call_id"] and call["input"]
         assert any(item.get("encrypted_content") for item in second_input)
         print("Codex stream, request headers/schema, tools, encrypted reasoning resume and cache usage passed")
 
@@ -225,6 +229,43 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
             _, timed_records = replay(timing_home / "sessions" / f"{timed_id}.jsonl")
             assert_timing(timed_records, final_only=prompt == "timing final only")
         print("Codex timing E2E passed: streamed/final-only UTF-8 arguments, model latency and per-tool Run timing")
+        for prompt in ("syntax recovery", "runtime recovery"):
+            recovered = ask(prompt)
+            recovered_id = recovered[0]["start"]["session_id"]
+            _, recovery_records = replay(tmp / f"nib/sessions/{recovered_id}.jsonl")
+            results = [r for record in recovery_records for r in record.get("run_results", [])]
+            assert [r["ok"] for r in results] == [False, True], results
+            failed_output = next(m["content"] for r in recovery_records for m in r["messages"] if m["role"] == "tool")
+            assert "Correct the script and continue the task" in failed_output, failed_output
+            if prompt == "syntax recovery":
+                assert "source line 1:" in failed_output and "<run>:1:" in failed_output, failed_output
+            assert (cwd / "recovered.txt").read_text() == "fixed"
+            replayed = subprocess.run([str(BIN), "replay", recovered_id, "--all", "--json"],
+                                     cwd=cwd, env=env, text=True, capture_output=True, timeout=20)
+            assert replayed.returncode == 0, (replayed.stdout, replayed.stderr)
+            assert json.loads(replayed.stdout)["matched"] == 2, replayed.stdout
+
+        before = len(requests())
+        legacy = ask("use tools", overrides={"NIB_CODEX_RUN_TOOL": "function"})
+        legacy_id = legacy[0]["start"]["session_id"]
+        legacy_body = requests()[before]["body"]
+        assert legacy_body["tools"][0]["type"] == "function" and legacy_body["tools"][0]["strict"] is False
+        legacy_history, _ = replay(tmp / f"nib/sessions/{legacy_id}.jsonl")
+        old_arguments = next(c["function"]["arguments"] for m in legacy_history for c in m.get("tool_calls", []))
+        before = len(requests())
+        ask("use tools", "--resume", legacy_id)
+        continued = requests()[before:]
+        assert continued[0]["body"]["tools"][0]["type"] == "custom"
+        old_call = next(i for i in continued[0]["body"]["input"] if i.get("type") == "function_call")
+        assert old_call["arguments"] == old_arguments
+        assert any(i.get("type") == "function_call_output" and i["call_id"] == old_call["call_id"] for i in continued[0]["body"]["input"])
+        assert any(i.get("type") == "custom_tool_call_output" for i in continued[-1]["body"]["input"])
+        before = len(requests())
+        ask("use tools", "--resume", legacy_id, overrides={"NIB_CODEX_RUN_TOOL": "function"})
+        assert requests()[before]["body"]["tools"][0]["type"] == "function"
+        assert any(i.get("type") == "custom_tool_call" for i in requests()[before]["body"]["input"])
+        print("Codex custom recovery/replay and legacy function resume/fallback passed")
+
 
         before = len(requests())
         interrupted = subprocess.Popen([str(BIN), "ask", "--json", "interrupt stalled"],

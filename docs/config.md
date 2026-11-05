@@ -25,6 +25,9 @@ effort = "high"
 model = "gpt-6.1-sol"
 base_url = "https://chatgpt.com/backend-api"
 context_window = 500000
+reasoning_summary = "off" # auto 开启可读推理摘要
+run_tool = "custom" # function 回退到 JSON code/effort 工具
+transport = "websocket" # 握手/协议失败后本 Session 降级 SSE；sse 强制 HTTP
 
 [chat_completions]
 model = "deepseek-flash"
@@ -38,13 +41,17 @@ llm_input_kib = 256
 agent_concurrency = 4
 # max_steps = 50  # 可选；省略时不设 Step 上限
 stream_idle_timeout_s = 300
+stream_content_timeout_s = 120
+request_timeout_s = 300
+run_background_after_ms = 10000
+run_output_bytes = 16384
 ```
 
 只使用当前 provider 的段落；切换 provider 不需要改写另一段。环境和配置文件均未指定时，默认 provider 为 `codex`，默认模型 `gpt-6.1-sol`、窗口 500000 tokens；使用本机 Codex 登录，无需 API key。Codex 窗口随模型变化，未知模型需要显式提供 `context_window` 或 `NIB_CONTEXT_WINDOW`。模型、恢复和凭证边界见 [codex.md](codex.md) 与 [ADR 0011](adr/0011-provider-wire-protocols.md)。
 
 DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 `DEEPSEEK_API_KEY`（或 `NIB_API_KEY`），默认模型 `deepseek-flash`、窗口 1000000 tokens；其他默认值见上例。
 
-这是无额外依赖的 TOML 子集：支持空行、`#` 注释、单行双引号字符串（支持 `\"`、`\\`、`\n` 转义）、十进制整数（可带符号、下划线分组）和 true/false 布尔值；当前配置键只使用字符串和正整数，布尔值会报告类型错误。仅接受顶层 `provider`、`effort`，`[codex]` / `[chat_completions]` 下的 `model`、`base_url`、`context_window`，以及下述 `[limits]` 键。不支持数组、嵌套表、多行字符串等完整 TOML 语法；未知键、重复键/段落和格式错误会报配置文件路径与行号，不静默忽略。
+这是无额外依赖的 TOML 子集：支持空行、`#` 注释、单行双引号字符串（支持 `\"`、`\\`、`\n` 转义）、十进制整数（可带符号、下划线分组）和 true/false 布尔值；当前配置键只使用字符串和正整数，布尔值会报告类型错误。仅接受顶层 `provider`、`effort`，`[codex]` / `[chat_completions]` 下的 `model`、`base_url`、`context_window`，`[codex]` 还接受 `transport = "sse"|"websocket"`、`reasoning_summary = "off"|"auto"`、`run_tool = "custom"|"function"`，以及下述 `[limits]` 键。不支持数组、嵌套表、多行字符串等完整 TOML 语法；未知键、重复键/段落和格式错误会报配置文件路径与行号，不静默忽略。
 
 ## [limits]
 
@@ -52,18 +59,26 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 
 | 键 | 含义 | 默认值 | 范围 |
 | --- | --- | --- | --- |
+| `run_output_bytes` | 每个 Run／后台结果消息的模型展示字节预算，不改变 JS 内工具数据 | 16384 | 16384–16777216 |
 | `llm_concurrency` | `tools.llm` 每进程同时进行的请求数，超出排队 | 4 | 1–64 |
 | `llm_calls_per_run` | 每个 Run 的 `tools.llm` 调用上限，超出 reject | 100 | 1–10000 |
 | `llm_input_kib` | 单次 prompt + 序列化 input 的 UTF-8 字节上限（KiB），超出 reject，不截断 | 256 | 1–65536 |
 | `agent_concurrency` | 每进程同时运行的子 agent 数，超出排队 | 4 | 1–64 |
 | `max_steps` | 每个 Turn 的 Step 上限，耗尽时返回 `TooManySteps`；省略时不设上限（内部为 `null`） | 无上限 | 1–100000 |
+| `run_background_after_ms` | Run 超过此墙钟毫秒数且仍等待工具时自动转后台；只作用于模型发起的 Run | 10000 | 1–3600000 |
+| `stream_content_timeout_s` | 连续没有非空 reasoning、文本或工具参数增量的秒数；心跳、元数据不重置 | 120 | 1–3600 |
+| `request_timeout_s` | 单次模型尝试的总秒数；持续推理也不延长，取消并 join 后按原策略重试 | 300 | 1–3600 |
 | `stream_idle_timeout_s` | 流式模型响应连续无字节到达的超时秒数（含首次数据前等待；心跳、元数据也重置计时），超时按连接中断沿用重试策略 | 300 | 1–3600 |
 
-`stream_idle_timeout_s` 同时约束主模型请求、`tools.llm` 和压缩摘要请求。空闲超时复用连接中断的重试上限和退避；Chat Completions 已输出可见增量时仍不自动重放，缓冲结果的 `tools.llm` 与摘要可以安全重试。
+自动转后台阈值沿用 `[limits]` 配置和子会话继承，不增加环境变量或 CLI 开关。设成较大值可用于前台对照实验。`nib js`、TUI `/js` 和离线 replay 保持同步执行；运行中的 JS 片段不会因墙钟阈值被切断。语义见 [run-output.md](run-output.md#长-run-自动转后台)。
 
-这些限额没有环境变量或 CLI 覆盖；随有效配置经 stdin 传给子会话，子会话不读取配置文件。`max_steps` 未设置时子会话同样为 `null`，显式设置时继承该上限。sandbox 内全部工具最多 8 并发是线程调度实现，不由此小节控制。
+三个截止时间同时约束主模型请求、`tools.llm` 和压缩摘要请求，适用于 WS 和 SSE，每次重试重新计时。总请求截止时间覆盖连接、发送、读头及读取响应；另外两个截止时间在接收流时检查。空闲超时复用连接中断的重试上限和退避；Chat Completions 已输出可见增量时仍不自动重放，缓冲结果的 `tools.llm` 与摘要可以安全重试。
 
-显式设置 `max_steps` 时，新会话的 system prompt 会写明每个 Turn 的上限；剩余不多于 3 个 Step 时，每个 Run 输出末尾追加剩余步数（不计入 16 KiB 输出预算）。耗尽后不再请求模型；正在运行的后台 agent/bash 会先完成，结果按现有格式写进历史和日志，下一 Turn 可见。Turn 仍以 `TooManySteps` / `stopped after N steps` 结束；若等待了任务，提示会列出任务类型与 ID。等待期间 Esc 仍会立即取消 Turn 并停止后台任务。未设置时不添加这些提示，也不限制 Step 数。恢复会话保留原始 system；若当前配置与其中记录的上限不同，会在每个 Turn 的用户输入前附加当前预算事实，避免沿用过期上限。
+字节活动不能区分有效进展与心跳，持续摘要也不能证明请求会结束，因此分别限制字节空闲、内容空闲和单次请求总时长。120/300 秒的内容/请求默认值给 2026-11-05 已观察到的最长首代码等待和单次成功请求各留约两倍余量；合法的长静默推理或超长请求仍可能被中断，可按实际任务调高。300 秒总上限是 nib 的选择，不是 Codex CLI 默认值：参考版本 [rust-v0.166.0](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/codex-client/src/provider.rs#L86) 未设置 stream request 总 timeout。重试会重新计时，最多 5 次尝试加退避，整个 Step 仍可能等待约 25 分钟。逐次诊断见 [日志](session-log.md#step-传输字段)。
+
+`run_output_bytes` 可由 `NIB_RUN_OUTPUT_BYTES` 覆盖；其余限额没有环境变量或 CLI 覆盖；随有效配置经 stdin 传给子会话，子会话不读取配置文件。`max_steps` 未设置时子会话同样为 `null`，显式设置时继承该上限。sandbox 内全部工具最多 8 并发是线程调度实现，不由此小节控制。
+
+显式设置 `max_steps` 时，新会话的 system prompt 会写明每个 Turn 的上限；剩余不多于 3 个 Step 时，每个 Run 输出末尾追加剩余步数（不计入配置的 Run 展示预算）。耗尽后不再请求模型；正在运行的后台 agent/bash 会先完成，结果按现有格式写进历史和日志，下一 Turn 可见。Turn 仍以 `TooManySteps` / `stopped after N steps` 结束；若等待了任务，提示会列出任务类型与 ID。等待期间 Esc 仍会立即取消 Turn 并停止后台任务。未设置时不添加这些提示，也不限制 Step 数。恢复会话保留原始 system；若当前配置与其中记录的上限不同，会在每个 Turn 的用户输入前附加当前预算事实，避免沿用过期上限。
 
 配置文件不存秘密，也不接受 API key、token、密码或凭证字段。Chat Completions 的 key 使用 `NIB_API_KEY` / `DEEPSEEK_API_KEY`；Codex 使用现有登录文件。不要把秘密放进 URL。
 
@@ -72,7 +87,7 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 从高到低：
 
 1. CLI `--effort <level>`（TUI 启动和 `ask` 都支持）。
-2. 环境变量：`NIB_PROVIDER`、`NIB_MODEL`、`NIB_BASE_URL`、`NIB_CONTEXT_WINDOW`、`NIB_THINKING`、`NIB_REASONING_EFFORT`。
+2. 环境变量：`NIB_PROVIDER`、`NIB_MODEL`、`NIB_BASE_URL`、`NIB_CONTEXT_WINDOW`、`NIB_THINKING`、`NIB_REASONING_EFFORT`、`NIB_CODEX_TRANSPORT`、`NIB_CODEX_RUN_TOOL`、`NIB_REASONING_SUMMARY`、`NIB_RUN_OUTPUT_BYTES`。
 3. `$NIB_HOME/config.toml`。
 4. 内置默认值。
 
@@ -88,6 +103,10 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 | `NIB_HOME` | 用户目录，默认 `~/.nib`；不改变 Codex 凭证位置 |
 | `NIB_PROVIDER` | `codex` / `chat_completions` |
 | `NIB_BASE_URL` | 当前 provider 的服务地址 |
+| `NIB_CODEX_TRANSPORT` | Codex 传输：`websocket`（默认）或 `sse`；覆盖 `[codex].transport`，握手/协议失败后本 Session 降级 SSE，见 [Codex 传输](codex.md#responses-websocket-传输) |
+| `NIB_CODEX_RUN_TOOL` | `custom`（默认，直接发送 JS）或 `function`（JSON code/effort）；覆盖 `[codex].run_tool`，不改写既有历史类型，Chat Completions 始终使用 function |
+| `NIB_REASONING_SUMMARY` | `off`（默认，不发送 summary）或 `auto`；覆盖 `[codex].reasoning_summary`，不改变 effort 和加密 reasoning 回传 |
+| `NIB_RUN_OUTPUT_BYTES` | 模型展示预算字节数，16384–16777216；覆盖 `[limits].run_output_bytes`，默认 16384；不改变 JS 数据与 console 捕获上限 |
 | `NIB_MODEL` | 当前 provider 的模型 |
 | `NIB_CONTEXT_WINDOW` | 上下文窗口 tokens，DeepSeek 默认 1000000 |
 | `NIB_THINKING` | `on` / `off`，不设时用服务端默认（若无其他推理配置） |
@@ -105,7 +124,7 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 
 ## 逐 Step effort 调度
 
-主模型可调用 `run({code: "...", effort: "low"})`，可选值为 `low|medium|high|default`。声明针对看到本次 Run 结果之后的**下一次主模型 Step 请求**，仅生效一次；后续未再次声明则恢复用户设置。同一 Step 多个 Run 取最后一个声明，未声明的 Run 不覆盖它。`default` 显式恢复用户设置。机械性的下一步适合 low，重新设计或疑难排查不宜降档。
+Codex 默认 custom `run` 直接接收 JS；可选首行 `// @run: {"effort":"low"}` 声明 effort，下一行开始正文。该行保留在源码和日志中；只识别第一行，格式或档位无效时返回可修正的 Run 错误。Chat Completions 或 Codex `run_tool = "function"` 仍调用 `run({code: "...", effort: "low"})`。可选值为 `low|medium|high|default`。声明针对看到本次 Run 结果之后的**下一次主模型 Step 请求**，仅生效一次；后续未再次声明则恢复用户设置。同一 Step 多个 Run 取最后一个声明，未声明的 Run 不覆盖它。`default` 显式恢复用户设置。机械性的下一步适合 low，重新设计或疑难排查不宜降档。
 
 护栏由 Session 统一决定：
 

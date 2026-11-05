@@ -664,7 +664,7 @@ class ToolData:
 class AgentStats:
     def __init__(self):
         self.counts = {kind: dict(foreground_calls=0, background_calls=0, steps=[])
-                       for kind in ('agent', 'bash')}
+                       for kind in ('agent', 'bash', 'run')}
 
     def add(self, record, completed_steps, include, pending, seen, is_step=False, allow_agent=True):
         if not include:
@@ -838,6 +838,9 @@ def records(path):
                 if isinstance(diagnostic, dict) and isinstance(diagnostic.get('message'), str):
                     yield record
                     continue
+                if isinstance(record.get('bash'), dict) and record['bash'].get('state') in ('started', 'finished', 'superseded'):
+                    yield record
+                    continue
                 event = record.get('background') or record.get('background_agent')
                 if (isinstance(event, dict) and isinstance(event.get('id'), str)
                         and event.get('state') in ('started', 'finished', 'lost')):
@@ -855,8 +858,23 @@ def records(path):
         return
 
 
-def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
-    if group_by not in (None, 'version', 'system', 'patches'):
+def transport_group(record):
+    value = record.get('transport')
+    return value if value in ('sse', 'websocket') else 'unknown'
+
+
+def step_group(record, field):
+    if field == 'transport':
+        return transport_group(record)
+    if field == 'full_reason':
+        value = record.get('full_reason')
+        return value if isinstance(value, str) and value else 'incremental' if record.get('incremental') is True else 'unknown'
+    value = record.get('incremental')
+    return str(value).lower() if isinstance(value, bool) else 'unknown'
+
+
+def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _step_filter=None):
+    if group_by not in (None, 'version', 'system', 'patches', 'transport', 'incremental', 'full_reason'):
         raise ValueError('invalid group_by')
     paths = list(paths)
     if _systems is None:
@@ -882,6 +900,7 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
     tool_counts, bash_counts = Counter(), Counter()
     timing = Timing()
     tool_data = ToolData()
+    bash_superseded = 0
     agents = AgentStats()
     child_costs = ChildCosts()
     errors = {name: {'count': 0, 'examples': []} for name in ERRORS}
@@ -908,12 +927,13 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
         if cwd is not None and (not isinstance(header.get('cwd'), str) or
                                 Path(header['cwd']).expanduser().resolve() != cwd):
             continue
-        if group_by is not None:
+        if group_by is not None and group_by not in ('transport', 'incremental', 'full_reason'):
             group_paths.setdefault(header_group(header, group_by), []).append(path)
 
         def selected(record):
             at = record.get('at')
-            return cutoff_ms is None or (at if number(at) else mtime_ms) >= cutoff_ms
+            return ((cutoff_ms is None or (at if number(at) else mtime_ms) >= cutoff_ms)
+                    and (_step_filter is None or step_group(record, _step_filter[0]) == _step_filter[1]))
 
         session_selected = selected(header)
         length = header['from'] + len(header['messages'])
@@ -942,6 +962,13 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
                 current['previous_effort'] = None
                 current['mechanical_previous'] = None
             has_at = number(record.get('at'))
+            if isinstance(record.get('bash'), dict):
+                if include and record['bash'].get('state') == 'superseded':
+                    bash_superseded += 1
+                if include:
+                    session_selected = True
+                    time_filter['selected_records_with_at' if has_at else 'selected_records_using_mtime'] += 1
+                continue
             diagnostic = isinstance(record.get('diagnostic'), dict)
             lifecycle = isinstance(record.get('background') or record.get('background_agent'), dict)
             if not diagnostic and not lifecycle:
@@ -1007,11 +1034,13 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
                             child_first_request_cache_hit_rate = cache / child_usage['prompt_tokens']
             if current is not None:
                 current['full_steps'] += 1
-                current['complete'] = any(m['role'] == 'assistant' and not m.get('tool_calls') for m in messages)
+                current['complete'] = any(m['role'] == 'assistant' and not m.get('tool_calls') and not m.get('waiting') for m in messages)
             if not include:
                 if current is not None:
                     current['previous'] = None
                 continue
+            if group_by in ('transport', 'incremental', 'full_reason'):
+                group_paths.setdefault(step_group(record, group_by), set()).add(path)
             totals['steps'] += 1
             if not has_at:
                 time_filter['selected_steps_using_mtime'] += 1
@@ -1133,10 +1162,11 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
         return dict(count=count, pairs=pairs, ratio=count / pairs if pairs else None)
 
     report = {'overall': totals, 'usage': usage, 'time_filter': time_filter, 'tools': dict(sorted(tool_counts.items())),
+            'bash_superseded': bash_superseded,
             'bash_top10': [{'command': k, 'count': v} for k, v in sorted(bash_counts.items(), key=lambda p: (-p[1], p[0]))[:10]],
             'errors': errors, 'slowest_steps': slowest, 'timing': timing.report(),
             'tool_data': tool_data.report(), 'child_costs': child_costs.report(),
-            'agents': agents.report(), 'bash_calls': agents.report('bash'),
+            'agents': agents.report(), 'bash_calls': agents.report('bash'), 'background_runs': agents.report('run'),
             'round_trips': dict(steps_per_turn=distribution(turn_steps),
                                write_to_validation=pair_summary(write_validation_pairs, adjacent_pairs),
                                mechanical_followups=mechanical,
@@ -1153,10 +1183,11 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
         report['group_by'] = group_by
         report['groups'] = {}
         for key, members in sorted(group_paths.items()):
-            group = summarize(members, since, cwd, _systems=_systems)
+            group = summarize(members, since, cwd, _systems=_systems,
+                              _step_filter=(group_by, key) if group_by in ('transport', 'incremental', 'full_reason') else None)
             if group['overall']['sessions']:
                 report['groups'][key] = group
-        report['notes'][0] += (' --group-by 按 header nib_version/system_sha/patches_off 分组，'
+        report['notes'][0] += (' --group-by transport/incremental/full_reason 按完整 Step 的实际线路/续接状态分组，同会话可在多个组出现；缺字段归 unknown；按记录筛选，不把混合线路 Turn 当作完整墙钟样本。其他分组 按 header nib_version/system_sha/patches_off 分组，'
             '缺失/无效值为 unknown；patches_off 缺失但 nib_version 或 system_sha 有效时为 none，'
             '显式空补丁集也为 none；补丁数组按去重排序的集合分组，每组重新汇总完整核心报告。')
     return report
@@ -1177,11 +1208,12 @@ def text_report(report):
              f"每 Turn 平均 {fmt(t['avg_steps_per_turn'])} Step；平均耗时 {fmt(t['avg_turn_ms'], ' ms')}（完整计时 {t['timed_turns']}/{t['turns']} Turn，{t['steps_with_ms']} Step）",
              '工具（静态调用点）：' + (', '.join(f'{k} {v}' for k, v in report['tools'].items()) or '无'),
              'bash 命令 Top 10：' + (', '.join(f"{v['command']} {v['count']}" for v in report['bash_top10']) or '无')]
-    for name, key in (('Agent', 'agents'), ('Bash', 'bash_calls')):
+    lines.append(f"Bash 被取代次数：{report['bash_superseded']}")
+    for name, key in (('Agent', 'agents'), ('Bash', 'bash_calls'), ('Run', 'background_runs')):
         calls = report[key]
         overlap = calls['background_steps']
         lines.extend([f"{name} 调用：前台 {calls['foreground_calls']} / 后台 {calls['background_calls']}",
-                      f"{'' if key == 'agents' else 'Bash '}后台期间主模型 Step: samples={overlap['samples']} median={fmt(overlap['median'])} p90={fmt(overlap['p90'])}"])
+                      f"{'' if key == 'agents' else name + ' '}后台期间主模型 Step: samples={overlap['samples']} median={fmt(overlap['median'])} p90={fmt(overlap['p90'])}"])
     lines.extend('  ' + note for note in report['agents']['notes'])
     costs = report['child_costs']
     lines.append('子会话已记录成本（每子会话；非费用）：')
@@ -1282,7 +1314,7 @@ def main():
     parser.add_argument('paths', nargs='*', type=Path, help='session JSONL files or directories')
     parser.add_argument('--since', type=date.fromisoformat, metavar='YYYY-MM-DD', help='record date, inclusive, local time; legacy records fall back to file modification time')
     parser.add_argument('--cwd', type=Path, help='exact session working directory')
-    parser.add_argument('--group-by', choices=('version', 'system', 'patches'), help='group core reports by session header metadata')
+    parser.add_argument('--group-by', choices=('version', 'system', 'patches', 'transport', 'incremental', 'full_reason'), help='group by session metadata, actual Step transport, incremental state or full-request reason')
     parser.add_argument('--json', action='store_true', help='emit JSON instead of text')
     args = parser.parse_args()
     inputs = args.paths or [Path(os.environ.get('NIB_HOME', '~/.nib')).expanduser() / 'sessions']

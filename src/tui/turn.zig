@@ -98,7 +98,7 @@ pub const Turn = struct {
             .background => |b| blk: {
                 const id = try gpa.dupe(u8, b.id);
                 errdefer gpa.free(id);
-                break :blk .{ .background = .{ .id = id, .kind = b.kind, .state = b.state, .ok = b.ok, .result = if (b.result) |result| try gpa.dupe(u8, result) else null } };
+                break :blk .{ .background = .{ .id = id, .kind = b.kind, .state = b.state, .ok = b.ok, .result = if (b.completion) |value| try @import("transcript.zig").runResultText(gpa, value.output, value.changes) else if (b.result) |result| try gpa.dupe(u8, result) else null } };
             },
             .turn_end => |summary| .{ .turn_end = summary },
         };

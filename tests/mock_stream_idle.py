@@ -93,6 +93,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.stream(prompt, kind, attempt)
 
     def stream(self, prompt, kind, attempt):
+        if prompt == "content-progress":
+            for _ in range(7):
+                self.chunk(self.frame("response.reasoning_summary_text.delta", delta="thinking") if self.server.provider == "codex"
+                           else self.frame(choices=[{"delta": {"reasoning_content": "thinking"}}]))
+                self.server.stopping.wait(.2)
+        if prompt in ("content-heartbeats", "content-metadata", "request-progress") and attempt == 1:
+            for _ in range(12):
+                if prompt == "content-heartbeats":
+                    data = b": heartbeat\n\n"
+                elif prompt == "content-metadata":
+                    data = self.frame("response.metadata") if self.server.provider == "codex" else self.frame(choices=[])
+                else:
+                    data = (self.frame("response.reasoning_summary_text.delta", delta="thinking") if self.server.provider == "codex"
+                            else self.frame(choices=[{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "thinking"}}]}}]))
+                self.chunk(data)
+                self.server.stopping.wait(.2)
+            return
         if kind == "main" and prompt == "agent-inherit":
             self.server.config_path.write_text("[limits]\nstream_idle_timeout_s = 0\n")
             self.complete("", code='await tools.agent({prompt: "idle-agent-child"})')

@@ -1,6 +1,10 @@
 # tools.llm 与 tools.agent：调用与实现
 
-少量文件直接 read 最便宜，不调用模型。大量数据的单步判断、分类、抽取适合 llm，通常几秒；批量简单判断优先低成本模型和低 effort，强模型留给少量难题。agent 用于独立多步工作：几十行以上改动的提交前只读审查、先约定接口并划分负责文件的并行实现、需要大量读代码的调查；默认新建子会话从零读代码，fork 继承当前父上下文，接续保留子会话已有历史，不代替 read 或 llm。延迟与成本只是量级提示，依任务、模型和 effort 变化，不是保证。
+少量文件直接 read 最便宜，不调用模型。大量数据的单步判断、分类、抽取适合 llm，通常几秒；批量简单判断优先低成本模型和低 effort，强模型留给少量难题。默认由主循环完成修改、构建、测试和串行审查。除非用户要求委派，agent 只用于能与主循环有用工作并行、结果可丢弃的独立只读调查。前台等子 agent 就是串行；后台启动后主循环无法继续，同样增加关键路径延迟。默认新建子会话从零读代码，fork 继承当前父上下文，接续保留子会话已有历史，不代替 read 或 llm。接口仍允许用户要求的实现委派，不加运行时禁令，也不改 model/effort 的继承默认值。
+
+2026-11-04 的本地 `nib-bench/runs/smoke-20261104` 父日志说明了这个区别：timers 在 Step 1 派只读调查、Step 3 派文档修改，随后三次接续仍忙的 a1 都返回 AgentBusy，Step 11 又派 a3 实现核心调度，Step 17 才成功接续 a1 做审查。7 次调用并非 7 个新子会话，而是 3 次新建、1 次有效接续和 3 次 busy；主循环之后大量 sleep 等实现和测试。console-tail 在 Step 1 派核心捕获实现，Step 4 想询问尚未确定的 API、Step 29 想催结束，后两次接续都 busy；只有一个新子会话，父模型反复 sleep、查 diff 和编译日志。两者的实现均在关键路径上。原提示描述了新建/fork 的成本，却没有给出何时不委派的决策标准；全局 AGENTS.md 已有限制，因此只能从调用与等待记录推断行为，不能断言模型的内部动机。接续是完成后的新 Turn，不能给运行中的 agent 发消息；busy 后等待结果，不重复接续或派替代实现。
+
+后台 bash/agent/Run 完成后自动投递结果。等这些结果不要调用 tools.sleep 或轮询文件；没有独立工作就给极短、无工具调用的回复，Session 在本地等 inbox 后继续 Turn。detached 服务的就绪探测可使用有界 sleep，服务启动与后台任务完成不是同一条件。sleep 不根据“存在后台任务”拒绝或改变行为，以免破坏这类合法等待及录制/重放语义。
 
 成本参考来自本次统计时本机 `~/.nib/sessions` 的全部 105 个子会话（0.2.0 时期，以 `gpt-6.1-sol` / `high` 为主，含少量模型/effort 覆盖；旧日志部分元数据缺失），不再只用 [#37](https://github.com/yyydddkkk/nib-code/issues/37) 中的 6 个样本。统计命令：
 
@@ -73,11 +77,11 @@ timeout_ms 可省略，默认 30 分钟，不计排队时间。model/effort 省�
 
 后台任务与前台调用共用 agent 并发限额、模型/effort 配置、超时和取消路径；同一父会话的各 Run 不会因各自沙箱退出而取消后台任务。父 Turn 取消或失败、Session 退出时停止并清理未完成任务，不留下脱离父会话的子进程；恢复会话保留已写入日志的结果，未完成任务不会重启，而是插入 `[background agent <id> lost: process ended]`。后台 agent 的启动/结果插入通过 `background` 事件报告，见 [ask-json.md](ask-json.md)；结果消息的日志来源标记与统计口径见 [session-log.md](session-log.md)。
 
-`tools.bash({command, background: true})` 同样立即返回含 `id` 的启动确认；后台 bash 独立于 agent 并发限额。agent 与 bash 分别使用会话级编号 `a1、a2…` 和 `b1、b2…`：前后台 agent 仅在新建时分配，接续不递增编号、沿用原 id，后台 bash 在启动时分配，前台 bash 仅运行超过 3 秒、开始显示进度时分配。计数跨 Run/Turn 保留；恢复时根据日志中的任务 id 分别取各前缀最大值继续编号，兼容旧的共用计数日志且不补空号。后台 bash 最多同时运行 8 个，超出时立即 reject 并给出明确错误，不排队；子 agent 内也可使用。结果在下一次主模型请求前作为带来源标记的 user 消息插入，恢复未完成任务时插入 lost 消息。后台 bash 的生命周期也通过 `background` 事件报告。
+`tools.bash({command, background: true})` 同样立即返回含 `id` 的启动确认；后台 bash 独立于 agent 并发限额。agent 与 bash 分别使用会话级编号 `a1、a2…` 和 `b1、b2…`：前后台 agent 仅在新建时分配，接续不递增编号、沿用原 id，所有 bash 在启动时分配，前台 bash 仍只在运行超过 3 秒时显示进度。计数跨 Run/Turn 保留；恢复时根据日志中的任务 id 分别取各前缀最大值继续编号，兼容旧的共用计数日志且不补空号。后台 bash 最多同时运行 8 个，超出时立即 reject 并给出明确错误，不排队；子 agent 内也可使用。结果在下一次主模型请求前作为带来源标记的 user 消息插入，恢复未完成任务时插入 lost 消息。后台 bash 的生命周期也通过 `background` 事件报告。
 
-`tools.bash({command, background: true, detached: true})` 是会话级任务：跨 Run 和正常 Turn 存活，最终回答和 Step 上限收尾只等待普通后台任务，不等待 detached；停止提示只列实际等待的任务。detached 要求 `background:true`，默认 `timeout_ms:0`（无截止时间），也可显式指定正数超时；普通 bash 默认 120000 ms。它与其他 bash 共用 b 计数器、并发和输出上限。完成时只入 inbox，空闲时不自动发起 Turn；下一次 Step/Turn 消费一次。Turn 取消/失败、Session 退出或切换清理全部任务；ask 回答后退出 Session，因此不跨 ask 进程保活。恢复会话不重启进程，沿用 lost 消息。
+`tools.bash({command, background: true, detached: true})` 是会话级任务：跨 Run 和正常 Turn 存活，最终回答和 Step 上限收尾只等待普通后台任务，不等待 detached；停止提示只列实际等待的任务。detached 要求 `background:true`，默认 `timeout_ms:0`（无截止时间），也可显式指定正数超时；普通前台/后台 bash 默认 1800000 ms（30 分钟），Run 自动转后台不重置或缩短这个截止时间，显式正数 timeout_ms 始终优先。默认值的依据与清理边界见 [run-output.md](run-output.md#bash-执行时限)。它与其他 bash 共用 b 计数器、并发和输出上限。完成时只入 inbox，空闲时不自动发起 Turn；下一次 Step/Turn 消费一次。Turn 取消/失败、Session 退出或切换清理全部任务；ask 回答后退出 Session，因此不跨 ask 进程保活。恢复会话不重启进程，沿用 lost 消息。
 
-`tools.stop({id}) → {id,stopped}` 按现有 a/b id 取消并 join 单个后台 bash/agent，清理进程组。停止运行中的任务返回 `stopped:true`；已结束的已知任务返回 false，未知 id reject。并发停止同一任务只 join 一次，完成结果仍经原 inbox 路径投递一次。stop 返回前释放 agent 的执行占用；它不删除任务身份。启动和 stop 都经普通工具统一结算/录制出口，后台结果消息按 UTF-8 字节计入接收它的 Step 的 output_bytes。见 [ADR 0014](adr/0014-session-background-jobs.md)。
+`tools.stop({id,reason}) → {id,stopped,reason,notice?}` reason 必须是非空白字符串，否则 reject 且不停止任务。所有显式 stop 都要求给出具体理由，不猜测命令是否属于验证：时间长或没有输出本身不证明任务卡住；用户要求、已观察到的失败、需求变化仍可作为停止理由。取消未完成测试会丢弃本次测试进度，不能据此声称验证通过；启动新进程会重做未完成的工作。已写文件和编译缓存不会回滚。返回值保留 reason，实际停止时附带 notice 提醒。按现有 a/b id 取消并 join 单个后台 bash/agent，清理进程组。停止运行中的任务返回 `stopped:true`；已结束的已知任务返回 false，未知 id reject。并发停止同一任务只 join 一次，完成结果仍经原 inbox 路径投递一次。stop 返回前释放 agent 的执行占用；它不删除任务身份。启动和 stop 都经普通工具统一结算/录制出口，后台结果消息按 UTF-8 字节计入接收它的 Step 的 output_bytes。见 [ADR 0014](adr/0014-session-background-jobs.md)。
 
 后台 agent/bash 的执行失败通常转换成结果消息；若后台工作线程自身出错，无法生成或写入 inbox 结果（例如分配失败），内部错误由轮询路径上报一次，该任务不再计入待结果集合，后续 Run 不会反复收到同一错误。
 
@@ -89,7 +93,7 @@ Run 结束只取已记录的改动，不重新读盘。bash、外部进程、父
 
 任意工具调用失败都不会取消同一 Run 的其他调用，不限于返回 `ok:false` 的子 agent。顶层 Run Promise fulfill 和 reject 都继续 drain 在途及排队工具、JS jobs 和 continuation 新发起的调用；顶层 reject 时，Run 仍报告原始拒绝原因。因此 `Promise.all` 中 read 或 llm reject 后，其他前台 agent 仍会工作到完成：父 Run 要承担其剩余等待时间与用量，用户仍可按 Esc 取消。
 
-llm 与 agent 的 usage 都计入本轮累计用量。只有用户取消（Esc/SIGINT/SIGTERM）或 JS 执行超时才中止 Run 内在途及排队工具；工具自身超时不影响其他调用。若中止时还有未完成调用，Run 输出保留一行 `[stopped before completion: bash #0, agent #2]`，索引按该 Run 内全部工具调用的创建顺序从 0 开始，不是后台任务 id。输出预算和 JS 执行预算见 [run-output.md](run-output.md)。
+llm 与 agent 的 usage 都计入本轮累计用量。用户取消（Esc/SIGINT/SIGTERM）或 JS 执行超时会中止整个 Run 的在途及排队工具；单个工具超时、bash 被取代或按 id stop 不影响其他调用。若整个 Run 中止时还有未完成调用，Run 输出保留一行 `[stopped before completion: bash #0, agent #2]`，索引按该 Run 内全部工具调用的创建顺序从 0 开始，不是后台任务 id。输出预算和 JS 执行预算见 [run-output.md](run-output.md)。
 
 子进程 NDJSON 在运行途中按完整行观察；最终输出仍按原路径解析和统计。进度使用受互斥锁保护、每次调用仅保留最新快照的队列（同任务 id 的各次调用分开记账）；工具线程只更新队列，不调用 Session sink。Run 线程在 sandbox 的 Promise/工具等待循环里约每 20 ms 尝试转发，转发不计入 JS 执行预算；eval 返回前已停止并 join 所有前台工具线程，后台 agent 由父会话持有，不随 Run 结束而 join；进度队列在 Turn 结束时清理，后台任务的原 Run 进度会继续显示到结果插入。TUI 收到事件后复制数据到自身事件循环，在发起任务的 Run 下方默认显示子任务树，每个任务固定一行，按创建顺序排列并按 id 原地更新；接续 `a1` 的 progress 事件和 tree 行仍标为 `a1`，不生成新的任务 id。agent 行为 `  ├─ a1 prompt 摘要 · 状态 · step N · 工具名 变更文件`，bash 行为 `  └─ b2 bash 命令摘要 · 已运行时间 · 状态`（分支符按行位置变化）。前台 bash 运行超过 3 秒才出现在所在 Run 下，此后每秒更新时间，结束后保留最终状态；不到阈值的命令不出现，Run 标题不变。时间小于 60 秒显示为 `42.3s`，否则为 `3m12s`。普通后台任务在结果送达前显示 `background`；detached 任务运行中显示 `detached`，结束或被停止后显示最终状态。prompt 和命令最多预览前 40 个 Unicode 字符；窄屏先缩短 prompt/命令，再缩短末尾文件信息，优先保留 id、状态和 step 或时间，不换行。ctrl+o 只切换 Run 代码、结果及 diff 的展开，不隐藏子任务树。Run 结束恢复工具/耗时/改动摘要，并保留最后收到的子任务状态；从历史恢复的 Run 不重建子任务树。后台结果条目使用相同 id：成功为 `✓ b2 bash · ok · 输出预览`，失败为 `✗ a2 agent · failed · 文本预览`，丢失为 `✗ a2 agent · lost`；ctrl+o 展开仍显示完整 JSON 结果，历史恢复也使用相同格式。工具名来自最近一次 Run，文件仅为 edit/write 报告的变更路径，不代表当前正在执行的命令或任务完成百分比。
 
@@ -100,3 +104,19 @@ bash 与子会话复用标准库子进程等待和进程组执行器。所有 ba
 新会话构建 system 时，`src/tools.zig` 根据有效 provider 配置生成 llm 的模型列表：Codex 模型取自 `src/provider/codex.zig` 的目录；Chat Completions 至少提供 `src/provider/openai.zig` 的默认模型，另加入当前配置模型并去重。effort 说明只列常用的 low/medium/high，省略 model/effort 仍继承当前配置；完整档位与映射见 [config.md](config.md) 和 [codex.md](codex.md)。选择只在当前 provider 内进行，不隐式切换 provider。
 
 工具说明中的模型名按 JSON 字符串编码，不直接插入原始配置文本。根会话与默认新建子会话使用同一生成路径，但默认子会话隐藏 agent；fork 复用父 system/schema，不重新生成，agent 的不可递归边界由运行时执行。恢复会话仍沿用日志原始 system，不改写历史。架构理由见 [ADR 0010](adr/0010-subagents.md)、[ADR 0013](adr/0013-llm-functions.md) 与 [ADR 0015](adr/0015-agent-fork.md)。
+
+## 自动后台 Run
+
+长 Run 不依赖模型主动传 `background:true`；达到默认 10 秒的可配置阈值并仍在等工具时，整个脚本继续执行，模型先收到 `rN` 通知。已 await 的工具返回类型不变，console 和 edit/write changes 延后一起交付。后台 Run 与其他 Run 共享 cwd 和文件观察状态；模型可继续工作，无需轮询完成结果，edit/write 后重跑同一命令会按下节语义取代旧执行。详细的并发上限、文件冲突边界、取消、展示预算与恢复语义见 [run-output.md](run-output.md#长-run-自动转后台)。
+
+`tools.stop` 同时接受其他后台 Run 的 `rN`；Run 不能 stop 自己。后台 Run 非 detached，最终回答和 Step 上限仍等待结果送达。Run 的后续代码也可以启动显式后台 bash/agent，沿用其各自的普通或 detached 语义。只有 Session 主线程向 sink 转发进度/用量/结果；后台沙箱与工具线程不调用前台 sink。
+
+无工具调用的文本回复在仍有普通后台任务时一定提交为 waiting Step 并进入本地等待；不看文本长短、不识别“等待”关键词。一个 Step 的全部 Run 都成功、没有输出且没有任何实际宿主工具调用（例如空 Run 或仅打印空行）时，同样等待，不额外请求模型。有计算输出或实际调用过工具的 Run 仍按正常工作处理，不能把任意 git/read/stop 调用自动当作等待。后台结果或用户插话到达后再继续；detached 任务保持跨 Turn 语义。
+
+## 同一命令取代过时执行
+
+同一 Session 的 bash 启动时，只要仍在运行的旧 bash 属于更早的 Run、命令字符串及启动 cwd 完全相同，且旧 bash 启动后本 Session 的 edit/write 确实修改过文件，就自动停止旧 bash 的进程组。无需先等旧验证结果；修改后可直接再次启动同一验证。命令不按语言或用途分类，不解析 shell 的 cd、参数或重定向。相同 Run 内的并行调用不互相取代，无修改的重复调用不取代、不缓存结果；新旧任一方显式 detached 都不参与。
+
+旧调用 resolve 为 `{superseded_by:"bN"}`，没有 exit_code、output 或 error：它表示已被更新的同一验证取代，不表示验证通过或失败。后台 bash 的消息带 `background_ok:true`；自动后台 Run 的 await 拿到同样的数据，脚本继续执行，Run 最终状态由脚本决定。需要检查退出码的脚本可用 `if (!r.superseded_by && r.exit_code !== 0) ...`；无条件检查退出码的旧脚本仍可能自行抛错。只取代该 bash，不停止整个 Run 或其余工具，继续脚本仍可产生副作用。
+
+修改代数在成功 edit/write 后推进，与界面 changes 统计是否启用无关；最多读取 16 MiB 比较旧内容，无效 edit、失败写入、已确认内容相同的覆盖不计，创建空文件也计。旧内容超过读取上限或不可读时，成功 write 保守地计为修改。它是 Session 级记录，不推断文件依赖，因此任何 edit/write 都可能使旧命令过时；bash 自身副作用、用户编辑、其他 Session/子 agent 的写入无法据此识别。进程组清理沿用 stop/取消路径，20 ms 轮询观察停止标志，新执行不等旧进程自然退出。匹配的全部旧命令各取代一次；后台并发准入限额仍正常检查。停止前已产生的文件或其他副作用不会回滚。设计取舍见 [ADR 0016](adr/0016-superseded-bash.md)，独立启动/取代事件及统计见 [日志](session-log.md#bash-启动与取代事件)。

@@ -13,7 +13,7 @@ pub fn grep(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     var message: [128]u8 = undefined;
-    var s = grep_engine.search(t.io, gpa, a.value, .{ .deny = try t.credentialPaths(arena.allocator()), .cancel = &t.cancel }, &message) catch |err| return switch (err) {
+    var s = grep_engine.search(t.io, gpa, a.value, .{ .deny = try t.credentialPaths(arena.allocator()), .cancel = t.cancelFlag() }, &message) catch |err| return switch (err) {
         error.InvalidPattern => blk: {
             const pattern = a.value.pattern;
             var end = @min(pattern.len, 200);
@@ -38,7 +38,7 @@ pub fn glob(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
     const pattern = if (std.mem.startsWith(u8, a.value.pattern, "./")) a.value.pattern[2..] else a.value.pattern;
     const found = walk.files(t.io, arena.allocator(), a.value.path, .{
         .deny = try t.credentialPaths(arena.allocator()),
-        .cancel = &t.cancel,
+        .cancel = t.cancelFlag(),
         .filter = pattern,
         .max = a.value.limit,
     }) catch |err| return switch (err) {

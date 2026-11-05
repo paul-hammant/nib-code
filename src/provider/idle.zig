@@ -7,6 +7,11 @@ pub const Monitor = struct {
     duration: std.Io.Clock.Duration,
     last: std.Io.Clock.Timestamp,
     model: ?*timing.Model,
+    content_duration: std.Io.Clock.Duration = .{ .raw = .fromSeconds(120), .clock = .awake },
+    request_duration: std.Io.Clock.Duration = .{ .raw = .fromSeconds(300), .clock = .awake },
+    started: std.Io.Clock.Timestamp,
+    last_content: std.Io.Clock.Timestamp,
+    timeout_kind: enum { bytes, content, request } = .bytes,
     read_failure: ?anyerror = null,
     body: bool = false,
 
@@ -23,6 +28,8 @@ pub const Monitor = struct {
             .duration = .{ .raw = .fromSeconds(@intCast(@min(timeout_s, std.math.maxInt(i64)))), .clock = .awake },
             .last = .now(io, .awake),
             .model = model,
+            .started = .now(io, .awake),
+            .last_content = .now(io, .awake),
         };
     }
 
@@ -30,7 +37,6 @@ pub const Monitor = struct {
         m.last = .now(m.io, .awake);
         m.read_failure = null;
         m.body = false;
-        if (m.model) |model| model.resetAttempt();
         // Stream.Reader only uses Io.operate; intercept below HTTP and TLS buffering.
         connection.stream_reader.io = .{ .userdata = m, .vtable = &vtable };
     }
@@ -38,6 +44,36 @@ pub const Monitor = struct {
     pub fn detach(m: *Monitor, connection: *std.http.Client.Connection) void {
         connection.stream_reader.io = m.io;
         if (m.read_failure != null) connection.closing = true;
+    }
+
+    pub fn content(m: *Monitor, bytes: usize) void {
+        if (bytes == 0) return;
+        m.last_content = .now(m.io, .awake);
+        if (m.model) |model| model.content(bytes);
+    }
+
+    pub fn check(m: *Monitor) !void {
+        const expires = m.deadline();
+        if (expires.untilNow(m.io).raw.nanoseconds >= 0) {
+            m.read_failure = error.Timeout;
+            return error.Canceled;
+        }
+    }
+
+    fn deadline(m: *Monitor) std.Io.Clock.Timestamp {
+        var result = m.last.addDuration(m.duration);
+        m.timeout_kind = .bytes;
+        const content_deadline = m.last_content.addDuration(m.content_duration);
+        if (content_deadline.raw.nanoseconds < result.raw.nanoseconds) {
+            result = content_deadline;
+            m.timeout_kind = .content;
+        }
+        const request_deadline = m.started.addDuration(m.request_duration);
+        if (request_deadline.raw.nanoseconds < result.raw.nanoseconds) {
+            result = request_deadline;
+            m.timeout_kind = .request;
+        }
+        return result;
     }
 
     fn operate(ctx: ?*anyopaque, op: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
@@ -48,7 +84,7 @@ pub const Monitor = struct {
         // A timed-out/canceled batch may still own the socket and destination buffers.
         defer batch.cancel(m.io);
         batch.addAt(0, op);
-        batch.awaitConcurrent(m.io, .{ .deadline = m.last.addDuration(m.duration) }) catch |err| {
+        batch.awaitConcurrent(m.io, .{ .deadline = m.deadline() }) catch |err| {
             m.read_failure = err;
             return error.Canceled;
         };
@@ -62,14 +98,32 @@ pub const Monitor = struct {
     pub fn failure(m: *const Monitor, gpa: std.mem.Allocator, detail: *?[]u8, err: anyerror) anyerror {
         const failure_error = m.read_failure orelse return err;
         if (failure_error != error.Timeout) return failure_error;
-        const message = std.fmt.allocPrint(gpa, "Stream idle timeout after {d}s without receiving bytes.{s}{s}", .{
-            m.timeout_s,
+        const message = std.fmt.allocPrint(gpa, "{s} timeout after {d}s {s}.{s}{s}", .{
+            switch (m.timeout_kind) {
+                .bytes => "Stream idle",
+                .content => "Stream content idle",
+                .request => "Model request",
+            },
+            switch (m.timeout_kind) {
+                .bytes => m.timeout_s,
+                .content => @as(usize, @intCast(m.content_duration.raw.toSeconds())),
+                .request => @as(usize, @intCast(m.request_duration.raw.toSeconds())),
+            },
+            switch (m.timeout_kind) {
+                .bytes => "without receiving bytes",
+                .content => "without reasoning, text or tool arguments",
+                .request => "without completing the attempt",
+            },
             if (detail.* != null) "\n" else "",
             detail.* orelse "",
         }) catch return error.OutOfMemory;
         if (detail.*) |old| gpa.free(old);
         detail.* = message;
-        return error.StreamIdleTimeout;
+        return switch (m.timeout_kind) {
+            .bytes => error.StreamIdleTimeout,
+            .content => error.StreamContentTimeout,
+            .request => error.ModelRequestTimeout,
+        };
     }
 };
 
@@ -192,7 +246,7 @@ test "cancel interrupts an idle socket read without waiting for the deadline" {
     var canceler = try t.io.concurrent(State.cancelSoon, .{&state});
     defer canceler.cancel(t.io);
     const start = std.Io.Clock.awake.now(t.io);
-    try t.expectError(error.Canceled, @import("cancel.zig").run(t.io, &state.cancel, State.request, .{ &state, &reader.interface }));
+    try t.expectError(error.Canceled, @import("cancel.zig").run(t.io, &state.cancel, null, State.request, .{ &state, &reader.interface }));
     try t.expectEqual(error.Canceled, m.read_failure.?);
     try t.expect(start.durationTo(.now(t.io, .awake)).toMilliseconds() < 2000);
 }

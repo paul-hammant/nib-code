@@ -70,7 +70,7 @@ pub const PollTarget = struct {
     }
 };
 
-pub const Executed = struct { output: []const u8, ok: bool, run_ms: ?u64 = null, effort: ?effort.Declaration = null, remaining_steps: ?usize = null, tool_summary: ?ToolSummary = null };
+pub const Executed = struct { output: []const u8, ok: bool, empty: bool = false, run_ms: ?u64 = null, effort: ?effort.Declaration = null, remaining_steps: ?usize = null, tool_summary: ?ToolSummary = null, background_id: ?[]const u8 = null };
 
 /// Output is arena-owned.
 pub fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const std.atomic.Value(bool), timing: *sandbox.RunTiming) !Executed {
@@ -85,18 +85,70 @@ pub fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const 
 
     const code = if (args.value.code) |value| (if (value == .string) value.string else null) else null;
     if (code == null) return .{ .ok = false, .output = try a.dupe(u8, "error: arguments must be a JSON object { \"code\": string }"), .effort = args.value.effort };
+    const declaration = if (std.mem.eql(u8, call.type, "custom")) effort.fromCode(s.gpa, code.?) catch
+        return .{ .ok = false, .output = "error: invalid first-line // @run: pragma; use {\"effort\":\"low|medium|high|default\"}. Fix the script and continue the task." } else args.value.effort;
     try sink.emit(sink.ctx, .{ .run_start = code.? });
     const before_omitted = timing.omitted;
-    const ran = try runTimed(s, code.?, cancel, timing);
-    const o = ran.outcome;
+    const started: std.Io.Clock.Timestamp = .now(s.io, .awake);
+    const ran = try executeTimed(s, code.?, cancel, timing);
+    if (ran == null) {
+        const remaining = if (s.cfg.limits.max_steps) |limit| limit -| s.steps else null;
+        const message = try std.fmt.allocPrint(a, "Run still executing after {d} ms; continuing in background as {s}. Its captured output is preserved and will arrive automatically as a message when it finishes. Continue useful work meanwhile; no ps, cat/tail logs, sleep, empty Runs or timeout reruns to check/wait. Do not read its redirected logs before completion. If no independent work remains, end the model response immediately with a brief text reply and no run/tool call (not even console.log); Session waits locally, delivers the result and continues the Turn. After edit/write changes, rerun the same command/cwd directly: older Run bash stops with {{superseded_by}}, not failure. Do not wait for the stale result.", .{ s.cfg.limits.run_background_after_ms, s.tools.background.runs.items[s.tools.background.runs.items.len - 1].id });
+        const text = try output_format.stepLimitOutput(a, message, remaining);
+        try sink.emit(sink.ctx, .{ .run_end = .{ .ok = true, .output = text, .tool_summary = .{} } });
+        return .{ .output = text, .ok = true, .run_ms = @intCast(@max(started.untilNow(s.io).raw.toMilliseconds(), 0)), .remaining_steps = remaining, .tool_summary = .{}, .background_id = s.tools.background.runs.items[s.tools.background.runs.items.len - 1].id };
+    }
+    const o = ran.?.outcome;
     defer o.deinit(s.gpa);
 
     const remaining_steps = if (s.cfg.limits.max_steps) |limit| limit -| s.steps else null;
-    const output = try output_format.stepLimitOutput(a, try output_format.format(a, o), remaining_steps);
+    const output = try output_format.stepLimitOutput(a, try output_format.format(a, o, s.cfg.limits.run_output_bytes), remaining_steps);
     const run_ms = timing.elapsed();
     const tool_summary = try ToolSummary.init(a, timing.entries[0..timing.count], timing.run_index, timing.omitted - before_omitted);
-    try sink.emit(sink.ctx, .{ .run_end = .{ .ok = o.ok, .output = output, .changes = ran.changes, .tool_summary = tool_summary } });
-    return .{ .output = output, .ok = o.ok, .run_ms = run_ms, .effort = args.value.effort, .remaining_steps = remaining_steps, .tool_summary = tool_summary };
+    try sink.emit(sink.ctx, .{ .run_end = .{ .ok = o.ok, .output = output, .changes = ran.?.changes, .tool_summary = tool_summary } });
+    return .{ .output = output, .ok = o.ok, .empty = std.mem.eql(u8, o.text, "undefined") and std.mem.trim(u8, o.logs, " \t\r\n").len == 0, .run_ms = run_ms, .effort = declaration, .remaining_steps = remaining_steps, .tool_summary = tool_summary };
+}
+
+fn executeTimed(s: *Session, code: []const u8, cancel: *const std.atomic.Value(bool), timing: *sandbox.RunTiming) !?Ran {
+    defer s.tools.progress.drain(s.io) catch {};
+    if (!s.tools.background.anyPending(s.io)) s.tools.progress.clear(s.gpa);
+    s.tools.run_id += 1;
+    const job = try @import("run_job.zig").Job.create(&s.tools, s.gpa, code, s.log.steps + 1, timing.run_index, if (s.recorder) |*r| r else null);
+    var adopted = false;
+    defer if (!adopted) job.destroy();
+    var attempted = false;
+    while (!job.done.load(.acquire)) {
+        if (cancel.load(.acquire)) return error.Canceled;
+        try @import("../tools.zig").Tools.poll(&s.tools);
+        if (!attempted and job.timing.elapsed() >= s.cfg.limits.run_background_after_ms and job.waiting.load(.acquire)) {
+            attempted = true;
+            if (try s.tools.background.adoptRun(job)) {
+                adopted = true;
+                return null;
+            }
+        }
+        job.completed.waitTimeout(s.io, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch |err| switch (err) {
+            error.Timeout => {},
+            else => return err,
+        };
+    }
+    job.join();
+    if (job.failure) |err| return err;
+    const count = @min(job.timing.count, timing.entries.len - timing.count);
+    @memcpy(timing.entries[timing.count..][0..count], job.timing.entries[0..count]);
+    timing.count += count;
+    timing.omitted += job.timing.omitted + job.timing.count - count;
+    timing.tool_bytes += job.timing.tool_bytes;
+    timing.llm_calls += job.timing.llm_calls;
+    timing.agent_calls += job.timing.agent_calls;
+    timing.started = job.timing.started;
+    s.usage.add(s.tools.takeUsage());
+    const cwd = try std.process.currentPathAlloc(s.io, s.gpa);
+    defer s.gpa.free(cwd);
+    const changes = try job.scope.changes.take(s.gpa, s.arena.allocator(), cwd);
+    const outcome = job.outcome.?;
+    job.outcome = null;
+    return .{ .outcome = outcome, .changes = changes };
 }
 
 test "execute emits per-Run actual tool summaries including empty and overflow" {

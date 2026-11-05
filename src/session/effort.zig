@@ -3,6 +3,29 @@ const provider = @import("../provider.zig");
 
 pub const Declaration = enum { low, medium, high, default };
 
+pub fn fromCode(a: std.mem.Allocator, code: []const u8) !?Declaration {
+    const line = std.mem.trim(u8, code[0 .. std.mem.indexOfScalar(u8, code, '\n') orelse code.len], " \t\r");
+    const prefix = "// @run:";
+    if (!std.mem.startsWith(u8, line, prefix)) return null;
+    const parsed = try std.json.parseFromSlice(struct { effort: ?Declaration = null }, a, line[prefix.len..], .{});
+    defer parsed.deinit();
+    return parsed.value.effort;
+}
+
+test "custom Run effort is an optional strict first-line pragma" {
+    const t = std.testing;
+    try t.expectEqual(@as(?Declaration, null), try fromCode(t.allocator, "console.log('plain')"));
+    try t.expectEqual(@as(?Declaration, null), try fromCode(t.allocator, "// ordinary comment\n// @run: {\"effort\":\"low\"}"));
+    inline for (.{ Declaration.low, .medium, .high, .default }) |value| {
+        const code = " \t// @run: {\"effort\":\"" ++ @tagName(value) ++ "\"}\r\nconsole.log('ok')";
+        try t.expectEqual(@as(?Declaration, value), try fromCode(t.allocator, code));
+    }
+    try t.expectEqual(@as(?Declaration, null), try fromCode(t.allocator, "// @run: {}\n42"));
+    try t.expectError(error.InvalidEnumTag, fromCode(t.allocator, "// @run: {\"effort\":\"max\"}\n42"));
+    try t.expectError(error.UnknownField, fromCode(t.allocator, "// @run: {\"unknown\":1}\n42"));
+    try t.expectError(error.SyntaxError, fromCode(t.allocator, "// @run: invalid\n42"));
+}
+
 pub const Pending = struct {
     effort: Declaration,
     ok: bool,

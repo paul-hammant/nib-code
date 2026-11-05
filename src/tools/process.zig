@@ -1,5 +1,6 @@
 const std = @import("std");
 const secrets = @import("secrets.zig");
+const Execution = @import("../sandbox/timing.zig").Execution;
 
 pub const Result = struct {
     term: std.process.Child.Term,
@@ -10,6 +11,7 @@ pub const Result = struct {
 const Stop = error{ Canceled, TimedOut };
 
 pub const Options = struct {
+    execution: ?*Execution = null,
     spawn: std.process.SpawnOptions,
     cancel: *const std.atomic.Value(bool),
     timeout_ms: i64,
@@ -45,6 +47,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Result {
     opts.environ_map = &env;
     if (options.input != null) opts.stdin = .pipe;
     opts.pgid = 0;
+    if (options.execution) |execution| execution.start_ms_epoch = Execution.now(io);
     var child = try std.process.spawn(io, opts);
     const pid = child.id.?;
     defer child.kill(io);
@@ -77,13 +80,16 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Result {
     child.stdout = null;
     defer stdout.close(io);
     const Wait = struct {
-        fn work(c: *std.process.Child, i: std.Io, done: *std.Io.Event) !std.process.Child.Term {
+        fn work(c: *std.process.Child, i: std.Io, done: *std.Io.Event, execution: ?*Execution) !std.process.Child.Term {
             defer done.set(i);
+            defer if (execution) |value| {
+                value.end_ms_epoch = Execution.now(i);
+            };
             return c.wait(i);
         }
     };
     var done: std.Io.Event = .unset;
-    var waiter = try io.concurrent(Wait.work, .{ &child, io, &done });
+    var waiter = try io.concurrent(Wait.work, .{ &child, io, &done, options.execution });
     defer {
         group.kill();
         _ = waiter.await(io) catch {};

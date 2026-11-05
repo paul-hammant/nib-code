@@ -80,7 +80,7 @@ pub const State = struct {
 };
 
 pub fn lock(t: *Tools, gpa: std.mem.Allocator, path: []const u8) !std.Io.File {
-    if (t.cancel.load(.acquire)) return error.Canceled;
+    if (t.cancelFlag().load(.acquire)) return error.Canceled;
     const home = if (t.data_home) |home| try gpa.dupe(u8, home) else if (t.environ) |env| try @import("../config.zig").home(gpa, env) else try std.fs.path.join(gpa, &.{ t.home, ".nib" });
     defer gpa.free(home);
     const directory = try std.fs.path.join(gpa, &.{ home, "locks" });
@@ -95,11 +95,11 @@ pub fn lock(t: *Tools, gpa: std.mem.Allocator, path: []const u8) !std.Io.File {
     const file = try cwd.createFile(t.io, lock_path, .{ .truncate = false, .permissions = .fromMode(0o600) });
     errdefer file.close(t.io);
     while (true) {
-        if (t.cancel.load(.acquire)) return error.Canceled;
+        if (t.cancelFlag().load(.acquire)) return error.Canceled;
         if (try file.tryLock(t.io, .exclusive)) break;
         try std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(20), .clock = .awake }, t.io);
     }
-    if (t.cancel.load(.acquire)) return error.Canceled;
+    if (t.cancelFlag().load(.acquire)) return error.Canceled;
     // Lock files must stay linked: unlinking lets waiters lock different inodes.
     return file;
 }

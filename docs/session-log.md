@@ -6,6 +6,8 @@
 
 新会话按基础指令、全局 `$NIB_HOME/AGENTS.md`（默认 `~/.nib/AGENTS.md`）、项目 `AGENTS.md` 的顺序拼接 system，后者优先。项目目录是从 cwd 向上遇到的第一个 `.git` 标记所在目录；没有则用 cwd。只读取 `AGENTS.md`。恢复会话沿用日志中的原始 system，之后修改指令文件只影响新会话。
 
+Codex custom Run 在 `tool_calls` 中记录 `type:"custom"`，`function.arguments` 仍是 JSON `{code}`，其中 code 是完整原始 JS（含可选 effort 首行）；旧记录缺省为 function。恢复和 replay 不需要迁移日志。Responses 原始 output、调用与结果的协议类型以及参数进度的字节口径见 [Codex custom Run](codex.md#custom-run-工具)。
+
 ## 工具录制与离线重放
 
 主日志 `$NIB_HOME/sessions/<session_id>.jsonl` 保存模型消息和 Step；独立的 `<session_id>.calls.jsonl` 保存 Run 内工具的实际返回值与拒绝信息，权限为 `0600`。旁路录制默认开启，可关闭；主日志格式与恢复不依赖它。`nib replay` 只在新沙箱内重跑已保存的 JavaScript，以录制结果替代真实工具，不请求模型、不执行 bash 或文件写入。
@@ -32,7 +34,7 @@
 
 ## 后台任务结果
 
-`tools.agent({prompt, background: true})` 与 `tools.bash({command, background: true})` 启动前同步追加独立的 `background: {id, kind: "agent"|"bash", state: "started"}` 记录；结果消息插入后追加 `state: "finished", ok` 记录，恢复发现未完成任务时追加 `state: "lost"`。agent 和 bash 分别使用会话级计数器：`a1、a2…` 与 `b1、b2…`，前台与后台共用各自类型的计数器。恢复扫描所有后台 `started/finished/lost` 记录和 `calls[].id`，按前缀分别取最大值继续分配；旧的共用计数日志也按此规则恢复，不补空号。这些记录带 `at` 和 `turn_step`，不改变历史或 context_tokens。结果在下次主模型请求前单独提交为一条 user 消息：`source: "background"`、`background_kind`、`background_id`、`background_ok`；可选的 `background_ok` 记录任务是否成功，供 TUI 在正文 JSON 截断后正确回放。agent 正文为 `[background agent a1 finished]\n` 后接截断后的 `{ok,id,text,changes,error?}` JSON，不含 usage；bash 正文结果恰为 `{exit_code,output}` 或 `{error}`，无 `ok` 字段。恢复时未完成任务不会重启，插入 `[background agent a1 lost: process ended]` 或对应的 bash 消息。来源字段只保存在日志中，不发送给 provider；正文会发送给模型。后台消息不发起新 Turn。旧 `background_agent` 日志仍可统计。
+`tools.agent({prompt, background: true})` 与 `tools.bash({command, background: true})` 启动前同步追加独立的 `background: {id, kind: "agent"|"bash"|"run", state: "started"}` 记录；结果消息插入后追加 `state: "finished", ok` 记录，恢复发现未完成任务时追加 `state: "lost"`。agent 和 bash 分别使用会话级计数器：`a1、a2…` 与 `b1、b2…`，前台与后台共用各自类型的计数器。恢复扫描所有后台 `started/finished/lost` 记录、`bash` 事件和 `calls[].id`，按前缀分别取最大值继续分配；旧的共用计数日志也按此规则恢复，不补空号。这些记录带 `at` 和 `turn_step`，不改变历史或 context_tokens。结果在下次主模型请求前单独提交为一条 user 消息：`source: "background"`、`background_kind`、`background_id`、`background_ok`；可选的 `background_ok` 记录任务是否成功，供 TUI 在正文 JSON 截断后正确回放。agent 正文为 `[background agent a1 finished]\n` 后接截断后的 `{ok,id,text,changes,error?}` JSON，不含 usage；bash 正文结果为 `{exit_code,output}`、`{superseded_by}` 或 `{error}`，无 `ok` 字段。恢复时未完成任务不会重启，插入 `[background agent a1 lost: process ended]` 或对应的 bash 消息。来源字段只保存在日志中，不发送给 provider；正文会发送给模型。后台消息不发起新 Turn。旧 `background_agent` 日志仍可统计。
 
 子 agent 首次报告 start 后，父日志同步追加独立的 `agent_session: {id: "a1", session: "内部子会话 ID"}` 映射记录；它不修改对话历史、context_tokens 或 Step 数，也不发送给模型。接续沿用任务 id，映射在压缩、失败和取消后保留；恢复父会话时重建映射，并将映射中的任务 id 纳入计数器高水位。工具仅接受任务 id，内部通过 `nib ask --resume` 接续原子会话。同 id 的各次后台调用按启动顺序配对；恢复时先补齐已提交结果缺失的终态记录，再为真正未完成的调用生成 lost，旧结果不清除新调用的恢复状态。
 
@@ -40,14 +42,14 @@
 
 ## Step 计时字段
 
-完整 Step 的可选计时字段（旧日志缺失时正常恢复）：`model_ms` 是模型请求总耗时，包含重试和退避，`attempts` 是实际尝试数；`first_data_ms` 是 provider.Sink.onData 首次收到任何 SSE 数据（含心跳、元数据）相对 Step 开始的时间，不代表首个模型内容 token。`code` 每个 run 一条 `{tool_call_id, first_ms, last_ms, progress}`，首尾时间相对 Step 开始，`progress` 是 `[ms, 累计参数 UTF-8 字节数]` 数组；接收时按到达顺序写入每调用最多 1024 点的固定缓冲，超出后按 stride 跳采，finish 时一次均匀抽样成最多 32 点并保留首尾；Codex 按 output_index、Chat Completions 按工具 index 跟踪，最终一次性参数如实记录 `first_ms == last_ms`，不推断未收到的片段。重试只保留成功请求的 code，first_data_ms 保留所有尝试中最早 onData 时间。`run_ms` 为此 Step 各 Run 从 sandbox 开始到 `session/output.zig` 格式化完成的总耗时，`run_results[].run_ms` 为单次耗时；未进入 sandbox 的调用无单次 run_ms。`calls` 最多保留 200 个宿主工具调用 `{name, start_ms, end_ms, ok, run_index}`，时间相对各自 Run 开始，run_index 是 run_results 的零起始下标，超出条数记 `calls_omitted`；ok 表示工具返回成功/错误，不等同于 bash 命令退出码。子 agent 只计父进程侧的调用，不追加参数或结果正文。`calls[]` 的可选 `id` 保存已分配的会话级任务编号：前台 agent 启动即分配，前台 bash 仅运行超过 3 秒开始上报进度时分配，短 bash 不含此字段；恢复依靠这些 id 避免前台编号回退。完整 Step、压缩及中断提交另保存可选 `task_ids: {agent, bash}`，数值为各类型已分配编号的高水位；恢复同时取其最大值，避免任务超过 `calls[]` 的 200 条明细上限时丢失续号信息。旧日志可省略。后台 agent/bash 的启动调用另带 `background: true` 和 `id`；该调用计时仅到启动返回，不表示后台任务执行耗时。所有计时使用单调 awake 时钟、毫秒单位；固定容量缓冲复用现有调度/完成路径，不新增锁或逐片段分配，不预取或推测执行。
+完整 Step 的可选计时字段（旧日志缺失时正常恢复）：`model_ms` 是模型请求总耗时，包含重试和退避，`attempts` 是实际尝试数；`first_data_ms` 是 provider.Sink.onData 首次收到任何传输数据（含心跳、元数据）相对 Step 开始的时间，不代表首个模型内容 token。`code` 每个 run 一条 `{tool_call_id, first_ms, last_ms, progress}`，首尾时间相对 Step 开始，`progress` 是 `[ms, 累计参数 UTF-8 字节数]` 数组；接收时按到达顺序写入每调用最多 1024 点的固定缓冲，超出后按 stride 跳采，finish 时一次均匀抽样成最多 32 点并保留首尾；Codex 按 output_index、Chat Completions 按工具 index 跟踪，最终一次性参数如实记录 `first_ms == last_ms`，不推断未收到的片段。重试只保留成功请求的 code，first_data_ms 保留所有尝试中最早 onData 时间。`run_ms` 为此 Step 各 Run 从 sandbox 开始到 `session/output.zig` 格式化完成的总耗时，`run_results[].run_ms` 为单次耗时；未进入 sandbox 的调用无单次 run_ms。`calls` 最多保留 200 个宿主工具调用 `{name, start_ms, end_ms, ok, run_index}`，时间相对各自 Run 开始，run_index 是 run_results 的零起始下标，超出条数记 `calls_omitted`；ok 表示工具返回成功/错误，不等同于 bash 命令退出码。子 agent 只计父进程侧的调用，不追加参数或结果正文。`calls[]` 的可选 `id` 保存已分配的会话级任务编号：前台 agent 启动即分配，所有 bash 启动时分配，短 bash 同样含此字段；恢复依靠这些 id 避免前台编号回退。完整 Step、压缩及中断提交另保存可选 `task_ids: {agent, bash, run}`，数值为各类型已分配编号的高水位；恢复同时取其最大值，避免任务超过 `calls[]` 的 200 条明细上限时丢失续号信息。旧日志可省略。后台 agent/bash 的启动调用另带 `background: true` 和 `id`；该调用计时仅到启动返回，不表示后台任务执行耗时。所有计时使用单调 awake 时钟、毫秒单位；固定容量缓冲复用现有调度/完成路径，不新增锁或逐片段分配，不预取或推测执行。
 
 ## 工具字节度量
 
 完整 Step 顶层另有可选 `tool_bytes`、`output_bytes`：`tool_bytes` 为该 Step 各 Run 的同名字段之和，`output_bytes` 为各 Run 的同名字段之和加上首次计入该完整 Step 的后台结果消息正文字节数；`run_results[]` 保存每个 Run 的可选 `tool_bytes`、`output_bytes`，不含后台结果消息。它们与现有 Step 顶层计时字段并列，不嵌套到 `timing` 对象。旧日志缺失字段仍可恢复，不把缺失当作零。
 
 - `sandbox.Outcome.tool_bytes` 在宿主工具结果交给 JS 时累计：成功按序列化 JSON 的 UTF-8 字节数，错误按错误文本的 UTF-8 字节数计量。无论 JS 是否使用或 await 结果都计入；未产生交回 JS 的结果计 0。`agent` 只计父 Run 收到的返回对象，不累加子会话内部工具数据。
-- Run 的 `output_bytes` 是 `session/output.format` 格式化后交给模型的 tool result 实际 UTF-8 字节数，包含 16 KiB 预算内的截断标记、错误、`no output`、条目标签和分隔符等。harness 拒绝执行的 Run 也记录其返回文本的 `output_bytes`，`tool_bytes` 为 0。
+- Run 的 `output_bytes` 是 `session/output.format` 格式化后交给模型的 tool result 实际 UTF-8 字节数，包含配置展示预算内的截断标记、错误、`no output`、条目标签和分隔符等。harness 拒绝执行的 Run 也记录其返回文本的 `output_bytes`，`tool_bytes` 为 0。
 - 后台 agent/bash 启动时交回 JS 的 `{id}` 按普通工具结果计量；之后插入的结果消息不经过 Run，仅计入接收它的完整 Step 的 `output_bytes`，不增加 `tool_bytes` 或 `run_results[]` 的字节数。按实际消息正文的 UTF-8 字节数计量，包含 `[background ...]` 前缀、换行、截断后的 JSON 和截断标记；恢复后的 lost 消息同样计入。每条结果只在首次接收它的完整 Step 计量一次；上限收尾已提交但尚无接收 Step、或接收请求失败/取消的结果，将字节结转到下一完整 Step。恢复时从追加的后台消息和完整 Step 记录重建未计量字节，不因退出丢失，后续请求重带历史不重复计量，用户插话不计入。独立的消息提交和生命周期记录不写字节字段，避免与完整 Step 重复累计。若接收消息的 Step 失败或取消而未完整提交，其后台字节也不计入账单和 Step 统计；已提交的后台消息仍可恢复。
 - `calls[]` 的 `dispatched` 默认为 true；入队前被限额拒绝的调用记录为 false，仍计入错误文本字节，但不增加原有的 llm/agent 实际调度次数。
 - `calls[]` 新增可选 `result_bytes`，口径与单次宿主调用贡献的 `tool_bytes` 相同。旧明细可为 null 或省略；新记录中取消时尚未结算的调用为 0。超过 200 条的明细仍按 `calls_omitted` 省略，不影响 Run/Step 的字节总数。
@@ -80,7 +82,7 @@ assistant 消息的可选 `step_effort: {effort, source}` 保存界面元数据�
 
 ## 会话统计
 
-会话统计：`python3 scripts/stats.py [日志文件或目录] [--since YYYY-MM-DD] [--cwd 目录] [--group-by version|system|patches] [--json]`，默认只读 `$NIB_HOME/sessions`（默认 `~/.nib/sessions`），用于发现故障和比较改动前后效果。文本和 JSON 均包含“耗时构成”：Step/model/run 的中位数与 p90、首段代码前等待和参数生成跨度、运行时各工具调用次数/总耗时/中位耗时，以及参数到达跨度严格大于 50 ms 的 run 比例；每项列出有效样本数，旧日志缺字段不补零。bash 耗时 Top 10（JSON `timing.bash.top10`）按 shell 命令中的 `&&`、`||`、`;`、`|` 和换行拆段，不拆引号和 heredoc 正文；将每段前两个 shell 单词按顺序用 ` → ` 连接，例如 `zig fmt x && zig build test` 归为 `zig fmt → zig build`，单段保持原分组。标签仍是启发式，耗时为整个 bash 调用，不推算各段耗时或实际走过的分支。优先取同目录 `<id>.calls.jsonl` 中实际的 `args.command`，按会话 Step、Run 及 bash 调用顺序关联（录制以创建顺序 index 排序，不用结算顺序 seq；多 bash 须数量一致且无未调度项），无法可靠关联时回退旧的静态 JS 字面量启发式。`timing.bash.sources.recorded` / `static` 分别是成功分组的两种来源条数，二者之和为 `matched_calls`；无法关联或无法分组的计时调用列为 `unmatched_calls`。录制不改变静态工具/命令计数或“写→仅验证”等静态往返结构指标；下文的“机械收尾”指标单独优先使用完整录制。
+会话统计：`python3 scripts/stats.py [日志文件或目录] [--since YYYY-MM-DD] [--cwd 目录] [--group-by version|system|patches|transport|incremental|full_reason] [--json]`，默认只读 `$NIB_HOME/sessions`（默认 `~/.nib/sessions`），用于发现故障和比较改动前后效果。文本和 JSON 均包含“耗时构成”：Step/model/run 的中位数与 p90、首段代码前等待和参数生成跨度、运行时各工具调用次数/总耗时/中位耗时，以及参数到达跨度严格大于 50 ms 的 run 比例；每项列出有效样本数，旧日志缺字段不补零。bash 耗时 Top 10（JSON `timing.bash.top10`）按 shell 命令中的 `&&`、`||`、`;`、`|` 和换行拆段，不拆引号和 heredoc 正文；将每段前两个 shell 单词按顺序用 ` → ` 连接，例如 `zig fmt x && zig build test` 归为 `zig fmt → zig build`，单段保持原分组。标签仍是启发式，耗时为整个 bash 调用，不推算各段耗时或实际走过的分支。优先取同目录 `<id>.calls.jsonl` 中实际的 `args.command`，按会话 Step、Run 及 bash 调用顺序关联（录制以创建顺序 index 排序，不用结算顺序 seq；多 bash 须数量一致且无未调度项），无法可靠关联时回退旧的静态 JS 字面量启发式。`timing.bash.sources.recorded` / `static` 分别是成功分组的两种来源条数，二者之和为 `matched_calls`；无法关联或无法分组的计时调用列为 `unmatched_calls`。录制不改变静态工具/命令计数或“写→仅验证”等静态往返结构指标；下文的“机械收尾”指标单独优先使用完整录制。
 
 “子会话已记录成本”（JSON `child_costs`）以每个带 `parent_session_id` 的入选子日志为一个样本，含前台与后台。`steps`、`model_ms`、`prompt_tokens`、`uncached_prompt_tokens` 分别统计每子会话完整 Step 数、累计模型时间（毫秒）、累计输入 token（含缓存）、累计未缓存输入 token 的中位数、p90 和样本数。未缓存量逐 Step 用 `prompt_tokens - prompt_cache_hit_tokens` 计算后累加，要求两字段均为非负整数且 cache 不大于 prompt；缺字段不补零，也不由两个分位数相减。`full_range_sessions` 要求非零完整 Step 且所有完整 Step 都入选；`--since` 截断的日志列入 `partial_range_sessions`，无完整 Step 的日志列入 `no_step_sessions`，两者不进入分布。计时与 token 各自要求该子会话所有完整 Step 对应字段有效，缺失或无效不补零，因此各指标 samples 可不同。只累计子日志自身 Step 字段，不叠加父会话 usage 或工具结果 usage；缓存输入已包含在 prompt 中。失败、取消或仍运行的子日志也可能入选，这些是已提交成本的下界，不代表成功任务或完整端到端耗时，更不是费用估算。
 
@@ -88,7 +90,7 @@ assistant 消息的可选 `step_effort: {effort, source}` 保存界面元数据�
 
 “工具数据度量”（JSON `tool_data`）独立累计 Step 顶层 `tool_bytes`、`output_bytes` 的有效样本数和总字节，不与 Run/calls 相加，也不从其他层回填。`output_tool_ratio` 按 `run_results[]` 中两字段有效且 `tool_bytes>0` 的 Run，统计各自 `output_bytes/tool_bytes` 的中位数、p90（nearest-rank）和样本数，不是总量之比，比例可大于 1。工具占比按有效 `calls[].result_bytes` 的总和为分母，按 name 汇总字节和调用数；明细被省略时覆盖有限，不代表全部工具数据。旧日志缺失字段跳过，不补零；明细总字节为零时占比为 n/a。
 
-`--group-by version|system|patches` 分别按 header 的 `nib_version`、`system_sha`、`patches_off` 分组，总体报告保留，每组分别输出核心报告；JSON 使用 `group_by` 和 `groups`。缺失标签的旧日志归 `unknown`；新版 header 有版本或系统哈希但省略 `patches_off` 时归 `none`，补丁列表按排序后的集合分组。
+`--group-by version|system|patches` 分别按 header 的 `nib_version`、`system_sha`、`patches_off` 分组，总体报告保留，每组分别输出核心报告；JSON 使用 `group_by` 和 `groups`。缺失标签的旧日志归 `unknown`；新版 header 有版本或系统哈希但省略 `patches_off` 时归 `none`，补丁列表按排序后的集合分组。`transport` 则按完整 Step 实际线路分组，见下文。
 
 完整 Step 新增可选 `turn_step`（Turn 内从 1 开始的 Step 序号），只用于识别日志中的 Turn 边界，运行中插话不会另起 Turn；恢复后新 Turn 从 1 开始。旧日志缺少该字段时仍按 user 消息估算边界（排除后台结果消息），可能把插话算成新 Turn。
 
@@ -100,7 +102,7 @@ JSON `agents` 和 `bash_calls` 分别统计 agent、bash 的前台/后台调用�
 
 `count/samples/ratio` 是命中数/候选 Step 数/比例；`ms/sample_ms/time_ratio` 是有计时的命中后步时长/候选后步时长/比例，`timed_count/timed_samples` 给出计时覆盖，缺计时不补零、零总时长的比例为 null。不是全体 Step 的占比，也不是 model_ms 的占比。`sources` 给候选 Step 的录制/静态/混合（`recorded/static/mixed`）来源数，`hit_sources` 给命中来源数。逐 Run 的完整 `<id>.calls.jsonl` 录制优先使用实际工具及 `args.command`（可识别动态 JS 组装的命令）；没有完整录制的 Run 回退静态直线代码提取（控制流/未执行函数体等保守跳过），有些 Run 回退则为 mixed。完整指只有一个结束 meta（ok/error）、无 incomplete 且调用 index 连续无重复；损坏、不完整记录不作完整执行证据。无调用的最终回答不是命中。
 
-`--group-by version|system|patches` 的各组会重新计算全部字段，文本与 `--json` 均展示该指标。共享分类器扩充了状态命令，因此历史“写→仅验证”的命中数可能增加；该旧指标仍只认静态 bash，不把 read 算验证，也不改用录制。新补丁对比见 [compromises.md](compromises.md#expected-continuation-基线与测量)。
+`--group-by version|system|patches|transport|incremental|full_reason` 的各组会重新计算全部字段，文本与 `--json` 均展示该指标。共享分类器扩充了状态命令，因此历史“写→仅验证”的命中数可能增加；该旧指标仍只认静态 bash，不把 read 算验证，也不改用录制。新补丁对比见 [compromises.md](compromises.md#expected-continuation-基线与测量)。
 
 耗时构成的 `timing.effort.by_effort` 按完整 Step 的顶层 effort 分组，列出 Step 数、model_ms 分布（含中位数和样本数）、prompt/cache token 总量与缓存命中率。缺 effort 的旧记录跳过，缺计时仍计 Step；缓存率为有效 prompt/cache 成对字段的总和之比，不是各 Step 比例的平均。
 
@@ -109,3 +111,54 @@ JSON `agents` 和 `bash_calls` 分别统计 agent、bash 的前台/后台调用�
 各档 `downgraded` 及跨档 `timing.effort.downgraded` 给出降档后的 Run 失败率：分母是有 Run 的降档 Step 数，分子是该 Step 响应后执行的任一 Run 显式 `ok=false` 的 Step 数，不关联后一个 Step，也不把无 Run 的最终回答放入分母。未知 Run 状态仍入分母并单列 `steps_with_unknown_run_status`。降档按 `effort_source=model` 且 `effort_downgraded=true` 判定；缺少后一字段的过渡记录按 model 来源推断，显式 false 排除等档声明。
 
 机器事件接口见 [ask-json.md](ask-json.md)。
+
+## 自动后台 Run 的记录与统计
+
+自动切换同步写入 `background:{id:"rN",kind:"run",state:"started"}`，随后当前完整 Step 的 `run_results[]` 保存 `background_id`，省略 `ok`（执行状态尚未确定），tool content 为提前通知，`tool_bytes:0`、空工具摘要。通知不采样仍在变动的工具计时。为避免尚未成功的 Run 影响下一次 effort，忽略该 Run 的 effort 声明。该 Step 的 `run_ms` 记录前台等待，`output_bytes` 记录通知；普通已完成 Run 保持原有字段含义。
+
+最终结果的后台 user 消息保存 `background_run:{step,run_index,ok,output,run_ms,tool_bytes,calls,calls_omitted,changes}`，`step` 为原 Session 的全局 Step（从 1 开始），`run_index` 从 0 开始。`output` 是正常格式化后的最终 Run 输出，`run_ms` 是原 Run 完整墙钟耗时，calls 时间相对原 Run 开始，changes 归属原 Run。独立 finished 生命周期记录的 `completion` 保存同一对象；`ask --json` 的 finished 事件也带 completion，供父 agent 汇总 changes。它们不是额外 Step。恢复以已经提交的后台消息为准，若来不及写 finished，沿用原来的终态修补规则；未提交结果恢复为 lost。`r` 计数器沿用后台事件与 `task_ids.run` 高水位，恢复不复用已分配的 ID。
+
+Step/Turn 的 `run_ms`、`tool_bytes`、llm/agent 调用数只计前台已结算的 Run，不把后台完整耗时叠加到重叠的主模型时间；后台 Run 的完整计时、字节与调用数从 `background_run` 获取。最终消息（含来源前缀）的字节按原有后台规则计入接收它的完整 Step 的 output_bytes，限额收尾和取消时继续结转。提前通知的 `run_end.ok:true` 仅表示成功转后台，实际成败由最终 completion.ok/background_ok 表示。
+
+`stats.py` 的 `background_runs` 与现有 agents/bash_calls 使用相同口径：`background_calls` 是自动切换次数，`background_steps` 是启动 Step 之后、结果插入之前已完成的本会话模型 Step 分布，`foreground_calls` 恒为 0（只统计自动后台 Run）。该指标包含根会话和子会话各自的主模型 Step，不将子会话 Step 当成父模型 Step。静态工具计数仍读取原代码；Step/calls 的旧性能指标不混入异步完成数据，避免重复计数。
+
+等待后台结果的无工具回复或仅成功运行无输出、无宿主工具的 Run 的 assistant 消息带本地元数据 `waiting:true`，不改模型原始 content/reasoning/phase，也不把 waiting 发给 provider。恢复到 TUI 时显示为通知；统计不把它当作 Turn 完成。它仍是已花费用量的完整 Step。
+
+## Step 传输字段
+
+完整 Step 新增可选 `transport`（`sse|websocket`）、`incremental`、`input_items`、`input_bytes`、`transport_fallback`。Chat Completions 同样记录 `sse`；旧日志缺字段仍可恢复，统计归 `unknown`，不按 header/provider 猜测。
+
+`transport` 和 `incremental` 表示最终成功尝试实际使用的传输与续接方式。WS 的 `input_items` 是该次线上 input 数组条数，`input_bytes` 是该数组紧凑 JSON 的 UTF-8 字节数，包含方括号和分隔符；不含请求其他字段、帧头、TLS、失败/重发尝试。完整 WS 请求同样记录这两项，结合 `incremental` 区分；SSE 不记录 input 数量/字节。`transport_fallback` 为握手/协议错误名（如 `WebSocketHandshake`、`WebSocketProtocol`），Session 内后续 SSE Step 保留该原因；`previous_response_not_found` 表示本 Step 的增量续接失效、已用完整 input 重发，传输仍可为 WS。不写 response id、路由 token 或认证数据。
+
+`model_ms` 继续包含本 Step 的握手、重发、重试和退避；`first_data_ms` 是首次接收传输数据的时间（WS 帧也包括心跳/元数据，握手头不算），`code[].first_ms` 等代码计时口径不变。失败尝试已经产生的 first_data 仍保留；模型参数计时沿用重试重置规则。`attempts` 仍只数外层重试，原地 previous_response_not_found 全量重发不增加它。日志中的 messages 始终是完整本地历史，恢复无需服务端保存 response。
+
+`python3 scripts/stats.py <日志目录> --group-by transport [--json]`（或 `--group-by incremental`）按每个完整 Step 的实际传输或续接状态筛选，再生成与其他分组相同的完整报告；比较各组 `timing.model_ms`、`timing.first_data_ms`、`timing.code_first_ms` 的 median/p90/samples。一个混合线路 Session 可出现在多个组；混合线路 Turn 的部分 Step 不作为整 Turn 墙钟样本，缺失计时不补零，过滤断点不建立 effort/工具相邻关系。incremental 分组键为 `true|false|unknown`，SSE 的 false 与全量 WS 的 false 同组，缺字段不补 false。分组是最终成功线路的观测，发生降级的 SSE 样本包含先前 WS 尝试成本，不能把分组差异直接当作纯网络耗时差。
+
+
+`full_reason` 说明本次为何未续接：`first_request`、`missing_response_id`、`unsupported_output`、`reconnect`、`scope_changed`、`compaction`、`effort_changed`、`properties_changed`、`input_prefix_mismatch`、`previous_response_not_found`、`sse_configured` 或 `sse_fallback`。实际前缀不匹配同时记录 `mismatch_index`（线上 input 的零起始位置）；成功增量无 full_reason。`--group-by full_reason` 按完整 Step 分组，成功增量归 `incremental`，旧日志缺字段归 `unknown`，沿用其他 Step 分组的过滤与相邻关系规则。
+
+每次降级立即追加独立记录，包含 `transport_fallback`、`transport_fallback_at`（Unix 毫秒）、`transport_fallback_detail`（如有）及 step，取消也不丢失该记录；它没有 usage/model_ms，messages 为空，不增加 Step，也不替换历史或 context_tokens。恢复和离线 replay 跳过其历史应用。完整 Step 保留相同原因及原始降级时间。previous_response_not_found 的原地全量重发也立即记录。协议诊断包含解析阶段、最后事件类型、output_index、已收条目数及 pending 数，不保存原始帧、认证头或路由 token。
+
+完整 Step 的 `model_attempts` 按外层尝试依次保存 start_ms/end_ms（均相对 Step 开始）、error_name/detail、transport/incremental/full_reason、fallback_reason/fallback_at/fallback_detail、bytes/content_bytes、first_content_ms/last_content_ms/max_content_gap_ms 和 max_gap_ms。content_bytes 只计非空文本、reasoning 摘要和工具参数增量；bytes 是接收响应体的字节，不含握手头。相邻尝试的 start_ms 减去前次 end_ms 可见退避。失败耗尽时 diagnostic 同样保存该数组；成功 Step 顶层 max_content_gap_ms 是最后尝试的内容间隔，不包含首次等待和重试退避。缺失的可选值省略，不补零。总超时覆盖所有 I/O，收集每次尝试前先取消并 join 请求，下一尝试才可复用 sink 和分配器。
+
+Codex 新响应的 `reasoning.includes_output:true` 表示 `reasoning.data` 是服务端完整、有序的 output 数组，包含 reasoning、message、function_call 和 custom_tool_call；展示仍用 content/tool_calls，回传只用该数组，避免重复发送。reasoning 加密条目不改写。旧日志没有标记时，沿用旧格式（data 仅推理数组）的回放方式。fork 深拷贝该标记和 data；估算 token 时只计算完整数组一次。新字段向后兼容旧日志，不保证旧二进制能读取新格式。
+
+## 实际后台执行区间
+
+后台 bash 的 finished 事件新增可选 `execution:{start_ms_epoch,end_ms_epoch}`（Unix 毫秒）：开始在 spawn 前采样，结束在 wait 返回时采样，不包含结果送达的延迟。失败在 spawn 前发生时省略 execution。取消／超时仍以进程 wait 完成为结束。此字段出现在主日志和 `ask --json` 生命周期事件中；agent 不冒用 bash 进程区间。
+
+自动后台 Run 的 `completion`／消息 `background_run` 新增同形的 `execution`，从 Run 创建到执行线程结算，包含自动转后台之前的等待；其 calls 的 start/end 仍相对原 Run 开始。执行区间不等于纯工具执行：关键路径应把 calls 偏移加到 execution.start_ms_epoch，再取实际调用区间并集，不能直接把 Run／后台注册到结果送达的整段当工具区间。
+
+旧日志可从 calls footer 的 `meta.start_ms_epoch` 得到 Run 锚点，从 completion.calls 得到完整调用（含转后台前部分）；显式后台 bash 只能从注册时间及终态 progress.elapsed_ms 近似恢复，缺少精确结束值时必须注明估计／未知，不能用送达时间冒充实际完成。
+
+## Bash 启动与取代事件
+
+每条 bash 执行单独追加 `bash` 事件，messages 为空，也不修改历史、token 或 Step 序号：
+
+- `started`：`id`（会话级 bN）、`run`（Session 内 Run 序号）、完整 `command`、启动 `cwd`、`detached`。
+- `superseded`：旧 `id`、旧 `run`、`superseded_by`（新 bN）、`elapsed_ms`（旧执行从登记到取代的单调时钟时长）。每次旧执行最多记录一次。
+- `finished`：`id`、`run`、`elapsed_ms`，进程组清理后记录，包含正常完成、失败、超时、取消和取代。日志写入失败时结束事件可能缺失。
+
+事件沿用顶层 `at` 毫秒时间戳，旧日志没有这些事件。恢复跳过事件的历史应用，并从事件 id 恢复 b 计数器；不重启命令。主日志因此也包含完整 shell 命令，分享时应检查其中的敏感参数。
+
+`scripts/stats.py` 的 JSON 字段 `bash_superseded` 统计入选记录中的 `superseded` 次数，文本显示“Bash 被取代次数”。按 --since 的事件 at 过滤；事件不计作 Step、Turn 或失败。被取代的工具 resolve 数据与后台结果仍走原有录制/消息路径；其含义和脚本分支见 [tool-delegation.md](tool-delegation.md#同一命令取代过时执行)。

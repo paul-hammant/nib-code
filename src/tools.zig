@@ -21,6 +21,7 @@ const all = [_]Tool{
         .name = "sleep",
         .doc =
         \\  // Wait ms (integer 0..2147483647); cancellable, no process/thread or tool slot. Counts Run wall time, not JS budget. Run drains even unawaited sleeps.
+        \\  // For timed delays such as service readiness. Background Run/bash/agent results arrive automatically as messages; never sleep or poll for them. No independent work: brief reply without tools; Session waits.
         \\  async sleep(ms) {}, // → null
         ,
     },
@@ -28,6 +29,7 @@ const all = [_]Tool{
         .name = "read",
         .run = files.read,
         .doc =
+        \\  // Locate with grep first, then read needed line ranges; batch large multi-file output or print snippets to stay within the Run display budget.
         \\  // Read requested lines of a UTF-8 file (max 16 MiB) verbatim. offset is 1-based; next_offset is null at EOF.
         \\  async read({ path, offset = 1, limit = 2000 }) {}, // → { text, next_offset }
         ,
@@ -79,19 +81,22 @@ const all = [_]Tool{
         .name = "bash",
         .run = bash.bash,
         .doc =
-        \\  // Bash in cwd; stderr merged. exit_code:null if killed. Returning kills its process group, including nohup/&.
-        \\  // Verbatim output; >16 MiB errors (redirect to file). >256 shell words excluding heredocs refused: write a script. File changes affect results.
-        \\  // background returns {id}; result in a later Step. detached requires background; survives normal Turns without waiting. Stop/timeout/Turn cancel or failure/Session exit cleans up.
-        \\  // A detached task ends when its shell exits; run servers in command foreground.
-        \\  async bash({ command, timeout_ms, background = false, detached = false }) {}, // → { exit_code, output } or { id }; timeout_ms default: detached 0 (unlimited), else 120000
+        \\  // cwd; merged stderr; group cleanup (nohup/& too).
+        \\  // >16 MiB:redirect. >256 words except heredocs:script.
+        \\  // background:{id}, auto-message. detached requires background, spans Turns; stop/timeout/cancel/exit cleans up.
+        \\  // Auto-bg keeps await/output. No polling/logs. Idle:reply to wait.
+        \\  // After edit/write, rerun same command/cwd: older Run stops, returns {superseded_by}, not failure; no detached.
+        \\  // Full checks:finish code/tests/fixtures/fmt; fix and rerun.
+        \\  // Example: await tools.bash({command: "sh checks.sh"})
+        \\  async bash({ command, timeout_ms, background = false, detached = false }) {}, // → { exit_code, output }, { superseded_by } or { id }; timeout_ms: 1800000 (30 min), detached:0
         ,
     },
     .{
         .name = "stop",
         .run = @import("tools/stop.zig").stop,
         .doc =
-        \\  // Cancel and join one background bash/agent by id, cleaning up its process group. Completed tasks return stopped:false; unknown ids reject. Completion is still delivered once as a background message.
-        \\  async stop({ id }) {}, // → { id, stopped }
+        \\  // Requires a concrete reason; elapsed time/no output alone is not a failure. Canceling a long test discards progress and its completed validation result; restarting repeats work. With no independent work, reply without tools to wait locally. Cancel and join one background bash/agent/Run by id, cleaning up its process group. Completed tasks return stopped:false; unknown ids reject. Completion is still delivered once as a background message.
+        \\  async stop({ id, reason }) {}, // → { id, stopped, reason, notice? }
         ,
     },
     .{
@@ -109,10 +114,10 @@ const all = [_]Tool{
         .root_only = true,
         .run = subagent.agent,
         .doc =
-        \\  // No nesting. New: clean/independent, starts over; 105-child medians: 6 read-only Steps/22% time, 12 total/~3min/~290k prompt.
-        \\  // fork: parent history+judgments/assumptions; cached first request, no reread; full history/Step. Other model/effort loses cache (Codex effort-separated; same-model history).
-        \\  // resume:a1; fork+resume rejects. One/agent; failures ok:false, args/cancel reject. usage/changes:this call, edit/write. Shared cwd/no worktree; locks/stale checks reject conflicts.
-        \\  // background:{id}, later Step; reply waits. Partial files possible.
+        \\  // Default: work yourself. Unless requested, delegate only parallel independent read-only investigations with discardable results.
+        \\  // Serial edits/builds/tests/reviews:parent. No nesting; shared cwd, partial files possible.
+        \\  // fork:parent history; model/effort switch loses cache. resume:a1 after completion; busy:wait, don't retry/replace. fork+resume rejects.
+        \\  // background:{id}, auto-delivered result message. No ps/log reads/sleep/reruns to check/wait. No independent work:brief reply without tools; Session waits. Failure:ok:false; args/cancel reject.
         \\  async agent({ prompt, resume, fork = false, timeout_ms = 1800000, model, effort, background = false }) {}, // → { ok, id, text, usage, changes, error? } or { id }
         ,
     },
@@ -145,6 +150,38 @@ const child_api = makeApi(1);
 pub const names = root_api.names;
 pub const docs = root_api.docs;
 
+pub const RunScope = struct {
+    tools: *Tools,
+    id: usize,
+    cancel: std.atomic.Value(bool) = .init(false),
+    llm_calls: std.atomic.Value(usize) = .init(0),
+    changes: @import("tools/changes.zig").Tracker = .{},
+    fork: ?@import("tools/agent/input.zig").Fork = null,
+
+    pub fn host(scope: *RunScope) sandbox.Host {
+        return .{ .ctx = scope, .names = scope.tools.api().names, .call = call, .cancel = &scope.cancel, .admit = admit };
+    }
+
+    fn call(ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8, args: []const u8) sandbox.ToolResult {
+        const scope: *RunScope = @ptrCast(@alignCast(ctx));
+        const previous = current_scope;
+        current_scope = scope;
+        defer current_scope = previous;
+        return Tools.call(scope.tools, gpa, name, args);
+    }
+
+    fn admit(ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8) !?[]u8 {
+        const scope: *RunScope = @ptrCast(@alignCast(ctx));
+        const previous = current_scope;
+        current_scope = scope;
+        defer current_scope = previous;
+        return Tools.admit(scope.tools, gpa, name);
+    }
+};
+
+// Native tool workers bind the owning Run; explicit background jobs use their own cancellation.
+threadlocal var current_scope: ?*RunScope = null;
+
 /// State shared by all tool calls of one Session; each tool lives in `tools/`.
 pub const Tools = struct {
     io: std.Io,
@@ -169,15 +206,34 @@ pub const Tools = struct {
     usage_sink: ?struct { ctx: *anyopaque, emit: *const fn (*anyopaque, provider.Usage) anyerror!void } = null,
     cancel: std.atomic.Value(bool) = .init(false),
     file_state: @import("tools/file_state.zig").State = .{},
+    bash_commands: @import("tools/bash/registry.zig").Registry = .{},
     track_changes: bool = false,
     changes_mutex: std.Io.Mutex = .init,
     changes: @import("tools/changes.zig").Tracker = .{},
 
+    fn scope(t: *Tools) ?*RunScope {
+        const value = current_scope orelse return null;
+        return if (value.tools == t) value else null;
+    }
+
+    pub fn cancelFlag(t: *Tools) *std.atomic.Value(bool) {
+        return if (t.scope()) |value| &value.cancel else &t.cancel;
+    }
+
+    pub fn runId(t: *Tools) usize {
+        return if (t.scope()) |value| value.id else t.run_id;
+    }
+
+    pub fn forkSnapshot(t: *Tools) ?@import("tools/agent/input.zig").Fork {
+        return if (t.scope()) |value| value.fork else t.fork_snapshot;
+    }
+
     pub fn noteChange(t: *Tools, gpa: std.mem.Allocator, path: []const u8, before: ?[]const u8, after: []const u8) !void {
+        if (before == null or !std.mem.eql(u8, before.?, after)) t.bash_commands.changed(t.io);
         if (!t.track_changes) return;
         t.changes_mutex.lockUncancelable(t.io);
         defer t.changes_mutex.unlock(t.io);
-        try t.changes.record(gpa, path, before, after);
+        try (if (t.scope()) |value| &value.changes else &t.changes).record(gpa, path, before, after);
     }
 
     pub fn takeChanges(t: *Tools, gpa: std.mem.Allocator, a: std.mem.Allocator) ![]const diff.Change {
@@ -241,7 +297,7 @@ pub const Tools = struct {
         const t: *Tools = @ptrCast(@alignCast(ctx));
         if (std.mem.eql(u8, name, "llm")) {
             const limit = (t.cfg orelse return error.LlmConfigUnavailable).limits.llm_calls_per_run;
-            if (t.llm_calls.fetchAdd(1, .monotonic) >= limit)
+            if ((if (t.scope()) |value| &value.llm_calls else &t.llm_calls).fetchAdd(1, .monotonic) >= limit)
                 return try std.fmt.allocPrint(gpa, "llm limit is {d} calls per Run; split into batches or filter in JavaScript first", .{limit});
         }
         return null;
@@ -316,6 +372,7 @@ pub fn callTool(name: []const u8, args: []const u8) !sandbox.ToolResult {
     defer testing.allocator.free(home);
     var t: Tools = .{ .io = testing.io, .home = home };
     defer t.file_state.deinit(testing.allocator);
+    defer t.progress.deinit(testing.allocator);
     return Tools.call(&t, testing.allocator, name, args);
 }
 
@@ -335,6 +392,7 @@ test "tool docs are valid JavaScript" {
 
 test "Promise.all runs bash concurrently and await remains sequential" {
     var t: Tools = .{ .io = testing.io, .home = "/home/nobody" };
+    defer t.progress.deinit(testing.allocator);
     const clock = std.Io.Clock.awake;
     const start = clock.now(testing.io);
     const parallel = try sandbox.eval(testing.allocator, testing.io,
@@ -360,6 +418,7 @@ test "cancel and deadline join running tools and discard queued calls" {
         }
     };
     var t: Tools = .{ .io = testing.io, .home = "/home/nobody" };
+    defer t.progress.deinit(testing.allocator);
     var flag: std.atomic.Value(bool) = .init(false);
     const thread = try std.Thread.spawn(.{}, Cancel.work, .{ testing.io, &flag });
     defer thread.join();
@@ -402,6 +461,7 @@ test "child API filters agent from both docs and sandbox" {
 
 test "Run excludes tool waits without resetting the JS budget" {
     var t: Tools = .{ .io = testing.io, .home = "/home/nobody" };
+    defer t.progress.deinit(testing.allocator);
     const waited = try sandbox.eval(testing.allocator, testing.io,
         \\const a = await tools.bash({command: "sleep 0.3; printf first"});
         \\const b = await tools.bash({command: "sleep 0.3; printf second"});
@@ -429,13 +489,28 @@ test "llm map documentation example reaches the host byte for byte" {
     const rendered = try t.documentation(testing.allocator);
     defer testing.allocator.free(rendered);
     const marker = "// Example: ";
-    const start = std.mem.indexOf(u8, rendered, marker).? + marker.len;
+    const llm_start = std.mem.indexOf(u8, rendered, "  // Pure single-step").?;
+    const start = std.mem.indexOfPos(u8, rendered, llm_start, marker).? + marker.len;
     const end = std.mem.indexOfScalarPos(u8, rendered, start, '\n').?;
     var dummy: u8 = 0;
     const result = try sandbox.eval(testing.allocator, testing.io, rendered[start..end], .{}, .{ .ctx = &dummy, .names = &.{"llm"}, .call = EchoLlm.call }, null);
     defer result.deinit(testing.allocator);
     try testing.expect(result.ok);
     try testing.expectEqualStrings("[{\"prompt\":\"Classify the input\",\"input\":\"yes\"},{\"prompt\":\"Classify the input\",\"input\":\"no\"}]", result.text);
+}
+
+test "bash documentation example keeps test output captured byte for byte" {
+    const doc = for (all) |tool| {
+        if (std.mem.eql(u8, tool.name, "bash")) break tool.doc;
+    } else unreachable;
+    const marker = "Example: ";
+    const start = std.mem.indexOf(u8, doc, marker).? + marker.len;
+    const end = std.mem.indexOfScalarPos(u8, doc, start, '\n').?;
+    var dummy: u8 = 0;
+    const result = try sandbox.eval(testing.allocator, testing.io, doc[start..end], .{}, .{ .ctx = &dummy, .names = &.{"bash"}, .call = EchoLlm.call }, null);
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.ok);
+    try testing.expectEqualStrings("{\"command\":\"sh checks.sh\"}", result.text);
 }
 
 test "grep documentation RegExp example reaches the host byte for byte" {

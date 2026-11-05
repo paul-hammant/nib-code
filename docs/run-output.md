@@ -4,9 +4,9 @@
 
 ## 模型看到什么
 
-`src/session/output.zig` 为**整个 Run**生成最多 16 KiB 的 UTF-8 输出，包含标题、分隔符与省略标记。这也是 `run_end.output`、会话日志中的 tool content、下一次模型请求共用的文本；不是每次工具调用各有 16 KiB。
+`src/session/output.zig` 为**整个 Run**生成最多配置预算（默认 16 KiB）的 UTF-8 输出，包含标题、分隔符与省略标记。这也是 `run_end.output`、会话日志中的 tool content、下一次模型请求共用的文本；不是每次工具调用各有一份预算。
 
-若用户设置了 `max_steps`，且剩余不多于 3 个 Step，Session 在上述格式化之后追加 `[N Steps left in this Turn]`。这行不占 16 KiB 预算，不会被截断；`run_end.output`、日志和下一次模型请求包含相同的完整文本。未设置上限时不追加。
+若用户设置了 `max_steps`，且剩余不多于 3 个 Step，Session 在上述格式化之后追加 `[N Steps left in this Turn]`。这行不占配置的展示预算，不会被截断；`run_end.output`、日志和下一次模型请求包含相同的完整文本。未设置上限时不追加。
 
 输出较小时沿用原格式。需要截断时：
 
@@ -17,7 +17,9 @@
 
 一次 console 打印整个结果数组仍只有一个条目。需要分别定位时，给每个结果单独打印标签；需要大量正文时，先在 JS 里过滤，或分成多个 Run 输出。
 
-日志的 `tool_bytes` 统计宿主实际交给 JS 的工具结果 UTF-8 字节数（成功按序列化 JSON、错误按错误文本），不取决于 JS 是否使用或 await；未交回结果计 0，agent 只计父 Run 返回对象。`output_bytes` 则是交给模型的实际 tool result 字节数，包含 16 KiB 预算内的截断标记、错误、无输出提示与标签，以及预算外的剩余 Step 提示（若有），不是原始工具数据大小。
+日志的 `tool_bytes` 统计宿主实际交给 JS 的工具结果 UTF-8 字节数（成功按序列化 JSON、错误按错误文本），不取决于 JS 是否使用或 await；未交回结果计 0，agent 只计父 Run 返回对象。`output_bytes` 则是交给模型的实际 tool result 字节数，包含展示预算内的截断标记、错误、无输出提示与标签，以及预算外的剩余 Step 提示（若有），不是原始工具数据大小。
+
+展示预算由 `[limits].run_output_bytes` 或 `NIB_RUN_OUTPUT_BYTES` 配置（16384–16777216 字节）。system prompt 随有效配置渲染；恢复会话仍保留原 system。下限保留现有格式化标题与省略标记空间；提高展示预算不会提高下述 console 捕获上限，也不会改变 JS 内工具结果。先 grep 定位，再按行范围读；多文件长正文应分批或只打印片段。
 
 ## 捕获上限
 
@@ -32,7 +34,7 @@
 
 范围中若仍有正文落在捕获的头部或尾部，会与其他条目一样参与展示预算分配；上例表示范围正文恰好全部省略。范围之后仍显示最后 32 次调用的明细，最终返回值／错误的编号继续按原始调用次数递增。正文、调用明细和格式化缓冲区的内存均不会随 console 调用次数无限增长。省略字节数同时包含捕获阶段和模型展示阶段的损失。
 
-独立的 `nib js`、TUI `/js` 显示 sandbox 捕获的头尾，并在中间插入 `[console output truncated: N of T bytes omitted]`，其中 N 包含 UTF-8 修边损失。不套用模型侧 16 KiB 格式化；未超限时保持原输出。
+独立的 `nib js`、TUI `/js` 显示 sandbox 捕获的头尾，并在中间插入 `[console output truncated: N of T bytes omitted]`，其中 N 包含 UTF-8 修边损失。不套用模型侧展示预算格式化；未超限时保持原输出。
 
 ## 工具返回的数据与显式上限
 
@@ -56,21 +58,29 @@
 
 顶层 Run Promise fulfill 或 reject 后都继续 drain：等待在途及排队工具完成，执行剩余 JS jobs，并接纳 continuation 新发起的工具调用，直到没有剩余工作。任意调用失败都不会取消其他调用（不只子 agent 失败）；顶层 reject 时，Run 最终仍报原始拒绝原因，不被后续完成或失败覆盖。因此 `Promise.all` 提前 reject 不代表并行副作用停止，失败的 Run 也可能继续写文件；前台 agent 仍需等待完成并计入用量，等待期间用户仍可按 Esc 取消。后台任务的跨 Run 生命周期见 [tool-delegation.md](tool-delegation.md)。
 
-只有用户取消或 JS 执行超时才中止 Run 内工具；工具自身超时只终止该调用，不取消其他调用。中止时如有未完成调用，Run 输出保留一行：
+用户取消或 JS 执行超时会中止整个 Run 的在途及排队工具；单个工具超时、bash 被取代或按 id stop 只终止目标，不取消其他调用。整个 Run 中止时如有未完成调用，输出保留一行：
 
 ```text
 [stopped before completion: bash #0, agent #2]
 ```
 
-这里的索引按该 Run 内全部工具调用的创建顺序从 0 开始，不是各工具独立编号，也不是后台任务 id；已交回 JS 的调用不列入，未交回的调用（包括仍在排队或已产生结果但尚未交回的调用）按创建顺序列出。这行最多 4 KiB；清单过长时用 `..., N more` 明示剩余调用数，为错误和 console 保留空间。整行预留模型侧 16 KiB 输出预算，不会被正文截断，用于区分报错前已完成的副作用与可能留下半成品的调用。普通 fulfill/reject 的 drain 完成不会产生这行。
+这里的索引按该 Run 内全部工具调用的创建顺序从 0 开始，不是各工具独立编号，也不是后台任务 id；已交回 JS 的调用不列入，未交回的调用（包括仍在排队或已产生结果但尚未交回的调用）按创建顺序列出。这行最多 4 KiB；清单过长时用 `..., N more` 明示剩余调用数，为错误和 console 保留空间。整行预留模型侧展示预算，不会被正文截断，用于区分报错前已完成的副作用与可能留下半成品的调用。普通 fulfill/reject 的 drain 完成不会产生这行。
 
 Run 的默认 5 分钟超时只累计 QuickJS 执行片段（初始脚本、Promise jobs、工具结果解析/resolve、返回值序列化和错误转换），不计算等待工具完成（包括 `tools.sleep`）的时间，也不在每次 await 后重置预算。它用于中断 JS 死循环；bash/fetch/agent 的执行时限由各自工具负责。等待时仍以不超过 20 ms 的间隔检查取消，Esc/SIGINT/SIGTERM 不受计时暂停影响。
+
+## bash 执行时限
+
+未传 timeout_ms 的普通 bash（前台或显式后台）使用 1800000 ms（30 分钟）的有限上限。Run 自动转后台只改变结果交付时机，不重置命令的截止时间。冷缓存并发冒烟中，120 秒默认值杀掉了首次 `zig build test`，重跑仍花了 130 秒；因此把默认窗口放大 15 倍，与 agent 默认的 30 分钟预算一致，给冷编译及资源争用留余量，同时避免普通命令无限失控。这是运行预算选择，不保证任意构建都能完成；超过预算的已知长任务应显式设置 timeout_ms。
+
+显式正数 timeout_ms 原样生效，仍从命令启动后计时；负数拒绝，0 仅允许 `background:true, detached:true`。detached 默认 0，沿用会话级服务语义。超时、stop、取消、Turn 失败和 Session 退出仍清理进程组；正常 Turn 收尾等待普通后台结果，正常 shell 退出也清理整组，不保留 nohup/& 后代。输出上限仍为 16 MiB。
 
 ## Run 内延时与轮询
 
 `await tools.sleep(ms)` 返回 `null`；`ms` 必须是 `0..2147483647` 的整数（毫秒）。缺少参数、非数字、非有限值、小数或越界值都会使 Promise reject，不做类型转换。`0` 也走异步调度。
 
 延时由 sandbox 原生事件循环计时器完成，不启动进程或线程，也不占工具并发槽；优先用它代替 `bash` 执行 `sleep` 或 JS 忙等。等待本身不调用模型、不产生 token 用量，但仍增加 Run 的墙钟耗时；JS 执行预算在等待期间暂停，轮询中的 JS 执行仍累计，read/fetch 等调用仍有各自成本。
+
+不要用 sleep 等后台 bash/agent/Run 的完成结果；Session 自动交付。没有独立工作时极短回复且不调用工具，Session 在本地等待 inbox，再继续下一 Step。sleep 仍可用于下面的服务就绪探测：后台服务可能一直运行，但已经可以接受请求。仅因存在待完成后台任务而拦截 sleep 无法区分这两种情况，因此只在 system、工具说明和自动后台通知中明确提示，不更改 sleep 返回值、计时或录制/重放。
 
 例如轮询本地服务的 HTTP 状态，最多检查 10 次，相邻检查之间等待 1 秒；非 200 状态重试，连接等错误仍会 reject 并终止 Run：
 
@@ -89,3 +99,19 @@ console.log("service ready");
 ```
 
 与其他已调度工具一样，正常结束 Run 前会排空待完成的 sleep，即使没有 `await`；它不是跨 Run 的后台任务。用户取消或 JS 执行超时时会及时丢弃未到期计时器，不等延时结束；顶层 Promise reject 时，已发出的工具调用继续排空，但未到期的计时器直接丢弃（计时器本身没有副作用，它的后续逻辑尚未开始）；取消检查沿用上述不超过 20 ms 的间隔。sleep 走标准工具计时、结果字节统计和录制/重放路径；重放按录制结果结算，不实际等待，见 [replay.md](replay.md)。
+
+## 长 Run 自动转后台
+
+模型发起的 Run 超过 `[limits].run_background_after_ms`（默认 10000 ms）且沙箱仍在等待工具或 sleep 时，整个 Run 自动转后台，分配会话级 `r1…` ID。当前 Step 收到明确通知：捕获的输出保留，完成后自动作为消息投递；模型可继续有用工作，无需用 ps、cat/tail 日志、sleep、空 Run 或 timeout 重跑检查/等待，也不提前读取重定向日志。测试输出默认直接捕获，只有超过 16 MiB 上限时才重定向。它是成功登记的通知，不代表脚本执行成功。连续执行的 JS 不在中途转后台，仍受 JS 执行预算限制；工具等待和主线程轮询以约 20 ms 为粒度。
+
+原 Sandbox、Promise、工具参数与结果保持原样：`const r = await tools.bash(...); if (r.exit_code) ...` 的 continuation 仍收到完整 `{exit_code,output}`，不会收到任务 ID。顶层 fulfill/reject 的 drain、JS 执行预算、工具超时和输出捕获上限均保持原语义。阈值之前与之后的 console 一起捕获，只在最终结果中展示一次；提前通知不展示部分 console。
+
+后台 Run 使用自己的取消标记、llm 调用限额、changes、计时和录制缓冲；Session 的 agent 并发、后台 bash 并发、任务 ID、文件观察状态和用量仍共享。最多同时有 8 个自动后台 Run，独立于后台 bash 的 8 个上限；达到上限时新 Run 保持前台等待，不失败、不排队转后台。每个 Sandbox 仍最多同时执行 8 个工具。后台 Run 本身不消耗额外 Step，之后的主模型请求仍逐次消耗 Step。
+
+结束后用同一个 `session/output.zig` 格式化器生成配置预算内的最终输出，通过 Inbox 插入 `[background run rN finished]` 后接完整格式化输出的 user 消息；来源前缀是预算外的信封。通知和最终输出各展示一次。没有独立工作时，模型应立即以极短、无工具调用的回复结束当前 Step；不要用 console.log 模拟回复。成功但无输出、无实际宿主工具调用的空 Run 同样进入等待；有计算输出的纯 JS Run 仍正常继续。该回复保留在历史中并标记 `waiting:true`，作为 notice 展示，不作为最终答案；Session 在本地等待 Inbox，不额外请求模型，结果送达后自动继续下一 Step。普通后台任务同样适用；detached bash 不触发等待。等待期间仍可取消或接收用户插话。Step 上限收尾先等结果送达，不额外请求模型。Esc/SIGINT/SIGTERM、Turn 失败、Session 退出或切换都会取消并 join Run 及其工具，bash 按原有进程组规则清理；SIGKILL 无法执行清理。`tools.stop({id:"r1",reason:"测试已报错，需要修改输入"})` 也可停止另一个后台 Run，仍投递取消结果；不能停止当前 Run 自己。取消不会回滚已发生的 edit/write 或 shell 副作用。
+
+后台 Run 的所有成功 edit/write（含转后台之前）只归属该 Run，最终结果事件与日志的 `completion.changes` 保存按操作累计的计数和 diff；临时通知不提前领取 changes。TUI 在后台结果中显示输出与这些改动，恢复也能显示；子 agent 的调用结果同样汇总这些改动。bash 的改动继续不计入 changes。
+
+多个 Run 共享 cwd，可能同时使用或修改文件。file_state 的互斥锁保证状态表安全，路径锁串行化单次 read/edit/write，write 能发现当前会话最近观察之后的外部改动；但会话内别的 Run 的 read/write 会更新同一观察状态，因此它不是每个脚本独立的乐观事务，也不能检测所有 Run 间语义冲突。bash 更不参与文件锁。edit/write 修改后可直接重跑相同 command/cwd，旧 bash 按[取代语义](tool-delegation.md#同一命令取代过时执行)停止并返回 `{superseded_by}`；只停止匹配的 bash，原 Run 的后续代码仍会继续，已有副作用不回滚。处理后台结果前按需要重新 read，核对当前文件状态。
+
+进程退出后不恢复 JS 堆或重启命令，未送达任务按原后台机制恢复为 lost；已经提交的结果不重复投递。离线 replay 不重现墙钟切换：按原 Step/Run 定位录制，重放完整脚本，比较最终输出。最终结果尚未提交时，不把提前通知当成脚本的期望输出。

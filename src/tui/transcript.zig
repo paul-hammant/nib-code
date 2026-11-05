@@ -69,6 +69,9 @@ pub const Transcript = struct {
                 try e.label.appendSlice(gpa, " · ");
                 try appendPreview(gpa, &e.label, preview);
             }
+        } else if (kind == .run) {
+            try e.label.appendSlice(gpa, " · ");
+            try appendPreview(gpa, &e.label, result);
         } else if (std.mem.indexOf(u8, result, if (kind == .agent) "\"text\":" else "\"output\":")) |at| {
             const tail = std.mem.trimStart(u8, result[at + (if (kind == .agent) @as(usize, 7) else 9) ..], " \t\r\n");
             if (tail.len > 0 and tail[0] == '"') {
@@ -295,11 +298,13 @@ pub const Transcript = struct {
                 const parsed = std.json.parseFromSlice(Result, gpa, result, .{ .ignore_unknown_fields = true }) catch null;
                 defer if (parsed) |value| value.deinit();
                 const parsed_ok = if (parsed) |value| (if (kind == .agent) value.value.ok orelse false else value.value.exit_code != null and value.value.exit_code.? == 0) else false;
-                try t.backgroundResult(gpa, kind, m.background_id orelse "?", m.background_ok orelse parsed_ok, result);
+                const shown = if (m.background_run) |completion| try runResultText(gpa, completion.output, completion.changes) else null;
+                defer if (shown) |text| gpa.free(text);
+                try t.backgroundResult(gpa, kind, m.background_id orelse "?", m.background_ok orelse parsed_ok, shown orelse result);
             } else if (std.mem.eql(u8, m.role, "user")) {
                 try t.add(gpa, .user, content);
             } else if (std.mem.eql(u8, m.role, "assistant")) {
-                if (content.len > 0) try t.add(gpa, .assistant, content);
+                if (content.len > 0) try t.add(gpa, if (m.waiting orelse false) .info else .assistant, content);
                 for (m.tool_calls orelse &.{}) |call| {
                     const Args = struct { code: []const u8 = "" };
                     const args = std.json.parseFromSlice(Args, gpa, call.function.arguments, .{ .ignore_unknown_fields = true }) catch continue;
@@ -510,6 +515,7 @@ test "thinking stays hidden in streamed and restored transcripts" {
     t.clear(gpa);
     try t.addHistory(gpa, &.{
         .{ .role = "user", .content = "hi" },
+        .{ .role = "assistant", .reasoning = .{ .provider = .codex, .data = "[{\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"opaque\"}]" } },
         .{ .role = "assistant", .reasoning = .{ .provider = .chat_completions, .data = "hidden thinking" }, .tool_calls = &.{.{ .id = "1", .function = .{ .name = "run", .arguments = "{\"code\":\"tools.bash({})\"}" } }} },
         .{ .role = "tool", .tool_call_id = "1", .content = "out" },
         .{ .role = "assistant", .content = "answer", .reasoning = .{ .provider = .codex, .data = "[{\"summary\":[{\"text\":\"hidden summary\"}]}]" } },
@@ -518,6 +524,15 @@ test "thinking stays hidden in streamed and restored transcripts" {
     try testing.expectEqualStrings("answer", t.lastAnswer().?);
     try testing.expectEqualStrings("out", t.entries.items[1].output.items);
     try testing.expect(t.entries.items[1].run == .ok);
+}
+
+test "restored waiting replies are notices rather than answers" {
+    const gpa = testing.allocator;
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    try t.addHistory(gpa, &.{.{ .role = "assistant", .content = "Waiting.", .waiting = true }});
+    try testing.expectEqual(Kind.info, t.entries.items[0].kind);
+    try testing.expect(t.lastAnswer() == null);
 }
 
 test "a Run shows changed files in its summary and a colored diff when open" {
@@ -1206,4 +1221,20 @@ test "two coalesced background invocations in one drain register before ID only 
     try t.backgroundResult(gpa, .agent, id, false, "{}");
     try testing.expectEqualStrings("  └─ a1 second · failed · step 0", t.entries.items[0].agent_tree.rows.items[0].text);
     try testing.expect(!t.entries.items[0].agents.items[0].background);
+}
+
+pub fn runResultText(gpa: std.mem.Allocator, result: []const u8, changes: []const @import("../tools/diff.zig").Change) ![]u8 {
+    var formatted = try ChangeText.init(gpa, changes);
+    defer formatted.deinit(gpa);
+    if (formatted.summary.len == 0) return gpa.dupe(u8, result);
+    return std.fmt.allocPrint(gpa, "{s}\n\n{s}\n{s}", .{ result, formatted.summary, formatted.diff });
+}
+
+test "automatic Run and its agent have a mixed task label" {
+    var transcript: Transcript = .{};
+    defer transcript.deinit(testing.allocator);
+    try transcript.startRun(testing.allocator, "await tools.agent({prompt:'task'})");
+    try transcript.progress(testing.allocator, .{ .id = "a1", .kind = .agent, .prompt = "task" });
+    try transcript.progress(testing.allocator, .{ .id = "r1", .kind = .run, .prompt = "Run", .background = true });
+    try testing.expect(std.mem.startsWith(u8, transcript.entries.items[0].label.items, "task ×2"));
 }

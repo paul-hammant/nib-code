@@ -16,6 +16,7 @@ pub const Background = struct {
     log: ?*Log = null,
     turn_step: u32 = 0,
     bash_active: usize = 0,
+    runs: std.ArrayList(*@import("../session/run_job.zig").Job) = .empty,
 
     pub const bash_limit = @import("../sandbox.zig").tool_concurrency;
 
@@ -36,6 +37,7 @@ pub const Background = struct {
         announced: bool = false,
         delivered: bool = false,
         failure: ?anyerror = null,
+        execution: @import("../sandbox/timing.zig").Execution = .{},
 
         fn join(job: *Job) void {
             if (job.thread) |thread| {
@@ -83,7 +85,8 @@ pub const Background = struct {
             const t = job.t;
             const result = switch (job.kind) {
                 .agent => agent.execute(t, gpa, job.args, &job.cancel, job.id, job.run, true, job.fork_input),
-                .bash => @import("bash.zig").executeBackground(t, gpa, job.args, &job.cancel, .{ .id = job.id, .run = job.run, .background = true, .kind = .bash, .prompt = "" }),
+                .run => unreachable,
+                .bash => @import("bash.zig").executeBackground(t, gpa, job.args, &job.cancel, .{ .id = job.id, .run = job.run, .background = true, .kind = .bash, .prompt = "" }, &job.execution),
             } catch |err| try @import("../tools.zig").fail(gpa, "{s}", .{@errorName(err)});
             defer switch (result) {
                 inline else => |bytes| gpa.free(bytes),
@@ -103,19 +106,20 @@ pub const Background = struct {
             const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
             defer parsed.deinit();
             const ok = switch (job.kind) {
+                .run => unreachable,
                 .agent => parsed.value.object.get("ok").?.bool,
-                .bash => if (parsed.value.object.get("exit_code")) |code| code == .integer and code.integer == 0 else false,
+                .bash => if (parsed.value.object.get("exit_code")) |code| code == .integer and code.integer == 0 else parsed.value.object.contains("superseded_by"),
             };
             const prefix = try std.fmt.allocPrint(gpa, "[background {s} {s} finished]\n", .{ @tagName(job.kind), job.id });
             defer gpa.free(prefix);
-            const formatted = try output.formatMessage(gpa, prefix, json);
+            const formatted = try output.formatMessage(gpa, prefix, json, if (t.cfg) |cfg| cfg.limits.run_output_bytes else output.max_bytes);
             defer gpa.free(formatted);
             if (job.kind == .agent) {
                 t.agent_sessions.mutex.lockUncancelable(t.io);
                 defer t.agent_sessions.mutex.unlock(t.io);
-                _ = try t.background.inbox.?.enqueueBackground(gpa, t.io, job.id, job.kind, .finished, ok, formatted, job.detached, job.invocation);
+                _ = try t.background.inbox.?.enqueueBackground(gpa, t.io, job.id, job.kind, .finished, ok, formatted, job.detached, job.invocation, if (job.execution.end_ms_epoch > 0) job.execution else null);
                 t.agent_sessions.releaseLocked(job.id);
-            } else _ = try t.background.inbox.?.enqueueBackground(gpa, t.io, job.id, job.kind, .finished, ok, formatted, job.detached, job.invocation);
+            } else _ = try t.background.inbox.?.enqueueBackground(gpa, t.io, job.id, job.kind, .finished, ok, formatted, job.detached, job.invocation, if (job.execution.end_ms_epoch > 0) job.execution else null);
         }
     };
 
@@ -143,8 +147,8 @@ pub const Background = struct {
         } else false;
         const job = try gpa.create(Job);
         errdefer gpa.destroy(job);
-        const progress_id = task_id orelse try t.progress.add(gpa, t.io, kind, prompt, t.run_id, true);
-        if (detached) try t.progress.update(gpa, t.io, .{ .id = progress_id, .run = t.run_id, .kind = kind, .background = true, .detached = true, .prompt = prompt, .state = .queued });
+        const progress_id = task_id orelse try t.progress.add(gpa, t.io, kind, prompt, t.runId(), true);
+        if (detached) try t.progress.update(gpa, t.io, .{ .id = progress_id, .run = t.runId(), .kind = kind, .background = true, .detached = true, .prompt = prompt, .state = .queued });
         const id = try gpa.dupe(u8, progress_id);
         errdefer gpa.free(id);
         const copy = try gpa.dupe(u8, args);
@@ -156,7 +160,7 @@ pub const Background = struct {
         const fork_copy = if (fork_input) |input| try gpa.dupe(u8, input) else null;
         errdefer if (fork_copy) |input| gpa.free(input);
         try bg.jobs.ensureUnusedCapacity(gpa, 1);
-        job.* = .{ .t = t, .gpa = gpa, .args = copy, .prompt = prompt_copy, .id = id, .kind = kind, .detached = detached, .fork_input = fork_copy, .run = t.run_id, .invocation = t.progress.currentInvocation(t.io, id) };
+        job.* = .{ .t = t, .gpa = gpa, .args = copy, .prompt = prompt_copy, .id = id, .kind = kind, .detached = detached, .fork_input = fork_copy, .run = t.runId(), .invocation = t.progress.currentInvocation(t.io, id) };
         try log.background(t.io, gpa, .{ .id = id, .kind = kind, .state = .started }, bg.turn_step);
         @import("../sandbox.zig").tool_identity = .{ .id = progress_id, .background = true };
         bg.jobs.appendAssumeCapacity(job);
@@ -173,6 +177,24 @@ pub const Background = struct {
         return result;
     }
 
+    pub fn adoptRun(bg: *Background, job: *@import("../session/run_job.zig").Job) !bool {
+        const t = job.t;
+        bg.lifecycle.lockUncancelable(t.io);
+        defer bg.lifecycle.unlock(t.io);
+        bg.mutex.lockUncancelable(t.io);
+        defer bg.mutex.unlock(t.io);
+        var active: usize = 0;
+        for (bg.runs.items) |run| if (!run.done.load(.acquire)) {
+            active += 1;
+        };
+        if (active >= @import("../sandbox.zig").tool_concurrency) return false;
+        try bg.runs.ensureUnusedCapacity(job.gpa, 1);
+        job.id = try t.progress.add(job.gpa, t.io, .run, "Run", job.scope.id, true);
+        try bg.log.?.background(t.io, job.gpa, .{ .id = job.id, .kind = .run, .state = .started }, bg.turn_step);
+        bg.runs.appendAssumeCapacity(job);
+        return true;
+    }
+
     pub fn setTurnStep(bg: *Background, io: std.Io, step: u32) void {
         bg.mutex.lockUncancelable(io);
         defer bg.mutex.unlock(io);
@@ -182,6 +204,7 @@ pub const Background = struct {
     pub fn pending(bg: *Background, io: std.Io) bool {
         bg.mutex.lockUncancelable(io);
         defer bg.mutex.unlock(io);
+        for (bg.runs.items) |job| if (!job.delivered) return true;
         for (bg.jobs.items) |job| if (!job.detached and !job.delivered) return true;
         return false;
     }
@@ -189,6 +212,7 @@ pub const Background = struct {
     pub fn anyPending(bg: *Background, io: std.Io) bool {
         bg.mutex.lockUncancelable(io);
         defer bg.mutex.unlock(io);
+        for (bg.runs.items) |job| if (!job.delivered) return true;
         for (bg.jobs.items) |job| if (!job.delivered) return true;
         return false;
     }
@@ -203,12 +227,21 @@ pub const Background = struct {
             if (names.items.len > 0) try names.appendSlice(gpa, ", ");
             try names.print(gpa, "{s} {s}", .{ @tagName(job.kind), job.id });
         }
+        for (bg.runs.items) |job| {
+            if (job.delivered) continue;
+            if (names.items.len > 0) try names.appendSlice(gpa, ", ");
+            try names.print(gpa, "run {s}", .{job.id});
+        }
         return names.toOwnedSlice(gpa);
     }
 
     pub fn delivered(bg: *Background, io: std.Io, id: []const u8, invocation: usize) void {
         bg.mutex.lockUncancelable(io);
         defer bg.mutex.unlock(io);
+        for (bg.runs.items) |job| if (std.mem.eql(u8, job.id, id)) {
+            job.delivered = true;
+            return;
+        };
         for (bg.jobs.items) |job| if (!job.delivered and job.invocation == invocation and std.mem.eql(u8, job.id, id)) {
             job.delivered = true;
             return;
@@ -220,6 +253,27 @@ pub const Background = struct {
         defer bg.lifecycle.unlock(io);
         bg.mutex.lockUncancelable(io);
         defer bg.mutex.unlock(io);
+        for (bg.runs.items) |job| {
+            if (!job.announced) {
+                try emit(ctx, .{ .id = job.id, .kind = .run, .state = .started });
+                job.announced = true;
+            }
+            if (job.collected) continue;
+            try job.t.progress.update(job.gpa, io, .{ .id = job.id, .run = job.scope.id, .kind = .run, .background = true, .prompt = "Run", .elapsed_ms = if (job.done.load(.acquire)) job.elapsed_ms else job.timing.elapsed(), .state = if (job.done.load(.acquire)) .done else .working });
+            if (!job.done.load(.acquire)) continue;
+            var scratch: std.heap.ArenaAllocator = .init(job.gpa);
+            defer scratch.deinit();
+            const completion = job.completion(scratch.allocator()) catch |err| {
+                job.collected = true;
+                job.delivered = true;
+                return err;
+            };
+            const text = try std.fmt.allocPrint(job.gpa, "[background run {s} finished]\n{s}", .{ job.id, completion.output });
+            defer job.gpa.free(text);
+            _ = try bg.inbox.?.enqueueCompletion(job.gpa, io, job.id, .run, .finished, completion.ok, text, false, 0, completion, completion.execution);
+            job.collected = true;
+            job.releaseExecution();
+        }
         for (bg.jobs.items) |job| {
             if (!job.announced) {
                 try emit(ctx, .{ .id = job.id, .kind = job.kind, .state = .started });
@@ -239,6 +293,24 @@ pub const Background = struct {
         bg.lifecycle.lockUncancelable(io);
         defer bg.lifecycle.unlock(io);
         bg.mutex.lockUncancelable(io);
+        for (bg.runs.items) |job| if (std.mem.eql(u8, job.id, id)) {
+            if (job.scope.id == (@as(*Tools, @fieldParentPtr("background", bg))).runId()) {
+                bg.mutex.unlock(io);
+                return error.CannotStopCurrentRun;
+            }
+            const stopped = !job.done.load(.acquire);
+            job.cancel.store(true, .release);
+            bg.mutex.unlock(io);
+            bg.lifecycle.unlock(io);
+            defer bg.lifecycle.lockUncancelable(io);
+            const t: *Tools = @fieldParentPtr("background", bg);
+            while (!job.done.load(.acquire)) {
+                if (t.cancelFlag().load(.acquire)) return error.Canceled;
+                try std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(20), .clock = .awake }, io);
+            }
+            job.join();
+            return stopped;
+        };
         var index = bg.jobs.items.len;
         const job = while (index > 0) {
             index -= 1;
@@ -264,10 +336,12 @@ pub const Background = struct {
         bg.lifecycle.lockUncancelable(io);
         defer bg.lifecycle.unlock(io);
         bg.mutex.lockUncancelable(io);
+        for (bg.runs.items) |job| job.cancel.store(true, .release);
         for (bg.jobs.items) |job| if (!job.detached) {
             job.cancel.store(true, .release);
         };
         bg.mutex.unlock(io);
+        for (bg.runs.items) |job| job.join();
         for (bg.jobs.items) |job| {
             if (!job.detached) job.join();
             job.reap();
@@ -278,10 +352,14 @@ pub const Background = struct {
         // Background is owned by Tools; teardown shares the same lifecycle lock as stopById.
         const t: *Tools = @fieldParentPtr("background", bg);
         const io = t.io;
+        bg.mutex.lockUncancelable(io);
+        bg.cancel.store(true, .release);
+        for (bg.runs.items) |job| job.cancel.store(true, .release);
+        bg.mutex.unlock(io);
+        for (bg.runs.items) |job| job.join();
         bg.lifecycle.lockUncancelable(io);
         defer bg.lifecycle.unlock(io);
         bg.mutex.lockUncancelable(io);
-        bg.cancel.store(true, .release);
         for (bg.jobs.items) |job| job.cancel.store(true, .release);
         bg.mutex.unlock(io);
         for (bg.jobs.items) |job| job.join();
@@ -289,6 +367,8 @@ pub const Background = struct {
         defer bg.mutex.unlock(io);
         for (bg.jobs.items) |job| job.destroy();
         bg.jobs.clearAndFree(gpa);
+        for (bg.runs.items) |job| job.destroy();
+        bg.runs.clearAndFree(gpa);
         bg.inbox = null;
         bg.log = null;
     }

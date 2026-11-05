@@ -126,7 +126,7 @@ def main():
             with socket.socket() as sock:
                 sock.bind(("127.0.0.1", 0))
                 port = sock.getsockname()[1]
-            env.update(NIB_PROVIDER=provider, NIB_API_KEY="fake-key",
+            env.update(NIB_PROVIDER=provider, NIB_CODEX_TRANSPORT="sse", NIB_API_KEY="fake-key",
                        NIB_BASE_URL=f"http://127.0.0.1:{port}", NIB_CONTEXT_WINDOW="128000",
                        NIB_MODEL="gpt-6.1-terra" if provider == "codex" else "mock-model",
                        HOME=str(tmp), NIB_HOME=str(tmp / "nib"), CODEX_HOME=str(tmp / "codex"),

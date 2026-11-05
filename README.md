@@ -12,7 +12,7 @@ const r = await tools.bash({ command: "zig build test" });
 r.exit_code === 0 ? "ok" : r.output
 ```
 
-Version 0.3.0. This is a personal project and still changes quickly.
+Version 0.4.0. This is a personal project and still changes quickly.
 
 ## Features
 
@@ -22,7 +22,7 @@ Version 0.3.0. This is a personal project and still changes quickly.
   - A failure comes back as data and does not affect other sub-agents in the same Run.
   - The result lists the files the sub-agent changed.
   - Pass `resume: "a1"` to continue an earlier sub-agent with its history intact.
-- **Background tasks.** `agent` and `bash` accept `background: true`. The call returns a task id right away and the main model keeps working. The result arrives as a message in a later Step. Long-lived processes such as dev servers can use `detached: true`. Use `tools.stop({ id })` to stop a task.
+- **Background tasks.** `agent` and `bash` accept `background: true`. The call returns a task id right away and the main model keeps working. The result arrives as a message in a later Step. Long-lived processes such as dev servers can use `detached: true`. Use `tools.stop({ id, reason })` with a nonblank reason to stop a task.
 - **Per-Step reasoning effort.** The model can ask for lower effort on its next Step. Your setting is the upper bound. Effort is restored automatically after a failed Run or when you interject.
 - **TUI.**
   - Interject while a turn is running.

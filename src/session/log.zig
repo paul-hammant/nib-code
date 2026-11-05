@@ -3,7 +3,8 @@ const provider = @import("../provider.zig");
 
 pub const RunResult = struct {
     tool_call_id: []const u8,
-    ok: bool,
+    background_id: ?[]const u8 = null,
+    ok: ?bool = null,
     run_ms: ?u64 = null,
     tool_bytes: ?u64 = null,
     output_bytes: ?u64 = null,
@@ -16,6 +17,7 @@ pub const Diagnostic = struct {
     message: []const u8,
     attempts: u32,
     step: u32,
+    model_attempts: ?[]const @import("../provider/timing.zig").Attempt = null,
 };
 
 pub const AgentSession = struct {
@@ -34,6 +36,7 @@ pub const Record = struct {
     diagnostic: ?Diagnostic = null,
     agent_session: ?AgentSession = null,
     background: ?@import("events.zig").Background = null,
+    bash: ?@import("../tools/bash/registry.zig").Event = null,
     usage: ?provider.Usage = null,
     effort: ?[]const u8 = null,
     effort_source: ?provider.EffortSource = null,
@@ -41,6 +44,17 @@ pub const Record = struct {
     turn_step: ?u32 = null,
     ms: ?u64 = null,
     model_ms: ?u64 = null,
+    transport: ?[]const u8 = null,
+    incremental: ?bool = null,
+    input_items: ?usize = null,
+    input_bytes: ?usize = null,
+    transport_fallback: ?[]const u8 = null,
+    transport_fallback_at: ?i64 = null,
+    transport_fallback_detail: ?[]const u8 = null,
+    full_reason: ?[]const u8 = null,
+    mismatch_index: ?usize = null,
+    model_attempts: ?[]const @import("../provider/timing.zig").Attempt = null,
+    max_content_gap_ms: ?u64 = null,
     attempts: ?u32 = null,
     first_data_ms: ?u64 = null,
     max_gap_ms: ?u64 = null,
@@ -72,6 +86,7 @@ pub const Log = struct {
     mutex: std.Io.Mutex = .init,
     next_agent_id: u64 = 1,
     next_bash_id: u64 = 1,
+    next_run_id: u64 = 1,
     agent_sessions: []const AgentSession = &.{},
     lost_background: []const @import("events.zig").Background = &.{},
     pending_background_bytes: u64 = 0,
@@ -103,7 +118,7 @@ pub const Log = struct {
         if (expected_parent) |parent| {
             if (!std.mem.eql(u8, parent, restored.parent_session_id orelse "")) return error.AgentSessionParentMismatch;
         }
-        var log: Log = .{ .file = file, .offset = data.len, .parent_session_id = restored.parent_session_id, .cache_key = restored.cache_key, .forked_from = restored.forked_from, .provider = restored.provider, .model = restored.model, .steps = restored.steps, .next_agent_id = restored.next_agent_id, .next_bash_id = restored.next_bash_id, .agent_sessions = restored.agent_sessions, .lost_background = restored.lost_background, .pending_background_bytes = restored.pending_background_bytes };
+        var log: Log = .{ .file = file, .offset = data.len, .parent_session_id = restored.parent_session_id, .cache_key = restored.cache_key, .forked_from = restored.forked_from, .provider = restored.provider, .model = restored.model, .steps = restored.steps, .next_agent_id = restored.next_agent_id, .next_bash_id = restored.next_bash_id, .next_run_id = restored.next_run_id, .agent_sessions = restored.agent_sessions, .lost_background = restored.lost_background, .pending_background_bytes = restored.pending_background_bytes };
         if (restored.needs_repair) try log.append(io, a, .{ .repair = true });
         for (restored.background_repairs) |event| try log.append(io, a, .{ .background = event });
         if (restored.needs_repair or restored.background_repairs.len != 0) try log.file.sync(io);
@@ -133,10 +148,31 @@ pub const Log = struct {
         try log.file.sync(io);
     }
 
+    pub fn bash(log: *Log, io: std.Io, a: std.mem.Allocator, event: @import("../tools/bash/registry.zig").Event) !void {
+        log.mutex.lockUncancelable(io);
+        defer log.mutex.unlock(io);
+        try log.append(io, a, .{ .bash = event });
+    }
+
     pub fn agentSession(log: *Log, io: std.Io, a: std.mem.Allocator, mapping: AgentSession) !void {
         log.mutex.lockUncancelable(io);
         defer log.mutex.unlock(io);
         try log.append(io, a, .{ .agent_session = mapping });
+        errdefer log.poisoned = true;
+        try log.file.sync(io);
+    }
+
+    pub fn fallback(log: *Log, io: std.Io, a: std.mem.Allocator, info: @import("../provider/codex_ws.zig").Info, step: u32) !void {
+        log.mutex.lockUncancelable(io);
+        defer log.mutex.unlock(io);
+        try log.append(io, a, .{
+            .transport = @tagName(info.transport),
+            .transport_fallback = info.fallback_reason,
+            .transport_fallback_at = info.fallback_at,
+            .transport_fallback_detail = info.fallback_detail,
+            .full_reason = info.full_reason,
+            .turn_step = step,
+        });
         errdefer log.poisoned = true;
         try log.file.sync(io);
     }
@@ -209,12 +245,13 @@ fn restoreToolSummaries(a: std.mem.Allocator, history: []provider.Message, recor
     }
 }
 
-pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, history: *std.ArrayList(provider.Message), tokens: *u64) !struct { needs_repair: bool, steps: usize, parent_session_id: ?[]const u8, cache_key: ?[]const u8, forked_from: ?ForkedFrom, provider: provider.Id, model: ?[]const u8, next_agent_id: u64, next_bash_id: u64, agent_sessions: []const AgentSession, lost_background: []const @import("events.zig").Background, background_repairs: []const @import("events.zig").Background, pending_background_bytes: u64 } {
+pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, history: *std.ArrayList(provider.Message), tokens: *u64) !struct { needs_repair: bool, steps: usize, parent_session_id: ?[]const u8, cache_key: ?[]const u8, forked_from: ?ForkedFrom, provider: provider.Id, model: ?[]const u8, next_agent_id: u64, next_bash_id: u64, next_run_id: u64, agent_sessions: []const AgentSession, lost_background: []const @import("events.zig").Background, background_repairs: []const @import("events.zig").Background, pending_background_bytes: u64 } {
     var parent_session_id: ?[]const u8 = null;
     var cache_key: ?[]const u8 = null;
     var forked_from: ?ForkedFrom = null;
     var next_agent_id: u64 = 1;
     var next_bash_id: u64 = 1;
+    var next_run_id: u64 = 1;
     var pending_background_bytes: u64 = 0;
     var agent_sessions: std.ArrayList(AgentSession) = .empty;
     defer agent_sessions.deinit(a);
@@ -247,19 +284,20 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
         }
         if (torn) return error.InvalidSessionLog;
         for (r.calls orelse &.{}) |call| if (call.id) |call_id| {
-            try restoreId(call_id, &next_agent_id, &next_bash_id);
+            try restoreId(call_id, &next_agent_id, &next_bash_id, &next_run_id);
         };
         if (r.task_ids) |ids| {
             next_agent_id = @max(next_agent_id, std.math.add(u64, ids.agent, 1) catch return error.InvalidSessionLog);
             next_bash_id = @max(next_bash_id, std.math.add(u64, ids.bash, 1) catch return error.InvalidSessionLog);
+            next_run_id = @max(next_run_id, std.math.add(u64, ids.run, 1) catch return error.InvalidSessionLog);
         }
         if (r.agent_session) |mapping| {
-            try restoreId(mapping.id, &next_agent_id, &next_bash_id);
+            try restoreId(mapping.id, &next_agent_id, &next_bash_id, &next_run_id);
             try agent_sessions.append(a, mapping);
             continue;
         }
         if (r.background) |b| {
-            try restoreId(b.id, &next_agent_id, &next_bash_id);
+            try restoreId(b.id, &next_agent_id, &next_bash_id, &next_run_id);
             if (b.state == .started) {
                 try pending_background.append(a, .{ .event = b });
             } else {
@@ -284,7 +322,11 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
                 }
             }
         };
-        if (r.diagnostic != null) continue;
+        if (r.bash) |event| {
+            try restoreId(event.id, &next_agent_id, &next_bash_id, &next_run_id);
+            continue;
+        }
+        if (r.diagnostic != null or (r.transport_fallback != null and r.messages.len == 0)) continue;
         if (r.from > history.items.len) return error.InvalidSessionLog;
         try history.ensureTotalCapacity(gpa, r.from + r.messages.len);
         if (r.from == history.items.len and r.forked_from == null) {
@@ -309,13 +351,13 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
             try background_repairs.append(a, pending.event);
         } else try lost_background.append(a, pending.event);
     }
-    return .{ .steps = steps, .needs_repair = torn or data[data.len - 1] != '\n', .parent_session_id = parent_session_id, .cache_key = cache_key, .forked_from = forked_from, .provider = id, .model = model, .next_agent_id = next_agent_id, .next_bash_id = next_bash_id, .agent_sessions = try agent_sessions.toOwnedSlice(a), .lost_background = try lost_background.toOwnedSlice(a), .background_repairs = try background_repairs.toOwnedSlice(a), .pending_background_bytes = pending_background_bytes };
+    return .{ .steps = steps, .needs_repair = torn or data[data.len - 1] != '\n', .parent_session_id = parent_session_id, .cache_key = cache_key, .forked_from = forked_from, .provider = id, .model = model, .next_agent_id = next_agent_id, .next_bash_id = next_bash_id, .next_run_id = next_run_id, .agent_sessions = try agent_sessions.toOwnedSlice(a), .lost_background = try lost_background.toOwnedSlice(a), .background_repairs = try background_repairs.toOwnedSlice(a), .pending_background_bytes = pending_background_bytes };
 }
 
-fn restoreId(id: []const u8, next_agent: *u64, next_bash: *u64) !void {
-    if (id.len < 2 or (id[0] != 'a' and id[0] != 'b')) return;
+fn restoreId(id: []const u8, next_agent: *u64, next_bash: *u64, next_run: *u64) !void {
+    if (id.len < 2 or (id[0] != 'a' and id[0] != 'b' and id[0] != 'r')) return;
     const number = std.fmt.parseInt(u64, id[1..], 10) catch return error.InvalidSessionLog;
-    const next = if (id[0] == 'a') next_agent else next_bash;
+    const next = if (id[0] == 'a') next_agent else if (id[0] == 'b') next_bash else next_run;
     next.* = @max(next.*, std.math.add(u64, number, 1) catch return error.InvalidSessionLog);
 }
 
@@ -589,6 +631,31 @@ test "diagnostic append and replay do not commit messages or replace context tok
     try t.expectEqualStrings("next", summaries[0].preview);
 }
 
+test "transport fallback events preserve history, tokens and Steps across restore" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/s.jsonl", .{tmp.sub_path});
+    var log = try Log.create(t.io, path);
+    defer log.close(t.io);
+    var history: std.ArrayList(provider.Message) = .empty;
+    var tokens: u64 = 0;
+    try log.commit(t.io, a, &history, &tokens, .{ .messages = &.{.{ .role = "system", .content = "base" }}, .context_tokens = 123 });
+    for ([_][]const u8{ "WebSocketHandshake", "previous_response_not_found" }) |reason| {
+        try log.fallback(t.io, a, .{ .fallback_reason = reason, .fallback_at = 1 }, 1);
+        try log.commit(t.io, a, &history, &tokens, .{ .from = history.items.len, .messages = &.{ .{ .role = "user", .content = "next" }, .{ .role = "assistant", .content = "ok" } }, .context_tokens = 200, .model_ms = 1, .transport_fallback = reason });
+    }
+    var restored: std.ArrayList(provider.Message) = .empty;
+    var restored_tokens: u64 = 0;
+    const result = try replay(a, a, try tmp.dir.readFileAlloc(t.io, "s.jsonl", a, .unlimited), &restored, &restored_tokens);
+    try t.expectEqualDeep(history.items, restored.items);
+    try t.expectEqual(tokens, restored_tokens);
+    try t.expectEqual(@as(usize, 2), result.steps);
+}
+
 test "timing fields are optional and replay preserves mixed old and measured Steps" {
     const t = std.testing;
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
@@ -724,27 +791,32 @@ test "replay restores independent ID maxima from every background state and fore
             .{ .name = "bash", .id = "b6", .background = false, .start_ms = 0, .end_ms = 1, .ok = true, .run_index = 0 },
         } },
         .{ .from = 1, .messages = &.{.{ .role = "user", .content = "compacted" }} },
+        .{ .bash = .{ .id = "b20", .run = 1, .state = .started } },
+        .{ .bash = .{ .id = "b20", .run = 1, .state = .superseded, .superseded_by = "b21", .elapsed_ms = 5 } },
+        .{ .bash = .{ .id = "b21", .run = 2, .state = .started } },
     };
     for (records) |record| try encoded.writer.print("{f}\n", .{std.json.fmt(record, .{ .emit_null_optional_fields = false })});
     var history: std.ArrayList(provider.Message) = .empty;
     var tokens: u64 = 0;
     const restored = try replay(a, a, encoded.written(), &history, &tokens);
     try t.expectEqual(@as(u64, 11), restored.next_agent_id);
-    try t.expectEqual(@as(u64, 13), restored.next_bash_id);
+    try t.expectEqual(@as(u64, 22), restored.next_bash_id);
+    try t.expectEqualStrings("compacted", history.items[1].content.?);
     try t.expectEqual(@as(usize, 1), restored.lost_background.len);
     try t.expectEqualStrings("a3", restored.lost_background[0].id);
     var progress: @import("../tools/progress.zig").Queue = .{ .next_agent_id = restored.next_agent_id, .next_bash_id = restored.next_bash_id };
     defer progress.deinit(t.allocator);
     try t.expectEqualStrings("a11", try progress.add(t.allocator, t.io, .agent, "resumed", 1, false));
-    try t.expectEqualStrings("b13", try progress.add(t.allocator, t.io, .bash, "resumed", 1, true));
+    try t.expectEqualStrings("b22", try progress.add(t.allocator, t.io, .bash, "resumed", 1, true));
 }
 
 test "ID restoration rejects overflow rather than wrapping the session counter" {
     const t = std.testing;
     var next_agent: u64 = 1;
     var next_bash: u64 = 1;
-    try t.expectError(error.InvalidSessionLog, restoreId("a18446744073709551615", &next_agent, &next_bash));
-    try restoreId("legacy_id", &next_agent, &next_bash);
+    var next_run: u64 = 1;
+    try t.expectError(error.InvalidSessionLog, restoreId("a18446744073709551615", &next_agent, &next_bash, &next_run));
+    try restoreId("legacy_id", &next_agent, &next_bash, &next_run);
     try t.expectEqual(@as(u64, 1), next_agent);
     try t.expectEqual(@as(u64, 1), next_bash);
 }
@@ -792,11 +864,12 @@ test "agent session mappings survive snapshots and compaction without changing h
     var expected_steps: usize = 0;
     var next_agent: u64 = 1;
     var next_bash: u64 = 1;
+    var next_run: u64 = 1;
     for (records) |record| {
         try encoded.writer.print("{f}\n", .{std.json.fmt(record, .{ .emit_null_optional_fields = false })});
         if (record.agent_session) |mapping| {
             mapping_count += 1;
-            try restoreId(mapping.id, &next_agent, &next_bash);
+            try restoreId(mapping.id, &next_agent, &next_bash, &next_run);
         } else {
             try expected.ensureTotalCapacity(a, record.from + record.messages.len);
             if (record.from == expected.items.len) expected_steps += assistantCount(record.messages);

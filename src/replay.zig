@@ -129,7 +129,9 @@ fn loadMain(a: Allocator, data: []const u8) ![]Run {
         if (record.object.get("diagnostic")) |d| if (d != .null) continue;
         if (record.object.get("agent_session")) |mapping| if (mapping != .null) continue;
         if (record.object.get("background")) |b| if (b != .null) continue;
+        if (record.object.get("bash")) |b| if (b != .null) continue;
         const messages: []const Value = if (record.object.get("messages")) |v| try array(v) else &.{};
+        if (messages.len == 0 and (try optionalString(record, "transport_fallback")) != null) continue;
         const from = if (record.object.get("from")) |v| try natural(v) else 0;
         if (from > length) return error.InvalidReplayLog;
         if (records == 0) child = (try optionalString(record, "parent_session_id")) != null;
@@ -139,6 +141,13 @@ fn loadMain(a: Allocator, data: []const u8) ![]Run {
         if (!appended) continue;
         if (record.object.get("forked_from")) |fork| if (fork != .null) continue;
         for (messages, 0..) |message, m| {
+            if (message.object.get("background_run")) |completion| if (completion != .null) {
+                const key: Key = .{ .step = try natural(try field(completion, "step")), .run = try natural(try field(completion, "run_index")) };
+                for (runs.items) |*item| if (item.key.eql(key)) {
+                    item.expected = try string(try field(completion, "output"));
+                    item.remaining_steps = null;
+                };
+            };
             if (!std.mem.eql(u8, try string(try field(message, "role")), "assistant")) continue;
             step += 1;
             const calls_value = message.object.get("tool_calls") orelse continue;
@@ -166,6 +175,7 @@ fn loadMain(a: Allocator, data: []const u8) ![]Run {
                 if (record.object.get("run_results")) |results| {
                     if (results != .null) for (try array(results)) |result| {
                         if (std.mem.eql(u8, id, try string(try field(result, "tool_call_id")))) {
+                            if (try optionalString(result, "background_id")) |_| expected = null;
                             if (result.object.get("remaining_steps")) |remaining| {
                                 if (remaining != .null) remaining_steps = try natural(remaining);
                             }
@@ -184,6 +194,7 @@ fn loadMain(a: Allocator, data: []const u8) ![]Run {
 const Recording = struct {
     key: Key,
     start_ms_epoch: i64,
+    run_output_bytes: usize = output.max_bytes,
     entries: std.ArrayList(core.Entry) = .empty,
     end: ?End = null,
     incomplete: bool = false,
@@ -211,6 +222,10 @@ fn loadCalls(a: Allocator, data: []const u8) ![]Recording {
             const start = try field(meta, "start_ms_epoch");
             if (start != .integer) return error.InvalidReplayLog;
             r.start_ms_epoch = start.integer;
+            if (meta.object.get("run_output_bytes")) |limit| {
+                r.run_output_bytes = try natural(limit);
+                if (r.run_output_bytes < 16384 or r.run_output_bytes > 16777216) return error.InvalidReplayLog;
+            }
             if (meta.object.get("incomplete")) |incomplete| {
                 if (incomplete != .bool) return error.InvalidReplayLog;
                 r.incomplete = r.incomplete or incomplete.bool;
@@ -279,7 +294,7 @@ const Report = struct {
 fn replayOne(a: Allocator, io: std.Io, original: Run, recording: Recording, script: ?[]const u8) !Report {
     const evaluated = try core.executeSession(a, io, script orelse original.code, recording.entries.items, recording.start_ms_epoch, recording.end orelse .ok, script != null, original.child);
     defer evaluated.deinit(a);
-    const text = try output.stepLimitOutput(a, try output.format(a, evaluated.outcome), original.remaining_steps);
+    const text = try output.stepLimitOutput(a, try output.format(a, evaluated.outcome, recording.run_output_bytes), original.remaining_steps);
     const incomplete = recording.incomplete or evaluated.incomplete or original.expected == null;
     const determined = script == null and !incomplete and recording.end != .timeout and recording.end != .cancelled;
     const equal = if (original.expected) |expected| std.mem.eql(u8, expected, text) else false;
@@ -385,6 +400,7 @@ test "raw main records count global assistant Steps across turns and compaction"
     const data = "{\"messages\":[{\"role\":\"system\",\"content\":\"s\"},{\"role\":\"user\",\"content\":\"one\"}]}\n" ++
         "{\"from\":2,\"turn_step\":1,\"messages\":[{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"a\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"code\\\":\\\"first\\\"}\"}},{\"id\":\"x\",\"function\":{\"name\":\"other\",\"arguments\":\"{\\\"code\\\":\\\"ignored\\\"}\"}},{\"id\":\"b\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"code\\\":\\\"second\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"a\",\"content\":\"one\"},{\"role\":\"tool\",\"tool_call_id\":\"x\",\"content\":\"unknown\"},{\"role\":\"tool\",\"tool_call_id\":\"b\",\"content\":\"two\"}]}\n" ++
         "{\"agent_session\":{\"id\":\"a1\",\"session\":\"0123456789abcdef0123456789abcdef\"}}\n" ++
+        "{\"transport_fallback\":\"WebSocketProtocol\",\"from\":0,\"messages\":[]}\n" ++
         "{\"from\":6,\"turn_step\":2,\"messages\":[{\"role\":\"assistant\",\"content\":\"done\"}]}\n" ++
         "{\"from\":7,\"turn_step\":1,\"messages\":[{\"role\":\"user\",\"content\":\"two\"},{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"c\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"code\\\":\\\"third\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"c\",\"content\":\"three\"}]}\n" ++
         "{\"from\":1,\"messages\":[{\"role\":\"user\",\"content\":\"summary\"},{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"c\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"code\\\":\\\"third\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"c\",\"content\":\"three\"}]}\n" ++
@@ -434,8 +450,10 @@ test "background lifecycle records do not replace replay history" {
     const data =
         \\{"messages":[{"role":"system","content":"s"}]}
         \\{"from":0,"messages":[],"background":{"id":"b1","kind":"bash","state":"started"}}
+        \\{"bash":{"id":"b1","run":1,"state":"started","command":"check","cwd":"/a"}}
         \\{"from":1,"messages":[{"role":"assistant","tool_calls":[{"id":"r1","function":{"name":"run","arguments":"{\"code\":\"42\"}"}}]},{"role":"tool","tool_call_id":"r1","content":"42"}]}
         \\{"from":0,"messages":[],"background":{"id":"b1","kind":"bash","state":"finished"}}
+        \\{"bash":{"id":"b1","run":1,"state":"superseded","superseded_by":"b2","elapsed_ms":20}}
         \\
     ;
     const runs = try loadMain(arena.allocator(), data);

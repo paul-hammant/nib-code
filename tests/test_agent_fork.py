@@ -217,6 +217,7 @@ class ForkTests:
         thread = threading.Thread(target=mock.serve_forever, daemon=True)
         thread.start()
         self.env["NIB_BASE_URL"] = "http://127.0.0.1:" + str(mock.server_port)
+        self.env["NIB_CODEX_TRANSPORT"] = "sse"
         if self.provider == "codex":
             self.env["NIB_MODEL"] = "gpt-6.1-sol"
 

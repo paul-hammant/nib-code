@@ -56,6 +56,23 @@ def mechanical_metric(count, samples, *, ms=None, sample_ms=None, timed_count=No
 
 
 class StatsTest(unittest.TestCase):
+    def test_bash_lifecycle_does_not_replace_history_and_counts_supersession(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'root.jsonl'
+            rows = synthetic_log(path, [[None]])
+            expected = stats.summarize([path])
+            rows[1:1] = [dict(at=100 + i, bash=dict(id='b1', run=1, state=state, **extra))
+                         for i, (state, extra) in enumerate([
+                             ('started', dict(command='anything', cwd='/a')),
+                             ('superseded', dict(superseded_by='b2', elapsed_ms=12)),
+                             ('finished', dict(elapsed_ms=15))])]
+            path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            actual = stats.summarize([path])
+            self.assertEqual(actual['bash_superseded'], 1)
+            self.assertEqual(actual['overall'], expected['overall'])
+            self.assertIn('Bash 被取代次数：1', stats.text_report(actual))
+
+
     def test_child_costs_parent_system_groups_and_cli(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
@@ -1928,6 +1945,69 @@ class StatsTest(unittest.TestCase):
         code = 'await tools.bash({timeout_ms: 100, command: ' + json.dumps(command) + '})'
         self.assertEqual(list(stats.commands(code)), ['python3', 'git', 'zig'])
         self.assertEqual(list(stats.commands("tools.bash({command: 'echo 你好'})")), ['echo'])
+
+
+class TransportTests(unittest.TestCase):
+    def test_mixed_transport_groups_steps_and_latency_without_filling_legacy_gaps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'mixed.jsonl'
+            rows = synthetic_log(path, [["1", "2", None]])
+            for row, transport, model_ms, first_ms, code_ms in zip(
+                    rows[1:], ('websocket', 'sse', None), (20, 80, 30), (2, 8, None), (5, 15, None)):
+                row['model_ms'] = model_ms
+                if transport:
+                    row.update(transport=transport, first_data_ms=first_ms,
+                               code=[dict(first_ms=code_ms, last_ms=code_ms + 1)])
+            path.write_text('\n'.join(map(json.dumps, rows)) + '\n')
+            report = stats.summarize([path], group_by='transport')
+            self.assertEqual(report['overall']['steps'], 3)
+            self.assertEqual(set(report['groups']), {'websocket', 'sse', 'unknown'})
+            for name, expected in [('websocket', (20, 2, 5)), ('sse', (80, 8, 15))]:
+                group = report['groups'][name]
+                self.assertEqual(group['overall']['steps'], 1)
+                for field, value in zip(('model_ms', 'first_data_ms', 'code_first_ms'), expected):
+                    self.assertEqual(group['timing'][field]['median'], value)
+                    self.assertEqual(group['timing'][field]['samples'], 1)
+            legacy = report['groups']['unknown']['timing']
+            self.assertEqual(legacy['first_data_ms']['samples'], 0)
+            self.assertEqual(legacy['code_first_ms']['samples'], 0)
+            self.assertIn('transport=websocket', stats.text_report(report))
+            output = subprocess.check_output([sys.executable, str(ROOT / 'scripts/stats.py'), str(path),
+                                              '--group-by', 'transport', '--json'])
+            self.assertEqual(json.loads(output)['groups']['sse']['overall']['steps'], 1)
+
+    def test_full_reason_groups(self):
+        for value in (None, '', [], 12):
+            self.assertEqual(stats.step_group({'full_reason': value}, 'full_reason'), 'unknown')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'reasons.jsonl'
+            rows = synthetic_log(path, [["1", "2", "3", None]])
+            for row, reason in zip(rows[1:], ('first_request', None, 'effort_changed', None)):
+                row['full_reason'] = reason
+            rows[2]['incremental'] = True
+            path.write_text('\n'.join(map(json.dumps, rows)) + '\n')
+            report = stats.summarize([path], group_by='full_reason')
+            self.assertEqual({key: value['overall']['steps'] for key, value in report['groups'].items()},
+                             {'first_request': 1, 'incremental': 1, 'effort_changed': 1, 'unknown': 1})
+            self.assertEqual(report['groups']['incremental']['round_trips']['write_to_validation']['pairs'], 0)
+            output = subprocess.check_output([sys.executable, str(ROOT / 'scripts/stats.py'), str(path),
+                                              '--group-by', 'full_reason', '--json'])
+            self.assertEqual(json.loads(output)['groups']['effort_changed']['overall']['steps'], 1)
+
+    def test_incremental_groups_preserve_unknown_and_filter_step_adjacency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'mixed.jsonl'
+            rows = synthetic_log(path, [["1", "2", "3", "4", None]])
+            for row, value in zip(rows[1:], (False, True, None, True, "true")):
+                row['incremental'] = value
+            path.write_text('\n'.join(map(json.dumps, rows)) + '\n')
+            report = stats.summarize([path], group_by='incremental')
+            self.assertEqual({key: value['overall']['steps'] for key, value in report['groups'].items()},
+                             {'false': 1, 'true': 2, 'unknown': 2})
+            self.assertEqual(report['groups']['true']['round_trips']['write_to_validation']['pairs'], 0)
+            output = subprocess.check_output([sys.executable, str(ROOT / 'scripts/stats.py'), str(path),
+                                              '--group-by', 'incremental', '--json'])
+            self.assertEqual(json.loads(output)['groups']['true']['overall']['steps'], 2)
 
 
 if __name__ == '__main__':

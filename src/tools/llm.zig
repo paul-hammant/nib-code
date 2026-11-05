@@ -12,9 +12,9 @@ var active: usize = 0;
 fn acquire(t: *tools.Tools, limit: usize) !void {
     mutex.lockUncancelable(t.io);
     defer mutex.unlock(t.io);
-    while (active >= limit and !t.cancel.load(.acquire))
+    while (active >= limit and !t.cancelFlag().load(.acquire))
         changed.waitTimeout(t.io, &mutex, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch {};
-    if (t.cancel.load(.acquire)) return error.Canceled;
+    if (t.cancelFlag().load(.acquire)) return error.Canceled;
     active += 1;
 }
 
@@ -86,7 +86,7 @@ fn invoke(comptime complete: anytype, t: *tools.Tools, gpa: std.mem.Allocator, a
         var detail: ?[]u8 = null;
         defer if (detail) |d| gpa.free(d);
         var attempts: u32 = 0;
-        const reply = complete(gpa, a, &client, cfg, cache_key, messages.items, "[]", null, .{ .ctx = t, .onDelta = silent, .replay_safe = true }, &t.cancel, &detail, &attempts, null) catch |err|
+        const reply = complete(gpa, a, &client, cfg, cache_key, messages.items, "[]", null, .{ .ctx = t, .onDelta = silent, .replay_safe = true }, t.cancelFlag(), &detail, &attempts, null) catch |err|
             return tools.fail(gpa, "llm request failed: {s}: {s}", .{ @errorName(err), detail orelse "" });
         usage.add(reply.usage);
         t.addUsage(reply.usage);

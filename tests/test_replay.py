@@ -16,6 +16,8 @@ import tempfile
 import threading
 import unittest
 
+from background_assertions import stop_result
+
 from test_interjections import Terminal, wait_for
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -144,7 +146,8 @@ class ReplayTests(unittest.TestCase):
             run_rows = [r for r in rows if (r["step"], r["run"]) == key]
             self.assertEqual(sum("meta" in r for r in run_rows), 1)
             self.assertEqual(set(run_rows[-1]), {"step", "run", "meta"})
-            self.assertEqual(set(run_rows[-1]["meta"]), {"start_ms_epoch", "end"})
+            self.assertEqual(set(run_rows[-1]["meta"]), {"start_ms_epoch", "run_output_bytes", "end"})
+            self.assertEqual(run_rows[-1]["meta"]["run_output_bytes"], 16384)
         (self.cwd / "sample.txt").unlink()
         (self.cwd / "side-effect").unlink()
         before = len(self.mock.requests)
@@ -166,12 +169,12 @@ class ReplayTests(unittest.TestCase):
         session = self.ask([
             'const job = await tools.bash({command: "printf started > detached-side-effect; sleep 60", '
             'background: true, detached: true}); await tools.sleep(100); '
-            'console.log(job, await tools.stop({id: job.id}));'
+            'console.log(job, await tools.stop({id: job.id,reason:"mock requested cancellation"}));'
         ])
         calls = [r for r in jsonl(self.calls_path(session)) if "index" in r]
         self.assertEqual([r["name"] for r in calls], ["bash", "sleep", "stop"])
         self.assertEqual(json.loads(calls[0]["result"]), {"id": "b1"})
-        self.assertEqual(json.loads(calls[-1]["result"]), {"id": "b1", "stopped": True})
+        self.assertEqual(json.loads(calls[-1]["result"]), stop_result("b1", True))
         log = jsonl(self.home / "sessions" / f"{session}.jsonl")
         timed = [c for row in log for c in row.get("calls", [])]
         self.assertEqual([c["name"] for c in timed], ["bash", "sleep", "stop"])
@@ -559,7 +562,11 @@ class ReplayTests(unittest.TestCase):
             self.assertEqual([(r["step"], r["run"]) for r in rows if "meta" in r],
                              [(1, 0), (3, 0)])
             self.assertTrue(path.read_bytes().startswith(retained))
-            self.assertEqual(main.read_bytes(), committed)
+            current = main.read_bytes()
+            self.assertTrue(current.startswith(committed))
+            additions = [json.loads(line) for line in current[len(committed):].splitlines()]
+            self.assertTrue(additions)
+            self.assertTrue(all(r.get("bash") and not r["messages"] for r in additions))
         finally:
             os.killpg(proc.pid, signal.SIGKILL)
             proc.communicate(timeout=10)

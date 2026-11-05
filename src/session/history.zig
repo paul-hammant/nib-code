@@ -46,7 +46,7 @@ fn clone(a: std.mem.Allocator, message: provider.Message) !provider.Message {
     copy.tool_call_id = try dupeOptional(a, message.tool_call_id);
     copy.phase = try dupeOptional(a, message.phase);
     copy.background_id = try dupeOptional(a, message.background_id);
-    if (message.reasoning) |reasoning| copy.reasoning = .{ .provider = reasoning.provider, .data = try a.dupe(u8, reasoning.data) };
+    if (message.reasoning) |reasoning| copy.reasoning = .{ .provider = reasoning.provider, .data = try a.dupe(u8, reasoning.data), .includes_output = reasoning.includes_output };
     if (message.step_effort) |effort| copy.step_effort = .{ .effort = try a.dupe(u8, effort.effort), .source = effort.source };
     if (message.tool_summary) |summary| copy.tool_summary = try summary.clone(a);
     if (message.tool_calls) |calls| {

@@ -12,7 +12,7 @@ pub fn fetch(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolR
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     var content_type: []const u8 = "";
-    const page = get(t.io, gpa, arena.allocator(), t.environ, a.value, &t.cancel, &content_type) catch |err| return switch (err) {
+    const page = get(t.io, gpa, arena.allocator(), t.environ, a.value, t.cancelFlag(), &content_type) catch |err| return switch (err) {
         error.Canceled => fail(gpa, "canceled", .{}),
         error.Timeout => fail(gpa, "timed out after {d} ms", .{a.value.timeout_ms}),
         error.BinaryContent => fail(gpa, "binary content ({s}); download it with bash if needed", .{content_type}),
