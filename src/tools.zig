@@ -21,6 +21,7 @@ const all = [_]Tool{
         .name = "sleep",
         .doc =
         \\  // Wait ms (integer 0..2147483647); cancellable, no process/thread or tool slot. Counts Run wall time, not JS budget. Run drains even unawaited sleeps.
+        \\  // For timed delays such as service readiness. Never sleep to wait for background bash/agent/Run results; with no independent work, reply briefly without tools and Session waits for delivery.
         \\  async sleep(ms) {}, // → null
         ,
     },
@@ -79,11 +80,11 @@ const all = [_]Tool{
         .name = "bash",
         .run = bash.bash,
         .doc =
-        \\  // Bash in cwd; merged stderr. exit_code:null if killed. Return kills group, including nohup/&.
-        \\  // Verbatim output; >16 MiB errors: redirect to file. >256 shell words (excluding heredocs) refused: write a script.
+        \\  // Bash in cwd; merged stderr. Group killed on return, including nohup/&. Killed:exit_code:null.
+        \\  // Output >16 MiB errors: redirect to file. >256 shell words (except heredocs): write a script.
         \\  // background:{id}, later result. detached requires background; survives Turns, ends with shell. stop/timeout/cancel/failure/exit cleans up.
-        \\  // Long Runs auto-background; await unchanged. Only independent work; no polling/reruns. If none, reply briefly without tools; results arrive and Turn continues.
-        \\  async bash({ command, timeout_ms, background = false, detached = false }) {}, // → { exit_code, output } or { id }; timeout_ms default: detached 0 (unlimited), else 120000
+        \\  // Long Runs auto-background; await unchanged. No sleep/polling/reruns. No independent work: brief reply without tools; Session waits.
+        \\  async bash({ command, timeout_ms, background = false, detached = false }) {}, // → { exit_code, output } or { id }; timeout_ms default: detached 0 (unlimited), else 1800000 (30 min), including auto-background Runs
         ,
     },
     .{
@@ -109,10 +110,10 @@ const all = [_]Tool{
         .root_only = true,
         .run = subagent.agent,
         .doc =
-        \\  // No nesting. New: clean/independent, starts over; 105-child medians: 6 read-only Steps/22% time, 12 total/~3min/~290k prompt.
-        \\  // fork: parent history+judgments/assumptions; cached first request, no reread; full history/Step. Other model/effort loses cache (Codex effort-separated; same-model history).
-        \\  // resume:a1; fork+resume rejects. One/agent; failures ok:false, args/cancel reject. usage/changes:this call, edit/write. Shared cwd/no worktree; locks/stale checks reject conflicts.
-        \\  // background:{id}, later Step; reply waits. Partial files possible.
+        \\  // Default: work yourself. Unless requested, delegate only parallel independent read-only investigations with discardable results.
+        \\  // Serial edits/builds/tests/reviews stay in parent. Foreground waiting is serial. No nesting; shared cwd, partial files possible.
+        \\  // fork:parent history; model/effort switch loses cache. resume:a1 after completion; busy:wait, don't retry/replace. fork+resume rejects.
+        \\  // background:{id}, auto-result. No sleep/polling; no independent work:brief reply without tools; Session waits. Failure:ok:false; args/cancel reject.
         \\  async agent({ prompt, resume, fork = false, timeout_ms = 1800000, model, effort, background = false }) {}, // → { ok, id, text, usage, changes, error? } or { id }
         ,
     },

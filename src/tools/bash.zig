@@ -15,7 +15,7 @@ const Args = struct {
     detached: bool = false,
 
     fn timeoutMs(a: Args) i64 {
-        return a.timeout_ms orelse if (a.detached) @as(i64, 0) else 120_000;
+        return a.timeout_ms orelse if (a.detached) @as(i64, 0) else 1_800_000;
     }
 
     fn validationError(a: Args) ?[]const u8 {
@@ -329,9 +329,15 @@ test "bash validates detached and zero timeout before starting" {
     }
 }
 
-test "bash detached timeout defaults and overrides" {
-    try testing.expectEqual(@as(i64, 120_000), (Args{ .command = "true" }).timeoutMs());
-    try testing.expectEqual(@as(i64, 120_000), (Args{ .command = "true", .background = true }).timeoutMs());
+test "bash has a finite 30 minute default and honors explicit timeouts in every mode" {
+    inline for (.{ false, true }) |background| {
+        const ordinary: Args = .{ .command = "true", .background = background };
+        try testing.expectEqual(@as(i64, 1_800_000), ordinary.timeoutMs());
+        try testing.expect(ordinary.validationError() == null);
+        const explicit: Args = .{ .command = "true", .background = background, .timeout_ms = 25 };
+        try testing.expectEqual(@as(i64, 25), explicit.timeoutMs());
+        try testing.expect(explicit.validationError() == null);
+    }
     const detached: Args = .{ .command = "true", .background = true, .detached = true };
     try testing.expectEqual(@as(i64, 0), detached.timeoutMs());
     try testing.expect(detached.validationError() == null);

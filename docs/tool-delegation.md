@@ -1,6 +1,10 @@
 # tools.llm 与 tools.agent：调用与实现
 
-少量文件直接 read 最便宜，不调用模型。大量数据的单步判断、分类、抽取适合 llm，通常几秒；批量简单判断优先低成本模型和低 effort，强模型留给少量难题。agent 用于独立多步工作：几十行以上改动的提交前只读审查、先约定接口并划分负责文件的并行实现、需要大量读代码的调查；默认新建子会话从零读代码，fork 继承当前父上下文，接续保留子会话已有历史，不代替 read 或 llm。延迟与成本只是量级提示，依任务、模型和 effort 变化，不是保证。
+少量文件直接 read 最便宜，不调用模型。大量数据的单步判断、分类、抽取适合 llm，通常几秒；批量简单判断优先低成本模型和低 effort，强模型留给少量难题。默认由主循环完成修改、构建、测试和串行审查。除非用户要求委派，agent 只用于能与主循环有用工作并行、结果可丢弃的独立只读调查。前台等子 agent 就是串行；后台启动后主循环无法继续，同样增加关键路径延迟。默认新建子会话从零读代码，fork 继承当前父上下文，接续保留子会话已有历史，不代替 read 或 llm。接口仍允许用户要求的实现委派，不加运行时禁令，也不改 model/effort 的继承默认值。
+
+2026-11-04 的本地 `nib-bench/runs/smoke-20261104` 父日志说明了这个区别：timers 在 Step 1 派只读调查、Step 3 派文档修改，随后三次接续仍忙的 a1 都返回 AgentBusy，Step 11 又派 a3 实现核心调度，Step 17 才成功接续 a1 做审查。7 次调用并非 7 个新子会话，而是 3 次新建、1 次有效接续和 3 次 busy；主循环之后大量 sleep 等实现和测试。console-tail 在 Step 1 派核心捕获实现，Step 4 想询问尚未确定的 API、Step 29 想催结束，后两次接续都 busy；只有一个新子会话，父模型反复 sleep、查 diff 和编译日志。两者的实现均在关键路径上。原提示描述了新建/fork 的成本，却没有给出何时不委派的决策标准；全局 AGENTS.md 已有限制，因此只能从调用与等待记录推断行为，不能断言模型的内部动机。接续是完成后的新 Turn，不能给运行中的 agent 发消息；busy 后等待结果，不重复接续或派替代实现。
+
+后台 bash/agent/Run 完成后自动投递结果。等这些结果不要调用 tools.sleep 或轮询文件；没有独立工作就给极短、无工具调用的回复，Session 在本地等 inbox 后继续 Turn。detached 服务的就绪探测可使用有界 sleep，服务启动与后台任务完成不是同一条件。sleep 不根据“存在后台任务”拒绝或改变行为，以免破坏这类合法等待及录制/重放语义。
 
 成本参考来自本次统计时本机 `~/.nib/sessions` 的全部 105 个子会话（0.2.0 时期，以 `gpt-6.1-sol` / `high` 为主，含少量模型/effort 覆盖；旧日志部分元数据缺失），不再只用 [#37](https://github.com/yyydddkkk/nib-code/issues/37) 中的 6 个样本。统计命令：
 
@@ -75,7 +79,7 @@ timeout_ms 可省略，默认 30 分钟，不计排队时间。model/effort 省�
 
 `tools.bash({command, background: true})` 同样立即返回含 `id` 的启动确认；后台 bash 独立于 agent 并发限额。agent 与 bash 分别使用会话级编号 `a1、a2…` 和 `b1、b2…`：前后台 agent 仅在新建时分配，接续不递增编号、沿用原 id，后台 bash 在启动时分配，前台 bash 仅运行超过 3 秒、开始显示进度时分配。计数跨 Run/Turn 保留；恢复时根据日志中的任务 id 分别取各前缀最大值继续编号，兼容旧的共用计数日志且不补空号。后台 bash 最多同时运行 8 个，超出时立即 reject 并给出明确错误，不排队；子 agent 内也可使用。结果在下一次主模型请求前作为带来源标记的 user 消息插入，恢复未完成任务时插入 lost 消息。后台 bash 的生命周期也通过 `background` 事件报告。
 
-`tools.bash({command, background: true, detached: true})` 是会话级任务：跨 Run 和正常 Turn 存活，最终回答和 Step 上限收尾只等待普通后台任务，不等待 detached；停止提示只列实际等待的任务。detached 要求 `background:true`，默认 `timeout_ms:0`（无截止时间），也可显式指定正数超时；普通 bash 默认 120000 ms。它与其他 bash 共用 b 计数器、并发和输出上限。完成时只入 inbox，空闲时不自动发起 Turn；下一次 Step/Turn 消费一次。Turn 取消/失败、Session 退出或切换清理全部任务；ask 回答后退出 Session，因此不跨 ask 进程保活。恢复会话不重启进程，沿用 lost 消息。
+`tools.bash({command, background: true, detached: true})` 是会话级任务：跨 Run 和正常 Turn 存活，最终回答和 Step 上限收尾只等待普通后台任务，不等待 detached；停止提示只列实际等待的任务。detached 要求 `background:true`，默认 `timeout_ms:0`（无截止时间），也可显式指定正数超时；普通前台/后台 bash 默认 1800000 ms（30 分钟），Run 自动转后台不重置或缩短这个截止时间，显式正数 timeout_ms 始终优先。默认值的依据与清理边界见 [run-output.md](run-output.md#bash-执行时限)。它与其他 bash 共用 b 计数器、并发和输出上限。完成时只入 inbox，空闲时不自动发起 Turn；下一次 Step/Turn 消费一次。Turn 取消/失败、Session 退出或切换清理全部任务；ask 回答后退出 Session，因此不跨 ask 进程保活。恢复会话不重启进程，沿用 lost 消息。
 
 `tools.stop({id}) → {id,stopped}` 按现有 a/b id 取消并 join 单个后台 bash/agent，清理进程组。停止运行中的任务返回 `stopped:true`；已结束的已知任务返回 false，未知 id reject。并发停止同一任务只 join 一次，完成结果仍经原 inbox 路径投递一次。stop 返回前释放 agent 的执行占用；它不删除任务身份。启动和 stop 都经普通工具统一结算/录制出口，后台结果消息按 UTF-8 字节计入接收它的 Step 的 output_bytes。见 [ADR 0014](adr/0014-session-background-jobs.md)。
 

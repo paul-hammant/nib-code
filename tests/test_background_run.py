@@ -56,6 +56,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif index == 0:
             if case == "wait":
                 code = "await tools.fetch(" + json.dumps({"url": f"http://127.0.0.1:{self.server.server_port}/work"}) + "); 'wait-result'"
+            elif case == "timeout":
+                code = "await tools.bash(" + json.dumps({"command": "echo $$ > worker.pid; sleep 30", "timeout_ms": 500}) + ")"
             elif case in ("cancel", "crash", "stop"):
                 command = "echo $$ > worker.pid; sleep 30; echo should-not-finish"
                 code = "const r=await tools.bash(" + json.dumps({"command": command}) + "); if(r.exit_code!==null) throw new Error('stop did not kill command'); r"
@@ -147,6 +149,7 @@ class BackgroundRunTests(unittest.TestCase):
         self.assertEqual(completion["tool_bytes"], sum(c["result_bytes"] for c in completion["calls"]))
         runs = [e["run_end"] for e in events if "run_end" in e]
         self.assertIn("continuing in background as r1", runs[0]["output"])
+        self.assertIn("do not sleep, poll or rerun it", runs[0]["output"])
         self.assertNotIn("before-yield", runs[0]["output"])
         self.assertEqual(runs[0]["changes"], [])
         self.assertEqual([c["path"] for c in runs[1]["changes"]], ["independent.txt"])
@@ -264,6 +267,15 @@ class BackgroundRunTests(unittest.TestCase):
         result = self.results(rows)[0]
         self.assertFalse(result["background_ok"])
         self.assertIn("run canceled", result["content"])
+        self.assertFalse(alive(int((self.cwd / "worker.pid").read_text())))
+
+    def test_explicit_bash_timeout_still_applies_after_run_yields(self):
+        self.server.case = "timeout"
+        events, rows, _ = self.finish(self.launch())
+        self.assertIn("continuing in background as r1", next(e["run_end"]["output"] for e in events if "run_end" in e))
+        result = self.results(rows)[0]
+        self.assertFalse(result["background_ok"])
+        self.assertIn("timed out after 500 ms", result["content"])
         self.assertFalse(alive(int((self.cwd / "worker.pid").read_text())))
 
     def test_cancel_cleans_process_and_resume_marks_lost(self):

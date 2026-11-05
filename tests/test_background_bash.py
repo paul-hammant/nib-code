@@ -913,6 +913,9 @@ class BackgroundBashTests:
         self.assertEqual([(m["background_kind"], m["background_id"]) for m in stored], [("bash", "b1")])
         calls = [c for r in log for c in r.get("calls", []) if c["name"] == "bash"]
         self.assertEqual([(c["background"], c["id"]) for c in calls], [(True, "b1")])
+        self.assertEqual(len(mock.observed()), 3)
+        self.assertTrue(any(m.get("waiting") for r in log for m in r.get("messages", [])))
+        self.assertFalse(any(c["name"] == "sleep" for r in log for c in r.get("calls", [])))
         self.assert_accounting(mock, events)
 
     def test_two_steps_and_next_boundary(self):
