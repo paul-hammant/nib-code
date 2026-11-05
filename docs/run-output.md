@@ -89,3 +89,19 @@ console.log("service ready");
 ```
 
 与其他已调度工具一样，正常结束 Run 前会排空待完成的 sleep，即使没有 `await`；它不是跨 Run 的后台任务。用户取消或 JS 执行超时时会及时丢弃未到期计时器，不等延时结束；顶层 Promise reject 时，已发出的工具调用继续排空，但未到期的计时器直接丢弃（计时器本身没有副作用，它的后续逻辑尚未开始）；取消检查沿用上述不超过 20 ms 的间隔。sleep 走标准工具计时、结果字节统计和录制/重放路径；重放按录制结果结算，不实际等待，见 [replay.md](replay.md)。
+
+## 长 Run 自动转后台
+
+模型发起的 Run 超过 `[limits].run_background_after_ms`（默认 10000 ms）且沙箱仍在等待工具或 sleep 时，整个 Run 自动转后台，分配会话级 `r1…` ID。当前 Step 收到明确的“仍在执行、稍后投递最终输出、做独立工作、不要轮询或重跑”通知。它是成功登记的通知，不代表脚本执行成功。连续执行的 JS 不在中途转后台，仍受 JS 执行预算限制；工具等待和主线程轮询以约 20 ms 为粒度。
+
+原 Sandbox、Promise、工具参数与结果保持原样：`const r = await tools.bash(...); if (r.exit_code) ...` 的 continuation 仍收到完整 `{exit_code,output}`，不会收到任务 ID。顶层 fulfill/reject 的 drain、JS 执行预算、工具超时和输出捕获上限均保持原语义。阈值之前与之后的 console 一起捕获，只在最终结果中展示一次；提前通知不展示部分 console。
+
+后台 Run 使用自己的取消标记、llm 调用限额、changes、计时和录制缓冲；Session 的 agent 并发、后台 bash 并发、任务 ID、文件观察状态和用量仍共享。最多同时有 8 个自动后台 Run，独立于后台 bash 的 8 个上限；达到上限时新 Run 保持前台等待，不失败、不排队转后台。每个 Sandbox 仍最多同时执行 8 个工具。后台 Run 本身不消耗额外 Step，之后的主模型请求仍逐次消耗 Step。
+
+结束后用同一个 `session/output.zig` 格式化器生成最多 16 KiB 的最终输出，通过 Inbox 插入 `[background run rN finished]` 后接完整格式化输出的 user 消息；来源前缀是预算外的信封。通知和最终输出各展示一次。普通后台任务的等待规则适用：最终回答和 Step 上限收尾先等结果送达；上限收尾不额外请求模型。Esc/SIGINT/SIGTERM、Turn 失败、Session 退出或切换都会取消并 join Run 及其工具，bash 按原有进程组规则清理；SIGKILL 无法执行清理。`tools.stop({id:"r1"})` 也可停止另一个后台 Run，仍投递取消结果；不能停止当前 Run 自己。取消不会回滚已发生的 edit/write 或 shell 副作用。
+
+后台 Run 的所有成功 edit/write（含转后台之前）只归属该 Run，最终结果事件与日志的 `completion.changes` 保存按操作累计的计数和 diff；临时通知不提前领取 changes。TUI 在后台结果中显示输出与这些改动，恢复也能显示；子 agent 的调用结果同样汇总这些改动。bash 的改动继续不计入 changes。
+
+多个 Run 共享 cwd，可能同时使用或修改文件。file_state 的互斥锁保证状态表安全，路径锁串行化单次 read/edit/write，write 能发现当前会话最近观察之后的外部改动；但会话内别的 Run 的 read/write 会更新同一观察状态，因此它不是每个脚本独立的乐观事务，也不能检测所有 Run 间语义冲突。bash 更不参与文件锁。等待时只做独立工作（审阅 diff、修改无关文档、准备下一步），不要改动后台 Run 可能使用的文件；收到结果后重新 read 再修改。
+
+进程退出后不恢复 JS 堆或重启命令，未送达任务按原后台机制恢复为 lost；已经提交的结果不重复投递。离线 replay 不重现墙钟切换：按原 Step/Run 定位录制，重放完整脚本，比较最终输出。最终结果尚未提交时，不把提前通知当成脚本的期望输出。

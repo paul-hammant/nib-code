@@ -8,6 +8,7 @@ pub const Queue = struct {
     next_agent_id: u64 = 1,
     next_invocation: usize = 1,
     next_bash_id: u64 = 1,
+    next_run_id: u64 = 1,
     sink: ?struct { ctx: *anyopaque, emit: *const fn (*anyopaque, Progress) anyerror!void } = null,
 
     const Slot = struct { value: Progress, dirty: bool = true, sent: ?std.Io.Timestamp = null };
@@ -24,9 +25,17 @@ pub const Queue = struct {
     fn addTask(q: *Queue, gpa: std.mem.Allocator, io: std.Io, kind: @FieldType(Progress, "kind"), prompt: []const u8, run: usize, background: bool, fork: bool) ![]const u8 {
         q.mutex.lockUncancelable(io);
         defer q.mutex.unlock(io);
-        const next = if (kind == .agent) &q.next_agent_id else &q.next_bash_id;
+        const next = switch (kind) {
+            .agent => &q.next_agent_id,
+            .bash => &q.next_bash_id,
+            .run => &q.next_run_id,
+        };
         if (next.* == std.math.maxInt(u64)) return error.IdExhausted;
-        const id = try std.fmt.allocPrint(gpa, "{s}{d}", .{ if (kind == .agent) "a" else "b", next.* });
+        const id = try std.fmt.allocPrint(gpa, "{s}{d}", .{ switch (kind) {
+            .agent => "a",
+            .bash => "b",
+            .run => "r",
+        }, next.* });
         errdefer gpa.free(id);
         if (kind == .agent and q.next_invocation == std.math.maxInt(usize)) return error.InvocationExhausted;
         var value = try (Progress{ .invocation = if (kind == .agent) q.next_invocation else 0, .id = id, .kind = kind, .prompt = prompt, .run = run, .background = background, .fork = fork, .state = .queued }).clone(gpa);
@@ -103,7 +112,7 @@ pub const Queue = struct {
     pub fn highWater(q: *Queue, io: std.Io) @import("../session/events.zig").TaskIds {
         q.mutex.lockUncancelable(io);
         defer q.mutex.unlock(io);
-        return .{ .agent = q.next_agent_id - 1, .bash = q.next_bash_id - 1 };
+        return .{ .agent = q.next_agent_id - 1, .bash = q.next_bash_id - 1, .run = q.next_run_id - 1 };
     }
 
     pub fn deinit(q: *Queue, gpa: std.mem.Allocator) void {

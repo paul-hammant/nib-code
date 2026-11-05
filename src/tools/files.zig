@@ -54,7 +54,7 @@ pub fn edit(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
     try t.checkCredentialPath(gpa, path);
     const lock = try file_state.lock(t, gpa, path);
     defer lock.close(t.io);
-    if (t.cancel.load(.acquire)) return error.Canceled;
+    if (t.cancelFlag().load(.acquire)) return error.Canceled;
     if (v.old_text.len == 0) return fail(gpa, "old_text is empty; use write to create a file", .{});
 
     const dir = std.Io.Dir.cwd();
@@ -87,7 +87,7 @@ pub fn write(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolR
     try t.checkCredentialPath(gpa, path);
     const lock = try file_state.lock(t, gpa, path);
     defer lock.close(t.io);
-    if (t.cancel.load(.acquire)) return error.Canceled;
+    if (t.cancelFlag().load(.acquire)) return error.Canceled;
 
     const dir = std.Io.Dir.cwd();
     const current = dir.statFile(t.io, path, .{}) catch |err| switch (err) {

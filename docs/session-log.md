@@ -32,7 +32,7 @@
 
 ## 后台任务结果
 
-`tools.agent({prompt, background: true})` 与 `tools.bash({command, background: true})` 启动前同步追加独立的 `background: {id, kind: "agent"|"bash", state: "started"}` 记录；结果消息插入后追加 `state: "finished", ok` 记录，恢复发现未完成任务时追加 `state: "lost"`。agent 和 bash 分别使用会话级计数器：`a1、a2…` 与 `b1、b2…`，前台与后台共用各自类型的计数器。恢复扫描所有后台 `started/finished/lost` 记录和 `calls[].id`，按前缀分别取最大值继续分配；旧的共用计数日志也按此规则恢复，不补空号。这些记录带 `at` 和 `turn_step`，不改变历史或 context_tokens。结果在下次主模型请求前单独提交为一条 user 消息：`source: "background"`、`background_kind`、`background_id`、`background_ok`；可选的 `background_ok` 记录任务是否成功，供 TUI 在正文 JSON 截断后正确回放。agent 正文为 `[background agent a1 finished]\n` 后接截断后的 `{ok,id,text,changes,error?}` JSON，不含 usage；bash 正文结果恰为 `{exit_code,output}` 或 `{error}`，无 `ok` 字段。恢复时未完成任务不会重启，插入 `[background agent a1 lost: process ended]` 或对应的 bash 消息。来源字段只保存在日志中，不发送给 provider；正文会发送给模型。后台消息不发起新 Turn。旧 `background_agent` 日志仍可统计。
+`tools.agent({prompt, background: true})` 与 `tools.bash({command, background: true})` 启动前同步追加独立的 `background: {id, kind: "agent"|"bash"|"run", state: "started"}` 记录；结果消息插入后追加 `state: "finished", ok` 记录，恢复发现未完成任务时追加 `state: "lost"`。agent 和 bash 分别使用会话级计数器：`a1、a2…` 与 `b1、b2…`，前台与后台共用各自类型的计数器。恢复扫描所有后台 `started/finished/lost` 记录和 `calls[].id`，按前缀分别取最大值继续分配；旧的共用计数日志也按此规则恢复，不补空号。这些记录带 `at` 和 `turn_step`，不改变历史或 context_tokens。结果在下次主模型请求前单独提交为一条 user 消息：`source: "background"`、`background_kind`、`background_id`、`background_ok`；可选的 `background_ok` 记录任务是否成功，供 TUI 在正文 JSON 截断后正确回放。agent 正文为 `[background agent a1 finished]\n` 后接截断后的 `{ok,id,text,changes,error?}` JSON，不含 usage；bash 正文结果恰为 `{exit_code,output}` 或 `{error}`，无 `ok` 字段。恢复时未完成任务不会重启，插入 `[background agent a1 lost: process ended]` 或对应的 bash 消息。来源字段只保存在日志中，不发送给 provider；正文会发送给模型。后台消息不发起新 Turn。旧 `background_agent` 日志仍可统计。
 
 子 agent 首次报告 start 后，父日志同步追加独立的 `agent_session: {id: "a1", session: "内部子会话 ID"}` 映射记录；它不修改对话历史、context_tokens 或 Step 数，也不发送给模型。接续沿用任务 id，映射在压缩、失败和取消后保留；恢复父会话时重建映射，并将映射中的任务 id 纳入计数器高水位。工具仅接受任务 id，内部通过 `nib ask --resume` 接续原子会话。同 id 的各次后台调用按启动顺序配对；恢复时先补齐已提交结果缺失的终态记录，再为真正未完成的调用生成 lost，旧结果不清除新调用的恢复状态。
 
@@ -40,7 +40,7 @@
 
 ## Step 计时字段
 
-完整 Step 的可选计时字段（旧日志缺失时正常恢复）：`model_ms` 是模型请求总耗时，包含重试和退避，`attempts` 是实际尝试数；`first_data_ms` 是 provider.Sink.onData 首次收到任何 SSE 数据（含心跳、元数据）相对 Step 开始的时间，不代表首个模型内容 token。`code` 每个 run 一条 `{tool_call_id, first_ms, last_ms, progress}`，首尾时间相对 Step 开始，`progress` 是 `[ms, 累计参数 UTF-8 字节数]` 数组；接收时按到达顺序写入每调用最多 1024 点的固定缓冲，超出后按 stride 跳采，finish 时一次均匀抽样成最多 32 点并保留首尾；Codex 按 output_index、Chat Completions 按工具 index 跟踪，最终一次性参数如实记录 `first_ms == last_ms`，不推断未收到的片段。重试只保留成功请求的 code，first_data_ms 保留所有尝试中最早 onData 时间。`run_ms` 为此 Step 各 Run 从 sandbox 开始到 `session/output.zig` 格式化完成的总耗时，`run_results[].run_ms` 为单次耗时；未进入 sandbox 的调用无单次 run_ms。`calls` 最多保留 200 个宿主工具调用 `{name, start_ms, end_ms, ok, run_index}`，时间相对各自 Run 开始，run_index 是 run_results 的零起始下标，超出条数记 `calls_omitted`；ok 表示工具返回成功/错误，不等同于 bash 命令退出码。子 agent 只计父进程侧的调用，不追加参数或结果正文。`calls[]` 的可选 `id` 保存已分配的会话级任务编号：前台 agent 启动即分配，前台 bash 仅运行超过 3 秒开始上报进度时分配，短 bash 不含此字段；恢复依靠这些 id 避免前台编号回退。完整 Step、压缩及中断提交另保存可选 `task_ids: {agent, bash}`，数值为各类型已分配编号的高水位；恢复同时取其最大值，避免任务超过 `calls[]` 的 200 条明细上限时丢失续号信息。旧日志可省略。后台 agent/bash 的启动调用另带 `background: true` 和 `id`；该调用计时仅到启动返回，不表示后台任务执行耗时。所有计时使用单调 awake 时钟、毫秒单位；固定容量缓冲复用现有调度/完成路径，不新增锁或逐片段分配，不预取或推测执行。
+完整 Step 的可选计时字段（旧日志缺失时正常恢复）：`model_ms` 是模型请求总耗时，包含重试和退避，`attempts` 是实际尝试数；`first_data_ms` 是 provider.Sink.onData 首次收到任何 SSE 数据（含心跳、元数据）相对 Step 开始的时间，不代表首个模型内容 token。`code` 每个 run 一条 `{tool_call_id, first_ms, last_ms, progress}`，首尾时间相对 Step 开始，`progress` 是 `[ms, 累计参数 UTF-8 字节数]` 数组；接收时按到达顺序写入每调用最多 1024 点的固定缓冲，超出后按 stride 跳采，finish 时一次均匀抽样成最多 32 点并保留首尾；Codex 按 output_index、Chat Completions 按工具 index 跟踪，最终一次性参数如实记录 `first_ms == last_ms`，不推断未收到的片段。重试只保留成功请求的 code，first_data_ms 保留所有尝试中最早 onData 时间。`run_ms` 为此 Step 各 Run 从 sandbox 开始到 `session/output.zig` 格式化完成的总耗时，`run_results[].run_ms` 为单次耗时；未进入 sandbox 的调用无单次 run_ms。`calls` 最多保留 200 个宿主工具调用 `{name, start_ms, end_ms, ok, run_index}`，时间相对各自 Run 开始，run_index 是 run_results 的零起始下标，超出条数记 `calls_omitted`；ok 表示工具返回成功/错误，不等同于 bash 命令退出码。子 agent 只计父进程侧的调用，不追加参数或结果正文。`calls[]` 的可选 `id` 保存已分配的会话级任务编号：前台 agent 启动即分配，前台 bash 仅运行超过 3 秒开始上报进度时分配，短 bash 不含此字段；恢复依靠这些 id 避免前台编号回退。完整 Step、压缩及中断提交另保存可选 `task_ids: {agent, bash, run}`，数值为各类型已分配编号的高水位；恢复同时取其最大值，避免任务超过 `calls[]` 的 200 条明细上限时丢失续号信息。旧日志可省略。后台 agent/bash 的启动调用另带 `background: true` 和 `id`；该调用计时仅到启动返回，不表示后台任务执行耗时。所有计时使用单调 awake 时钟、毫秒单位；固定容量缓冲复用现有调度/完成路径，不新增锁或逐片段分配，不预取或推测执行。
 
 ## 工具字节度量
 
@@ -109,3 +109,13 @@ JSON `agents` 和 `bash_calls` 分别统计 agent、bash 的前台/后台调用�
 各档 `downgraded` 及跨档 `timing.effort.downgraded` 给出降档后的 Run 失败率：分母是有 Run 的降档 Step 数，分子是该 Step 响应后执行的任一 Run 显式 `ok=false` 的 Step 数，不关联后一个 Step，也不把无 Run 的最终回答放入分母。未知 Run 状态仍入分母并单列 `steps_with_unknown_run_status`。降档按 `effort_source=model` 且 `effort_downgraded=true` 判定；缺少后一字段的过渡记录按 model 来源推断，显式 false 排除等档声明。
 
 机器事件接口见 [ask-json.md](ask-json.md)。
+
+## 自动后台 Run 的记录与统计
+
+自动切换同步写入 `background:{id:"rN",kind:"run",state:"started"}`，随后当前完整 Step 的 `run_results[]` 保存 `background_id`，省略 `ok`（执行状态尚未确定），tool content 为提前通知，`tool_bytes:0`、空工具摘要。通知不采样仍在变动的工具计时。为避免尚未成功的 Run 影响下一次 effort，忽略该 Run 的 effort 声明。该 Step 的 `run_ms` 记录前台等待，`output_bytes` 记录通知；普通已完成 Run 保持原有字段含义。
+
+最终结果的后台 user 消息保存 `background_run:{step,run_index,ok,output,run_ms,tool_bytes,calls,calls_omitted,changes}`，`step` 为原 Session 的全局 Step（从 1 开始），`run_index` 从 0 开始。`output` 是正常格式化后的最终 Run 输出，`run_ms` 是原 Run 完整墙钟耗时，calls 时间相对原 Run 开始，changes 归属原 Run。独立 finished 生命周期记录的 `completion` 保存同一对象；`ask --json` 的 finished 事件也带 completion，供父 agent 汇总 changes。它们不是额外 Step。恢复以已经提交的后台消息为准，若来不及写 finished，沿用原来的终态修补规则；未提交结果恢复为 lost。`r` 计数器沿用后台事件与 `task_ids.run` 高水位，恢复不复用已分配的 ID。
+
+Step/Turn 的 `run_ms`、`tool_bytes`、llm/agent 调用数只计前台已结算的 Run，不把后台完整耗时叠加到重叠的主模型时间；后台 Run 的完整计时、字节与调用数从 `background_run` 获取。最终消息（含来源前缀）的字节按原有后台规则计入接收它的完整 Step 的 output_bytes，限额收尾和取消时继续结转。提前通知的 `run_end.ok:true` 仅表示成功转后台，实际成败由最终 completion.ok/background_ok 表示。
+
+`stats.py` 的 `background_runs` 与现有 agents/bash_calls 使用相同口径：`background_calls` 是自动切换次数，`background_steps` 是启动 Step 之后、结果插入之前已完成的本会话模型 Step 分布，`foreground_calls` 恒为 0（只统计自动后台 Run）。该指标包含根会话和子会话各自的主模型 Step，不将子会话 Step 当成父模型 Step。静态工具计数仍读取原代码；Step/calls 的旧性能指标不混入异步完成数据，避免重复计数。

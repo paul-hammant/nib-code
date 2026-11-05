@@ -3,7 +3,7 @@ const provider = @import("../provider.zig");
 const Change = @import("../tools/diff.zig").Change;
 const Summary = @import("tool_summary.zig").Summary;
 
-pub const TaskIds = struct { agent: u64 = 0, bash: u64 = 0 };
+pub const TaskIds = struct { agent: u64 = 0, bash: u64 = 0, run: u64 = 0 };
 
 pub const Progress = struct {
     id: []const u8,
@@ -79,14 +79,27 @@ pub const TurnSummary = struct {
 
 pub const ModelActivity = enum { started, data, finished };
 
+pub const RunCompletion = struct {
+    step: usize,
+    run_index: usize,
+    ok: bool,
+    output: []const u8,
+    run_ms: u64,
+    tool_bytes: u64,
+    calls: []const @import("../sandbox/timing.zig").Call,
+    calls_omitted: u64,
+    changes: []const Change,
+};
+
 pub const Background = struct {
     id: []const u8,
     kind: Kind,
     state: enum { started, finished, lost },
     ok: ?bool = null,
     result: ?[]const u8 = null,
+    completion: ?RunCompletion = null,
 
-    pub const Kind = enum { agent, bash };
+    pub const Kind = enum { agent, bash, run };
 };
 
 pub const Event = union(enum) {
@@ -117,7 +130,7 @@ pub const JsonEvent = union(enum) {
         switch (value) {
             .event => |event| if (event == .background) {
                 const b = event.background;
-                try writer.write(.{ .background = .{ .id = b.id, .kind = b.kind, .state = b.state, .ok = b.ok } });
+                try writer.write(.{ .background = .{ .id = b.id, .kind = b.kind, .state = b.state, .ok = b.ok, .completion = b.completion } });
             } else try writer.write(event),
             inline else => |payload, tag| {
                 try writer.beginObject();

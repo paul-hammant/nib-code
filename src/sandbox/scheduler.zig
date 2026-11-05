@@ -265,6 +265,8 @@ pub const State = struct {
             }
             if (expired != null or c.JS_IsJobPending(rt)) continue;
             if (active == 0 and (failed or !st.hasTimers())) return true;
+            if (st.host.?.waiting) |waiting| waiting.store(true, .release);
+            defer if (st.host.?.waiting) |waiting| waiting.store(false, .release);
             st.mutex.lockUncancelable(st.io);
             if (st.ready == null) st.completed.waitTimeout(st.io, &st.mutex, .{ .duration = .{ .raw = .fromMilliseconds(wait_ms), .clock = .awake } }) catch {};
             st.mutex.unlock(st.io);

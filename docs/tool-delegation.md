@@ -100,3 +100,9 @@ bash 与子会话复用标准库子进程等待和进程组执行器。所有 ba
 新会话构建 system 时，`src/tools.zig` 根据有效 provider 配置生成 llm 的模型列表：Codex 模型取自 `src/provider/codex.zig` 的目录；Chat Completions 至少提供 `src/provider/openai.zig` 的默认模型，另加入当前配置模型并去重。effort 说明只列常用的 low/medium/high，省略 model/effort 仍继承当前配置；完整档位与映射见 [config.md](config.md) 和 [codex.md](codex.md)。选择只在当前 provider 内进行，不隐式切换 provider。
 
 工具说明中的模型名按 JSON 字符串编码，不直接插入原始配置文本。根会话与默认新建子会话使用同一生成路径，但默认子会话隐藏 agent；fork 复用父 system/schema，不重新生成，agent 的不可递归边界由运行时执行。恢复会话仍沿用日志原始 system，不改写历史。架构理由见 [ADR 0010](adr/0010-subagents.md)、[ADR 0013](adr/0013-llm-functions.md) 与 [ADR 0015](adr/0015-agent-fork.md)。
+
+## 自动后台 Run
+
+长 Run 不依赖模型主动传 `background:true`；达到默认 10 秒的可配置阈值并仍在等工具时，整个脚本继续执行，模型先收到 `rN` 通知。已 await 的工具返回类型不变，console 和 edit/write changes 延后一起交付。后台 Run 与其他 Run 共享 cwd 和文件观察状态；只做独立工作，不轮询、不重跑、不同时修改相关文件。详细的并发上限、文件冲突边界、取消、展示预算与恢复语义见 [run-output.md](run-output.md#长-run-自动转后台)。
+
+`tools.stop` 同时接受其他后台 Run 的 `rN`；Run 不能 stop 自己。后台 Run 非 detached，最终回答和 Step 上限仍等待结果送达。Run 的后续代码也可以启动显式后台 bash/agent，沿用其各自的普通或 detached 语义。只有 Session 主线程向 sink 转发进度/用量/结果；后台沙箱与工具线程不调用前台 sink。

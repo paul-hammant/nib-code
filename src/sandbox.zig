@@ -60,6 +60,7 @@ pub const Host = struct {
     /// Borrowed until eval returns; inspect entries or change started/run_index only between evals.
     timing: ?*RunTiming = null,
     record: ?*Recorder = null,
+    waiting: ?*std.atomic.Value(bool) = null,
     virtual: ?*Virtual = null,
 };
 

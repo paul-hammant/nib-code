@@ -664,7 +664,7 @@ class ToolData:
 class AgentStats:
     def __init__(self):
         self.counts = {kind: dict(foreground_calls=0, background_calls=0, steps=[])
-                       for kind in ('agent', 'bash')}
+                       for kind in ('agent', 'bash', 'run')}
 
     def add(self, record, completed_steps, include, pending, seen, is_step=False, allow_agent=True):
         if not include:
@@ -1136,7 +1136,7 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None):
             'bash_top10': [{'command': k, 'count': v} for k, v in sorted(bash_counts.items(), key=lambda p: (-p[1], p[0]))[:10]],
             'errors': errors, 'slowest_steps': slowest, 'timing': timing.report(),
             'tool_data': tool_data.report(), 'child_costs': child_costs.report(),
-            'agents': agents.report(), 'bash_calls': agents.report('bash'),
+            'agents': agents.report(), 'bash_calls': agents.report('bash'), 'background_runs': agents.report('run'),
             'round_trips': dict(steps_per_turn=distribution(turn_steps),
                                write_to_validation=pair_summary(write_validation_pairs, adjacent_pairs),
                                mechanical_followups=mechanical,
@@ -1177,11 +1177,11 @@ def text_report(report):
              f"每 Turn 平均 {fmt(t['avg_steps_per_turn'])} Step；平均耗时 {fmt(t['avg_turn_ms'], ' ms')}（完整计时 {t['timed_turns']}/{t['turns']} Turn，{t['steps_with_ms']} Step）",
              '工具（静态调用点）：' + (', '.join(f'{k} {v}' for k, v in report['tools'].items()) or '无'),
              'bash 命令 Top 10：' + (', '.join(f"{v['command']} {v['count']}" for v in report['bash_top10']) or '无')]
-    for name, key in (('Agent', 'agents'), ('Bash', 'bash_calls')):
+    for name, key in (('Agent', 'agents'), ('Bash', 'bash_calls'), ('Run', 'background_runs')):
         calls = report[key]
         overlap = calls['background_steps']
         lines.extend([f"{name} 调用：前台 {calls['foreground_calls']} / 后台 {calls['background_calls']}",
-                      f"{'' if key == 'agents' else 'Bash '}后台期间主模型 Step: samples={overlap['samples']} median={fmt(overlap['median'])} p90={fmt(overlap['p90'])}"])
+                      f"{'' if key == 'agents' else name + ' '}后台期间主模型 Step: samples={overlap['samples']} median={fmt(overlap['median'])} p90={fmt(overlap['p90'])}"])
     lines.extend('  ' + note for note in report['agents']['notes'])
     costs = report['child_costs']
     lines.append('子会话已记录成本（每子会话；非费用）：')

@@ -126,3 +126,5 @@ plain 单 Run 显示 `match`、`diff` 或 `undetermined`，必要时附 `incompl
 - 后台任务（`background: true` 的 agent/bash）只录制启动时交回 JS 的 `{ id }`；它们之后作为消息插入的结果不经过 Run，不在 calls 录制中，已写入主日志。
 
 本地 mock、固定时间、首次参数分歧与 `/reflect` 特殊标记隐私回归测试：`zig build` 后运行 `python3 tests/test_replay.py`。
+
+自动后台 Run 的录制仍使用启动时的全局 Step/Run 编号，多个 Run 的录制块可能按完成顺序乱序追加。每个 Run 内 index/seq 与统一结算出口不变。会话恢复整理所有未提交 Step 的录制，保留夹在其后的已提交早期 Step；跨 Run 去重不引用更晚 Step 的数据。replay 不等待真实阈值、不启动后台任务，用已提交后台消息中的 background_run.output 比较完整脚本的最终输出；未送达时不拿提前通知作期望值。取消或丢失且录制不完整时仍报告原有的不完整/停止语义。

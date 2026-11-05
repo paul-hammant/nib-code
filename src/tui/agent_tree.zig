@@ -39,7 +39,7 @@ const Row = struct {
     fn init(gpa: std.mem.Allocator, p: Progress, last: bool) !Row {
         var text: std.ArrayList(u8) = .empty;
         errdefer text.deinit(gpa);
-        try text.print(gpa, "  {s} {s}{s} {s}", .{ if (last) "└─" else "├─", p.id, if (p.fork) " fork" else "", if (p.kind == .bash) "bash " else "" });
+        try text.print(gpa, "  {s} {s}{s} {s}", .{ if (last) "└─" else "├─", p.id, if (p.fork) " fork" else "", if (p.kind == .agent) "" else if (p.kind == .bash) "bash " else "run " });
         const prompt_start = text.items.len;
         var end: usize = 0;
         var chars: usize = 0;
@@ -55,7 +55,7 @@ const Row = struct {
         const prompt_end = text.items.len;
         const live = p.state == .queued or p.state == .working;
         const state = if (p.detached) (if (live) "detached" else @tagName(p.state)) else if (p.background) "background" else @tagName(p.state);
-        if (p.kind == .bash) {
+        if (p.kind != .agent) {
             try text.appendSlice(gpa, " · ");
             try appendElapsed(gpa, &text, p.elapsed_ms);
             try text.print(gpa, " · {s}", .{state});

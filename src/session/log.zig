@@ -3,7 +3,8 @@ const provider = @import("../provider.zig");
 
 pub const RunResult = struct {
     tool_call_id: []const u8,
-    ok: bool,
+    background_id: ?[]const u8 = null,
+    ok: ?bool = null,
     run_ms: ?u64 = null,
     tool_bytes: ?u64 = null,
     output_bytes: ?u64 = null,
@@ -72,6 +73,7 @@ pub const Log = struct {
     mutex: std.Io.Mutex = .init,
     next_agent_id: u64 = 1,
     next_bash_id: u64 = 1,
+    next_run_id: u64 = 1,
     agent_sessions: []const AgentSession = &.{},
     lost_background: []const @import("events.zig").Background = &.{},
     pending_background_bytes: u64 = 0,
@@ -103,7 +105,7 @@ pub const Log = struct {
         if (expected_parent) |parent| {
             if (!std.mem.eql(u8, parent, restored.parent_session_id orelse "")) return error.AgentSessionParentMismatch;
         }
-        var log: Log = .{ .file = file, .offset = data.len, .parent_session_id = restored.parent_session_id, .cache_key = restored.cache_key, .forked_from = restored.forked_from, .provider = restored.provider, .model = restored.model, .steps = restored.steps, .next_agent_id = restored.next_agent_id, .next_bash_id = restored.next_bash_id, .agent_sessions = restored.agent_sessions, .lost_background = restored.lost_background, .pending_background_bytes = restored.pending_background_bytes };
+        var log: Log = .{ .file = file, .offset = data.len, .parent_session_id = restored.parent_session_id, .cache_key = restored.cache_key, .forked_from = restored.forked_from, .provider = restored.provider, .model = restored.model, .steps = restored.steps, .next_agent_id = restored.next_agent_id, .next_bash_id = restored.next_bash_id, .next_run_id = restored.next_run_id, .agent_sessions = restored.agent_sessions, .lost_background = restored.lost_background, .pending_background_bytes = restored.pending_background_bytes };
         if (restored.needs_repair) try log.append(io, a, .{ .repair = true });
         for (restored.background_repairs) |event| try log.append(io, a, .{ .background = event });
         if (restored.needs_repair or restored.background_repairs.len != 0) try log.file.sync(io);
@@ -209,12 +211,13 @@ fn restoreToolSummaries(a: std.mem.Allocator, history: []provider.Message, recor
     }
 }
 
-pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, history: *std.ArrayList(provider.Message), tokens: *u64) !struct { needs_repair: bool, steps: usize, parent_session_id: ?[]const u8, cache_key: ?[]const u8, forked_from: ?ForkedFrom, provider: provider.Id, model: ?[]const u8, next_agent_id: u64, next_bash_id: u64, agent_sessions: []const AgentSession, lost_background: []const @import("events.zig").Background, background_repairs: []const @import("events.zig").Background, pending_background_bytes: u64 } {
+pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, history: *std.ArrayList(provider.Message), tokens: *u64) !struct { needs_repair: bool, steps: usize, parent_session_id: ?[]const u8, cache_key: ?[]const u8, forked_from: ?ForkedFrom, provider: provider.Id, model: ?[]const u8, next_agent_id: u64, next_bash_id: u64, next_run_id: u64, agent_sessions: []const AgentSession, lost_background: []const @import("events.zig").Background, background_repairs: []const @import("events.zig").Background, pending_background_bytes: u64 } {
     var parent_session_id: ?[]const u8 = null;
     var cache_key: ?[]const u8 = null;
     var forked_from: ?ForkedFrom = null;
     var next_agent_id: u64 = 1;
     var next_bash_id: u64 = 1;
+    var next_run_id: u64 = 1;
     var pending_background_bytes: u64 = 0;
     var agent_sessions: std.ArrayList(AgentSession) = .empty;
     defer agent_sessions.deinit(a);
@@ -247,19 +250,20 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
         }
         if (torn) return error.InvalidSessionLog;
         for (r.calls orelse &.{}) |call| if (call.id) |call_id| {
-            try restoreId(call_id, &next_agent_id, &next_bash_id);
+            try restoreId(call_id, &next_agent_id, &next_bash_id, &next_run_id);
         };
         if (r.task_ids) |ids| {
             next_agent_id = @max(next_agent_id, std.math.add(u64, ids.agent, 1) catch return error.InvalidSessionLog);
             next_bash_id = @max(next_bash_id, std.math.add(u64, ids.bash, 1) catch return error.InvalidSessionLog);
+            next_run_id = @max(next_run_id, std.math.add(u64, ids.run, 1) catch return error.InvalidSessionLog);
         }
         if (r.agent_session) |mapping| {
-            try restoreId(mapping.id, &next_agent_id, &next_bash_id);
+            try restoreId(mapping.id, &next_agent_id, &next_bash_id, &next_run_id);
             try agent_sessions.append(a, mapping);
             continue;
         }
         if (r.background) |b| {
-            try restoreId(b.id, &next_agent_id, &next_bash_id);
+            try restoreId(b.id, &next_agent_id, &next_bash_id, &next_run_id);
             if (b.state == .started) {
                 try pending_background.append(a, .{ .event = b });
             } else {
@@ -309,13 +313,13 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
             try background_repairs.append(a, pending.event);
         } else try lost_background.append(a, pending.event);
     }
-    return .{ .steps = steps, .needs_repair = torn or data[data.len - 1] != '\n', .parent_session_id = parent_session_id, .cache_key = cache_key, .forked_from = forked_from, .provider = id, .model = model, .next_agent_id = next_agent_id, .next_bash_id = next_bash_id, .agent_sessions = try agent_sessions.toOwnedSlice(a), .lost_background = try lost_background.toOwnedSlice(a), .background_repairs = try background_repairs.toOwnedSlice(a), .pending_background_bytes = pending_background_bytes };
+    return .{ .steps = steps, .needs_repair = torn or data[data.len - 1] != '\n', .parent_session_id = parent_session_id, .cache_key = cache_key, .forked_from = forked_from, .provider = id, .model = model, .next_agent_id = next_agent_id, .next_bash_id = next_bash_id, .next_run_id = next_run_id, .agent_sessions = try agent_sessions.toOwnedSlice(a), .lost_background = try lost_background.toOwnedSlice(a), .background_repairs = try background_repairs.toOwnedSlice(a), .pending_background_bytes = pending_background_bytes };
 }
 
-fn restoreId(id: []const u8, next_agent: *u64, next_bash: *u64) !void {
-    if (id.len < 2 or (id[0] != 'a' and id[0] != 'b')) return;
+fn restoreId(id: []const u8, next_agent: *u64, next_bash: *u64, next_run: *u64) !void {
+    if (id.len < 2 or (id[0] != 'a' and id[0] != 'b' and id[0] != 'r')) return;
     const number = std.fmt.parseInt(u64, id[1..], 10) catch return error.InvalidSessionLog;
-    const next = if (id[0] == 'a') next_agent else next_bash;
+    const next = if (id[0] == 'a') next_agent else if (id[0] == 'b') next_bash else next_run;
     next.* = @max(next.*, std.math.add(u64, number, 1) catch return error.InvalidSessionLog);
 }
 
@@ -743,8 +747,9 @@ test "ID restoration rejects overflow rather than wrapping the session counter" 
     const t = std.testing;
     var next_agent: u64 = 1;
     var next_bash: u64 = 1;
-    try t.expectError(error.InvalidSessionLog, restoreId("a18446744073709551615", &next_agent, &next_bash));
-    try restoreId("legacy_id", &next_agent, &next_bash);
+    var next_run: u64 = 1;
+    try t.expectError(error.InvalidSessionLog, restoreId("a18446744073709551615", &next_agent, &next_bash, &next_run));
+    try restoreId("legacy_id", &next_agent, &next_bash, &next_run);
     try t.expectEqual(@as(u64, 1), next_agent);
     try t.expectEqual(@as(u64, 1), next_bash);
 }
@@ -792,11 +797,12 @@ test "agent session mappings survive snapshots and compaction without changing h
     var expected_steps: usize = 0;
     var next_agent: u64 = 1;
     var next_bash: u64 = 1;
+    var next_run: u64 = 1;
     for (records) |record| {
         try encoded.writer.print("{f}\n", .{std.json.fmt(record, .{ .emit_null_optional_fields = false })});
         if (record.agent_session) |mapping| {
             mapping_count += 1;
-            try restoreId(mapping.id, &next_agent, &next_bash);
+            try restoreId(mapping.id, &next_agent, &next_bash, &next_run);
         } else {
             try expected.ensureTotalCapacity(a, record.from + record.messages.len);
             if (record.from == expected.items.len) expected_steps += assistantCount(record.messages);

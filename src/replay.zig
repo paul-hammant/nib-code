@@ -139,6 +139,13 @@ fn loadMain(a: Allocator, data: []const u8) ![]Run {
         if (!appended) continue;
         if (record.object.get("forked_from")) |fork| if (fork != .null) continue;
         for (messages, 0..) |message, m| {
+            if (message.object.get("background_run")) |completion| if (completion != .null) {
+                const key: Key = .{ .step = try natural(try field(completion, "step")), .run = try natural(try field(completion, "run_index")) };
+                for (runs.items) |*item| if (item.key.eql(key)) {
+                    item.expected = try string(try field(completion, "output"));
+                    item.remaining_steps = null;
+                };
+            };
             if (!std.mem.eql(u8, try string(try field(message, "role")), "assistant")) continue;
             step += 1;
             const calls_value = message.object.get("tool_calls") orelse continue;
@@ -166,6 +173,7 @@ fn loadMain(a: Allocator, data: []const u8) ![]Run {
                 if (record.object.get("run_results")) |results| {
                     if (results != .null) for (try array(results)) |result| {
                         if (std.mem.eql(u8, id, try string(try field(result, "tool_call_id")))) {
+                            if (try optionalString(result, "background_id")) |_| expected = null;
                             if (result.object.get("remaining_steps")) |remaining| {
                                 if (remaining != .null) remaining_steps = try natural(remaining);
                             }

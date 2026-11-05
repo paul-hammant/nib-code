@@ -20,6 +20,7 @@ pub const Limits = struct {
     agent_concurrency: usize = 4,
     max_steps: ?usize = null,
     stream_idle_timeout_s: usize = 300,
+    run_background_after_ms: usize = 10000,
 };
 
 pub const Config = struct {
@@ -106,6 +107,7 @@ pub const Message = struct {
     source: ?enum { background } = null,
     background_id: ?[]const u8 = null,
     background_ok: ?bool = null,
+    background_run: ?@import("session/events.zig").RunCompletion = null,
     background_kind: ?@import("session/events.zig").Background.Kind = null,
 };
 

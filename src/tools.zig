@@ -79,10 +79,11 @@ const all = [_]Tool{
         .name = "bash",
         .run = bash.bash,
         .doc =
-        \\  // Bash in cwd; stderr merged. exit_code:null if killed. Returning kills its process group, including nohup/&.
-        \\  // Verbatim output; >16 MiB errors (redirect to file). >256 shell words excluding heredocs refused: write a script. File changes affect results.
-        \\  // background returns {id}; result in a later Step. detached requires background; survives normal Turns without waiting. Stop/timeout/Turn cancel or failure/Session exit cleans up.
-        \\  // A detached task ends when its shell exits; run servers in command foreground.
+        \\  // Bash in cwd; merged stderr. exit_code:null if killed. Return kills group (including nohup/&).
+        \\  // Verbatim output; >16 MiB errors: redirect to file. >256 shell words (excluding heredocs) refused: write a script.
+        \\  // background:{id}, later result. detached requires background, survives Turns; stop/timeout/cancel/failure/exit cleans up.
+        \\  // Long Runs auto-background; await keeps its result. Do independent work; do not poll/rerun.
+        \\  // detached ends with shell exit; run servers in foreground.
         \\  async bash({ command, timeout_ms, background = false, detached = false }) {}, // → { exit_code, output } or { id }; timeout_ms default: detached 0 (unlimited), else 120000
         ,
     },
@@ -90,7 +91,7 @@ const all = [_]Tool{
         .name = "stop",
         .run = @import("tools/stop.zig").stop,
         .doc =
-        \\  // Cancel and join one background bash/agent by id, cleaning up its process group. Completed tasks return stopped:false; unknown ids reject. Completion is still delivered once as a background message.
+        \\  // Cancel and join one background bash/agent/Run by id, cleaning up its process group. Completed tasks return stopped:false; unknown ids reject. Completion is still delivered once as a background message.
         \\  async stop({ id }) {}, // → { id, stopped }
         ,
     },
@@ -145,6 +146,38 @@ const child_api = makeApi(1);
 pub const names = root_api.names;
 pub const docs = root_api.docs;
 
+pub const RunScope = struct {
+    tools: *Tools,
+    id: usize,
+    cancel: std.atomic.Value(bool) = .init(false),
+    llm_calls: std.atomic.Value(usize) = .init(0),
+    changes: @import("tools/changes.zig").Tracker = .{},
+    fork: ?@import("tools/agent/input.zig").Fork = null,
+
+    pub fn host(scope: *RunScope) sandbox.Host {
+        return .{ .ctx = scope, .names = scope.tools.api().names, .call = call, .cancel = &scope.cancel, .admit = admit };
+    }
+
+    fn call(ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8, args: []const u8) sandbox.ToolResult {
+        const scope: *RunScope = @ptrCast(@alignCast(ctx));
+        const previous = current_scope;
+        current_scope = scope;
+        defer current_scope = previous;
+        return Tools.call(scope.tools, gpa, name, args);
+    }
+
+    fn admit(ctx: *anyopaque, gpa: std.mem.Allocator, name: []const u8) !?[]u8 {
+        const scope: *RunScope = @ptrCast(@alignCast(ctx));
+        const previous = current_scope;
+        current_scope = scope;
+        defer current_scope = previous;
+        return Tools.admit(scope.tools, gpa, name);
+    }
+};
+
+// Native tool workers bind the owning Run; explicit background jobs use their own cancellation.
+threadlocal var current_scope: ?*RunScope = null;
+
 /// State shared by all tool calls of one Session; each tool lives in `tools/`.
 pub const Tools = struct {
     io: std.Io,
@@ -173,11 +206,28 @@ pub const Tools = struct {
     changes_mutex: std.Io.Mutex = .init,
     changes: @import("tools/changes.zig").Tracker = .{},
 
+    fn scope(t: *Tools) ?*RunScope {
+        const value = current_scope orelse return null;
+        return if (value.tools == t) value else null;
+    }
+
+    pub fn cancelFlag(t: *Tools) *std.atomic.Value(bool) {
+        return if (t.scope()) |value| &value.cancel else &t.cancel;
+    }
+
+    pub fn runId(t: *Tools) usize {
+        return if (t.scope()) |value| value.id else t.run_id;
+    }
+
+    pub fn forkSnapshot(t: *Tools) ?@import("tools/agent/input.zig").Fork {
+        return if (t.scope()) |value| value.fork else t.fork_snapshot;
+    }
+
     pub fn noteChange(t: *Tools, gpa: std.mem.Allocator, path: []const u8, before: ?[]const u8, after: []const u8) !void {
         if (!t.track_changes) return;
         t.changes_mutex.lockUncancelable(t.io);
         defer t.changes_mutex.unlock(t.io);
-        try t.changes.record(gpa, path, before, after);
+        try (if (t.scope()) |value| &value.changes else &t.changes).record(gpa, path, before, after);
     }
 
     pub fn takeChanges(t: *Tools, gpa: std.mem.Allocator, a: std.mem.Allocator) ![]const diff.Change {
@@ -241,7 +291,7 @@ pub const Tools = struct {
         const t: *Tools = @ptrCast(@alignCast(ctx));
         if (std.mem.eql(u8, name, "llm")) {
             const limit = (t.cfg orelse return error.LlmConfigUnavailable).limits.llm_calls_per_run;
-            if (t.llm_calls.fetchAdd(1, .monotonic) >= limit)
+            if ((if (t.scope()) |value| &value.llm_calls else &t.llm_calls).fetchAdd(1, .monotonic) >= limit)
                 return try std.fmt.allocPrint(gpa, "llm limit is {d} calls per Run; split into batches or filter in JavaScript first", .{limit});
         }
         return null;

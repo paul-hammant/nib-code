@@ -263,16 +263,17 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         other = tmp / "other"
         other.mkdir()
         ask("no session", "-c", workdir=other, ok=False)
-        ask("one", workdir=other, window="4352")
-        result = ask("two", "--continue", workdir=other, window="4352")
-        assert b"compacted context:" in result.stderr
+        ask("one", workdir=other, window="5120")
+        ask("one", "--continue", workdir=other, window="5120")
+        result = ask("two" + " " * 2048, "--continue", workdir=other, window="5120")
+        assert b"compacted context:" in result.stderr, result.stderr
         compact_log = next(p for p in (tmp / "nib/sessions").glob("[0-9a-f]" * 32 + ".jsonl") if p != log)
         compacted, records = replay(compact_log)
         replacements = [r for r in records[1:] if r["messages"][0].get("content", "").startswith("Earlier session summary:")]
         assert len(replacements) == 1
-        assert replacements[0]["context_tokens"] <= 2176
+        assert replacements[0]["context_tokens"] <= 2560
         assert compacted[1]["content"].startswith("Earlier session summary:")
-        ask("three", "-c", workdir=other, window="4352")
+        ask("three", "-c", workdir=other, window="5120")
         assert read_requests(requests_path)[-2]["messages"] == compacted + [{"role": "user", "content": "three"}]
         def events(result):
             assert result.stderr == b"", result.stderr

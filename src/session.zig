@@ -164,6 +164,7 @@ pub const Session = struct {
         }
         s.tools.progress.next_agent_id = s.log.next_agent_id;
         s.tools.progress.next_bash_id = s.log.next_bash_id;
+        s.tools.progress.next_run_id = s.log.next_run_id;
         for (s.log.lost_background) |lost| {
             const id = lost.id;
             const text = try std.fmt.allocPrint(gpa, "[background {s} {s} lost: process ended]", .{ @tagName(lost.kind), id });
@@ -426,7 +427,8 @@ pub const Session = struct {
                 try pending.append(s.gpa, .{ .role = "tool", .content = result.output, .tool_call_id = call.id, .tool_summary = result.tool_summary });
                 try run_results.append(s.gpa, .{
                     .tool_call_id = call.id,
-                    .ok = result.ok,
+                    .background_id = result.background_id,
+                    .ok = if (result.background_id != null) null else result.ok,
                     .run_ms = result.run_ms,
                     .tool_bytes = run_timing.tool_bytes - before_bytes,
                     .calls_omitted = run_timing.omitted - before_omitted,

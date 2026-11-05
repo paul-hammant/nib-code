@@ -9,6 +9,10 @@ pub const Batch = struct {
         for (b.items.items) |item| {
             gpa.free(item.text);
             if (item.background) |bkg| gpa.free(bkg.id);
+            if (item.completion_arena) |owned| {
+                var arena = owned;
+                arena.deinit();
+            }
         }
         b.items.deinit(gpa);
     }
@@ -25,7 +29,7 @@ pub const Batch = struct {
     }
 };
 
-pub const Item = struct { id: u64, text: []const u8, background: ?Background = null, detached: bool = false, invocation: usize = 0 };
+pub const Item = struct { id: u64, text: []const u8, background: ?Background = null, detached: bool = false, invocation: usize = 0, completion_arena: ?std.heap.ArenaAllocator = null };
 
 pub const Inbox = struct {
     mutex: std.Io.Mutex = .init,
@@ -44,14 +48,24 @@ pub const Inbox = struct {
     }
 
     pub fn enqueueBackground(q: *Inbox, gpa: std.mem.Allocator, io: std.Io, id: []const u8, kind: Background.Kind, state: @FieldType(Background, "state"), ok: ?bool, text: []const u8, detached: bool, invocation: usize) !u64 {
+        return q.enqueueCompletion(gpa, io, id, kind, state, ok, text, detached, invocation, null);
+    }
+
+    pub fn enqueueCompletion(q: *Inbox, gpa: std.mem.Allocator, io: std.Io, id: []const u8, kind: Background.Kind, state: @FieldType(Background, "state"), ok: ?bool, text: []const u8, detached: bool, invocation: usize, completion: ?@import("events.zig").RunCompletion) !u64 {
         q.mutex.lockUncancelable(io);
         defer q.mutex.unlock(io);
         const copy = try gpa.dupe(u8, text);
         errdefer gpa.free(copy);
         const agent_id = try gpa.dupe(u8, id);
         errdefer gpa.free(agent_id);
+        var owned: ?std.heap.ArenaAllocator = null;
+        errdefer if (owned) |*arena| arena.deinit();
+        const copy_completion = if (completion) |value| blk: {
+            owned = .init(gpa);
+            break :blk try cloneCompletion(owned.?.allocator(), value);
+        } else null;
         const message_id = q.next_id;
-        try q.batch.items.append(gpa, .{ .id = message_id, .text = copy, .background = .{ .id = agent_id, .kind = kind, .state = state, .ok = ok }, .detached = detached, .invocation = invocation });
+        try q.batch.items.append(gpa, .{ .id = message_id, .text = copy, .background = .{ .id = agent_id, .kind = kind, .state = state, .ok = ok, .completion = copy_completion }, .detached = detached, .invocation = invocation, .completion_arena = owned });
         q.next_id += 1;
         return message_id;
     }
@@ -112,7 +126,7 @@ pub const Inbox = struct {
         for (q.batch.items.items) |item| {
             if (background_only and (item.background == null or item.detached)) continue;
             selected.items.appendAssumeCapacity(item);
-            try messages.append(gpa, .{ .role = "user", .content = try arena.dupe(u8, item.text), .source = if (item.background != null) .background else null, .background_kind = if (item.background) |b| b.kind else null, .background_ok = if (item.background) |b| b.ok else null, .background_id = if (item.background) |b| try arena.dupe(u8, b.id) else null });
+            try messages.append(gpa, .{ .role = "user", .content = try arena.dupe(u8, item.text), .source = if (item.background != null) .background else null, .background_kind = if (item.background) |b| b.kind else null, .background_ok = if (item.background) |b| b.ok else null, .background_id = if (item.background) |b| try arena.dupe(u8, b.id) else null, .background_run = if (item.background) |b| if (b.completion) |value| try cloneCompletion(arena, value) else null else null });
         }
         try pending.appendSlice(gpa, messages.items);
         var retained: usize = 0;
@@ -255,4 +269,10 @@ test "taking queued users leaves the inbox untouched on allocation failure" {
     try t.expectEqualStrings("b1", q.batch.items.items[0].background.?.id);
     try t.expectEqual(id, q.batch.items.items[1].id);
     try t.expectEqualStrings("next input", q.batch.items.items[1].text);
+}
+
+fn cloneCompletion(a: std.mem.Allocator, value: @import("events.zig").RunCompletion) !@import("events.zig").RunCompletion {
+    const json = try std.json.Stringify.valueAlloc(a, value, .{});
+    defer a.free(json);
+    return std.json.parseFromSliceLeaky(@import("events.zig").RunCompletion, a, json, .{ .allocate = .alloc_always });
 }

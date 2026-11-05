@@ -51,7 +51,7 @@ pub fn bash(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
         };
         return .{ .ok = result };
     }
-    return execute(t, gpa, a.value.command, a.value.timeoutMs(), &t.cancel, null);
+    return execute(t, gpa, a.value.command, a.value.timeoutMs(), t.cancelFlag(), null);
 }
 
 pub fn executeBackground(t: *Tools, gpa: std.mem.Allocator, args: []const u8, cancel: *const std.atomic.Value(bool), progress: @import("../session/events.zig").Progress) !sandbox.ToolResult {
@@ -120,9 +120,9 @@ const Tracker = struct {
     fn tickAt(tr: *Tracker, elapsed_ms: u64) void {
         if (tr.value == null) {
             if (elapsed_ms < foreground_progress_threshold_ms) return;
-            const id = tr.t.progress.add(tr.gpa, tr.t.io, .bash, tr.command, tr.t.run_id, false) catch return;
+            const id = tr.t.progress.add(tr.gpa, tr.t.io, .bash, tr.command, tr.t.runId(), false) catch return;
             sandbox.tool_identity = .{ .id = id };
-            tr.value = .{ .id = id, .kind = .bash, .prompt = tr.command, .run = tr.t.run_id };
+            tr.value = .{ .id = id, .kind = .bash, .prompt = tr.command, .run = tr.t.runId() };
         }
         var value = tr.value.?;
         value.elapsed_ms = elapsed_ms;

@@ -17,7 +17,7 @@ _Avoid_: history, transcript（transcript 只指界面上显示的内容）
 _Avoid_: round。注意：pi 的 `turn_start` 指的是单次模型调用，相当于这里的 Step。
 
 **Step**（步）：
-一个 Turn 内的一次模型请求与响应，以及随后执行的全部 Run（如果有）。Step 完整后才提交日志；首个 Step 同时提交该 Turn 的用户消息。
+一个 Turn 内的一次模型请求与响应，以及随后发起的全部 Run（如果有）。Run 可以在工具等待超过阈值时自动转后台，Step 先以通知完成，最终结果作为后续消息送达。Step 完整后才提交日志；首个 Step 同时提交该 Turn 的用户消息。
 _Avoid_: iteration, turn
 
 **Subagent**（子 agent）：

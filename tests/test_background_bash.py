@@ -1023,7 +1023,7 @@ class BackgroundBashTests:
         step = next(r for r in rows if r.get("calls_omitted"))
         self.assertEqual((len(step["calls"]), step["calls_omitted"]), (200, 2))
         self.assertTrue(all("id" not in c for c in step["calls"]))
-        self.assertEqual(step["task_ids"], {"agent": 1, "bash": 1})
+        self.assertEqual(step["task_ids"], {"agent": 1, "bash": 1, "run": 0})
         self.assert_progress_ids(events, {"a1": ("agent", False), "b1": ("bash", False)})
         mock.child_gate.set()
         resumed = self.finish(self.start("--resume", events[0]["start"]["session_id"], "resume"))
@@ -1067,6 +1067,7 @@ class BackgroundBashTests:
         self.assertEqual({m["background_id"] for m in logged}, {"a2", "b1"})
 
     def test_foreground_bash_delays_progress_and_keeps_two_completed_ids(self):
+        (self.home / "config.toml").write_text("[limits]\nrun_background_after_ms = 30000\n")
         self.mock("foreground_bash")
         started = time.monotonic()
         process = self.start()
