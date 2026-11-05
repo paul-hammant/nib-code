@@ -326,7 +326,7 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
             try restoreId(event.id, &next_agent_id, &next_bash_id, &next_run_id);
             continue;
         }
-        if (r.diagnostic != null) continue;
+        if (r.diagnostic != null or (r.transport_fallback != null and r.messages.len == 0)) continue;
         if (r.from > history.items.len) return error.InvalidSessionLog;
         try history.ensureTotalCapacity(gpa, r.from + r.messages.len);
         if (r.from == history.items.len and r.forked_from == null) {
@@ -629,6 +629,31 @@ test "diagnostic append and replay do not commit messages or replace context tok
     const summaries = try list(t.io, a, std.fs.path.dirname(path).?, "/work");
     try t.expectEqual(@as(usize, 1), summaries.len);
     try t.expectEqualStrings("next", summaries[0].preview);
+}
+
+test "transport fallback events preserve history, tokens and Steps across restore" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/s.jsonl", .{tmp.sub_path});
+    var log = try Log.create(t.io, path);
+    defer log.close(t.io);
+    var history: std.ArrayList(provider.Message) = .empty;
+    var tokens: u64 = 0;
+    try log.commit(t.io, a, &history, &tokens, .{ .messages = &.{.{ .role = "system", .content = "base" }}, .context_tokens = 123 });
+    for ([_][]const u8{ "WebSocketHandshake", "previous_response_not_found" }) |reason| {
+        try log.fallback(t.io, a, .{ .fallback_reason = reason, .fallback_at = 1 }, 1);
+        try log.commit(t.io, a, &history, &tokens, .{ .from = history.items.len, .messages = &.{ .{ .role = "user", .content = "next" }, .{ .role = "assistant", .content = "ok" } }, .context_tokens = 200, .model_ms = 1, .transport_fallback = reason });
+    }
+    var restored: std.ArrayList(provider.Message) = .empty;
+    var restored_tokens: u64 = 0;
+    const result = try replay(a, a, try tmp.dir.readFileAlloc(t.io, "s.jsonl", a, .unlimited), &restored, &restored_tokens);
+    try t.expectEqualDeep(history.items, restored.items);
+    try t.expectEqual(tokens, restored_tokens);
+    try t.expectEqual(@as(usize, 2), result.steps);
 }
 
 test "timing fields are optional and replay preserves mixed old and measured Steps" {

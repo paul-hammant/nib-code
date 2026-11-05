@@ -137,7 +137,7 @@ Step/Turn 的 `run_ms`、`tool_bytes`、llm/agent 调用数只计前台已结算
 
 `full_reason` 说明本次为何未续接：`first_request`、`missing_response_id`、`unsupported_output`、`reconnect`、`scope_changed`、`compaction`、`effort_changed`、`properties_changed`、`input_prefix_mismatch`、`previous_response_not_found`、`sse_configured` 或 `sse_fallback`。实际前缀不匹配同时记录 `mismatch_index`（线上 input 的零起始位置）；成功增量无 full_reason。`--group-by full_reason` 按完整 Step 分组，成功增量归 `incremental`，旧日志缺字段归 `unknown`，沿用其他 Step 分组的过滤与相邻关系规则。
 
-每次降级立即追加独立记录，包含 `transport_fallback`、`transport_fallback_at`（Unix 毫秒）、`transport_fallback_detail`（如有）及 step，取消也不丢失该记录；它没有 usage/model_ms/messages，不增加 Step。完整 Step 保留相同原因及原始降级时间。previous_response_not_found 的原地全量重发也立即记录。协议诊断包含解析阶段、最后事件类型、output_index、已收条目数及 pending 数，不保存原始帧、认证头或路由 token。
+每次降级立即追加独立记录，包含 `transport_fallback`、`transport_fallback_at`（Unix 毫秒）、`transport_fallback_detail`（如有）及 step，取消也不丢失该记录；它没有 usage/model_ms，messages 为空，不增加 Step，也不替换历史或 context_tokens。恢复和离线 replay 跳过其历史应用。完整 Step 保留相同原因及原始降级时间。previous_response_not_found 的原地全量重发也立即记录。协议诊断包含解析阶段、最后事件类型、output_index、已收条目数及 pending 数，不保存原始帧、认证头或路由 token。
 
 完整 Step 的 `model_attempts` 按外层尝试依次保存 start_ms/end_ms（均相对 Step 开始）、error_name/detail、transport/incremental/full_reason、fallback_reason/fallback_at/fallback_detail、bytes/content_bytes、first_content_ms/last_content_ms/max_content_gap_ms 和 max_gap_ms。content_bytes 只计非空文本、reasoning 摘要和工具参数增量；bytes 是接收响应体的字节，不含握手头。相邻尝试的 start_ms 减去前次 end_ms 可见退避。失败耗尽时 diagnostic 同样保存该数组；成功 Step 顶层 max_content_gap_ms 是最后尝试的内容间隔，不包含首次等待和重试退避。缺失的可选值省略，不补零。总超时覆盖所有 I/O，收集每次尝试前先取消并 join 请求，下一尝试才可复用 sink 和分配器。
 

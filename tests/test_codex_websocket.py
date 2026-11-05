@@ -284,6 +284,16 @@ def run_case(tmp, mode, *, resume=None, home=None, extra=None):
 
 
 
+def check_saved_run(tmp, session, home):
+    result = subprocess.run([str(BIN), "replay", session, "--all", "--json"], cwd=tmp,
+                            env=dict(os.environ, NIB_HOME=str(home)), capture_output=True, timeout=10)
+    assert result.returncode == 0 and result.stderr == b"", (result.stdout, result.stderr)
+    report = json.loads(result.stdout)
+    assert report["total"] == report["matched"] == 1, report
+    resumed, _, _, _ = run_case(tmp, "normal", resume=session, home=home)
+    assert any(i.get("type") == "custom_tool_call_output" for i in resumed.requests[0]["body"]["input"])
+
+
 def test_tui_cancel(tmp):
     from test_interjections import Terminal, wait_for, finished
     server = Mock("cancel")
@@ -394,10 +404,11 @@ def main():
             first_by_connection.setdefault(request["connection"], request["body"])
         assert all("previous_response_id" not in b for b in first_by_connection.values())
         assert len({b["prompt_cache_key"] for b in first_by_connection.values()}) == 1
-        server, steps, _, _ = run_case(tmp, "missing")
+        server, steps, sid, case_home = run_case(tmp, "missing")
         assert len(server.requests) == 3 and "previous_response_id" in server.requests[1]["body"]
         assert "previous_response_id" not in server.requests[2]["body"]
         assert steps[1]["transport_fallback"] == "previous_response_not_found" and not steps[1]["incremental"]
+        check_saved_run(tmp, sid, case_home)
         for mode in ("handshake", "bad-accept", "protocol", "protocol-emitted"):
             server, steps, sid, case_home = run_case(tmp, mode)
             assert server.connections == 1 and server.posts >= 1, (mode, server.requests)
@@ -410,6 +421,7 @@ def main():
                 assert attempts[0]["error_name"] == "WebSocketFallback" and attempts[0]["fallback_at"]
             if mode not in ("protocol", "protocol-emitted"):
                 assert server.posts == 2
+            check_saved_run(tmp, sid, case_home)
         server, steps, _, _ = run_case(tmp, "event-state")
         assert server.requests[1]["body"]["client_metadata"]["x-codex-turn-state"] == "event-turn"
         server, steps, _, _ = run_case(tmp, "disconnect")
