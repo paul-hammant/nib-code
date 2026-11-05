@@ -263,7 +263,7 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         other = tmp / "other"
         other.mkdir()
         ask("no session", "-c", workdir=other, ok=False)
-        ask("one", workdir=other, window="4352")
+        ask("one", workdir=other, window="4352", overrides={"NIB_PATCHES_OFF": "all"})
         result = ask("two", "--continue", workdir=other, window="4352")
         assert b"compacted context:" in result.stderr
         compact_log = next(p for p in (tmp / "nib/sessions").glob("[0-9a-f]" * 32 + ".jsonl") if p != log)

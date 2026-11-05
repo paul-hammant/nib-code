@@ -25,6 +25,7 @@ effort = "high"
 model = "gpt-6.1-sol"
 base_url = "https://chatgpt.com/backend-api"
 context_window = 500000
+transport = "sse" # websocket 为显式启用的 Responses WS 原型
 
 [chat_completions]
 model = "deepseek-flash"
@@ -44,7 +45,7 @@ stream_idle_timeout_s = 300
 
 DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 `DEEPSEEK_API_KEY`（或 `NIB_API_KEY`），默认模型 `deepseek-flash`、窗口 1000000 tokens；其他默认值见上例。
 
-这是无额外依赖的 TOML 子集：支持空行、`#` 注释、单行双引号字符串（支持 `\"`、`\\`、`\n` 转义）、十进制整数（可带符号、下划线分组）和 true/false 布尔值；当前配置键只使用字符串和正整数，布尔值会报告类型错误。仅接受顶层 `provider`、`effort`，`[codex]` / `[chat_completions]` 下的 `model`、`base_url`、`context_window`，以及下述 `[limits]` 键。不支持数组、嵌套表、多行字符串等完整 TOML 语法；未知键、重复键/段落和格式错误会报配置文件路径与行号，不静默忽略。
+这是无额外依赖的 TOML 子集：支持空行、`#` 注释、单行双引号字符串（支持 `\"`、`\\`、`\n` 转义）、十进制整数（可带符号、下划线分组）和 true/false 布尔值；当前配置键只使用字符串和正整数，布尔值会报告类型错误。仅接受顶层 `provider`、`effort`，`[codex]` / `[chat_completions]` 下的 `model`、`base_url`、`context_window`，`[codex]` 还接受 `transport = "sse"|"websocket"`，以及下述 `[limits]` 键。不支持数组、嵌套表、多行字符串等完整 TOML 语法；未知键、重复键/段落和格式错误会报配置文件路径与行号，不静默忽略。
 
 ## [limits]
 
@@ -72,7 +73,7 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 从高到低：
 
 1. CLI `--effort <level>`（TUI 启动和 `ask` 都支持）。
-2. 环境变量：`NIB_PROVIDER`、`NIB_MODEL`、`NIB_BASE_URL`、`NIB_CONTEXT_WINDOW`、`NIB_THINKING`、`NIB_REASONING_EFFORT`。
+2. 环境变量：`NIB_PROVIDER`、`NIB_MODEL`、`NIB_BASE_URL`、`NIB_CONTEXT_WINDOW`、`NIB_THINKING`、`NIB_REASONING_EFFORT`、`NIB_CODEX_TRANSPORT`。
 3. `$NIB_HOME/config.toml`。
 4. 内置默认值。
 
@@ -88,6 +89,7 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 | `NIB_HOME` | 用户目录，默认 `~/.nib`；不改变 Codex 凭证位置 |
 | `NIB_PROVIDER` | `codex` / `chat_completions` |
 | `NIB_BASE_URL` | 当前 provider 的服务地址 |
+| `NIB_CODEX_TRANSPORT` | Codex 传输：`sse`（默认）或 `websocket`；覆盖 `[codex].transport`，握手/协议失败后本 Session 降级 SSE，见 [Codex 传输](codex.md#responses-websocket-原型) |
 | `NIB_MODEL` | 当前 provider 的模型 |
 | `NIB_CONTEXT_WINDOW` | 上下文窗口 tokens，DeepSeek 默认 1000000 |
 | `NIB_THINKING` | `on` / `off`，不设时用服务端默认（若无其他推理配置） |

@@ -80,7 +80,7 @@ assistant 消息的可选 `step_effort: {effort, source}` 保存界面元数据�
 
 ## 会话统计
 
-会话统计：`python3 scripts/stats.py [日志文件或目录] [--since YYYY-MM-DD] [--cwd 目录] [--group-by version|system|patches] [--json]`，默认只读 `$NIB_HOME/sessions`（默认 `~/.nib/sessions`），用于发现故障和比较改动前后效果。文本和 JSON 均包含“耗时构成”：Step/model/run 的中位数与 p90、首段代码前等待和参数生成跨度、运行时各工具调用次数/总耗时/中位耗时，以及参数到达跨度严格大于 50 ms 的 run 比例；每项列出有效样本数，旧日志缺字段不补零。bash 耗时 Top 10（JSON `timing.bash.top10`）按 shell 命令中的 `&&`、`||`、`;`、`|` 和换行拆段，不拆引号和 heredoc 正文；将每段前两个 shell 单词按顺序用 ` → ` 连接，例如 `zig fmt x && zig build test` 归为 `zig fmt → zig build`，单段保持原分组。标签仍是启发式，耗时为整个 bash 调用，不推算各段耗时或实际走过的分支。优先取同目录 `<id>.calls.jsonl` 中实际的 `args.command`，按会话 Step、Run 及 bash 调用顺序关联（录制以创建顺序 index 排序，不用结算顺序 seq；多 bash 须数量一致且无未调度项），无法可靠关联时回退旧的静态 JS 字面量启发式。`timing.bash.sources.recorded` / `static` 分别是成功分组的两种来源条数，二者之和为 `matched_calls`；无法关联或无法分组的计时调用列为 `unmatched_calls`。录制不改变静态工具/命令计数或“写→仅验证”等静态往返结构指标；下文的“机械收尾”指标单独优先使用完整录制。
+会话统计：`python3 scripts/stats.py [日志文件或目录] [--since YYYY-MM-DD] [--cwd 目录] [--group-by version|system|patches|transport] [--json]`，默认只读 `$NIB_HOME/sessions`（默认 `~/.nib/sessions`），用于发现故障和比较改动前后效果。文本和 JSON 均包含“耗时构成”：Step/model/run 的中位数与 p90、首段代码前等待和参数生成跨度、运行时各工具调用次数/总耗时/中位耗时，以及参数到达跨度严格大于 50 ms 的 run 比例；每项列出有效样本数，旧日志缺字段不补零。bash 耗时 Top 10（JSON `timing.bash.top10`）按 shell 命令中的 `&&`、`||`、`;`、`|` 和换行拆段，不拆引号和 heredoc 正文；将每段前两个 shell 单词按顺序用 ` → ` 连接，例如 `zig fmt x && zig build test` 归为 `zig fmt → zig build`，单段保持原分组。标签仍是启发式，耗时为整个 bash 调用，不推算各段耗时或实际走过的分支。优先取同目录 `<id>.calls.jsonl` 中实际的 `args.command`，按会话 Step、Run 及 bash 调用顺序关联（录制以创建顺序 index 排序，不用结算顺序 seq；多 bash 须数量一致且无未调度项），无法可靠关联时回退旧的静态 JS 字面量启发式。`timing.bash.sources.recorded` / `static` 分别是成功分组的两种来源条数，二者之和为 `matched_calls`；无法关联或无法分组的计时调用列为 `unmatched_calls`。录制不改变静态工具/命令计数或“写→仅验证”等静态往返结构指标；下文的“机械收尾”指标单独优先使用完整录制。
 
 “子会话已记录成本”（JSON `child_costs`）以每个带 `parent_session_id` 的入选子日志为一个样本，含前台与后台。`steps`、`model_ms`、`prompt_tokens`、`uncached_prompt_tokens` 分别统计每子会话完整 Step 数、累计模型时间（毫秒）、累计输入 token（含缓存）、累计未缓存输入 token 的中位数、p90 和样本数。未缓存量逐 Step 用 `prompt_tokens - prompt_cache_hit_tokens` 计算后累加，要求两字段均为非负整数且 cache 不大于 prompt；缺字段不补零，也不由两个分位数相减。`full_range_sessions` 要求非零完整 Step 且所有完整 Step 都入选；`--since` 截断的日志列入 `partial_range_sessions`，无完整 Step 的日志列入 `no_step_sessions`，两者不进入分布。计时与 token 各自要求该子会话所有完整 Step 对应字段有效，缺失或无效不补零，因此各指标 samples 可不同。只累计子日志自身 Step 字段，不叠加父会话 usage 或工具结果 usage；缓存输入已包含在 prompt 中。失败、取消或仍运行的子日志也可能入选，这些是已提交成本的下界，不代表成功任务或完整端到端耗时，更不是费用估算。
 
@@ -88,7 +88,7 @@ assistant 消息的可选 `step_effort: {effort, source}` 保存界面元数据�
 
 “工具数据度量”（JSON `tool_data`）独立累计 Step 顶层 `tool_bytes`、`output_bytes` 的有效样本数和总字节，不与 Run/calls 相加，也不从其他层回填。`output_tool_ratio` 按 `run_results[]` 中两字段有效且 `tool_bytes>0` 的 Run，统计各自 `output_bytes/tool_bytes` 的中位数、p90（nearest-rank）和样本数，不是总量之比，比例可大于 1。工具占比按有效 `calls[].result_bytes` 的总和为分母，按 name 汇总字节和调用数；明细被省略时覆盖有限，不代表全部工具数据。旧日志缺失字段跳过，不补零；明细总字节为零时占比为 n/a。
 
-`--group-by version|system|patches` 分别按 header 的 `nib_version`、`system_sha`、`patches_off` 分组，总体报告保留，每组分别输出核心报告；JSON 使用 `group_by` 和 `groups`。缺失标签的旧日志归 `unknown`；新版 header 有版本或系统哈希但省略 `patches_off` 时归 `none`，补丁列表按排序后的集合分组。
+`--group-by version|system|patches` 分别按 header 的 `nib_version`、`system_sha`、`patches_off` 分组，总体报告保留，每组分别输出核心报告；JSON 使用 `group_by` 和 `groups`。缺失标签的旧日志归 `unknown`；新版 header 有版本或系统哈希但省略 `patches_off` 时归 `none`，补丁列表按排序后的集合分组。`transport` 则按完整 Step 实际线路分组，见下文。
 
 完整 Step 新增可选 `turn_step`（Turn 内从 1 开始的 Step 序号），只用于识别日志中的 Turn 边界，运行中插话不会另起 Turn；恢复后新 Turn 从 1 开始。旧日志缺少该字段时仍按 user 消息估算边界（排除后台结果消息），可能把插话算成新 Turn。
 
@@ -100,7 +100,7 @@ JSON `agents` 和 `bash_calls` 分别统计 agent、bash 的前台/后台调用�
 
 `count/samples/ratio` 是命中数/候选 Step 数/比例；`ms/sample_ms/time_ratio` 是有计时的命中后步时长/候选后步时长/比例，`timed_count/timed_samples` 给出计时覆盖，缺计时不补零、零总时长的比例为 null。不是全体 Step 的占比，也不是 model_ms 的占比。`sources` 给候选 Step 的录制/静态/混合（`recorded/static/mixed`）来源数，`hit_sources` 给命中来源数。逐 Run 的完整 `<id>.calls.jsonl` 录制优先使用实际工具及 `args.command`（可识别动态 JS 组装的命令）；没有完整录制的 Run 回退静态直线代码提取（控制流/未执行函数体等保守跳过），有些 Run 回退则为 mixed。完整指只有一个结束 meta（ok/error）、无 incomplete 且调用 index 连续无重复；损坏、不完整记录不作完整执行证据。无调用的最终回答不是命中。
 
-`--group-by version|system|patches` 的各组会重新计算全部字段，文本与 `--json` 均展示该指标。共享分类器扩充了状态命令，因此历史“写→仅验证”的命中数可能增加；该旧指标仍只认静态 bash，不把 read 算验证，也不改用录制。新补丁对比见 [compromises.md](compromises.md#expected-continuation-基线与测量)。
+`--group-by version|system|patches|transport` 的各组会重新计算全部字段，文本与 `--json` 均展示该指标。共享分类器扩充了状态命令，因此历史“写→仅验证”的命中数可能增加；该旧指标仍只认静态 bash，不把 read 算验证，也不改用录制。新补丁对比见 [compromises.md](compromises.md#expected-continuation-基线与测量)。
 
 耗时构成的 `timing.effort.by_effort` 按完整 Step 的顶层 effort 分组，列出 Step 数、model_ms 分布（含中位数和样本数）、prompt/cache token 总量与缓存命中率。缺 effort 的旧记录跳过，缺计时仍计 Step；缓存率为有效 prompt/cache 成对字段的总和之比，不是各 Step 比例的平均。
 
@@ -109,3 +109,14 @@ JSON `agents` 和 `bash_calls` 分别统计 agent、bash 的前台/后台调用�
 各档 `downgraded` 及跨档 `timing.effort.downgraded` 给出降档后的 Run 失败率：分母是有 Run 的降档 Step 数，分子是该 Step 响应后执行的任一 Run 显式 `ok=false` 的 Step 数，不关联后一个 Step，也不把无 Run 的最终回答放入分母。未知 Run 状态仍入分母并单列 `steps_with_unknown_run_status`。降档按 `effort_source=model` 且 `effort_downgraded=true` 判定；缺少后一字段的过渡记录按 model 来源推断，显式 false 排除等档声明。
 
 机器事件接口见 [ask-json.md](ask-json.md)。
+
+
+## Step 传输字段
+
+完整 Step 新增可选 `transport`（`sse|websocket`）、`incremental`、`input_items`、`input_bytes`、`transport_fallback`。Chat Completions 同样记录 `sse`；旧日志缺字段仍可恢复，统计归 `unknown`，不按 header/provider 猜测。
+
+`transport` 和 `incremental` 表示最终成功尝试实际使用的传输与续接方式。WS 的 `input_items` 是该次线上 input 数组条数，`input_bytes` 是该数组紧凑 JSON 的 UTF-8 字节数，包含方括号和分隔符；不含请求其他字段、帧头、TLS、失败/重发尝试。完整 WS 请求同样记录这两项，结合 `incremental` 区分；SSE 不记录 input 数量/字节。`transport_fallback` 为握手/协议错误名（如 `WebSocketHandshake`、`WebSocketProtocol`），Session 内后续 SSE Step 保留该原因；`previous_response_not_found` 表示本 Step 的增量续接失效、已用完整 input 重发，传输仍可为 WS。不写 response id、路由 token 或认证数据。
+
+`model_ms` 继续包含本 Step 的握手、重发、重试和退避；`first_data_ms` 是首次接收传输数据的时间（WS 帧也包括心跳/元数据，握手头不算），`code[].first_ms` 等代码计时口径不变。失败尝试已经产生的 first_data 仍保留；模型参数计时沿用重试重置规则。`attempts` 仍只数外层重试，原地 previous_response_not_found 全量重发不增加它。日志中的 messages 始终是完整本地历史，恢复无需服务端保存 response。
+
+`python3 scripts/stats.py <日志目录> --group-by transport [--json]` 按每个完整 Step 的实际传输筛选，再生成与其他分组相同的完整报告；比较各组 `timing.model_ms`、`timing.first_data_ms`、`timing.code_first_ms` 的 median/p90/samples。一个混合线路 Session 可出现在多个组；混合线路 Turn 的部分 Step 不作为整 Turn 墙钟样本，缺失计时不补零，过滤断点不建立 effort/工具相邻关系。分组是最终成功线路的观测，发生降级的 SSE 样本包含先前 WS 尝试成本，不能把分组差异直接当作纯网络耗时差。

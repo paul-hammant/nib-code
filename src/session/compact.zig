@@ -11,6 +11,8 @@ pub fn compact(s: *Session, sink: Sink, cancel: *const std.atomic.Value(bool), d
         try sink.emit(sink.ctx, .{ .notice = "compaction skipped: fewer than three complete Steps" });
         return .too_few_steps;
     }
+    s.codex_state.clearPrevious(s.gpa);
+    defer s.codex_state.clearPrevious(s.gpa);
     const a = s.arena.allocator();
     var request: std.ArrayList(provider.Message) = .empty;
     defer request.deinit(s.gpa);
@@ -31,7 +33,7 @@ pub fn compact(s: *Session, sink: Sink, cancel: *const std.atomic.Value(bool), d
     const reply = request_model: {
         try sink.modelActivity(.started);
         defer sink.modelActivity(.finished) catch {};
-        break :request_model try provider.complete(s.gpa, a, s.client, cfg, s.cache_key, request.items, "[]", @intCast(@min(2048, @max(32, s.cfg.context_window / 8))), .{ .ctx = &observer, .onDelta = Silent.delta, .onData = Silent.data, .replay_safe = true }, cancel, detail, &attempts, null);
+        break :request_model try provider.complete(s.gpa, a, s.client, cfg, s.cache_key, request.items, "[]", @intCast(@min(2048, @max(32, s.cfg.context_window / 8))), .{ .ctx = &observer, .onDelta = Silent.delta, .onData = Silent.data, .replay_safe = true, .codex_state = &s.codex_state }, cancel, detail, &attempts, null);
     };
     s.usage.add(reply.usage);
     try sink.emit(sink.ctx, .{ .usage = s.usage });
