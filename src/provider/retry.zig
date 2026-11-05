@@ -49,6 +49,11 @@ const Forward = struct {
         try f.sink.received();
     }
 
+    fn onFallback(ctx: *anyopaque, info: @import("codex_ws.zig").Info) !void {
+        const f: *@This() = @ptrCast(@alignCast(ctx));
+        try f.sink.fallback(info);
+    }
+
     fn onDelta(ctx: *anyopaque, kind: p.Kind, text: []const u8) !void {
         const f: *@This() = @ptrCast(@alignCast(ctx));
         f.emitted = true;
@@ -77,12 +82,14 @@ fn completeWith(
     while (true) : (attempt += 1) {
         attempts.* = attempt;
         var fwd: Forward = .{ .sink = sink };
-        const forwarded: p.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .timing = sink.timing, .codex_state = sink.codex_state };
-        return response: {
+        const forwarded: p.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .onFallback = Forward.onFallback, .timing = sink.timing, .codex_state = sink.codex_state };
+        const attempt_start = if (sink.timing) |timing| timing.elapsed() else 0;
+        const result = response: {
             try Sink.emit(retry_sink, .started);
             defer Sink.emit(retry_sink, .finished) catch {};
             break :response request(gpa, out, client, cfg, cache_key, messages, tools_json, max_tokens, forwarded, cancel, detail);
         } catch |err| {
+            if (sink.timing) |timing| try timing.finishAttempt(out, attempt_start, err, detail.*, sink.codex_state);
             if (err == error.Canceled or cancel.load(.acquire)) return err;
             const is_codex = cfg.provider == .codex;
             if ((!is_codex and fwd.emitted and !sink.replay_safe) or attempt == max_attempts or !transient(err)) {
@@ -99,6 +106,8 @@ fn completeWith(
             try wait(client.io, delay_ms, cancel);
             continue;
         };
+        if (sink.timing) |timing| try timing.finishAttempt(out, attempt_start, null, null, sink.codex_state);
+        return result;
     }
 }
 

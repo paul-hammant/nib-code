@@ -80,7 +80,7 @@ assistant 消息的可选 `step_effort: {effort, source}` 保存界面元数据�
 
 ## 会话统计
 
-会话统计：`python3 scripts/stats.py [日志文件或目录] [--since YYYY-MM-DD] [--cwd 目录] [--group-by version|system|patches|transport] [--json]`，默认只读 `$NIB_HOME/sessions`（默认 `~/.nib/sessions`），用于发现故障和比较改动前后效果。文本和 JSON 均包含“耗时构成”：Step/model/run 的中位数与 p90、首段代码前等待和参数生成跨度、运行时各工具调用次数/总耗时/中位耗时，以及参数到达跨度严格大于 50 ms 的 run 比例；每项列出有效样本数，旧日志缺字段不补零。bash 耗时 Top 10（JSON `timing.bash.top10`）按 shell 命令中的 `&&`、`||`、`;`、`|` 和换行拆段，不拆引号和 heredoc 正文；将每段前两个 shell 单词按顺序用 ` → ` 连接，例如 `zig fmt x && zig build test` 归为 `zig fmt → zig build`，单段保持原分组。标签仍是启发式，耗时为整个 bash 调用，不推算各段耗时或实际走过的分支。优先取同目录 `<id>.calls.jsonl` 中实际的 `args.command`，按会话 Step、Run 及 bash 调用顺序关联（录制以创建顺序 index 排序，不用结算顺序 seq；多 bash 须数量一致且无未调度项），无法可靠关联时回退旧的静态 JS 字面量启发式。`timing.bash.sources.recorded` / `static` 分别是成功分组的两种来源条数，二者之和为 `matched_calls`；无法关联或无法分组的计时调用列为 `unmatched_calls`。录制不改变静态工具/命令计数或“写→仅验证”等静态往返结构指标；下文的“机械收尾”指标单独优先使用完整录制。
+会话统计：`python3 scripts/stats.py [日志文件或目录] [--since YYYY-MM-DD] [--cwd 目录] [--group-by version|system|patches|transport|incremental|full_reason] [--json]`，默认只读 `$NIB_HOME/sessions`（默认 `~/.nib/sessions`），用于发现故障和比较改动前后效果。文本和 JSON 均包含“耗时构成”：Step/model/run 的中位数与 p90、首段代码前等待和参数生成跨度、运行时各工具调用次数/总耗时/中位耗时，以及参数到达跨度严格大于 50 ms 的 run 比例；每项列出有效样本数，旧日志缺字段不补零。bash 耗时 Top 10（JSON `timing.bash.top10`）按 shell 命令中的 `&&`、`||`、`;`、`|` 和换行拆段，不拆引号和 heredoc 正文；将每段前两个 shell 单词按顺序用 ` → ` 连接，例如 `zig fmt x && zig build test` 归为 `zig fmt → zig build`，单段保持原分组。标签仍是启发式，耗时为整个 bash 调用，不推算各段耗时或实际走过的分支。优先取同目录 `<id>.calls.jsonl` 中实际的 `args.command`，按会话 Step、Run 及 bash 调用顺序关联（录制以创建顺序 index 排序，不用结算顺序 seq；多 bash 须数量一致且无未调度项），无法可靠关联时回退旧的静态 JS 字面量启发式。`timing.bash.sources.recorded` / `static` 分别是成功分组的两种来源条数，二者之和为 `matched_calls`；无法关联或无法分组的计时调用列为 `unmatched_calls`。录制不改变静态工具/命令计数或“写→仅验证”等静态往返结构指标；下文的“机械收尾”指标单独优先使用完整录制。
 
 “子会话已记录成本”（JSON `child_costs`）以每个带 `parent_session_id` 的入选子日志为一个样本，含前台与后台。`steps`、`model_ms`、`prompt_tokens`、`uncached_prompt_tokens` 分别统计每子会话完整 Step 数、累计模型时间（毫秒）、累计输入 token（含缓存）、累计未缓存输入 token 的中位数、p90 和样本数。未缓存量逐 Step 用 `prompt_tokens - prompt_cache_hit_tokens` 计算后累加，要求两字段均为非负整数且 cache 不大于 prompt；缺字段不补零，也不由两个分位数相减。`full_range_sessions` 要求非零完整 Step 且所有完整 Step 都入选；`--since` 截断的日志列入 `partial_range_sessions`，无完整 Step 的日志列入 `no_step_sessions`，两者不进入分布。计时与 token 各自要求该子会话所有完整 Step 对应字段有效，缺失或无效不补零，因此各指标 samples 可不同。只累计子日志自身 Step 字段，不叠加父会话 usage 或工具结果 usage；缓存输入已包含在 prompt 中。失败、取消或仍运行的子日志也可能入选，这些是已提交成本的下界，不代表成功任务或完整端到端耗时，更不是费用估算。
 
@@ -100,7 +100,7 @@ JSON `agents` 和 `bash_calls` 分别统计 agent、bash 的前台/后台调用�
 
 `count/samples/ratio` 是命中数/候选 Step 数/比例；`ms/sample_ms/time_ratio` 是有计时的命中后步时长/候选后步时长/比例，`timed_count/timed_samples` 给出计时覆盖，缺计时不补零、零总时长的比例为 null。不是全体 Step 的占比，也不是 model_ms 的占比。`sources` 给候选 Step 的录制/静态/混合（`recorded/static/mixed`）来源数，`hit_sources` 给命中来源数。逐 Run 的完整 `<id>.calls.jsonl` 录制优先使用实际工具及 `args.command`（可识别动态 JS 组装的命令）；没有完整录制的 Run 回退静态直线代码提取（控制流/未执行函数体等保守跳过），有些 Run 回退则为 mixed。完整指只有一个结束 meta（ok/error）、无 incomplete 且调用 index 连续无重复；损坏、不完整记录不作完整执行证据。无调用的最终回答不是命中。
 
-`--group-by version|system|patches|transport` 的各组会重新计算全部字段，文本与 `--json` 均展示该指标。共享分类器扩充了状态命令，因此历史“写→仅验证”的命中数可能增加；该旧指标仍只认静态 bash，不把 read 算验证，也不改用录制。新补丁对比见 [compromises.md](compromises.md#expected-continuation-基线与测量)。
+`--group-by version|system|patches|transport|incremental|full_reason` 的各组会重新计算全部字段，文本与 `--json` 均展示该指标。共享分类器扩充了状态命令，因此历史“写→仅验证”的命中数可能增加；该旧指标仍只认静态 bash，不把 read 算验证，也不改用录制。新补丁对比见 [compromises.md](compromises.md#expected-continuation-基线与测量)。
 
 耗时构成的 `timing.effort.by_effort` 按完整 Step 的顶层 effort 分组，列出 Step 数、model_ms 分布（含中位数和样本数）、prompt/cache token 总量与缓存命中率。缺 effort 的旧记录跳过，缺计时仍计 Step；缓存率为有效 prompt/cache 成对字段的总和之比，不是各 Step 比例的平均。
 
@@ -120,7 +120,7 @@ Step/Turn 的 `run_ms`、`tool_bytes`、llm/agent 调用数只计前台已结算
 
 `stats.py` 的 `background_runs` 与现有 agents/bash_calls 使用相同口径：`background_calls` 是自动切换次数，`background_steps` 是启动 Step 之后、结果插入之前已完成的本会话模型 Step 分布，`foreground_calls` 恒为 0（只统计自动后台 Run）。该指标包含根会话和子会话各自的主模型 Step，不将子会话 Step 当成父模型 Step。静态工具计数仍读取原代码；Step/calls 的旧性能指标不混入异步完成数据，避免重复计数。
 
-等待后台结果的无工具 assistant 消息带本地元数据 `waiting:true`，不改模型原始 content/reasoning/phase，也不把 waiting 发给 provider。恢复到 TUI 时显示为通知；统计不把它当作 Turn 完成。它仍是已花费用量的完整 Step。
+等待后台结果的无工具回复或仅成功运行无输出、无宿主工具的 Run 的 assistant 消息带本地元数据 `waiting:true`，不改模型原始 content/reasoning/phase，也不把 waiting 发给 provider。恢复到 TUI 时显示为通知；统计不把它当作 Turn 完成。它仍是已花费用量的完整 Step。
 
 ## Step 传输字段
 
@@ -131,3 +131,12 @@ Step/Turn 的 `run_ms`、`tool_bytes`、llm/agent 调用数只计前台已结算
 `model_ms` 继续包含本 Step 的握手、重发、重试和退避；`first_data_ms` 是首次接收传输数据的时间（WS 帧也包括心跳/元数据，握手头不算），`code[].first_ms` 等代码计时口径不变。失败尝试已经产生的 first_data 仍保留；模型参数计时沿用重试重置规则。`attempts` 仍只数外层重试，原地 previous_response_not_found 全量重发不增加它。日志中的 messages 始终是完整本地历史，恢复无需服务端保存 response。
 
 `python3 scripts/stats.py <日志目录> --group-by transport [--json]`（或 `--group-by incremental`）按每个完整 Step 的实际传输或续接状态筛选，再生成与其他分组相同的完整报告；比较各组 `timing.model_ms`、`timing.first_data_ms`、`timing.code_first_ms` 的 median/p90/samples。一个混合线路 Session 可出现在多个组；混合线路 Turn 的部分 Step 不作为整 Turn 墙钟样本，缺失计时不补零，过滤断点不建立 effort/工具相邻关系。incremental 分组键为 `true|false|unknown`，SSE 的 false 与全量 WS 的 false 同组，缺字段不补 false。分组是最终成功线路的观测，发生降级的 SSE 样本包含先前 WS 尝试成本，不能把分组差异直接当作纯网络耗时差。
+
+
+`full_reason` 说明本次为何未续接：`first_request`、`missing_response_id`、`unsupported_output`、`reconnect`、`scope_changed`、`compaction`、`effort_changed`、`properties_changed`、`input_prefix_mismatch`、`previous_response_not_found`、`sse_configured` 或 `sse_fallback`。实际前缀不匹配同时记录 `mismatch_index`（线上 input 的零起始位置）；成功增量无 full_reason。`--group-by full_reason` 按完整 Step 分组，成功增量归 `incremental`，旧日志缺字段归 `unknown`，沿用其他 Step 分组的过滤与相邻关系规则。
+
+每次降级立即追加独立记录，包含 `transport_fallback`、`transport_fallback_at`（Unix 毫秒）、`transport_fallback_detail`（如有）及 step，取消也不丢失该记录；它没有 usage/model_ms/messages，不增加 Step。完整 Step 保留相同原因及原始降级时间。previous_response_not_found 的原地全量重发也立即记录。协议诊断包含解析阶段、最后事件类型、output_index、已收条目数及 pending 数，不保存原始帧、认证头或路由 token。
+
+完整 Step 的 `model_attempts` 按外层尝试依次保存 start_ms/end_ms（均相对 Step 开始）、error_name/detail、transport/incremental/full_reason、fallback_reason/fallback_at/fallback_detail、bytes/content_bytes、first_content_ms/last_content_ms/max_content_gap_ms 和 max_gap_ms。content_bytes 只计非空文本、reasoning 摘要和工具参数增量；bytes 是接收响应体的字节，不含握手头。相邻尝试的 start_ms 减去前次 end_ms 可见退避。失败耗尽时 diagnostic 同样保存该数组；成功 Step 顶层 max_content_gap_ms 是最后尝试的内容间隔，不包含首次等待和重试退避。缺失的可选值省略，不补零。总超时覆盖所有 I/O，收集每次尝试前先取消并 join 请求，下一尝试才可复用 sink 和分配器。
+
+Codex 新响应的 `reasoning.includes_output:true` 表示 `reasoning.data` 是服务端完整、有序的 output 数组，包含 reasoning、message 和 function_call；展示仍用 content/tool_calls，回传只用该数组，避免重复发送。reasoning 加密条目不改写。旧日志没有标记时，沿用旧格式（data 仅推理数组）的回放方式。fork 深拷贝该标记和 data；估算 token 时只计算完整数组一次。

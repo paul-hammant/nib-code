@@ -23,6 +23,8 @@ pub const Limits = struct {
     agent_concurrency: usize = 4,
     max_steps: ?usize = null,
     stream_idle_timeout_s: usize = 300,
+    stream_content_timeout_s: usize = 120,
+    request_timeout_s: usize = 300,
     run_background_after_ms: usize = 10000,
 };
 
@@ -89,6 +91,7 @@ pub const ToolCall = struct {
 pub const Reasoning = struct {
     provider: Id,
     data: []const u8,
+    includes_output: bool = false,
 };
 
 pub const EffortSource = enum { model, default, guard };
@@ -146,7 +149,13 @@ pub const Sink = struct {
     codex_state: ?*CodexState = null,
     ctx: *anyopaque,
     onDelta: *const fn (ctx: *anyopaque, kind: Kind, text: []const u8) anyerror!void,
+    monitor: ?*idle.Monitor = null,
+    onFallback: ?*const fn (ctx: *anyopaque, info: @import("provider/codex_ws.zig").Info) anyerror!void = null,
     onData: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+
+    pub fn fallback(s: Sink, info: @import("provider/codex_ws.zig").Info) !void {
+        if (s.onFallback) |notify| try notify(s.ctx, info);
+    }
 
     pub fn received(s: Sink) !void {
         if (s.onData) |notify| try notify(s.ctx);
@@ -167,14 +176,24 @@ pub fn stream(
     detail: *?[]u8,
 ) !Reply {
     if (sink.timing) |timing| timing.resetAttempt();
-    errdefer if (sink.timing) |timing| timing.resetAttempt();
     var monitor: idle.Monitor = .init(client.io, cfg.limits.stream_idle_timeout_s, sink.timing);
+    monitor.content_duration.raw = .fromSeconds(@intCast(cfg.limits.stream_content_timeout_s));
+    monitor.request_duration.raw = .fromSeconds(@intCast(cfg.limits.request_timeout_s));
+    var observed_sink = sink;
+    observed_sink.monitor = &monitor;
     return switch (cfg.provider) {
-        .chat_completions => cancelable.run(client.io, cancel, chat.stream, .{ gpa, out, client, cfg, messages, tools_json, max_tokens, sink, cancel, detail, &monitor }),
-        .codex => cancelable.run(client.io, cancel, codex.stream, .{ gpa, out, client, cfg, cache_key, messages, tools_json, max_tokens, sink, cancel, detail, &monitor }),
+        .chat_completions => cancelable.run(client.io, cancel, monitor.started.addDuration(monitor.request_duration), chat.stream, .{ gpa, out, client, cfg, messages, tools_json, max_tokens, observed_sink, cancel, detail, &monitor }),
+        .codex => cancelable.run(client.io, cancel, monitor.started.addDuration(monitor.request_duration), codex.stream, .{ gpa, out, client, cfg, cache_key, messages, tools_json, max_tokens, observed_sink, cancel, detail, &monitor }),
     } catch |err| {
-        if (cfg.provider == .codex) if (sink.codex_state) |state| state.reset(gpa);
+        if (cfg.provider == .codex) if (sink.codex_state) |state| {
+            state.reset(gpa);
+            state.reset_reason = "reconnect";
+        };
         if (cancel.load(.acquire)) return error.Canceled;
+        if (err == error.ModelRequestTimeout) {
+            monitor.read_failure = error.Timeout;
+            monitor.timeout_kind = .request;
+        }
         return monitor.failure(gpa, detail, err);
     };
 }

@@ -16,6 +16,8 @@ import tempfile
 import threading
 import unittest
 
+from background_assertions import stop_result
+
 from test_interjections import Terminal, wait_for
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -166,12 +168,12 @@ class ReplayTests(unittest.TestCase):
         session = self.ask([
             'const job = await tools.bash({command: "printf started > detached-side-effect; sleep 60", '
             'background: true, detached: true}); await tools.sleep(100); '
-            'console.log(job, await tools.stop({id: job.id}));'
+            'console.log(job, await tools.stop({id: job.id,reason:"mock requested cancellation"}));'
         ])
         calls = [r for r in jsonl(self.calls_path(session)) if "index" in r]
         self.assertEqual([r["name"] for r in calls], ["bash", "sleep", "stop"])
         self.assertEqual(json.loads(calls[0]["result"]), {"id": "b1"})
-        self.assertEqual(json.loads(calls[-1]["result"]), {"id": "b1", "stopped": True})
+        self.assertEqual(json.loads(calls[-1]["result"]), stop_result("b1", True))
         log = jsonl(self.home / "sessions" / f"{session}.jsonl")
         timed = [c for row in log for c in row.get("calls", [])]
         self.assertEqual([c["name"] for c in timed], ["bash", "sleep", "stop"])

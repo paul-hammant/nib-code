@@ -39,6 +39,8 @@ llm_input_kib = 256
 agent_concurrency = 4
 # max_steps = 50  # 可选；省略时不设 Step 上限
 stream_idle_timeout_s = 300
+stream_content_timeout_s = 120
+request_timeout_s = 300
 run_background_after_ms = 10000
 ```
 
@@ -60,11 +62,13 @@ DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 
 | `agent_concurrency` | 每进程同时运行的子 agent 数，超出排队 | 4 | 1–64 |
 | `max_steps` | 每个 Turn 的 Step 上限，耗尽时返回 `TooManySteps`；省略时不设上限（内部为 `null`） | 无上限 | 1–100000 |
 | `run_background_after_ms` | Run 超过此墙钟毫秒数且仍等待工具时自动转后台；只作用于模型发起的 Run | 10000 | 1–3600000 |
+| `stream_content_timeout_s` | 连续没有非空 reasoning、文本或工具参数增量的秒数；心跳、元数据不重置 | 120 | 1–3600 |
+| `request_timeout_s` | 单次模型尝试的总秒数；持续推理也不延长，取消并 join 后按原策略重试 | 300 | 1–3600 |
 | `stream_idle_timeout_s` | 流式模型响应连续无字节到达的超时秒数（含首次数据前等待；心跳、元数据也重置计时），超时按连接中断沿用重试策略 | 300 | 1–3600 |
 
 自动转后台阈值沿用 `[limits]` 配置和子会话继承，不增加环境变量或 CLI 开关。设成较大值可用于前台对照实验。`nib js`、TUI `/js` 和离线 replay 保持同步执行；运行中的 JS 片段不会因墙钟阈值被切断。语义见 [run-output.md](run-output.md#长-run-自动转后台)。
 
-`stream_idle_timeout_s` 同时约束主模型请求、`tools.llm` 和压缩摘要请求。空闲超时复用连接中断的重试上限和退避；Chat Completions 已输出可见增量时仍不自动重放，缓冲结果的 `tools.llm` 与摘要可以安全重试。
+三个截止时间同时约束主模型请求、`tools.llm` 和压缩摘要请求，适用于 WS 和 SSE，每次重试重新计时。总请求截止时间覆盖连接、发送、读头及读取响应；另外两个截止时间在接收流时检查。空闲超时复用连接中断的重试上限和退避；Chat Completions 已输出可见增量时仍不自动重放，缓冲结果的 `tools.llm` 与摘要可以安全重试。默认阈值的正式批次分布、一手来源和局限见 [speed-v4.md](speed-v4.md)。
 
 这些限额没有环境变量或 CLI 覆盖；随有效配置经 stdin 传给子会话，子会话不读取配置文件。`max_steps` 未设置时子会话同样为 `null`，显式设置时继承该上限。sandbox 内全部工具最多 8 并发是线程调度实现，不由此小节控制。
 

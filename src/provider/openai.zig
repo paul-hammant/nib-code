@@ -126,6 +126,7 @@ pub fn stream(
             error.ReadFailed => return response.bodyErr() orelse err,
             else => return err,
         } orelse break;
+        try monitor.check();
         const data = (try parser.feed(gpa, line)) orelse continue;
         if (std.mem.eql(u8, data, "[DONE]")) {
             done = true;
@@ -140,6 +141,11 @@ pub fn stream(
         if (chunk.usage) |u| usage = .{ .prompt_tokens = u.prompt_tokens, .completion_tokens = u.completion_tokens, .prompt_cache_hit_tokens = if (u.prompt_tokens_details) |d| d.cached_tokens else u.prompt_cache_hit_tokens };
         for (chunk.choices) |choice| {
             const d = choice.delta;
+            if (d.content) |value| monitor.content(value.len);
+            if (d.reasoning_content) |value| monitor.content(value.len);
+            for (d.tool_calls) |tc| if (tc.function.arguments) |value| {
+                monitor.content(value.len);
+            };
             if (d.reasoning_content) |t| if (t.len > 0) {
                 try reasoning.appendSlice(gpa, t);
                 try sink.onDelta(sink.ctx, .reasoning, t);

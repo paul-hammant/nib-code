@@ -174,12 +174,12 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
         assert records[0]["system_sha"] == hashlib.sha256(base.encode()).hexdigest()[:12]
         reasoning = history[-1]["reasoning"]
         assert reasoning["provider"] == "codex"
-        items = json.loads(reasoning["data"])
+        items = [item for item in json.loads(reasoning["data"]) if item["type"] == "reasoning"]
         assert len(items) == 2 and all(item["encrypted_content"].startswith("fake-encrypted-") for item in items)
         assert items[0]["summary"] == [{"type": "summary_text", "text": "Mock reasoning."}]
         ask("plain text", "--resume", session)
         assert_cache_key(requests()[-1:], session)
-        assert all(item in requests()[-1]["body"]["input"] for item in items)
+        assert all(item in requests()[-1]["body"]["input"] for item in items), (items, requests()[-1]["body"]["input"])
         assert next(item for item in requests()[-1]["body"]["input"] if item.get("role") == "assistant")["phase"] == "final_answer"
         disabled = ask("plain text", overrides={"NIB_MODEL": "gpt-6.1-terra", "NIB_THINKING": "off"})
         assert requests()[-1]["body"]["reasoning"] == {"effort": "none", "summary": "auto"}

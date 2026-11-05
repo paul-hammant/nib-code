@@ -17,6 +17,7 @@ pub const Diagnostic = struct {
     message: []const u8,
     attempts: u32,
     step: u32,
+    model_attempts: ?[]const @import("../provider/timing.zig").Attempt = null,
 };
 
 pub const AgentSession = struct {
@@ -47,6 +48,12 @@ pub const Record = struct {
     input_items: ?usize = null,
     input_bytes: ?usize = null,
     transport_fallback: ?[]const u8 = null,
+    transport_fallback_at: ?i64 = null,
+    transport_fallback_detail: ?[]const u8 = null,
+    full_reason: ?[]const u8 = null,
+    mismatch_index: ?usize = null,
+    model_attempts: ?[]const @import("../provider/timing.zig").Attempt = null,
+    max_content_gap_ms: ?u64 = null,
     attempts: ?u32 = null,
     first_data_ms: ?u64 = null,
     max_gap_ms: ?u64 = null,
@@ -144,6 +151,21 @@ pub const Log = struct {
         log.mutex.lockUncancelable(io);
         defer log.mutex.unlock(io);
         try log.append(io, a, .{ .agent_session = mapping });
+        errdefer log.poisoned = true;
+        try log.file.sync(io);
+    }
+
+    pub fn fallback(log: *Log, io: std.Io, a: std.mem.Allocator, info: @import("../provider/codex_ws.zig").Info, step: u32) !void {
+        log.mutex.lockUncancelable(io);
+        defer log.mutex.unlock(io);
+        try log.append(io, a, .{
+            .transport = @tagName(info.transport),
+            .transport_fallback = info.fallback_reason,
+            .transport_fallback_at = info.fallback_at,
+            .transport_fallback_detail = info.fallback_detail,
+            .full_reason = info.full_reason,
+            .turn_step = step,
+        });
         errdefer log.poisoned = true;
         try log.file.sync(io);
     }

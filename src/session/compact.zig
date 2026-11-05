@@ -12,6 +12,7 @@ pub fn compact(s: *Session, sink: Sink, cancel: *const std.atomic.Value(bool), d
         return .too_few_steps;
     }
     s.codex_state.clearPrevious(s.gpa);
+    s.codex_state.reset_reason = "compaction";
     defer s.codex_state.clearPrevious(s.gpa);
     const a = s.arena.allocator();
     var request: std.ArrayList(provider.Message) = .empty;
@@ -76,6 +77,10 @@ pub fn estimateTokens(messages: []const provider.Message) u64 {
     var total: u64 = 0;
     for (messages) |m| {
         const content = m.content orelse "";
+        if (m.reasoning) |r| if (r.includes_output) {
+            total += 8 + r.data.len / 3;
+            continue;
+        };
         total += 8 + content.len / 3;
         if (m.reasoning) |r| total += r.data.len / 3;
         for (m.tool_calls orelse &.{}) |call| total += 8 + (call.id.len + call.function.name.len + call.function.arguments.len) / 3;

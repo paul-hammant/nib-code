@@ -382,7 +382,7 @@ pub const Session = struct {
             var first_data_ms: ?u64 = null;
             const buffer_text = s.tools.background.pending(s.io);
             const reply = try s.complete(decision.cfg, request.items, sink, cancel, detail, partial, &model_timing, &attempts, &first_data_ms, buffer_text);
-            const waiting = reply.tool_calls.len == 0 and s.tools.background.pending(s.io);
+            var waiting = reply.tool_calls.len == 0 and s.tools.background.pending(s.io);
             if (waiting) {
                 try sink.emit(sink.ctx, .{ .notice = if (reply.text.len > 0) reply.text else "Waiting for background results." });
             } else if (buffer_text and reply.text.len > 0) {
@@ -395,6 +395,7 @@ pub const Session = struct {
             s.usage.add(reply.usage);
             try sink.emit(sink.ctx, .{ .usage = s.usage });
             s.steps += 1;
+            const assistant_index = pending.items.len;
             try pending.append(s.gpa, .{
                 .role = "assistant",
                 .content = reply.text,
@@ -429,11 +430,14 @@ pub const Session = struct {
             var run_results: std.ArrayList(session_log.RunResult) = .empty;
             defer run_results.deinit(s.gpa);
             var output_tokens: u64 = 0;
+            var empty_runs = reply.tool_calls.len > 0;
             for (reply.tool_calls, 0..) |call, run_index| {
                 run_timing.run_index = run_index;
                 const before_bytes = run_timing.tool_bytes;
                 const before_omitted = run_timing.omitted;
                 const result = try s.execute(call, sink, cancel, &run_timing);
+                empty_runs = empty_runs and result.ok and result.empty and result.background_id == null and
+                    result.tool_summary != null and result.tool_summary.?.counts.len == 0 and result.tool_summary.?.omitted == 0;
                 run_timing.output_bytes += result.output.len;
                 effort.Pending.record(&next_effort, result.effort, result.ok);
                 run_ms += result.run_ms orelse 0;
@@ -451,6 +455,11 @@ pub const Session = struct {
                 });
                 output_tokens += result.output.len / 3 + 1;
             }
+            if (empty_runs and s.tools.background.pending(s.io)) {
+                waiting = true;
+                pending.items[assistant_index].waiting = true;
+                try sink.emit(sink.ctx, .{ .notice = "Waiting for background results." });
+            }
             const tokens = reply.usage.prompt_tokens + reply.usage.completion_tokens + output_tokens;
             const ms: u64 = @intCast(@max(started.untilNow(s.io).raw.toMilliseconds(), 0));
             try s.log.commit(s.io, s.gpa, &s.history, &s.context_tokens, .{
@@ -467,6 +476,12 @@ pub const Session = struct {
                 .input_items = if (s.codex_state.last.transport == .websocket) s.codex_state.last.input_items else null,
                 .input_bytes = if (s.codex_state.last.transport == .websocket) s.codex_state.last.input_bytes else null,
                 .transport_fallback = s.codex_state.last.fallback_reason,
+                .transport_fallback_at = s.codex_state.last.fallback_at,
+                .transport_fallback_detail = s.codex_state.last.fallback_detail,
+                .full_reason = s.codex_state.last.full_reason,
+                .mismatch_index = s.codex_state.last.mismatch_index,
+                .model_attempts = model_timing.attempts[0..model_timing.attempt_count],
+                .max_content_gap_ms = model_timing.max_content_gap_ms,
                 .effort = decision.metadata.effort,
                 .effort_source = decision.metadata.source,
                 .effort_downgraded = decision.downgraded,
@@ -493,7 +508,7 @@ pub const Session = struct {
             s.summary.?.timing.agent_calls += run_timing.agent_calls;
             pending.clearRetainingCapacity();
             try sink.emit(sink.ctx, .{ .usage = s.usage });
-            if (reply.tool_calls.len == 0) {
+            if (reply.tool_calls.len == 0 or waiting) {
                 if (!s.tools.background.pending(s.io)) return;
                 if (s.cfg.limits.max_steps) |max_steps| {
                     if (s.steps >= max_steps) continue;
@@ -520,6 +535,7 @@ pub const Session = struct {
             first_data_ms: *?u64,
             session: *Session,
             buffer_text: bool,
+            timing: *provider.ModelTiming,
             fn onData(ctx: *anyopaque) !void {
                 const f: *@This() = @ptrCast(@alignCast(ctx));
                 f.mutex.lockUncancelable(f.io);
@@ -533,6 +549,10 @@ pub const Session = struct {
                 defer f.mutex.unlock(f.io);
                 try (if (kind == .text) &f.partial.text else &f.partial.reasoning).appendSlice(f.gpa, text);
                 if (!f.buffer_text or kind != .text) try f.sink.emit(f.sink.ctx, .{ .delta = .{ .kind = kind, .text = text } });
+            }
+            fn onFallback(ctx: *anyopaque, info: @import("provider/codex_ws.zig").Info) !void {
+                const f: *@This() = @ptrCast(@alignCast(ctx));
+                try f.session.log.fallback(f.io, f.gpa, info, f.session.steps + 1);
             }
             fn onRetry(ctx: *anyopaque, event: provider.RetryEvent) !void {
                 const f: *@This() = @ptrCast(@alignCast(ctx));
@@ -552,13 +572,14 @@ pub const Session = struct {
                             .message = failure.reason,
                             .attempts = failure.attempt,
                             .step = f.session.steps + 1,
+                            .model_attempts = f.timing.attempts[0..f.timing.attempt_count],
                         });
                     },
                 }
             }
         };
-        var fwd: Forward = .{ .sink = sink, .gpa = s.gpa, .partial = partial, .io = s.io, .started = timing.started, .first_data_ms = first_data_ms, .session = s, .buffer_text = buffer_text };
-        const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .timing = timing, .codex_state = &s.codex_state };
+        var fwd: Forward = .{ .sink = sink, .gpa = s.gpa, .partial = partial, .io = s.io, .started = timing.started, .first_data_ms = first_data_ms, .session = s, .buffer_text = buffer_text, .timing = timing };
+        const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .onFallback = Forward.onFallback, .timing = timing, .codex_state = &s.codex_state };
         if (!s.tools.background.anyPending(s.io))
             return provider.complete(s.gpa, s.arena.allocator(), s.client, request_cfg, s.cache_key, messages, prompt.tools_json, null, provider_sink, cancel, detail, attempts, .{ .ctx = &fwd, .onEvent = Forward.onRetry });
         const Request = struct {

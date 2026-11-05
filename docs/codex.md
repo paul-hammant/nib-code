@@ -97,7 +97,7 @@ model/effort 默认继承父配置，也可显式覆盖；两者不同时不再�
 
 ## 推理摘要与流活动
 
-发送 `reasoning` 配置时同时请求 `summary: auto`，服务端提供的推理摘要沿用 reasoning delta 展示；未显式配置推理时不额外发送 reasoning。加密推理条目的日志存储与上下文回传保持不变。
+发送 `reasoning` 配置时同时请求 `summary: auto`，服务端提供的推理摘要沿用 reasoning delta 展示；未显式配置推理时不额外发送 reasoning。加密推理条目原样回传；新日志同时保留服务端有序输出，避免 commentary 和 reasoning 交错时重排前缀，见 [会话日志](session-log.md#step-传输字段)。
 
 TUI 在模型请求期间记录最后收到 SSE 行的时间，包括文本、推理摘要、工具参数、output_item 事件和心跳。连续 30 秒没有数据时，活动行追加 `· no data Ns`，收到新数据后清除。Turn 对连续数据的 TUI 活动通知按 1 秒节流，请求开始和结束仍立即通知；静默后收到数据会立即清除提示。这个计时独立于 thinking/writing 的阶段时长；Run 执行和重试等待不计入，每次请求重新计时，压缩请求同样显示。静默提示不表示连接已经断开，也不触发读超时或重试；仍可按 Esc 取消。活动通知仅用于 TUI，不新增 ask NDJSON 事件或日志内容。
 
@@ -147,17 +147,17 @@ transport = "websocket"
 
 ### 生命周期、失败与限制
 
-每个 Session 串行使用一个独占 WS 连接；后台 agent 是独立子进程，fork/resume 不复制连接或 response id。上一响应成功后保存非 input 属性、已发送的完整 input 和规范化后的服务端输出。message 仅保留本地历史实际承载的 role/content/phase；function_call 比较 type/call_id/name/arguments；reasoning 保留原条目。多个消息合并、输出顺序差异、未知输出条目等不能精确匹配时，发送完整 input。无服务端 id 时也发完整 input。压缩前后清除续接，effort/instructions/tools/schema 等改变时由属性匹配拒绝续接；凭证、模型、端点或缓存 key 改变时关闭旧连接。
+每个 Session 串行使用一个独占 WS 连接；后台 agent 是独立子进程，fork/resume 不复制连接或 response id。上一响应成功后保存非 input 属性、已发送的完整 input 和规范化后的服务端有序输出。完整输出按顺序随 Session 日志保存：message 规范化为 role/content/phase（含空消息），function_call 保留 type/call_id/name/arguments，reasoning 保留原条目。后续请求回放同一有序输出，不从合并后的展示文本重建；恢复和 fork 同样保序。实际前缀不匹配或未知输出条目时发送完整 input。无服务端 id 时也发完整 input。压缩前后清除续接，effort/instructions/tools/schema 等改变时由属性匹配拒绝续接；凭证、模型、端点或缓存 key 改变时关闭旧连接。
 
-previous_response_not_found 在尚未输出 delta 的增量请求上只补发一次完整 input；不重复执行 Run。完整重发仍失败时交回错误。websocket_connection_limit_reached、断流、空闲超时沿用最多 5 次重试，下次新连接发完整 input。握手失败（含不支持升级或无效 accept）和协议/非法事件错误记住 Session 级 SSE 降级；发生于可见 delta 后先走已有重试清理 partial，再请求 SSE，因此 UI 仍可能显示失败尝试的片段，日志只提交成功结果。
+previous_response_not_found 在尚未输出 delta 的增量请求上只补发一次完整 input；不重复执行 Run。完整重发仍失败时交回错误。websocket_connection_limit_reached、断流、空闲超时沿用最多 5 次重试，下次新连接发完整 input。只有明确的握手失败（含不支持升级或无效 accept）、WS 协议或超大帧错误记住 Session 级 SSE 降级；连接错误和响应内容校验失败保持 WS 重试，不因 InvalidResponse 改用 SSE。每次降级立即持久化原因、时间及协议诊断；发生于可见 delta 后先走已有重试清理 partial，再请求 SSE，因此 UI 仍可能显示失败尝试的片段，日志只提交成功结果。
 
-沿用 provider/cancel.zig 的取消并 join：Esc/SIGINT 中断阻塞 I/O，丢弃连接，后续 Turn 全量发送。取消不等待 close 握手；正常收到 close 回复 close 后重连。空闲超时使用 provider/idle.zig，在 TLS/HTTP 缓冲之下监测读操作，帧、ping/pong、元数据均算接收活动。
+沿用 provider/cancel.zig 的取消并 join：Esc/SIGINT 中断阻塞 I/O，丢弃连接，后续 Turn 全量发送。取消不等待 close 握手；正常收到 close 回复 close 后重连。空闲超时使用 provider/idle.zig，在 TLS/HTTP 缓冲之下监测读操作，帧、ping/pong、元数据均算字节活动；另外以 120 秒限制无内容停顿，以 300 秒限制单次尝试，总超时不受心跳或持续摘要延长。三个值均可配置，见 [config.md](config.md)。
 
 帧层支持随机客户端 mask、短/16/64 位长度、文本分片、ping/pong/close、UTF-8 与控制帧校验。服务端单消息上限 16 MiB；超过或收到二进制/扩展帧则降级 SSE，不截断数据。不协商压缩/扩展。TLS、证书与代理行为复用 std.http.Client；真实 TLS/代理/长空闲重连、网关是否要求额外头（例如不同客户端 originator、User-Agent 或账号策略）尚未验证，不能声称已追平 Codex CLI 性能。没有连接池并发复用，一个 Session 同时只允许现有的一个主模型请求。
 
 后台 Run 完成消息只追加到已提交历史末尾；等待回复的本地 waiting 标记不进入线上 input，因此后续可只发后台 user 消息。前缀不一致仍全量发送。后台等待不运行流空闲计时器；服务器关闭闲置连接时，下一 Step 走已有重试，新连接清除 previous response 并发送完整历史。
 
-本地测试：`python3 tests/test_codex_websocket.py` 覆盖增量、前缀/配置变化、缺失 response 重发、握手/协议降级、帧分片和 ping/pong、turn-state、重连、fork、恢复、SIGINT、Esc 后继续、跨 Turn 复用、后台等待期间无额外请求、后台消息的增量/前缀回退、闲置连接关闭重连及空闲超时。日志与统计字段见 [session-log.md](session-log.md#step-传输字段)。
+本地测试：`python3 tests/test_codex_websocket.py` 覆盖增量、前缀/配置变化、缺失 response 重发、握手/协议降级、帧分片和 ping/pong、turn-state、重连、fork、恢复、SIGINT、Esc 后继续、跨 Turn 复用、后台等待期间无额外请求、后台消息的增量/前缀回退、闲置连接关闭重连及空闲超时、心跳/元数据无内容超时、持续推理请求总超时、交错多条消息的精确增量续接。日志与统计字段见 [session-log.md](session-log.md#step-传输字段)。
 
 ### 用 nib-bench 对比
 

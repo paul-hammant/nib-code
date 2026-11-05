@@ -12,6 +12,8 @@ import sys
 import threading
 import unittest
 
+from background_assertions import stop_result
+
 from mock_agent import USAGE, reply
 from mock_llm_tool import content
 from test_agent import alive
@@ -556,7 +558,7 @@ class ReuseTests:
                 state.update(stage=2, child=self.child_log(), prefix=self.child_log().read_bytes())
                 self.assertFalse(completions(messages), messages)
                 resume = agent("stop-two", "a1", background=True) if background_resume else agent("next", "a1")
-                return ("const stopped = await tools.stop({id:'a1'}); "
+                return ("const stopped = await tools.stop({id:'a1',reason:'mock requested cancellation'}); "
                         "const resumed = await " + resume + "; [stopped, resumed]")
             if state["stage"] == 2 and background_resume:
                 state["stage"] = 3
@@ -566,7 +568,7 @@ class ReuseTests:
                 running_worker("stop-two")
                 return ("const busy = await Promise.all([" + agent("forbidden", "a1") + "," +
                         agent("forbidden", "a1", background=True) + "]); "
-                        "const stopped = await tools.stop({id:'a1'}); "
+                        "const stopped = await tools.stop({id:'a1',reason:'mock requested cancellation'}); "
                         "const resumed = await " + agent("next", "a1") +
                         "; [busy, stopped, resumed]")
             return None
@@ -586,7 +588,7 @@ class ReuseTests:
         outputs = self.outputs(events)
         self.assertEqual(outputs[0], {"id": "a1"})
         stopped, resumed = outputs[1]
-        self.assertEqual(stopped, {"id": "a1", "stopped": True})
+        self.assertEqual(stopped, stop_result("a1", True))
         if background_resume:
             self.assertEqual(len(outputs), 3, outputs)
             self.assertEqual(resumed, {"id": "a1"})
@@ -594,7 +596,7 @@ class ReuseTests:
             for contender in busy:
                 self.assert_failure(contender, "a1")
                 self.assertIn("busy", contender["error"].lower())
-            self.assertEqual(stopped, {"id": "a1", "stopped": True})
+            self.assertEqual(stopped, stop_result("a1", True))
         else:
             self.assertEqual(len(outputs), 2, outputs)
         self.assert_result(resumed)

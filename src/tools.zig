@@ -92,8 +92,8 @@ const all = [_]Tool{
         .name = "stop",
         .run = @import("tools/stop.zig").stop,
         .doc =
-        \\  // Cancel and join one background bash/agent/Run by id, cleaning up its process group. Completed tasks return stopped:false; unknown ids reject. Completion is still delivered once as a background message.
-        \\  async stop({ id }) {}, // → { id, stopped }
+        \\  // Requires a concrete reason; elapsed time/no output alone is not a failure. Canceling a long test discards progress and its completed validation result; restarting repeats work. With no independent work, reply without tools to wait locally. Cancel and join one background bash/agent/Run by id, cleaning up its process group. Completed tasks return stopped:false; unknown ids reject. Completion is still delivered once as a background message.
+        \\  async stop({ id, reason }) {}, // → { id, stopped, reason, notice? }
         ,
     },
     .{

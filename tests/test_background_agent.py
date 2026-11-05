@@ -113,7 +113,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         code = "42"
                 if self.server.case in ("limit", "stop"):
                     wait_for(lambda: (self.server.cwd / "worker.started").exists())
-                    code = ("const stopped=await Promise.all([tools.stop({id:'a1'}),tools.stop({id:'a1'})]); "
+                    code = ("const stopped=await Promise.all([tools.stop({id:'a1',reason:'mock requested cancellation'}),tools.stop({id:'a1',reason:'mock requested cancellation'})]); "
                             "const next=await tools.agent({prompt:'child:one'}); "
                             "if(!next.ok)throw new Error('occupancy not released'); stopped"
                             if self.server.case == "stop" else "42")

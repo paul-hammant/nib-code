@@ -863,12 +863,15 @@ def transport_group(record):
 def step_group(record, field):
     if field == 'transport':
         return transport_group(record)
+    if field == 'full_reason':
+        value = record.get('full_reason')
+        return value if isinstance(value, str) and value else 'incremental' if record.get('incremental') is True else 'unknown'
     value = record.get('incremental')
     return str(value).lower() if isinstance(value, bool) else 'unknown'
 
 
 def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _step_filter=None):
-    if group_by not in (None, 'version', 'system', 'patches', 'transport', 'incremental'):
+    if group_by not in (None, 'version', 'system', 'patches', 'transport', 'incremental', 'full_reason'):
         raise ValueError('invalid group_by')
     paths = list(paths)
     if _systems is None:
@@ -920,7 +923,7 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
         if cwd is not None and (not isinstance(header.get('cwd'), str) or
                                 Path(header['cwd']).expanduser().resolve() != cwd):
             continue
-        if group_by is not None and group_by not in ('transport', 'incremental'):
+        if group_by is not None and group_by not in ('transport', 'incremental', 'full_reason'):
             group_paths.setdefault(header_group(header, group_by), []).append(path)
 
         def selected(record):
@@ -1025,7 +1028,7 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
                 if current is not None:
                     current['previous'] = None
                 continue
-            if group_by in ('transport', 'incremental'):
+            if group_by in ('transport', 'incremental', 'full_reason'):
                 group_paths.setdefault(step_group(record, group_by), set()).add(path)
             totals['steps'] += 1
             if not has_at:
@@ -1169,10 +1172,10 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
         report['groups'] = {}
         for key, members in sorted(group_paths.items()):
             group = summarize(members, since, cwd, _systems=_systems,
-                              _step_filter=(group_by, key) if group_by in ('transport', 'incremental') else None)
+                              _step_filter=(group_by, key) if group_by in ('transport', 'incremental', 'full_reason') else None)
             if group['overall']['sessions']:
                 report['groups'][key] = group
-        report['notes'][0] += (' --group-by transport/incremental 按完整 Step 的实际线路/续接状态分组，同会话可在多个组出现；缺字段归 unknown；按记录筛选，不把混合线路 Turn 当作完整墙钟样本。其他分组 按 header nib_version/system_sha/patches_off 分组，'
+        report['notes'][0] += (' --group-by transport/incremental/full_reason 按完整 Step 的实际线路/续接状态分组，同会话可在多个组出现；缺字段归 unknown；按记录筛选，不把混合线路 Turn 当作完整墙钟样本。其他分组 按 header nib_version/system_sha/patches_off 分组，'
             '缺失/无效值为 unknown；patches_off 缺失但 nib_version 或 system_sha 有效时为 none，'
             '显式空补丁集也为 none；补丁数组按去重排序的集合分组，每组重新汇总完整核心报告。')
     return report
@@ -1298,7 +1301,7 @@ def main():
     parser.add_argument('paths', nargs='*', type=Path, help='session JSONL files or directories')
     parser.add_argument('--since', type=date.fromisoformat, metavar='YYYY-MM-DD', help='record date, inclusive, local time; legacy records fall back to file modification time')
     parser.add_argument('--cwd', type=Path, help='exact session working directory')
-    parser.add_argument('--group-by', choices=('version', 'system', 'patches', 'transport', 'incremental'), help='group by session metadata, actual Step transport or incremental state')
+    parser.add_argument('--group-by', choices=('version', 'system', 'patches', 'transport', 'incremental', 'full_reason'), help='group by session metadata, actual Step transport, incremental state or full-request reason')
     parser.add_argument('--json', action='store_true', help='emit JSON instead of text')
     args = parser.parse_args()
     inputs = args.paths or [Path(os.environ.get('NIB_HOME', '~/.nib')).expanduser() / 'sessions']

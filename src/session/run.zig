@@ -70,7 +70,7 @@ pub const PollTarget = struct {
     }
 };
 
-pub const Executed = struct { output: []const u8, ok: bool, run_ms: ?u64 = null, effort: ?effort.Declaration = null, remaining_steps: ?usize = null, tool_summary: ?ToolSummary = null, background_id: ?[]const u8 = null };
+pub const Executed = struct { output: []const u8, ok: bool, empty: bool = false, run_ms: ?u64 = null, effort: ?effort.Declaration = null, remaining_steps: ?usize = null, tool_summary: ?ToolSummary = null, background_id: ?[]const u8 = null };
 
 /// Output is arena-owned.
 pub fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const std.atomic.Value(bool), timing: *sandbox.RunTiming) !Executed {
@@ -91,7 +91,7 @@ pub fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const 
     const ran = try executeTimed(s, code.?, cancel, timing);
     if (ran == null) {
         const remaining = if (s.cfg.limits.max_steps) |limit| limit -| s.steps else null;
-        const message = try std.fmt.allocPrint(a, "Run still executing after {d} ms; continuing in background as {s}. Its captured output is preserved and will arrive automatically as a message when it finishes. Do only independent work meanwhile; no ps, cat/tail logs, sleep, empty Runs or timeout reruns to check/wait. Do not read its redirected logs before completion. If no independent work remains, reply briefly without calling tools; Session waits locally, delivers the result and continues the Turn. Avoid changing files this Run may use.", .{ s.cfg.limits.run_background_after_ms, s.tools.background.runs.items[s.tools.background.runs.items.len - 1].id });
+        const message = try std.fmt.allocPrint(a, "Run still executing after {d} ms; continuing in background as {s}. Its captured output is preserved and will arrive automatically as a message when it finishes. Do only independent work meanwhile; no ps, cat/tail logs, sleep, empty Runs or timeout reruns to check/wait. Do not read its redirected logs before completion. If no independent work remains, end the model response immediately with a brief text reply and no run/tool call (not even console.log); Session waits locally, delivers the result and continues the Turn. Avoid changing files this Run may use.", .{ s.cfg.limits.run_background_after_ms, s.tools.background.runs.items[s.tools.background.runs.items.len - 1].id });
         const text = try output_format.stepLimitOutput(a, message, remaining);
         try sink.emit(sink.ctx, .{ .run_end = .{ .ok = true, .output = text, .tool_summary = .{} } });
         return .{ .output = text, .ok = true, .run_ms = @intCast(@max(started.untilNow(s.io).raw.toMilliseconds(), 0)), .remaining_steps = remaining, .tool_summary = .{}, .background_id = s.tools.background.runs.items[s.tools.background.runs.items.len - 1].id };
@@ -104,7 +104,7 @@ pub fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const 
     const run_ms = timing.elapsed();
     const tool_summary = try ToolSummary.init(a, timing.entries[0..timing.count], timing.run_index, timing.omitted - before_omitted);
     try sink.emit(sink.ctx, .{ .run_end = .{ .ok = o.ok, .output = output, .changes = ran.?.changes, .tool_summary = tool_summary } });
-    return .{ .output = output, .ok = o.ok, .run_ms = run_ms, .effort = args.value.effort, .remaining_steps = remaining_steps, .tool_summary = tool_summary };
+    return .{ .output = output, .ok = o.ok, .empty = std.mem.eql(u8, o.text, "undefined") and std.mem.trim(u8, o.logs, " \t\r\n").len == 0, .run_ms = run_ms, .effort = args.value.effort, .remaining_steps = remaining_steps, .tool_summary = tool_summary };
 }
 
 fn executeTimed(s: *Session, code: []const u8, cancel: *const std.atomic.Value(bool), timing: *sandbox.RunTiming) !?Ran {

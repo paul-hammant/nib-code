@@ -81,7 +81,7 @@ timeout_ms 可省略，默认 30 分钟，不计排队时间。model/effort 省�
 
 `tools.bash({command, background: true, detached: true})` 是会话级任务：跨 Run 和正常 Turn 存活，最终回答和 Step 上限收尾只等待普通后台任务，不等待 detached；停止提示只列实际等待的任务。detached 要求 `background:true`，默认 `timeout_ms:0`（无截止时间），也可显式指定正数超时；普通前台/后台 bash 默认 1800000 ms（30 分钟），Run 自动转后台不重置或缩短这个截止时间，显式正数 timeout_ms 始终优先。默认值的依据与清理边界见 [run-output.md](run-output.md#bash-执行时限)。它与其他 bash 共用 b 计数器、并发和输出上限。完成时只入 inbox，空闲时不自动发起 Turn；下一次 Step/Turn 消费一次。Turn 取消/失败、Session 退出或切换清理全部任务；ask 回答后退出 Session，因此不跨 ask 进程保活。恢复会话不重启进程，沿用 lost 消息。
 
-`tools.stop({id}) → {id,stopped}` 按现有 a/b id 取消并 join 单个后台 bash/agent，清理进程组。停止运行中的任务返回 `stopped:true`；已结束的已知任务返回 false，未知 id reject。并发停止同一任务只 join 一次，完成结果仍经原 inbox 路径投递一次。stop 返回前释放 agent 的执行占用；它不删除任务身份。启动和 stop 都经普通工具统一结算/录制出口，后台结果消息按 UTF-8 字节计入接收它的 Step 的 output_bytes。见 [ADR 0014](adr/0014-session-background-jobs.md)。
+`tools.stop({id,reason}) → {id,stopped,reason,notice?}` reason 必须是非空白字符串，否则 reject 且不停止任务。所有显式 stop 都要求给出具体理由，不猜测命令是否属于验证：时间长或没有输出本身不证明任务卡住；用户要求、已观察到的失败、需求变化仍可作为停止理由。取消未完成测试会丢弃本次测试进度，不能据此声称验证通过；启动新进程会重做未完成的工作。已写文件和编译缓存不会回滚。返回值保留 reason，实际停止时附带 notice 提醒。按现有 a/b id 取消并 join 单个后台 bash/agent，清理进程组。停止运行中的任务返回 `stopped:true`；已结束的已知任务返回 false，未知 id reject。并发停止同一任务只 join 一次，完成结果仍经原 inbox 路径投递一次。stop 返回前释放 agent 的执行占用；它不删除任务身份。启动和 stop 都经普通工具统一结算/录制出口，后台结果消息按 UTF-8 字节计入接收它的 Step 的 output_bytes。见 [ADR 0014](adr/0014-session-background-jobs.md)。
 
 后台 agent/bash 的执行失败通常转换成结果消息；若后台工作线程自身出错，无法生成或写入 inbox 结果（例如分配失败），内部错误由轮询路径上报一次，该任务不再计入待结果集合，后续 Run 不会反复收到同一错误。
 
@@ -110,3 +110,5 @@ bash 与子会话复用标准库子进程等待和进程组执行器。所有 ba
 长 Run 不依赖模型主动传 `background:true`；达到默认 10 秒的可配置阈值并仍在等工具时，整个脚本继续执行，模型先收到 `rN` 通知。已 await 的工具返回类型不变，console 和 edit/write changes 延后一起交付。后台 Run 与其他 Run 共享 cwd 和文件观察状态；只做独立工作，不轮询、不重跑、不同时修改相关文件。详细的并发上限、文件冲突边界、取消、展示预算与恢复语义见 [run-output.md](run-output.md#长-run-自动转后台)。
 
 `tools.stop` 同时接受其他后台 Run 的 `rN`；Run 不能 stop 自己。后台 Run 非 detached，最终回答和 Step 上限仍等待结果送达。Run 的后续代码也可以启动显式后台 bash/agent，沿用其各自的普通或 detached 语义。只有 Session 主线程向 sink 转发进度/用量/结果；后台沙箱与工具线程不调用前台 sink。
+
+无工具调用的文本回复在仍有普通后台任务时一定提交为 waiting Step 并进入本地等待；不看文本长短、不识别“等待”关键词。一个 Step 的全部 Run 都成功、没有输出且没有任何实际宿主工具调用（例如空 Run 或仅打印空行）时，同样等待，不额外请求模型。有计算输出或实际调用过工具的 Run 仍按正常工作处理，不能把任意 git/read/stop 调用自动当作等待。后台结果或用户插话到达后再继续；detached 任务保持跨 Turn 语义。

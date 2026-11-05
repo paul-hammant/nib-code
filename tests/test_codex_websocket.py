@@ -120,12 +120,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     full += body["input"]
                 else:
                     full = list(body["input"])
-                if server.mode == "protocol" and count == 2:
+                if server.mode in ("protocol", "protocol-emitted") and count == 2:
+                    if server.mode == "protocol-emitted":
+                        self.event("response.reasoning_summary_text.delta", delta="before fallback")
                     self.wfile.write(b"\xc1\x00")
                     self.wfile.flush()
                     break
                 if server.mode == "disconnect" and count == 2:
                     break
+                if server.mode in ("content-heartbeats", "content-metadata", "request-progress", "content-progress", "invalid-response") and len(server.requests) == 1:
+                    if server.mode == "invalid-response":
+                        self.event("response.output_item.done", output_index=300, item={"type": "reasoning"})
+                        continue
+                    for _ in range(7 if server.mode == "content-progress" else 12):
+                        if server.mode == "content-heartbeats":
+                            self.wfile.write(frame(b"ping", opcode=9))
+                            self.wfile.flush()
+                        elif server.mode == "content-metadata":
+                            self.event("response.metadata")
+                        else:
+                            self.event("response.reasoning_summary_text.delta", delta="thinking")
+                        time.sleep(.2)
+                    if server.mode != "content-progress":
+                        continue
                 if server.mode == "idle":
                     self.connection.settimeout(5)
                     self.rfile.read(1)
@@ -200,10 +217,25 @@ def response(inputs, response_id, mode):
     events += [dict(type="response.output_item.done", output_index=0, item=item),
                dict(type="response.completed", response=dict(id=response_id, status="completed", output=[item],
                      usage=dict(input_tokens=100, output_tokens=10, input_tokens_details=dict(cached_tokens=50))))]
-    # Force a prefix mismatch without changing request properties: nib's history drops this
-    # empty assistant message, whereas it remains in the server's completed output.
-    if (mode == "prefix" and item["type"] == "function_call") or (mode == "background-prefix" and item.get("content", [{}])[0].get("text") == "Waiting."):
-        empty = dict(type="message", role="assistant", content=[])
+    if mode in ("ordered", "background-ordered"):
+        output = [dict(type="reasoning", id="rs-first", summary=[], encrypted_content="fake-one"),
+                  dict(type="message", role="assistant", phase="commentary",
+                       content=[dict(type="output_text", text="Part one.")]),
+                  dict(type="reasoning", id="rs-second", summary=[], encrypted_content="fake-two"), item]
+        events = [dict(type="response.created", response=dict(id=response_id, status="in_progress"))]
+        for index, value in enumerate(output):
+            events.append(dict(type="response.output_item.added", output_index=index, item=value))
+            if value["type"] == "message":
+                events.append(dict(type="response.output_text.delta", output_index=index, delta=value["content"][0]["text"]))
+            elif value["type"] == "function_call":
+                events.append(dict(type="response.function_call_arguments.delta", output_index=index, delta=value["arguments"]))
+            events.append(dict(type="response.output_item.done", output_index=index, item=value))
+        events.append(dict(type="response.completed", response=dict(id=response_id, status="completed", output=output,
+                           usage=dict(input_tokens=100, output_tokens=10))))
+        return events, output
+    # Empty output messages and unsupported items exercise distinct continuation paths.
+    if (mode in ("prefix", "unsupported") and item["type"] == "function_call") or (mode == "background-prefix" and item.get("content", [{}])[0].get("text") == "Waiting."):
+        empty = dict(type="message", role="assistant", content=[]) if mode != "unsupported" else dict(type="future_output")
         events.insert(-1, dict(type="response.output_item.done", output_index=1, item=empty))
         return events, [item, empty]
     return events, [item]
@@ -219,6 +251,10 @@ def run_case(tmp, mode, *, resume=None, home=None, extra=None):
     home.mkdir(exist_ok=True)
     if mode.startswith("background"):
         (home / "config.toml").write_text("[limits]\nrun_background_after_ms = 50\nstream_idle_timeout_s = 1\n")
+    if mode in ("content-heartbeats", "content-metadata", "request-progress", "content-progress"):
+        (home / "config.toml").write_text("[limits]\nstream_idle_timeout_s = 3\nstream_content_timeout_s = " +
+            ("3" if mode == "request-progress" else "1") + "\nrequest_timeout_s = " +
+            ("1" if mode == "request-progress" else "3") + "\n")
     env = {k: v for k, v in os.environ.items() if not k.startswith(("NIB_", "CODEX_"))}
     env.update(NIB_HOME=str(home), CODEX_HOME=str(tmp / "auth"), NIB_PROVIDER="codex", NIB_MODEL="gpt-6.1-terra",
                NIB_BASE_URL=f"http://127.0.0.1:{server.server_port}", NIB_CODEX_TRANSPORT="websocket",
@@ -234,9 +270,9 @@ def run_case(tmp, mode, *, resume=None, home=None, extra=None):
         events = [json.loads(line) for line in result.stdout.splitlines()]
         session = events[0]["start"]["session_id"]
         if mode.startswith("background"):
-            assert [e["notice"] for e in events if "notice" in e] == ["Waiting."], events
+            assert [e["notice"] for e in events if "notice" in e] == ["Part one.Waiting." if mode == "background-ordered" else "Waiting."], events
             assert not any(e.get("delta", {}).get("text") == "Waiting." for e in events), events
-        assert events[-1]["end"]["text"] == "finished🙂", events
+        assert events[-1]["end"]["text"] == ("Part one.finished🙂" if mode in ("ordered", "background-ordered") else "finished🙂"), events
         steps = [r for r in read_log(home, session) if r.get("model_ms") is not None]
         return server, steps, session, home
     finally:
@@ -300,16 +336,17 @@ def main():
         assert second["client_metadata"]["x-codex-turn-state"] == "mock-turn"
         assert server.pongs >= 1
         assert [s["incremental"] for s in steps] == [False, True], steps
+        assert steps[0]["full_reason"] == "first_request"
         assert all(s["transport"] == "websocket" and s["first_data_ms"] <= s["model_ms"] for s in steps)
         assert steps[1]["input_items"] == 1 and steps[1]["input_bytes"] == len(json.dumps(second["input"], ensure_ascii=False, separators=(",", ":")).encode())
-        for mode in ("background", "background-prefix", "background-reconnect"):
+        for mode in ("background", "background-prefix", "background-ordered", "background-reconnect"):
             background, bg_steps, _, _ = run_case(tmp, mode)
             assert len(background.requests) == len(bg_steps) == 3, (mode, background.requests, bg_steps)
             assert bg_steps[1]["messages"][-1]["waiting"] is True
             assert background.requests[2]["at"] - background.requests[1]["at"] > 1
             delta = background.requests[2]["body"]
             assert "background-result" in delta["input"][-1]["content"]
-            if mode == "background":
+            if mode != "background-reconnect":
                 assert delta["previous_response_id"] == "resp-1-2"
                 assert len(delta["input"]) == 1 and delta["input"][0]["role"] == "user"
             else:
@@ -326,11 +363,26 @@ def main():
         assert any(i.get("type") == "function_call" for i in resumed.requests[0]["body"]["input"])
         assert any(i.get("type") == "function_call_output" for i in resumed.requests[0]["body"]["input"])
         assert resumed_steps[-1]["incremental"] is False
-        for mode in ("prefix", "effort"):
+        for mode in ("ordered", "prefix", "unsupported", "effort", "content-heartbeats", "content-metadata", "request-progress", "content-progress", "invalid-response"):
             server, steps, _, _ = run_case(tmp, mode)
-            assert len(server.requests) == 2 and server.connections == 1
-            assert "previous_response_id" not in server.requests[1]["body"], (mode, server.requests)
-            assert steps[1]["incremental"] is False
+            if mode in ("ordered", "prefix", "unsupported", "effort", "content-progress"):
+                assert len(server.requests) == 2 and server.connections == 1
+                if mode == "content-progress":
+                    assert steps[0]["model_ms"] > 1200 and steps[0]["attempts"] == 1
+                    assert steps[0]["max_content_gap_ms"] < 1000
+                assert steps[1]["incremental"] == (mode not in ("effort", "unsupported")), (mode, steps)
+                assert steps[1].get("full_reason") == ("effort_changed" if mode == "effort" else "unsupported_output" if mode == "unsupported" else None)
+            else:
+                assert server.connections == 2 and server.posts == 0, (mode, server.requests)
+                attempts = steps[0]["model_attempts"]
+                assert len(attempts) == 2, (mode, attempts)
+                expected = "InvalidResponse" if mode == "invalid-response" else "ModelRequestTimeout" if mode == "request-progress" else "StreamContentTimeout"
+                assert attempts[0]["error_name"] == expected, (mode, attempts)
+                assert attempts[1]["full_reason"] == "reconnect", attempts
+                if mode == "invalid-response":
+                    assert "output_index=300" in attempts[0]["detail"] and "output_item.done" in attempts[0]["detail"]
+                else:
+                    assert attempts[0]["content_bytes"] > 0 if mode == "request-progress" else attempts[0]["content_bytes"] == 0
         server, steps, _, _ = run_case(tmp, "fork")
         assert server.connections == 2 and len(server.requests) == 3
         first_by_connection = {}
@@ -342,11 +394,17 @@ def main():
         assert len(server.requests) == 3 and "previous_response_id" in server.requests[1]["body"]
         assert "previous_response_id" not in server.requests[2]["body"]
         assert steps[1]["transport_fallback"] == "previous_response_not_found" and not steps[1]["incremental"]
-        for mode in ("handshake", "bad-accept", "protocol"):
-            server, steps, _, _ = run_case(tmp, mode)
+        for mode in ("handshake", "bad-accept", "protocol", "protocol-emitted"):
+            server, steps, sid, case_home = run_case(tmp, mode)
             assert server.connections == 1 and server.posts >= 1, (mode, server.requests)
-            assert steps[-1]["transport"] == "sse" and steps[-1]["transport_fallback"], (mode, steps)
-            if mode != "protocol":
+            assert steps[-1]["transport"] == "sse" and steps[-1]["transport_fallback"] and steps[-1]["transport_fallback_at"], (mode, steps)
+            fallbacks = [r for r in read_log(case_home, sid) if r.get("transport_fallback") and "model_ms" not in r]
+            assert len(fallbacks) == 1 and fallbacks[0]["transport_fallback_at"] <= steps[-1]["at"]
+            if mode == "protocol-emitted":
+                attempts = steps[-1]["model_attempts"]
+                assert [a["transport"] for a in attempts] == ["websocket", "sse"], attempts
+                assert attempts[0]["error_name"] == "WebSocketFallback" and attempts[0]["fallback_at"]
+            if mode not in ("protocol", "protocol-emitted"):
                 assert server.posts == 2
         server, steps, _, _ = run_case(tmp, "event-state")
         assert server.requests[1]["body"]["client_metadata"]["x-codex-turn-state"] == "event-turn"

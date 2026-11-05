@@ -1959,6 +1959,24 @@ class TransportTests(unittest.TestCase):
                                               '--group-by', 'transport', '--json'])
             self.assertEqual(json.loads(output)['groups']['sse']['overall']['steps'], 1)
 
+    def test_full_reason_groups(self):
+        for value in (None, '', [], 12):
+            self.assertEqual(stats.step_group({'full_reason': value}, 'full_reason'), 'unknown')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'reasons.jsonl'
+            rows = synthetic_log(path, [["1", "2", "3", None]])
+            for row, reason in zip(rows[1:], ('first_request', None, 'effort_changed', None)):
+                row['full_reason'] = reason
+            rows[2]['incremental'] = True
+            path.write_text('\n'.join(map(json.dumps, rows)) + '\n')
+            report = stats.summarize([path], group_by='full_reason')
+            self.assertEqual({key: value['overall']['steps'] for key, value in report['groups'].items()},
+                             {'first_request': 1, 'incremental': 1, 'effort_changed': 1, 'unknown': 1})
+            self.assertEqual(report['groups']['incremental']['round_trips']['write_to_validation']['pairs'], 0)
+            output = subprocess.check_output([sys.executable, str(ROOT / 'scripts/stats.py'), str(path),
+                                              '--group-by', 'full_reason', '--json'])
+            self.assertEqual(json.loads(output)['groups']['effort_changed']['overall']['steps'], 1)
+
     def test_incremental_groups_preserve_unknown_and_filter_step_adjacency(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'mixed.jsonl'

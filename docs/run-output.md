@@ -106,7 +106,7 @@ console.log("service ready");
 
 后台 Run 使用自己的取消标记、llm 调用限额、changes、计时和录制缓冲；Session 的 agent 并发、后台 bash 并发、任务 ID、文件观察状态和用量仍共享。最多同时有 8 个自动后台 Run，独立于后台 bash 的 8 个上限；达到上限时新 Run 保持前台等待，不失败、不排队转后台。每个 Sandbox 仍最多同时执行 8 个工具。后台 Run 本身不消耗额外 Step，之后的主模型请求仍逐次消耗 Step。
 
-结束后用同一个 `session/output.zig` 格式化器生成最多 16 KiB 的最终输出，通过 Inbox 插入 `[background run rN finished]` 后接完整格式化输出的 user 消息；来源前缀是预算外的信封。通知和最终输出各展示一次。没有独立工作时，模型应以极短、无工具调用的回复结束当前 Step。该回复保留在历史中并标记 `waiting:true`，作为 notice 展示，不作为最终答案；Session 在本地等待 Inbox，不额外请求模型，结果送达后自动继续下一 Step。普通后台任务同样适用；detached bash 不触发等待。等待期间仍可取消或接收用户插话。Step 上限收尾先等结果送达，不额外请求模型。Esc/SIGINT/SIGTERM、Turn 失败、Session 退出或切换都会取消并 join Run 及其工具，bash 按原有进程组规则清理；SIGKILL 无法执行清理。`tools.stop({id:"r1"})` 也可停止另一个后台 Run，仍投递取消结果；不能停止当前 Run 自己。取消不会回滚已发生的 edit/write 或 shell 副作用。
+结束后用同一个 `session/output.zig` 格式化器生成最多 16 KiB 的最终输出，通过 Inbox 插入 `[background run rN finished]` 后接完整格式化输出的 user 消息；来源前缀是预算外的信封。通知和最终输出各展示一次。没有独立工作时，模型应立即以极短、无工具调用的回复结束当前 Step；不要用 console.log 模拟回复。成功但无输出、无实际宿主工具调用的空 Run 同样进入等待；有计算输出的纯 JS Run 仍正常继续。该回复保留在历史中并标记 `waiting:true`，作为 notice 展示，不作为最终答案；Session 在本地等待 Inbox，不额外请求模型，结果送达后自动继续下一 Step。普通后台任务同样适用；detached bash 不触发等待。等待期间仍可取消或接收用户插话。Step 上限收尾先等结果送达，不额外请求模型。Esc/SIGINT/SIGTERM、Turn 失败、Session 退出或切换都会取消并 join Run 及其工具，bash 按原有进程组规则清理；SIGKILL 无法执行清理。`tools.stop({id:"r1",reason:"测试已报错，需要修改输入"})` 也可停止另一个后台 Run，仍投递取消结果；不能停止当前 Run 自己。取消不会回滚已发生的 edit/write 或 shell 副作用。
 
 后台 Run 的所有成功 edit/write（含转后台之前）只归属该 Run，最终结果事件与日志的 `completion.changes` 保存按操作累计的计数和 diff；临时通知不提前领取 changes。TUI 在后台结果中显示输出与这些改动，恢复也能显示；子 agent 的调用结果同样汇总这些改动。bash 的改动继续不计入 changes。
 

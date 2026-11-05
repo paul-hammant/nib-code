@@ -56,7 +56,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if case == "resume":
             code = "await tools.sleep(150); 'resumed-result'" if index == 0 else None
         elif index == 0:
-            if case == "wait":
+            if case in ("wait", "empty-wait", "stop-reason"):
                 script = ("import sys, urllib.request; print('stdout-before', flush=True); "
                           "print(urllib.request.urlopen(" + repr(f"http://127.0.0.1:{self.server.server_port}/work") + ").read().decode(), flush=True); "
                           "print('stderr-after', file=sys.stderr)")
@@ -84,8 +84,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif case in ("cancel", "crash"):
             self.server.followup.set()
             self.server.release.wait(10)
+        elif case == "empty-wait" and index == 1:
+            code = "console.log('')"
+        elif case == "stop-reason" and index == 1:
+            code = "for(const reason of [undefined,'  ']) {try {await tools.stop({id:'r1',reason}); throw new Error('accepted missing reason')} catch(e) {if(!String(e).includes('nonempty reason')) throw e}}"
         elif case == "stop" and index == 1:
-            code = "await tools.stop({id:'r1'})"
+            code = "await tools.stop({id:'r1',reason:'mock requested cancellation'})"
         elif case == "multiple" and index == 1:
             code = "await tools.sleep(180); await tools.write({path:'second.txt',content:'second'}); 'second-result'"
         elif case == "slots" and index < 9:
@@ -137,6 +141,27 @@ class BackgroundRunTests(unittest.TestCase):
 
     def results(self, rows):
         return [m for r in rows for m in r.get("messages", []) if m.get("background_kind") == "run"]
+
+    def test_empty_runs_wait_and_missing_stop_reason_keeps_work(self):
+        for case in ("empty-wait", "stop-reason"):
+            with self.subTest(case=case):
+                self.server.case = case
+                self.server.requests.clear()
+                self.server.release.clear()
+                self.server.followup.clear()
+                previous = set((self.home / "sessions").glob("*.jsonl"))
+                process = self.launch()
+                wait_for(self.server.followup.is_set)
+                log = lambda: [json.loads(line) for f in (self.home / "sessions").glob("*.jsonl")
+                               if ".calls." not in f.name and f not in previous for line in f.read_text().splitlines()]
+                wait_for(lambda: any(m.get("waiting") for r in log() for m in r.get("messages", [])))
+                self.assertEqual(len(self.server.requests), 3 if case == "stop-reason" else 2)
+                self.assertIsNone(process.poll())
+                self.server.release.set()
+                _, rows, _ = self.finish(process)
+                self.assertTrue(self.results(rows)[0]["background_ok"])
+                self.assertIn("wait-result", self.results(rows)[0]["content"])
+                self.assertEqual(len(self.server.requests), 4 if case == "stop-reason" else 3)
 
     def assert_overlap(self):
         events, rows, session = self.finish(self.launch())

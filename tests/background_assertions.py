@@ -62,3 +62,10 @@ def assert_background_bytes(test, log, requests, terminal=None):
         for key in ("tool_bytes", "output_bytes"):
             test.assertEqual(terminal["timing"][key], sum(step[key] for step in steps))
     return steps
+
+
+def stop_result(id, stopped):
+    result = dict(id=id, stopped=stopped, reason='mock requested cancellation')
+    if stopped:
+        result['notice'] = 'Task canceled; unfinished validation has no passing result. Restarting repeats its work.'
+    return result
