@@ -58,7 +58,7 @@
 
 顶层 Run Promise fulfill 或 reject 后都继续 drain：等待在途及排队工具完成，执行剩余 JS jobs，并接纳 continuation 新发起的工具调用，直到没有剩余工作。任意调用失败都不会取消其他调用（不只子 agent 失败）；顶层 reject 时，Run 最终仍报原始拒绝原因，不被后续完成或失败覆盖。因此 `Promise.all` 提前 reject 不代表并行副作用停止，失败的 Run 也可能继续写文件；前台 agent 仍需等待完成并计入用量，等待期间用户仍可按 Esc 取消。后台任务的跨 Run 生命周期见 [tool-delegation.md](tool-delegation.md)。
 
-只有用户取消或 JS 执行超时才中止 Run 内工具；工具自身超时只终止该调用，不取消其他调用。中止时如有未完成调用，Run 输出保留一行：
+用户取消或 JS 执行超时会中止整个 Run 的在途及排队工具；单个工具超时、bash 被取代或按 id stop 只终止目标，不取消其他调用。整个 Run 中止时如有未完成调用，输出保留一行：
 
 ```text
 [stopped before completion: bash #0, agent #2]
