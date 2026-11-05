@@ -1959,6 +1959,21 @@ class TransportTests(unittest.TestCase):
                                               '--group-by', 'transport', '--json'])
             self.assertEqual(json.loads(output)['groups']['sse']['overall']['steps'], 1)
 
+    def test_incremental_groups_preserve_unknown_and_filter_step_adjacency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'mixed.jsonl'
+            rows = synthetic_log(path, [["1", "2", "3", "4", None]])
+            for row, value in zip(rows[1:], (False, True, None, True, "true")):
+                row['incremental'] = value
+            path.write_text('\n'.join(map(json.dumps, rows)) + '\n')
+            report = stats.summarize([path], group_by='incremental')
+            self.assertEqual({key: value['overall']['steps'] for key, value in report['groups'].items()},
+                             {'false': 1, 'true': 2, 'unknown': 2})
+            self.assertEqual(report['groups']['true']['round_trips']['write_to_validation']['pairs'], 0)
+            output = subprocess.check_output([sys.executable, str(ROOT / 'scripts/stats.py'), str(path),
+                                              '--group-by', 'incremental', '--json'])
+            self.assertEqual(json.loads(output)['groups']['true']['overall']['steps'], 2)
+
 
 if __name__ == '__main__':
     unittest.main()

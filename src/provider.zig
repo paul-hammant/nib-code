@@ -105,6 +105,7 @@ pub const Message = struct {
     tool_call_id: ?[]const u8 = null,
     reasoning: ?Reasoning = null,
     phase: ?[]const u8 = null,
+    waiting: ?bool = null,
     step_effort: ?StepEffort = null,
     tool_summary: ?@import("session/tool_summary.zig").Summary = null,
     step_calls_omitted: ?u64 = null,

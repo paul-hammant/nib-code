@@ -120,6 +120,8 @@ Step/Turn 的 `run_ms`、`tool_bytes`、llm/agent 调用数只计前台已结算
 
 `stats.py` 的 `background_runs` 与现有 agents/bash_calls 使用相同口径：`background_calls` 是自动切换次数，`background_steps` 是启动 Step 之后、结果插入之前已完成的本会话模型 Step 分布，`foreground_calls` 恒为 0（只统计自动后台 Run）。该指标包含根会话和子会话各自的主模型 Step，不将子会话 Step 当成父模型 Step。静态工具计数仍读取原代码；Step/calls 的旧性能指标不混入异步完成数据，避免重复计数。
 
+等待后台结果的无工具 assistant 消息带本地元数据 `waiting:true`，不改模型原始 content/reasoning/phase，也不把 waiting 发给 provider。恢复到 TUI 时显示为通知；统计不把它当作 Turn 完成。它仍是已花费用量的完整 Step。
+
 ## Step 传输字段
 
 完整 Step 新增可选 `transport`（`sse|websocket`）、`incremental`、`input_items`、`input_bytes`、`transport_fallback`。Chat Completions 同样记录 `sse`；旧日志缺字段仍可恢复，统计归 `unknown`，不按 header/provider 猜测。
@@ -128,4 +130,4 @@ Step/Turn 的 `run_ms`、`tool_bytes`、llm/agent 调用数只计前台已结算
 
 `model_ms` 继续包含本 Step 的握手、重发、重试和退避；`first_data_ms` 是首次接收传输数据的时间（WS 帧也包括心跳/元数据，握手头不算），`code[].first_ms` 等代码计时口径不变。失败尝试已经产生的 first_data 仍保留；模型参数计时沿用重试重置规则。`attempts` 仍只数外层重试，原地 previous_response_not_found 全量重发不增加它。日志中的 messages 始终是完整本地历史，恢复无需服务端保存 response。
 
-`python3 scripts/stats.py <日志目录> --group-by transport [--json]` 按每个完整 Step 的实际传输筛选，再生成与其他分组相同的完整报告；比较各组 `timing.model_ms`、`timing.first_data_ms`、`timing.code_first_ms` 的 median/p90/samples。一个混合线路 Session 可出现在多个组；混合线路 Turn 的部分 Step 不作为整 Turn 墙钟样本，缺失计时不补零，过滤断点不建立 effort/工具相邻关系。分组是最终成功线路的观测，发生降级的 SSE 样本包含先前 WS 尝试成本，不能把分组差异直接当作纯网络耗时差。
+`python3 scripts/stats.py <日志目录> --group-by transport [--json]`（或 `--group-by incremental`）按每个完整 Step 的实际传输或续接状态筛选，再生成与其他分组相同的完整报告；比较各组 `timing.model_ms`、`timing.first_data_ms`、`timing.code_first_ms` 的 median/p90/samples。一个混合线路 Session 可出现在多个组；混合线路 Turn 的部分 Step 不作为整 Turn 墙钟样本，缺失计时不补零，过滤断点不建立 effort/工具相邻关系。incremental 分组键为 `true|false|unknown`，SSE 的 false 与全量 WS 的 false 同组，缺字段不补 false。分组是最终成功线路的观测，发生降级的 SSE 样本包含先前 WS 尝试成本，不能把分组差异直接当作纯网络耗时差。

@@ -91,7 +91,7 @@ pub fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const 
     const ran = try executeTimed(s, code.?, cancel, timing);
     if (ran == null) {
         const remaining = if (s.cfg.limits.max_steps) |limit| limit -| s.steps else null;
-        const message = try std.fmt.allocPrint(a, "Run still executing after {d} ms; continuing in background as {s}. Its final output will arrive as a later message. Do independent work meanwhile; do not poll or rerun it. Avoid changing files this Run may use.", .{ s.cfg.limits.run_background_after_ms, s.tools.background.runs.items[s.tools.background.runs.items.len - 1].id });
+        const message = try std.fmt.allocPrint(a, "Run still executing after {d} ms; continuing in background as {s}. Its final output will arrive as a later message. Do only independent work meanwhile; do not poll or rerun it. If no independent work remains, reply briefly without calling tools; the result will arrive and the Turn continues. Avoid changing files this Run may use.", .{ s.cfg.limits.run_background_after_ms, s.tools.background.runs.items[s.tools.background.runs.items.len - 1].id });
         const text = try output_format.stepLimitOutput(a, message, remaining);
         try sink.emit(sink.ctx, .{ .run_end = .{ .ok = true, .output = text, .tool_summary = .{} } });
         return .{ .output = text, .ok = true, .run_ms = @intCast(@max(started.untilNow(s.io).raw.toMilliseconds(), 0)), .remaining_steps = remaining, .tool_summary = .{}, .background_id = s.tools.background.runs.items[s.tools.background.runs.items.len - 1].id };

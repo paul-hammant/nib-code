@@ -380,7 +380,14 @@ pub const Session = struct {
             var model_timing: provider.ModelTiming = .init(s.io, started);
             var attempts: u32 = 0;
             var first_data_ms: ?u64 = null;
-            const reply = try s.complete(decision.cfg, request.items, sink, cancel, detail, partial, &model_timing, &attempts, &first_data_ms);
+            const buffer_text = s.tools.background.pending(s.io);
+            const reply = try s.complete(decision.cfg, request.items, sink, cancel, detail, partial, &model_timing, &attempts, &first_data_ms, buffer_text);
+            const waiting = reply.tool_calls.len == 0 and s.tools.background.pending(s.io);
+            if (waiting) {
+                try sink.emit(sink.ctx, .{ .notice = if (reply.text.len > 0) reply.text else "Waiting for background results." });
+            } else if (buffer_text and reply.text.len > 0) {
+                try sink.emit(sink.ctx, .{ .delta = .{ .kind = .text, .text = reply.text } });
+            }
             const model_ms: u64 = @intCast(@max(started.untilNow(s.io).raw.toMilliseconds(), 0));
             var run_timing: sandbox.RunTiming = .init(s.io, started);
             var run_ms: u64 = 0;
@@ -394,6 +401,7 @@ pub const Session = struct {
                 .tool_calls = if (reply.tool_calls.len > 0) reply.tool_calls else null,
                 .reasoning = reply.reasoning,
                 .phase = reply.phase,
+                .waiting = if (waiting) true else null,
                 .step_effort = decision.metadata,
             });
             const fork_prefix = if (reply.tool_calls.len > 0 and s.tools.depth == 0 and !s.tools.forked)
@@ -501,7 +509,7 @@ pub const Session = struct {
         }
     }
 
-    fn complete(s: *Session, request_cfg: provider.Config, messages: []const provider.Message, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, partial: *Partial, timing: *provider.ModelTiming, attempts: *u32, first_data_ms: *?u64) !provider.Reply {
+    fn complete(s: *Session, request_cfg: provider.Config, messages: []const provider.Message, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, partial: *Partial, timing: *provider.ModelTiming, attempts: *u32, first_data_ms: *?u64, buffer_text: bool) !provider.Reply {
         const Forward = struct {
             mutex: std.Io.Mutex = .init,
             sink: Sink,
@@ -511,6 +519,7 @@ pub const Session = struct {
             started: std.Io.Clock.Timestamp,
             first_data_ms: *?u64,
             session: *Session,
+            buffer_text: bool,
             fn onData(ctx: *anyopaque) !void {
                 const f: *@This() = @ptrCast(@alignCast(ctx));
                 f.mutex.lockUncancelable(f.io);
@@ -523,7 +532,7 @@ pub const Session = struct {
                 f.mutex.lockUncancelable(f.io);
                 defer f.mutex.unlock(f.io);
                 try (if (kind == .text) &f.partial.text else &f.partial.reasoning).appendSlice(f.gpa, text);
-                try f.sink.emit(f.sink.ctx, .{ .delta = .{ .kind = kind, .text = text } });
+                if (!f.buffer_text or kind != .text) try f.sink.emit(f.sink.ctx, .{ .delta = .{ .kind = kind, .text = text } });
             }
             fn onRetry(ctx: *anyopaque, event: provider.RetryEvent) !void {
                 const f: *@This() = @ptrCast(@alignCast(ctx));
@@ -548,7 +557,7 @@ pub const Session = struct {
                 }
             }
         };
-        var fwd: Forward = .{ .sink = sink, .gpa = s.gpa, .partial = partial, .io = s.io, .started = timing.started, .first_data_ms = first_data_ms, .session = s };
+        var fwd: Forward = .{ .sink = sink, .gpa = s.gpa, .partial = partial, .io = s.io, .started = timing.started, .first_data_ms = first_data_ms, .session = s, .buffer_text = buffer_text };
         const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .timing = timing, .codex_state = &s.codex_state };
         if (!s.tools.background.anyPending(s.io))
             return provider.complete(s.gpa, s.arena.allocator(), s.client, request_cfg, s.cache_key, messages, prompt.tools_json, null, provider_sink, cancel, detail, attempts, .{ .ctx = &fwd, .onEvent = Forward.onRetry });

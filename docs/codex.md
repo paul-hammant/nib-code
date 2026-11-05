@@ -155,7 +155,9 @@ previous_response_not_found 在尚未输出 delta 的增量请求上只补发一
 
 帧层支持随机客户端 mask、短/16/64 位长度、文本分片、ping/pong/close、UTF-8 与控制帧校验。服务端单消息上限 16 MiB；超过或收到二进制/扩展帧则降级 SSE，不截断数据。不协商压缩/扩展。TLS、证书与代理行为复用 std.http.Client；真实 TLS/代理/长空闲重连、网关是否要求额外头（例如不同客户端 originator、User-Agent 或账号策略）尚未验证，不能声称已追平 Codex CLI 性能。没有连接池并发复用，一个 Session 同时只允许现有的一个主模型请求。
 
-本地测试：`python3 tests/test_codex_websocket.py` 覆盖增量、前缀/配置变化、缺失 response 重发、握手/协议降级、帧分片和 ping/pong、turn-state、重连、fork、恢复、SIGINT、Esc 后继续、跨 Turn 复用及空闲超时。日志与统计字段见 [session-log.md](session-log.md#step-传输字段)。
+后台 Run 完成消息只追加到已提交历史末尾；等待回复的本地 waiting 标记不进入线上 input，因此后续可只发后台 user 消息。前缀不一致仍全量发送。后台等待不运行流空闲计时器；服务器关闭闲置连接时，下一 Step 走已有重试，新连接清除 previous response 并发送完整历史。
+
+本地测试：`python3 tests/test_codex_websocket.py` 覆盖增量、前缀/配置变化、缺失 response 重发、握手/协议降级、帧分片和 ping/pong、turn-state、重连、fork、恢复、SIGINT、Esc 后继续、跨 Turn 复用、后台等待期间无额外请求、后台消息的增量/前缀回退、闲置连接关闭重连及空闲超时。日志与统计字段见 [session-log.md](session-log.md#step-传输字段)。
 
 ### 用 nib-bench 对比
 

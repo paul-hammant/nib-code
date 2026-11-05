@@ -36,6 +36,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def do_GET(self):
+        self.server.release.wait(10)
+        body = b"wait-result"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            self.wfile.write(body)
+
     def do_POST(self):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         index = len(self.server.requests)
@@ -45,7 +54,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if case == "resume":
             code = "await tools.sleep(150); 'resumed-result'" if index == 0 else None
         elif index == 0:
-            if case in ("cancel", "crash", "stop"):
+            if case == "wait":
+                code = "await tools.fetch(" + json.dumps({"url": f"http://127.0.0.1:{self.server.server_port}/work"}) + "); 'wait-result'"
+            elif case in ("cancel", "crash", "stop"):
                 command = "echo $$ > worker.pid; sleep 30; echo should-not-finish"
                 code = "const r=await tools.bash(" + json.dumps({"command": command}) + "); if(r.exit_code!==null) throw new Error('stop did not kill command'); r"
             elif case == "limit":
@@ -77,7 +88,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if index > 0 and case not in ("cancel", "crash", "resume"):
             self.server.followup.set()
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-            reply(self, self.server.provider, code, "done" if code is None else "working")
+            reply(self, self.server.provider, code, "Waiting." if case == "wait" and index == 1 else "done" if code is None else "working")
 
 
 class BackgroundRunTests(unittest.TestCase):
@@ -166,6 +177,33 @@ class BackgroundRunTests(unittest.TestCase):
             "access_token": "fake", "account_id": "fake", "refresh_token": "fake", "id_token": "fake"}}))
         self.env.update(NIB_PROVIDER="codex", NIB_MODEL="gpt-6.1-sol", CODEX_HOME=str(auth))
         self.assert_overlap()
+
+    def test_no_independent_work_waits_without_model_requests_or_final_text(self):
+        self.server.case = "wait"
+        process = self.launch()
+        try:
+            self.assertTrue(self.server.followup.wait(5))
+            def waiting_step():
+                for path in (self.home / "sessions").glob("*.jsonl"):
+                    if path.name.endswith(".calls.jsonl"):
+                        continue
+                    rows = [json.loads(line) for line in path.read_text().splitlines()]
+                    if any(m.get("waiting") for r in rows for m in r.get("messages", [])):
+                        return rows
+            wait_for(waiting_step)
+            self.assertIsNone(process.poll())
+            self.assertEqual(len(self.server.requests), 2)
+        finally:
+            self.server.release.set()
+        events, rows, _ = self.finish(process)
+        self.assertEqual(len(self.server.requests), 3)
+        self.assertEqual([e["notice"] for e in events if "notice" in e], ["Waiting."])
+        self.assertFalse(any(e.get("delta", {}).get("text") == "Waiting." for e in events))
+        self.assertEqual(events[-1]["end"]["text"], "done")
+        messages = self.server.requests[-1]["messages"]
+        self.assertEqual(messages[-2]["content"], "Waiting.")
+        self.assertIn("wait-result", messages[-1]["content"])
+        self.assertNotIn("waiting", messages[-2])
 
     def test_completed_resume_does_not_redeliver_results(self):
         _, _, session = self.finish(self.launch())

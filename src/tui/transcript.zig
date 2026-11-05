@@ -304,7 +304,7 @@ pub const Transcript = struct {
             } else if (std.mem.eql(u8, m.role, "user")) {
                 try t.add(gpa, .user, content);
             } else if (std.mem.eql(u8, m.role, "assistant")) {
-                if (content.len > 0) try t.add(gpa, .assistant, content);
+                if (content.len > 0) try t.add(gpa, if (m.waiting orelse false) .info else .assistant, content);
                 for (m.tool_calls orelse &.{}) |call| {
                     const Args = struct { code: []const u8 = "" };
                     const args = std.json.parseFromSlice(Args, gpa, call.function.arguments, .{ .ignore_unknown_fields = true }) catch continue;
@@ -523,6 +523,15 @@ test "thinking stays hidden in streamed and restored transcripts" {
     try testing.expectEqualStrings("answer", t.lastAnswer().?);
     try testing.expectEqualStrings("out", t.entries.items[1].output.items);
     try testing.expect(t.entries.items[1].run == .ok);
+}
+
+test "restored waiting replies are notices rather than answers" {
+    const gpa = testing.allocator;
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    try t.addHistory(gpa, &.{.{ .role = "assistant", .content = "Waiting.", .waiting = true }});
+    try testing.expectEqual(Kind.info, t.entries.items[0].kind);
+    try testing.expect(t.lastAnswer() == null);
 }
 
 test "a Run shows changed files in its summary and a colored diff when open" {

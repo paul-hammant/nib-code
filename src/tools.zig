@@ -79,11 +79,10 @@ const all = [_]Tool{
         .name = "bash",
         .run = bash.bash,
         .doc =
-        \\  // Bash in cwd; merged stderr. exit_code:null if killed. Return kills group (including nohup/&).
+        \\  // Bash in cwd; merged stderr. exit_code:null if killed. Return kills group, including nohup/&.
         \\  // Verbatim output; >16 MiB errors: redirect to file. >256 shell words (excluding heredocs) refused: write a script.
-        \\  // background:{id}, later result. detached requires background, survives Turns; stop/timeout/cancel/failure/exit cleans up.
-        \\  // Long Runs auto-background; await keeps its result. Do independent work; do not poll/rerun.
-        \\  // detached ends with shell exit; run servers in foreground.
+        \\  // background:{id}, later result. detached requires background; survives Turns, ends with shell. stop/timeout/cancel/failure/exit cleans up.
+        \\  // Long Runs auto-background; await unchanged. Only independent work; no polling/reruns. If none, reply briefly without tools; results arrive and Turn continues.
         \\  async bash({ command, timeout_ms, background = false, detached = false }) {}, // → { exit_code, output } or { id }; timeout_ms default: detached 0 (unlimited), else 120000
         ,
     },

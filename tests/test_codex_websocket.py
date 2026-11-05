@@ -108,7 +108,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     continue
                 assert opcode == 1
                 body = json.loads(payload)
-                server.requests.append(dict(transport="websocket", connection=conn, body=body))
+                server.requests.append(dict(transport="websocket", connection=conn, body=body, at=time.monotonic()))
                 assert body["type"] == "response.create"
                 count += 1
                 if server.mode == "missing" and count == 2:
@@ -147,6 +147,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(frame(data[:cut], fin=False) + frame(b"", opcode=10) + frame(data[cut:], opcode=0))
                     self.wfile.flush()
                 full += output
+                if server.mode == "background-reconnect" and count == 2:
+                    self.wfile.write(frame(struct.pack("!H", 1000), opcode=8))
+                    self.wfile.flush()
+                    break
         except (ConnectionError, TimeoutError, BrokenPipeError):
             pass
         self.close_connection = True
@@ -174,14 +178,19 @@ def response(inputs, response_id, mode):
     summary = "Summarize the conversation above" in prompt
     if not tools and not summary and prompt != "resumed":
         args = {"code": 'console.log("mock result🙂")'}
+        if mode.startswith("background"):
+            args["code"] = "await tools.sleep(1500); 'background-result🙂'"
         if mode == "fork":
             args["code"] = 'console.log(await tools.agent({prompt: "resumed", fork: true}))'
         if mode == "effort":
             args["effort"] = "low"
         item = dict(type="function_call", id="fc1", status="completed", call_id="call1", name="run", arguments=json.dumps(args))
     else:
+        text = "finished🙂" if not summary else "Earlier summary"
+        if mode.startswith("background") and "background-result" not in prompt:
+            text = "Waiting."
         item = dict(type="message", role="assistant", phase="final_answer", id="msg1", status="completed",
-                    content=[dict(type="output_text", text="finished🙂" if not summary else "Earlier summary")])
+                    content=[dict(type="output_text", text=text)])
     events = [dict(type="response.created", response=dict(id=response_id, status="in_progress")),
               dict(type="response.output_item.added", output_index=0, item=item)]
     if item["type"] == "message":
@@ -193,7 +202,7 @@ def response(inputs, response_id, mode):
                      usage=dict(input_tokens=100, output_tokens=10, input_tokens_details=dict(cached_tokens=50))))]
     # Force a prefix mismatch without changing request properties: nib's history drops this
     # empty assistant message, whereas it remains in the server's completed output.
-    if mode == "prefix" and item["type"] == "function_call":
+    if (mode == "prefix" and item["type"] == "function_call") or (mode == "background-prefix" and item.get("content", [{}])[0].get("text") == "Waiting."):
         empty = dict(type="message", role="assistant", content=[])
         events.insert(-1, dict(type="response.output_item.done", output_index=1, item=empty))
         return events, [item, empty]
@@ -208,6 +217,8 @@ def run_case(tmp, mode, *, resume=None, home=None, extra=None):
     server = Mock(mode)
     home = home or tmp / mode
     home.mkdir(exist_ok=True)
+    if mode.startswith("background"):
+        (home / "config.toml").write_text("[limits]\nrun_background_after_ms = 50\nstream_idle_timeout_s = 1\n")
     env = {k: v for k, v in os.environ.items() if not k.startswith(("NIB_", "CODEX_"))}
     env.update(NIB_HOME=str(home), CODEX_HOME=str(tmp / "auth"), NIB_PROVIDER="codex", NIB_MODEL="gpt-6.1-terra",
                NIB_BASE_URL=f"http://127.0.0.1:{server.server_port}", NIB_CODEX_TRANSPORT="websocket",
@@ -222,6 +233,9 @@ def run_case(tmp, mode, *, resume=None, home=None, extra=None):
         assert result.returncode == 0 and result.stderr == b"", (mode, result.stdout, result.stderr)
         events = [json.loads(line) for line in result.stdout.splitlines()]
         session = events[0]["start"]["session_id"]
+        if mode.startswith("background"):
+            assert [e["notice"] for e in events if "notice" in e] == ["Waiting."], events
+            assert not any(e.get("delta", {}).get("text") == "Waiting." for e in events), events
         assert events[-1]["end"]["text"] == "finished🙂", events
         steps = [r for r in read_log(home, session) if r.get("model_ms") is not None]
         return server, steps, session, home
@@ -288,6 +302,25 @@ def main():
         assert [s["incremental"] for s in steps] == [False, True], steps
         assert all(s["transport"] == "websocket" and s["first_data_ms"] <= s["model_ms"] for s in steps)
         assert steps[1]["input_items"] == 1 and steps[1]["input_bytes"] == len(json.dumps(second["input"], ensure_ascii=False, separators=(",", ":")).encode())
+        for mode in ("background", "background-prefix", "background-reconnect"):
+            background, bg_steps, _, _ = run_case(tmp, mode)
+            assert len(background.requests) == len(bg_steps) == 3, (mode, background.requests, bg_steps)
+            assert bg_steps[1]["messages"][-1]["waiting"] is True
+            assert background.requests[2]["at"] - background.requests[1]["at"] > 1
+            delta = background.requests[2]["body"]
+            assert "background-result" in delta["input"][-1]["content"]
+            if mode == "background":
+                assert delta["previous_response_id"] == "resp-1-2"
+                assert len(delta["input"]) == 1 and delta["input"][0]["role"] == "user"
+            else:
+                assert "previous_response_id" not in delta
+                assert len(delta["input"]) > 1
+            assert background.connections == (2 if mode == "background-reconnect" else 1)
+            for step, request in zip(bg_steps, background.requests):
+                wire = request["body"]["input"]
+                assert step["input_items"] == len(wire), (mode, step)
+                assert step["input_bytes"] == len(json.dumps(wire, ensure_ascii=False, separators=(",", ":")).encode()), (mode, step)
+                assert step["incremental"] == ("previous_response_id" in request["body"])
         resumed, resumed_steps, _, _ = run_case(tmp, "normal", resume=session, home=home)
         assert "previous_response_id" not in resumed.requests[0]["body"]
         assert any(i.get("type") == "function_call" for i in resumed.requests[0]["body"]["input"])
