@@ -5,7 +5,7 @@ date: 2026-11-01
 
 # Tool calls within a Run are truly concurrent, ordered by JS semantics
 
-Host functions immediately return Promises; work normally executes on threads, resolving back on the Run thread because QuickJS is not thread-safe. `tools.sleep(ms)` is an exception: native sandbox event-loop timers, without processes, threads, or tool concurrency slots. See [run-output.md](../run-output.md#run-内延时与轮询) for waiting, cancellation, and draining. Scripts determine ordering: `Promise.all` is parallel, successive `await` is serial. The only extra rule is per-path locking for `edit` / `write` on the same path.
+Host functions immediately return Promises; work normally executes on threads, resolving back on the Run thread because QuickJS is not thread-safe. `tools.sleep(ms)` is an exception: native sandbox event-loop timers, without processes, threads, or tool concurrency slots. See [run-output.md](../run-output.md#delays-and-polling-within-runs) for waiting, cancellation, and draining. Scripts determine ordering: `Promise.all` is parallel, successive `await` is serial. The only extra rule is per-path locking for `edit` / `write` on the same path.
 
 **Why:** Previously synchronous tools made `Promise.all` correct but nonconcurrent. Subagents ([0010](0010-subagents.md)) need parallel dispatch to be useful, so concurrency is prerequisite. Code already expresses ordering; no extra rules are needed.
 

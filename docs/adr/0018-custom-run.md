@@ -6,4 +6,4 @@ Keep existing one-shot effort scheduling and the user's ceiling, expressed by op
 
 History preserves each call's custom/function type and raw arguments, pairing results by type. Configuration switches neither convert old history nor lose old effort or encrypted reasoning. Tool-definition changes may still lose some cache; resume always uses full history and a new connection. Wire argument timing counts raw JS input / JSON arguments separately; normalized internal JSON lengths cannot be compared directly.
 
-See [Codex custom Run](../codex.md#custom-run-工具) for configuration, protocol, and error diagnostics. Real endpoints and local mocks cover custom round trips and WS increments; fall back to function if compatibility or script errors worsen, retaining saved calls' original types.
+See [Codex custom Run](../codex.md#custom-run-tool) for configuration, protocol, and error diagnostics. Real endpoints and local mocks cover custom round trips and WS increments; fall back to function if compatibility or script errors worsen, retaining saved calls' original types.

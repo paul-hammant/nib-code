@@ -1,6 +1,6 @@
 # Compromise register
 
-See [README.md](README.md#立足当下面向未来) for principles. Each item is a compromise for current conditions, not part of the design itself. Register new compromises first; when removal conditions hold, delete the code and strike out the entry.
+See [README.md](README.md#grounded-in-the-present-ready-for-the-future) for principles. Each item is a compromise for current conditions, not part of the design itself. Register new compromises first; when removal conditions hold, delete the code and strike out the entry.
 
 ## Model patches
 

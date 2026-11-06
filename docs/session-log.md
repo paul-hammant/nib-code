@@ -1,170 +1,170 @@
-# 会话日志、恢复与计时
+# Session logs, resume, and timing
 
-TUI `/undo` 用独立的本地文件快照回退 edit/write 副作用；主日志保留原对话，并追加 `source:"undo"` 的 user 意图和结果消息。正文在后续请求发给模型，来源元数据不发送；恢复重建消息但不加载撤销栈。存储、冲突和跨进程边界见 [undo.md](undo.md)。
+TUI `/undo` uses independent local snapshots for edit/write effects. Main logs retain conversation and append `source:"undo"` user intent/results; bodies reach later requests, source metadata does not. Resume rebuilds messages, not undo stacks. Storage/conflicts/process boundaries: [undo.md](undo.md).
 
-## 恢复会话
+## Resuming Sessions
 
-恢复：`nib -c` / `nib --continue` 继续当前目录最近的根会话（跳过子会话）；`nib --resume <32位小写十六进制ID>` 指定会话；`ask` 也支持这些选项，放在 prompt 前后均可。
+Resume current-directory latest root Session (skip children) with nib -c / --continue, or nib --resume <32-character-lowercase-hex-ID>. ask supports options before/after prompt.
 
-新会话按基础指令、全局 `$NIB_HOME/AGENTS.md`（默认 `~/.nib/AGENTS.md`）、项目 `AGENTS.md` 的顺序拼接 system，后者优先。项目目录是从 cwd 向上遇到的第一个 `.git` 标记所在目录；没有则用 cwd。只读取 `AGENTS.md`。恢复会话沿用日志中的原始 system，之后修改指令文件只影响新会话。
+New systems concatenate base instructions, global `$NIB_HOME/AGENTS.md` (default `~/.nib/AGENTS.md`), project `AGENTS.md`, later taking precedence. Project root: first cwd ancestor with .git, otherwise cwd. Read only AGENTS.md. Resume keeps original logged system; changes affect new Sessions only.
 
-Codex custom Run 在 `tool_calls` 中记录 `type:"custom"`，`function.arguments` 仍是 JSON `{code}`，其中 code 是完整原始 JS（含可选 effort 首行）；旧记录缺省为 function。恢复和 replay 不需要迁移日志。Responses 原始 output、调用与结果的协议类型以及参数进度的字节口径见 [Codex custom Run](codex.md#custom-run-工具)。
+Codex custom `tool_calls` carry `type:"custom"`; `function.arguments` remains JSON {code}, complete raw JS including optional effort line. Old entries default function. Resume/replay require no migration. Raw Responses outputs/types/argument-byte definitions: [custom Run](codex.md#custom-run-tool).
 
-## 工具录制与离线重放
+## Tool recording and offline replay
 
-主日志 `$NIB_HOME/sessions/<session_id>.jsonl` 保存模型消息和 Step；独立的 `<session_id>.calls.jsonl` 保存 Run 内工具的实际返回值与拒绝信息，权限为 `0600`。旁路录制默认开启，可关闭；主日志格式与恢复不依赖它。`nib replay` 只在新沙箱内重跑已保存的 JavaScript，以录制结果替代真实工具，不请求模型、不执行 bash 或文件写入。
+Main `$NIB_HOME/sessions/<session_id>.jsonl` stores messages/Steps; independent `<session_id>.calls.jsonl` stores actual returns/rejections, mode 0600. Sidecars default on, disableable, independent of main format/resume. nib replay executes saved JS in fresh sandboxes with recorded tools, no models/bash/file writes.
 
-重放定位的 `step` 是**整个会话中 assistant Step 的 1-based 序号**（包括无 Run 的最终回答，不随 Turn 重置），`run` 是该 assistant 消息中 `tool_calls` 的 **0-based 数组索引**；它们不是 `turn_step` 或 Run 内工具调用的 `index`。格式、命令、截断/去重和无法判定的情况见 [replay.md](replay.md)。
+Replay step is **1-based assistant Step ordinal over the Session**, including final answers, never resetting per Turn; run is **0-based `tool_calls` index**. Not `turn_step` or internal tool index. Commands/format/truncation/dedup/undetermined cases: [replay.md](replay.md).
 
-旁路文件可能含主日志未展示的完整文件内容、命令输出与秘密，不发送给 provider，也不作为 `/reflect` 的输入。反思提示只允许读指定主日志，不枚举 sessions 目录或读取旁路/兄弟/子会话日志；这是提示词约束，不是独立的文件访问控制。分享日志时分别检查两个文件，不因主日志已经脱敏就分享旁路文件。
+Sidecars may contain undisplayed full files/output/secrets, not sent to providers/reflection. Reflection only reads specified main logs, without sessions enumeration or sidecar/sibling/child reads: prompt constraint, not separate access control. Inspect both before sharing; main redaction does not cover sidecars.
 
-## 实验标签（header）
+## Experiment tags (header)
 
-日志首行是 header，根会话与子会话在新建时记录以下可选字段；旧日志缺失时仍可恢复。标签只用于记录和统计，不发送给 provider，也不改变执行、系统提示或工具说明。恢复会话保留原 header，不用当前构建或环境重算、回填或改写。
+First-line headers optionally tag new roots/children; old logs still resume. Recording/stats only, not provider input or changes to execution/system/tools. Resume preserves originals without recomputing/backfilling/rewriting from current builds/environment.
 
-| 字段 | 含义 |
+| Field | Meaning |
 | --- | --- |
-| `nib_version` | `build.zig.zon` 版本号加构建时注入的 git 短提交号，如 `0.1.0+abc1234`；无法取得提交号时仅版本号。 |
-| `system_sha` | `system_template` 实际渲染结果（含 cwd、工具说明、生效补丁和显式配置的 Step 上限，不含全局/项目 AGENTS.md）的 SHA-256 前 12 位小写十六进制。因此 cwd、工具可用性或补丁变化也可能改变它，不只是模板文字修改。 |
-| `patches_off` | `NIB_PATCHES_OFF` 实际禁用的已注册补丁 id，去重并排序；未知 id 忽略，`all` 展开为全部已注册 id。没有禁用项时省略字段。 |
+| `nib_version` | `build.zig.zon` version plus injected short git hash, e.g. `0.1.0+abc1234`; version alone if hash unavailable |
+| `system_sha` | First 12 lowercase SHA-256 hex characters of rendered `system_template`, including cwd/tools/patches/explicit Step caps, excluding global/project `AGENTS.md`; cwd/tool availability/patches can change it, not just wording |
+| `patches_off` | Actually disabled registered `NIB_PATCHES_OFF` ids, deduplicated/sorted; ignore unknowns, expand all; omit when none |
 
-## 提交与中断
+## Commits and interruptions
 
-会话日志位于 `$NIB_HOME/sessions/<ID>.jsonl`（默认 `~/.nib/sessions/`）。新写入的每条日志记录带 `at`（Unix 毫秒，追加时的墙上时钟时间），恢复兼容无时间戳的旧记录；`scripts/stats.py --since` 按记录时间筛选，无效或缺失 `at` 回退文件修改时间并报告数量。通常只在完整 Step 后提交；后台结果消息及其生命周期记录在下一次 Step 请求前独立提交；Step 上限耗尽时只等待普通后台任务并独立提交其结果，然后结束 Turn，不再请求模型；detached 结果保留到之后的 Step/Turn。Codex 请求最终失败时另追加 `diagnostic: {error_name, message, attempts, step}` 诊断记录（message 保留服务端 code/reason），不提交用户消息或失败输出，不改变模型历史和 context_tokens，恢复时跳过；`scripts/stats.py` 将其计入 `errors.provider_failure`，不算 Step/token。取消（TUI 的 Esc、ask 收到 SIGTERM/SIGINT）时额外提交本轮用户消息和已流出的文本，TUI Esc / ask SIGINT 在末尾标记 `[interrupted by user]`，ask SIGTERM 标记 `[interrupted: process terminated]`，未完成的工具调用丢弃；恢复不重执行已提交的 Run；未完成 Step 可能已产生外部副作用，日志不回滚这些变化。
+Logs: `$NIB_HOME/sessions/<ID>.jsonl`, default ~/.nib/sessions/. Every new record has append-time wall-clock Unix-ms at; old missing timestamps remain compatible. stats --since uses at, falling back to mtime for missing/invalid values with counts. Normally commit complete Steps; background results/lifecycles commit separately before next requests. Step-cap cleanup awaits ordinary tasks, independently commits results, ends without requests; detached results wait later Steps/Turns. Final Codex failures append diagnostic: {error_name, message, attempts, step}, preserving server code/reason, without committing input/failed output or changing history/context_tokens. Resume skips; stats `errors.provider_failure` adds no Steps/tokens. Cancellation (Esc/SIGTERM/SIGINT) additionally commits Turn input/streamed text, ending Esc/SIGINT with [interrupted by user], SIGTERM `[interrupted: process terminated]`, discarding unfinished tool calls. Resume never reruns committed Runs; unfinished Steps may already have external effects, never rolled back.
 
-模型请求的两条线路共用 `src/provider/cancel.zig` 的 `std.Io.Select` 取消封装：请求任务实时写入 sink，另一个任务每 20 ms 检查 cancel 标志；取消时中断连接、发送或读取中的阻塞 I/O，并等待请求任务清理后返回 `error.Canceled`，无需等下一块数据。TUI Esc 与 ask SIGINT/SIGTERM 均走此路径，不设读超时，不改变重试策略；已流出的文本继续由原有 `commitInterrupted` 提交。
+Both transports share `src/provider/cancel.zig` `std.Io.Select`: request task writes live sink, another checks cancel every 20 ms. Cancellation interrupts blocked connect/send/read I/O and joins cleanup before `error.Canceled`, without next-data waits. TUI Esc/ask signals share this, no read timeout/retry changes; commitInterrupted retains streamed text.
 
-## 后台任务结果
+## Background task results
 
-`tools.agent({prompt, background: true})` 与 `tools.bash({command, background: true})` 启动前同步追加独立的 `background: {id, kind: "agent"|"bash"|"run", state: "started"}` 记录；结果消息插入后追加 `state: "finished", ok` 记录，恢复发现未完成任务时追加 `state: "lost"`。agent 和 bash 分别使用会话级计数器：`a1、a2…` 与 `b1、b2…`，前台与后台共用各自类型的计数器。恢复扫描所有后台 `started/finished/lost` 记录、`bash` 事件和 `calls[].id`，按前缀分别取最大值继续分配；旧的共用计数日志也按此规则恢复，不补空号。这些记录带 `at` 和 `turn_step`，不改变历史或 context_tokens。结果在下次主模型请求前单独提交为一条 user 消息：`source: "background"`、`background_kind`、`background_id`、`background_ok`；可选的 `background_ok` 记录任务是否成功，供 TUI 在正文 JSON 截断后正确回放。agent 正文为 `[background agent a1 finished]\n` 后接截断后的 `{ok,id,text,changes,error?}` JSON，不含 usage；bash 正文结果为 `{exit_code,output}`、`{superseded_by}` 或 `{error}`，无 `ok` 字段。恢复时未完成任务不会重启，插入 `[background agent a1 lost: process ended]` 或对应的 bash 消息。来源字段只保存在日志中，不发送给 provider；正文会发送给模型。后台消息不发起新 Turn。旧 `background_agent` 日志仍可统计。
+Before agent/bash background start, synchronously append independent background: {id, kind: "agent"|"bash"|"run", state: "started"}. After result insertion append finished/ok; unfinished resume appends lost. Separate Session a1,a2…/b1,b2… counters share foreground/background per type. Resume scans lifecycles/bash/calls[].id and continues each prefix maximum, including old shared-counter logs without filling gaps. Records carry at/turn_step, changing no history/context_tokens. Results separately commit user source: "background", background_kind/id/ok before main requests. Optional `background_ok` lets TUI restore status despite truncated body JSON. Agent body [background agent a1 finished] newline plus truncated {ok,id,text,changes,error?}, no usage. Bash body `{exit_code,output}`, `{superseded_by}`, or {error}, no ok. Unfinished resume never restarts, inserting lost process-ended messages. Source metadata stays local; bodies reach models. No new Turns. Legacy `background_agent` remains countable.
 
-子 agent 首次报告 start 后，父日志同步追加独立的 `agent_session: {id: "a1", session: "内部子会话 ID"}` 映射记录；它不修改对话历史、context_tokens 或 Step 数，也不发送给模型。接续沿用任务 id，映射在压缩、失败和取消后保留；恢复父会话时重建映射，并将映射中的任务 id 纳入计数器高水位。工具仅接受任务 id，内部通过 `nib ask --resume` 接续原子会话。同 id 的各次后台调用按启动顺序配对；恢复时先补齐已提交结果缺失的终态记录，再为真正未完成的调用生成 lost，旧结果不清除新调用的恢复状态。
+After first child start, parent synchronously logs agent_session:{id:"a1",session:"internal-child-ID"}, outside history/context/Step counts/model input. Continuation keeps ids/mappings through compaction/failure/cancel; resume reconstructs mappings/high-water ids. Models use tasks only, internally nib ask --resume. Same-id background invocations pair in start order. Resume repairs terminal records for committed results before marking truly unfinished calls lost; old results never clear newer recovery state.
 
-显式配置 Step 上限时，已执行 Run 的 `run_results[].remaining_steps` 记录该 Step 完成后剩余的步数（同一 Step 的多个 Run 共用此值）。无上限时省略；replay 使用此元数据恢复预算外的剩余步数提示，不读取当前配置，也不从输出正文反推。
+Explicit Step caps record `run_results[].remaining_steps` after Step completion, shared across same-Step Runs, omitted unlimited. Replay restores unbudgeted hints from metadata, not current settings/output inference.
 
-## Step 计时字段
+## Step timing fields
 
-完整 Step 的可选计时字段（旧日志缺失时正常恢复）：`model_ms` 是模型请求总耗时，包含重试和退避，`attempts` 是实际尝试数；`first_data_ms` 是 provider.Sink.onData 首次收到任何传输数据（含心跳、元数据）相对 Step 开始的时间，不代表首个模型内容 token。`code` 每个 run 一条 `{tool_call_id, first_ms, last_ms, progress}`，首尾时间相对 Step 开始，`progress` 是 `[ms, 累计参数 UTF-8 字节数]` 数组；接收时按到达顺序写入每调用最多 1024 点的固定缓冲，超出后按 stride 跳采，finish 时一次均匀抽样成最多 32 点并保留首尾；Codex 按 output_index、Chat Completions 按工具 index 跟踪，最终一次性参数如实记录 `first_ms == last_ms`，不推断未收到的片段。重试只保留成功请求的 code，first_data_ms 保留所有尝试中最早 onData 时间。`run_ms` 为此 Step 各 Run 从 sandbox 开始到 `session/output.zig` 格式化完成的总耗时，`run_results[].run_ms` 为单次耗时；未进入 sandbox 的调用无单次 run_ms。`calls` 最多保留 200 个宿主工具调用 `{name, start_ms, end_ms, ok, run_index}`，时间相对各自 Run 开始，run_index 是 run_results 的零起始下标，超出条数记 `calls_omitted`；ok 表示工具返回成功/错误，不等同于 bash 命令退出码。子 agent 只计父进程侧的调用，不追加参数或结果正文。`calls[]` 的可选 `id` 保存已分配的会话级任务编号：前台 agent 启动即分配，所有 bash 启动时分配，短 bash 同样含此字段；恢复依靠这些 id 避免前台编号回退。完整 Step、压缩及中断提交另保存可选 `task_ids: {agent, bash, run}`，数值为各类型已分配编号的高水位；恢复同时取其最大值，避免任务超过 `calls[]` 的 200 条明细上限时丢失续号信息。旧日志可省略。后台 agent/bash 的启动调用另带 `background: true` 和 `id`；该调用计时仅到启动返回，不表示后台任务执行耗时。所有计时使用单调 awake 时钟、毫秒单位；固定容量缓冲复用现有调度/完成路径，不新增锁或逐片段分配，不预取或推测执行。
+Optional complete-Step timings support old logs. `model_ms` includes retries/backoff; attempts counts actual attempts. `first_data_ms` is first Sink.onData transport activity (heartbeat/metadata included) relative to Step start, not first content token. code entries {tool_call_id, first_ms, last_ms, progress} use Step-relative times and [ms,cumulative argument UTF-8 bytes]. Arrival-order fixed buffers cap at 1024/call, stride-sample overflow, then uniformly reduce at finish to ≤32 retaining endpoints. Track Codex output_index/Chat tool index; one-shot arguments faithfully first_ms == last_ms, no inferred fragments. Retries retain successful code only, earliest onData across attempts. `run_ms` sums sandbox-start→output-format durations; `run_results[].run_ms` per Run, absent before sandbox. calls retains ≤200 {name, start_ms, end_ms, ok, run_index}, Run-relative times, zero-based run_results index; overflow calls_omitted. ok means tool return/error, not bash exit. Children count parent calls only, no args/results. Optional calls.id stores task ids allocated on foreground agent/all bash startup, including short bash, preventing numbering rollback. Complete/compaction/interruption commits optionally store task_ids: {agent, bash, run} high-water marks, preserving numbering beyond 200 details; old logs may omit. Background calls add background: true/id and timing only until startup returns, not full execution. All timings use monotonic awake ms; fixed buffers reuse scheduling/completion without new locks/per-fragment allocations/prefetch/speculation.
 
-## 工具字节度量
+## Tool byte measurements
 
-完整 Step 顶层另有可选 `tool_bytes`、`output_bytes`：`tool_bytes` 为该 Step 各 Run 的同名字段之和，`output_bytes` 为各 Run 的同名字段之和加上首次计入该完整 Step 的后台结果消息正文字节数；`run_results[]` 保存每个 Run 的可选 `tool_bytes`、`output_bytes`，不含后台结果消息。它们与现有 Step 顶层计时字段并列，不嵌套到 `timing` 对象。旧日志缺失字段仍可恢复，不把缺失当作零。
+Optional Step-level `tool_bytes` sums Run bytes; `output_bytes` sums Runs plus first-accounted background-result bodies in that complete Step. `run_results[]` optional bytes exclude background messages. Fields are top-level beside timings, not nested timing. Missing old fields stay missing, not zero.
 
-- `sandbox.Outcome.tool_bytes` 在宿主工具结果交给 JS 时累计：成功按序列化 JSON 的 UTF-8 字节数，错误按错误文本的 UTF-8 字节数计量。无论 JS 是否使用或 await 结果都计入；未产生交回 JS 的结果计 0。`agent` 只计父 Run 收到的返回对象，不累加子会话内部工具数据。
-- Run 的 `output_bytes` 是 `session/output.format` 格式化后交给模型的 tool result 实际 UTF-8 字节数，包含配置展示预算内的截断标记、错误、`no output`、条目标签和分隔符等。harness 拒绝执行的 Run 也记录其返回文本的 `output_bytes`，`tool_bytes` 为 0。
-- 后台 agent/bash 启动时交回 JS 的 `{id}` 按普通工具结果计量；之后插入的结果消息不经过 Run，仅计入接收它的完整 Step 的 `output_bytes`，不增加 `tool_bytes` 或 `run_results[]` 的字节数。按实际消息正文的 UTF-8 字节数计量，包含 `[background ...]` 前缀、换行、截断后的 JSON 和截断标记；恢复后的 lost 消息同样计入。每条结果只在首次接收它的完整 Step 计量一次；上限收尾已提交但尚无接收 Step、或接收请求失败/取消的结果，将字节结转到下一完整 Step。恢复时从追加的后台消息和完整 Step 记录重建未计量字节，不因退出丢失，后续请求重带历史不重复计量，用户插话不计入。独立的消息提交和生命周期记录不写字节字段，避免与完整 Step 重复累计。若接收消息的 Step 失败或取消而未完整提交，其后台字节也不计入账单和 Step 统计；已提交的后台消息仍可恢复。
-- `calls[]` 的 `dispatched` 默认为 true；入队前被限额拒绝的调用记录为 false，仍计入错误文本字节，但不增加原有的 llm/agent 实际调度次数。
-- `calls[]` 新增可选 `result_bytes`，口径与单次宿主调用贡献的 `tool_bytes` 相同。旧明细可为 null 或省略；新记录中取消时尚未结算的调用为 0。超过 200 条的明细仍按 `calls_omitted` 省略，不影响 Run/Step 的字节总数。
+- `sandbox.Outcome.tool_bytes` accumulates delivered host results as UTF-8 serialized JSON or error text, regardless of usage/await; undelivered zero. Agents count parent objects only, not internal child data.
+- Run `output_bytes` counts actual formatted model tool-result UTF-8 including budgeted markers/errors/no output/labels/separators. Harness-rejected Runs record returned output bytes, zero tool bytes.
+- Startup {id} counts ordinary results; later agent/bash messages bypass Runs, adding only receiving complete-Step `output_bytes`, not tool/run-results bytes. Count actual body including background prefixes/newlines/truncated JSON/markers; resumed lost messages too. Count once on first complete receiver. Results committed during cap cleanup without receivers, or failed/canceled receiver requests, carry to next complete Step. Resume reconstructs pending bytes from append messages/complete Steps; no loss on exit, history retransmission recount, or interjections. Separate message/lifecycle commits omit byte fields. Failed/canceled incomplete receivers add no invoice/Step bytes; committed messages still restore.
+- calls.dispatched defaults true; prequeue quota rejection false, still error-text bytes, excluding llm/agent actual-dispatch counts.
+- Optional calls[].result_bytes matches each host contribution to tool_bytes. Old null/absent accepted; new unsettled canceled calls zero. Omitted >200 details do not change Run/Step totals.
 
-## Turn 账单
+## Turn invoice
 
-TUI 在每个 Turn 的内容后追加一行淡色账单，例如：
+TUI appends muted invoice after each Turn, e.g.:
 
 ```text
 12 steps · 3m10s · think 1m40 · tools 1m20 · 3.2M→18k B · 45k tok (91% cached) · llm ×8 · agent ×1
 ```
 
-宽度不足时从右向左移除整个字段，不换行；llm/agent 次数为 0 时不显示。失败或取消时开头为 `failed` 或 `canceled`，Step 数、think/tools 和调用次数只计已提交的完整 Step。总耗时是整个 Turn 的单调墙钟时间，不是 Step 耗时之和；think/tools 分别复用 Step 的 `model_ms`/`run_ms`。token 数使用完成 Step 后的本轮累计 usage（prompt + completion，包含截至该点已报告的压缩和委派用量），缓存率为 prompt_cache_hit_tokens / prompt_tokens。取消或失败的未完成 Step 不纳入账单，但墙钟仍包含其等待时间。
+Drop whole fields right-to-left without wrapping; hide zero llm/agent counts. Failures/cancel begin failed/canceled; Steps/think/tools/calls count committed complete Steps only. Total monotonic wall time includes whole Turn, not sum of Steps; think/tools reuse model_ms/run_ms. Tokens use Turn cumulative usage after complete Steps, prompt+completion including reported compaction/delegation; cache rate cache-hit/prompt. Unfinished failures/cancel excluded except wall waits.
 
-`TurnSummary.timing` 的 `tool_bytes`、`output_bytes` 为本轮已提交完整 Step 的同名字段之和，0 也保留键；失败和取消仍沿用上述完整 Step 口径。`output_bytes` 包含上述新插入的后台消息，旧日志中该字段可能仅包含 Run 输出。TUI 在 tools 后显示 `3.2M→18k B`（tool_bytes → output_bytes），`B` 表示字节，`k`/`M` 为十进制缩写；两项字节数都为 0 时省略此字段，只有后台消息输出时仍显示。
+`TurnSummary.timing` tool_bytes/output_bytes sum complete-Step fields, retaining zero keys even on failure/cancel. output includes new backgrounds; old logs may include Run output only. TUI shows `3.2M→18k B` after tools (tool→output), decimal k/M. Omit only if both zero, retain background-only output.
 
-Session 累计这些数据并通过 `turn_end` 按值传给 TUI，TUI 不跨线程读取统计；账单只是界面条目，不写入模型历史，恢复旧会话时不重建。`ask --json` 的 `end/error.timing` 与账单计时相同，详见 [ask-json.md](ask-json.md)。
+Session passes values through `turn_end`; TUI never reads cross-thread stats. Invoices are UI-only, outside model history, not rebuilt on resume. ask `end/error.timing` matches; [ask-json.md](ask-json.md).
 
-## Run 标题工具统计
+## Run title tool counts
 
-TUI 始终保留 Run 父标题，运行时只显示已知任务状态，结束后使用 Session 的 `run_end.tool_summary: {counts: [{name, count}], omitted, files: [{tool,path}]}`，只统计实际宿主调用（排除 `dispatched=false` 的准入拒绝，包含已派发但执行失败的调用），按首次调用顺序显示。Step 的 `calls[]` 最多保留 200 条，省略部分显示为 `+N`，不猜测工具名称。
+TUI keeps parent titles, active known states, then run_end.tool_summary: {counts: [{name, count}], omitted, files: [{tool,path}]} from Session. Actual dispatched calls only, excluding false admissions but including execution failure, first-call order. calls cap 200; overflow shows +N without guessed tool names.
 
-恢复时，主日志 `calls[].run_index` 对应同一 assistant 消息的 `tool_calls` 数组索引，再按 `tool_call_id` 关联结果。新的 `run_results[].calls_omitted` 保存各 Run 的省略次数；只有 Step 级 `calls_omitted` 的过渡日志，单 Run 时可直接归属；多 Run 时不猜测归属，以独立的 `tools +N · omitted calls (Run unknown)` 条目显示，assistant 消息的可选 `step_calls_omitted` 元数据保留这部分计数。无 `calls` 的旧日志只显示 Run，不从脚本文本推测调用。`calls[].path` 可记录 read/grep/glob 实际派发参数中的路径，省略的 grep/glob 根路径为 `.`；`tool_summary.files` 按 `{tool,path}` 去重。旧日志可缺省这些字段。tool 结果消息的可选 `tool_summary` 是界面元数据，用于压缩重写后保留统计，不发送给 provider。
+Resume maps calls[].run_index to assistant `tool_calls` indices then results by tool_call_id. New run_results[].calls_omitted tracks each Run. Transitional Step-only omitted counts assign directly for single Runs; multiple Runs show tools +N · omitted calls (Run unknown), preserved in assistant step_calls_omitted. Old logs without calls show Run only, no source inference. calls[].path may store actual read/grep/glob paths, omitted roots default .; tool_summary.files deduplicates {tool,path}, old optional. Optional tool-message `tool_summary` preserves UI stats across compaction, never provider input.
 
-## Step effort 字段
+## Step effort fields
 
-完整 Step 还记录可选 `effort`、`effort_source` 和 `effort_downgraded`。`effort` 是实际请求档位，未指定服务端档位为 `default`；`effort_source` 为 `model|default|guard`，分别表示模型声明生效、用户默认（含 Run 显式 default）、护栏回退。`effort_downgraded` 仅在模型声明实际低于用户有效档位时为 true；服务端 default 下接受的 low 也按降档声明计。等档声明来源可为 model，但不算降档。重试沿用同一档位，压缩不产生 Step effort 记录。旧日志缺字段仍可恢复。
+Complete Steps optionally log effort/effort_source/effort_downgraded. effort is actual request level or server default; source model|default|guard means applied model declaration, user default including explicit Run default, or guard fallback. downgraded true only below effective user level; accepted low under unknown server default counts too. Equal declarations may source model but not downgraded. Retries keep effort, compaction creates no Step effort. Old logs remain resumable.
 
-assistant 消息的可选 `step_effort: {effort, source}` 保存界面元数据，让压缩重写后保留的历史 Run 仍显示原来的请求档位；日志恢复以完整 Step 顶层 effort 字段为准。这些元数据不发送给 provider，不影响恢复后的调度；每个新 Turn 首步仍用本次用户设置。调度护栏见 [config.md](config.md#逐-step-effort-调度)。
+Assistant step_effort: {effort, source} is UI metadata preserving retained Run levels across compaction; complete-Step top-level fields govern resume. Never send to providers or affect resumed scheduling; first new-Turn Steps use current user settings. [Guardrails](config.md#per-step-effort-scheduling).
 
-## 会话统计
+## Session statistics
 
-会话统计：`python3 scripts/stats.py [日志文件或目录] [--since YYYY-MM-DD] [--cwd 目录] [--group-by version|system|patches|transport|incremental|full_reason] [--json]`，默认只读 `$NIB_HOME/sessions`（默认 `~/.nib/sessions`），用于发现故障和比较改动前后效果。文本和 JSON 均包含“耗时构成”：Step/model/run 的中位数与 p90、首段代码前等待和参数生成跨度、运行时各工具调用次数/总耗时/中位耗时，以及参数到达跨度严格大于 50 ms 的 run 比例；每项列出有效样本数，旧日志缺字段不补零。bash 耗时 Top 10（JSON `timing.bash.top10`）按 shell 命令中的 `&&`、`||`、`;`、`|` 和换行拆段，不拆引号和 heredoc 正文；将每段前两个 shell 单词按顺序用 ` → ` 连接，例如 `zig fmt x && zig build test` 归为 `zig fmt → zig build`，单段保持原分组。标签仍是启发式，耗时为整个 bash 调用，不推算各段耗时或实际走过的分支。优先取同目录 `<id>.calls.jsonl` 中实际的 `args.command`，按会话 Step、Run 及 bash 调用顺序关联（录制以创建顺序 index 排序，不用结算顺序 seq；多 bash 须数量一致且无未调度项），无法可靠关联时回退旧的静态 JS 字面量启发式。`timing.bash.sources.recorded` / `static` 分别是成功分组的两种来源条数，二者之和为 `matched_calls`；无法关联或无法分组的计时调用列为 `unmatched_calls`。录制不改变静态工具/命令计数或“写→仅验证”等静态往返结构指标；下文的“机械收尾”指标单独优先使用完整录制。
+python3 `scripts/stats.py` [log-file-or-directory] [--since YYYY-MM-DD] [--cwd directory] [`--group-by version|system|patches|transport|incremental|full_reason`] [--json] reads `$NIB_HOME/sessions` (default `~/.nib/sessions`) by default for failures/before-after comparisons. Text/JSON time breakdowns include Step/model/Run median/p90, first-code wait/argument span, runtime tool counts/totals/medians, and fraction of spans >50 ms, each with samples/no old-field zero-fill. Top 10 bash timings (`timing.bash.top10`) split shell &&/||/;/|/newlines outside quotes/heredoc, joins each segment’s first two words with →, e.g. zig fmt x && zig build test → zig fmt → zig build; single segments unchanged. Heuristic labels, whole-call times, no per-segment/branch inference. Prefer actual `args.command` in same-directory `<id>.calls.jsonl`, joining Session Step/Run/bash creation index (not seq; multiple bash require matching counts/no undispatched calls), otherwise static JS literals. timing.bash.sources.recorded/static count successfully grouped sources, sum `matched_calls`; unreliable/ungroupable timings unmatched_calls. Recordings do not change static counts/write→validation metrics; mechanical follow-ups below separately prefer complete recordings.
 
-“子会话已记录成本”（JSON `child_costs`）以每个带 `parent_session_id` 的入选子日志为一个样本，含前台与后台。`steps`、`model_ms`、`prompt_tokens`、`uncached_prompt_tokens` 分别统计每子会话完整 Step 数、累计模型时间（毫秒）、累计输入 token（含缓存）、累计未缓存输入 token 的中位数、p90 和样本数。未缓存量逐 Step 用 `prompt_tokens - prompt_cache_hit_tokens` 计算后累加，要求两字段均为非负整数且 cache 不大于 prompt；缺字段不补零，也不由两个分位数相减。`full_range_sessions` 要求非零完整 Step 且所有完整 Step 都入选；`--since` 截断的日志列入 `partial_range_sessions`，无完整 Step 的日志列入 `no_step_sessions`，两者不进入分布。计时与 token 各自要求该子会话所有完整 Step 对应字段有效，缺失或无效不补零，因此各指标 samples 可不同。只累计子日志自身 Step 字段，不叠加父会话 usage 或工具结果 usage；缓存输入已包含在 prompt 中。失败、取消或仍运行的子日志也可能入选，这些是已提交成本的下界，不代表成功任务或完整端到端耗时，更不是费用估算。
+`child_costs` samples each selected foreground/background child log with parent_session_id. steps/model_ms/prompt_tokens/uncached_prompt_tokens distribute complete-Step counts, cumulative model ms, cached-inclusive input, uncached input with median/p90/samples. Uncached sums per-Step prompt-cache, requiring nonnegative integer fields/cache≤prompt; no missing zeros or quantile subtraction. `full_range_sessions` requires nonzero Steps/all selected; `partial_range_sessions` filtered fragments and `no_step_sessions` enter no distributions. Timing/tokens independently require all corresponding fields valid, so sample counts differ. Only child-Step fields, not parent/tool-result usage; prompt already includes cache. Failed/canceled/running samples are committed-cost lower bounds, not successful/end-to-end cost or fee estimates.
 
-`child_costs.by_parent_system` 通过 `parent_session_id` 查找本次输入日志中的父 header，按其 `system_sha` 分组。比较工具说明修改前后时传入含父、子日志的目录，查看此字段；只传子日志或父标签缺失/无效时归 `unknown`，不猜测或回退到子 `system_sha`。子会话隐藏 agent 工具，自身哈希不一定随 agent 说明改变。父 header 的查找不受记录日期或 cwd 筛选影响，仅用于标签关联；成本仍只来自入选子日志。现有 `--group-by system` 仍按各日志自己的哈希分组，和这里的父哈希分组不同。恢复会话保留原 header 和 system，仍归原实验组。
+child_costs.by_parent_system joins `parent_session_id` to input parent header system_sha. Supply parents+children when comparing descriptions; absent/invalid parent labels mean unknown without child fallback/guessing. Child hidden-agent hashes may not track description changes. Parent-header lookup ignores date/cwd filters for labeling only; costs stay selected children. `--group-by system` still uses each log’s own hash, distinct from parents. Resume retains original headers/systems/groups.
 
-“工具数据度量”（JSON `tool_data`）独立累计 Step 顶层 `tool_bytes`、`output_bytes` 的有效样本数和总字节，不与 Run/calls 相加，也不从其他层回填。`output_tool_ratio` 按 `run_results[]` 中两字段有效且 `tool_bytes>0` 的 Run，统计各自 `output_bytes/tool_bytes` 的中位数、p90（nearest-rank）和样本数，不是总量之比，比例可大于 1。工具占比按有效 `calls[].result_bytes` 的总和为分母，按 name 汇总字节和调用数；明细被省略时覆盖有限，不代表全部工具数据。旧日志缺失字段跳过，不补零；明细总字节为零时占比为 n/a。
+`tool_data` independently sums valid Step tool_bytes/output_bytes samples/totals, never adding Run/calls or backfilling. `output_tool_ratio` distributes per-Run output/tool for valid fields/tool>0, median/nearest-rank p90/samples, not total ratio; may exceed 1. Tool shares use valid calls[].result_bytes total, grouped name/count; omitted details limit coverage. Skip old missing values without zeros; zero detail bytes means n/a.
 
-`--group-by version|system|patches` 分别按 header 的 `nib_version`、`system_sha`、`patches_off` 分组，总体报告保留，每组分别输出核心报告；JSON 使用 `group_by` 和 `groups`。缺失标签的旧日志归 `unknown`；新版 header 有版本或系统哈希但省略 `patches_off` 时归 `none`，补丁列表按排序后的集合分组。`transport` 则按完整 Step 实际线路分组，见下文。
+`--group-by version|system|patches` uses header nib_version/system_sha/patches_off, retaining overall/core reports per group via group_by/groups JSON. Missing old tags unknown; newer version/hash headers omitting patches mean none; lists group as sorted sets. transport uses actual complete-Step transports below.
 
-完整 Step 新增可选 `turn_step`（Turn 内从 1 开始的 Step 序号），只用于识别日志中的 Turn 边界，运行中插话不会另起 Turn；恢复后新 Turn 从 1 开始。旧日志缺少该字段时仍按 user 消息估算边界（排除后台结果消息），可能把插话算成新 Turn。
+Optional complete-Step `turn_step` is 1-based within Turn; interjections do not start Turns, new resumed Turns reset 1. Old logs estimate user-message boundaries excluding backgrounds and may overcount interjections as Turns.
 
-JSON `agents` 和 `bash_calls` 分别统计 agent、bash 的前台/后台调用及 `background_steps` 分布。前台数取有效 `calls[]`；agent 只计根会话，bash 也计子会话；`dispatched=false` 不计；后台数优先取独立 `background.started` 记录，旧日志回退 `calls[]` 的 `background: true` 和 `id`。`background_steps` 按 id 关联 started、finished/lost 和 `source=background` 的结果消息；旧日志兼容 `background_agent`。统计启动 Step 之后、消息插入之前已完成的主模型 Step 数（中位数、p90、样本数），排除启动 Step 和使用结果的请求。多个后台任务各自计样本；只统计同一会话、范围全入选且未中断的完整配对，过滤缺口与不完整配对不补零。
+agents/bash_calls report foreground/background counts and background_steps. Valid calls drive foreground; agents roots only, bash includes children; exclude dispatched=false. Background counts prefer independent started, old fallback background: true/id calls. Join ids to finished/lost/source=background results, supporting old background_agent. Count complete main Steps after starting Step/before result insertion, excluding start/consuming requests; median/p90/samples per task. Require same Session, full selected/uninterrupted pairs, no zero-fill across gaps/incomplete pairs.
 
-“往返结构”（JSON `round_trips`）包含每 Turn 入选 Step 数的中位数/p90（nearest-rank、含零步 Turn），写→仅验证相邻对次数/全部相邻对，以及连续写的不同文件对次数/有效连续写对；每项给出样本数。相邻对限同一 Turn，不跨过滤或取消断点；验证沿用 bash 首词/子命令启发式（build/test/fmt/check，以及 git status/diff/log/fetch/show、gh pr view/checks、tail/cat/ls/head/pwd 等状态命令），多 Run/调用必须全部是可识别验证 bash，动态或复合 shell 保守跳过。写路径只取直接 edit/write 的完整字面量，按 cwd 规范化；两步文件集合不相交才计“不同文件”，缺失/动态路径跳过，不推断 bash 的文件副作用。
+`round_trips` distributes selected Steps/Turn (nearest-rank median/p90, zero-Step included), write→validation adjacent pairs/all pairs, disjoint consecutive writes/valid write pairs, all with samples. Same-Turn only, no filters/cancel gaps. Validation heuristics use bash first words/subcommands: build/test/fmt/check, git status/diff/log/fetch/show, gh pr view/checks, tail/cat/ls/head/pwd. All Runs/calls must be recognized validation bash; skip dynamic/compound shell conservatively. Writes require complete direct edit/write literal paths normalized by cwd; disjoint sets mean different files, missing/dynamic skipped, no bash-effect inference.
 
-成功后的机械收尾 Step（mechanical follow-ups）在 `round_trips.mechanical_followups`：样本为同 Turn 相邻两个完整入选 Step，后步 `turn_step > 1`（旧日志按 Turn 内序号估算），前步至少一个 Run 且所有 Run 显式 `ok=true`；未知状态不当成功，不跨取消、过滤、压缩替换或显式 Step 序号缺口。后步至少调用一个工具，且只调用 bash/read，每条 bash 都通过同一个验证/状态分类器才命中。此启发式不推断 shell 副作用；git fetch 按状态检查计，git merge 不计；复合 shell、重定向与展开保守不计。
+`round_trips.mechanical_followups` candidates are adjacent complete selected same-Turn Steps, later `turn_step > 1` (estimated order in old logs), earlier ≥1 Run/all explicitly `ok=true`; unknown is not success. No cancellation/filter/compaction/explicit-sequence gaps. Hits later call ≥1 tool, only bash/read, all bash passing shared validation/status classifier. No effect inference; git fetch counts status, merge not; compound shell/redirects/expansions conservatively skipped.
 
-`count/samples/ratio` 是命中数/候选 Step 数/比例；`ms/sample_ms/time_ratio` 是有计时的命中后步时长/候选后步时长/比例，`timed_count/timed_samples` 给出计时覆盖，缺计时不补零、零总时长的比例为 null。不是全体 Step 的占比，也不是 model_ms 的占比。`sources` 给候选 Step 的录制/静态/混合（`recorded/static/mixed`）来源数，`hit_sources` 给命中来源数。逐 Run 的完整 `<id>.calls.jsonl` 录制优先使用实际工具及 `args.command`（可识别动态 JS 组装的命令）；没有完整录制的 Run 回退静态直线代码提取（控制流/未执行函数体等保守跳过），有些 Run 回退则为 mixed。完整指只有一个结束 meta（ok/error）、无 incomplete 且调用 index 连续无重复；损坏、不完整记录不作完整执行证据。无调用的最终回答不是命中。
+`count/samples/ratio` = hits/candidate Steps/share. `ms/sample_ms/time_ratio` = timed-hit later durations/timed-candidate later durations/share; `timed_count/timed_samples` show coverage. Missing timing not zero; zero total yields null. Neither all-Step nor `model_ms` shares. sources/hit_sources count `recorded/static/mixed` candidate/hit Steps. Complete per-Run recordings prefer actual tools/args.command, including dynamic JS-built commands; otherwise conservative straight-line static extraction excluding control flow/unexecuted function bodies. Partial Run fallback yields mixed. Complete means one end meta ok/error, no incomplete, continuous unique indexes; damaged/incomplete data is not full execution evidence. Tool-free final answers never hit.
 
-`--group-by version|system|patches|transport|incremental|full_reason` 的各组会重新计算全部字段，文本与 `--json` 均展示该指标。共享分类器扩充了状态命令，因此历史“写→仅验证”的命中数可能增加；该旧指标仍只认静态 bash，不把 read 算验证，也不改用录制。新补丁对比见 [compromises.md](compromises.md#expected-continuation-baseline-and-measurement)。
+All version/system/patches/transport/incremental/full_reason groups recompute all fields and expose this metric in text/JSON. Expanded status classification may increase historical write→validation hits; that old metric stays static bash, excluding read/recordings. [Patch comparison](compromises.md#expected-continuation-baseline-and-measurement).
 
-耗时构成的 `timing.effort.by_effort` 按完整 Step 的顶层 effort 分组，列出 Step 数、model_ms 分布（含中位数和样本数）、prompt/cache token 总量与缓存命中率。缺 effort 的旧记录跳过，缺计时仍计 Step；缓存率为有效 prompt/cache 成对字段的总和之比，不是各 Step 比例的平均。
+`timing.effort.by_effort` groups complete-Step effort, Step counts/model_ms distribution including medians/samples, prompt/cache totals/hit rate. Missing effort skips; missing timings still count Steps. Cache rate sums valid paired fields, not per-Step means.
 
-`timing.effort.cache_transitions` 按会话 header 的 provider/model 分组（各字段缺失或无效时为 `unknown`），分别给出同一 Turn 内相邻完整入选 Step 的 effort 相同（`same_effort`）或不同（`different_effort`）时，后一步缓存命中率 `prompt_cache_hit_tokens / prompt_tokens` 的 `samples`、`median` 和 `mean`。这是逐 Step 等权的中位数/算术平均，不是 token 总和之比；无样本时为 0/null/null。两步均须有非空 effort 及有效非负整数 prompt/cache 字段，不要求 completion 字段；后一步 prompt 必须大于零。缺失/无效 Step 不补零，也不跨过它与更早的 Step 配对；不跨 Turn、会话、过滤、取消或压缩替换断点。已有 `by_effort` 的缓存率口径不变。此项用于持续观察不同 provider/model 下 effort 切换与缓存命中的关系，不将分组差异直接当成因果结论。
+timing.effort.cache_transitions groups header provider/model (each missing/invalid unknown), comparing same_effort/different_effort adjacent selected same-Turn complete Steps by later cache/prompt samples/median/mean. Equal Step weights, not aggregate-token ratios; empty 0/null/null. Both need nonempty effort/nonnegative integer prompt/cache, no completion requirement; later prompt>0. Skip invalid/missing Steps without pairing across them; no cross-Turn/Session/filter/cancel/compaction gaps. Existing `by_effort` rate unchanged. Observe associations, not causal group effects.
 
-各档 `downgraded` 及跨档 `timing.effort.downgraded` 给出降档后的 Run 失败率：分母是有 Run 的降档 Step 数，分子是该 Step 响应后执行的任一 Run 显式 `ok=false` 的 Step 数，不关联后一个 Step，也不把无 Run 的最终回答放入分母。未知 Run 状态仍入分母并单列 `steps_with_unknown_run_status`。降档按 `effort_source=model` 且 `effort_downgraded=true` 判定；缺少后一字段的过渡记录按 model 来源推断，显式 false 排除等档声明。
+Per-level downgraded and overall `timing.effort.downgraded` report Run failures: denominator downgraded Steps with Runs, numerator any explicit `ok=false` Run produced by that Step, never next Step or tool-free finals. Unknown statuses remain denominator/list steps_with_unknown_run_status. Require `effort_source=model` plus downgraded=true; transitional missing downgraded inferred from model source, explicit false excludes equal declarations.
 
-机器事件接口见 [ask-json.md](ask-json.md)。
+Machine events: [ask-json.md](ask-json.md).
 
-## 自动后台 Run 的记录与统计
+## Automatic background Run recording and statistics
 
-自动切换同步写入 `background:{id:"rN",kind:"run",state:"started"}`，随后当前完整 Step 的 `run_results[]` 保存 `background_id`，省略 `ok`（执行状态尚未确定），tool content 为提前通知，`tool_bytes:0`、空工具摘要。通知不采样仍在变动的工具计时。为避免尚未成功的 Run 影响下一次 effort，忽略该 Run 的 effort 声明。该 Step 的 `run_ms` 记录前台等待，`output_bytes` 记录通知；普通已完成 Run 保持原有字段含义。
+Automatic transitions sync `background:{id:"rN",kind:"run",state:"started"}`; current complete-Step run_results records `background_id`, omits undetermined ok, tool content notification, `tool_bytes`:0/empty summary. Never sample moving timings. Ignore unfinished Run effort declarations. Step `run_ms` records foreground wait/output_bytes notification; ordinary completed Runs retain meanings.
 
-最终结果的后台 user 消息保存 `background_run:{step,run_index,ok,output,run_ms,tool_bytes,calls,calls_omitted,changes}`，`step` 为原 Session 的全局 Step（从 1 开始），`run_index` 从 0 开始。`output` 是正常格式化后的最终 Run 输出，`run_ms` 是原 Run 完整墙钟耗时，calls 时间相对原 Run 开始，changes 归属原 Run。独立 finished 生命周期记录的 `completion` 保存同一对象；`ask --json` 的 finished 事件也带 completion，供父 agent 汇总 changes。它们不是额外 Step。恢复以已经提交的后台消息为准，若来不及写 finished，沿用原来的终态修补规则；未提交结果恢复为 lost。`r` 计数器沿用后台事件与 `task_ids.run` 高水位，恢复不复用已分配的 ID。
+Final user messages preserve `background_run:{step,run_index,ok,output,run_ms,tool_bytes,calls,calls_omitted,changes}`; step is original Session-global 1-based, `run_index` 0-based. Output normal final formatting, `run_ms` full original wall duration, calls original-Run-relative, changes original-owned. Independent finished.completion and ask finished events carry same object for parent change aggregation, not extra Steps. Resume trusts committed messages, repairs missing finished; uncommitted results become lost. r ids continue lifecycles/task_ids.run maxima, never reused.
 
-Step/Turn 的 `run_ms`、`tool_bytes`、llm/agent 调用数只计前台已结算的 Run，不把后台完整耗时叠加到重叠的主模型时间；后台 Run 的完整计时、字节与调用数从 `background_run` 获取。最终消息（含来源前缀）的字节按原有后台规则计入接收它的完整 Step 的 output_bytes，限额收尾和取消时继续结转。提前通知的 `run_end.ok:true` 仅表示成功转后台，实际成败由最终 completion.ok/background_ok 表示。
+Step/Turn run_ms/tool_bytes/llm/agent counts include foreground-settled Runs only, never overlapping full background durations atop model time. Complete background timings/bytes/calls come from background_run. Final message/envelope bytes enter receiver `output_bytes` with existing carryover through caps/cancel. Early `run_end.ok:true` confirms backgrounding only; completion.ok/background_ok is actual outcome.
 
-`stats.py` 的 `background_runs` 与现有 agents/bash_calls 使用相同口径：`background_calls` 是自动切换次数，`background_steps` 是启动 Step 之后、结果插入之前已完成的本会话模型 Step 分布，`foreground_calls` 恒为 0（只统计自动后台 Run）。该指标包含根会话和子会话各自的主模型 Step，不将子会话 Step 当成父模型 Step。静态工具计数仍读取原代码；Step/calls 的旧性能指标不混入异步完成数据，避免重复计数。
+`background_runs` shares agents/bash_calls definitions: `background_calls` transitions; `background_steps` complete same-Session model Steps after start/before insertion; `foreground_calls` always 0 (automatic only). Include root/child main Steps separately, never child Steps as parent. Static tools use original source; old Step/calls performance metrics exclude asynchronous completions to avoid duplicates.
 
-等待后台结果的无工具回复或仅成功运行无输出、无宿主工具的 Run 的 assistant 消息带本地元数据 `waiting:true`，不改模型原始 content/reasoning/phase，也不把 waiting 发给 provider。恢复到 TUI 时显示为通知；统计不把它当作 Turn 完成。它仍是已花费用量的完整 Step。
+Tool-free waiting replies or all-success empty/no-host-call Runs carry assistant `waiting:true`, preserving content/reasoning/phase, never provider metadata. TUI restores notices; stats does not mark Turn completion. Still paid complete Steps.
 
-## Step 传输字段
+## Step transport fields
 
-完整 Step 新增可选 `transport`（`sse|websocket`）、`incremental`、`input_items`、`input_bytes`、`transport_fallback`。Chat Completions 同样记录 `sse`；旧日志缺字段仍可恢复，统计归 `unknown`，不按 header/provider 猜测。
+Optional complete-Step transport:sse|websocket, incremental, input_items/input_bytes/transport_fallback. Chat Completions logs sse too; old missing unknown, never inferred from provider/header.
 
-`transport` 和 `incremental` 表示最终成功尝试实际使用的传输与续接方式。WS 的 `input_items` 是该次线上 input 数组条数，`input_bytes` 是该数组紧凑 JSON 的 UTF-8 字节数，包含方括号和分隔符；不含请求其他字段、帧头、TLS、失败/重发尝试。完整 WS 请求同样记录这两项，结合 `incremental` 区分；SSE 不记录 input 数量/字节。`transport_fallback` 为握手/协议错误名（如 `WebSocketHandshake`、`WebSocketProtocol`），Session 内后续 SSE Step 保留该原因；`previous_response_not_found` 表示本 Step 的增量续接失效、已用完整 input 重发，传输仍可为 WS。不写 response id、路由 token 或认证数据。
+Transport/incremental describe final successful attempts. WS `input_items` counts wire input array entries; `input_bytes` compact UTF-8 JSON including brackets/separators, excluding other fields/frame/TLS/failed-resends. Full WS records too; SSE omits counts. `transport_fallback` names handshake/protocol errors (e.g. WebSocketHandshake, WebSocketProtocol), retained on subsequent Session SSE Steps; `previous_response_not_found` means incremental failed/full resend, possibly still WS. No response ids/routing tokens/auth.
 
-`model_ms` 继续包含本 Step 的握手、重发、重试和退避；`first_data_ms` 是首次接收传输数据的时间（WS 帧也包括心跳/元数据，握手头不算），`code[].first_ms` 等代码计时口径不变。失败尝试已经产生的 first_data 仍保留；模型参数计时沿用重试重置规则。`attempts` 仍只数外层重试，原地 previous_response_not_found 全量重发不增加它。日志中的 messages 始终是完整本地历史，恢复无需服务端保存 response。
+`model_ms` includes handshake/resend/retry/backoff. `first_data_ms` first transport receive including WS heartbeat/metadata, excluding handshake headers; code[].first_ms and other code timing unchanged. Failed-attempt first_data retained; code follows retry resets. attempts counts outer retries only, not in-place previous-response resends. Messages always full local history; server responses unnecessary for resume.
 
-`python3 scripts/stats.py <日志目录> --group-by transport [--json]`（或 `--group-by incremental`）按每个完整 Step 的实际传输或续接状态筛选，再生成与其他分组相同的完整报告；比较各组 `timing.model_ms`、`timing.first_data_ms`、`timing.code_first_ms` 的 median/p90/samples。一个混合线路 Session 可出现在多个组；混合线路 Turn 的部分 Step 不作为整 Turn 墙钟样本，缺失计时不补零，过滤断点不建立 effort/工具相邻关系。incremental 分组键为 `true|false|unknown`，SSE 的 false 与全量 WS 的 false 同组，缺字段不补 false。分组是最终成功线路的观测，发生降级的 SSE 样本包含先前 WS 尝试成本，不能把分组差异直接当作纯网络耗时差。
+--group-by transport or --group-by incremental filters complete Steps by actual final transport/continuation, then full reports with timing.model_ms/timing.first_data_ms/timing.code_first_ms median/p90/samples. Mixed Sessions may appear in several groups; partial mixed Turns excluded from whole-Turn wall samples, no missing zero-fill or adjacency across filters. incremental keys true|false|unknown: SSE false groups with full WS false, missing never false. Fallback SSE includes prior WS cost, not pure network differences.
 
 
-`full_reason` 说明本次为何未续接：`first_request`、`missing_response_id`、`unsupported_output`、`reconnect`、`scope_changed`、`compaction`、`effort_changed`、`properties_changed`、`input_prefix_mismatch`、`previous_response_not_found`、`sse_configured` 或 `sse_fallback`。实际前缀不匹配同时记录 `mismatch_index`（线上 input 的零起始位置）；成功增量无 full_reason。`--group-by full_reason` 按完整 Step 分组，成功增量归 `incremental`，旧日志缺字段归 `unknown`，沿用其他 Step 分组的过滤与相邻关系规则。
+`full_reason`: `first_request`, `missing_response_id`, `unsupported_output`, reconnect, `scope_changed`, compaction, `effort_changed`, `properties_changed`, `input_prefix_mismatch`, `previous_response_not_found`, `sse_configured`, sse_fallback. Prefix mismatch also records zero-based wire `mismatch_index`; successful increments omit full_reason. --group-by full_reason uses complete Steps, incremental for success, unknown old fields, same filtering/adjacency rules.
 
-每次降级立即追加独立记录，包含 `transport_fallback`、`transport_fallback_at`（Unix 毫秒）、`transport_fallback_detail`（如有）及 step，取消也不丢失该记录；它没有 usage/model_ms，messages 为空，不增加 Step，也不替换历史或 context_tokens。恢复和离线 replay 跳过其历史应用。完整 Step 保留相同原因及原始降级时间。previous_response_not_found 的原地全量重发也立即记录。协议诊断包含解析阶段、最后事件类型、output_index、已收条目数及 pending 数，不保存原始帧、认证头或路由 token。
+Immediately append transport_fallback, transport_fallback_at (Unix ms), transport_fallback_detail if any, and step, surviving cancel. No usage/model_ms; empty messages, no Steps/history/context replacement. Resume/replay skip history application. Complete Steps retain reason/original time. Immediately record missing-response full resends too. Diagnostics include parse stage/last event/output_index/received/pending counts, never raw frames/auth/routing.
 
-完整 Step 的 `model_attempts` 按外层尝试依次保存 start_ms/end_ms（均相对 Step 开始）、error_name/detail、transport/incremental/full_reason、fallback_reason/fallback_at/fallback_detail、bytes/content_bytes、first_content_ms/last_content_ms/max_content_gap_ms 和 max_gap_ms。content_bytes 只计非空文本、reasoning 摘要和工具参数增量；bytes 是接收响应体的字节，不含握手头。相邻尝试的 start_ms 减去前次 end_ms 可见退避。失败耗尽时 diagnostic 同样保存该数组；成功 Step 顶层 max_content_gap_ms 是最后尝试的内容间隔，不包含首次等待和重试退避。缺失的可选值省略，不补零。总超时覆盖所有 I/O，收集每次尝试前先取消并 join 请求，下一尝试才可复用 sink 和分配器。
+`model_attempts` ordered by outer attempt contain Step-relative start/end, error_name/detail, transport/incremental/full_reason, fallback_reason/at/detail, bytes/content_bytes, first/last_content_ms/max_content_gap_ms/max_gap_ms. Content counts nonempty text/reasoning summaries/args; bytes response bodies, not handshake. Next start minus prior end shows backoff. Exhausted diagnostics retain arrays; Step max_content_gap_ms is final attempt content intervals excluding first waits/backoff. Omit missing optionals, no zeros. Total timeouts cover all I/O; cancel/join before collecting attempts and reusing sinks/allocators.
 
-Codex 新响应的 `reasoning.includes_output:true` 表示 `reasoning.data` 是服务端完整、有序的 output 数组，包含 reasoning、message、function_call 和 custom_tool_call；展示仍用 content/tool_calls，回传只用该数组，避免重复发送。reasoning 加密条目不改写。旧日志没有标记时，沿用旧格式（data 仅推理数组）的回放方式。fork 深拷贝该标记和 data；估算 token 时只计算完整数组一次。新字段向后兼容旧日志，不保证旧二进制能读取新格式。
+reasoning.includes_output:true means reasoning.data holds full ordered Responses output array including reasoning/message/function/custom calls. Display content/tool_calls, return array only, avoiding duplicates; encrypted items unchanged. Old unmarked logs retain reasoning-only replay. Fork deep-copies flag/data; token estimates count full arrays once. New readers accept old logs, old binaries may reject new formats.
 
-## 实际后台执行区间
+## Actual background execution intervals
 
-后台 bash 的 finished 事件新增可选 `execution:{start_ms_epoch,end_ms_epoch}`（Unix 毫秒）：开始在 spawn 前采样，结束在 wait 返回时采样，不包含结果送达的延迟。失败在 spawn 前发生时省略 execution。取消／超时仍以进程 wait 完成为结束。此字段出现在主日志和 `ask --json` 生命周期事件中；agent 不冒用 bash 进程区间。
+Optional background-bash finished `execution:{start_ms_epoch,end_ms_epoch}`, Unix ms from before spawn through wait return, excluding delivery delay. Omit pre-spawn failures; cancel/timeout end at wait. Present in logs/ask events; agents never misuse bash intervals.
 
-自动后台 Run 的 `completion`／消息 `background_run` 新增同形的 `execution`，从 Run 创建到执行线程结算，包含自动转后台之前的等待；其 calls 的 start/end 仍相对原 Run 开始。执行区间不等于纯工具执行：关键路径应把 calls 偏移加到 execution.start_ms_epoch，再取实际调用区间并集，不能直接把 Run／后台注册到结果送达的整段当工具区间。
+Automatic completion/background_run execution uses Run creation→thread settlement, including pre-transition waits; calls remain original-relative. Not pure tool time: add call offsets to execution.start_ms_epoch and union actual intervals for critical paths; do not treat registration/delivery spans as tools.
 
-旧日志可从 calls footer 的 `meta.start_ms_epoch` 得到 Run 锚点，从 completion.calls 得到完整调用（含转后台前部分）；显式后台 bash 只能从注册时间及终态 progress.elapsed_ms 近似恢复，缺少精确结束值时必须注明估计／未知，不能用送达时间冒充实际完成。
+Old calls `meta.start_ms_epoch` anchors Runs, completion.calls supplies complete calls including pre-transition. Explicit background bash only approximates from registration/terminal `elapsed_ms`; label estimated/unknown without exact ends, never delivery-as-completion.
 
-## Bash 启动与取代事件
+## Bash start and supersession events
 
-每条 bash 执行单独追加 `bash` 事件，messages 为空，也不修改历史、token 或 Step 序号：
+Each execution independently appends bash events, empty messages, no history/token/Step changes:
 
-- `started`：`id`（会话级 bN）、`run`（Session 内 Run 序号）、完整 `command`、启动 `cwd`、`detached`。
-- `superseded`：旧 `id`、旧 `run`、`superseded_by`（新 bN）、`elapsed_ms`（旧执行从登记到取代的单调时钟时长）。每次旧执行最多记录一次。
-- `finished`：`id`、`run`、`elapsed_ms`，进程组清理后记录，包含正常完成、失败、超时、取消和取代。日志写入失败时结束事件可能缺失。
+- started: Session bN id, Session Run ordinal, full command, start cwd, detached.
+- superseded: old id/run, `superseded_by` new bN, `elapsed_ms` monotonic registration→supersession; at most once per old execution.
+- finished: id/run/elapsed_ms after group cleanup for normal/failure/timeout/cancel/supersession. Log-write failure may omit.
 
-事件沿用顶层 `at` 毫秒时间戳，旧日志没有这些事件。恢复跳过事件的历史应用，并从事件 id 恢复 b 计数器；不重启命令。主日志因此也包含完整 shell 命令，分享时应检查其中的敏感参数。
+Top-level at uses ms; old logs lack events. Resume skips history, restores b maxima, never restarts. Main logs now contain full shell commands; inspect sensitive arguments before sharing.
 
-`scripts/stats.py` 的 JSON 字段 `bash_superseded` 统计入选记录中的 `superseded` 次数，文本显示“Bash 被取代次数”。按 --since 的事件 at 过滤；事件不计作 Step、Turn 或失败。被取代的工具 resolve 数据与后台结果仍走原有录制/消息路径；其含义和脚本分支见 [tool-delegation.md](tool-delegation.md#同一命令取代过时执行)。
+stats `bash_superseded` counts selected superseded events, text “Bash supersessions”. --since filters event at; no Step/Turn/failure counts. Resolve data/background results retain existing recording/message paths; [semantics](tool-delegation.md#identical-commands-supersede-stale-execution).
 
-`task_stop` 是单独的任务控制记录，包含 `id`、`reason`、`stopped`，不改变模型历史；TUI `/stop` 的 reason 为 `user requested stop`。tool 消息中的 `run_ok` 与 `background_id` 供 TUI 恢复显示使用，不改变发给 provider 的工具结果正文。
+`task_stop` separately records id/reason/stopped without history; TUI reason user requested stop. Tool run_ok/background_id are local restore metadata, not changes to provider bodies.
 
-自定义服务以 header 的 `provider:"custom"` 与 `custom_provider` 共同标识，跨自定义 id 恢复仍拒绝。usage 新增可选 `prompt_cache_write_tokens`，缺省为零；输入总 tokens 已含缓存创建。`scripts/stats.py` 对有写入的日志累加该字段。
+Custom headers combine `provider:"custom"` and `custom_provider`; cross-custom-id resume rejects. Optional usage `prompt_cache_write_tokens` defaults zero, already included in prompt totals. stats accumulates cache writes where present.

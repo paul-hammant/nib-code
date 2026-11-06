@@ -21,7 +21,7 @@ Fork is an independent child Session, not a parent rollback point. Depth matches
 - **Observed motivation:** Among 105 locally created child Sessions, roughly 6 initial read-only Steps consumed about 22% of time; full subtasks took about 12 Steps, 3 minutes, and around 290,000 cumulative prompt tokens. Total tokens include repeated context/cache input, not fees. This shows rereading cost, not fork savings. See [cost reference](../tool-delegation.md) for samples/distributions.
 - **High-confidence semantics:** Copying current history, preserving system/schema bytes, including current assistant and synthetic closing results, independent ids, and runtime depth boundaries are locally verifiable and cache-service-independent.
 - **Medium-confidence expected benefit:** Parent context may reduce reinvestigation, but longer input may add cost or irrelevant context. No real fork comparison confirms net benefit yet.
-- **Routing hypothesis awaiting measurement:** Codex fork keeps the parent's `prompt_cache_key` to route matching prefixes to the same cache; confidence in actual server reuse is low, without protocol guarantees. Matching model/effort and byte prefixes are prerequisites, not hit promises; adjacent-Step effort cache statistics do not prove fork hits. See [Codex cache notes](../codex.md#fork-与父缓存路由).
+- **Routing hypothesis awaiting measurement:** Codex fork keeps the parent's `prompt_cache_key` to route matching prefixes to the same cache; confidence in actual server reuse is low, without protocol guarantees. Matching model/effort and byte prefixes are prerequisites, not hit promises; adjacent-Step effort cache statistics do not prove fork hits. See [Codex cache notes](../codex.md#fork-and-parent-cache-routing).
 
 ## When to reconsider
 
