@@ -31,6 +31,7 @@ pub const Turn = struct {
     loop: *vaxis.Loop(Event),
     cancel: std.atomic.Value(bool) = .init(false),
     thread: std.Thread = undefined,
+    last_script_activity: ?std.Io.Clock.Timestamp = null,
     last_model_activity: ?std.Io.Clock.Timestamp = null,
 
     pub fn spawn(gpa: std.mem.Allocator, session: *Session, loop: *vaxis.Loop(Event), text: []const u8, compact: bool) !*Turn {
@@ -52,7 +53,7 @@ pub const Turn = struct {
     }
 
     fn execute(t: *Turn, compact: bool, detail: *?[]u8) !void {
-        const sink: Sink = .{ .ctx = t, .emit = emit, .onModelActivity = modelActivity, .onUserInserted = userInserted };
+        const sink: Sink = .{ .ctx = t, .emit = emit, .onModelActivity = modelActivity, .onToolActivity = toolActivity, .onUserInserted = userInserted };
         if (compact) {
             errdefer t.session.tools.background.stop(t.gpa);
             _ = try t.session.compact(sink, &t.cancel, detail);
@@ -64,12 +65,24 @@ pub const Turn = struct {
         try t.loop.postEvent(.{ .user_inserted = id });
     }
 
+    pub fn toolActivity(ctx: *anyopaque, name: []const u8) !void {
+        const t: *Turn = @ptrCast(@alignCast(ctx));
+        try t.loop.postEvent(.{ .tool_activity = name });
+    }
+
     pub fn modelActivity(ctx: *anyopaque, state: ModelActivity) !void {
         const t: *Turn = @ptrCast(@alignCast(ctx));
         try t.modelActivityAt(state, .now(t.session.io, .awake));
     }
 
     pub fn modelActivityAt(t: *Turn, state: ModelActivity, at: std.Io.Clock.Timestamp) !void {
+        if (state == .started) t.last_script_activity = null;
+        if (state == .script) {
+            if (t.last_script_activity) |last| {
+                if (last.durationTo(at).raw.toMilliseconds() < 1000) return;
+            }
+            t.last_script_activity = at;
+        }
         if (state == .data) if (t.last_model_activity) |last| {
             if (last.durationTo(at).raw.toMilliseconds() < 1000) return;
         };

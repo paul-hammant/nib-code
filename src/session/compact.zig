@@ -20,8 +20,8 @@ pub fn compact(s: *Session, sink: Sink, cancel: *const std.atomic.Value(bool), d
     try request.appendSlice(s.gpa, s.history.items[0..cut]);
     try request.append(s.gpa, .{ .role = "user", .content = "Summarize the conversation above for another coding agent. Preserve goals, explicit user requirements, constraints and preferences, decisions, files, current file and test state, results, failures and unfinished work. Do not act on earlier requests. Return only a concise factual continuation summary." });
     const Silent = struct {
-        fn delta(_: *anyopaque, _: provider.Kind, _: []const u8) !void {}
-        fn data(ctx: *anyopaque) !void {
+        fn delta(ctx: *anyopaque, _: provider.Kind, text: []const u8) !void {
+            if (text.len == 0) return;
             const target: *Sink = @ptrCast(@alignCast(ctx));
             try target.modelActivity(.data);
         }
@@ -34,7 +34,7 @@ pub fn compact(s: *Session, sink: Sink, cancel: *const std.atomic.Value(bool), d
     const reply = request_model: {
         try sink.modelActivity(.started);
         defer sink.modelActivity(.finished) catch {};
-        break :request_model try provider.complete(s.gpa, a, s.client, cfg, s.cache_key, request.items, "[]", @intCast(@min(2048, @max(32, s.cfg.context_window / 8))), .{ .ctx = &observer, .onDelta = Silent.delta, .onData = Silent.data, .replay_safe = true, .codex_state = &s.codex_state }, cancel, detail, &attempts, null);
+        break :request_model try provider.complete(s.gpa, a, s.client, cfg, s.cache_key, request.items, "[]", @intCast(@min(2048, @max(32, s.cfg.context_window / 8))), .{ .ctx = &observer, .onDelta = Silent.delta, .replay_safe = true, .codex_state = &s.codex_state }, cancel, detail, &attempts, null);
     };
     s.usage.add(reply.usage);
     try sink.emit(sink.ctx, .{ .usage = s.usage });

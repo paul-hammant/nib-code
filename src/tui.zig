@@ -28,6 +28,7 @@ pub const Event = union(enum) {
     paste_end,
     mouse: vaxis.Mouse,
     tick,
+    tool_activity: []const u8,
     model_activity: struct { state: ModelActivity, at: std.Io.Clock.Timestamp },
     /// Slices are owned by the receiver.
     step: struct { n: u32, effort: []u8, source: provider.EffortSource },
@@ -132,6 +133,7 @@ pub const App = struct {
     scroll: Viewport = .{},
     menu: Menu,
     status_text: status.Text = .{},
+    activity_detail: [256]u8 = undefined,
     activity: status.Activity,
     usage: provider.Usage = .{},
     steps: u32 = 0,
@@ -201,8 +203,14 @@ pub const App = struct {
                 defer app.session.tools.progress.sink = null;
                 try app.session.tools.progress.drain(app.io);
             },
+            .tool_activity => |name| {
+                app.activity.tool = name;
+                app.activity.progress(.now(app.io, .awake));
+            },
             .model_activity => |activity| {
                 if (activity.state == .started and app.activity.phase != .compacting) app.activity.set(app.io, .thinking);
+                if (activity.state == .script) app.activity.set(app.io, .scripting);
+                if (activity.state == .waiting) app.activity.set(app.io, .waiting);
                 app.activity.modelActivity(activity.state, activity.at);
             },
             .winsize => |ws| {
@@ -217,12 +225,14 @@ pub const App = struct {
             .delta => |d| {
                 defer gpa.free(d.text);
                 app.live_steps = d.step;
+                if (d.text.len > 0) app.activity.progress(.now(app.io, .awake));
                 if (app.activity.phase != .compacting) app.activity.set(app.io, if (d.kind == .reasoning) .thinking else .writing);
                 try app.transcript.appendDelta(gpa, d.kind, d.text);
             },
             .run_start => |r| {
                 defer gpa.free(r.code);
                 app.live_steps = r.step;
+                app.activity.tool = "";
                 app.activity.set(app.io, .running);
                 try app.transcript.startRunWithEffort(gpa, r.code, app.step_effort);
             },
@@ -248,6 +258,7 @@ pub const App = struct {
             .progress => |p| {
                 var owned = p;
                 defer owned.deinit(gpa);
+                if (app.transcript.progressChanged(p)) app.activity.progress(.now(app.io, .awake));
                 try app.transcript.progress(gpa, p);
             },
             .background => |b| {
@@ -464,6 +475,7 @@ pub const App = struct {
             .context = app.context,
             .busy = if (app.turn != null) app.activity.label(app.io) else null,
             .notice = app.notice,
+            .detail = if (app.activity.phase == .waiting) app.session.tools.background.waitingLabel(app.io, &app.activity_detail) else if (app.activity.phase == .running) app.transcript.activityDetail(&app.activity_detail, app.activity.tool) else "",
         }, &app.status_text);
         app.selection.highlight(&app.vx.screen);
         try app.vx.render(app.w);

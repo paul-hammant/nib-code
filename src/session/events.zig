@@ -10,6 +10,7 @@ pub const Progress = struct {
     run: usize = 0,
     invocation: usize = 0,
     kind: Background.Kind = .agent,
+    output_bytes: u64 = 0,
     elapsed_ms: u64 = 0,
     superseded_by: ?[]const u8 = null,
     background: bool = false,
@@ -32,7 +33,7 @@ pub const Progress = struct {
         const replacement = if (p.superseded_by) |id| try gpa.dupe(u8, id) else null;
         errdefer if (replacement) |id| gpa.free(id);
         const id = try gpa.dupe(u8, p.id);
-        return .{ .superseded_by = replacement, .kind = p.kind, .elapsed_ms = p.elapsed_ms, .run = p.run, .invocation = p.invocation, .background = p.background, .detached = p.detached, .fork = p.fork, .id = id, .prompt = prompt, .state = p.state, .step = p.step, .tools = used, .files = files, .usage = p.usage };
+        return .{ .output_bytes = p.output_bytes, .superseded_by = replacement, .kind = p.kind, .elapsed_ms = p.elapsed_ms, .run = p.run, .invocation = p.invocation, .background = p.background, .detached = p.detached, .fork = p.fork, .id = id, .prompt = prompt, .state = p.state, .step = p.step, .tools = used, .files = files, .usage = p.usage };
     }
 
     pub fn deinit(p: *Progress, gpa: std.mem.Allocator) void {
@@ -81,7 +82,7 @@ pub const TurnSummary = struct {
     timing: Timing = .{},
 };
 
-pub const ModelActivity = enum { started, data, finished };
+pub const ModelActivity = enum { started, data, script, waiting, finished };
 
 pub const RunCompletion = struct {
     execution: ?@import("../sandbox/timing.zig").Execution = null,

@@ -2,20 +2,22 @@ const std = @import("std");
 const provider = @import("../provider.zig");
 const ModelActivity = @import("../session/events.zig").ModelActivity;
 
-pub const Phase = enum { thinking, writing, running, retrying, compacting };
+pub const Phase = enum { thinking, writing, scripting, running, waiting, retrying, compacting };
 
 const spinner = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
 
-/// What the running Turn is doing and since when.
 pub const Activity = struct {
     phase: Phase = .thinking,
     since: std.Io.Clock.Timestamp,
-    last_data: ?std.Io.Clock.Timestamp = null,
+    turn_since: std.Io.Clock.Timestamp,
+    last_progress: std.Io.Clock.Timestamp,
+    tool: []const u8 = "",
 
-    pub const Label = struct { phase: Phase, ms: u64, no_data_ms: ?u64 = null };
+    pub const Label = struct { phase: Phase, ms: u64, turn_ms: u64 = 0, quiet_ms: u64 = 0 };
 
     pub fn start(io: std.Io, phase: Phase) Activity {
-        return .{ .phase = phase, .since = .now(io, .awake) };
+        const now: std.Io.Clock.Timestamp = .now(io, .awake);
+        return .{ .phase = phase, .since = now, .turn_since = now, .last_progress = now };
     }
 
     pub fn set(a: *Activity, io: std.Io, phase: Phase) void {
@@ -25,10 +27,14 @@ pub const Activity = struct {
     }
 
     pub fn modelActivity(a: *Activity, activity: ModelActivity, at: std.Io.Clock.Timestamp) void {
-        a.last_data = switch (activity) {
-            .started, .data => at,
-            .finished => null,
-        };
+        switch (activity) {
+            .data, .script => a.progress(at),
+            .started, .finished, .waiting => {},
+        }
+    }
+
+    pub fn progress(a: *Activity, at: std.Io.Clock.Timestamp) void {
+        a.last_progress = at;
     }
 
     pub fn label(a: Activity, io: std.Io) Label {
@@ -39,7 +45,8 @@ pub const Activity = struct {
         return .{
             .phase = a.phase,
             .ms = @intCast(@max(a.since.durationTo(now).raw.toMilliseconds(), 0)),
-            .no_data_ms = if (a.last_data) |at| @intCast(@max(at.durationTo(now).raw.toMilliseconds(), 0)) else null,
+            .turn_ms = @intCast(@max(a.turn_since.durationTo(now).raw.toMilliseconds(), 0)),
+            .quiet_ms = @intCast(@max(a.last_progress.durationTo(now).raw.toMilliseconds(), 0)),
         };
     }
 };
@@ -55,6 +62,7 @@ pub const Status = struct {
     busy: ?Activity.Label = null,
     /// A transient message, such as a copy confirmation.
     notice: ?[]const u8 = null,
+    detail: []const u8 = "",
 };
 
 /// Printed slices must survive until vaxis renders the frame.
@@ -65,10 +73,19 @@ pub const Text = struct {
     pub fn format(text: *Text, s: Status, scrolled: bool) []const u8 {
         var w: std.Io.Writer = .fixed(&text.activity);
         if (s.busy) |b| {
-            w.print("{s} {s} {d}s", .{ spinner[(b.ms / 100) % spinner.len], @tagName(b.phase), b.ms / 1000 }) catch {};
-            if (b.no_data_ms) |ms| if (ms >= 30_000) {
-                w.print(" · no data {d}s", .{ms / 1000}) catch {};
+            const phase = switch (b.phase) {
+                .thinking => "waiting model",
+                .writing => "model output",
+                .scripting => "generating run",
+                .running => "tools",
+                .waiting => "waiting tasks",
+                .retrying => "retrying",
+                .compacting => "compacting",
             };
+            w.print("{s} {s}", .{ spinner[(b.ms / 100) % spinner.len], phase }) catch {};
+            if (s.detail.len > 0) w.print(" {s}", .{s.detail}) catch {};
+            w.print(" · turn {d}s", .{b.turn_ms / 1000}) catch {};
+            if (b.quiet_ms >= 30_000) w.print(" · no progress {d}s", .{b.quiet_ms / 1000}) catch {};
             w.print(" · step {d} · esc to cancel", .{s.current_step}) catch {};
         }
         if (s.background_count > 0) {
@@ -84,6 +101,26 @@ pub const Text = struct {
             w.writeAll(notice) catch {};
         }
         return w.buffered();
+    }
+
+    pub fn formatWidth(text: *Text, s: Status, scrolled: bool, width: u16) []const u8 {
+        var line = text.format(s, scrolled);
+        const vaxis = @import("vaxis");
+        while (vaxis.gwidth.gwidth(line, .unicode) > width) {
+            if (std.mem.lastIndexOf(u8, line, " · ")) |separator| {
+                line = line[0..separator];
+            } else {
+                var end: usize = 0;
+                var it = vaxis.unicode.graphemeIterator(line);
+                while (it.next()) |grapheme| {
+                    const next = end + grapheme.bytes(line).len;
+                    if (vaxis.gwidth.gwidth(line[0..next], .unicode) > width) break;
+                    end = next;
+                }
+                return line[0..end];
+            }
+        }
+        return line;
     }
 
     pub fn footer(text: *Text, s: Status, width: u16) []const u8 {
@@ -130,7 +167,7 @@ test "activity is optional and footer shows latest reported usage" {
     const cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "m", .context_window = 1000 };
     try std.testing.expectEqualStrings("", text.format(.{ .cfg = cfg }, false));
     try std.testing.expectEqualStrings("↑ history · PgDn to return", text.format(.{ .cfg = cfg }, true));
-    try std.testing.expectEqualStrings("⠙ running 0s · step 2 · esc to cancel · copied 3 chars", text.format(.{ .cfg = cfg, .current_step = 2, .busy = .{ .phase = .running, .ms = 150 }, .notice = "copied 3 chars" }, false));
+    try std.testing.expectEqualStrings("⠙ tools · turn 0s · step 2 · esc to cancel · copied 3 chars", text.format(.{ .cfg = cfg, .current_step = 2, .busy = .{ .phase = .running, .ms = 150 }, .notice = "copied 3 chars" }, false));
     const line = text.footer(.{ .cfg = cfg, .context = 250, .steps = 2, .usage = .{ .prompt_tokens = 1_800_000, .prompt_cache_hit_tokens = 1_692_000, .completion_tokens = 18_000 } }, 200);
     try std.testing.expectEqualStrings("m · effort server default · ctx 25% · in 1.8M (94% cached) · out 18k · last turn: 2 steps", line);
     const busy = text.footer(.{ .cfg = cfg, .context = 400, .steps = 1, .usage = .{ .prompt_tokens = 1200, .completion_tokens = 50, .prompt_cache_hit_tokens = 600 }, .busy = .{ .phase = .running, .ms = 100 } }, 200);
@@ -141,38 +178,34 @@ test "background task count remains visible during model work" {
     const t = std.testing;
     var text: Text = .{};
     const s: Status = .{ .cfg = .{ .base_url = "", .api_key = "", .model = "m" }, .busy = .{ .phase = .thinking, .ms = 0 }, .background_count = 2 };
-    try t.expectEqualStrings("⠋ thinking 0s · step 1 · esc to cancel · bg 2", text.format(s, false));
+    try t.expectEqualStrings("⠋ waiting model · turn 0s · step 1 · esc to cancel · bg 2", text.format(s, false));
     try t.expect(std.mem.endsWith(u8, text.footer(s, 200), " · bg 2"));
     try t.expectEqualStrings("bg 2", text.format(.{ .cfg = s.cfg, .background_count = 2 }, false));
 }
 
-test "model silence threshold, data reset, and request boundaries" {
+test "only content advances progress; stage changes preserve Turn duration" {
     const t = std.testing;
-    const cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "m" };
-    var text: Text = .{};
     var activity = Activity.start(t.io, .thinking);
     const start = activity.since;
-    const before = start.addDuration(.{ .raw = .fromMilliseconds(29_999), .clock = .awake });
-    const threshold = start.addDuration(.{ .raw = .fromMilliseconds(30_000), .clock = .awake });
-    const later = start.addDuration(.{ .raw = .fromMilliseconds(45_000), .clock = .awake });
-    activity.modelActivity(.started, start);
-    try t.expect(std.mem.indexOf(u8, text.format(.{ .cfg = cfg, .busy = activity.labelAt(before) }, false), "no data") == null);
-    try t.expect(std.mem.indexOf(u8, text.format(.{ .cfg = cfg, .busy = activity.labelAt(threshold) }, false), " · no data 30s") != null);
-    try t.expectEqualStrings("⠋ thinking 45s · no data 45s · step 1 · esc to cancel", text.format(.{ .cfg = cfg, .busy = activity.labelAt(later) }, false));
-    activity.modelActivity(.data, later);
-    try t.expectEqualStrings("⠋ thinking 45s · step 1 · esc to cancel", text.format(.{ .cfg = cfg, .busy = activity.labelAt(later) }, false));
-    activity.set(t.io, .writing);
-    try t.expectEqual(@as(?u64, 0), activity.labelAt(later).no_data_ms);
-    activity.modelActivity(.finished, later);
-    for ([_]Phase{ .running, .retrying, .thinking }) |phase| {
-        activity.set(t.io, phase);
-        try t.expectEqual(@as(?u64, null), activity.labelAt(later).no_data_ms);
-        try t.expect(std.mem.indexOf(u8, text.format(.{ .cfg = cfg, .busy = activity.labelAt(later) }, false), "no data") == null);
-    }
-    activity.set(t.io, .compacting);
+    const later = start.addDuration(.{ .raw = .fromMilliseconds(45000), .clock = .awake });
     activity.modelActivity(.started, later);
-    try t.expectEqual(@as(?u64, 0), activity.labelAt(later).no_data_ms);
-    try t.expectEqual(Phase.compacting, activity.phase);
+    activity.modelActivity(.finished, later);
+    try t.expectEqual(@as(u64, 45000), activity.labelAt(later).quiet_ms);
+    activity.modelActivity(.script, later);
+    try t.expectEqual(@as(u64, 0), activity.labelAt(later).quiet_ms);
+    activity.set(t.io, .running);
+    try t.expectEqual(@as(u64, 45000), activity.labelAt(later).turn_ms);
+    activity.modelActivity(.waiting, later);
+    try t.expectEqualDeep(later, activity.last_progress);
+    var text: Text = .{};
+    const cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "m" };
+    const s: Status = .{ .cfg = cfg, .detail = "r3 32s", .busy = .{ .phase = .waiting, .ms = 0, .turn_ms = 574000, .quiet_ms = 30000 } };
+    try t.expectEqualStrings("⠋ waiting tasks r3 32s · turn 574s · no progress 30s · step 1 · esc to cancel", text.format(s, false));
+    for (0..100) |width| {
+        const line = text.formatWidth(s, false, @intCast(width));
+        try t.expect(@import("vaxis").gwidth.gwidth(line, .unicode) <= width);
+        try t.expect(std.mem.indexOfScalar(u8, line, '\n') == null);
+    }
 }
 
 test "effort footer marks configured ceilings but preserves default" {

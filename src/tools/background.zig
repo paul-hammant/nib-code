@@ -344,6 +344,23 @@ pub const Background = struct {
         return tasks;
     }
 
+    pub fn waitingLabel(bg: *Background, io: std.Io, buf: []u8) []const u8 {
+        bg.mutex.lockUncancelable(io);
+        defer bg.mutex.unlock(io);
+        const now = @import("../sandbox/timing.zig").Execution.now(io);
+        for (bg.runs.items) |job| {
+            if (job.delivered) continue;
+            const ms: u64 = if (job.done.load(.acquire)) job.elapsed_ms else @intCast(@max(now - job.execution.start_ms_epoch, 0));
+            return std.fmt.bufPrint(buf, "{s} {d}s", .{ job.id, ms / 1000 }) catch "";
+        }
+        for (bg.jobs.items) |job| {
+            if (job.detached or job.delivered) continue;
+            const ms = @max((job.ended_ms orelse now) - (job.started_ms orelse job.registered_ms), 0);
+            return std.fmt.bufPrint(buf, "{s} {d}s", .{ job.id, @divTrunc(ms, 1000) }) catch "";
+        }
+        return "";
+    }
+
     pub fn beginTask(bg: *Background, io: std.Io, id: []const u8, timeout_ms: i64) void {
         bg.mutex.lockUncancelable(io);
         defer bg.mutex.unlock(io);

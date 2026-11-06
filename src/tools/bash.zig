@@ -90,7 +90,7 @@ fn execute(t: *Tools, gpa: std.mem.Allocator, command: []const u8, timeout_ms: i
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .ignore,
-    }, .execution = execution, .cancel = &active.cancel, .timeout_ms = timeout_ms, .on_tick = .{ .ctx = &tracker, .emit = Tracker.observe }, .max_output_bytes = 16 * 1024 * 1024 });
+    }, .execution = execution, .cancel = &active.cancel, .timeout_ms = timeout_ms, .on_tick = .{ .ctx = &tracker, .emit = Tracker.observe }, .on_line = .{ .ctx = &tracker, .emit = Tracker.line }, .max_output_bytes = 16 * 1024 * 1024 });
     defer {
         if (executed) |result| gpa.free(result.output) else |_| {}
     }
@@ -131,6 +131,13 @@ const Tracker = struct {
     value: ?@import("../session/events.zig").Progress,
     started: std.Io.Clock.Timestamp,
     last_second: ?u64 = null,
+    output_bytes: u64 = 0,
+
+    fn line(ctx: *anyopaque, bytes: []const u8) void {
+        const tr: *Tracker = @ptrCast(@alignCast(ctx));
+        tr.output_bytes += bytes.len + 1;
+        tr.tick();
+    }
 
     fn observe(ctx: *anyopaque) void {
         const tr: *Tracker = @ptrCast(@alignCast(ctx));
@@ -152,6 +159,7 @@ const Tracker = struct {
         }
         var value = tr.value.?;
         value.elapsed_ms = elapsed_ms;
+        value.output_bytes = tr.output_bytes;
         const second = value.elapsed_ms / 1000;
         if (tr.last_second == second) return;
         tr.last_second = second;

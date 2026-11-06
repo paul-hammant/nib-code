@@ -19,6 +19,7 @@ pub const ModelActivity = @import("session/events.zig").ModelActivity;
 pub const Sink = struct {
     ctx: *anyopaque,
     emit: *const fn (ctx: *anyopaque, event: Event) anyerror!void,
+    onToolActivity: ?*const fn (ctx: *anyopaque, name: []const u8) anyerror!void = null,
     onModelActivity: ?*const fn (ctx: *anyopaque, activity: ModelActivity) anyerror!void = null,
     onUserInserted: ?*const fn (ctx: *anyopaque, id: u64) anyerror!void = null,
 
@@ -336,6 +337,7 @@ pub const Session = struct {
             const notice = try std.fmt.allocPrint(s.arena.allocator(), "Step limit reached; waiting for background tasks: {s}", .{waited});
             try sink.emit(sink.ctx, .{ .notice = notice });
         }
+        if (waited.len > 0) try sink.modelActivity(.waiting);
         while (s.tools.background.pending(s.io)) {
             if (cancel.load(.acquire)) return error.Canceled;
             try tools.Tools.poll(&s.tools);
@@ -515,6 +517,7 @@ pub const Session = struct {
                 if (s.cfg.limits.max_steps) |max_steps| {
                     if (s.steps >= max_steps) continue;
                 }
+                try sink.modelActivity(.waiting);
                 while (s.inbox.empty(s.io) and s.tools.background.pending(s.io)) {
                     if (cancel.load(.acquire)) return error.Canceled;
                     try tools.Tools.poll(&s.tools);
@@ -543,12 +546,18 @@ pub const Session = struct {
                 f.mutex.lockUncancelable(f.io);
                 defer f.mutex.unlock(f.io);
                 if (f.first_data_ms.* == null) f.first_data_ms.* = @intCast(@max(f.started.untilNow(f.io).raw.toMilliseconds(), 0));
-                try f.sink.modelActivity(.data);
+            }
+            fn onToolArguments(ctx: *anyopaque) !void {
+                const f: *@This() = @ptrCast(@alignCast(ctx));
+                f.mutex.lockUncancelable(f.io);
+                defer f.mutex.unlock(f.io);
+                try f.sink.modelActivity(.script);
             }
             fn onDelta(ctx: *anyopaque, kind: provider.Kind, text: []const u8) !void {
                 const f: *@This() = @ptrCast(@alignCast(ctx));
                 f.mutex.lockUncancelable(f.io);
                 defer f.mutex.unlock(f.io);
+                if (text.len > 0) try f.sink.modelActivity(.data);
                 try (if (kind == .text) &f.partial.text else &f.partial.reasoning).appendSlice(f.gpa, text);
                 if (!f.buffer_text or kind != .text) try f.sink.emit(f.sink.ctx, .{ .delta = .{ .kind = kind, .text = text } });
             }
@@ -581,7 +590,7 @@ pub const Session = struct {
             }
         };
         var fwd: Forward = .{ .sink = sink, .gpa = s.gpa, .partial = partial, .io = s.io, .started = timing.started, .first_data_ms = first_data_ms, .session = s, .buffer_text = buffer_text, .timing = timing };
-        const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .onFallback = Forward.onFallback, .timing = timing, .codex_state = &s.codex_state };
+        const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .onToolArguments = Forward.onToolArguments, .onFallback = Forward.onFallback, .timing = timing, .codex_state = &s.codex_state };
         if (!s.tools.background.anyPending(s.io))
             return provider.complete(s.gpa, s.arena.allocator(), s.client, request_cfg, s.cache_key, messages, prompt.tools_json, null, provider_sink, cancel, detail, attempts, .{ .ctx = &fwd, .onEvent = Forward.onRetry });
         const Request = struct {

@@ -160,7 +160,10 @@ pub fn stream(
                 const p = &calls.items[tc.index];
                 if (tc.id) |s| try p.id.appendSlice(gpa, s);
                 if (tc.function.name) |s| try p.name.appendSlice(gpa, s);
-                if (tc.function.arguments) |s| try p.args.appendSlice(gpa, s);
+                if (tc.function.arguments) |s| {
+                    try p.args.appendSlice(gpa, s);
+                    if (s.len > 0) try sink.toolArguments();
+                }
             }
         }
     }

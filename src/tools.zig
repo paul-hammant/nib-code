@@ -155,8 +155,16 @@ pub const RunScope = struct {
     id: usize,
     cancel: std.atomic.Value(bool) = .init(false),
     llm_calls: std.atomic.Value(usize) = .init(0),
+    active_tools: [all.len]std.atomic.Value(u32) = @splat(.init(0)),
     changes: @import("tools/changes.zig").Tracker = .{},
     fork: ?@import("tools/agent/input.zig").Fork = null,
+
+    pub fn activeTool(scope: *RunScope) []const u8 {
+        for (all, &scope.active_tools) |tool, *count| {
+            if (count.load(.acquire) > 0) return tool.name;
+        }
+        return "";
+    }
 
     pub fn host(scope: *RunScope) sandbox.Host {
         return .{ .ctx = scope, .names = scope.tools.api().names, .call = call, .cancel = &scope.cancel, .admit = admit };
@@ -326,9 +334,15 @@ pub const Tools = struct {
         const t: *Tools = @ptrCast(@alignCast(ctx));
         if (t.forked and std.mem.eql(u8, name, "agent"))
             return fail(gpa, "agent is unavailable inside a forked sub-agent", .{}) catch .{ .err = &.{} };
-        const r = for (all) |tool| {
+        const r = for (all, 0..) |tool, i| {
             if (!enabled(tool, t.depth)) continue;
-            if (std.mem.eql(u8, name, tool.name)) break if (tool.run) |run_tool| run_tool(t, gpa, args) else error.SandboxOnlyTool;
+            if (!std.mem.eql(u8, name, tool.name)) continue;
+            const active = if (t.scope()) |run_scope| &run_scope.active_tools[i] else null;
+            if (active) |count| _ = count.fetchAdd(1, .acq_rel);
+            defer if (active) |count| {
+                _ = count.fetchSub(1, .acq_rel);
+            };
+            break if (tool.run) |run_tool| run_tool(t, gpa, args) else error.SandboxOnlyTool;
         } else fail(gpa, "unknown tool", .{});
         return r catch |err| fail(gpa, "{s}", .{@errorName(err)}) catch .{ .err = &.{} };
     }

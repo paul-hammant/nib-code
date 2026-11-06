@@ -226,6 +226,41 @@ pub const Transcript = struct {
         t.entries.items[t.entries.items.len - 1].run_number = t.next_run;
     }
 
+    fn sameStrings(a: []const []const u8, b: []const []const u8) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+        return true;
+    }
+
+    pub fn progressChanged(t: *const Transcript, p: Progress) bool {
+        for (t.entries.items) |entry| for (entry.agents.items) |old| {
+            if (!std.mem.eql(u8, old.id, p.id) or old.invocation != p.invocation) continue;
+            return old.state != p.state or old.step != p.step or old.output_bytes != p.output_bytes or !sameStrings(old.tools, p.tools) or !sameStrings(old.files, p.files);
+        };
+        return true;
+    }
+
+    pub fn activityDetail(t: *const Transcript, buf: []u8, tool: []const u8) []const u8 {
+        var i = t.entries.items.len;
+        while (i > 0) {
+            i -= 1;
+            const entry = &t.entries.items[i];
+            if (entry.kind != .run) continue;
+            if (entry.run != .running) continue;
+            for (entry.agents.items) |p| {
+                if (p.detached or (p.state != .queued and p.state != .working)) continue;
+                if (!p.background and (tool.len == 0 or std.mem.eql(u8, @tagName(p.kind), tool))) {
+                    const text = std.fmt.bufPrint(buf, "{s} {s}", .{ @tagName(p.kind), promptPrefix(p.prompt) }) catch return tool;
+                    for (text) |*byte| if (byte.* < 0x20 or byte.* == 0x7f) {
+                        byte.* = ' ';
+                    };
+                    return text;
+                }
+            }
+        }
+        return tool;
+    }
+
     pub fn progress(t: *Transcript, gpa: std.mem.Allocator, p: Progress) !void {
         const e = target: {
             for (t.entries.items) |*entry| {
@@ -1300,4 +1335,21 @@ test "background Run notifications and superseded bash stay neutral live and res
     try testing.expectEqualStrings("→ ", t.entries.items[0].segments(&segs)[0].text);
     try testing.expect(std.mem.endsWith(u8, t.entries.items[0].agent_tree.rows.items[0].text, "superseded by b2"));
     try testing.expect(std.mem.endsWith(u8, t.entries.items[1].label.items, "source Run → r3"));
+}
+
+test "elapsed heartbeats do not count as task progress and active tools show commands" {
+    const gpa = testing.allocator;
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    try t.startRun(gpa, "await tools.bash({})");
+    var p: Progress = .{ .id = "b1", .run = 1, .kind = .bash, .prompt = "zig build test", .background = true, .elapsed_ms = 3000 };
+    try t.progress(gpa, p);
+    p.elapsed_ms = 9000;
+    try testing.expect(!t.progressChanged(p));
+    p.output_bytes = 10;
+    try testing.expect(t.progressChanged(p));
+    var buf: [256]u8 = undefined;
+    p.background = false;
+    try t.progress(gpa, p);
+    try testing.expectEqualStrings("bash zig build test", t.activityDetail(&buf, "bash"));
 }

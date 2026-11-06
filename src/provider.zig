@@ -156,7 +156,12 @@ pub const Sink = struct {
     onDelta: *const fn (ctx: *anyopaque, kind: Kind, text: []const u8) anyerror!void,
     monitor: ?*idle.Monitor = null,
     onFallback: ?*const fn (ctx: *anyopaque, info: @import("provider/codex_ws.zig").Info) anyerror!void = null,
+    onToolArguments: ?*const fn (ctx: *anyopaque) anyerror!void = null,
     onData: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+
+    pub fn toolArguments(s: Sink) !void {
+        if (s.onToolArguments) |notify| try notify(s.ctx);
+    }
 
     pub fn fallback(s: Sink, info: @import("provider/codex_ws.zig").Info) !void {
         if (s.onFallback) |notify| try notify(s.ctx, info);

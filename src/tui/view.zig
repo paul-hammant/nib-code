@@ -28,7 +28,7 @@ pub fn draw(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewpo
     var body_h = win.height - input_h - borders - hints - menu_h - activity_h;
     var body = win.child(.{ .x_off = @min(1, win.width - 1), .width = @max(1, win.width -| 2), .height = body_h });
     var top = scroll.layout(entries, body);
-    const actual_h: u16 = @intFromBool(text.format(s, scroll.top != null).len > 0 and win.height > input_h + borders + hints + menu_h);
+    const actual_h: u16 = @intFromBool(text.formatWidth(s, scroll.top != null, win.width -| 2).len > 0 and win.height > input_h + borders + hints + menu_h);
     if (actual_h != activity_h) {
         activity_h = actual_h;
         body_h = win.height - input_h - borders - hints - menu_h - activity_h;
@@ -45,7 +45,7 @@ pub fn draw(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewpo
     }
 
     if (activity_h > 0) {
-        _ = win.child(.{ .x_off = 1, .y_off = body_h, .height = 1 }).printSegment(.{ .text = text.format(s, scroll.top != null), .style = if (s.busy != null) .{ .fg = .{ .index = 3 } } else .{ .dim = true } }, .{ .wrap = .none });
+        _ = win.child(.{ .x_off = 1, .y_off = body_h, .height = 1 }).printSegment(.{ .text = text.formatWidth(s, scroll.top != null, win.width -| 2), .style = if (s.busy != null) .{ .fg = .{ .index = 3 } } else .{ .dim = true } }, .{ .wrap = .none });
     }
     const first = if (menu_sel >= menu_h) menu_sel + 1 - menu_h else 0;
     for (0..menu_h) |i| {
@@ -204,7 +204,7 @@ test "layout snapshots: normal, short, tiny, narrow, menu, busy and history" {
             try testing.expectEqualStrings("╰", screen.readCell(0, if (c.h >= 8) c.h - 2 else c.h - 1).?.char.grapheme);
             try testing.expectEqualStrings("╯", screen.readCell(c.w - 1, if (c.h >= 8) c.h - 2 else c.h - 1).?.char.grapheme);
         } else try testing.expect(std.mem.indexOf(u8, image, "› Message nib") != null);
-        if (c.busy) try testing.expect(std.mem.indexOf(u8, image, "thinking 1s · step 1 · esc to cancel") != null);
+        if (c.busy) try testing.expect(std.mem.indexOf(u8, image, "waiting model · turn 0s · step 1 · esc to cancel") != null);
         if (c.history) try testing.expect(std.mem.indexOf(u8, image, "↑ history · PgDn to return") != null);
         if (c.notice) try testing.expect(std.mem.indexOf(u8, image, "copied 3 chars") != null);
         if (c.menu) try testing.expect(std.mem.indexOf(u8, image, "/help") != null);
