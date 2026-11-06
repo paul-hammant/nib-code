@@ -17,7 +17,7 @@ pub const Ticker = struct {
 
     pub fn work(t: *Ticker) void {
         while (!t.stop.load(.acquire)) {
-            std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(100), .clock = .awake }, t.io) catch return;
+            std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(@import("frames.zig").Frames.interval_ms), .clock = .awake }, t.io) catch return;
             if (t.busy.load(.acquire)) t.loop.postEvent(.tick) catch {};
         }
     }
