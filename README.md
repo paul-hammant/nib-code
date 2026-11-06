@@ -84,7 +84,7 @@ nib ask --json '...'            # NDJSON event stream
 nib replay <session-id> --all    # offline replay
 ```
 
-Type `/` for commands grouped into Send / View / Session, and `/help` for all keys. Select text with the mouse to copy it.
+Type `/` for commands grouped into Send / View / Session, and `/help` for all keys. User messages have a blue accent bar and a subtle background adapted to the terminal theme. Drag to select text and release to copy it; hold the mouse button and scroll to select across screens.
 
 Version 0.4.0. This is a personal project and still changes quickly.
 
