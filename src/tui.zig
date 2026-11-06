@@ -311,10 +311,12 @@ pub const App = struct {
             .delta => |d| {
                 app.live_steps = d.step;
                 if (d.text.len > 0) app.activity.progress(.now(app.io, .awake));
-                if (app.activity.phase != .compacting) app.activity.set(app.io, .writing);
+                if (d.text.len > 0 and app.activity.phase != .compacting) app.activity.set(app.io, status.Activity.deltaPhase(d.kind));
+                if (d.kind == .text and d.text.len > 0) app.transcript.clearRetry(gpa, &app.scroll);
                 try app.transcript.appendDelta(gpa, d.kind, d.text);
             },
             .run_start => |r| {
+                app.transcript.clearRetry(gpa, &app.scroll);
                 app.live_steps = r.step;
                 app.turn_runs += 1;
                 app.activity.tool = "";
@@ -329,7 +331,7 @@ pub const App = struct {
                 try app.transcript.endRunWithSummary(gpa, r.ok, r.output, elapsed, r.changes, r.tool_summary);
             },
             .retry => |msg| {
-                app.transcript.discardAttempt(gpa);
+                try app.transcript.retryAttempt(gpa, &app.scroll);
                 app.activity.set(app.io, .retrying);
                 const line = std.fmt.bufPrint(&app.retry_detail, "{s}", .{msg}) catch app.retry_detail[0..0];
                 app.retry_len = line.len;
@@ -363,6 +365,7 @@ pub const App = struct {
             .turn_end => |summary| app.pending_bill = summary,
             .user_inserted => |id| app.transcript.userInserted(id),
             .done => {
+                app.transcript.clearRetry(gpa, &app.scroll);
                 const canceled = app.turn.?.cancel.load(.acquire);
                 try app.finishTurn();
                 try app.saveReflection();
@@ -378,6 +381,7 @@ pub const App = struct {
                 app.issues = null;
             },
             .failed => |failure| {
+                app.transcript.clearRetry(gpa, &app.scroll);
                 const msg = failure.message;
                 app.stopReflecting();
                 const canceled = app.turn.?.cancel.load(.acquire);
@@ -592,6 +596,7 @@ pub const App = struct {
             .busy = if (app.turn != null) app.activity.label(app.io) else null,
             .notice = app.notice,
             .detail = app.activityDetail(),
+            .revision = app.transcript.revision,
         }, &app.status_text);
         if (app.selection.active and app.selection.history != null) {
             if (app.body) |body| app.scroll.top = body.top;
@@ -1008,4 +1013,30 @@ test "cancel returns queued messages alongside an existing draft" {
     try app.finishQueued(false);
     try std.testing.expectEqualStrings("queued request\n\ndraft", app.input.text());
     try std.testing.expectEqualStrings("1 queued message returned to input", app.transcript.entries.items[0].text.items);
+}
+
+test "stream events distinguish reasoning text and Run arguments through retry" {
+    const t = std.testing;
+    var app: App = undefined;
+    app.gpa = t.allocator;
+    app.io = t.io;
+    app.transcript = .{};
+    defer app.transcript.deinit(t.allocator);
+    app.scroll = .{};
+    app.activity = .start(t.io, .thinking);
+    app.activity.last_progress = app.activity.since.addDuration(.{ .raw = .fromMilliseconds(-45000), .clock = .awake });
+    _ = try app.handle(.{ .delta = .{ .kind = .reasoning, .text = try t.allocator.dupe(u8, "hidden"), .step = 1 } });
+    try t.expectEqual(status.Phase.reasoning, app.activity.phase);
+    try t.expect(app.activity.label(t.io).quiet_ms < 1000);
+    try t.expectEqual(@as(usize, 0), app.transcript.entries.items.len);
+    _ = try app.handle(.{ .delta = .{ .kind = .text, .text = try t.allocator.dupe(u8, "draft"), .step = 1 } });
+    try t.expectEqual(status.Phase.writing, app.activity.phase);
+    _ = try app.handle(.{ .retry = try t.allocator.dupe(u8, "attempt 2/5") });
+    try t.expect(app.transcript.entries.items[0].retry_placeholder);
+    _ = try app.handle(.{ .model_activity = .{ .state = .script, .at = .now(t.io, .awake) } });
+    try t.expectEqual(status.Phase.scripting, app.activity.phase);
+    try t.expect(app.transcript.entries.items[0].retry_placeholder);
+    _ = try app.handle(.{ .delta = .{ .kind = .text, .text = try t.allocator.dupe(u8, "answer"), .step = 1 } });
+    try t.expectEqual(@as(usize, 1), app.transcript.entries.items.len);
+    try t.expectEqualStrings("answer", app.transcript.lastAnswer().?);
 }

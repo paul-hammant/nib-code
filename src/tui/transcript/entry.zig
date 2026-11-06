@@ -23,6 +23,7 @@ pub const Entry = struct {
     user_bg: vaxis.Color = .default,
     queued: ?u64 = null,
     attempt: usize = 0,
+    retry_placeholder: bool = false,
     /// For `.run`: the script.
     text: std.ArrayList(u8) = .empty,
     /// For `.run`: the complete result delivered by Session.

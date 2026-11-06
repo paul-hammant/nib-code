@@ -23,6 +23,7 @@ pub const Transcript = struct {
     /// ctrl+o state; streamed collapsible entries start in it.
     expanded: bool = false,
     attempt: usize = 0,
+    revision: usize = 0,
     next_run: usize = 0,
     pending_results: std.ArrayList(PendingResult) = .empty,
 
@@ -44,6 +45,7 @@ pub const Transcript = struct {
     }
 
     pub fn add(t: *Transcript, gpa: std.mem.Allocator, kind: Kind, text: []const u8) !void {
+        t.revision +%= 1;
         var e: Entry = .{ .kind = kind, .open = t.expanded };
         errdefer e.deinit(gpa);
         try e.text.appendSlice(gpa, text);
@@ -52,6 +54,7 @@ pub const Transcript = struct {
     }
 
     pub fn backgroundResult(t: *Transcript, gpa: std.mem.Allocator, kind: BackgroundKind, id: []const u8, ok: bool, result: []const u8) !void {
+        t.revision +%= 1;
         try t.settleBackgroundProgress(gpa, kind, id, ok);
         if (kind == .run) if (t.backgroundRunEntry(id)) |entry| {
             entry.output.clearRetainingCapacity();
@@ -102,6 +105,7 @@ pub const Transcript = struct {
     }
 
     pub fn lostBackground(t: *Transcript, gpa: std.mem.Allocator, kind: BackgroundKind, id: []const u8, result: []const u8) !void {
+        t.revision +%= 1;
         try t.settleBackgroundProgress(gpa, kind, id, false);
         if (kind == .run) if (t.backgroundRunEntry(id)) |entry| {
             entry.run = .lost;
@@ -214,7 +218,8 @@ pub const Transcript = struct {
     }
 
     pub fn appendDelta(t: *Transcript, gpa: std.mem.Allocator, kind: provider.Kind, text: []const u8) !void {
-        if (kind == .reasoning) return;
+        if (kind == .reasoning or text.len == 0) return;
+        t.revision +%= 1;
         const entry_kind: Kind = .assistant;
         const items = t.entries.items;
         if (items.len == 0 or items[items.len - 1].kind != entry_kind or items[items.len - 1].attempt != t.attempt) try t.entries.append(gpa, .{ .kind = entry_kind, .open = t.expanded, .attempt = t.attempt });
@@ -237,7 +242,50 @@ pub const Transcript = struct {
         }
     }
 
+    pub fn clearRetry(t: *Transcript, gpa: std.mem.Allocator, scroll: *@import("viewport.zig").Viewport) void {
+        var i: usize = 0;
+        while (i < t.entries.items.len) {
+            if (!t.entries.items[i].retry_placeholder) {
+                i += 1;
+                continue;
+            }
+            var removed = t.entries.orderedRemove(i);
+            removed.deinit(gpa);
+            scroll.removed(i);
+            t.revision +%= 1;
+        }
+    }
+
+    pub fn retryAttempt(t: *Transcript, gpa: std.mem.Allocator, scroll: *@import("viewport.zig").Viewport) !void {
+        var kept = false;
+        var i: usize = 0;
+        while (i < t.entries.items.len) {
+            const e = &t.entries.items[i];
+            if (e.retry_placeholder) kept = true;
+            if (e.kind != .assistant or e.attempt != t.attempt) {
+                i += 1;
+                continue;
+            }
+            if (!kept) {
+                e.deinit(gpa);
+                e.* = .{ .kind = .info, .retry_placeholder = true };
+                try e.text.appendSlice(gpa, "Interrupted · retrying");
+                t.revision +%= 1;
+                if (scroll.top) |*top| {
+                    if (top.entry == i) top.row = 0;
+                }
+                kept = true;
+                i += 1;
+            } else {
+                var removed = t.entries.orderedRemove(i);
+                removed.deinit(gpa);
+                scroll.removed(i);
+            }
+        }
+    }
+
     pub fn failure(t: *Transcript, gpa: std.mem.Allocator, message: []const u8, reason: @import("../tools/changes.zig").Recovery.Reason) !void {
+        t.revision +%= 1;
         var e: Entry = .{ .kind = .failure, .open = t.expanded, .run = if (reason == .timeout) .warning else .failed };
         errdefer e.deinit(gpa);
         try e.text.appendSlice(gpa, message);
@@ -256,6 +304,7 @@ pub const Transcript = struct {
     }
 
     pub fn startRunWithEffort(t: *Transcript, gpa: std.mem.Allocator, code: []const u8, effort: ?provider.StepEffort) !void {
+        t.revision +%= 1;
         try t.addRun(gpa, code, t.expanded, effort);
         t.next_run += 1;
         t.entries.items[t.entries.items.len - 1].run_number = t.next_run;
@@ -297,6 +346,7 @@ pub const Transcript = struct {
     }
 
     pub fn progress(t: *Transcript, gpa: std.mem.Allocator, p: Progress) !void {
+        if (t.progressChanged(p)) t.revision +%= 1;
         const e = target: {
             for (t.entries.items) |*entry| {
                 if (entry.kind != .run or (p.run != 0 and entry.run_number != p.run)) continue;
@@ -362,6 +412,7 @@ pub const Transcript = struct {
 
     /// Takes ownership of `changes`; borrows `summary`.
     pub fn endRunWithSummary(t: *Transcript, gpa: std.mem.Allocator, ok: bool, output: []const u8, elapsed_ms: u64, changes: ChangeText, summary: ?ToolSummary) !void {
+        t.revision +%= 1;
         const e = t.lastRunning() orelse {
             var c = changes;
             c.deinit(gpa);
@@ -1557,4 +1608,29 @@ test "foreground command facts remain attached after their Run moves to backgrou
     try testing.expectEqual(@as(usize, 1), e.agents.items.len);
     try testing.expectEqualStrings("  └─ b1 bash zig build test · <1s · failed ✗ exit 1", e.agent_tree.rows.items[0].text);
     try testing.expect(e.hasWarning());
+}
+
+test "retry placeholder survives reasoning and replaces draft without losing history anchor" {
+    const a = testing.allocator;
+    var t: Transcript = .{};
+    defer t.deinit(a);
+    var scroll: @import("viewport.zig").Viewport = .{ .top = .{ .entry = 2, .row = 1 } };
+    t.beginAttempt();
+    try t.appendDelta(a, .text, "failed draft");
+    try t.add(a, .user, "queued");
+    try t.appendDelta(a, .text, "tail");
+    try t.retryAttempt(a, &scroll);
+    try testing.expectEqual(@as(usize, 2), t.entries.items.len);
+    try testing.expectEqualStrings("Interrupted · retrying", t.entries.items[0].text.items);
+    try testing.expect(t.entries.items[0].retry_placeholder);
+    t.beginAttempt();
+    try t.appendDelta(a, .reasoning, "hidden");
+    try t.retryAttempt(a, &scroll);
+    try testing.expectEqual(@as(usize, 2), t.entries.items.len);
+    scroll.top = .{ .entry = 1 };
+    t.clearRetry(a, &scroll);
+    try testing.expectEqual(@as(usize, 0), scroll.top.?.entry);
+    try t.appendDelta(a, .text, "answer");
+    try testing.expectEqualStrings("answer", t.lastAnswer().?);
+    t.clearRetry(a, &scroll);
 }

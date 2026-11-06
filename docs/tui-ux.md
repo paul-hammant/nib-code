@@ -10,9 +10,9 @@ Run 始终保留父标题。自动转后台时显示 `Run · r3 running`；结�
 
 活动行与上方对话之间保留一行空白，历史浏览和临时提示也沿用该留白；终端不足 10 行或正文可用高度不足时收紧，不挤掉输入框。没有活动行时不额外占行。
 
-活动行显示已知阶段：`Waiting for model`、`Generating response`、`Writing Run`、`Running bash zig build test`、`Waiting for r3 · 32s`，并保留整个 Turn 的累计时间。只有有内容的推理、文本、工具参数和工具状态/输出进度会更新最后活动；网络心跳、metadata、usage 和单纯经过的时间都不重置它。超过 30 秒无进展显示 `no progress 30s`，不预测 ETA。窄屏从右往左去掉字段，仍为单行。
+The activity line names known phases: `Waiting for model`, `Thinking` (streaming reasoning), `Generating response` (visible text), `Writing Run`, `Running bash zig build test`, or `Waiting for r3 · 32s`. Turn time accumulates throughout. Nonempty reasoning, text, Run arguments, and task state/output progress reset the progress timer; heartbeats, metadata, usage, and elapsed time do not. After 30s without progress, show `no progress 30s`. Normal activity is dim; retrying and no progress are yellow. History shows `↑ history · PgDn to return`, changing to `New output below · PgDn to return` when content arrives. Preserve the return hint before timing fields on narrow screens.
 
-重试显示 `Retrying · attempt 2/5 · rate limit`，移除失败尝试的流式草稿，保留此前成功的回答和排队插话。最终错误用一句说明加 Details，Ctrl+O 查看原始错误。取消仅显示一次恢复提示；未消费的排队消息回到输入框，已有草稿仍保留，并显示返回的消息数。
+Retries show `Retrying · attempt 2/5 · rate limit`. Remove failed streamed drafts while preserving earlier answers and queued interjections. Leave one dim `Interrupted · retrying` line at the first removed draft until visible output arrives or the Turn finishes. Final failures show a sentence and Details (Ctrl+O). Cancellation keeps the draft and shows one recovery hint; unconsumed queued messages return to the editor with their count.
 
 Turn 失败或取消后显示本轮直接 edit/write 修改的文件及 `type continue to resume`，有直接修改时另提示 `/undo to revert edit/write`。路径按首次修改去重，包括尚未交回 Run 结果的写入；不把子 agent 的修改当作根 Session 的直接修改。若运行过 bash，会注明 `bash changes untracked`；没有记录时显示 `no recorded edit/write changes`。取消不会回滚文件，下一次普通输入继续沿用 Session 上下文。
 
