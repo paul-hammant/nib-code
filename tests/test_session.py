@@ -611,7 +611,7 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
             kept, _ = replay(interrupted_log)
             assert kept[-2] == {"role": "user", "content": "interrupt stalled"}, kept
             assert kept[-1]["content"] == "partial answer\n\n" + marker, kept[-1]
-            assert kept[-1]["reasoning_content"] == "想一想。", kept[-1]
+            assert kept[-1]["reasoning_content"] == "Let me think.", kept[-1]
             ask("after interrupt", "--resume", session_id)
             assert read_requests(requests_path)[-2]["messages"] == kept + [{"role": "user", "content": "after interrupt"}]
         print("Interrupted Turn E2E passed: SIGINT/SIGTERM exit within 2 s during a 30 s stalled read, keep partial text and resume safely")

@@ -3,32 +3,32 @@ status: accepted
 date: 2026-11-01
 ---
 
-# 只暴露 run(code)：模型写 JS，跑在 QuickJS 里
+# Expose only run(code): the model writes JS for QuickJS
 
-模型 API 层面只有一个入口 `run(code)`。所有 Tool（read、bash……）都是 Sandbox 里的函数。系统提示里用合法的 JS 方法签名加注释来说明它们（解构参数带默认值，如 `async read({ path, offset = 1, limit = 2000 })`）；模型写的也是 JS，由内嵌的 QuickJS-ng 执行。
+The model API has one entry point, `run(code)`. All Tools (read, bash, etc.) are functions in the Sandbox. The system prompt describes them with valid JS method signatures and comments (destructured arguments with defaults, e.g. `async read({ path, offset = 1, limit = 2000 })`); models write JS executed by embedded QuickJS-ng.
 
-**为什么：** 代码驱动的主要收益在一次 Run 内部：读、搜、过滤、汇总的中间数据留在 Sandbox 里，只把结果交给模型，上下文不膨胀。选 JS 而非 Python，是因为 QuickJS 是纯 C 库，可以在进程内嵌入，开销很小，默认没有任何宿主能力；`async/await` 和 JSON 原生契合"编排 Tool 调用"。说明和代码用同一种语言：最初用 TS 类型声明描述签名（pi 的做法），但那样一边给 TS、一边要求"别写 TS"，信号自相矛盾，2026-11-01 改为 JS 方法签名。实测（字节数，2026-11-01）：旧 TS 声明 468 字节；JS 签名 441 字节，还多带了默认值等信息。中间试过"每个工具配一行完整调用示例"的写法，589 字节，偏长，弃用。说明是否合法由测试用 QuickJS 解析来保证。
+**Why:** Code-driven execution mainly helps within a Run: intermediate read/search/filter/aggregation data stays in the Sandbox and only results reach the model, avoiding context growth. JS was chosen over Python because QuickJS is a low-overhead pure C library embedded in-process, without host capabilities by default; async/await and JSON naturally fit Tool orchestration. Descriptions and code use the same language: initial TS declarations (pi's approach) gave contradictory signals by showing TS while forbidding it, so changed to JS method signatures on 2026-11-01. Measured bytes that day: old TS declarations 468; JS signatures 441 with extra default-value information. An intermediate full-call-example-per-tool form used 589 bytes and was discarded as too long. Tests parse descriptions with QuickJS to ensure validity.
 
-**数据与展示的边界：** 工具返回给 JS 的是完整数据，保护模型上下文的截断只发生在 Session 把 Run 输出交给模型的那一步：`tools.truncateMiddle` 保留首尾合计约 16 KiB。不能在 read/bash 返回值里做中间截断或加入提示文本；JS 会把这些返回值用于替换和写回，展示用的省略标记会变成文件内容，造成不可逆的数据损坏。
+**Data/display boundary:** Tools return complete data to JS; context-protecting truncation occurs only when Session delivers Run output to the model: `tools.truncateMiddle` retains about 16 KiB total head/tail. Never middle-truncate read/bash results or insert notices: JS uses them for replacement/writeback, turning display markers into file contents and causing irreversible corruption.
 
-- `read({ path, offset = 1, limit = 2000 })` 返回 `{ text, next_offset }`，text 是所请求行的原文，保留换行；有后续行时 next_offset 是下一页的 1-based 行号，否则为 null。16 MiB 文件大小上限不变，分页信息不进入 text。
-- `bash` 仍返回 `{ exit_code, output }`，output 完整返回；超过 16 MiB 则终止进程组并报错，要求把输出重定向到文件，不返回部分成功结果。
-- 明确约定的有界结果不等于完整正文：grep 的 500 字节行限制保留，grep/glob 的结果数量限制由 truncated 标明；fetch 保留 1 MiB 文本上限，返回独立的 `truncated` 布尔值，不往 text 里插标记。下载超过 5 MiB 报错。脚本应检查完整性再使用这些结果。
+- `read({ path, offset = 1, limit = 2000 })` returns `{ text, next_offset }`, preserving requested lines and newlines. next_offset is the next page's 1-based line number, or null at EOF. The 16 MiB file limit is unchanged; pagination stays outside text.
+- `bash` still returns `{ exit_code, output }` with complete output; beyond 16 MiB it terminates the process group and errors, asking for output redirection to a file rather than returning partial success.
+- Explicitly bounded results differ from full content: grep keeps its 500-byte line limit; grep/glob flag result-count limits with truncated; fetch keeps its 1 MiB text limit with a separate `truncated` boolean, without text markers. Downloads over 5 MiB error. Scripts should check completeness before using results.
 
-**参考（来源与把握）：**
-- pi codemode：QuickJS（wasm），签名用 TS 声明（一手：本地源码 `pi/packages/codemode`）
-- jcode codemode：rquickjs 内嵌（一手：本地源码 `jcode/crates/jcode-codemode`）
-- prime-agent：唯一工具 `python_repl`，常驻 CPython（一手：本地源码 `pa-core/src/prompts/layers/core.md`）
-- DeepSeek Harness 的 PTC：只暴露 `run_code`，每段程序起一个新 Node 进程，后来删除了"原生调用和 PTC 混用"的模式（**二手**：第三方博客 redreamality.com，未经官方核实）
+**References (sources and confidence):**
+- pi codemode: QuickJS (wasm), TS signatures (primary: local `pi/packages/codemode` source).
+- jcode codemode: embedded rquickjs (primary: local `jcode/crates/jcode-codemode` source).
+- prime-agent: sole tool `python_repl`, persistent CPython (primary: local `pa-core/src/prompts/layers/core.md` source).
+- DeepSeek Harness PTC: only `run_code`, fresh Node process per program, later removed mixed native/PTC mode (**secondary**: third-party redreamality.com blog, not officially verified).
 
-**把握程度：**
-- 实测：QuickJS 嵌入、内存上限、无宿主能力、顶层 await、工具调用、超时中断（`src/sandbox.zig` 中的测试）；完整的"模型调用 run → 执行 → 结果回传 → 回答"循环，用本地模拟服务器跑通（2026-11-01）。
-- 实测：如果脚本里出现 TS 语法，QuickJS 的报错（如 `missing initializer for variable`）看不出原因。曾为此对 SyntaxError 加过提示，改用 JS 说明后撤掉了：先看真实模型是否还会写出 TS，有证据再加。
-- 实测（2026-11-01，deepseek-chat，1 个任务："列出 /tmp 下最大的 5 个文件"）：5 段脚本全部是合法 JS，没有出现 TS 语法；最后一步输入 1848 token，其中 1664 命中缓存（约 90%）。样本太小，只能算初步证据。
-- 观察：这个任务里模型几乎只用 `tools.bash` + `console.log`，排序过滤都交给 shell 管道，也没有把多步合并进一段脚本，而是分 5 次 Run 逐步试探。"代码驱动能减少步数"在这个例子里没有体现，需要用更复杂的编码任务再看。
-- 推测，未实测：简单操作用 PTC 方式的整体 token 开销是否可接受（当时只记录了最后一步的用量；之后改为按 Turn 累计）。
+**Confidence:**
+- Measured: embedded QuickJS, memory limits, absent host capabilities, top-level await, Tool calls, timeout interruption (`src/sandbox.zig` tests); complete model run call → execution → result return → answer loop passed local mocks (2026-11-01).
+- Measured: QuickJS errors for TS syntax (e.g. `missing initializer for variable`) do not explain the cause. A SyntaxError hint was added then removed after switching to JS descriptions: observe whether real models still write TS before adding it back.
+- Measured (2026-11-01, deepseek-chat, one task: list the 5 largest files under /tmp): all 5 scripts were valid JS without TS syntax; last-Step input 1848 tokens, 1664 cached (about 90%). Too small a sample for more than preliminary evidence.
+- Observation: the model mostly used `tools.bash` + `console.log`, delegating sorting/filtering to shell pipelines and probing through 5 Runs rather than combining Steps. This example did not demonstrate fewer Steps from code-driven execution; assess more complex coding tasks.
+- Inference, unmeasured: whether overall PTC token overhead for simple operations is acceptable (only final-Step usage was recorded then; later changed to Turn accumulation).
 
-**何时重新考虑：**
-- 实测发现模型频繁写出 TS 语法或其他 QuickJS 不支持的语法，且看到报错后仍无法自我修正：先考虑给 SyntaxError 加提示，再考虑执行前剥离类型；
-- 简单操作的 token 开销明显高于原生 tool calling：可以考虑为少数高频 Tool 恢复原生调用（混合模式）；
-- 需要 Python 生态的任务占比很高：可以考虑把 Python 作为第二种运行时（经同一套 Tool 管线）。
+**When to reconsider:**
+- Models frequently produce TS or other unsupported syntax and cannot self-correct from errors: consider SyntaxError hints first, then pre-execution type stripping;
+- Simple-operation token overhead is materially higher than native tool calling: consider native calls for a few frequent Tools (hybrid mode);
+- Python-ecosystem tasks become common: consider Python as a second runtime through the same Tool pipeline.

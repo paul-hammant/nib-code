@@ -78,4 +78,4 @@ nib runs model-written code with your permissions. bash refuses obviously destru
 
 ## More
 
-[Docs](docs/README.md) (Chinese) · [Providers](docs/providers.md) · [Config](docs/config.md) · [Releases](docs/releases/) · [MIT](LICENSE)
+[Docs](docs/README.md) · [Providers](docs/providers.md) · [Config](docs/config.md) · [Releases](docs/releases/) · [MIT](LICENSE)

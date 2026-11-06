@@ -1,53 +1,53 @@
 # nibcode
 
-用 Zig 0.17 写的编码 agent，命令名 `nib`。
+A coding agent written in Zig 0.17, with command name `nib`.
 
-## 常用命令
+## Common commands
 
-- 构建：`zig build`；测试：`zig build test --summary all`；端到端（本地 mock，无真实 key）：`zig build` 后 `python3 tests/test_skills.py`、`python3 tests/test_session.py`、`python3 tests/test_agent.py`、`python3 tests/test_agent_reuse.py`、`python3 tests/test_agent_fork.py`、`python3 tests/test_background_agent.py`、`python3 tests/test_background_bash.py`、`python3 tests/test_background_run.py`、`python3 tests/test_codex.py`、`python3 tests/test_providers.py`、`python3 tests/test_codex_websocket.py`、`python3 tests/test_llm.py`、`python3 tests/test_stats.py`、`python3 tests/test_effort.py`、`python3 tests/test_interjections.py`、`python3 tests/test_limits.py`、`python3 tests/test_replay.py`、`python3 tests/test_stream_idle.py`、`python3 tests/test_files.py`、`python3 tests/test_cli.py`、`python3 tests/test_undo.py`、`python3 tests/test_tui_mouse.py`、`python3 tests/test_model.py`、`python3 tests/test_tui_stream.py`
-- 安装到 `~/.local/bin/nib`：`zig build -Doptimize=ReleaseFast --prefix ~/.local`；版本号在 `build.zig.zon`，`nib --version` 查看。
-- TUI `/model` 选择并保存服务与模型；已有 Steps 时自动新建会话。
-- 运行：`./zig-out/bin/nib`（TUI）、`nib ask '<prompt>'`、`nib js '<code>'`；TUI 用 `/compact` 手动压缩上下文。
-- 恢复：`nib -c` / `nib --continue`；`nib --resume <32位小写十六进制ID>`。`ask` 同样支持，选项可放在 prompt 前后。
-- 统计：`python3 scripts/stats.py [日志文件或目录] [--since YYYY-MM-DD] [--cwd 目录] [--group-by version|system|patches] [--json]`。
-- 反思：TUI `/reflect [focus]`（会自动发布 issue，开关与安全边界见 [docs/reflect.md](docs/reflect.md)）。
-- 发布：更新版本和 release notes 后推送 tag，见 [docs/releasing.md](docs/releasing.md)。
+- Build: `zig build`; tests: `zig build test --summary all`; end-to-end (local mocks, no real keys): after `zig build`, run `python3 tests/test_skills.py`, `python3 tests/test_session.py`, `python3 tests/test_agent.py`, `python3 tests/test_agent_reuse.py`, `python3 tests/test_agent_fork.py`, `python3 tests/test_background_agent.py`, `python3 tests/test_background_bash.py`, `python3 tests/test_background_run.py`, `python3 tests/test_codex.py`, `python3 tests/test_providers.py`, `python3 tests/test_codex_websocket.py`, `python3 tests/test_llm.py`, `python3 tests/test_stats.py`, `python3 tests/test_effort.py`, `python3 tests/test_interjections.py`, `python3 tests/test_limits.py`, `python3 tests/test_replay.py`, `python3 tests/test_stream_idle.py`, `python3 tests/test_files.py`, `python3 tests/test_cli.py`, `python3 tests/test_undo.py`, `python3 tests/test_tui_mouse.py`, `python3 tests/test_model.py`, `python3 tests/test_tui_stream.py`
+- Install to `~/.local/bin/nib`: `zig build -Doptimize=ReleaseFast --prefix ~/.local`; version in `build.zig.zon`; view with `nib --version`.
+- TUI `/model` selects and saves the service and model; automatically starts a new Session if Steps already exist.
+- Run: `./zig-out/bin/nib` (TUI), `nib ask '<prompt>'`, `nib js '<code>'`; use `/compact` in the TUI to compact context manually.
+- Resume: `nib -c` / `nib --continue`; `nib --resume <32-character-lowercase-hex-ID>`. Also supported by `ask`; options may precede or follow the prompt.
+- Statistics: `python3 scripts/stats.py [log-file-or-directory] [--since YYYY-MM-DD] [--cwd directory] [--group-by version|system|patches] [--json]`.
+- Reflection: TUI `/reflect [focus]` (publishes issues automatically; see [docs/reflect.md](docs/reflect.md) for the switch and safety boundaries).
+- Release: update the version and release notes, then push a tag; see [docs/releasing.md](docs/releasing.md).
 
-## 按需参考
+## References as needed
 
-- 技能发现、格式、优先级与恢复行为：[docs/skills.md](docs/skills.md)。
+- Skill discovery, format, precedence, and resume behavior: [docs/skills.md](docs/skills.md).
 
-- 修改 TUI、CLI 帮助或固定文案时，先读 [docs/ui-style.md](docs/ui-style.md)。
+- Before changing the TUI, CLI help, or fixed text, read [docs/ui-style.md](docs/ui-style.md).
 
-- provider、凭证、effort、配置与环境变量：[docs/config.md](docs/config.md)、[docs/providers.md](docs/providers.md)、[docs/codex.md](docs/codex.md)、[ADR 0011](docs/adr/0011-provider-wire-protocols.md)。
-- `ask --json` 的 NDJSON 格式：[docs/ask-json.md](docs/ask-json.md)。
-- 会话日志、恢复/取消语义、计时字段与统计口径：[docs/session-log.md](docs/session-log.md)。
-- `tools.llm({ prompt, input, schema, model, effort }) → { text, data, usage }`；`tools.agent({ prompt, resume?: string, fork?: boolean, timeout_ms, model, effort, background }) → { ok, id, text, usage, changes, error? }`（resume 使用当前父会话的 agent 任务 id，如 `a1`；接续沿用 `a1`，不分配新 id，前台结果、后台启动和完成、progress/tree 均使用该 id；同一 agent 一次只允许一个在途调用，busy、不存在或非本会话 agent 均返回 `ok:false`；不暴露内部子会话 ID；子会话失败为数据，仅参数错误/用户取消 reject；usage/changes 仅本次，changes 仅 edit/write）；agent 和 bash 传 `background: true` 时，成功登记后立即返回 `{ id }`，结果在之后的 Step 作为消息插入，agent 结果含同一 id：[接口、限额、用量与取消](docs/tool-delegation.md)。
+- Providers, credentials, effort, configuration, and environment variables: [docs/config.md](docs/config.md), [docs/providers.md](docs/providers.md), [docs/codex.md](docs/codex.md), [ADR 0011](docs/adr/0011-provider-wire-protocols.md).
+- NDJSON format for `ask --json`: [docs/ask-json.md](docs/ask-json.md).
+- Session logs, resume/cancellation semantics, timing fields, and measurement definitions: [docs/session-log.md](docs/session-log.md).
+- `tools.llm({ prompt, input, schema, model, effort }) → { text, data, usage }`; `tools.agent({ prompt, resume?: string, fork?: boolean, timeout_ms, model, effort, background }) → { ok, id, text, usage, changes, error? }` (resume uses an agent task id from the current parent Session, e.g. `a1`; continuation keeps `a1` without allocating a new id; foreground results, background starts/completions, and progress/tree all use that id. Only one in-flight call per agent; busy, missing, or foreign-Session agents return `ok:false`. Internal child-Session IDs are not exposed. Child-Session failures are data; only argument errors/user cancellation reject. usage/changes cover this call only; changes include only edit/write). With `background: true`, agent and bash return `{ id }` immediately after successful registration; results arrive as messages in later Steps, with the same id for agent results: [interfaces, limits, usage, and cancellation](docs/tool-delegation.md).
 
-## 代码地图
+## Code map
 
-目录按 [CONTEXT.md](CONTEXT.md) 的概念划分。`x.zig` 是该部分的入口和对外接口，`x/` 放它的内部实现；新代码放进所属概念的目录，不再往 `src/` 顶层平铺。
+Directories follow the concepts in [CONTEXT.md](CONTEXT.md). `x.zig` is a concept's entry point and public interface; `x/` holds its internals. Put new code in its concept's directory rather than adding files at the top of `src/`.
 
-- `src/main.zig`：命令行入口，分派到 TUI、`ask`、`js`、`replay`。
-- `src/replay.zig`：`nib replay`，从主日志和 calls 录制定位 Run 并离线重放（见 [docs/replay.md](docs/replay.md)）。
-- `src/config.zig`：解析 `NIB_HOME/config.toml`、合并环境配置、解析用户目录与原子写回 effort、技能开关。
-- `src/session.zig`：Session 引擎（Turn/Step 主循环、模型请求、取消）；`session/` 下：`prompt.zig`（system 模板、提示补丁、实验标签、Step 预算文字、run 工具 schema）、`compact.zig`（上下文压缩与 token 估算）、`run.zig`（执行一次 Run 并转发事件）、`run_job.zig`（独立 Run 执行状态，工具等待超阈值后由 Background 持有）、`skills.zig`（技能发现、frontmatter 与 system 索引）、日志、指令拼接、事件、Run 输出格式化。
-- `src/provider.zig`：Provider 接口与配置；`provider/` 下 `responses.zig` 共享 Responses 与 Codex 认证/WS 扩展，`openai.zig` 实现 Chat Completions，`anthropic.zig` 实现 Messages；其余包括 SSE 解析及 `codex_ws.zig`（Session 续接状态）、`websocket.zig`（帧与连接）；Codex 默认 WebSocket，握手/协议失败后本 Session 降级 SSE。`provider/timing.zig` 只负责 run 参数到达进度采样；首个接收活动时间由 Session 复用 Sink.onData 记录。
-- `src/sandbox.zig`：对外类型、JS prelude 与 `eval`；`sandbox/scheduler.zig` 是 Run 的调度器（工具线程、`tools.sleep(ms)` 原生计时器、结算出口；语义见 [docs/run-output.md](docs/run-output.md)），`sandbox/native.zig` 是注册给 QuickJS 的原生函数与 JS 值转换；`sandbox/console.zig` 捕获有界 console 首尾，`sandbox/timing.zig` 在原生工具调度/完成路径记录 Run 内工具调用耗时与结果字节数；`sandbox/record.zig` 在同一个结算出口录制工具参数和结果，`sandbox/replay.zig` + `sandbox/virtual.zig` 用录制结果代替真实工具执行。
-- `src/tools.zig`：工具表（给模型看的 JS 说明集中在这里）、`Tools` 共享状态与调度。`tools/` 下每个工具族一个入口文件，函数名即工具名：`files.zig`（read/edit/write）、`search.zig`（grep/glob）、`web.zig`（fetch）、`bash.zig` + `bash/registry.zig`（同 Session 修改后重跑相同 command/cwd，取代更早 Run 的活动 bash，返回 `{superseded_by}`）、`stop.zig`（按 id 和 reason 停止后台任务）、`agent.zig`、`llm.zig`（进程内单步纯模型调用，限额也集中在这里）、`background.zig`（后台 agent/bash/Run 任务，由 Session 持有，跨 Run 存活）；其余是它们的辅助模块。加工具：在 `tools/` 写入口函数，再在表里加一行。
-- `src/tui.zig`：TUI 事件循环（按键、Session 事件、渲染）；`tui/` 下：`turn.zig`（在后台线程运行 Turn 或 `/compact`，把 Session 事件转成 UI 事件）、`transcript.zig`（对话模型；`transcript/` 下是条目绘制、标题与预览文字、diff 文本）、`agent_tree.zig`（Run 下方的子 agent/后台任务状态树）、`viewport.zig`（滚动锚定）、`view.zig`（一帧的布局绘制）、`status.zig`（活动行与下边框元数据）、`menu.zig`（`/` 候选菜单）、`commands.zig`（指令表、解析与执行）、`reflect.zig` + `reflect.md`（/reflect 的提示词、reflections.md 追加与 issue 自动发布）、`editor.zig`（输入框、原子粘贴块与进程内草稿历史）、`long_text.zig`（长文本阈值与计数）、`markdown.zig`、`selection.zig`（鼠标选区、高亮与剪贴板复制）。
-- `tests/`：端到端测试和 mock 服务器；`scripts/`：辅助脚本。
+- `src/main.zig`: CLI entry point; dispatches to TUI, `ask`, `js`, and `replay`.
+- `src/replay.zig`: `nib replay`, locating Runs in the main log and calls recordings for offline replay (see [docs/replay.md](docs/replay.md)).
+- `src/config.zig`: parses `NIB_HOME/config.toml`, merges environment configuration, resolves the user directory, and atomically persists effort and skill switches.
+- `src/session.zig`: Session engine (Turn/Step loop, model requests, cancellation). In `session/`: `prompt.zig` (system template, prompt patches, experiment tags, Step-budget text, run tool schema), `compact.zig` (context compaction and token estimates), `run.zig` (executes one Run and forwards events), `run_job.zig` (independent Run execution state, held by Background after tool waits exceed the threshold), `skills.zig` (skill discovery, frontmatter, system index), plus logs, instruction assembly, events, and Run output formatting.
+- `src/provider.zig`: Provider interface and configuration. In `provider/`, `responses.zig` shares Responses and Codex authentication/WS extensions, `openai.zig` implements Chat Completions, and `anthropic.zig` implements Messages. Others include SSE parsing, `codex_ws.zig` (Session continuation state), and `websocket.zig` (frames and connections). Codex defaults to WebSocket and falls back to SSE for the Session after handshake/protocol failure. `provider/timing.zig` only samples run-argument arrival progress; Session reuses Sink.onData to record the first receive activity.
+- `src/sandbox.zig`: public types, JS prelude, and `eval`. `sandbox/scheduler.zig` schedules Runs (tool threads, native `tools.sleep(ms)` timers, settlement exit; semantics in [docs/run-output.md](docs/run-output.md)); `sandbox/native.zig` registers native functions with QuickJS and converts JS values; `sandbox/console.zig` captures bounded console head/tail; `sandbox/timing.zig` records tool-call durations and result bytes during native scheduling/completion; `sandbox/record.zig` records tool arguments/results at the same settlement exit; `sandbox/replay.zig` + `sandbox/virtual.zig` substitute recorded results for real tool execution.
+- `src/tools.zig`: tool table (central JS descriptions for the model), shared `Tools` state, and dispatch. One entry file per tool family under `tools/`, with function names matching tool names: `files.zig` (read/edit/write), `search.zig` (grep/glob), `web.zig` (fetch), `bash.zig` + `bash/registry.zig` (rerunning identical command/cwd after changes in the same Session supersedes active bash from earlier Runs, returning `{superseded_by}`), `stop.zig` (stops background tasks by id and reason), `agent.zig`, `llm.zig` (in-process single-step pure model calls and centralized limits), `background.zig` (Session-owned background agent/bash/Run tasks surviving across Runs); others support these modules. To add a tool, write its entry function in `tools/` and add one table row.
+- `src/tui.zig`: TUI event loop (keys, Session events, rendering). In `tui/`: `turn.zig` (runs Turn or `/compact` on a background thread, converts Session events to UI events), `transcript.zig` (conversation model; `transcript/` holds entry drawing, titles/previews, diff text), `agent_tree.zig` (subagent/background task status tree below Runs), `viewport.zig` (scroll anchoring), `view.zig` (frame layout/drawing), `status.zig` (activity line and bottom-border metadata), `menu.zig` (`/` completion menu), `commands.zig` (command table, parsing, execution), `reflect.zig` + `reflect.md` (/reflect prompt, reflections.md appending, automatic issue publication), `editor.zig` (input, atomic paste blocks, in-process draft history), `long_text.zig` (long-text thresholds/counts), `markdown.zig`, `selection.zig` (mouse selection, highlighting, clipboard copying).
+- `tests/`: end-to-end tests and mock servers; `scripts/`: helper scripts.
 
-## 工具与代码约定
+## Tool and code conventions
 
-工具返回给 JS 的是完整数据，不能为保护模型上下文而悄悄截断或往正文里添加提示；否则 `read → JS 替换 → write` 会把截断标记写回文件，造成数据损坏。模型侧整个 Run 共用展示预算（默认 16 KiB，可配置），不改变 Run 内的数据；工具显式分页/有界结果、console 捕获上限及 Run 执行超时见 [docs/run-output.md](docs/run-output.md)。
+Tools return complete data to JS. Never silently truncate it or insert notices into content to protect model context: `read → JS replacement → write` would write truncation markers back into files, corrupting data. The whole Run shares a model-side display budget (default 16 KiB, configurable), without changing data inside the Run. See [docs/run-output.md](docs/run-output.md) for explicit tool pagination/bounds, console capture limits, and Run execution timeouts.
 
-搜索优先用 tools.grep/tools.glob，不在 bash 里调 rg/find/grep。写包含反引号、`${` 或反斜杠的文件/命令文本时，用 JSON 转义的双引号 JS 字符串，不用模板字符串或 String.raw；工具表的示例由 sandbox 测试逐字节验证。
+Prefer tools.grep/tools.glob for searches rather than rg/find/grep in bash. For file/command text containing backticks, `${`, or backslashes, use JSON-escaped double-quoted JS strings, not template strings or String.raw; sandbox tests verify tool-table examples byte for byte.
 
-**代码的读者是 agent。** 不写复述代码、解释思路或记录改动历史的注释；过时的注释比没有注释更容易误导模型。只在代码表达不了、不知道就会改错的地方写一行：外部限制、协议怪癖、内存归属、并发不变量。含义靠命名、类型和测试承载；给人看的解释写进 `docs/`。
+**Agents are the code's readers.** Avoid comments that restate code, explain thought processes, or record change history; stale comments mislead models more than absent comments. Write one line only where code cannot express information whose absence would cause incorrect changes: external limits, protocol quirks, memory ownership, concurrency invariants. Convey meaning through names, types, and tests; put explanations for people in `docs/`.
 
-术语见 [CONTEXT.md](CONTEXT.md)，决策记录见 [docs/adr/](docs/adr/)。
+Terminology: [CONTEXT.md](CONTEXT.md); decision records: [docs/adr/](docs/adr/).
 
-**文档是参考，不是规则。** 读到的 ADR 与代码、实测或更好的方案冲突时，指出来并更新文档，不要为了迁就文档而迁就代码。详见 [docs/README.md](docs/README.md)。
+**Documentation is reference, not rules.** If an ADR conflicts with code, measurements, or a better solution, identify the conflict and update the documentation; do not bend code to fit docs. See [docs/README.md](docs/README.md). All content published on GitHub is in English, except the deliberate `README.zh-CN.md` translation and intentional Unicode test fixtures.
 
-新会话按基础指令、全局 `$NIB_HOME/AGENTS.md`（默认 `~/.nib/AGENTS.md`）、项目 `AGENTS.md` 的顺序拼接 system，后者优先。项目目录是从 cwd 向上遇到的第一个 `.git` 标记所在目录；没有则用 cwd。只读取 `AGENTS.md`。恢复会话沿用日志中的原始 system，之后修改指令文件只影响新会话。
+New Sessions assemble system from base instructions, global `$NIB_HOME/AGENTS.md` (default `~/.nib/AGENTS.md`), then project `AGENTS.md`; later instructions take precedence. The project directory is the first ancestor of cwd with a `.git` marker, or cwd if none exists. Read only `AGENTS.md`. Resumed Sessions retain the original system from the log; subsequent instruction-file changes affect new Sessions only.

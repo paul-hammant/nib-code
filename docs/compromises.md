@@ -1,41 +1,41 @@
-# 妥协登记表
+# Compromise register
 
-原则见 [README.md](README.md#立足当下面向未来)。这里登记的每一项都是为当下做的妥协，不是设计本身。新增妥协先登记；删除条件满足时删掉代码，并在这里划掉。
+See [README.md](README.md#grounded-in-the-present-ready-for-the-future) for principles. Each item is a compromise for current conditions, not part of the design itself. Register new compromises first; when removal conditions hold, delete the code and strike out the entry.
 
-## 模型补丁
+## Model patches
 
-提示词里的补丁集中在 `src/session/prompt.zig` 的 `patches`，设置 `NIB_PATCHES_OFF=<id,...|all>` 可以关闭（子会话继承环境变量）。验证方法：关闭一段时间，再用 `scripts/stats.py --since` 和开启时的同期数据对比观察信号。
+Prompt patches are centralized in `src/session/prompt.zig`'s `patches`; disable with `NIB_PATCHES_OFF=<id,...|all>` (child Sessions inherit the variable). Verification: disable temporarily, then compare signals using `scripts/stats.py --since` against comparable enabled-period data.
 
-| id / 名称 | 位置 | 原因 | 观察信号 | 删除条件 |
+| id / name | Location | Reason | Signal | Removal condition |
 |---|---|---|---|---|
-| `json-escape` | 系统提示 Writing scripts | 模型在写含反引号、`${`、反斜杠的文本时，常用模板字符串导致 SyntaxError 或内容被改写 | stats 错误分类 `js_syntax` | 关闭后 `js_syntax` 没有明显上升 |
-| `no-shell-search` | 系统提示 Writing scripts | 最初因 rg 未安装、调用报 127 而加；2026-11-03 已安装 ripgrep，现在只剩"推荐结构化结果、跳过凭证文件"这层理由 | bash 中 rg/grep 的使用次数、Run 内解析文本出错的次数、tools.grep 使用量 | 关闭后模型能在 rg 与 tools.grep 间合理选择，且解析出错没有明显上升；删除时把 tools.grep 的优势作为事实写进说明 |
-| `expected-continuation` | 系统提示 Writing scripts | 前一 Run 成功后，模型仍用下一 Step 做可预期的检查或读日志，浪费一次模型往返 | stats `round_trips.mechanical_followups` 的 Step/时间占比；用 `--group-by patches` 对比 `none` 和 `["expected-continuation"]`（后者表示关闭），并保持其他关闭补丁相同 | 关闭补丁时，机械收尾 Step 占比与开启时没有明显差别，说明模型已不需要这条提示 |
-| reflect 只报有证据的问题 | `src/tui/reflect.md` | 担心模型为完成反思而凑问题；草稿会自动公开发布 | 自动提交的 issue 中被关闭为无效或重复的比例 | 门槛措辞进一步精简后，误报率不上升（只能改模板验证，无开关） |
+| `json-escape` | System prompt, Writing scripts | Models often use template strings for text containing backticks, `${`, or backslashes, causing SyntaxError or altered content | stats error category `js_syntax` | Disabling causes no material increase in `js_syntax` |
+| `no-shell-search` | System prompt, Writing scripts | Originally added because rg was absent and returned 127; ripgrep was installed on 2026-11-03, leaving only structured results and credential skipping as reasons | rg/grep bash calls, Run text-parsing errors, tools.grep usage | Disabled models choose reasonably between rg and tools.grep without materially more parsing errors; on removal, describe tools.grep's benefits as facts |
+| `expected-continuation` | System prompt, Writing scripts | After successful Runs, models spend another Step on predictable checks/log reads, wasting a model round trip | Step/time share in stats `round_trips.mechanical_followups`; compare `none` with `["expected-continuation"]` (disabled) via `--group-by patches`, keeping other disabled patches identical | Disabled mechanical follow-up Step shares differ little from enabled shares, indicating the hint is no longer needed |
+| Reflect reports evidence-backed problems only | `src/tui/reflect.md` | Concern that models invent problems to fulfill reflection; drafts publish automatically | Fraction of automatically submitted issues closed as invalid or duplicate | Further simplifying threshold wording does not increase false positives (template edits only; no switch) |
 
-### expected-continuation 基线与测量
+### expected-continuation baseline and measurement
 
-实现复核后、启用新补丁前，在本机 `~/.nib/sessions` 执行 `python3 scripts/stats.py --json`：180 个会话（含子会话）、3404 个 Step；成功后的相邻候选 Step 共 2849 个，机械收尾 **442/2849 = 15.51%**，候选 Step 时间 **4,425,959/68,366,301 ms = 6.47%**（2849 个候选均有计时）。样本来源为完整录制 1592、静态提取 1257、混合 0；命中来源分别为 280、162、0。这里用前一步至少一个 Run 且全部显式成功的同 Turn 相邻 Step 作分母，不是全部 Step；取消、过滤与压缩替换均断开配对。
+After implementation review and before enabling the patch, `python3 scripts/stats.py --json` on local `~/.nib/sessions` found 180 Sessions (including children), 3404 Steps; 2849 adjacent candidate Steps after success, with mechanical follow-ups **442/2849 = 15.51%** and candidate-Step time **4,425,959/68,366,301 ms = 6.47%** (all 2849 candidates timed). Sample sources: complete recordings 1592, static extraction 1257, mixed 0; hit sources 280, 162, 0 respectively. Denominator: adjacent same-Turn Steps whose predecessor has at least one Run and all Runs explicitly succeeded, not all Steps; cancellation, filtering, and compaction replacements break pairs.
 
-测量命令：`python3 scripts/stats.py --since YYYY-MM-DD --group-by patches`（可加 `--json`）。指标复用写→仅验证的保守分类器，完整录制优先取实际工具及 `args.command`，否则回退静态提取；仅 bash/read 且全部 bash 属验证/状态检查才命中。动态静态提取不明、复合 shell、重定向、git merge 等不命中，因此此基线与手算的 316/1757（约 18%、时间约 16%）不完全同口径，历史样本范围也不同。时间占比分母是有 `ms` 的候选 Step 总时长，不是模型时间。旧日志/分组差异只能作观察信号，不直接解释为补丁的因果效果。
+Measure with `python3 scripts/stats.py --since YYYY-MM-DD --group-by patches` (optionally `--json`). Reuse the conservative write-to-validation classifier, preferring actual tools and `args.command` from complete recordings, otherwise static extraction. Hits require only bash/read with all bash commands validating/checking status. Unclear dynamic/static extraction, compound shell, redirects, and git merge do not hit. Thus this baseline differs from manually counted 316/1757 (about 18%, about 16% of time), including different historical sample scope. Time-share denominator is total candidate-Step duration with `ms`, not model time. Old-log/group differences are signals, not direct causal evidence of patch effects.
 
-## 实现妥协
+## Implementation compromises
 
-| 名称 | 位置 | 原因 | 删除条件 |
+| Name | Location | Reason | Removal condition |
 |---|---|---|---|
-| 子 agent 深度上限 1 | `src/tools.zig`（agent 仅根会话可用） | 没有成本预算机制时，防止递归派生失控 | 有按预算限制的机制后改为预算 |
-| `/undo` 不跨 Session 实例恢复 | `src/tools/undo.zig`、`src/session.zig` | 撤销栈只在进程内持有，避免重启后误用中断或旧版本快照 | 有已提交 Turn/撤销事务的持久索引与崩溃恢复后再加载快照 |
-| 流式响应空闲超时通过替换 HTTP 连接底层 reader 的 Io vtable 实现 | `src/provider/idle.zig` | `std.http.Client` 没有读取超时；替换 `connection.stream_reader.io` 依赖标准库内部结构，升级 Zig 时可能失效 | 标准库 HTTP 客户端支持读取超时或截止时间 |
-| bash 命令部分超过 256 个 shell 词即拒绝 | `src/tools/policy.zig` | 检查器用固定缓冲区存放命令部分的词；heredoc 正文已不计入 | 检查器不再需要固定缓冲区 |
+| Subagent depth limit 1 | `src/tools.zig` (agent available only to root Sessions) | Prevent uncontrolled recursive spawning without cost budgets | Replace with budgets once budget limiting exists |
+| `/undo` does not resume across Session instances | `src/tools/undo.zig`, `src/session.zig` | In-process stack avoids misusing interrupted/old-version snapshots after restart | Load snapshots once committed Turn/undo transactions have a persistent index and crash recovery |
+| Stream idle timeout replaces the underlying HTTP reader's Io vtable | `src/provider/idle.zig` | `std.http.Client` lacks read timeouts; replacing `connection.stream_reader.io` depends on std internals and may break on Zig upgrades | Standard-library HTTP client supports read timeouts/deadlines |
+| Reject bash command portions over 256 shell words | `src/tools/policy.zig` | Checker stores command words in a fixed buffer; heredoc bodies are excluded | Checker no longer needs a fixed buffer |
 
-## 写死的策略
+## Hardcoded policies
 
-这些是用户的预算和偏好，现在写成了常量，应进入 `config.toml`。
+These are user budgets/preferences currently expressed as constants; they belong in `config.toml`.
 
-llm/agent 的并发、调用次数、输入大小和 Step 上限已改为可配置，见 [config.md](config.md#limits)。Step 不再默认限制为 50：`max_steps` 省略时不设上限，显式设置范围为 1–100000，子会话继承当前有效值。sandbox 内全部工具最多 8 并发仍属于线程调度实现。
+llm/agent concurrency, call counts, input sizes, and Step limits are now configurable; see [config.md](config.md#limits). Steps no longer default to 50: omitted `max_steps` means unlimited; explicit range 1–100000, inherited by children from current effective configuration. The sandbox's 8-tool concurrency limit remains a thread-scheduling implementation detail.
 
-| 名称 | 位置 | 当前值 | 删除条件 |
+| Name | Location | Current value | Removal condition |
 |---|---|---|---|
-| 后台 bash 同时运行上限，超出即 reject | `src/tools/background.zig`（复用 `sandbox.tool_concurrency`） | 8 | 移入 `[limits]` |
-| 工具录制的单条结果上限；calls 文件没有总量上限或轮转 | `src/sandbox/record.zig` | 1 MiB | 有存储预算与清理配置后移入配置 |
-| TUI 撤销快照额度 | `src/tools/undo.zig` | 8 个已结束修改 Turn；每轮 256 路径、64 MiB 原始字节；单文件 16 MiB | 有实际额度需求与统一会话清理配置后移入配置 |
+| Concurrent background bash limit, rejecting excess | `src/tools/background.zig` (reuses `sandbox.tool_concurrency`) | 8 | Move to `[limits]` |
+| Per-result recording limit; calls files have no total limit or rotation | `src/sandbox/record.zig` | 1 MiB | Move to configuration once storage budgets/cleanup settings exist |
+| TUI undo snapshot quotas | `src/tools/undo.zig` | 8 completed edited Turns; 256 paths and 64 MiB original bytes per Turn; 16 MiB per file | Move to configuration with real quota needs and unified Session cleanup settings |

@@ -1,37 +1,37 @@
-# `/undo`：按 Turn 撤销文件修改
+# `/undo`: revert file changes by Turn
 
-TUI 空闲时输入 `/undo`，回退最近一个尚未撤销、且确实通过 `tools.edit` / `tools.write` 修改文件的 Turn。重复输入可继续回退。进行中的 Turn 会提示 `Press Esc to stop the Turn before /undo.`；停止后的半成品修改也在该 Turn 的撤销记录里。纯问答 Turn 不占记录。
+Enter `/undo` while the TUI is idle to revert the latest not-yet-undone Turn that actually changed files through `tools.edit` / `tools.write`. Repeat to go further back. During an active Turn, the TUI says `Press Esc to stop the Turn before /undo.`; unfinished changes after stopping are included in that Turn's undo record. Question-only Turns consume no record.
 
 ```text
 › /undo
 [undo] Restoring files to their contents before the latest edited Turn. Re-read listed files before continuing.
 restored: /project/src/main.zig
-deleted: /project/新文件.txt
+deleted: /project/new-file.txt
 ```
 
-每个文件保留该 Turn 首次修改前的完整字节；新建文件用“不存在”表示，撤销时删除文件，留下可能新建的空目录。中文路径和二进制原始内容均可恢复。父会话与子 agent（含 fork、resume、后台 agent）的 edit/write 共用父 Turn 的记录，不依赖有展示上限的 diff 或子 agent 的 `changes` 汇总。不会调用 git，也不修改该 Turn 未经 edit/write 修改的工作文件。`/js` 不属于模型 Turn，不建立撤销记录。
+Each file retains its complete bytes before the Turn's first change. New files are represented as absent and deleted on undo, leaving any newly created empty directories. Chinese paths and raw binary contents can both be restored. Parent and subagent edit/write (including fork, resume, and background agents) share the parent Turn's record, independently of display-limited diffs or child `changes` summaries. Undo does not call git or modify working files untouched by edit/write in that Turn. `/js` is outside model Turns and creates no undo records.
 
-## 冲突与范围
+## Conflicts and scope
 
-执行前，持有现有跨进程文件锁，逐文件检查规范路径、普通文件类型以及当前字节的 SHA-256。当前内容需要等于 nib 在该 Turn 最后一次成功 edit/write 后记录的版本；该轮两次 nib 写入之间若出现其他内容，也将该文件标记为冲突。任一文件冲突时，**整轮拒绝，不改任何工作文件**，列出 `skipped (external change or incomplete snapshot)` 路径，保留记录供重试。路径被删除或替换成符号链接、文件超限或不可读，也会拒绝。其他未冲突文件同样不回退。
+Before execution, hold the existing cross-process file lock and check each file's canonical path, regular-file type, and current-byte SHA-256. Current contents must match the version recorded after nib's last successful edit/write in that Turn; other content appearing between two nib writes in the Turn also marks a conflict. Any conflict **rejects the whole Turn without changing any working files**, lists `skipped (external change or incomplete snapshot)` paths, and preserves the record for retry. Deleted paths, symlink replacements, oversized files, and unreadable files also cause rejection. Nonconflicting files are not reverted either.
 
-bash、格式化器、脚本、用户编辑器以及其他独立会话的副作用均不在覆盖范围。它们改到跟踪文件时会触发上述冲突；改到其他文件时保持原样。逐文件内容相同的外部写入无法从哈希区分。文件锁只协调共用 NIB_HOME 的 nib 文件工具，外部写入者可以在校验后继续写；与 edit/write 一样，无法消除最后一次检查与原子替换之间的竞争。使用期间应停止会改动目标文件的外部任务，包括 detached bash。
+Side effects from bash, formatters, scripts, user editors, and other independent Sessions are outside scope. Changes to tracked files cause the conflicts above; changes elsewhere remain untouched. External writes with identical per-file contents cannot be distinguished by hashes. Locks coordinate only nib file tools sharing NIB_HOME; external writers can still write after validation. As with edit/write, the race between the final check and atomic replacement cannot be eliminated. Stop external tasks that modify target files during undo, including detached bash.
 
-通过全部校验后才开始恢复。多文件恢复不是文件系统事务：中途遇到磁盘或权限错误时，会报告已恢复/删除及失败路径；已经成功的路径标记为已撤销，重试处理剩余路径。快照不完整时保守拒绝，不猜测或覆盖。恢复沿用 edit/write 的同目录临时文件加 rename，保留目标当前权限；不恢复时间戳、inode、硬链接关系或目录元数据。
+Restoration starts only after all checks pass. Multi-file restoration is not a filesystem transaction: disk or permission errors midway report restored/deleted and failed paths; successful paths are marked undone, and retries handle the remainder. Incomplete snapshots are conservatively rejected, without guessing or overwriting. Restoration uses edit/write's same-directory temporary-file plus rename approach and preserves current target permissions; it does not restore timestamps, inodes, hard-link relationships, or directory metadata.
 
-## 历史、恢复与存储
+## History, resume, and storage
 
-撤销前先提交一条简短的“用户请求撤销，继续前重新读取文件”消息；操作结果再作为一条 user 消息提交到模型历史和主会话日志，列出恢复、删除或冲突的文件。两条消息带仅供本地使用的 `source:"undo"`，不触发模型请求、不计为新 Turn，恢复后显示为信息条目；正文在下一次请求发送给模型。先记意图是为了在文件恢复后、结果日志写入前发生失败时，也能提醒模型重新读取。不会删除旧对话或回退 token 用量。
+Before undo, commit a short message stating that the user requested undo and files should be reread before continuing. Then commit the result as a user message in model history and the main Session log, listing restored, deleted, or conflicting files. Both messages carry local-only `source:"undo"`, trigger no model request, count as no new Turn, and display as information entries after resume; their bodies reach the model in the next request. Recording intent first ensures a reminder to reread even if failure occurs after restoration but before result logging. Old conversation and token usage are not rolled back.
 
-第一版撤销栈只在**当前打开的 TUI Session 实例**内有效。退出、`/new` 或 `/resume` 切换后，不能撤销此前的 Turn；恢复只重建对话和已保存的撤销通知，不加载旧快照。无可用记录时明确显示 `Nothing to undo in this process. Restored sessions cannot undo earlier Turns.`。恢复后新产生的 Turn 可以正常撤销。
+The first version's undo stack exists only in the **currently open TUI Session instance**. After exit, `/new`, or `/resume` switching, earlier Turns cannot be undone; resume rebuilds conversation and saved undo notices but does not load old snapshots. Without available records, explicitly show `Nothing to undo in this process. Restored sessions cannot undo earlier Turns.` New Turns after resume can be undone normally.
 
-快照放在 `$NIB_HOME/sessions/<session-id>.undo/<turn-id>/`，父目录权限 0700，原始快照和元数据为 0600。`.before` 保存原始字节，`.json` 保存规范路径、最后写入内容的 SHA-256 和完成状态，跨进程锁文件记录该轮的快照失败原因，不把快照正文送给模型。每个 Turn 每个路径只保存一份原始内容。限制如下：
+Snapshots live in `$NIB_HOME/sessions/<session-id>.undo/<turn-id>/`, with parent directories mode 0700 and raw snapshots/metadata mode 0600. `.before` stores original bytes; `.json` stores canonical paths, last-written SHA-256, and completion status. The cross-process lock file records that Turn's snapshot-failure reason; snapshot contents are not sent to the model. Each path stores original contents once per Turn. Limits:
 
-- 撤销快照仅支持单文件修改前、修改后各最多 16 MiB。文件工具自身的读取边界保持不变；write 仍可覆盖无法读取快照的大文件，edit 仍可生成超过此大小的内容。
-- 每 Turn 的撤销记录最多包含 256 个修改路径，原始快照总量最多 64 MiB；新建空文件也占一个路径。
-- 保留最近 8 个有修改的已结束 Turn，加上进行中的一轮，快照正文峰值最多 576 MiB，另加有界的路径/哈希元数据。淘汰最早的记录、成功撤销或退出/切换会话时删除对应快照。
-- 启用撤销的 TUI 及其子 agent，若快照无法读取/保存（包括快照目录不可写）或超出限制，edit/write 仍按未启用撤销时的行为执行，返回给 JS 的结果不添加提示。当前 Turn 标记为不可完整撤销并记录原因，结束时仅显示一次简短提示。`/undo` 会说明原因并整轮拒绝，不部分恢复，也不允许越过该轮撤销更早的 Turn；之后新产生的完整记录仍可正常撤销。普通 `nib ask` 不建立撤销记录。
+- Undo snapshots support up to 16 MiB per file both before and after changes. File-tool read boundaries are unchanged; write can still overwrite large files whose snapshots cannot be read, and edit can still produce content larger than this limit.
+- Each Turn's record allows 256 changed paths and 64 MiB of original snapshots; newly created empty files also consume a path.
+- Retain the latest 8 finished edited Turns plus the active Turn, for at most 576 MiB of snapshot contents plus bounded path/hash metadata. Delete snapshots when evicting oldest records, successfully undoing, exiting, or switching Sessions.
+- In undo-enabled TUIs and their subagents, unreadable/unsavable snapshots (including unwritable snapshot directories) or exceeded limits do not change edit/write behavior; JS results receive no added notice. Mark the current Turn incompletely undoable and record the reason, showing one short notice at Turn end. `/undo` explains the reason and rejects the whole Turn without partial restoration or skipping it to undo older Turns; subsequent complete records remain undoable. Ordinary `nib ask` creates no undo records.
 
-快照数据主要驻留磁盘；记录时复用文件工具已有的 before 内容，撤销时最多加载一轮的 64 MiB 原始快照并逐文件读取当前内容。异常退出可留下快照；下次以 TUI 打开同一会话时，在获得主日志独占锁后清理，不恢复撤销栈。当前项目没有自动删除旧会话日志的保留策略；删除会话资料时同时删除同名 `.undo` 目录即可，整个 sessions 目录清理也涵盖它。快照可能含秘密，与会话工具录制一样只保存在本机，分享日志目录前需一并检查。
+Snapshot data resides mainly on disk; recording reuses existing before contents from file tools. Undo loads at most one Turn's 64 MiB original snapshots and reads current contents file by file. Crashes may leave snapshots; next opening the same Session in the TUI cleans them after acquiring the main log's exclusive lock, without restoring the undo stack. The project currently has no retention policy automatically deleting old Session logs; when deleting Session data, also delete the matching `.undo` directory. Cleaning the entire sessions directory covers it too. Snapshots may contain secrets; like tool recordings they stay local, and require inspection before sharing log directories.
 
-验证：`zig build test --summary all`；`zig build` 后执行 `python3 tests/test_undo.py`，只用本地 mock。
+Verification: `zig build test --summary all`; after `zig build`, run `python3 tests/test_undo.py`, using local mocks only.

@@ -1,40 +1,40 @@
-这是一次反思，不是继续工作：不要修改任何文件，不要运行构建、测试或其他有副作用的命令。
+This is a reflection, not a continuation of work: do not modify files or run builds, tests, or other commands with side effects.
 
-目的：判断 nib 这个 harness（工具、沙箱、系统提示与工具说明、输出截断、超时与取消、子 agent、TUI）在这次会话里有没有造成真实、值得修的问题。顺利的会话可能没有问题，"无"是正常结论。Issue 草稿会不经人工审核自动发布到公开仓库，所以只报告有证据的问题。
+Purpose: determine whether nib's harness (tools, sandbox, system prompt and tool descriptions, output truncation, timeouts and cancellation, subagents, TUI) caused real problems worth fixing in this session. A smooth session may have no problems; "None" is a normal conclusion. Issue drafts are published automatically to a public repository without human review, so report only problems supported by evidence.
 
-证据：
-- 先查日志再下结论。本会话日志是 {{log_path}}（JSONL，每行的 messages 是一个完整 Step；role 为 tool 的消息是 Run 的结果）。用 tools.grep 搜索失败信号，例如 `"exit_code":127`、`SyntaxError`、`timed out`、`Error:`、`refused by nib`、`interrupted`，需要时再 read 相关行。上下文被压缩过的话，日志是唯一可靠的来源。
-- 只允许读取上面明确指定的本会话主日志路径；tools.grep 的 path 也只指向该文件。不要枚举、glob 或搜索 sessions 目录，不要读取兄弟日志、子 agent 日志或任何 `.calls.jsonl` 工具录制旁路文件，也不要通过 bash、fetch 或其他工具绕过这个范围。旁路文件可能含主日志没有展示的完整文件内容、命令输出和凭证，不属于反思证据。
-- 本会话 ID 是 {{session_id}}；指定主日志只读。
+Evidence:
+- Check the log before drawing conclusions. This session's log is {{log_path}} (JSONL; each line's messages form a complete Step; messages with role tool are Run results). Use tools.grep to search for failure signals such as `"exit_code":127`, `SyntaxError`, `timed out`, `Error:`, `refused by nib`, and `interrupted`; read relevant lines as needed. If context was compacted, the log is the only reliable source.
+- Read only the explicitly specified main log path for this session; tools.grep's path must also point only to that file. Do not enumerate, glob, or search the sessions directory, read sibling logs, subagent logs, or any `.calls.jsonl` tool-recording sidecar, or bypass this scope through bash, fetch, or other tools. Sidecars may contain full file contents, command output, and credentials absent from the main log; they are outside the reflection's evidence scope.
+- This session's ID is {{session_id}}; the specified main log is read-only.
 
-按下面的结构回答，用户使用什么语言就用什么语言：
+Answer in English using this structure:
 
-### 摘要
-一句话：任务是什么、结果如何、一共大约多少个 Step、其中大约多少花在了应付 harness 上。
+### Summary
+One sentence: the task, its outcome, roughly how many Steps it took, and roughly how many were spent dealing with the harness.
 
-### 摩擦
-没有就写"无"。每条写成：`[类别] 现象 — 证据 — 代价 — 归因`
-- 类别：工具接口 / 工具缺失 / 沙箱与 JS / 系统提示与说明 / 输出与截断 / 超时与取消 / 子 agent / TUI / 其他
-- 证据：引用日志原文（截成一行），或写明是哪个 Run；没有直接证据的标"推测"。
-- 代价：大约多花的 Step 数或 token。
-- 归因：harness / 任务描述 / 自身失误。如果是说明误导你才用错的，归为 harness。纯属自身失误的只在明显影响结果时列一条，作为参考。
+### Friction
+Write "None" if there was none. Format each item as: `[category] symptom — evidence — cost — attribution`
+- Categories: tool interface / missing tool / sandbox and JS / system prompt and descriptions / output and truncation / timeouts and cancellation / subagents / TUI / other.
+- Evidence: quote the log (trimmed to one line), or identify the Run; label items without direct evidence "Inference".
+- Cost: approximate extra Steps or tokens.
+- Attribution: harness / task description / own mistake. Attribute misuse caused by misleading descriptions to the harness. Include a purely personal mistake only if it materially affected the outcome, as a reference item.
 
-### 建议（0–3 条，按 代价 × 复发频率 排序）
-只针对上面归因为 harness 的摩擦；没有就写"无"。每条写清楚：
-- 改哪里：具体到工具、参数、说明文字或文件；
-- 解决上面哪一条摩擦；
-- 怎么验证：一个能写成测试，或者能从会话日志统计出来的指标。
-不确定 nib 是否已经有某项能力时，只从指定主日志查证；证据不足就标明未知，不为查证扩大读取范围，也不要断言已有或缺失某项能力。
+### Suggestions (0–3, ranked by cost × recurrence frequency)
+Address only friction attributed to the harness above; write "None" if there is none. For each item specify:
+- Where to change: the specific tool, parameter, description, or file;
+- Which friction item it resolves;
+- How to verify: a metric that can become a test or be measured from session logs.
+If unsure whether nib already has a capability, check only the specified main log. Mark insufficient evidence as unknown; do not expand the read scope to investigate, or assert that a capability exists or is missing.
 
-### 任务描述
-用户给的任务说明里，哪些地方缺信息、有歧义或互相矛盾，导致你猜测或返工？没有就写"无"。
+### Task description
+Which missing, ambiguous, or contradictory parts of the user's task description caused guessing or rework? Write "None" if there were none.
 
-### 保留
-这次真正帮上忙、以后不该改动的设计，最多 2 条，要具体；没有就写"无"。
+### Keep
+Up to 2 specific designs that helped in this session and should be preserved; write "None" if there were none.
 
-### Issue 草稿
-只有同时满足以下条件的建议才写成 issue：归因为 harness、有日志原文为证（不是"推测"）、代价明显（例如多花 2 个以上 Step，或导致错误结果）。最多 3 个，放在回答最后的一个 ```json 代码块里：`[{"title": "...", "body": "..."}]`；没有符合条件的就输出 `[]`。写草稿前先运行只读命令 `gh issue list --repo {{issue_repo}} --state open --limit 100` 查看已有 issue（这条命令不违反上面的只读要求），与已有 issue 根因相同的不要再写草稿，在「建议」里注明"已有 #编号"即可；gh 不可用时照常写，发布前还会按标题查重。这些草稿会自动发布到 nib 的**公开** GitHub 仓库，所以：
-- 每个 issue 自成一体：读者看不到这次会话，也不知道用户在做什么项目；
-- 不得包含用户项目的代码、文件内容、项目或公司名称、nib 仓库以外的路径、URL、凭证和个人信息；证据改写成不暴露项目内容的描述，例如"一个约 400 行的 Python 脚本经 tools.write 写入时报 SyntaxError"；
-- title 简短、具体，能看出是哪个部件的什么问题；body 用 Markdown，依次写：现象、证据（已脱敏）、代价、建议的改法、验证方法。
+### Issue drafts
+Draft issues only for suggestions meeting all these conditions: attributed to the harness, supported by log quotations (not "Inference"), and material cost (e.g. more than 2 extra Steps or an incorrect result). Include at most 3 in a final ```json code block: `[{"title": "...", "body": "..."}]`; output `[]` if none qualify. Before drafting, run the read-only command `gh issue list --repo {{issue_repo}} --state open --limit 100` to inspect existing issues (this command complies with the read-only requirement above). Do not draft an issue with the same root cause as an existing issue; note "existing #number" under Suggestions instead. If gh is unavailable, draft normally; titles are checked for duplicates again before publication. These drafts are published automatically to nib's **public** GitHub repository, so:
+- Each issue must stand alone: readers cannot see this session or know the user's project;
+- Include no user-project code, file contents, project or company names, paths outside the nib repository, URLs, credentials, or personal information. Rephrase evidence without exposing project content, e.g. "Writing a Python script of about 400 lines with tools.write produced a SyntaxError";
+- Keep titles short and specific, identifying the component and problem. Use Markdown bodies with: symptom, evidence (redacted), cost, proposed change, and verification, in that order. Write all issue titles and bodies in English.
 {{focus}}

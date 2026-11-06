@@ -1,28 +1,28 @@
-# 0015 agent fork：复用父上下文，保留独立子会话
+# 0015 Agent fork: reuse parent context in an independent child Session
 
-## 决定与模型选择
+## Decision and model choice
 
-`tools.agent` 增加可选 `fork?: boolean`，默认 false。普通新建仍从独立 system 和任务 prompt 开始；`fork:true` 复制父会话压缩后的当前完整 history，system/工具 schema 与父会话逐字节相同，不恢复已被压缩丢弃的原始历史。每次 fork 分配新的 `aN`，此后可按该 id resume；fork 与 resume 同时传入是参数错误。返回值、后台执行、取消、限额和接续沿用现有 agent 机制，见 [委派接口](../tool-delegation.md)。
+`tools.agent` adds optional `fork?: boolean`, default false. Ordinary creation still starts with independent system and task prompt; `fork:true` copies the parent's complete current history after compaction, preserving system/tool schema byte for byte without recovering compacted-away history. Each fork allocates a new `aN`, resumable by that id; passing both fork and resume is an argument error. Results, background execution, cancellation, limits, and continuation reuse existing agent mechanisms; see [delegation interface](../tool-delegation.md).
 
-model/effort 默认继承父会话当前有效配置，也允许本次覆盖。与父会话保持同 model、同 effort 保留复用父缓存前缀的机会；改变任一项就失去这一缓存优势。另选模型的冷启动子会话仍可用默认新建；fork 不以换模型为目标。Codex fork 和 resume 一样检查模型一致性，避免将加密 reasoning 交给另一模型，model 覆盖不绕过此检查。
+model/effort inherit the parent's current effective configuration, with per-call overrides allowed. Matching parent model and effort preserves the opportunity to reuse its cache prefix; changing either loses this advantage. Default creation still supports cold-start children on other models; switching models is not fork's purpose. Like resume, Codex fork checks model consistency to avoid passing encrypted reasoning to another model; overrides do not bypass this check.
 
-fork 或普通新建由发起委派的主模型按任务选择，不采用自动规则。fork 可能减少重复调查，却要携带更长输入，也可能继承父会话的假设与偏见；普通新建付出重新读取上下文的成本，换取更独立的视角。成本与独立视角的取舍依任务而变，目前没有实测阈值能把上下文长度、预期 Step 数或任务类别可靠地映射到某一种选择。工具说明只描述继承内容、模型/缓存条件、成本观察及执行边界等事实，不把这些观察转成选择规则。
+The delegating main model chooses fork or ordinary creation by task, without automatic rules. Fork may reduce repeated investigation but carries longer input and may inherit assumptions/biases; ordinary creation pays rereading costs for a more independent perspective. This tradeoff varies by task; no measured threshold reliably maps context length, expected Steps, or task category to a choice. Tool descriptions state inheritance, model/cache conditions, cost observations, and execution boundaries without turning observations into selection rules.
 
-## 截取点与执行边界
+## Capture point and execution boundaries
 
-截取点包括发起 fork 的当前 assistant 消息，而不只到上一轮已完成的 tool result；该消息中的 reasoning（含 Codex 加密推理条目）与工具调用一并保留。随后为当前 assistant 的工具调用补齐合成 tool results，再追加子任务的 user prompt。合成结果闭合消息序列，不代表父 Run 的真实执行结果，也不触发子会话重跑父 Run。这样既保留刚形成的上下文，又不等待正在执行的父 Run 完成。
+The capture includes the current assistant message initiating fork, not just the previous completed tool result, preserving its reasoning (including Codex encrypted items) and tool calls. Synthetic tool results close the current assistant's calls, followed by the child task user prompt. These results close the message sequence, represent no real parent Run result, and do not rerun the parent Run in the child. This retains fresh context without waiting for the executing parent Run.
 
-fork 首个工作请求不先自动压缩继承历史，避免 token 估算或临近窗口阈值让前缀在首次发送前被改写；后续请求仍按现有阈值自动压缩。
+Fork's first work request does not automatically compact inherited history, preventing token estimates/window thresholds from rewriting the prefix before first transmission; later requests use existing automatic thresholds.
 
-fork 是独立子会话，不是父会话回滚点。执行深度与普通 agent 相同：继承的 system/schema 虽然仍描述 agent，运行时不能再调用 agent，不开放递归。父子共享 cwd，没有 worktree 隔离；现有文件锁、原子替换和过期检测仍适用，bash/编辑器不参与这些锁。fork 同时复制截取点已有的文件版本观察，避免子会话根据继承的旧内容直接 write 时绕过过期检测；这些观察不从当前磁盘重新取值。历史和版本数组只保留到 Step 结束；后台 fork 在排队前序列化为任务独占的输入，不长期积累每步快照。
+Fork is an independent child Session, not a parent rollback point. Depth matches ordinary agents: inherited system/schema still describe agent, but runtime agent calls remain unavailable; recursion is not opened. Parent/child share cwd without worktree isolation. Existing locks, atomic replacement, and stale checks still apply; bash/editors do not participate in locks. Fork also copies existing file-version observations at capture, preventing writes based on inherited stale content from bypassing stale detection; observations are not refreshed from disk. History/version arrays last only through Step end; background fork serializes task-owned input before queuing, without accumulating per-Step snapshots indefinitely.
 
-## 依据与置信度
+## Evidence and confidence
 
-- **已观测的动机：** 本机 105 个新建子会话中，开头约 6 个只读 Step 占约 22% 时间；完整子任务约 12 Step、3 分钟、29 万级累计 prompt tokens。总 token 含重复上下文与缓存输入，不等于费用；这组数据说明重读上下文的成本，不是 fork 的节省比例。样本背景及完整分布见 [成本参考](../tool-delegation.md)。
-- **高置信度的语义：** 复制当前 history、保留 system/schema 字节、包含当前 assistant 并合成结果闭合、独立 id 与运行时深度边界，属于本地可验证的行为，不依赖缓存服务。
-- **中等置信度的收益预期：** 已有父上下文可能减少子会话重新调查，但更长的输入也可能增加成本或引入无关上下文。尚无真实 fork 对照实验确认净收益。
-- **待实测的路由假设：** Codex fork 的 `prompt_cache_key` 沿用父值，旨在把相同前缀路由到同一缓存；对服务端是否因此复用缓存的把握较低，不是协议保证。同 model/effort、同字节前缀是复用前提，不是命中承诺；已有相邻 Step 的 effort 缓存统计不能证明 fork 命中。见 [Codex 缓存说明](../codex.md#fork-与父缓存路由)。
+- **Observed motivation:** Among 105 locally created child Sessions, roughly 6 initial read-only Steps consumed about 22% of time; full subtasks took about 12 Steps, 3 minutes, and around 290,000 cumulative prompt tokens. Total tokens include repeated context/cache input, not fees. This shows rereading cost, not fork savings. See [cost reference](../tool-delegation.md) for samples/distributions.
+- **High-confidence semantics:** Copying current history, preserving system/schema bytes, including current assistant and synthetic closing results, independent ids, and runtime depth boundaries are locally verifiable and cache-service-independent.
+- **Medium-confidence expected benefit:** Parent context may reduce reinvestigation, but longer input may add cost or irrelevant context. No real fork comparison confirms net benefit yet.
+- **Routing hypothesis awaiting measurement:** Codex fork keeps the parent's `prompt_cache_key` to route matching prefixes to the same cache; confidence in actual server reuse is low, without protocol guarantees. Matching model/effort and byte prefixes are prerequisites, not hit promises; adjacent-Step effort cache statistics do not prove fork hits. See [Codex cache notes](../codex.md#fork-and-parent-cache-routing).
 
-## 何时重新考虑
+## When to reconsider
 
-在相同父前缀、model/effort 下，对照父 key 与独立 key 的首请求命中率、未缓存输入和耗时；若共用 key 没有收益，调整缓存路由而不改写 history 继承语义。若完整上下文增加的成本或干扰超过少读代码的收益，再考虑更小的显式上下文切片；若出现真实的嵌套委派或隔离工作区需求，再独立评估深度和 worktree，不把它们隐含在 fork 中。
+With identical parent prefix/model/effort, compare parent versus independent keys for first-request hit rate, uncached input, and time. If shared keys do not help, adjust routing without changing inheritance semantics. If complete-context costs/interference outweigh reduced reading, consider smaller explicit slices. Evaluate depth and worktrees separately when real nested-delegation or workspace-isolation needs arise, without implying them in fork.

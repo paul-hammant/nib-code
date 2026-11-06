@@ -1,7 +1,7 @@
-# 0016 新的同一命令取代过时 bash 执行
+# 0016 New identical commands supersede stale bash executions
 
-长 Run 自动转后台后，继续修改代码却等待旧验证自然结束，会延长串行路径；由模型先 stop 再重跑又容易取消仍有价值的验证。因此在同 Session 的新 bash 启动时，取代更早 Run 中 command/cwd 字节相同、启动后已有成功 edit/write 修改且双方均非 detached 的活动执行。匹配的旧调用 resolve 为 `{superseded_by:"bN"}`，不伪造通过/失败或 exit_code；停止只作用于该 bash，原 Run 的 continuation 和其他工具继续。
+After long Runs automatically move to the background, continuing edits while waiting for old validation to finish extends the serial path; having the model stop then rerun risks canceling still-useful validation. Therefore, new bash calls in the same Session supersede active executions from earlier Runs when command/cwd match byte for byte, successful edit/write changes occurred after the old call started, and neither call is detached. Matching old calls resolve as `{superseded_by:"bN"}`, without fabricated pass/failure or exit_code. Stopping affects only that bash; the original Run's continuation and other tools continue.
 
-修改代数是 Session 级证据，不分析语言、命令用途或文件依赖，不跟踪 bash、用户或子会话的外部修改。这个边界换取小而可解释的机制；同 Run、无修改重复执行和 detached 服务保留原行为，不缓存结果。取消复用既有进程组清理和 join，已有副作用不回滚，后台并发准入不绕过。脚本检查退出码前需处理取代标记。
+The change generation is Session-level evidence, without analyzing languages, command purpose, or file dependencies or tracking external changes from bash, users, or child Sessions. This boundary yields a small, explainable mechanism. Same-Run calls, repetitions without changes, and detached services keep existing behavior; results are not cached. Cancellation reuses process-group cleanup and join, without rolling back side effects or bypassing background concurrency admission. Scripts must handle the supersession marker before checking exit codes.
 
-接口与边界见 [委派工具](../tool-delegation.md#同一命令取代过时执行)，独立启动/取代事件和统计见 [日志](../session-log.md#bash-启动与取代事件)。若真实开发中频繁误停不受修改影响的长命令，再评估更精确的依赖或显式策略；不凭命令名推测验证语义。
+See [delegation tools](../tool-delegation.md#identical-commands-supersede-stale-execution) for interfaces/boundaries and [logs](../session-log.md#bash-start-and-supersession-events) for independent start/supersession events and statistics. Reconsider more precise dependencies or explicit policy if real development frequently stops long commands unaffected by changes; do not infer validation semantics from command names.

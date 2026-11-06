@@ -3,27 +3,27 @@ status: accepted
 date: 2026-11-01
 ---
 
-# Run 内工具调用真正并发，顺序按 JS 语义
+# Tool calls within a Run are truly concurrent, ordered by JS semantics
 
-宿主函数立即返回一个 Promise；通常实际工作在线程上执行，完成后回到 Run 所在的线程 resolve（QuickJS 不是线程安全的）。`tools.sleep(ms)` 是例外：由 sandbox 原生事件循环计时器调度，不启动进程或线程、不占工具并发槽；等待、取消与 Run 排空语义见 [run-output.md](../run-output.md#run-内延时与轮询)。执行顺序完全由脚本决定：`Promise.all` 就并行，依次 `await` 就串行。唯一的额外规则：对同一路径的 `edit` / `write` 按路径加锁。
+Host functions immediately return Promises; work normally executes on threads, resolving back on the Run thread because QuickJS is not thread-safe. `tools.sleep(ms)` is an exception: native sandbox event-loop timers, without processes, threads, or tool concurrency slots. See [run-output.md](../run-output.md#delays-and-polling-within-runs) for waiting, cancellation, and draining. Scripts determine ordering: `Promise.all` is parallel, successive `await` is serial. The only extra rule is per-path locking for `edit` / `write` on the same path.
 
-**为什么：** 现在工具调用同步执行，`Promise.all` 结果正确但不并发。子 agent（[0010](0010-subagents.md)）要靠并行分派才有价值，并发是它的前提。顺序已经由代码表达，不需要再加规则。
+**Why:** Previously synchronous tools made `Promise.all` correct but nonconcurrent. Subagents ([0010](0010-subagents.md)) need parallel dispatch to be useful, so concurrency is prerequisite. Code already expresses ordering; no extra rules are needed.
 
-**被否决的方案：** DeepSeek Harness 的规则：只读操作并行，有副作用的操作按提交顺序串行（**二手**：第三方博客，未核实）。它让 `Promise.all` 的语义因工具而异，模型需要额外记住一条规则。
+**Rejected alternative:** DeepSeek Harness runs read-only operations concurrently but serializes side effects in submission order (**secondary**: unverified third-party blog). This changes `Promise.all` semantics by tool and adds a rule for models to remember.
 
-**实现选择：** 每个 Run 最多 8 个工具工作线程，超出的调用留在 Run 队列；完成结果进入互斥锁保护的队列，Run 线程独自调用 QuickJS。没有 pending job 时最多等待 20 ms，再检查取消；等待工具的时间不消耗 JS 执行预算。顶层 Run Promise 无论 fulfill 还是 reject，都继续 drain 在途及排队工具、JS jobs，以及 continuation 新发起的调用，直到没有剩余工作；reject 时仍报告顶层 Promise 的原始拒绝原因。任意调用失败都不会取消其他调用，不限于子 agent。用户取消或 JS 执行超时会中止整个 Run 的工具并设置 `Tools.cancel`；单个工具超时、bash 取代或按 id stop 只影响目标，不改变其他调用的 drain；中止时已完成调用立即回收数据，先 join 全部剩余线程，再释放调用数据和 QuickJS。路径锁覆盖 edit/write 的完整操作，已有路径解析符号链接，尚不存在的路径由最近存在的父目录规范化；不约束 bash 或其他进程的文件写入。
+**Implementation:** At most 8 tool worker threads per Run, with excess calls queued in the Run. Completion results enter a mutex-protected queue; only the Run thread calls QuickJS. Without pending jobs, wait at most 20 ms before checking cancellation; tool waits consume no JS budget. Whether the top-level Run Promise fulfills or rejects, drain in-flight/queued tools, JS jobs, and calls initiated by continuations until no work remains; rejection still reports the top-level Promise's original reason. No call failure cancels other calls, including non-agent tools. User cancellation or JS timeout stops all Run tools and sets `Tools.cancel`; individual tool timeouts, bash supersession, and id-based stop affect only their target, leaving other calls' drain unchanged. On interruption, reclaim completed-call data immediately, join remaining threads, then free call data and QuickJS. Path locks cover complete edit/write operations; resolve existing symlinks and canonicalize nonexistent paths through the nearest existing parent. Bash/other-process writes are outside these locks.
 
-因此 `Promise.all` 中一次 read 失败不会停止并行 bash 的写入；即使 Run 已经 reject，也要等待前台 agent 完成，承担其剩余等待时间与用量，用户仍可按 Esc 取消。用户取消或 JS 执行超时留下未完成调用时，Run 输出保留一行 `[stopped before completion: bash #0, agent #2]`，索引是该 Run 内全部工具调用的创建顺序，从 0 开始，不按工具类型分别编号。
+Thus a failed read in `Promise.all` does not stop parallel bash writes; even rejected Runs wait for foreground agents, paying remaining time/usage, while Esc remains available. User cancellation/JS timeout leaving unfinished calls adds `[stopped before completion: bash #0, agent #2]`; indices are 0-based creation order across all tool calls in that Run, not per-tool numbering.
 
-bash 的进程组启动、限时输出轮询、取消和回收移入 `src/tools/process.zig`，供后续子 agent 复用。调整了旧实现的一个漏洞：输出 EOF 后仍继续轮询进程退出，关闭输出的命令也能取消和超时。
+Bash process-group startup, bounded output polling, cancellation, and reaping moved to `src/tools/process.zig` for later subagent reuse. Fixed an old flaw: continue polling process exit after output EOF so commands closing output remain cancelable and time-limited.
 
-**把握程度：** 实测（2026-11-01，本机 Debug，`src/tools.zig` 测试）：两个 `sleep 0.3`，Promise.all 为 307 ms，依次 await 为 611 ms。50 项单元测试通过，覆盖 JS 异常、12 个调用执行期间取消/超时、16 个同路径并行 edit、悬空符号链接别名和 EOF 后超时；Session 端到端测试通过。一手源码（同日，Zig 0.17 `std/process.zig`、`std/start.zig`）：Init.gpa 明确保证线程安全；Debug/ReleaseSafe 使用 SafeAllocator，本项目链接 libc 的 ReleaseFast/Small 使用 c_allocator。
+**Confidence:** Measured locally (2026-11-01, Debug, `src/tools.zig` tests): two `sleep 0.3` calls took 307 ms with Promise.all versus 611 ms with successive await. All 50 unit tests passed, covering JS exceptions, cancellation/timeouts during 12 calls, 16 parallel same-path edits, dangling symlink aliases, and post-EOF timeout; Session e2e passed. Primary source that day: Zig 0.17 `std/process.zig`, `std/start.zig` explicitly guarantee thread-safe Init.gpa; Debug/ReleaseSafe use SafeAllocator, libc-linked ReleaseFast/Small use c_allocator.
 
-后续验证（同日）：Debug/ReleaseFast 均通过 53 项单元测试与端到端测试；ReleaseFast 暴露并修正了工具 JSON 缓冲的零结尾要求（一手源码：QuickJS `quickjs.h` 的 `JS_ParseJSON` 声明）。
+Follow-up verification that day: Debug/ReleaseFast passed 53 unit tests and e2e. ReleaseFast exposed and prompted a fix for null-terminated tool JSON buffers (primary: QuickJS `quickjs.h`'s `JS_ParseJSON` declaration).
 
-**超时边界（2026-11-02）：** 用户提供的真实任务中，子 agent 正常工作到 5 分钟却被 Run 总时限停止，留下未完成文件。Run 时限的目的是中断 JS 死循环，不是再次限制已有独立超时的工具，因此改为累计 QuickJS 执行片段的纳秒耗时：初始脚本、pending jobs、工具结果解析/resolve、返回值序列化和错误转换（getter/toString 也可能运行 JS）。等待完成队列时预算暂停，恢复执行时继续扣除，不能每次 await 都重置；取消检查独立于预算。这里计量的是执行片段的单调墙钟时间，不是操作系统线程 CPU 时间。
+**Timeout boundary (2026-11-02):** In a real user task, Run's total timeout stopped a normally working subagent at 5 minutes, leaving unfinished files. Run limits interrupt JS infinite loops, not tools with independent timeouts. Therefore accumulate nanoseconds of QuickJS execution segments: initial script, pending jobs, tool-result parsing/resolve, return serialization, and error conversion (getters/toString can execute JS). Pause while waiting on completion queues and resume deductions afterward; never reset per await. Cancellation checks are independent. This measures monotonic wall time of execution segments, not OS thread CPU time.
 
-实测（同日，本地单元测试）：Run 预算 100 ms，依次 await 两个 sleep 0.3 的 bash 正常返回；跨 await 的两段 60 ms JS 忙循环仍触发累计超时；纯死循环、超时后清理运行中/排队工具、等待超过预算后取消均有覆盖。写脚本的说明也改为优先原生搜索工具、用 JSON 转义双引号字符串承载文件/命令文本；工具表中的特殊字符示例在 sandbox 中真实 write 后逐字节验证，避免 String.raw 仍解析反引号和插值的陷阱。
+Measured locally that day: with a 100 ms Run budget, successive bash sleep 0.3 calls complete; two 60 ms JS busy loops across await still trigger cumulative timeout. Tests also cover pure infinite loops, cleaning up running/queued tools after timeout, and cancellation after waits longer than the budget. Script instructions now prefer native search and JSON-escaped double-quoted strings for file/command text. Special-character tool-table examples execute actual writes in the sandbox with byte-for-byte checks, avoiding String.raw's continued backtick/interpolation parsing.
 
-**何时重新考虑：**
-- 观察到模型在 `Promise.all` 里并行做了互相依赖的副作用操作并因此出错。
+**When to reconsider:**
+- Models cause errors by running mutually dependent side effects concurrently in `Promise.all`.

@@ -3,27 +3,27 @@ status: accepted
 date: 2026-11-01
 ---
 
-# 不审批，宿主侧直接拒绝危险命令
+# No approvals; reject dangerous commands on the host
 
-nib 不对 Tool 调用做逐次审批，也暂不做系统层沙箱（[0004](0004-two-layer-isolation.md) 暂缓）。但 bash 命令在执行前过一遍 `src/tools/policy.zig`：命中危险类别的直接拒绝，错误返回给模型，提示"如确有必要，请用户自己执行"。不弹窗，不打断用户。
+nib does not approve individual Tool calls and defers system sandboxing ([0004](0004-two-layer-isolation.md)). Before execution, bash commands pass through `src/tools/policy.zig`: dangerous categories are rejected, returning an error advising the model to ask the user to execute the command themselves if truly needed. No dialogs or user interruptions.
 
-**拒绝的类别（用户选定，2026-11-01）：**
-- 破坏性删除：对 `/`、`~`、`$HOME`、系统目录、`.`、`..` 的递归 `rm`；`mkfs`、`dd of=/dev/*`、`shred`、`wipefs`、分区工具。
-- 提权和系统级：`sudo`、`su`、`doas`、`pkexec`、`shutdown`/`reboot` 等、`systemctl`；把下载内容交给 shell 执行（`curl … | sh`、`bash <(curl …)`、`sh -c "$(curl …)"`）。
+**Rejected categories (selected by the user, 2026-11-01):**
+- Destructive deletion: recursive `rm` targeting `/`, `~`, `$HOME`, system directories, `.`, or `..`; `mkfs`, `dd of=/dev/*`, `shred`, `wipefs`, and partitioning tools.
+- Privilege escalation and system operations: `sudo`, `su`, `doas`, `pkexec`, `shutdown`/`reboot`, etc., `systemctl`; executing downloads through shells (`curl … | sh`, `bash <(curl …)`, `sh -c "$(curl …)"`).
 
-**凭证边界：**
-- `process.run` 在所有子进程启动前移除 `src/tools/secrets.zig` 单一定义的常见 API key/token 环境变量，调用方提供环境也同样处理；保留普通环境变量。子会话通过 stdin JSON 接收 provider 配置，API key 不进入 argv 或子进程环境；Codex 配置不包含登录 token。
-- bash 命令文本拒绝引用默认 `.codex`、`$CODEX_HOME` 和当前自定义凭证目录，覆盖通配符和递归扫描。read/edit/write 对默认及自定义凭证路径一律拒绝，并复用规范化路径识别符号链接；不会读取凭证内容后再过滤。
-- 这些保护防止无意输出或破坏凭证，不是文件系统沙箱；变量拼接、任意脚本、其他进程读取和刻意绕过不在保证范围内。环境清理只覆盖维护的变量名单。
+**Credential boundary:**
+- Before launching any child process, `process.run` removes common API-key/token environment variables defined centrally in `src/tools/secrets.zig`, including caller-supplied environments, preserving ordinary variables. Child Sessions receive provider configuration through stdin JSON; API keys enter neither argv nor child environments. Codex configuration contains no login token.
+- Bash command text rejects references to default `.codex`, `$CODEX_HOME`, and current custom credential directories, including wildcards and recursive scans. read/edit/write reject default and custom credential paths, using canonical paths to detect symlinks; credentials are not read then filtered.
+- These protections prevent accidental credential disclosure/destruction, not a filesystem sandbox. Variable concatenation, arbitrary scripts, reads by other processes, and deliberate bypasses are outside guarantees. Environment cleanup covers only the maintained variable list.
 
-**明确不拦（用户选定）：** git 操作（包括 `push --force`、`reset --hard`），以及 edit/write 写入工作目录之外的路径。
+**Explicitly allowed (selected by the user):** git operations (including `push --force`, `reset --hard`) and edit/write paths outside the working directory.
 
-**为什么：** 用户不想被审批打断，但不审批不等于放开危险操作。宿主侧拒绝既不打断，又能挡住最常见的灾难性误操作。
+**Why:** Users do not want approval interruptions, but no approvals does not mean unrestricted dangerous operations. Host rejection prevents common catastrophic mistakes without interruptions.
 
-**把握程度：**
-- 实测：`src/tools/policy.zig` 的测试覆盖了拒绝和放行两个方向，例如 `rm -rf build`、`git push --force`、`curl … | jq` 放行；`bash -c 'rm -rf ~'`、`env FOO=1 rm -rf /`、`timeout 10 rm -rf /` 拒绝。
-- 已知局限：这是对命令文本的模式匹配，**只防误操作，不防刻意绕过**，例如 `r''m -rf /`、变量拼接出的命令、脚本文件里的命令都检查不到。heredoc 正文里如果出现危险命令文本会被误判为要执行，这时模型可以改用 `write` 工具。
+**Confidence:**
+- Measured: `src/tools/policy.zig` tests cover rejection and allowance. `rm -rf build`, `git push --force`, and `curl … | jq` pass; `bash -c 'rm -rf ~'`, `env FOO=1 rm -rf /`, and `timeout 10 rm -rf /` are rejected.
+- Known limit: command-text pattern matching **prevents mistakes, not deliberate bypasses**. It misses `r''m -rf /`, variable-built commands, and commands in script files. Dangerous command text in heredoc bodies can be mistaken for execution; the model can use `write` instead.
 
-**何时重新考虑：**
-- 出现误拦正常开发命令的情况：调整规则，并补上对应的放行测试；
-- 出现规则没拦住的事故：评估是加规则，还是重启 [0004](0004-two-layer-isolation.md) 的系统层沙箱。
+**When to reconsider:**
+- Normal development commands are wrongly rejected: adjust rules and add corresponding allowance tests;
+- Rules miss an incident: evaluate additional rules versus reviving [0004](0004-two-layer-isolation.md)'s system sandbox.

@@ -3,21 +3,21 @@ status: accepted
 date: 2026-11-01
 ---
 
-# 每次 Run 都是全新的沙箱
+# Every Run uses a fresh sandbox
 
-每次 Run 都新建一个 QuickJS runtime 和 context，结束即销毁，变量不跨 Run 保留。需要跨 Turn 保留的数据，由脚本通过 Tool 写成文件。
+Each Run creates a QuickJS runtime and context and destroys them on completion; variables do not persist across Runs. Scripts persist data across Turns by writing files through Tools.
 
-**为什么：** 恢复的模型上下文来自 Session log（见 [CONTEXT.md](../../CONTEXT.md)）。常驻内核会让一部分状态藏在进程堆里，仅恢复消息无法恢复这些变量。日志也不恢复文件和命令的外部副作用；这里的决定只让 Run 没有额外的隐藏常驻状态。代码驱动的主要收益发生在单次 Run 内部，跨 Run 保留是次要需求；需要保留时，用文件就够了，不必再引入一个变量存储的概念。
+**Why:** Resumed model context comes from the Session log (see [CONTEXT.md](../../CONTEXT.md)). A persistent kernel would hide some state in the process heap; restoring messages alone cannot restore those variables. Logs do not restore external file/command side effects either; this decision only prevents extra hidden persistent Run state. Code-driven execution mainly helps within a Run; cross-Run persistence is secondary. Files suffice when needed, without introducing a variable-store concept.
 
-**被否决的方案：**
-- 常驻 REPL（prime-agent）：RLM 的"上下文作为变量"更自然，但牺牲可回放性。
-- 显式的 `store/load` 变量存储，按内容寻址写入日志（讨论中曾提出）：能兼顾两者，但多了一个概念；在出现实际需求前不做。
+**Rejected alternatives:**
+- Persistent REPL (prime-agent): RLM's "context as variables" feels more natural but sacrifices replayability.
+- Explicit `store/load` variable storage, content-addressed in the log (proposed in discussion): combines both benefits but adds a concept; defer until a real need appears.
 
-**事实来源与把握程度（2026-11-01）：**
-- 一手源码：`src/sandbox.zig` 每次求值创建 runtime/context；`src/session.zig` 与 `src/session/log.zig` 仅恢复模型上下文。
-- 推测，未实测：跨 Run 状态不是刚需；用文件替代够用。
-- 未单独测量：新建 QuickJS context 的耗时。目前只有"进程启动 + 新建 runtime + 求值"合计 1.6 ms 的数据。
+**Sources and confidence (2026-11-01):**
+- Primary source: `src/sandbox.zig` creates runtime/context for each evaluation; `src/session.zig` and `src/session/log.zig` restore model context only.
+- Inference, unmeasured: cross-Run state is not essential; files are sufficient.
+- Not measured separately: QuickJS context creation time. The only current figure is 1.6 ms total for process startup + runtime creation + evaluation.
 
-**何时重新考虑：**
-- 观察到模型反复重做昂贵的工作，尤其是重复调用子 agent（每次都要花 token）；
-- 用文件中转的数据在模型侧造成明显的额外 token 或出错。
+**When to reconsider:**
+- Models repeatedly redo expensive work, especially subagent calls (each costs tokens);
+- File-mediated data causes material extra tokens or errors on the model side.

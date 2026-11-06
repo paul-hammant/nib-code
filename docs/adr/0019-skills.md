@@ -1,11 +1,11 @@
-# 0019：Skills 索引与按需读取
+# 0019: Skill index and on-demand reading
 
-## 决策
+## Decision
 
-新会话在读取 AGENTS.md 的同时扫描固定的全局和项目技能目录，只有用户在全局 `[skills]` 配置中逐个启用的技能才将名称、描述和绝对路径索引追加到 system。模型按任务匹配描述，用现有 `tools.read` 读取 SKILL.md；相对资源路径以技能目录为基准。恢复会话保留原 system。
+While reading AGENTS.md, new Sessions scan fixed global and project skill directories. Only skills individually enabled by the user in global `[skills]` configuration append a name, description, and absolute-path index to system. The model matches task descriptions and reads SKILL.md through existing `tools.read`; relative resource paths resolve against the skill directory. Resumed Sessions retain their original system.
 
-## 原因与取舍
+## Reasons and tradeoffs
 
-复用现有文件工具和会话机制，不增加工具或除 skill 以外的概念；仅增加全局 `[skills]` 开关。技能默认关闭：nib 保持克制，用户未选择的内容不进入模型上下文。索引在没有启用技能时完全省略，有技能时只付描述和路径的上下文成本，不自动请求模型或加载正文。项目技能覆盖全局技能，便于项目约定优先。
+Reuse existing file tools and Session mechanisms, adding no tools or concepts beyond skills, only global `[skills]` switches. Skills default to off: nib stays restrained and unselected content stays outside model context. Omit the index entirely when no skills are enabled; otherwise pay context costs only for descriptions and paths, without automatic model requests or body loading. Project skills override global ones so project conventions take priority.
 
-仅解析所需 frontmatter 字段，不引入完整 YAML 库、包管理或忽略文件。`/skills` 列出发现项，on/off 子命令复用原子配置写回，避免新增交互选择器；切换只影响新会话。暂不增加技能执行 slash command，已启用的技能由模型按任务读取。跳过原因写入日志，状态页只显示计数。
+Parse only needed frontmatter fields, without a full YAML library, package management, or ignore files. `/skills` lists discoveries; on/off subcommands reuse atomic configuration writes, avoiding another interactive selector. Switches affect new Sessions only. Defer skill-execution slash commands; models read enabled skills according to the task. Log skip reasons; the status page shows counts only.

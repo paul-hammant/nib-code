@@ -1,25 +1,25 @@
-# 用户目录与配置
+# User directory and configuration
 
-`NIB_HOME` 指定 nib 的用户目录，未设置时用 `$HOME/.nib`：
+`NIB_HOME` selects the user directory, default `$HOME/.nib`:
 
 ```text
 ~/.nib/
-  AGENTS.md       全局指令
-  config.toml     非秘密运行配置，可不创建
-  sessions/       <32位小写十六进制ID>.jsonl 主日志及同 ID 的 .calls.jsonl 工具录制
-  reflections.md  /reflect 正常结束后的回答与 issue 发布结果
+  AGENTS.md       Global instructions
+  config.toml     Optional nonsecret runtime configuration
+  sessions/       <32-character-lowercase-hex-ID>.jsonl main logs and matching .calls.jsonl recordings
+  reflections.md  Completed /reflect answers and issue publication results
 ```
 
-不读取 XDG 配置或数据目录，也不搜索或自动迁移旧文件。需要保留旧指令、会话时，由用户自行放入新目录。`NIB_HOME` 不改变 Codex 凭证位置：仍读取 `$CODEX_HOME/auth.json`，默认 `~/.codex/auth.json`。
+No XDG configuration/data reads, old-file searches, or automatic migration. Users move retained instructions/Sessions themselves. `NIB_HOME` does not change Codex credentials: `$CODEX_HOME/auth.json`, default ~/.codex/auth.json.
 
-新会话按基础指令、`$NIB_HOME/AGENTS.md`、项目 `AGENTS.md` 的顺序拼接 system。项目目录从 cwd 向上取第一个 `.git` 标记所在目录，没有则用 cwd；恢复会话沿用日志内的 system。暂不读取项目级 `config.toml`，项目约定仍写在 `AGENTS.md`。
+New Sessions assemble system from base instructions, `$NIB_HOME/AGENTS.md`, then project AGENTS.md. Project root is the first cwd ancestor containing .git, or cwd if absent. Resume retains logged system. No project `config.toml` yet; project conventions remain in AGENTS.md.
 
-## config.toml
+## `config.toml`
 
-TUI 中优先使用 `/model` 选择服务与模型，选择会原子保存到 config.toml；已有 Steps 时自动新建会话。自定义服务需先在配置中定义，之后会出现在菜单中。直接编辑配置或设置环境变量也是替代方式；NIB_PROVIDER/NIB_MODEL 在启动时优先于保存值。参数形式、凭证筛选与会话语义见 [providers.md](providers.md)。
+Prefer TUI `/model` for services/models, atomically saving to `config.toml` and starting new Sessions when Steps exist. Define custom services before menu use. Direct file/environment edits remain alternatives; NIB_PROVIDER/NIB_MODEL override saved values at startup. Syntax, credential filtering, Session semantics: [providers.md](providers.md).
 
 ```toml
-# 顶层键；均可省略
+# Optional top-level keys
 provider = "codex"
 effort = "high"
 
@@ -27,9 +27,9 @@ effort = "high"
 model = "gpt-6.1-sol"
 base_url = "https://chatgpt.com/backend-api"
 context_window = 500000
-reasoning_summary = "off" # auto 开启可读推理摘要
-run_tool = "custom" # function 回退到 JSON code/effort 工具
-transport = "websocket" # 握手/协议失败后本 Session 降级 SSE；sse 强制 HTTP
+reasoning_summary = "off" # auto enables readable reasoning summaries
+run_tool = "custom" # function falls back to JSON code/effort
+transport = "websocket" # Session falls back to SSE after handshake/protocol failure; sse forces HTTP
 
 [chat_completions]
 model = "deepseek-flash"
@@ -41,7 +41,7 @@ llm_concurrency = 4
 llm_calls_per_run = 100
 llm_input_kib = 256
 agent_concurrency = 4
-# max_steps = 50  # 可选；省略时不设 Step 上限
+# max_steps = 50  # Optional; omission means no Step limit
 stream_idle_timeout_s = 300
 stream_content_timeout_s = 120
 request_timeout_s = 300
@@ -49,12 +49,12 @@ run_background_after_ms = 10000
 run_output_bytes = 16384
 
 [skills]
-hallmark = true # 默认全部关闭，按名称逐个启用
+hallmark = true # All disabled by default; enable individually by name
 ```
 
-只使用当前 provider 的段落；切换 provider 不需要改写另一段。环境和配置文件均未指定时，默认 provider 为 `codex`，默认模型 `gpt-6.1-sol`、窗口 500000 tokens；使用本机 Codex 登录，无需 API key。Codex 窗口随模型变化，未知模型需要显式提供 `context_window` 或 `NIB_CONTEXT_WINDOW`。模型、恢复和凭证边界见 [codex.md](codex.md) 与 [ADR 0011](adr/0011-provider-wire-protocols.md)。
+Only the selected provider section applies; switching need not rewrite others. Without environment/file settings, default codex uses `gpt-6.1-sol`, window 500000 tokens, local Codex login, no API key. Codex windows depend on model; unknown models require `context_window` or NIB_CONTEXT_WINDOW. Models/resume/credentials: [codex.md](codex.md), [ADR 0011](adr/0011-provider-wire-protocols.md).
 
-内置 provider 为 codex（默认）、openai、anthropic、deepseek、xai；旧 chat_completions 是保留独立会话身份的 DeepSeek 兼容入口。内置服务表、模型窗口、认证方式、effort 映射与自定义站点示例见 [providers.md](providers.md)。
+Built-ins: codex (default), openai, anthropic, deepseek, xai. Legacy chat_completions is a DeepSeek-compatible entry retaining independent Session identity. Tables/windows/authentication/effort/custom examples: [providers.md](providers.md).
 
 ```toml
 provider = "openai"
@@ -62,7 +62,7 @@ provider = "openai"
 [openai]
 model = "gpt-6.1-sol"
 
-# 切换到自己的 OpenAI 兼容站点时，将顶层 provider 改成 mysite
+# For your OpenAI-compatible endpoint, set top-level provider to mysite
 [providers.mysite]
 protocol = "chat_completions"
 base_url = "https://models.example.com/v1"
@@ -71,109 +71,109 @@ context_window = 128000
 api_key_env = "MYSITE_API_KEY"
 ```
 
-openai 使用环境 OPENAI_API_KEY；mysite 使用 MYSITE_API_KEY。密钥内容不写进文件。自定义 provider 的 protocol/base_url/model/context_window 必填；无认证本地服务省略 api_key_env。设置 NIB_PROVIDER=mysite 可覆盖顶层选择。
+openai uses `OPENAI_API_KEY`; mysite uses MYSITE_API_KEY. Never write key contents to files. Custom protocol/base_url/model/context_window are required; omit api_key_env for unauthenticated local services. `NIB_PROVIDER`=mysite overrides the top-level choice.
 
-这是无额外依赖的 TOML 子集：支持空行、`#` 注释、单行双引号字符串（支持 `\"`、`\\`、`\n` 转义）、十进制整数（可带符号、下划线分组）和 true/false 布尔值；仅 `[skills]` 的技能名称键接受布尔值，其余配置键只使用字符串和正整数，布尔值会报告类型错误。仅接受顶层 `provider`、`effort`，内置 provider 同名段落下的 `model`、`base_url`、`context_window`，`[codex]` 还接受 `transport = "sse"|"websocket"`、`reasoning_summary = "off"|"auto"`、`run_tool = "custom"|"function"`，以及下述 `[limits]` 键和 `[skills]` 技能名称开关。另接受 `[providers.<id>]` 的 protocol/base_url/model/context_window/api_key_env；除此之外不支持数组、一般嵌套表、多行字符串等完整 TOML 语法；未知键、重复键/段落和格式错误会报配置文件路径与行号，不静默忽略。
+Dependency-free TOML subset: blank lines, # comments, single-line double-quoted strings (escapes `\"`, `\\`, `\n`), signed decimal integers with underscore grouping, true/false. Only [skills] name keys accept booleans; other keys use strings/positive integers and reject booleans by type. Accept only top-level provider/effort; model/base_url/context_window in built-in same-name sections; [codex] additionally transport = "sse"|"websocket", reasoning_summary = "off"|"auto", run_tool = "custom"|"function"; the [limits] keys below; [skills] switches; and `[providers.<id>]` protocol/base_url/model/context_window/api_key_env. No arrays, general nested tables, multiline strings, or full TOML. Unknown/duplicate keys/sections and malformed syntax report path/line rather than silently ignoring.
 
 ## [skills]
 
-技能默认关闭。键是技能名称，只有 `true` 启用；`false` 和缺省均关闭。找不到文件的启用项不进入提示索引，`/status` 显示 missing。没有环境变量或项目级开关。
+Skills default off. Keys are names; only true enables, false/absence disables. Enabled missing files stay outside the prompt index; `/status` shows missing. No environment/project switches.
 
-TUI `/skills` 列表显示发现的技能与开关；`/skills on <name>`、`/skills off <name>` 原子保存并保留其他配置行。仅新会话使用新设置，当前和恢复会话保留原 system。格式、目录和优先级见 [skills.md](skills.md)。
+TUI `/skills` lists discoveries/switches; `/skills on <name>` and `/skills off <name>` save atomically, preserving other lines. New Sessions only; current/resumed Sessions retain original system. Format/directories/precedence: [skills.md](skills.md).
 
 ## [limits]
 
-`[limits]` 适用于当前有效配置，与 provider 无关；各项可独立省略，默认值见下表。显式设置的值必须为范围内的正整数：
+[limits] applies to effective configuration independently of provider. Each may be omitted; defaults follow. Explicit values must be positive integers within range:
 
-| 键 | 含义 | 默认值 | 范围 |
+| Key | Meaning | Default | Range |
 | --- | --- | --- | --- |
-| `run_output_bytes` | 每个 Run／后台结果消息的模型展示字节预算，不改变 JS 内工具数据 | 16384 | 16384–16777216 |
-| `llm_concurrency` | `tools.llm` 每进程同时进行的请求数，超出排队 | 4 | 1–64 |
-| `llm_calls_per_run` | 每个 Run 的 `tools.llm` 调用上限，超出 reject | 100 | 1–10000 |
-| `llm_input_kib` | 单次 prompt + 序列化 input 的 UTF-8 字节上限（KiB），超出 reject，不截断 | 256 | 1–65536 |
-| `agent_concurrency` | 每进程同时运行的子 agent 数，超出排队 | 4 | 1–64 |
-| `max_steps` | 每个 Turn 的 Step 上限，耗尽时返回 `TooManySteps`；省略时不设上限（内部为 `null`） | 无上限 | 1–100000 |
-| `run_background_after_ms` | Run 超过此墙钟毫秒数且仍等待工具时自动转后台；只作用于模型发起的 Run | 10000 | 1–3600000 |
-| `stream_content_timeout_s` | 连续没有非空 reasoning、文本或工具参数增量的秒数；心跳、元数据不重置 | 120 | 1–3600 |
-| `request_timeout_s` | 单次模型尝试的总秒数；持续推理也不延长，取消并 join 后按原策略重试 | 300 | 1–3600 |
-| `stream_idle_timeout_s` | 流式模型响应连续无字节到达的超时秒数（含首次数据前等待；心跳、元数据也重置计时），超时按连接中断沿用重试策略 | 300 | 1–3600 |
+| `run_output_bytes` | Model display bytes per Run/background result message; JS tool data unchanged | 16384 | 16384–16777216 |
+| `llm_concurrency` | Concurrent `tools.llm` requests per process; excess queues | 4 | 1–64 |
+| `llm_calls_per_run` | `tools.llm` calls per Run; excess rejects | 100 | 1–10000 |
+| `llm_input_kib` | UTF-8 prompt + serialized input cap per call (KiB); excess rejects, never truncates | 256 | 1–65536 |
+| `agent_concurrency` | Concurrent children per process; excess queues | 4 | 1–64 |
+| `max_steps` | Steps per Turn; exhaustion returns TooManySteps; omission means unlimited (internal null) | Unlimited | 1–100000 |
+| `run_background_after_ms` | Model-initiated Run automatically backgrounds after this wall time while waiting for tools | 10000 | 1–3600000 |
+| `stream_content_timeout_s` | Seconds without nonempty reasoning/text/tool-argument deltas; heartbeat/metadata do not reset | 120 | 1–3600 |
+| `request_timeout_s` | Total seconds per model attempt; reasoning does not extend it; cancel/join then retry by policy | 300 | 1–3600 |
+| `stream_idle_timeout_s` | Seconds without stream bytes, including first-data wait; heartbeat/metadata reset; timeout retries as disconnection | 300 | 1–3600 |
 
-自动转后台阈值沿用 `[limits]` 配置和子会话继承，不增加环境变量或 CLI 开关。设成较大值可用于前台对照实验。`nib js`、TUI `/js` 和离线 replay 保持同步执行；运行中的 JS 片段不会因墙钟阈值被切断。语义见 [run-output.md](run-output.md#长-run-自动转后台)。
+Automatic background thresholds use [limits] and child inheritance, without environment/CLI switches; large values allow foreground comparison. nib js, TUI `/js`, offline replay stay synchronous; active JS segments are not interrupted at wall thresholds. See [run-output.md](run-output.md#long-runs-automatically-move-to-the-background).
 
-三个截止时间同时约束主模型请求、`tools.llm` 和压缩摘要请求，适用于 WS 和 SSE，每次重试重新计时。总请求截止时间覆盖连接、发送、读头及读取响应；另外两个截止时间在接收流时检查。空闲超时复用连接中断的重试上限和退避；Chat Completions 已输出可见增量时仍不自动重放，缓冲结果的 `tools.llm` 与摘要可以安全重试。
+All three deadlines apply to main-model, `tools.llm`, and compaction requests over WS/SSE, resetting each retry. Total deadlines cover connection/send/headers/body; idle deadlines check receiving streams. Idle timeouts share disconnection retries/backoff. Chat Completions does not replay after visible deltas; buffered llm/summaries can retry safely.
 
-字节活动不能区分有效进展与心跳，持续摘要也不能证明请求会结束，因此分别限制字节空闲、内容空闲和单次请求总时长。120/300 秒的内容/请求默认值给 2026-11-05 已观察到的最长首代码等待和单次成功请求各留约两倍余量；合法的长静默推理或超长请求仍可能被中断，可按实际任务调高。300 秒总上限是 nib 的选择，不是 Codex CLI 默认值：参考版本 [rust-v0.166.0](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/codex-client/src/provider.rs#L86) 未设置 stream request 总 timeout。重试会重新计时，最多 5 次尝试加退避，整个 Step 仍可能等待约 25 分钟。逐次诊断见 [日志](session-log.md#step-传输字段)。
+Bytes cannot distinguish progress from heartbeats; continuous summaries cannot guarantee completion. Hence separate byte-idle/content-idle/total limits. Content/request defaults 120/300 seconds leave about twice the longest first-code wait/successful request observed on 2026-11-05. Legitimate silent reasoning/long requests can still interrupt; raise limits for actual tasks. Total 300 seconds is nib policy, not Codex CLI default: [rust-v0.166.0](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/codex-client/src/provider.rs#L86) has no stream-request total timeout. Up to 5 attempts plus backoff reset timers, so a Step may still wait about 25 minutes. Per-attempt diagnostics: [logs](session-log.md#step-transport-fields).
 
-`run_output_bytes` 可由 `NIB_RUN_OUTPUT_BYTES` 覆盖；其余限额没有环境变量或 CLI 覆盖；随有效配置经 stdin 传给子会话，子会话不读取配置文件。`max_steps` 未设置时子会话同样为 `null`，显式设置时继承该上限。sandbox 内全部工具最多 8 并发是线程调度实现，不由此小节控制。
+`NIB_RUN_OUTPUT_BYTES` overrides `run_output_bytes`; other limits have no environment/CLI overrides. Effective limits pass via stdin to children, which skip config reads. Missing `max_steps` remains null in children; explicit limits inherit. Sandbox 8-tool concurrency is thread scheduling, outside this section.
 
-显式设置 `max_steps` 时，新会话的 system prompt 会写明每个 Turn 的上限；剩余不多于 3 个 Step 时，每个 Run 输出末尾追加剩余步数（不计入配置的 Run 展示预算）。耗尽后不再请求模型；正在运行的后台 agent/bash 会先完成，结果按现有格式写进历史和日志，下一 Turn 可见。Turn 仍以 `TooManySteps` / `stopped after N steps` 结束；若等待了任务，提示会列出任务类型与 ID。等待期间 Esc 仍会立即取消 Turn 并停止后台任务。未设置时不添加这些提示，也不限制 Step 数。恢复会话保留原始 system；若当前配置与其中记录的上限不同，会在每个 Turn 的用户输入前附加当前预算事实，避免沿用过期上限。
+Explicit `max_steps` enters new-Session system prompts per Turn. With at most 3 Steps left, append remaining counts to each Run output outside display budgets. Exhaustion stops model requests; active background agent/bash finish first, results enter history/logs for next Turn. Still end with TooManySteps / stopped after N steps, listing waited task types/IDs if any. Esc immediately cancels Turn/tasks during waits. Without limits, no hints or Step cap. Resume retains original system; if current limits differ, prepend current budget facts to each Turn input to avoid stale limits.
 
-配置文件不存秘密，也不接受 API key、token、密码或凭证字段。Chat Completions 的 key 使用 `NIB_API_KEY` / `DEEPSEEK_API_KEY`；Codex 使用现有登录文件。不要把秘密放进 URL。
+Configuration stores no secrets and accepts no API-key/token/password/credential fields. Chat Completions uses `NIB_API_KEY` / `DEEPSEEK_API_KEY`; Codex uses login files. Keep secrets out of URLs.
 
-## 覆盖优先级
+## Override precedence
 
-从高到低：
+Highest first:
 
-1. CLI `--effort <level>`（TUI 启动和 `ask` 都支持）。
-2. 环境变量：`NIB_PROVIDER`、`NIB_MODEL`、`NIB_BASE_URL`、`NIB_CONTEXT_WINDOW`、`NIB_THINKING`、`NIB_REASONING_EFFORT`、`NIB_CODEX_TRANSPORT`、`NIB_CODEX_RUN_TOOL`、`NIB_REASONING_SUMMARY`、`NIB_RUN_OUTPUT_BYTES`。
+1. CLI `--effort <level>` (TUI startup and ask).
+2. Environment: `NIB_PROVIDER`, `NIB_MODEL`, `NIB_BASE_URL`, `NIB_CONTEXT_WINDOW`, `NIB_THINKING`, `NIB_REASONING_EFFORT`, `NIB_CODEX_TRANSPORT`, `NIB_CODEX_RUN_TOOL`, `NIB_REASONING_SUMMARY`, NIB_RUN_OUTPUT_BYTES.
 3. `$NIB_HOME/config.toml`。
-4. 内置默认值。
+4. Built-in defaults.
 
-环境中设置 thinking 或 effort 时，不采用文件 effort。`NIB_THINKING=off` 优先于环境 effort；显式 CLI effort 又覆盖两者。未指定任何推理配置时使用服务端默认。CLI `--effort default` 清除本进程的 thinking/effort 覆盖，不修改文件。
+Environment thinking/effort suppress file effort. `NIB_THINKING=off` overrides environment effort; explicit CLI effort overrides both. Without reasoning configuration use server defaults. CLI --effort default clears process thinking/effort overrides without editing files.
 
-子会话通过匿名 stdin 管道继承父会话的有效 provider/模型配置及限额，跳过配置文件读取，不会因文件在中途变化而采用另一套配置；各进程独立读取选定密钥环境变量，stdin 不传密钥内容；Codex 凭证仍由各进程独立读取。
+Children inherit effective provider/model/limits through anonymous stdin, skipping files so mid-execution file changes cannot alter configuration. Each independently reads selected environment keys; stdin contains no secrets. Codex credentials are independently read too.
 
-## 环境变量
+## Environment variables
 
-| 变量 | 含义 |
+| Variable | Meaning |
 |---|---|
-| `NIB_RECORD` | 默认开启工具结果录制；仅 `off` 关闭，不删除已有 calls 文件，见 [replay.md](replay.md) |
-| `NIB_HOME` | 用户目录，默认 `~/.nib`；不改变 Codex 凭证位置 |
-| `NIB_PROVIDER` | codex / openai / anthropic / deepseek / xai / chat_completions 或已配置自定义 id |
-| `NIB_BASE_URL` | 当前 provider 的服务地址 |
-| `NIB_CODEX_TRANSPORT` | Codex 传输：`websocket`（默认）或 `sse`；覆盖 `[codex].transport`，握手/协议失败后本 Session 降级 SSE，见 [Codex 传输](codex.md#responses-websocket-传输) |
-| `NIB_CODEX_RUN_TOOL` | `custom`（默认，直接发送 JS）或 `function`（JSON code/effort）；覆盖 `[codex].run_tool`，不改写既有历史类型，Chat Completions 始终使用 function |
-| `NIB_REASONING_SUMMARY` | `off`（默认，不发送 summary）或 `auto`；覆盖 `[codex].reasoning_summary`，不改变 effort 和加密 reasoning 回传 |
-| `NIB_RUN_OUTPUT_BYTES` | 模型展示预算字节数，16384–16777216；覆盖 `[limits].run_output_bytes`，默认 16384；不改变 JS 数据与 console 捕获上限 |
-| `NIB_MODEL` | 当前 provider 的模型 |
-| `NIB_CONTEXT_WINDOW` | 上下文窗口 tokens，DeepSeek 默认 1000000 |
-| `NIB_THINKING` | `on` / `off`，不设时用服务端默认（若无其他推理配置） |
-| `NIB_REASONING_EFFORT` | 推理档位，如 `low` / `high` / `max` |
-| `CODEX_HOME` | Codex 登录目录，凭证为其中的 `auth.json`，默认 `~/.codex/auth.json` |
-| `NIB_API_KEY` / `DEEPSEEK_API_KEY` | 旧 chat_completions 优先用 NIB_API_KEY；deepseek 使用 DEEPSEEK_API_KEY，仅从环境读取 |
-| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `XAI_API_KEY` | 对应内置 provider 的 API key，仅从环境读取 |
-| `NIB_PATCHES_OFF` | 关闭提示词中的模型补丁：`all` 或逗号分隔的 id，见 [compromises.md](compromises.md) |
-| `NIB_ISSUE_REPO` | `/reflect` 自动发布的目标仓库或 `off`，见 [reflect.md](reflect.md) |
+| `NIB_RECORD` | Recording defaults on; only off disables, without deleting calls files; [replay.md](replay.md) |
+| `NIB_HOME` | User directory, default ~/.nib; Codex credentials unchanged |
+| `NIB_PROVIDER` | codex / openai / anthropic / deepseek / xai / chat_completions or configured custom id |
+| `NIB_BASE_URL` | Current provider endpoint |
+| `NIB_CODEX_TRANSPORT` | websocket (default) or sse; overrides [codex].transport; Session SSE fallback after handshake/protocol failure; [transport](codex.md#responses-websocket-transport) |
+| `NIB_CODEX_RUN_TOOL` | custom (default, direct JS) or function (JSON code/effort); overrides `[codex].run_tool`, preserving history types; Chat Completions always function |
+| `NIB_REASONING_SUMMARY` | off (default, omit summary) or auto; overrides `[codex].reasoning_summary`, preserving effort/encrypted continuation |
+| `NIB_RUN_OUTPUT_BYTES` | Model display bytes, 16384–16777216; overrides `[limits].run_output_bytes`, default 16384; JS data/console capture unchanged |
+| `NIB_MODEL` | Current provider model |
+| `NIB_CONTEXT_WINDOW` | Context tokens; DeepSeek default 1000000 |
+| `NIB_THINKING` | on / off; unset uses server defaults absent other reasoning settings |
+| `NIB_REASONING_EFFORT` | Reasoning level, e.g. low / high / max |
+| `CODEX_HOME` | Codex login directory containing `auth.json`; default `~/.codex/auth.json` |
+| `NIB_API_KEY` / `DEEPSEEK_API_KEY` | Legacy chat_completions prefers `NIB_API_KEY`; deepseek uses `DEEPSEEK_API_KEY`; environment only |
+| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `XAI_API_KEY` | Corresponding built-in keys; environment only |
+| `NIB_PATCHES_OFF` | Disable prompt patches: all or comma-separated ids; [compromises.md](compromises.md) |
+| `NIB_ISSUE_REPO` | `/reflect` publication repository or off; [reflect.md](reflect.md) |
 
-## 工具结果录制
+## Tool-result recording
 
-工具结果录制默认开启，设置环境变量 `NIB_RECORD=off` 关闭后续录制，不删除已有旁路文件。其他取值与未设置一样开启，不添加 TOML 配置项。录制写入 `$NIB_HOME/sessions/<session_id>.calls.jsonl`，创建权限 `0600`，独立于主日志和恢复功能。它可能含模型展示预算之外的完整文件内容、命令输出和秘密；关闭前已录下的数据仍需单独检查或删除。旁路不自动发给 provider，也不供 `/reflect` 枚举读取。
+Recording defaults on. `NIB_RECORD=off` disables subsequent recording without deleting sidecars. Other values behave like unset/on; no TOML key. Write `$NIB_HOME/sessions/<session_id>.calls.jsonl`, created mode 0600, independently of main logs/resume. It may contain complete files, output, and secrets beyond display budgets; inspect/delete prior data separately. Sidecars are neither automatically sent to providers nor enumerated by /reflect.
 
-离线命令、JSONL 格式、SHA-256 去重、每项 1 MiB 截断和隐私/能力边界见 [replay.md](replay.md)。
+Offline commands, JSONL, SHA-256 deduplication, per-item 1 MiB truncation, privacy/capability boundaries: [replay.md](replay.md).
 
-## 逐 Step effort 调度
+## Per-Step effort scheduling
 
-Codex 默认 custom `run` 直接接收 JS；可选首行 `// @run: {"effort":"low"}` 声明 effort，下一行开始正文。该行保留在源码和日志中；只识别第一行，格式或档位无效时返回可修正的 Run 错误。Chat Completions 或 Codex `run_tool = "function"` 仍调用 `run({code: "...", effort: "low"})`。可选值为 `low|medium|high|default`。声明针对看到本次 Run 结果之后的**下一次主模型 Step 请求**，仅生效一次；后续未再次声明则恢复用户设置。同一 Step 多个 Run 取最后一个声明，未声明的 Run 不覆盖它。`default` 显式恢复用户设置。机械性的下一步适合 low，重新设计或疑难排查不宜降档。
+Codex custom run accepts JS directly; optional first line `// @run: {"effort":"low"}` declares effort, body starts next line. Preserve it in source/logs; recognize only the first line, returning correctable Run errors for invalid syntax/levels. Chat Completions/Codex run_tool = "function" use run({code: "...", effort: "low"}). Values: low|medium|high|default. Apply once to the **next main-model Step request** after this result, then restore user settings unless redeclared. Last declaration in a Step wins; undeclared Runs do not overwrite it. default explicitly restores user settings. Mechanical next Steps fit low; redesign/difficult diagnosis should not reduce effort.
 
-护栏由 Session 统一决定：
+Session applies guardrails centrally:
 
-- 用户有效 effort 既是默认值也是上限；`low < medium < high < xhigh < max`，声明超过上限则回退用户设置。`off/none/minimal` 也不会被模型声明抬升。
-- 服务端 `default` 的实际档位未知，只放行最低档 `low` 或恢复 `default`；`medium/high` 回退默认，不猜测服务端档位。
-- 声明所在的 Run 返回 `ok=false` 时忽略该降档，下一次回退默认；其他未声明 Run 的失败不改变最后一个声明的选择。
-- Turn 首次请求、以及带有新插话（回合中用户消息）的请求始终用用户设置；压缩保持独立策略；`tools.llm` 保持用户配置及其自己的 effort 参数，不继承主模型的临时降档。
-- Codex 仍沿用现有映射，不能关闭推理的模型将 off 映射为 low。调度不修改用户配置、文件或子会话继承的配置。
+- Effective user effort is default and ceiling: low < medium < high < xhigh < max. Above-ceiling declarations revert to user settings; `off/none/minimal` cannot be raised either.
+- Actual server-default effort is unknown: allow only low or default; `medium/high` revert without guessing.
+- Ignore a reduction if its declaring Run returns `ok=false`, reverting next time; failures in other undeclared Runs do not alter the last declaration.
+- First Turn requests and requests carrying new interjections always use user settings. Compaction keeps independent policy; `tools.llm` uses user configuration/its own effort, not temporary main-model reductions.
+- Existing Codex mappings remain; non-disableable models map off→low. Scheduling changes no user configuration/files/child-inherited configuration.
 
-TUI 的 Run 摘要末尾显示**产生它的模型请求**实际 effort（不是该 Run 对下一步的声明），护栏来源加 `(guard)`；历史从日志恢复，旧日志无 effort 则不显示。下边框显式设置显示为 `effort ≤high`，服务端 default 显示保持原样。
+TUI Run summaries show actual effort of the **request producing them**, not next-Step declarations, with (guard) for guarded sources. Restore history from logs; omit effort for old logs without it. Explicit bottom-border settings show effort ≤high; server default displays unchanged.
 
-## effort 持久化
+## Effort persistence
 
-`default|off|none|minimal|low|medium|high|xhigh|max` 可用于 `--effort` 或 TUI `/effort`；具体支持档位由模型/服务端决定。
+--effort and TUI `/effort` accept default|off|none|minimal|low|medium|high|xhigh|max; model/server determines supported levels.
 
-- `nib --effort high`、`nib ask --effort high ...`：仅本进程生效，不写文件。
-- TUI `/effort`：查询当前请求配置，不写文件。
-- TUI `/effort high`：空闲时切换，后续 Turn 生效，并将顶层 `effort` 原子保存至 `config.toml`；只更新该值，保留其他配置行和注释，不把环境变量或有效配置整体序列化回文件。
-- TUI `/effort default`：清除本进程 thinking/effort 覆盖，并移除文件顶层 `effort`，保留其余内容。下次启动仍按正常优先级解析，环境覆盖可能再次生效。
+- nib --effort high and nib ask --effort high ... affect this process only, without persistence.
+- TUI `/effort` queries current request settings without writing.
+- TUI `/effort high` switches while idle for later Turns, atomically saving top-level effort only, preserving other lines/comments without serializing environment/effective configuration wholesale.
+- TUI `/effort default` clears process thinking/effort and removes file top-level effort, preserving the rest. Next startup follows normal precedence; environment may override again.
 
-当前有效配置由子会话继承；摘要使用独立的最低推理策略。恢复会话采用本次启动的有效配置，但 provider 和 Codex 模型需符合日志的恢复边界，见 [codex.md](codex.md)。
+Children inherit effective configuration; summaries use independent minimum reasoning. Resume uses current launch settings within provider/Codex-model boundaries; [codex.md](codex.md).
 
-写回先读入并校验当前文件，再按字节范围仅替换 effort 的值（删除键时保留同行注释）；缺失时插在第一个小节前的顶层末尾。完整内容写入同目录临时文件、sync 后 rename 替换，失败时清理临时文件，原文件不被部分覆盖。保存失败会在对话区提示，不撤销本次 effort 设置。没有跨进程锁：多个 nib 或外部编辑器同时保存时仍可能后写覆盖先写。配置文件上限为 1 MiB；不提供自动迁移和项目级配置。
+Read/validate current files before writeback, replacing only effort value byte ranges (preserve same-line comments on deletion); if absent insert at top-level end before first section. Write full contents to same-directory temporary file, sync, rename; failures clean up temporary files, never partially overwrite originals. Save failures show in transcript without reverting current effort. No cross-process lock: simultaneous nib/editor saves may overwrite earlier saves. File cap 1 MiB; no automatic migration/project config.
