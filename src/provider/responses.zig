@@ -29,6 +29,7 @@ pub fn contextWindow(model: []const u8) !u64 {
 }
 
 pub fn reasoningEffort(cfg: p.Config) ?[]const u8 {
+    if (cfg.provider == .xai and (cfg.thinking == false or (cfg.reasoning_effort != null and (std.mem.eql(u8, cfg.reasoning_effort.?, "none") or std.mem.eql(u8, cfg.reasoning_effort.?, "minimal"))))) return null;
     if (cfg.thinking == false) {
         if (modelInfo(cfg.model)) |model| if (!model.can_disable_reasoning) return "low";
         return "none";
@@ -323,7 +324,7 @@ fn requestBody(gpa: std.mem.Allocator, cfg: p.Config, cache_key: []const u8, mes
         }
     }
     try tool_writer.writer.writeByte(']');
-    const effort = if (cfg.provider == .xai and (cfg.thinking == false or (cfg.reasoning_effort != null and (std.mem.eql(u8, cfg.reasoning_effort.?, "none") or std.mem.eql(u8, cfg.reasoning_effort.?, "minimal"))))) null else reasoningEffort(cfg);
+    const effort = reasoningEffort(cfg);
     const reasoning = if (effort != null or cfg.reasoning_summary == .auto) try std.fmt.allocPrint(a, ",\"reasoning\":{f}", .{std.json.fmt(.{ .effort = effort, .summary = if (cfg.reasoning_summary == .auto) @as(?[]const u8, "auto") else null }, .{ .emit_null_optional_fields = false })}) else "";
     const format = if (cfg.output_schema) |schema|
         try std.fmt.allocPrint(a, ",\"text\":{f}", .{std.json.fmt(.{ .format = .{ .type = "json_schema", .name = "result", .strict = true, .schema = schema } }, .{})})

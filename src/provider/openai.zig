@@ -217,13 +217,15 @@ fn requestBody(gpa: std.mem.Allocator, cfg: Config, messages: []const Message, t
     defer gpa.free(limit);
     const tool_field = if (std.mem.eql(u8, tools_json, "[]")) try gpa.dupe(u8, "") else try std.fmt.allocPrint(gpa, ",\"tools\":{s}", .{tools_json});
     defer gpa.free(tool_field);
-    const thinking = if (cfg.thinking) |on|
+    const deepseek = cfg.provider == .chat_completions or cfg.provider == .deepseek;
+    const thinking = if (if (deepseek) cfg.thinking else null) |on|
         try std.fmt.allocPrint(gpa, ",\"thinking\":{{\"type\":\"{s}\"}}", .{if (on) "enabled" else "disabled"})
     else
         try gpa.dupe(u8, "");
     defer gpa.free(thinking);
-    const effort = if (cfg.reasoning_effort != null and cfg.thinking != false)
-        try std.fmt.allocPrint(gpa, ",\"reasoning_effort\":{f}", .{std.json.fmt(cfg.reasoning_effort.?, opts)})
+    const effort_value = if (!deepseek and cfg.thinking == false) "none" else if (cfg.thinking != false) cfg.reasoning_effort else null;
+    const effort = if (effort_value) |value|
+        try std.fmt.allocPrint(gpa, ",\"reasoning_effort\":{f}", .{std.json.fmt(value, opts)})
     else
         try gpa.dupe(u8, "");
     defer gpa.free(effort);
@@ -338,4 +340,14 @@ test "tool-free JSON requests retain system and use json_object without leaking 
             try t.expect(!object.contains("response_format"));
         }
     }
+}
+
+test "custom Chat Completions effort avoids DeepSeek-only thinking fields" {
+    const t = std.testing;
+    var cfg: Config = .{ .provider = .custom, .custom_provider = "site", .base_url = "", .api_key = "", .model = "local" };
+    try cfg.setEffort("high");
+    const body = try requestBody(t.allocator, cfg, &.{.{ .role = "user", .content = "hi" }}, "[]", null);
+    defer t.allocator.free(body);
+    try t.expect(std.mem.indexOf(u8, body, "\"thinking\"") == null);
+    try t.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
 }
