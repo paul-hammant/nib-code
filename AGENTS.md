@@ -5,6 +5,7 @@ A coding agent written in Zig 0.17, with command name `nib`.
 ## Common commands
 
 - Build: `zig build`; tests: `zig build test --summary all`; end-to-end (local mocks, no real keys): after `zig build`, run `python3 tests/test_skills.py`, `python3 tests/test_session.py`, `python3 tests/test_agent.py`, `python3 tests/test_agent_reuse.py`, `python3 tests/test_agent_fork.py`, `python3 tests/test_background_agent.py`, `python3 tests/test_background_bash.py`, `python3 tests/test_background_run.py`, `python3 tests/test_codex.py`, `python3 tests/test_providers.py`, `python3 tests/test_codex_websocket.py`, `python3 tests/test_llm.py`, `python3 tests/test_stats.py`, `python3 tests/test_effort.py`, `python3 tests/test_interjections.py`, `python3 tests/test_limits.py`, `python3 tests/test_replay.py`, `python3 tests/test_stream_idle.py`, `python3 tests/test_files.py`, `python3 tests/test_cli.py`, `python3 tests/test_undo.py`, `python3 tests/test_tui_mouse.py`, `python3 tests/test_model.py`, `python3 tests/test_tui_stream.py`
+- Parallel e2e: after `zig build`, run `scripts/test-all.sh [N]` locally (default 4 workers); it reads the list above, prints only failures and a summary, and retains failing logs. Tests use isolated temporary homes and dynamic ports.
 - Install to `~/.local/bin/nib`: `zig build -Doptimize=ReleaseFast --prefix ~/.local`; version in `build.zig.zon`; view with `nib --version`.
 - TUI `/model` selects and saves the service and model; automatically starts a new Session if Steps already exist.
 - Run: `./zig-out/bin/nib` (TUI), `nib ask '<prompt>'`, `nib js '<code>'`; use `/compact` in the TUI to compact context manually.
@@ -12,6 +13,13 @@ A coding agent written in Zig 0.17, with command name `nib`.
 - Statistics: `python3 scripts/stats.py [log-file-or-directory] [--since YYYY-MM-DD] [--cwd directory] [--group-by version|system|patches] [--json]`.
 - Reflection: TUI `/reflect [focus]` (publishes issues automatically; see [docs/reflect.md](docs/reflect.md) for the switch and safety boundaries).
 - Release: update the version and release notes, then push a tag; see [docs/releasing.md](docs/releasing.md).
+
+## Workflow
+
+- Test only the code you change locally: matching unit tests through `zig build test` (use filters if supported) and 1–3 related e2e scripts. GitHub Actions runs unit tests on Linux/macOS and the full e2e suite on Linux (portable scripts also on macOS) on every push, pull request, or manual dispatch: push a feature branch (`feat/…`, `fix/…`, `docs/…`, `ci/…`), wait for CI to pass before merging to main, and delete the remote branch after merging. Use the parallel local runner only when CI is unavailable.
+- Pushing feature branches is allowed. Pushing or merging to main, tags/releases, editing GitHub releases, and closing or merging PRs require the maintainer's explicit approval.
+- Everything published on GitHub is English: docs, ADRs, release notes, comments, and prompts. `README.zh-CN.md` is the only Chinese file.
+- Never tune nib for benchmark tasks. Judge speed against other agents using the same model, effort, and service tier.
 
 ## References as needed
 
@@ -48,6 +56,6 @@ Prefer tools.grep/tools.glob for searches rather than rg/find/grep in bash. For 
 
 Terminology: [CONTEXT.md](CONTEXT.md); decision records: [docs/adr/](docs/adr/).
 
-**Documentation is reference, not rules.** If an ADR conflicts with code, measurements, or a better solution, identify the conflict and update the documentation; do not bend code to fit docs. See [docs/README.md](docs/README.md). All content published on GitHub is in English, except the deliberate `README.zh-CN.md` translation and intentional Unicode test fixtures.
+**Documentation is reference, not rules.** If an ADR conflicts with code, measurements, or a better solution, identify the conflict and update the documentation; do not bend code to fit docs. See [docs/README.md](docs/README.md).
 
 New Sessions assemble system from base instructions, global `$NIB_HOME/AGENTS.md` (default `~/.nib/AGENTS.md`), then project `AGENTS.md`; later instructions take precedence. The project directory is the first ancestor of cwd with a `.git` marker, or cwd if none exists. Read only `AGENTS.md`. Resumed Sessions retain the original system from the log; subsequent instruction-file changes affect new Sessions only.
