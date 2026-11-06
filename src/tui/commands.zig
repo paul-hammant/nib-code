@@ -10,7 +10,10 @@ pub const Command = enum { help, new, @"resume", compact, effort, copy, reflect,
 
 pub const Choices = enum { none, efforts, sessions, tasks };
 
+pub const Group = enum { send, view, session };
+
 pub const Spec = struct {
+    group: Group = .session,
     args: []const u8 = "",
     help: []const u8,
     /// Usable while a Turn is running.
@@ -21,20 +24,20 @@ pub const Spec = struct {
 };
 
 pub const specs = std.enums.EnumArray(Command, Spec).init(.{
-    .status = .{ .help = "show timing and cache details", .while_busy = true },
-    .tasks = .{ .help = "list background tasks", .while_busy = true },
-    .stop = .{ .args = "<id>", .help = "stop one background task; partial changes may remain", .while_busy = true, .choices = .tasks, .needs_arg = true },
-    .help = .{ .help = "list commands and keys", .while_busy = true },
-    .new = .{ .help = "start a new session in this directory" },
-    .@"resume" = .{ .args = "<id>", .help = "switch to an earlier session in this directory", .choices = .sessions, .needs_arg = true },
-    .compact = .{ .help = "summarize earlier history now" },
-    .effort = .{ .args = "[level]", .help = "show or set reasoning effort", .choices = .efforts },
-    .copy = .{ .help = "copy the last answer to the clipboard", .while_busy = true },
-    .reflect = .{ .args = "[focus]", .help = "review this session for harness problems; saved to reflections.md" },
-    .js = .{ .args = "<code>", .help = "run JavaScript in the sandbox", .needs_arg = true },
+    .status = .{ .group = .view, .help = "timing and cache details", .while_busy = true },
+    .tasks = .{ .group = .view, .help = "background tasks", .while_busy = true },
+    .stop = .{ .args = "<id>", .help = "stop a task; changes may remain", .while_busy = true, .choices = .tasks, .needs_arg = true },
+    .help = .{ .group = .view, .help = "commands and keys", .while_busy = true },
+    .new = .{ .help = "new session" },
+    .@"resume" = .{ .args = "<id>", .help = "resume a session", .choices = .sessions, .needs_arg = true },
+    .compact = .{ .help = "compact earlier history" },
+    .effort = .{ .group = .send, .args = "[level]", .help = "reasoning effort", .choices = .efforts },
+    .copy = .{ .group = .view, .help = "copy last answer", .while_busy = true },
+    .reflect = .{ .args = "[focus]", .help = "publish issue drafts: yyydddkkk/nib-code" },
+    .js = .{ .group = .send, .args = "<code>", .help = "run JavaScript", .needs_arg = true },
 });
 
-pub const keys = "Enter send · Shift+Enter newline · Esc cancel · Ctrl+O expand folded entries · PgUp/PgDn, Shift+↑↓ or wheel scroll · ↑ input history · Ctrl+C quit";
+pub const keys = "Enter send · Shift+Enter newline · Esc cancel\nCtrl+O details · PgUp/PgDn scroll · ↑ input history · Ctrl+C quit";
 
 const slash_names = blk: {
     var names: [std.enums.values(Command).len][]const u8 = undefined;
@@ -83,6 +86,10 @@ pub const Candidate = struct {
     label: []const u8,
     detail: []const u8,
 
+    pub fn group(c: Candidate) ?Group {
+        return if (c.value == null) specs.get(c.command).group else null;
+    }
+
     /// What accepting it with Tab leaves in the input.
     pub fn completion(c: Candidate, gpa: std.mem.Allocator) ![]u8 {
         if (c.value) |v| return std.fmt.allocPrint(gpa, "{s} {s}", .{ slashName(c.command), v });
@@ -116,12 +123,15 @@ pub fn candidates(input: []const u8, sessions: []const Choice, tasks: []const Ch
     var n: usize = 0;
     const space = std.mem.indexOfScalar(u8, input, ' ') orelse {
         const prefix = input[1..];
-        for (std.enums.values(Command)) |c| {
-            if (n == out.len) break;
-            if (!std.mem.startsWith(u8, @tagName(c), prefix)) continue;
-            const spec = specs.get(c);
-            out[n] = .{ .command = c, .label = slashName(c), .detail = spec.help };
-            n += 1;
+        for (std.enums.values(Group)) |group| {
+            for (std.enums.values(Command)) |c| {
+                if (n == out.len) return out[0..n];
+                if (specs.get(c).group != group) continue;
+                if (!std.mem.startsWith(u8, @tagName(c), prefix)) continue;
+                const spec = specs.get(c);
+                out[n] = .{ .command = c, .label = slashName(c), .detail = spec.help };
+                n += 1;
+            }
         }
         return out[0..n];
     };
@@ -142,12 +152,30 @@ pub fn candidates(input: []const u8, sessions: []const Choice, tasks: []const Ch
     return out[0..n];
 }
 
-pub fn helpText(gpa: std.mem.Allocator) ![]u8 {
+pub fn groupName(group: Group) []const u8 {
+    return switch (group) {
+        .send => "Send",
+        .view => "View",
+        .session => "Session",
+    };
+}
+
+pub fn reflectHelp(buf: []u8, repo: ?[]const u8) []const u8 {
+    return if (repo) |r| std.fmt.bufPrint(buf, "publish issue drafts: {s}", .{r}) catch "publish issue drafts (see /help)" else "review session · issue publishing off";
+}
+
+pub fn helpText(gpa: std.mem.Allocator, issue_repo: ?[]const u8) ![]u8 {
     var text: std.ArrayList(u8) = .empty;
     errdefer text.deinit(gpa);
-    for (std.enums.values(Command)) |c| {
-        const spec = specs.get(c);
-        try text.print(gpa, "{s}{s}{s} — {s}{s}\n", .{ slashName(c), if (spec.args.len > 0) " " else "", spec.args, spec.help, if (spec.while_busy) " (also while working)" else "" });
+    var reflect_buf: [512]u8 = undefined;
+    for (std.enums.values(Group)) |group| {
+        try text.print(gpa, "{s}\n", .{groupName(group)});
+        for (std.enums.values(Command)) |c| {
+            const spec = specs.get(c);
+            if (spec.group != group) continue;
+            try text.print(gpa, "  {s}{s}{s} · {s}\n", .{ slashName(c), if (spec.args.len > 0) " " else "", spec.args, if (c == .reflect) reflectHelp(&reflect_buf, issue_repo) else spec.help });
+        }
+        try text.append(gpa, '\n');
     }
     try text.appendSlice(gpa, keys);
     return text.toOwnedSlice(gpa);
@@ -182,7 +210,7 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
             }
         },
         .help => {
-            const text = try helpText(gpa);
+            const text = try helpText(gpa, reflect.issueRepo(app));
             defer gpa.free(text);
             try app.transcript.add(gpa, .info, text);
         },
@@ -281,8 +309,8 @@ test "candidates complete command names, then argument choices" {
     try testing.expectEqual(@as(usize, std.enums.values(Command).len), candidates("/", &.{}, &.{}, &buf).len);
     const co = candidates("/co", &.{}, &.{}, &buf);
     try testing.expectEqual(@as(usize, 2), co.len);
-    try testing.expectEqualStrings("/compact", co[0].label);
-    try testing.expectEqualStrings("/copy", co[1].label);
+    try testing.expectEqualStrings("/copy", co[0].label);
+    try testing.expectEqualStrings("/compact", co[1].label);
     try testing.expectEqual(@as(usize, 0), candidates("/js 1 + 1", &.{}, &.{}, &buf).len);
     try testing.expectEqual(@as(usize, 0), candidates("hi /co", &.{}, &.{}, &buf).len);
 
@@ -308,7 +336,7 @@ test "accepting a command waits for required arguments only" {
     try testing.expectEqualStrings("/js ", tab);
     const effort = candidates("/ef", &.{}, &.{}, &buf)[0];
     try testing.expect(effort.runs());
-    const help = try helpText(testing.allocator);
+    const help = try helpText(testing.allocator, reflect.Issues.default_repo);
     defer testing.allocator.free(help);
     try testing.expect(std.mem.indexOf(u8, help, "/resume <id>") != null);
 }
@@ -323,4 +351,16 @@ test "task commands run while busy and stop completes current task ids" {
     try testing.expectEqualStrings("r3", selected[0].value.?);
     try testing.expect(selected[0].runs());
     try testing.expect(!candidates("/stop", &.{}, &tasks, &buf)[0].runs());
+}
+
+test "help groups commands and states the real issue destination or disabled state" {
+    const a = testing.allocator;
+    const on = try helpText(a, "owner/repo");
+    defer a.free(on);
+    try testing.expect(std.mem.indexOf(u8, on, "Send\n").? < std.mem.indexOf(u8, on, "View\n").?);
+    try testing.expect(std.mem.indexOf(u8, on, "publish issue drafts: owner/repo") != null);
+    const off = try helpText(a, null);
+    defer a.free(off);
+    try testing.expect(std.mem.indexOf(u8, off, "issue publishing off") != null);
+    try testing.expect(std.mem.indexOf(u8, off, reflect.Issues.default_repo) == null);
 }

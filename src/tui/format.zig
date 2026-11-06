@@ -29,6 +29,22 @@ pub fn bytes(buf: []u8, n: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{s}B", .{number(&digits, n)}) catch unreachable;
 }
 
+pub const Fitted = struct { text: []const u8, suffix: []const u8 = "" };
+
+pub fn fit(text: []const u8, columns: u16) Fitted {
+    const vaxis = @import("vaxis");
+    if (vaxis.gwidth.gwidth(text, .unicode) <= columns) return .{ .text = text };
+    if (columns == 0) return .{ .text = "" };
+    var end: usize = 0;
+    var it = vaxis.unicode.graphemeIterator(text);
+    while (it.next()) |grapheme| {
+        const next = end + grapheme.bytes(text).len;
+        if (vaxis.gwidth.gwidth(text[0..next], .unicode) > columns - 1) break;
+        end = next;
+    }
+    return .{ .text = text[0..end], .suffix = "…" };
+}
+
 test "UI state vocabulary and decimal units" {
     const t = std.testing;
     try t.expectEqualStrings("running", state("working"));
@@ -40,4 +56,11 @@ test "UI state vocabulary and decimal units" {
     try t.expectEqualStrings("6.6k", number(&buf, 6699));
     try t.expectEqualStrings("18kB", bytes(&buf, 18_000));
     try t.expectEqualStrings("3.2MB", bytes(&buf, 3_200_000));
+}
+
+test "single-line previews mark omissions and preserve graphemes" {
+    const result = fit("á👩‍💻xyz", 4);
+    try std.testing.expectEqualStrings("á👩‍💻", result.text);
+    try std.testing.expectEqualStrings("…", result.suffix);
+    try std.testing.expectEqualStrings("", fit("word", 0).text);
 }

@@ -23,7 +23,7 @@ pub const Menu = struct {
         m.arena.deinit();
     }
 
-    pub fn items(m: *Menu, input: []const u8) []const commands.Candidate {
+    pub fn items(m: *Menu, input: []const u8) []commands.Candidate {
         if (m.closed) return m.buf[0..0];
         return commands.candidates(input, m.sessions, m.tasks, &m.buf);
     }
@@ -116,15 +116,15 @@ const testing = std.testing;
 test "selection wraps, closing hides the list and editing reopens it" {
     var m: Menu = .init(testing.allocator);
     defer m.deinit();
-    try testing.expectEqualStrings("/compact", m.selected("/co").?.label);
-    m.move("/co", true);
     try testing.expectEqualStrings("/copy", m.selected("/co").?.label);
     m.move("/co", true);
     try testing.expectEqualStrings("/compact", m.selected("/co").?.label);
+    m.move("/co", true);
+    try testing.expectEqualStrings("/copy", m.selected("/co").?.label);
     m.move("/co", false);
-    try testing.expectEqualStrings("/copy", m.selected("/co").?.label);
+    try testing.expectEqualStrings("/compact", m.selected("/co").?.label);
     m.closed = true;
     try testing.expect(m.selected("/co") == null);
     m.inputChanged("/c");
-    try testing.expectEqualStrings("/compact", m.selected("/c").?.label);
+    try testing.expectEqualStrings("/copy", m.selected("/c").?.label);
 }

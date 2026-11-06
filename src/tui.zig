@@ -142,6 +142,7 @@ pub const App = struct {
     scroll: Viewport = .{},
     menu: Menu,
     status_text: status.Text = .{},
+    reflect_help: [512]u8 = undefined,
     activity_detail: [256]u8 = undefined,
     retry_detail: [256]u8 = undefined,
     retry_len: usize = 0,
@@ -521,6 +522,9 @@ pub const App = struct {
     fn render(app: *App) !void {
         try app.menu.load(app.io, app.input.text(), app.session);
         const menu = app.menu.items(app.input.text());
+        for (menu) |*candidate| if (candidate.command == .reflect and candidate.value == null) {
+            candidate.detail = commands.reflectHelp(&app.reflect_help, reflect.issueRepo(app));
+        };
         if (app.scroll.pending != 0) app.selection.clear();
         view.draw(app.vx.window(), app.transcript.entries.items, &app.input, &app.scroll, menu, @min(app.menu.sel, menu.len -| 1), .{
             .cfg = app.cfg,
@@ -608,7 +612,7 @@ test "bracketed paste buffers newline and slash keys without executing them" {
     }
     try std.testing.expectEqualStrings("", app.input.text());
     _ = try app.handle(.paste_end);
-    try std.testing.expectEqualStrings("[Pasted #1 · 6 lines]", app.input.text());
+    try std.testing.expectEqualStrings("[Pasted #1 · 6 lines · /help]", app.input.text());
     const expanded = try app.input.expanded(gpa);
     defer gpa.free(expanded);
     try std.testing.expectEqualStrings("/help\nx\nx\nx\nx\nx", expanded);
