@@ -115,16 +115,17 @@ class Terminal:
         os.write(self.master, text.encode())
 
     def close(self):
-        if self.child.poll() is not None:
-            return
-        self.send("\x03")
-        try:
-            self.child.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.child.kill()
-            self.child.wait()
+        if self.child.poll() is None:
+            self.send("\x03")
+            deadline = time.monotonic() + 5
+            while self.child.poll() is None and time.monotonic() < deadline:
+                self.read()
+                time.sleep(.02)
+            if self.child.poll() is None:
+                self.child.kill()
         self.read()
         os.close(self.master)
+        self.child.wait(timeout=5)
         assert self.child.returncode == 0, self.output[-4000:]
 
 
