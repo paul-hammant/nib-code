@@ -92,6 +92,7 @@ class Terminal:
                                       stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
         os.close(slave)
         self.output = b""
+        self.output_chunks = []
         self.output_changed = threading.Condition()
         self.reader_stop = threading.Event()
         self.reader = threading.Thread(target=self.drain, daemon=True)
@@ -108,6 +109,7 @@ class Terminal:
                     break
                 with self.output_changed:
                     self.output += chunk
+                    self.output_chunks.append((len(self.output), time.monotonic()))
                     self.output_changed.notify_all()
             except OSError:
                 break

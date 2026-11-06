@@ -110,10 +110,21 @@ def test_incremental_stream(tmp):
                 assert input_latency < .05, f"input latency: {input_latency * 1000:.1f}ms"
                 print(f"PTY chars={milestone} input={input_latency * 1000:.1f}ms")
             wait_for(reply.paused.is_set, "stream pause", timeout=30)
-            terminal.until(b"PAUSED_TAIL")
-            tail_lag = time.monotonic() - reply.tail_sent
-            assert tail_lag < .15, f"tail latency: {tail_lag * 1000:.1f}ms"
-            wait_for(lambda: any("PAUSED_TAIL" in row for row in screen(terminal.read(), 120, 32)), "visible paused tail")
+            def visible_tail():
+                with terminal.output_changed:
+                    output, chunks = terminal.output, terminal.output_chunks.copy()
+                if any("PAUSED_TAIL" in row for row in screen(output, 120, 32)):
+                    return output, chunks
+            output, chunks = wait_for(visible_tail, "visible paused tail")
+            first, last = 0, len(chunks) - 1
+            while first < last:
+                middle = (first + last) // 2
+                if any("PAUSED_TAIL" in row for row in screen(output[:chunks[middle][0]], 120, 32)):
+                    last = middle
+                else:
+                    first = middle + 1
+            tail_lag = chunks[first][1] - reply.tail_sent
+            assert 0 <= tail_lag < .15, f"tail latency: {tail_lag * 1000:.1f}ms"
             print(f"PTY first={first_latency * 1000:.1f}ms input={input_latency * 1000:.1f}ms tail={tail_lag * 1000:.1f}ms")
             assert not finished(home, reply.text), "tail must display while the response is still open"
             output = terminal.read()[start:]
