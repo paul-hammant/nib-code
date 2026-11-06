@@ -70,12 +70,11 @@ pub fn edit(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
 
     const out = try std.mem.replaceOwned(u8, gpa, data, v.old_text, v.new_text);
     defer gpa.free(out);
-    var snapshot = undo.prepare(t, gpa, path, data, out) catch |err|
-        return fail(gpa, "{s}: undo snapshot failed ({s}); edit refused", .{ v.path, @errorName(err) });
+    var snapshot = undo.prepare(t, gpa, path, data, out);
     defer if (snapshot) |*s| s.deinit(t, gpa);
     const written = atomic_file.replace(t.io, gpa, path, out, .{}) catch |err|
         return fail(gpa, "{s}: {s}", .{ v.path, @errorName(err) });
-    if (snapshot) |*s| try s.commit(t, gpa, out);
+    if (snapshot) |*s| s.commit(t, gpa, out);
     try t.file_state.remember(t.io, gpa, path, written);
     try t.noteChange(gpa, path, data, out);
     return .{ .ok = try std.fmt.allocPrint(gpa, "{{\"replaced\":{d}}}", .{count}) };
@@ -109,15 +108,14 @@ pub fn write(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolR
         break :before null;
     };
     defer if (before) |data| gpa.free(data);
-    if (!can_track and t.undo_dir != null) return fail(gpa, "{s}: undo snapshot unavailable (file unreadable or larger than 16 MiB); write refused", .{v.path});
-    var snapshot = undo.prepare(t, gpa, path, before, v.content) catch |err|
-        return fail(gpa, "{s}: undo snapshot failed ({s}); write refused", .{ v.path, @errorName(err) });
+    if (!can_track) undo.markIncomplete(t, gpa, .snapshot_unavailable);
+    var snapshot = if (can_track) undo.prepare(t, gpa, path, before, v.content) else null;
     defer if (snapshot) |*s| s.deinit(t, gpa);
     if (std.fs.path.dirname(path)) |parent| dir.createDirPath(t.io, parent) catch |err|
         return fail(gpa, "{s}: {s}", .{ parent, @errorName(err) });
     const written = atomic_file.replace(t.io, gpa, path, v.content, .{}) catch |err|
         return fail(gpa, "{s}: {s}", .{ v.path, @errorName(err) });
-    if (snapshot) |*s| try s.commit(t, gpa, v.content);
+    if (snapshot) |*s| s.commit(t, gpa, v.content);
     try t.file_state.remember(t.io, gpa, path, written);
     if (can_track) try t.noteChange(gpa, path, before, v.content) else t.bash_commands.changed(t.io);
     return .{ .ok = try std.fmt.allocPrint(gpa, "{{\"bytes\":{d}}}", .{v.content.len}) };

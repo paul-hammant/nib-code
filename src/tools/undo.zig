@@ -8,6 +8,42 @@ pub const turn_limit = 64 * 1024 * 1024;
 pub const path_limit = 256;
 pub const history_limit = 8;
 
+pub const Reason = enum(u8) {
+    snapshot_unavailable = 1,
+    file_too_large,
+    path_limit,
+    turn_limit,
+
+    pub fn text(reason: Reason) []const u8 {
+        return switch (reason) {
+            .snapshot_unavailable => "undo snapshot could not be read or saved",
+            .file_too_large => "file exceeds undo limit (16 MiB)",
+            .path_limit => "Turn exceeds undo path limit (256 files)",
+            .turn_limit => "Turn exceeds undo snapshot limit (64 MiB)",
+        };
+    }
+};
+
+pub fn markIncomplete(t: *Tools, gpa: std.mem.Allocator, reason: Reason) void {
+    const directory = t.undo_dir orelse return;
+    _ = t.undo_failure.cmpxchgStrong(0, @backingInt(reason), .acq_rel, .acquire);
+    const protection = t.io.swapCancelProtection(.blocked);
+    defer _ = t.io.swapCancelProtection(protection);
+    const lock = file_state.lock(t, gpa, directory) catch return;
+    defer lock.close(t.io);
+    // The lock inode shares failure state with children even when snapshots are unwritable.
+    if ((lock.length(t.io) catch 0) == 0) lock.setLength(t.io, @backingInt(reason)) catch {};
+}
+
+fn recordedReason(t: *Tools, gpa: std.mem.Allocator, directory: []const u8) !?Reason {
+    const local = t.undo_failure.load(.acquire);
+    if (local != 0) return @fromBackingInt(@intCast(local));
+    const lock = try file_state.lock(t, gpa, directory);
+    defer lock.close(t.io);
+    const code = try lock.length(t.io);
+    return if (code == 0) null else std.enums.fromInt(Reason, code) orelse .snapshot_unavailable;
+}
+
 const Entry = struct {
     path: []const u8,
     created: bool,
@@ -48,13 +84,16 @@ pub const Write = struct {
         w.lock.close(t.io);
     }
 
-    pub fn commit(w: *Write, t: *Tools, gpa: std.mem.Allocator, after: []const u8) !void {
+    pub fn commit(w: *Write, t: *Tools, gpa: std.mem.Allocator, after: []const u8) void {
         w.written = true;
         const protection = t.io.swapCancelProtection(.blocked);
         defer _ = t.io.swapCancelProtection(protection);
         w.entry.hash = hash(after);
         w.entry.pending = false;
-        try save(t.io, gpa, w.metadata, w.entry);
+        save(t.io, gpa, w.metadata, w.entry) catch {
+            _ = t.undo_failure.cmpxchgStrong(0, @backingInt(Reason.snapshot_unavailable), .acq_rel, .acquire);
+            if ((w.lock.length(t.io) catch 0) == 0) w.lock.setLength(t.io, @backingInt(Reason.snapshot_unavailable)) catch {};
+        };
     }
 };
 
@@ -64,12 +103,29 @@ fn save(io: std.Io, gpa: std.mem.Allocator, path: []const u8, entry: Entry) !voi
     _ = try atomic.replace(io, gpa, path, data, .{ .permissions = .fromMode(0o600) });
 }
 
-pub fn prepare(t: *Tools, gpa: std.mem.Allocator, path: []const u8, before: ?[]const u8, after: []const u8) !?Write {
+pub fn prepare(t: *Tools, gpa: std.mem.Allocator, path: []const u8, before: ?[]const u8, after: []const u8) ?Write {
+    return prepareTracked(t, gpa, path, before, after) catch |err| {
+        markIncomplete(t, gpa, switch (err) {
+            error.UndoFileTooLarge => .file_too_large,
+            error.UndoPathLimit => .path_limit,
+            error.UndoTurnLimit => .turn_limit,
+            else => .snapshot_unavailable,
+        });
+        return null;
+    };
+}
+
+fn prepareTracked(t: *Tools, gpa: std.mem.Allocator, path: []const u8, before: ?[]const u8, after: []const u8) !?Write {
     const directory = t.undo_dir orelse return null;
+    if (t.undo_failure.load(.acquire) != 0) return null;
     if (before != null and std.mem.eql(u8, before.?, after)) return null;
     if (after.len > file_limit or (before != null and before.?.len > file_limit)) return error.UndoFileTooLarge;
     const lock = try file_state.lock(t, gpa, directory);
     errdefer lock.close(t.io);
+    if (try lock.length(t.io) != 0) {
+        lock.close(t.io);
+        return null;
+    }
     const key = std.fmt.bytesToHex(hash(path), .lower);
     const metadata = try std.fmt.allocPrint(gpa, "{s}/{s}.json", .{ directory, key });
     errdefer gpa.free(metadata);
@@ -102,7 +158,8 @@ pub fn prepare(t: *Tools, gpa: std.mem.Allocator, path: []const u8, before: ?[]c
             if (std.mem.endsWith(u8, item.name, ".json")) paths += 1;
             if (std.mem.endsWith(u8, item.name, ".before")) total += (try folder.statFile(t.io, item.name, .{})).size;
         }
-        if (paths >= path_limit or total + (if (before) |data| data.len else @as(usize, 0)) > turn_limit) return error.UndoTurnLimit;
+        if (paths >= path_limit) return error.UndoPathLimit;
+        if (total + (if (before) |data| data.len else @as(usize, 0)) > turn_limit) return error.UndoTurnLimit;
         if (before) |data| _ = try atomic.replace(t.io, gpa, snapshot, data, .{ .permissions = .fromMode(0o600) });
     } else if (before == null or !std.mem.eql(u8, &entry.hash, &hash(before.?))) {
         entry.tainted = true;
@@ -115,8 +172,11 @@ pub fn prepare(t: *Tools, gpa: std.mem.Allocator, path: []const u8, before: ?[]c
 }
 
 pub const History = struct {
+    const Turn = struct { path: []const u8, reason: ?Reason = null };
+
     root: ?[]const u8 = null,
-    turns: std.ArrayList([]const u8) = .empty,
+    turns: std.ArrayList(Turn) = .empty,
+    notice: ?Reason = null,
 
     pub fn begin(h: *History, t: *Tools, gpa: std.mem.Allocator) !void {
         const root = h.root orelse return;
@@ -124,8 +184,10 @@ pub const History = struct {
         t.io.random(&random);
         const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, std.fmt.bytesToHex(random, .lower) });
         errdefer gpa.free(path);
-        try std.Io.Dir.cwd().createDirPath(t.io, path);
-        try h.turns.append(gpa, path);
+        const reason: ?Reason = if (std.Io.Dir.cwd().createDirPath(t.io, path)) null else |_| .snapshot_unavailable;
+        try h.turns.append(gpa, .{ .path = path, .reason = reason });
+        t.undo_failure.store(0, .release);
+        h.notice = null;
         t.undo_dir = path;
     }
 
@@ -133,15 +195,27 @@ pub const History = struct {
         if (h.root == null) return;
         t.undo_dir = null;
         if (h.turns.items.len == 0) return;
-        const path = h.turns.items[h.turns.items.len - 1];
-        const dir = std.Io.Dir.cwd().openDir(t.io, path, .{ .iterate = true }) catch return;
-        defer dir.close(t.io);
-        var it = dir.iterate();
-        if ((it.next(t.io) catch return) != null) {
+        const turn = &h.turns.items[h.turns.items.len - 1];
+        const path = turn.path;
+        turn.reason = turn.reason orelse (recordedReason(t, gpa, path) catch .snapshot_unavailable);
+        const dir = std.Io.Dir.cwd().openDir(t.io, path, .{ .iterate = true }) catch null;
+        defer if (dir) |folder| folder.close(t.io);
+        const has_entries = if (dir) |folder| entries: {
+            var it = folder.iterate();
+            break :entries (it.next(t.io) catch {
+                turn.reason = .snapshot_unavailable;
+                break :entries true;
+            }) != null;
+        } else missing: {
+            turn.reason = .snapshot_unavailable;
+            break :missing true;
+        };
+        h.notice = turn.reason;
+        if (turn.reason != null or has_entries) {
             if (h.turns.items.len > history_limit) {
                 const oldest = h.turns.orderedRemove(0);
-                std.Io.Dir.cwd().deleteTree(t.io, oldest) catch {};
-                gpa.free(oldest);
+                std.Io.Dir.cwd().deleteTree(t.io, oldest.path) catch {};
+                gpa.free(oldest.path);
             }
             return;
         }
@@ -152,13 +226,18 @@ pub const History = struct {
 
     pub fn deinit(h: *History, io: std.Io, gpa: std.mem.Allocator) void {
         if (h.root) |root| std.Io.Dir.cwd().deleteTree(io, root) catch {};
-        for (h.turns.items) |path| gpa.free(path);
+        for (h.turns.items) |turn| gpa.free(turn.path);
         h.turns.deinit(gpa);
     }
 
     pub fn undo(h: *History, t: *Tools, gpa: std.mem.Allocator) ![]u8 {
         if (h.turns.items.len == 0) return gpa.dupe(u8, "Nothing to undo in this process. Restored sessions cannot undo earlier Turns.");
-        const path = h.turns.items[h.turns.items.len - 1];
+        const turn = &h.turns.items[h.turns.items.len - 1];
+        const path = turn.path;
+        if (turn.reason orelse (recordedReason(t, gpa, path) catch .snapshot_unavailable)) |reason| {
+            turn.reason = reason;
+            return std.fmt.allocPrint(gpa, "Undo refused; no files changed: {s}. This Turn cannot be fully undone; earlier Turns cannot be undone across it.", .{reason.text()});
+        }
         var arena: std.heap.ArenaAllocator = .init(gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -276,6 +355,11 @@ const Fixture = struct {
         defer @import("../tools.zig").freeResult(result);
         if (result == .err) std.debug.print("{s}\n", .{result.err});
         try testing.expect(result == .ok);
+        if (@hasField(@TypeOf(args), "content")) {
+            const expected = try std.fmt.allocPrint(testing.allocator, "{{\"bytes\":{d}}}", .{args.content.len});
+            defer testing.allocator.free(expected);
+            try testing.expectEqualStrings(expected, result.ok);
+        }
     }
 
     fn begin(f: *Fixture) !void {
@@ -386,34 +470,122 @@ test "undo shares parent snapshots with child tools and evicts only edited Turns
     try f.undo("Nothing to undo");
 }
 
-test "undo snapshot limits reject before modifying files" {
+test "undo file limit allows edits and writes but blocks the whole Turn and earlier history" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const path = try f.path("a");
+    try f.begin();
+    try f.call("write", .{ .path = path, .content = "earlier" });
+    f.finish();
+    try f.begin();
+    try f.call("write", .{ .path = try f.path("tracked"), .content = "keep" });
+    const large = try testing.allocator.alloc(u8, file_limit + 2);
+    defer testing.allocator.free(large);
+    @memset(large, 'x');
+    try f.call("edit", .{ .path = path, .old_text = "earlier", .new_text = large });
+    try f.call("write", .{ .path = path, .content = "written over unreadable snapshot" });
+    f.finish();
+    try testing.expectEqual(Reason.file_too_large, f.history.notice.?);
+    try f.undo("file exceeds undo limit (16 MiB)");
+    try f.content("a", "written over unreadable snapshot");
+    try f.content("tracked", "keep");
+    try f.undo("earlier Turns cannot be undone across it");
+    try testing.expectEqual(@as(usize, 2), f.history.turns.items.len);
+    try f.begin();
+    try f.call("write", .{ .path = path, .content = "newer" });
+    f.finish();
+    try f.undo("restored:");
+    try f.content("a", "written over unreadable snapshot");
+    try f.undo("file exceeds undo limit");
+}
+
+test "undo byte limit allows writes and refuses partial restoration" {
     var f = try Fixture.init();
     defer f.deinit();
     try f.begin();
-    const large = try testing.allocator.alloc(u8, file_limit + 1);
-    defer testing.allocator.free(large);
-    @memset(large, 'x');
-    const path = try f.path("a");
-    try testing.expectError(error.UndoFileTooLarge, prepare(&f.tools, testing.allocator, path, null, large));
-    const block = large[0..file_limit];
+    const block = try testing.allocator.alloc(u8, file_limit);
+    defer testing.allocator.free(block);
+    @memset(block, 'x');
     for (0..4) |i| {
         const name = try std.fmt.allocPrint(f.arena.allocator(), "file{d}", .{i});
         try f.tmp.dir.writeFile(testing.io, .{ .sub_path = name, .data = block });
         try f.call("write", .{ .path = try f.path(name), .content = "small" });
     }
-    try testing.expectError(error.UndoTurnLimit, prepare(&f.tools, testing.allocator, path, "x", "y"));
-    try testing.expectError(error.FileNotFound, f.tmp.dir.statFile(testing.io, "a", .{}));
+    try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "overflow", .data = "x" });
+    try f.call("write", .{ .path = try f.path("overflow"), .content = "y" });
     f.finish();
-    try f.undo("restored:");
-    try f.content("file0", block);
+    try f.undo("Turn exceeds undo snapshot limit (64 MiB)");
+    try f.content("file0", "small");
+    try f.content("overflow", "y");
+}
+
+test "undo path limit allows all writes and refuses partial deletion" {
+    var f = try Fixture.init();
+    defer f.deinit();
     try f.begin();
-    for (0..path_limit) |i| {
+    for (0..300) |i| {
         const name = try std.fmt.allocPrint(f.arena.allocator(), "new{d}", .{i});
         try f.call("write", .{ .path = try f.path(name), .content = "" });
     }
-    try testing.expectError(error.UndoTurnLimit, prepare(&f.tools, testing.allocator, path, null, ""));
     f.finish();
-    try f.undo("deleted:");
+    try f.undo("Turn exceeds undo path limit (256 files)");
+    try f.content("new0", "");
+    try f.content("new299", "");
+}
+
+test "unavailable snapshot directories never prevent file tools or child writes" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.begin();
+    const directory = f.tools.undo_dir.?;
+    try std.Io.Dir.cwd().deleteTree(testing.io, directory);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = directory, .data = "not a directory" });
+    var child: Tools = .{ .io = testing.io, .home = f.tools.home, .data_home = f.tools.data_home, .undo_dir = directory };
+    defer child.file_state.deinit(testing.allocator);
+    const args = try std.json.Stringify.valueAlloc(testing.allocator, .{ .path = try f.path("child"), .content = "written" }, .{});
+    defer testing.allocator.free(args);
+    const result = Tools.call(&child, testing.allocator, "write", args);
+    defer @import("../tools.zig").freeResult(result);
+    try testing.expectEqualStrings("{\"bytes\":7}", result.ok);
+    try std.Io.Dir.cwd().deleteFile(testing.io, directory);
+    try std.Io.Dir.cwd().createDirPath(testing.io, directory);
+    try f.call("edit", .{ .path = try f.path("child"), .old_text = "written", .new_text = "edited" });
+    f.finish();
+    try f.undo("undo snapshot could not be read or saved");
+    try f.content("child", "edited");
+}
+
+test "snapshot directory creation failure does not stop a Turn" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try std.Io.Dir.cwd().deleteTree(testing.io, f.history.root.?);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = f.history.root.?, .data = "not a directory" });
+    try f.begin();
+    try f.call("write", .{ .path = try f.path("a"), .content = "written" });
+    f.finish();
+    try f.undo("undo snapshot could not be read or saved");
+    try f.content("a", "written");
+}
+
+test "snapshot commit failure preserves successful write and blocks child Turn undo" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.begin();
+    try f.call("write", .{ .path = try f.path("tracked"), .content = "keep" });
+    var child: Tools = .{ .io = testing.io, .home = f.tools.home, .data_home = f.tools.data_home, .undo_dir = f.tools.undo_dir };
+    const path = try f.path("a");
+    var snapshot = prepare(&child, testing.allocator, path, null, "written").?;
+    {
+        defer snapshot.deinit(&child, testing.allocator);
+        try std.Io.Dir.cwd().deleteFile(testing.io, snapshot.metadata);
+        try std.Io.Dir.cwd().createDirPath(testing.io, snapshot.metadata);
+        _ = try atomic.replace(testing.io, testing.allocator, path, "written", .{});
+        snapshot.commit(&child, testing.allocator, "written");
+    }
+    f.finish();
+    try f.undo("undo snapshot could not be read or saved");
+    try f.content("a", "written");
+    try f.content("tracked", "keep");
 }
 
 test "aborted file replacement preserves the prior undo record" {
@@ -423,10 +595,10 @@ test "aborted file replacement preserves the prior undo record" {
     try f.tmp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "old" });
     try f.begin();
     try f.call("write", .{ .path = path, .content = "first" });
-    var abandoned = (try prepare(&f.tools, testing.allocator, path, "first", "unwritten")).?;
+    var abandoned = prepare(&f.tools, testing.allocator, path, "first", "unwritten").?;
     abandoned.deinit(&f.tools, testing.allocator);
     const fresh_path = try f.path("unwritten");
-    var fresh = (try prepare(&f.tools, testing.allocator, fresh_path, null, "unwritten")).?;
+    var fresh = prepare(&f.tools, testing.allocator, fresh_path, null, "unwritten").?;
     fresh.deinit(&f.tools, testing.allocator);
     f.finish();
     try f.undo("restored:");

@@ -182,6 +182,66 @@ def test_cancelled_turn(tmp):
         assert (tmp / "a").read_text() == "old"
 
 
+def test_limits_do_not_block_child_writes(tmp):
+    bulk = "for (let i = 0; i < 300; i++) { const r = await tools.write({path: 'bulk-' + i, content: 'bulk'}); if (JSON.stringify(r) !== '{\"bytes\":4}') throw new Error(JSON.stringify(r)); }"
+    replies = [Reply(code=js_call("write", path="earlier", content="keep")), Reply("earlier-finished"),
+               Reply(code=js_call("agent", prompt="bulk")), Reply(code=bulk), Reply("child-finished"),
+               Reply("bulk-finished"), Reply(code=js_call("write", path="newer", content="new")),
+               Reply("newer-finished")]
+    with fixture(tmp, replies) as (terminal, home, _):
+        terminal.send("earlier\r")
+        done(terminal, home, "earlier-finished")
+        terminal.send("bulk\r")
+        done(terminal, home, "bulk-finished")
+        assert len(list(tmp.glob("bulk-*"))) == 300
+        text = undo(terminal, home, "Turn exceeds undo path limit (256 files)")
+        assert "earlier Turns cannot be undone across it" in text
+        assert all(p.read_text() == "bulk" for p in tmp.glob("bulk-*"))
+        assert (tmp / "earlier").read_text() == "keep"
+        terminal.send("newer\r")
+        done(terminal, home, "newer-finished")
+        undo(terminal, home, "deleted:")
+        assert not (tmp / "newer").exists()
+        undo(terminal, home, "Turn exceeds undo path limit")
+        assert (tmp / "earlier").exists()
+
+
+def test_unwritable_snapshots_do_not_block_child_writes(tmp):
+    gated = Reply(code=js_call("agent", prompt="write with unwritable snapshots"), gated=True)
+    child = js_call("write", path="child-new", content="child")
+    parent = "const r = await tools.edit({path: 'child-new', old_text: 'child', new_text: 'edited'}); if (JSON.stringify(r) !== '{\"replaced\":1}') throw new Error(JSON.stringify(r));"
+    replies = [Reply(code=js_call("write", path="earlier", content="keep")), Reply("earlier-finished"),
+               gated, Reply(code=child), Reply("child-finished"), Reply(code=parent), Reply("unwritable-finished")]
+    with fixture(tmp, replies) as (terminal, home, _):
+        terminal.send("earlier\r")
+        done(terminal, home, "earlier-finished")
+        terminal.send("unwritable\r")
+        assert gated.received.wait(5)
+        directory = next(p for p in (home / "sessions").glob("*.undo/*") if not list(p.iterdir()))
+        directory.chmod(0o500)
+        try:
+            gated.release.set()
+            done(terminal, home, "unwritable-finished")
+            assert (tmp / "child-new").read_text() == "edited"
+        finally:
+            directory.chmod(0o700)
+        undo(terminal, home, "undo snapshot could not be read or saved")
+        undo(terminal, home, "earlier Turns cannot be undone across it")
+        assert (tmp / "earlier").read_text() == "keep"
+        assert (tmp / "child-new").read_text() == "edited"
+
+
+def test_large_original_does_not_block_write(tmp):
+    code = "const r = await tools.write({path: 'large', content: 'small'}); if (JSON.stringify(r) !== '{\"bytes\":5}') throw new Error(JSON.stringify(r));"
+    with fixture(tmp, [Reply(code=code), Reply("large-finished")]) as (terminal, home, _):
+        (tmp / "large").write_bytes(b"x" * (16 * 1024 * 1024 + 2))
+        terminal.send("write\r")
+        done(terminal, home, "large-finished")
+        assert (tmp / "large").read_text() == "small"
+        undo(terminal, home, "undo snapshot could not be read or saved")
+        assert (tmp / "large").read_text() == "small"
+
+
 def test_background_agent(tmp):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -243,6 +303,7 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="nib-undo-") as directory:
         root = Path(directory)
         for test in (test_files_and_history, test_conflict_and_busy, test_agents, test_resume,
-                     test_cancelled_turn, test_background_agent):
+                     test_cancelled_turn, test_background_agent, test_limits_do_not_block_child_writes,
+                     test_unwritable_snapshots_do_not_block_child_writes, test_large_original_does_not_block_write):
             test(root / test.__name__)
             print(test.__name__ + " passed")

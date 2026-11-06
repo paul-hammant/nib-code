@@ -188,6 +188,7 @@ pub const Tools = struct {
     home: []const u8,
     data_home: ?[]const u8 = null,
     undo_dir: ?[]const u8 = null,
+    undo_failure: std.atomic.Value(u8) = .init(0),
     environ: ?*const std.process.Environ.Map = null,
     cfg: ?provider.Config = null,
     depth: u32 = 0,

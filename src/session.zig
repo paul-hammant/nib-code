@@ -176,8 +176,8 @@ pub const Session = struct {
         s.tools.undo_dir = options.undo_dir;
         if (options.undo_enabled and s.parent_session_id == null) {
             const root = try std.fmt.allocPrint(a, "{s}/{s}.undo", .{ directory, s.id });
-            try std.Io.Dir.cwd().deleteTree(io, root);
-            try std.Io.Dir.cwd().createDir(io, root, .fromMode(0o700));
+            std.Io.Dir.cwd().deleteTree(io, root) catch {};
+            std.Io.Dir.cwd().createDir(io, root, .fromMode(0o700)) catch {};
             s.undo_history.root = root;
         }
         return s;
@@ -232,7 +232,10 @@ pub const Session = struct {
 
     pub fn turn(s: *Session, user_text: []const u8, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
         try s.undo_history.begin(&s.tools, s.gpa);
-        defer s.undo_history.finish(&s.tools, s.gpa);
+        defer {
+            s.undo_history.finish(&s.tools, s.gpa);
+            if (s.undo_history.notice != null) sink.emit(sink.ctx, .{ .notice = "This Turn has no complete undo record; /undo cannot cross it." }) catch {};
+        }
         if (s.codex_state.socket) |*socket| {
             if (socket.turn_state) |value| s.gpa.free(value);
             socket.turn_state = null;
