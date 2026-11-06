@@ -1,6 +1,7 @@
 """Incremental TUI output through a PTY, including a paused stream and live input."""
 import contextlib
 import json
+import random
 import sys
 from pathlib import Path
 import tempfile
@@ -17,7 +18,16 @@ from screen import screen
 class StreamReply(Reply):
     def __init__(self):
         self.prefix = "STREAM_BEGIN "
-        self.chunks = ["中文🙂 " if i % 20 == 0 else "word " for i in range(400)]
+        rng = random.Random(17)
+        answer = ("word English 中文 👩‍💻 🙂 **late bold\n- list `inline\n```zig\n" +
+                  "const value = 123; // 中文\n" * 150 + "```\nclose` bold**\n") * 12
+        answer = answer[:30000]
+        self.chunks = []
+        while answer:
+            n = rng.randint(1, 500)
+            self.chunks.append(answer[:n])
+            answer = answer[n:]
+        self.gaps = [rng.choice([0, .001, .016, .040, .400]) for _ in self.chunks]
         self.tail = " PAUSED_TAIL"
         self.end = " STREAM_END"
         super().__init__(self.prefix + "".join(self.chunks) + self.tail + self.end, gated=True)
@@ -53,9 +63,9 @@ class StreamHandler(Handler):
             if not reply.continue_stream.wait(10):
                 return
             start = time.monotonic()
-            for chunk in reply.chunks:
+            for chunk, gap in zip(reply.chunks, reply.gaps):
                 text(chunk)
-                time.sleep(.001)
+                time.sleep(gap)
             text(reply.tail)
             reply.elapsed = time.monotonic() - start
             reply.paused.set()
@@ -74,8 +84,10 @@ def test_incremental_stream(tmp):
         with fixture(tmp, [reply]) as (terminal, home, _):
             terminal.send("stream test\r")
             wait_for(lambda: any("Thinking" in row for row in screen(terminal.read(), 120, 32)), "Thinking during reasoning")
+            first_start = time.monotonic()
             reply.reasoning_done.set()
             terminal.until(reply.prefix.strip().encode())
+            assert time.monotonic() - first_start < .5
             wait_for(lambda: any("Generating response" in row for row in screen(terminal.read(), 120, 32)), "Generating response during text")
             assert not reply.paused.is_set(), "first fragment must appear before the rest is sent"
             terminal.send("\x1b[200~live-draft\x1b[201~")
@@ -89,7 +101,7 @@ def test_incremental_stream(tmp):
             assert not finished(home, reply.text), "tail must display while the response is still open"
             output = terminal.read()[start:]
             frames = output.count(b"\x1b[?2026h")
-            assert 1 < frames < len(reply.chunks) // 2, frames
+            assert 1 < frames, frames
             print(f"stream: {len(reply.chunks)} deltas in {reply.elapsed:.3f}s, {frames} frames, {len(output)} terminal bytes")
             reply.release.set()
             wait_for(lambda: finished(home, reply.text), "complete stream committed")

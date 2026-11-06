@@ -396,3 +396,37 @@ test "model menu shows distinct model names and current marker at common widths"
         try testing.expect(std.mem.indexOf(u8, rendered, "current") != null);
     }
 }
+
+ test "stream stress frame timings" {
+    const a = testing.allocator;
+    var screen = try vaxis.Screen.init(a, .{ .cols = 120, .rows = 32, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 120, .height = 32, .screen = &screen };
+    var transcript: Transcript = .{};
+    defer transcript.deinit(a);
+    var input: Editor = .{};
+    defer input.deinit(a);
+    var scroll: Viewport = .{};
+    var text: status.Text = .{};
+    const sample = "English 中文 👩‍💻 🙂 **late bold\n- list `late code\n```zig\n" ++ "const value = 123; // 中文\n" ++ "```\nclose` bold**\n";
+    var answer: std.ArrayList(u8) = .empty;
+    defer answer.deinit(a);
+    while ((std.unicode.utf8CountCodepoints(answer.items) catch 0) < 30000) try answer.appendSlice(a, sample);
+    for ([_]usize{1000, 10000, 30000}) |size| {
+        transcript.clear(a);
+        var it = (try std.unicode.Utf8View.init(answer.items)).iterator();
+        var end: usize = 0;
+        for (0..size) |_| end += it.nextCodepointSlice().?.len;
+        try transcript.add(a, .assistant, answer.items[0..end]);
+        var times: [100]i64 = undefined;
+        for (&times, 0..) |*elapsed, i| {
+            transcript.entries.items[0].cached = null;
+            if (i % 2 == 0) try input.insert(a, "x") else try input.insert(a, "y");
+            const start = std.Io.Clock.Timestamp.now(testing.io, .awake);
+            draw(win, transcript.entries.items, &input, &scroll, &.{}, 0, .{ .cfg = mock_cfg }, &text);
+            elapsed.* = @intCast(start.durationTo(.now(testing.io, .awake)).raw.toNanoseconds());
+        }
+        std.mem.sort(i64, &times, {}, std.sort.asc(i64));
+        std.debug.print("stress chars={d} frame p95={d}us max={d}us input-to-draw max={d}us\n", .{size, @divTrunc(times[94],1000), @divTrunc(times[99],1000), @divTrunc(times[99],1000)});
+    }
+}
