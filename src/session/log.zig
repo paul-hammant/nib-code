@@ -312,7 +312,7 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
             torn = true;
             continue;
         };
-        if (history.items.len == 0) {
+        if (history.items.len == 0 or (steps == 0 and r.from == 0 and r.provider != null)) {
             parent_session_id = r.parent_session_id;
             skills = r.skills orelse .{};
             cache_key = r.cache_key;

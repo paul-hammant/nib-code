@@ -16,6 +16,8 @@
 
 ## config.toml
 
+TUI 中优先使用 `/model` 选择服务与模型，选择会原子保存到 config.toml；已有 Steps 时自动新建会话。自定义服务需先在配置中定义，之后会出现在菜单中。直接编辑配置或设置环境变量也是替代方式；NIB_PROVIDER/NIB_MODEL 在启动时优先于保存值。参数形式、凭证筛选与会话语义见 [providers.md](providers.md)。
+
 ```toml
 # 顶层键；均可省略
 provider = "codex"

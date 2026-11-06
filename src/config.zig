@@ -416,6 +416,136 @@ pub fn resolve(a: Allocator, env: *const Env, text: []const u8, path: []const u8
     return cfg;
 }
 
+pub const ModelSelection = struct { provider: []const u8, model: ?[]const u8 };
+
+pub fn parseModel(arg: []const u8) !ModelSelection {
+    var words = std.mem.tokenizeAny(u8, arg, " \t\n");
+    const first = words.next() orelse return error.InvalidModelArgument;
+    if (std.mem.indexOfScalar(u8, first, '/')) |slash| {
+        if (slash == 0 or slash + 1 == first.len or words.next() != null) return error.InvalidModelArgument;
+        return .{ .provider = first[0..slash], .model = first[slash + 1 ..] };
+    }
+    const model = words.next();
+    if (words.next() != null) return error.InvalidModelArgument;
+    return .{ .provider = first, .model = model };
+}
+
+fn rewriteValue(a: Allocator, text: []const u8, section: []const u8, key: []const u8, value: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var current: []const u8 = "";
+    var found_section = section.len == 0;
+    var inserted = false;
+    var offset: usize = 0;
+    const newline = if (std.mem.indexOf(u8, text, "\r\n") != null) "\r\n" else "\n";
+    while (offset < text.len) {
+        const end = if (std.mem.indexOfScalarPos(u8, text, offset, '\n')) |i| i + 1 else text.len;
+        const raw = text[offset..end];
+        const line = std.mem.trim(u8, raw, " \t\r\n");
+        if (std.mem.startsWith(u8, line, "[")) {
+            if (std.mem.eql(u8, current, section) and !inserted) {
+                try out.print(a, "{s} = {f}{s}", .{ key, std.json.fmt(value, .{}), newline });
+                inserted = true;
+            }
+            const close = std.mem.indexOfScalar(u8, line, ']').?;
+            current = line[1..close];
+            if (std.mem.eql(u8, current, section)) found_section = true;
+        }
+        if (std.mem.eql(u8, current, section)) {
+            if (std.mem.indexOfScalar(u8, line, '=')) |eq| {
+                if (std.mem.eql(u8, std.mem.trim(u8, line[0..eq], " \t"), key)) {
+                    const start = std.mem.indexOfScalar(u8, raw, '=').? + 1;
+                    const vstart = start + raw[start..].len - std.mem.trimStart(u8, raw[start..], " \t").len;
+                    var consumed: usize = 0;
+                    var detail: ?[]u8 = null;
+                    const parser: Parser = .{ .a = a, .diagnostics = a, .path = "config.toml", .detail = &detail, .line = 1 };
+                    _ = try parser.value(raw[vstart..], &consumed);
+                    try out.appendSlice(a, raw[0..vstart]);
+                    try out.print(a, "{f}", .{std.json.fmt(value, .{})});
+                    try out.appendSlice(a, raw[vstart + consumed ..]);
+                    inserted = true;
+                    offset = end;
+                    continue;
+                }
+            }
+        }
+        try out.appendSlice(a, raw);
+        offset = end;
+    }
+    if (!inserted) {
+        if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') try out.appendSlice(a, newline);
+        if (!found_section) try out.print(a, "[{s}]{s}", .{ section, newline });
+        try out.print(a, "{s} = {f}{s}", .{ key, std.json.fmt(value, .{}), newline });
+    }
+    return out.toOwnedSlice(a);
+}
+
+fn modelText(a: Allocator, text: []const u8, selection: ModelSelection) ![]u8 {
+    var detail: ?[]u8 = null;
+    _ = try parse(a, a, text, "config.toml", &detail);
+    const top = try rewriteValue(a, text, "", "provider", selection.provider);
+    if (selection.model) |model| {
+        const builtin = std.meta.stringToEnum(provider.Id, selection.provider) != null;
+        const section = if (builtin) selection.provider else try std.fmt.allocPrint(a, "providers.{s}", .{selection.provider});
+        return rewriteValue(a, top, section, "model", model);
+    }
+    return top;
+}
+
+pub fn saveModel(a: Allocator, io: std.Io, env: *const Env, home_path: []const u8, selection: ModelSelection) !provider.Config {
+    const path = try std.fs.path.join(a, &.{ home_path, "config.toml" });
+    const text = try read(a, io, path);
+    var selected_env = try env.clone(a);
+    _ = selected_env.swapRemove("NIB_MODEL");
+    try selected_env.put("NIB_PROVIDER", selection.provider);
+    if (selection.model) |model| try selected_env.put("NIB_MODEL", model);
+    var detail: ?[]u8 = null;
+    const cfg = try resolve(a, &selected_env, text, path, &detail);
+    if (cfg.provider == .chat_completions and !std.mem.eql(u8, cfg.model, provider.definition(.chat_completions).default_model) and env.get("NIB_CONTEXT_WINDOW") == null) {
+        const file = try parse(a, a, text, path, &detail);
+        if (file.chat_settings.context_window == null) return error.UnknownModelContextWindow;
+    }
+    const updated = try modelText(a, text, .{ .provider = selection.provider, .model = cfg.model });
+    try std.Io.Dir.cwd().createDirPath(io, home_path);
+    _ = try atomic_file.replace(io, a, path, updated, .{ .permissions = .fromMode(0o600), .sync = true });
+    return cfg;
+}
+
+pub const ModelEntry = struct { provider: []const u8, model: []const u8 };
+
+pub fn modelEntries(a: Allocator, io: std.Io, env: *const Env, home_path: []const u8) ![]const ModelEntry {
+    const path = try std.fs.path.join(a, &.{ home_path, "config.toml" });
+    const text = try read(a, io, path);
+    var detail: ?[]u8 = null;
+    const file = try parse(a, a, text, path, &detail);
+    var entries: std.ArrayList(ModelEntry) = .empty;
+    for (provider.definitions) |entry| {
+        var usable = false;
+        if (std.mem.eql(u8, entry.id, "codex")) {
+            const dir = env.get("CODEX_HOME") orelse try std.fs.path.join(a, &.{ env.get("HOME") orelse "", ".codex" });
+            const auth = try std.fs.path.join(a, &.{ dir, "auth.json" });
+            if (std.Io.Dir.cwd().access(io, auth, .{})) |_| {
+                usable = true;
+            } else |_| {}
+        } else for (entry.api_key_env) |key| {
+            if (env.get(key)) |value| if (value.len > 0) {
+                usable = true;
+            };
+        }
+        if (!usable) continue;
+        if (entry.models.len == 0) try entries.append(a, .{ .provider = entry.id, .model = entry.default_model });
+        for (entry.models) |model| try entries.append(a, .{ .provider = entry.id, .model = model.id });
+    }
+    for (file.providers.items) |item| {
+        if (!item.custom) continue;
+        if (item.settings.api_key_env) |key| {
+            const value: []const u8 = env.get(key) orelse continue;
+            if (value.len == 0) continue;
+        }
+        try entries.append(a, .{ .provider = item.name, .model = item.settings.model.? });
+    }
+    return entries.toOwnedSlice(a);
+}
+
 pub fn saveEffort(a: Allocator, io: std.Io, home_path: []const u8, value: []const u8) !void {
     const effort = knownEffort(value) orelse return error.InvalidReasoningEffort;
     const path = try std.fs.path.join(a, &.{ home_path, "config.toml" });
@@ -983,4 +1113,57 @@ test "custom configuration rejects incomplete duplicate conflicting and secret f
         try t.expectError(error.InvalidConfig, parse(a, a, text, "bad/config.toml", &detail));
         try t.expect(std.mem.startsWith(u8, detail.?, "bad/config.toml:"));
     }
+}
+
+test "model arguments and configuration preserve comments and sections" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try t.expectEqualStrings("openai", (try parseModel("openai/gpt-test")).provider);
+    try t.expectEqualStrings("gpt-test", (try parseModel("openai gpt-test")).model.?);
+    try t.expect((try parseModel("openai")).model == null);
+    for ([_][]const u8{ "", "/model", "openai/", "openai a b" }) |arg| try t.expectError(error.InvalidModelArgument, parseModel(arg));
+    const text = "# header\nprovider = \"codex\" # keep\n[openai] # section\nmodel = \"old\" # model\n[skills]\nx = true\n";
+    const updated = try modelText(a, text, .{ .provider = "openai", .model = "new" });
+    try t.expectEqualStrings("# header\nprovider = \"openai\" # keep\n[openai] # section\nmodel = \"new\" # model\n[skills]\nx = true\n", updated);
+    try t.expectEqualStrings("provider = \"openai\"\n[openai]\nmodel = \"new\"\n", try modelText(a, "", .{ .provider = "openai", .model = "new" }));
+    const custom = "[providers.local]\nprotocol = \"responses\"\nbase_url = \"http://localhost\"\nmodel = \"old\" # keep\ncontext_window = 1000\n";
+    const changed = try modelText(a, custom, .{ .provider = "local", .model = "new" });
+    try t.expect(std.mem.indexOf(u8, changed, "model = \"new\" # keep") != null);
+    try t.expect(std.mem.indexOf(u8, changed, "[providers.local]") != null);
+}
+
+test "model entries filter keys auth and custom providers and save atomically" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var env: Env = .init(a);
+    try env.put("HOME", root);
+    try env.put("CODEX_HOME", root);
+    const custom = "[providers.local]\nprotocol = \"responses\"\nbase_url = \"http://localhost\"\nmodel = \"old\"\ncontext_window = 1000\n[providers.locked]\nprotocol = \"responses\"\nbase_url = \"http://localhost\"\nmodel = \"old\"\ncontext_window = 1000\napi_key_env = \"SITE_KEY\"\n";
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "config.toml", .data = custom });
+    const initial = try modelEntries(a, t.io, &env, root);
+    try t.expectEqual(@as(usize, 1), initial.len);
+    try t.expectEqualStrings("local", initial[0].provider);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "auth.json", .data = "{}" });
+    try env.put("OPENAI_API_KEY", "fake");
+    try env.put("SITE_KEY", "fake");
+    const entries = try modelEntries(a, t.io, &env, root);
+    try t.expect(entries.len > 4);
+    try t.expectEqualStrings("codex", entries[0].provider);
+    _ = try saveModel(a, t.io, &env, root, .{ .provider = "local", .model = "new" });
+    const saved = try tmp.dir.readFileAlloc(t.io, "config.toml", a, .unlimited);
+    try t.expect(std.mem.startsWith(u8, saved, "provider = \"local\"\n"));
+    try t.expect(std.mem.indexOf(u8, saved, "model = \"new\"") != null);
+    try t.expect(std.mem.indexOf(u8, saved, "[providers.locked]") != null);
+    try t.expectError(error.InvalidConfig, saveModel(a, t.io, &env, root, .{ .provider = "openai", .model = "unknown" }));
+    try t.expectEqualStrings(saved, try tmp.dir.readFileAlloc(t.io, "config.toml", a, .unlimited));
+    const new_home = try std.fs.path.join(a, &.{ root, "new" });
+    _ = try saveModel(a, t.io, &env, new_home, .{ .provider = "openai", .model = null });
+    try t.expectEqualStrings("provider = \"openai\"\n[openai]\nmodel = \"gpt-6.1-sol\"\n", try tmp.dir.readFileAlloc(t.io, "new/config.toml", a, .unlimited));
 }

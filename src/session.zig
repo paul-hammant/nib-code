@@ -144,29 +144,7 @@ pub const Session = struct {
                     .nib_version = @import("build_options").nib_version,
                 });
             } else {
-                const template = try prompt.renderSystem(a, cwd, &s.tools, options.environ);
-                const base = try prompt.stepLimitPrompt(a, template, cfg.limits.max_steps);
-                const global = try std.fs.path.join(a, &.{ options.home, "AGENTS.md" });
-                const root = try instructions.projectRoot(io, a, cwd);
-                const project = try std.fs.path.join(a, &.{ root, "AGENTS.md" });
-                const discovered = try skills.load(io, a, options.home, options.user_home, root);
-                const found = try skills.select(a, discovered, s.cfg.enabled_skills);
-                const system = try skills.append(a, try instructions.append(io, a, base, global, project), found.skills);
-                s.log.skills = found.summary;
-                const sha = prompt.systemSha(base);
-                try s.log.commit(io, gpa, &s.history, &s.context_tokens, .{
-                    .messages = &.{.{ .role = "system", .content = system }},
-                    .cwd = cwd,
-                    .provider = cfg.provider,
-                    .custom_provider = cfg.custom_provider,
-                    .model = cfg.model,
-                    .parent_session_id = s.parent_session_id,
-                    .cache_key = s.cache_key,
-                    .nib_version = @import("build_options").nib_version,
-                    .system_sha = &sha,
-                    .skills = found.summary,
-                    .patches_off = try prompt.disabledPatches(a, options.environ),
-                });
+                try s.initializeHistory(cwd);
             }
         }
         errdefer s.log.close(io);
@@ -196,6 +174,34 @@ pub const Session = struct {
             s.undo_history.root = root;
         }
         return s;
+    }
+
+    pub fn initializeHistory(s: *Session, cwd: []const u8) !void {
+        std.debug.assert(s.log.steps == 0);
+        const a = s.arena.allocator();
+        const template = try prompt.renderSystem(a, cwd, &s.tools, s.options.environ);
+        const base = try prompt.stepLimitPrompt(a, template, s.cfg.limits.max_steps);
+        const global = try std.fs.path.join(a, &.{ s.options.home, "AGENTS.md" });
+        const root = try instructions.projectRoot(s.io, a, cwd);
+        const project = try std.fs.path.join(a, &.{ root, "AGENTS.md" });
+        const discovered = try skills.load(s.io, a, s.options.home, s.options.user_home, root);
+        const found = try skills.select(a, discovered, s.cfg.enabled_skills);
+        const system = try skills.append(a, try instructions.append(s.io, a, base, global, project), found.skills);
+        s.log.skills = found.summary;
+        const sha = prompt.systemSha(base);
+        try s.log.commit(s.io, s.gpa, &s.history, &s.context_tokens, .{
+            .messages = &.{.{ .role = "system", .content = system }},
+            .cwd = cwd,
+            .provider = s.cfg.provider,
+            .custom_provider = s.cfg.custom_provider,
+            .model = s.cfg.model,
+            .parent_session_id = s.parent_session_id,
+            .cache_key = s.cache_key,
+            .nib_version = @import("build_options").nib_version,
+            .system_sha = &sha,
+            .skills = found.summary,
+            .patches_off = try prompt.disabledPatches(a, s.options.environ),
+        });
     }
 
     /// Replaces this Session with a new one (`id == null`) or a logged one.
