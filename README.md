@@ -1,11 +1,13 @@
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
-  <img src="docs/assets/logo-light.svg" alt="nib" width="72">
-</picture>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
+    <img src="docs/assets/logo-light.svg" alt="nib" width="96">
+  </picture>
+</p>
 
-# nib
+<h1 align="center">nib</h1>
 
-English | [中文](README.zh-CN.md)
+<p align="center">English | <a href="README.zh-CN.md">中文</a></p>
 
 nib is a coding agent written in Zig that works in Runs: one JavaScript script can read, edit and check a project.
 
