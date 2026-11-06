@@ -39,7 +39,7 @@ pub fn effort(cfg: p.Config) ?[]const u8 {
     if (cfg.thinking == false) return if (canDisable(cfg.model)) "off" else "low";
     const value = cfg.reasoning_effort orelse return if (cfg.thinking == true) "high" else null;
     if (std.mem.eql(u8, value, "none")) return if (canDisable(cfg.model)) "off" else "low";
-    if (std.mem.eql(u8, value, "minimal")) return "low";
+    if (std.mem.eql(u8, value, "minimal")) return if (adaptive(cfg.model)) "low" else "minimal";
     if ((family(cfg.model, "claude-opus-4-6") or family(cfg.model, "claude-sonnet-4-6")) and std.mem.eql(u8, value, "xhigh")) return "high";
     return value;
 }
@@ -54,7 +54,7 @@ pub fn requestBody(gpa: std.mem.Allocator, cfg: p.Config, messages: []const p.Me
     const managed = managedEffort(cfg.model) and level != null and !std.mem.eql(u8, level.?, "off");
     var budget: u32 = 0;
     if (!adaptive(cfg.model) and level != null and !std.mem.eql(u8, level.?, "off")) {
-        budget = if (std.mem.eql(u8, level.?, "low")) 2048 else if (std.mem.eql(u8, level.?, "medium")) 8192 else 16384;
+        budget = if (std.mem.eql(u8, level.?, "minimal")) 1024 else if (std.mem.eql(u8, level.?, "low")) 2048 else if (std.mem.eql(u8, level.?, "medium")) 8192 else 16384;
     }
     const cap = @min(@as(u32, 128000), @max(max_tokens orelse 128000, budget + 1024));
     try w.print("{{\"model\":{f},\"max_tokens\":{d},\"stream\":true,\"system\":[", .{ std.json.fmt(cfg.model, .{}), cap });
@@ -299,6 +299,9 @@ test "Anthropic request caching paired results adaptive effort and signed contin
     const legacy = try requestBody(a, cfg, &.{.{ .role = "user", .content = "task" }}, "[]", 32);
     try t.expect(std.mem.indexOf(u8, legacy, "\"budget_tokens\":8192") != null);
     try t.expect(std.mem.indexOf(u8, legacy, "\"max_tokens\":9216") != null);
+    try cfg.setEffort("minimal");
+    const minimal = try requestBody(a, cfg, &.{.{ .role = "user", .content = "task" }}, "[]", 32);
+    try t.expect(std.mem.indexOf(u8, minimal, "\"budget_tokens\":1024") != null);
     try t.expect(adaptive("claude-fable-5-1"));
     try t.expect(adaptive("claude-opus-5-5-20261106"));
     try t.expect(!adaptive("claude-opus-5-50"));

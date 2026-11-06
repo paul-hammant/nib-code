@@ -53,7 +53,7 @@ Chat Completions 向 base_url 追加 `/chat/completions`；Responses 追加 `/re
 - OpenAI Responses：发送 reasoning.effort；off 对已知不能关闭推理的模型使用 low，其余用 none。默认不覆盖服务端 effort。
 - xAI Responses：发送已选择的 effort；没有已验证的 off/none/minimal 映射时省略该字段，显示 server default。
 - DeepSeek 与旧 chat_completions：保留 thinking.type 与 reasoning_effort。自定义 Chat Completions 只发送 reasoning_effort，off 映射 none，不发送 DeepSeek 专用 thinking 对象。
-- Anthropic：模型家族规则来自 pi `catalog/families/anthropic.ts`。新列表均为 adaptive，并支持逐消息 output_config effort；顶层 effort 固定 low，历史与当前 effort 通过消息标记发送，thinking 使用 block_binding 的 drop_block。minimal 映射 low；支持的模型保留 xhigh/max。Haiku 5.5 可以关闭；Opus/Sonnet 5.5 和 Fable 5.1 的 off 使用 low。旧预算模型使用 pi 的 low=2048、medium=8192、high=16384 预算，保留至少 1024 输出 tokens，总输出不超过 128000。
+- Anthropic：模型家族规则来自 pi `catalog/families/anthropic.ts`。新列表均为 adaptive，并支持逐消息 output_config effort；顶层 effort 固定 low，历史与当前 effort 通过消息标记发送，thinking 使用 block_binding 的 drop_block。minimal 映射 low；支持的模型保留 xhigh/max。Haiku 5.5 可以关闭；Opus/Sonnet 5.5 和 Fable 5.1 的 off 使用 low。旧预算模型使用 pi 的 minimal=1024、low=2048、medium=8192、high=16384 预算，保留至少 1024 输出 tokens，总输出不超过 128000。
 
 Codex/OpenAI 使用 custom raw-JS Run；xAI、Anthropic、Chat Completions 与自定义服务使用 `{code}` function Run。历史调用类型和结果配对原样保留。Responses 保存完整有序输出及 encrypted_content；Anthropic 保存完整内容块，包括 thinking 签名和 redacted_thinking，工具结果按 tool_use id 配对。只有完整响应返回工具调用，截断或未结束的输入不执行。
 
