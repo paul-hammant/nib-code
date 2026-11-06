@@ -14,6 +14,8 @@ pub const Info = struct {
 };
 
 pub const State = struct {
+    reused: bool = false,
+    stale_socket: bool = false,
     socket: ?websocket.Connection = null,
     scope: ?[32]u8 = null,
     previous_id: ?[]u8 = null,

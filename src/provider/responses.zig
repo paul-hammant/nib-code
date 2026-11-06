@@ -80,6 +80,7 @@ pub fn stream(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.
     var local: ws_state.State = .{};
     defer local.reset(gpa);
     const state = sink.codex_state orelse &local;
+    state.stale_socket = false;
     state.last = .{ .fallback_reason = state.degraded, .fallback_at = state.degraded_at, .full_reason = if (state.degraded != null) "sse_fallback" else if (cfg.codex_transport == .sse) "sse_configured" else null };
     if (cfg.codex_transport == .websocket and state.degraded == null) {
         state.last.transport = .websocket;
@@ -159,6 +160,13 @@ fn streamWebSocket(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.
         state.reset(gpa);
         state.reset_reason = "scope_changed";
     };
+    if (state.socket) |*socket| {
+        if (!try socket.checkIdle(gpa, monitor)) {
+            state.reset(gpa);
+            state.reset_reason = "connection_closed";
+        }
+    }
+    state.reused = state.socket != null;
     if (state.socket == null) {
         const url = try std.fmt.allocPrint(gpa, "{s}/codex/responses", .{std.mem.trimEnd(u8, cfg.base_url, "/")});
         defer gpa.free(url);
@@ -179,14 +187,14 @@ fn streamWebSocket(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.
     const socket = &state.socket.?;
     monitor.attach(socket.connection);
     defer monitor.detach(socket.connection);
-    var observed = try body_reader.Reader.init(gpa, socket.connection.reader(), monitor, sink);
-    defer observed.deinit(gpa);
+    var observed = try socket.observe(gpa, monitor, sink);
+    defer socket.saveReader(&observed.reader);
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     for (0..2) |attempt| {
         const payload = try state.payload(arena.allocator(), body, attempt != 0);
         try socket.send(1, payload);
-        return readEvents(gpa, out, &observed.reader, sink, cancel, detail, socket, body) catch |err| {
+        const reply = readEvents(gpa, out, &observed.reader, sink, cancel, detail, socket, body) catch |err| {
             if (err == error.PreviousResponseNotFound and attempt == 0 and state.last.incremental and !forward.emitted) {
                 state.clearPrevious(gpa);
                 state.last.fallback_reason = "previous_response_not_found";
@@ -198,6 +206,7 @@ fn streamWebSocket(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.
             }
             return if (err == error.PreviousResponseNotFound) error.ProviderFailed else err;
         };
+        return reply;
     }
     unreachable;
 }
@@ -414,6 +423,10 @@ fn readEvents(gpa: std.mem.Allocator, out: std.mem.Allocator, reader: *std.Io.Re
         if (sink.monitor) |monitor| try monitor.check();
         stage = "parse";
         const data = if (socket) |ws| ws.message(reader, &line) catch |err| {
+            if (sink.codex_state) |state| {
+                state.stale_socket = state.reused and std.mem.eql(u8, event_type, "before_event") and
+                    (err == error.WebSocketClosed or err == error.EndOfStream);
+            }
             detail.* = try std.fmt.allocPrint(gpa, "Codex WebSocket read failed: {s}; last event={s}, output_index={d}", .{ @errorName(err), event_type, event_index });
             return err;
         } else data: {

@@ -4,9 +4,26 @@ const idle = @import("idle.zig");
 pub const Connection = struct {
     connection: *std.http.Client.Connection,
     turn_state: ?[]u8 = null,
+    read_buffer: ?[]u8 = null,
+    read_seek: usize = 0,
+    read_end: usize = 0,
+
+    pub fn observe(ws: *Connection, gpa: std.mem.Allocator, monitor: *idle.Monitor, sink: @import("../provider.zig").Sink) !@import("body.zig").Reader {
+        if (ws.read_buffer == null) ws.read_buffer = try gpa.alloc(u8, 64 * 1024);
+        var observed = @import("body.zig").Reader.initBuffer(ws.read_buffer.?, ws.connection.reader(), monitor, sink);
+        observed.reader.seek = ws.read_seek;
+        observed.reader.end = ws.read_end;
+        return observed;
+    }
+
+    pub fn saveReader(ws: *Connection, reader: *std.Io.Reader) void {
+        ws.read_seek = reader.seek;
+        ws.read_end = reader.end;
+    }
 
     pub fn close(ws: *Connection, gpa: std.mem.Allocator) void {
         if (ws.turn_state) |s| gpa.free(s);
+        if (ws.read_buffer) |buffer| gpa.free(buffer);
         const c = ws.connection;
         c.closing = true;
         c.client.connection_pool.release(c, c.client.io);
@@ -67,6 +84,76 @@ pub const Connection = struct {
         if (!upgrade or !connection or !accepted) return error.WebSocketHandshake;
         req.connection = null;
         return ws;
+    }
+
+    pub fn checkIdle(ws: *Connection, gpa: std.mem.Allocator, monitor: *idle.Monitor) !bool {
+        const c = ws.connection;
+        monitor.attach(c);
+        defer monitor.detach(c);
+        var observed = try ws.observe(gpa, monitor, .{ .ctx = ws, .onDelta = idleDelta });
+        defer ws.saveReader(&observed.reader);
+        const reader = &observed.reader;
+        const raw = &c.stream_reader.interface;
+        const original = raw.vtable;
+        // A partial frame or TLS control record must not wait for more socket bytes.
+        raw.vtable = &.{ .stream = IdleRead.stream, .readVec = IdleRead.readVec };
+        defer raw.vtable = original;
+        while (reader.buffered().len != 0 or try ws.readable()) {
+            const head = readHeader(reader) catch |err| switch (err) {
+                error.EndOfStream, error.ReadFailed => return false,
+                else => return err,
+            };
+            if (!head.fin or head.opcode < 8) return false;
+            var control: [125]u8 = undefined;
+            reader.readSliceAll(control[0..head.len]) catch return false;
+            switch (head.opcode) {
+                8 => return false,
+                9 => try ws.send(10, control[0..head.len]),
+                10 => {},
+                else => return error.WebSocketProtocol,
+            }
+        }
+        return true;
+    }
+
+    fn idleDelta(_: *anyopaque, _: @import("../provider.zig").Kind, _: []const u8) !void {}
+
+    const IdleRead = struct {
+        fn ready(r: *std.Io.Reader) bool {
+            const raw: *std.Io.net.Stream.Reader = @alignCast(@fieldParentPtr("interface", r));
+            return socketReadable(raw.stream.socket.handle) catch false;
+        }
+
+        fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            if (!ready(r)) return error.ReadFailed;
+            const raw: *std.Io.net.Stream.Reader = @alignCast(@fieldParentPtr("interface", r));
+            const original = std.Io.net.Stream.Reader.init(raw.stream, raw.io, &.{});
+            return original.interface.vtable.stream(r, w, limit);
+        }
+
+        fn readVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+            if (!ready(r)) return error.ReadFailed;
+            const raw: *std.Io.net.Stream.Reader = @alignCast(@fieldParentPtr("interface", r));
+            const original = std.Io.net.Stream.Reader.init(raw.stream, raw.io, &.{});
+            return original.interface.vtable.readVec(r, data);
+        }
+    };
+
+    fn readable(ws: *Connection) !bool {
+        const c = ws.connection;
+        // TLS plaintext and encrypted input may already be buffered above the socket.
+        if (c.reader().buffered().len != 0 or c.stream_reader.interface.buffered().len != 0) return true;
+        return socketReadable(c.stream_reader.stream.socket.handle) catch false;
+    }
+
+    fn socketReadable(handle: std.Io.net.Socket.Handle) !bool {
+        switch (@import("builtin").os.tag) {
+            .linux, .macos => {
+                var fds = [_]std.posix.pollfd{.{ .fd = handle, .events = std.posix.POLL.IN, .revents = 0 }};
+                return try std.posix.poll(&fds, 0) != 0;
+            },
+            else => return false,
+        }
     }
 
     pub fn send(ws: *Connection, opcode: u4, payload: []const u8) !void {

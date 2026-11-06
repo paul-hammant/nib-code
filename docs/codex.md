@@ -109,6 +109,8 @@ Preserve server code/message/incomplete reason from error/response.failed/respon
 
 Never retry `context_length_exceeded`, `insufficient_quota`, `usage_not_included`, `invalid_prompt`, request 4xx except 429. Retry `server_error`, rate limits, overload/unavailability, unknown codes, IncompleteResponse up to 5 attempts, default waits 1/2/4/8 seconds. Rate-limit try again in Xs/Xms overrides a wait, including decimals. Existing retry events/TUI remain.
 
+A reused WebSocket that closes (`WebSocketClosed` or `EndOfStream`) before any event/content gets one immediate reconnect without backoff or a retry notice. The failed attempt remains in `model_attempts`; a fresh-connection failure and failures after output use normal retry/backoff. SSE fallback rules are unchanged.
+
 Codex may retry after text/reasoning deltas; displayed failed fragments are not rolled back and may duplicate. Reuse requests, clearing failed partials used for cancellation commits; commit only successful complete Steps, final `end.text` rather than all deltas. Chat Completions retries only before deltas.
 
 Unretried/exhausted failures append independent diagnostic (`error_name`, code/message text, attempts, failed step), outside context/committed messages/context_tokens. Resume ignores; stats counts `errors.provider_failure` without Steps/tokens. Cancellation retains interruption commits.
@@ -157,7 +159,9 @@ Reuse provider/cancel.zig cancel/join: Esc/SIGINT interrupts I/O, discards socke
 
 Frames support random client masks, short/16/64-bit lengths, fragmented text, ping/pong/close, UTF-8/control validation. Server-message cap 16 MiB; oversize/binary/extension frames fall back without truncation. No negotiated compression/extensions. Reuse std.http.Client TLS/certs/proxies. Real local ChatGPT gateway verified custom/incremental; v7 formal benchmarks do not cover all proxies, long idle sockets, accounts. No pooled concurrency; one main request per Session. [ADR 0017](adr/0017-codex-websocket.md).
 
-Background results append to committed history only; waiting metadata stays local, so subsequent input may contain only background user messages. Mismatches send full history. Background waits do not run stream idle timers. Server idle-close makes next Step retry with new connection, cleared previous response, full history.
+Before reuse, Linux/macOS poll the socket without waiting and inspect buffered TLS plaintext and encrypted input. Pending Ping frames receive Pong; Close/EOF triggers a full-input reconnect with `connection_closed` and no failed attempt. Incomplete pending frames reconnect conservatively rather than waiting. Healthy sockets remain reusable regardless of idle duration. No keepalive pings or background reader are added.
+
+Background results append to committed history only; waiting metadata stays local, so subsequent input may contain only background user messages. Mismatches send full history. Background waits do not run stream idle timers. The server closes idle sockets after an unspecified period: session logs observed closes after 82 seconds or more, while a real TLS comparison successfully reused a socket after 75 seconds. Elapsed idle time alone does not trigger reconnects.
 
 Local `python3 tests/test_codex_websocket.py` covers increments, prefix/config changes, missing-response resend, handshake/protocol fallback, fragments/ping/pong, turn-state, reconnect, fork/resume, SIGINT/Esc continuation, cross-Turn reuse, no requests while background waiting, incremental/background prefix fallback, idle-close reconnect/timeout, heartbeat/metadata content timeout, continuous-reasoning total timeout, exact interleaved-message continuation. Fields/stats: [session-log.md](session-log.md#step-transport-fields).
 

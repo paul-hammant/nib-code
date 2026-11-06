@@ -51,8 +51,9 @@ def receive(reader):
 class Mock(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, mode):
+    def __init__(self, mode, idle_close_s=None):
         self.mode, self.requests, self.handshakes = mode, [], []
+        self.idle_close_s = idle_close_s
         self.connections = self.posts = self.pongs = 0
         super().__init__(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.serve_forever, daemon=True)
@@ -128,6 +129,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(b"\xc1\x00")
                     self.wfile.flush()
                     break
+                if (server.mode in ("stale-close", "stale-twice", "mid-output") and count == 2) or (server.mode == "stale-twice" and conn == 2):
+                    if server.mode == "mid-output":
+                        self.event("response.output_text.delta", delta="partial")
+                    self.wfile.write(frame(struct.pack("!H", 1000), opcode=8))
+                    self.wfile.flush()
+                    break
                 if server.mode == "disconnect" and count == 2:
                     break
                 if server.mode in ("content-heartbeats", "content-metadata", "request-progress", "content-progress", "invalid-response") and len(server.requests) == 1:
@@ -166,11 +173,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(frame(data[:cut], fin=False) + frame(b"", opcode=10) + frame(data[cut:], opcode=0))
                     self.wfile.flush()
                 full += output
+                if server.mode == "idle-ping":
+                    self.wfile.write(frame(b"ping", opcode=9))
+                    self.wfile.flush()
+                if server.mode == "idle-partial" and count == 1:
+                    self.wfile.write(b"\x89")
+                    self.wfile.flush()
+                if server.idle_close_s is not None:
+                    self.connection.settimeout(server.idle_close_s)
                 if server.mode == "background-reconnect" and count == 2:
                     self.wfile.write(frame(struct.pack("!H", 1000), opcode=8))
                     self.wfile.flush()
                     break
-        except (ConnectionError, TimeoutError, BrokenPipeError):
+        except TimeoutError:
+            self.wfile.write(frame(struct.pack("!H", 1000), opcode=8))
+            self.wfile.flush()
+        except (ConnectionError, BrokenPipeError):
             pass
         self.close_connection = True
 
@@ -199,6 +217,10 @@ def response(inputs, response_id, mode, body):
         args = {"code": 'console.log("mock result🙂")'}
         if mode.startswith("background"):
             args["code"] = "await tools.sleep(1500); 'background-result🙂'"
+        if mode in ("idle-closed", "idle-partial", "idle-ping"):
+            args["code"] = "await tools.sleep(300); console.log('idle result')"
+        if mode == "idle-alive":
+            args["code"] = "await tools.sleep(51000); console.log('idle result')"
         if mode == "fork":
             args["code"] = 'console.log(await tools.agent({prompt: "resumed", fork: true}))'
         if mode == "effort":
@@ -250,9 +272,11 @@ def read_log(home, session):
 
 
 def run_case(tmp, mode, *, resume=None, home=None, extra=None):
-    server = Mock(mode)
+    server = Mock(mode, idle_close_s=.1 if mode == "idle-closed" else None)
     home = home or tmp / mode
     home.mkdir(exist_ok=True)
+    if mode == "idle-alive":
+        (home / "config.toml").write_text("[limits]\nrun_background_after_ms = 60000\n")
     if mode.startswith("background"):
         (home / "config.toml").write_text("[limits]\nrun_background_after_ms = 50\nstream_idle_timeout_s = 1\n")
     if mode in ("content-heartbeats", "content-metadata", "request-progress", "content-progress"):
@@ -269,9 +293,10 @@ def run_case(tmp, mode, *, resume=None, home=None, extra=None):
     if resume:
         args += ["--resume", resume]
     try:
-        result = subprocess.run(args, cwd=tmp, env=env, capture_output=True, timeout=15)
+        result = subprocess.run(args, cwd=tmp, env=env, capture_output=True, timeout=65 if mode == "idle-alive" else 15)
         assert result.returncode == 0 and result.stderr == b"", (mode, result.stdout, result.stderr)
         events = [json.loads(line) for line in result.stdout.splitlines()]
+        server.events = events
         session = events[0]["start"]["session_id"]
         if mode.startswith("background"):
             assert [e["notice"] for e in events if "notice" in e] == ["Part one.Waiting." if mode == "background-ordered" else "Waiting."], events
@@ -292,6 +317,24 @@ def check_saved_run(tmp, session, home):
     assert report["total"] == report["matched"] == 1, report
     resumed, _, _, _ = run_case(tmp, "normal", resume=session, home=home)
     assert any(i.get("type") == "custom_tool_call_output" for i in resumed.requests[0]["body"]["input"])
+
+
+def test_tui_stale(tmp):
+    from test_interjections import Terminal, wait_for, finished
+    server = Mock("stale-close")
+    home = tmp / "tui-stale"
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("NIB_", "CODEX_"))}
+    env.update(NIB_HOME=str(home), CODEX_HOME=str(tmp / "auth"), NIB_PROVIDER="codex", NIB_MODEL="gpt-6.1-terra",
+               NIB_BASE_URL=f"http://127.0.0.1:{server.server_port}", TERM="xterm-256color")
+    terminal = Terminal(tmp, env)
+    try:
+        terminal.send("roundtrip\r")
+        wait_for(lambda: finished(home, "finished🙂"), "stale socket recovery")
+        assert server.connections == 2
+        assert b"Retrying" not in terminal.read()
+    finally:
+        terminal.close()
+        server.close()
 
 
 def test_tui_cancel(tmp):
@@ -397,6 +440,28 @@ def main():
                     assert "output_index=300" in attempts[0]["detail"] and "output_item.done" in attempts[0]["detail"]
                 else:
                     assert attempts[0]["content_bytes"] > 0 if mode == "request-progress" else attempts[0]["content_bytes"] == 0
+        for mode in ("idle-alive", "idle-closed", "idle-partial", "stale-close", "stale-twice", "mid-output"):
+            server, steps, _, _ = run_case(tmp, mode)
+            retries = [e for e in server.events if "retry" in e]
+            attempts = steps[-1]["model_attempts"]
+            if mode == "idle-alive":
+                assert server.connections == 1 and len(server.requests) == 2
+                assert server.requests[1]["at"] - server.requests[0]["at"] > 50
+                assert server.requests[1]["body"]["previous_response_id"] == "resp-1-1"
+                assert steps[-1]["incremental"] and steps[-1]["attempts"] == 1
+                assert len(attempts) == 1 and not retries
+            elif mode in ("idle-closed", "idle-partial"):
+                assert server.connections == 2 and len(server.requests) == 2, (mode, server.connections, server.requests)
+                assert steps[-1]["full_reason"] == "connection_closed" and steps[-1]["attempts"] == 1
+                assert not retries
+            elif mode == "stale-close":
+                assert len(attempts) == 2 and attempts[0]["error_name"] == "WebSocketClosed"
+                assert attempts[0]["content_bytes"] == 0 and not retries
+                assert server.requests[-1]["at"] - server.requests[-2]["at"] < .2
+            else:
+                assert len(retries) == 1, (mode, retries)
+                assert server.requests[-1]["at"] - server.requests[-2]["at"] >= .9
+                assert len(attempts) == (3 if mode == "stale-twice" else 2)
         server, steps, _, _ = run_case(tmp, "fork")
         assert server.connections == 2 and len(server.requests) == 3
         first_by_connection = {}
@@ -422,11 +487,17 @@ def main():
             if mode not in ("protocol", "protocol-emitted"):
                 assert server.posts == 2
             check_saved_run(tmp, sid, case_home)
+        ping, _, _, _ = run_case(tmp, "idle-ping")
+        assert ping.connections == 1 and ping.pongs >= 3
+        assert not any("retry" in e for e in ping.events)
         server, steps, _, _ = run_case(tmp, "event-state")
         assert server.requests[1]["body"]["client_metadata"]["x-codex-turn-state"] == "event-turn"
         server, steps, _, _ = run_case(tmp, "disconnect")
         assert server.connections == 2 and "previous_response_id" not in server.requests[-1]["body"]
         assert steps[-1]["attempts"] == 2 and steps[-1]["transport"] == "websocket" and not steps[-1]["incremental"]
+        assert not any("retry" in e for e in server.events)
+        assert steps[-1]["model_attempts"][0]["error_name"] == "EndOfStream"
+        assert server.requests[-1]["at"] - server.requests[-2]["at"] < .2
         for mode in ("cancel", "idle"):
             server = Mock(mode)
             case_home = tmp / mode
@@ -456,6 +527,7 @@ def main():
                     child.kill()
                     child.wait()
                 server.close()
+        test_tui_stale(tmp)
         test_tui_cancel(tmp)
         print("Codex WebSocket E2E passed: reuse/delta, prefix/config reset, missing response replay, sticky SSE fallback, fragmentation/ping, turn-state, reconnect, SIGINT, idle timeout and full-history resume")
 
