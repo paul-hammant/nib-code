@@ -14,8 +14,15 @@ pub const Tree = struct {
     pub fn update(tree: *Tree, gpa: std.mem.Allocator, agents: []const Progress) !void {
         var next: Tree = .{};
         errdefer next.deinit(gpa);
-        try next.rows.ensureTotalCapacity(gpa, agents.len);
-        for (agents, 0..) |p, i| next.rows.appendAssumeCapacity(try Row.init(gpa, p, i + 1 == agents.len));
+        var count: usize = 0;
+        for (agents) |p| if (p.kind != .run) {
+            count += 1;
+        };
+        try next.rows.ensureTotalCapacity(gpa, count);
+        for (agents) |p| {
+            if (p.kind == .run) continue;
+            next.rows.appendAssumeCapacity(try Row.init(gpa, p, next.rows.items.len + 1 == count));
+        }
         tree.deinit(gpa);
         tree.* = next;
     }

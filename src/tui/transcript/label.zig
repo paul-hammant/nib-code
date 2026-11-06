@@ -33,7 +33,3 @@ pub fn promptPrefix(prompt: []const u8) []const u8 {
     }
     return prompt[0..end];
 }
-
-pub fn appendPreview(gpa: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
-    for (promptPrefix(value)) |byte| try out.append(gpa, if (byte == '\n' or byte == '\r' or byte == '\t') ' ' else byte);
-}

@@ -283,7 +283,12 @@ pub const Background = struct {
                 job.announced = true;
             }
             if (job.collected) continue;
-            try job.t.progress.update(job.gpa, io, .{ .id = job.id, .run = job.scope.id, .kind = .run, .background = true, .prompt = "Run", .elapsed_ms = if (job.done.load(.acquire)) job.elapsed_ms else job.timing.elapsed(), .state = if (job.done.load(.acquire)) .done else .working });
+            try job.t.progress.update(job.gpa, io, .{ .id = job.id, .run = job.scope.id, .kind = .run, .background = true, .prompt = "Run", .elapsed_ms = if (job.done.load(.acquire)) job.elapsed_ms else job.timing.elapsed(), .state = if (job.done.load(.acquire)) switch (job.state) {
+                .done => .done,
+                .failed => .failed,
+                .canceled => .canceled,
+                .timed_out => .timed_out,
+            } else .working });
             if (!job.done.load(.acquire)) continue;
             var scratch: std.heap.ArenaAllocator = .init(job.gpa);
             defer scratch.deinit();

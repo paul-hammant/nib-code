@@ -496,8 +496,7 @@ class BackgroundBashTests:
 
         def terminal_state_visible():
             delta = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", terminal.read()[rendered:])
-            # vaxis may reuse the leading d when replacing detached with done.
-            return b"one" in delta
+            return b"completed" in delta
 
         wait_for(terminal_state_visible)
         self.assertEqual(len(mock.observed()), 2)
@@ -546,7 +545,7 @@ class BackgroundBashTests:
         terminal.send("hold\r")
         wait_for(lambda: len(mock.observed()) == 3)
         terminal.send("\x1b")
-        terminal.until(b"canceled")
+        terminal.until(b"Canceled")
         wait_for(lambda: all(not alive(pid) for pid in pids))
         mock.child_gate.set()
 
@@ -762,7 +761,7 @@ class BackgroundBashTests:
         self.assertEqual(len(mock.observed()), 1)
         self.assertFalse(self.completions(history(self.home), "b1"))
         self.release("ordinary")
-        terminal.until(b"stopped after 1 steps")
+        terminal.until(b"The step limit was reached.")
         self.assertFalse(self.completions(history(self.home), "b1"))
         terminal.send("next turn\r")
         self.wait_final("next turn complete")
@@ -1360,7 +1359,7 @@ class ChatTests(BackgroundBashTests, unittest.TestCase):
     def test_max_steps_result_is_visible_in_next_tui_turn(self):
         mock, terminal, pid, root_log = self.start_limited_terminal()
         self.release()
-        terminal.until(b"stopped after 5 steps")
+        terminal.until(b"The step limit was reached.")
         wait_for(lambda: not alive(pid))
         self.assertEqual(len(mock.observed()), 5)
         stored = self.completion([m for r in records(root_log) for m in r.get("messages", [])])
@@ -1373,7 +1372,7 @@ class ChatTests(BackgroundBashTests, unittest.TestCase):
     def test_escape_cancels_max_steps_wait(self):
         mock, terminal, pid, root_log = self.start_limited_terminal()
         terminal.send("\x1b")
-        terminal.until(b"canceled")
+        terminal.until(b"Canceled")
         wait_for(lambda: not alive(pid))
         self.assertEqual(len(mock.observed()), 5)
         self.assertNotIn(b"stopped after 5 steps", terminal.read())
@@ -1389,7 +1388,7 @@ class ChatTests(BackgroundBashTests, unittest.TestCase):
         wait_for(lambda: path.exists())
         pid = int(path.read_text())
         terminal.send("\x1b")
-        terminal.until(b"canceled")
+        terminal.until(b"Canceled")
         wait_for(lambda: not alive(pid))
         self.assertFalse(any(m.get("source") == "background" for m in history(self.home)))
 

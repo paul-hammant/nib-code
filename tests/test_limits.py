@@ -101,7 +101,7 @@ class AgentLimits(unittest.TestCase):
         self.assertNotEqual(process.returncode, 0, output)
         events = [json.loads(line) for line in output.splitlines()]
         self.assertIn("error", events[-1], events)
-        self.assertIn(f"stopped after {steps} steps", json.dumps(events[-1]))
+        self.assertIn(f"stopped after {steps} step" + ("s" if steps != 1 else ""), json.dumps(events[-1]))
         self.assertEqual(events[-1]["error"]["steps"], steps)
         self.assertFalse(any("end" in e for e in events), events)
         self.assertEqual([r["step"] for r in records(self.requests)], list(range(steps)))

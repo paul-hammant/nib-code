@@ -349,9 +349,9 @@ pub const Session = struct {
         }
         if (cancel.load(.acquire)) return error.Canceled;
         detail.* = if (waited.len > 0)
-            try std.fmt.allocPrint(s.gpa, "stopped after {d} steps (waited for background tasks: {s})", .{ max_steps, waited })
+            try std.fmt.allocPrint(s.gpa, "stopped after {d} step{s} (waited for background tasks: {s})", .{ max_steps, if (max_steps == 1) "" else "s", waited })
         else
-            try std.fmt.allocPrint(s.gpa, "stopped after {d} steps", .{max_steps});
+            try std.fmt.allocPrint(s.gpa, "stopped after {d} step{s}", .{ max_steps, if (max_steps == 1) "" else "s" });
         return error.TooManySteps;
     }
 

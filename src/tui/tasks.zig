@@ -7,7 +7,7 @@ pub fn format(a: std.mem.Allocator, tasks: []const Task, now_ms: i64) ![]const u
     var text: std.ArrayList(u8) = .empty;
     for (tasks, 0..) |task, i| {
         if (i > 0) try text.append(a, '\n');
-        try text.print(a, "{s} {s} · {s} · ", .{ task.id, @tagName(task.kind), @import("format.zig").state(task.state) });
+        try text.print(a, "{s} {s} · {s} · ", .{ task.id, if (task.kind == .run) "Run" else @tagName(task.kind), @import("format.zig").state(task.state) });
         try appendElapsed(a, &text, task.elapsed_ms);
         if (task.detached) {
             try text.appendSlice(a, " · no deadline (detached)");
@@ -33,5 +33,5 @@ test "tasks include state elapsed deadlines and detached lifetime" {
         .{ .id = "b1", .kind = .bash, .description = "server", .state = "working", .elapsed_ms = 61000, .detached = true },
         .{ .id = "r1", .kind = .run, .description = "Run (step 1)", .state = "done", .elapsed_ms = 10000 },
     }, 10000);
-    try std.testing.expectEqualStrings("a1 agent · running · 1s · deadline 00:00:30 UTC (20s) · investigate\nb1 bash · running · 1m1s · no deadline (detached) · server\nr1 run · completed · 10s · per-tool deadlines · Run (step 1)", text);
+    try std.testing.expectEqualStrings("a1 agent · running · 1s · deadline 00:00:30 UTC (20s) · investigate\nb1 bash · running · 1m1s · no deadline (detached) · server\nr1 Run · completed · 10s · per-tool deadlines · Run (step 1)", text);
 }

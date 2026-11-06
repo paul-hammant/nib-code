@@ -12,7 +12,6 @@ const ToolSummary = @import("../../session/tool_summary.zig").Summary;
 const ChangeText = @import("changes.zig").ChangeText;
 const label = @import("label.zig");
 const actualToolSummary = label.actualToolSummary;
-const appendPreview = label.appendPreview;
 
 pub const max_diff_lines = 60;
 pub const max_segments = 16 + max_diff_lines;
@@ -39,7 +38,7 @@ pub const Entry = struct {
     /// until render, so this must outlive draw(); see `refreshLabel`.
     label: std.ArrayList(u8) = .empty,
     files: std.ArrayList(u8) = .empty,
-    run: enum { running, background, superseded, ok, failed, warning } = .running,
+    run: enum { running, background, superseded, ok, failed, warning, lost, timed_out, canceled } = .running,
     elapsed_ms: u64 = 0,
     step_effort: ?provider.StepEffort = null,
     /// Collapsible entries share the transcript ctrl+o state.
@@ -77,12 +76,19 @@ pub const Entry = struct {
             .run => {
                 try e.label.appendSlice(gpa, "Run");
                 for (e.agents.items) |p| {
-                    if (p.superseded_by != null) continue;
+                    if (p.kind == .run or p.superseded_by != null) continue;
                     if (p.state == .failed or p.state == .timed_out or p.state == .canceled) {
                         try e.label.print(gpa, " · {s} {s}", .{ p.id, @import("../format.zig").state(@tagName(p.state)) });
                     }
                 }
-                if (e.task_id) |id| try e.label.print(gpa, " · {s} {s}", .{ id, if (e.run == .background) "running" else if (e.run == .failed) "failed" else "completed" });
+                if (e.task_id) |id| try e.label.print(gpa, " · {s} {s}", .{ id, switch (e.run) {
+                    .background, .running => "running",
+                    .failed => "failed",
+                    .lost => "lost",
+                    .timed_out => "timed out",
+                    .canceled => "canceled",
+                    else => "completed",
+                } });
                 var buf: [512]u8 = undefined;
                 const used = if (e.tool_summary) |summary| actualToolSummary(summary, e.changes.file_count, &buf) else "";
                 if (e.tool_summary) |summary| for (summary.files, 0..) |file, i| {
@@ -194,7 +200,7 @@ pub const Entry = struct {
             },
             .assistant => segs[0] = .{ .text = e.text.items },
             .run => {
-                segs[0] = if (e.run == .failed) .{ .text = "✗ ", .style = .{ .fg = .{ .index = 1 } } } else if (e.run == .warning or e.hasWarning()) .{ .text = "! ", .style = .{ .fg = .{ .index = 3 } } } else .{ .text = "  ", .style = dim };
+                segs[0] = if (e.run == .failed) .{ .text = "✗ ", .style = .{ .fg = .{ .index = 1 } } } else if (e.run == .warning or e.run == .lost or e.run == .timed_out or e.run == .canceled or e.hasWarning()) .{ .text = "! ", .style = .{ .fg = .{ .index = 3 } } } else .{ .text = "  ", .style = dim };
                 segs[1] = .{ .text = "" };
                 segs[2] = .{ .text = e.label.items, .style = dim };
                 if (!e.open) return segs[0..3];

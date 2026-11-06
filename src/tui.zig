@@ -758,7 +758,7 @@ test "background events own their payload and maintain running count" {
     _ = try app.handle((try loop.tryEvent()).?);
     try t.expectEqual(@as(usize, 0), app.background_count);
     try t.expectEqual(EntryKind.background, app.transcript.entries.items[0].kind);
-    try t.expectEqualStrings("a1 agent · completed · done", app.transcript.entries.items[0].label.items);
+    try t.expectEqualStrings("a1 agent · completed", app.transcript.entries.items[0].label.items);
 }
 
 test "Step events own effort and Runs keep their generating Step metadata" {

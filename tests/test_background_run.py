@@ -450,7 +450,7 @@ class BackgroundRunTests(unittest.TestCase):
             terminal.send("initial\r")
             wait_for(lambda: (self.cwd / "worker.pid").exists())
             terminal.send("\x1b")
-            terminal.until("继续".encode())
+            terminal.until(b"type continue to resume")
             self.assertIn(b"edited: changed.txt", terminal.output)
             self.assertIn(b"bash changes untracked", terminal.output)
             self.assertEqual((self.cwd / "changed.txt").read_text(), "partial work")
@@ -464,7 +464,7 @@ class BackgroundRunTests(unittest.TestCase):
         try:
             terminal.send("initial\r")
             terminal.until(b"model connection/request failed")
-            terminal.until("继续".encode())
+            terminal.until(b"type continue to resume")
             self.assertIn(b"no recorded edit/write changes", terminal.output)
             self.assertNotIn(b"edited:", terminal.output)
         finally:
@@ -501,7 +501,7 @@ class BackgroundRunTests(unittest.TestCase):
             pid = int((self.cwd / "worker.pid").read_text())
             terminal.send("\x1b")
             wait_for(lambda: not alive(pid))
-            terminal.until(b"canceled")
+            terminal.until(b"Canceled")
         finally:
             self.server.release.set()
             terminal.close()
