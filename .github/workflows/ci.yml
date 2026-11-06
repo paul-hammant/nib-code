@@ -30,6 +30,8 @@ jobs:
           # These tests inspect /proc directly or share the agent process-liveness fixtures.
           linux_only = {'session', 'agent', 'agent_reuse', 'agent_fork', 'background_agent',
                         'background_bash', 'background_run', 'limits'}
+          # Debug PTY latency limits (50/150 ms) are calibrated for Linux, not shared macOS runners.
+          linux_only.add('tui_stream')
           matrix = [{'os': 'ubuntu-latest', 'test': test, 'name': pathlib.Path(test).stem} for test in tests]
           portable = [test for test in tests if pathlib.Path(test).stem.removeprefix('test_') not in linux_only]
           matrix += [{'os': 'macos-latest', 'test': ' '.join(portable[i::4]), 'name': f'group-{i}'} for i in range(4)]
