@@ -1,11 +1,13 @@
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
-  <img src="docs/assets/logo-light.svg" alt="nib" width="72">
-</picture>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
+    <img src="docs/assets/logo-light.svg" alt="nib" width="96">
+  </picture>
+</p>
 
-# nib
+<h1 align="center">nib</h1>
 
-[English](README.md) | 中文
+<p align="center"><a href="README.md">English</a> | 中文</p>
 
 nib 是用 Zig 写的编码 agent，以 Run 为工作单位：一段 JavaScript 可以完成读取、修改和验证项目的一批工作。
 
