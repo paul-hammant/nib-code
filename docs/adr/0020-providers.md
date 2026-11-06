@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 date: 2026-11-05
 ---
 
@@ -15,11 +15,11 @@ date: 2026-11-05
 | --- | --- | --- | --- | --- | --- |
 | codex | Codex | responses | https://chatgpt.com/backend-api | CODEX_HOME/auth.json | gpt-6.1-sol |
 | openai | OpenAI | responses | https://api.openai.com/v1 | OPENAI_API_KEY | gpt-6.1-sol |
-| anthropic | Anthropic | anthropic_messages | https://api.anthropic.com | ANTHROPIC_API_KEY | 待核对生成目录 |
+| anthropic | Anthropic | anthropic_messages | https://api.anthropic.com | ANTHROPIC_API_KEY | claude-sonnet-5-5 |
 | deepseek | DeepSeek | chat_completions | https://api.deepseek.com | DEEPSEEK_API_KEY | deepseek-flash |
-| xai | xAI | responses | https://api.x.ai/v1 | XAI_API_KEY | 待核对生成目录 |
+| xai | xAI | responses | https://api.x.ai/v1 | XAI_API_KEY | grok-4.7 |
 
-当前 pi checkout 的 `src/providers/*.models.ts` 引用被 gitignore 的 `data/*.json`，生成目录不存在。不能把推测窗口记成 pi 快照。已可从 `catalog/providers` 核对 Codex 的 gpt-6.1-sol/terra 为 500000、DeepSeek 的 deepseek-flash/deepseek-v4-pro 为 1000000；OpenAI 对旗舰模型使用 `OPENAI_LONG_CONTEXT_INPUT_THRESHOLD`。实现前补齐 Anthropic/xAI 最新旗舰 id、窗口及 OpenAI 窗口的具体值，随后接受本 ADR。Codex 原有模型列表和默认行为完整保留。
+模型快照来源：用户提供的 models.dev api.json（获取日期 2026-11-06）。Anthropic 默认 claude-sonnet-5-5，列表 claude-opus-5-5、claude-sonnet-5-5、claude-haiku-5-5、claude-fable-5-1，窗口均为 1000000、最大输出 128000；OpenAI API 默认 gpt-6.1-sol，列表 gpt-6.1-sol/terra，窗口均为 1050000、最大输出 128000；xAI 默认 grok-4.7，列表 grok-4.7/4.6，窗口均为 500000。Codex 原有列表和窗口保持不变；DeepSeek 的 deepseek-flash/deepseek-v4-pro 窗口为 1000000。推理兼容规则来自 pi catalog/families/anthropic.ts。
 
 ## 配置与身份
 
@@ -62,4 +62,4 @@ Anthropic Usage.prompt_tokens = input_tokens + cache_read_input_tokens + cache_c
 
 不做非 Codex OAuth、模型发现端点、provider marketplace、逐 provider UI、跨协议历史转换。/status 和 CLI 帮助显示服务 id，固定 UI 文案英文。
 
-**来源：** 本机 pi `packages/ai/src/providers/{openai-codex,openai,anthropic,deepseek,xai}.ts`、同名 models wrapper、`catalog/providers`、`catalog/families` 及 `src/api/{openai-responses,openai-responses-shared,anthropic-messages,openai-completions}.ts`。本 ADR 为待实现设计，不能作为功能已交付的声明。
+**来源：** 本机 pi `packages/ai/src/providers/{openai-codex,openai,anthropic,deepseek,xai}.ts`、同名 models wrapper、`catalog/providers`、`catalog/families` 及 `src/api/{openai-responses,openai-responses-shared,anthropic-messages,openai-completions}.ts`。本 ADR 已获批准；交付状态以代码与验证为准。
