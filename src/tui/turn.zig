@@ -31,6 +31,8 @@ pub const Turn = struct {
     loop: *vaxis.Loop(Event),
     cancel: std.atomic.Value(bool) = .init(false),
     thread: std.Thread = undefined,
+    failure_stage: @import("../tools/changes.zig").Recovery.Reason = .model,
+    last_script_activity: ?std.Io.Clock.Timestamp = null,
     last_model_activity: ?std.Io.Clock.Timestamp = null,
 
     pub fn spawn(gpa: std.mem.Allocator, session: *Session, loop: *vaxis.Loop(Event), text: []const u8, compact: bool) !*Turn {
@@ -45,14 +47,15 @@ pub const Turn = struct {
         var detail: ?[]u8 = null;
         t.execute(compact, &detail) catch |err| {
             const msg = detail orelse (t.gpa.dupe(u8, @errorName(err)) catch return);
-            t.loop.postEvent(.{ .failed = msg }) catch t.gpa.free(msg);
+            t.loop.postEvent(.{ .failed = .{ .message = msg, .reason = @import("../tools/changes.zig").Recovery.classify(err, t.cancel.load(.acquire), t.failure_stage) } }) catch t.gpa.free(msg);
             return;
         };
         t.loop.postEvent(.done) catch {};
     }
 
     fn execute(t: *Turn, compact: bool, detail: *?[]u8) !void {
-        const sink: Sink = .{ .ctx = t, .emit = emit, .onModelActivity = modelActivity, .onUserInserted = userInserted };
+        t.session.tools.recovery.clear(t.gpa, t.session.io);
+        const sink: Sink = .{ .ctx = t, .emit = emit, .onModelActivity = modelActivity, .onToolActivity = toolActivity, .onUserInserted = userInserted };
         if (compact) {
             errdefer t.session.tools.background.stop(t.gpa);
             _ = try t.session.compact(sink, &t.cancel, detail);
@@ -64,12 +67,27 @@ pub const Turn = struct {
         try t.loop.postEvent(.{ .user_inserted = id });
     }
 
+    pub fn toolActivity(ctx: *anyopaque, name: []const u8) !void {
+        const t: *Turn = @ptrCast(@alignCast(ctx));
+        try t.loop.postEvent(.{ .tool_activity = name });
+    }
+
     pub fn modelActivity(ctx: *anyopaque, state: ModelActivity) !void {
         const t: *Turn = @ptrCast(@alignCast(ctx));
         try t.modelActivityAt(state, .now(t.session.io, .awake));
     }
 
     pub fn modelActivityAt(t: *Turn, state: ModelActivity, at: std.Io.Clock.Timestamp) !void {
+        if (state == .started) {
+            t.failure_stage = .model;
+            t.last_script_activity = null;
+        }
+        if (state == .script) {
+            if (t.last_script_activity) |last| {
+                if (last.durationTo(at).raw.toMilliseconds() < 1000) return;
+            }
+            t.last_script_activity = at;
+        }
         if (state == .data) if (t.last_model_activity) |last| {
             if (last.durationTo(at).raw.toMilliseconds() < 1000) return;
         };
@@ -80,6 +98,7 @@ pub const Turn = struct {
     pub fn emit(ctx: *anyopaque, ev: SessionEvent) !void {
         const t: *Turn = @ptrCast(@alignCast(ctx));
         const gpa = t.gpa;
+        if (ev == .run_start) t.failure_stage = .tool;
         const event: Event = switch (ev) {
             .step => |s| .{ .step = .{ .n = s.n, .effort = try gpa.dupe(u8, s.effort), .source = s.source } },
             .delta => |d| .{ .delta = .{ .kind = d.kind, .text = try gpa.dupe(u8, d.text), .step = t.session.steps + 1 } },
@@ -89,21 +108,28 @@ pub const Turn = struct {
                 errdefer gpa.free(output);
                 var changes = try ChangeText.init(gpa, r.changes);
                 errdefer changes.deinit(gpa);
-                break :blk .{ .run_end = .{ .ok = r.ok, .output = output, .changes = changes, .tool_summary = if (r.tool_summary) |summary| try summary.clone(gpa) else null } };
+                const background_id = if (r.background_id) |id| try gpa.dupe(u8, id) else null;
+                errdefer if (background_id) |id| gpa.free(id);
+                break :blk .{ .run_end = .{ .background_id = background_id, .ok = r.ok, .output = output, .changes = changes, .tool_summary = if (r.tool_summary) |summary| try summary.clone(gpa) else null } };
             },
-            .retry => |r| .{ .retry = try std.fmt.allocPrint(gpa, "retry {d} in {d}s: {s}", .{ r.attempt, r.delay_ms / 1000, r.reason }) },
+            .retry => |r| .{ .retry = try std.fmt.allocPrint(gpa, "attempt {d}/{d} · {s}", .{ r.attempt + 1, @import("../provider.zig").max_attempts, @import("status.zig").retryReason(r.reason) }) },
             .notice => |m| .{ .notice = try gpa.dupe(u8, m) },
             .usage => |u| .{ .usage = .{ .tokens = u, .context = t.session.context_tokens, .steps = t.session.steps } },
             .progress => |p| .{ .progress = try p.clone(gpa) },
             .background => |b| blk: {
                 const id = try gpa.dupe(u8, b.id);
                 errdefer gpa.free(id);
-                break :blk .{ .background = .{ .id = id, .kind = b.kind, .state = b.state, .ok = b.ok, .result = if (b.completion) |value| try @import("transcript.zig").runResultText(gpa, value.output, value.changes) else if (b.result) |result| try gpa.dupe(u8, result) else null } };
+                var changes: ChangeText = if (b.completion) |value| try .init(gpa, value.changes) else .{};
+                errdefer changes.deinit(gpa);
+                const summary: ?@import("../session/tool_summary.zig").Summary = if (b.completion) |value| try .init(gpa, value.calls, value.run_index, value.calls_omitted) else null;
+                errdefer if (summary) |value| value.deinit(gpa);
+                break :blk .{ .background = .{ .id = id, .kind = b.kind, .state = b.state, .ok = b.ok, .result = if (b.completion) |value| try gpa.dupe(u8, value.output) else if (b.result) |result| try gpa.dupe(u8, result) else null, .changes = changes, .tool_summary = summary } };
             },
             .turn_end => |summary| .{ .turn_end = summary },
         };
         errdefer switch (event) {
             .run_end => |r| {
+                if (r.background_id) |id| gpa.free(id);
                 gpa.free(r.output);
                 var changes = r.changes;
                 changes.deinit(gpa);
@@ -113,6 +139,9 @@ pub const Turn = struct {
             .background => |b| {
                 gpa.free(b.id);
                 if (b.result) |result| gpa.free(result);
+                var changes = b.changes;
+                changes.deinit(gpa);
+                if (b.tool_summary) |summary| summary.deinit(gpa);
             },
             .progress => |p| {
                 var owned = p;

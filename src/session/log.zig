@@ -31,7 +31,10 @@ pub const ForkedFrom = struct {
     message_count: usize,
 };
 
+pub const TaskStop = struct { id: []const u8, reason: []const u8, stopped: bool };
+
 pub const Record = struct {
+    task_stop: ?TaskStop = null,
     at: ?i64 = null,
     diagnostic: ?Diagnostic = null,
     agent_session: ?AgentSession = null,
@@ -154,6 +157,12 @@ pub const Log = struct {
         try log.append(io, a, .{ .bash = event });
     }
 
+    pub fn taskStop(log: *Log, io: std.Io, a: std.mem.Allocator, event: TaskStop) !void {
+        log.mutex.lockUncancelable(io);
+        defer log.mutex.unlock(io);
+        try log.append(io, a, .{ .task_stop = event });
+    }
+
     pub fn agentSession(log: *Log, io: std.Io, a: std.mem.Allocator, mapping: AgentSession) !void {
         log.mutex.lockUncancelable(io);
         defer log.mutex.unlock(io);
@@ -218,7 +227,25 @@ fn apply(history: *std.ArrayList(provider.Message), record: Record) void {
     }
 }
 
-fn restoreToolSummaries(a: std.mem.Allocator, history: []provider.Message, record: Record) !void {
+fn restoreToolSummaries(a: std.mem.Allocator, history: []provider.Message, record: Record, replacements: *const std.StringHashMap(@import("../tools/bash/registry.zig").Event)) !void {
+    for (record.run_results orelse &.{}) |result| {
+        if (result.background_id == null) continue;
+        for (history[record.from..]) |*message| {
+            if (std.mem.eql(u8, message.role, "tool") and std.mem.eql(u8, message.tool_call_id orelse "", result.tool_call_id)) message.background_id = result.background_id;
+        }
+    }
+    for (record.messages) |message| {
+        const completion = message.background_run orelse continue;
+        const id = message.background_id orelse continue;
+        for (history) |*origin| {
+            if (!std.mem.eql(u8, origin.role, "tool") or !std.mem.eql(u8, origin.background_id orelse "", id)) continue;
+            var replaced: std.ArrayList(@import("../tools/bash/registry.zig").Event) = .empty;
+            for (completion.calls) |call| {
+                if (replacements.get(call.id orelse "")) |event| try replaced.append(a, event);
+            }
+            if (replaced.items.len > 0) origin.bash_replacements = try replaced.toOwnedSlice(a);
+        }
+    }
     const calls = record.calls orelse return;
     for (record.messages, record.from..) |assistant, message_index| {
         const runs = assistant.tool_calls orelse continue;
@@ -237,6 +264,12 @@ fn restoreToolSummaries(a: std.mem.Allocator, history: []provider.Message, recor
             }
             for (history[record.from..]) |*message| {
                 if (std.mem.eql(u8, message.role, "tool") and std.mem.eql(u8, message.tool_call_id orelse "", run.id)) {
+                    var replaced: std.ArrayList(@import("../tools/bash/registry.zig").Event) = .empty;
+                    for (calls) |call| {
+                        if (call.run_index != run_index) continue;
+                        if (replacements.get(call.id orelse "")) |event| try replaced.append(a, event);
+                    }
+                    if (replaced.items.len > 0) message.bash_replacements = try replaced.toOwnedSlice(a);
                     message.tool_summary = try @import("tool_summary.zig").Summary.init(a, calls, run_index, omitted);
                     break;
                 }
@@ -260,6 +293,8 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
     defer pending_background.deinit(a);
     var id: provider.Id = .chat_completions;
     var model: ?[]const u8 = null;
+    var replacements: std.StringHashMap(@import("../tools/bash/registry.zig").Event) = .init(gpa);
+    defer replacements.deinit();
     var lines = std.mem.splitScalar(u8, data, '\n');
     var torn = false;
     var steps: usize = 0;
@@ -323,9 +358,11 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
             }
         };
         if (r.bash) |event| {
+            if (event.superseded_by != null) try replacements.put(event.id, event);
             try restoreId(event.id, &next_agent_id, &next_bash_id, &next_run_id);
             continue;
         }
+        if (r.task_stop != null) continue;
         if (r.diagnostic != null or (r.transport_fallback != null and r.messages.len == 0)) continue;
         if (r.from > history.items.len) return error.InvalidSessionLog;
         try history.ensureTotalCapacity(gpa, r.from + r.messages.len);
@@ -337,7 +374,7 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
             if (r.model_ms != null) pending_background_bytes = 0;
         }
         apply(history, r);
-        try restoreToolSummaries(a, history.items, r);
+        try restoreToolSummaries(a, history.items, r, &replacements);
         try validate(history.items);
         tokens.* = r.context_tokens;
     }
@@ -1267,4 +1304,51 @@ test "fork header retains provenance and cache across compaction without billing
         try t.expectEqualStrings("parent-cache", restored.cache_key.?);
         try t.expectEqualDeep(records[0].forked_from, restored.forked_from);
     }
+}
+
+test "0.4.0 replay restores background Run ids and bash replacements from lifecycle records" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var data: std.ArrayList(u8) = .empty;
+    for ([_]Record{
+        .{ .messages = &.{.{ .role = "system", .content = "system" }} },
+        .{ .bash = .{ .id = "b1", .run = 1, .state = .superseded, .superseded_by = "b2" } },
+        .{ .from = 1, .messages = &.{
+            .{ .role = "assistant", .tool_calls = &.{.{ .id = "run", .function = .{ .name = "run", .arguments = "{}" } }} },
+            .{ .role = "tool", .tool_call_id = "run", .content = "registered" },
+        }, .calls = &.{.{ .name = "bash", .id = "b1", .start_ms = 0, .end_ms = 1, .ok = true, .run_index = 0 }}, .run_results = &.{.{ .tool_call_id = "run", .background_id = "r3" }} },
+    }) |record| {
+        const line = try std.json.Stringify.valueAlloc(a, record, .{ .emit_null_optional_fields = false });
+        try data.print(a, "{s}\n", .{line});
+    }
+    var history: std.ArrayList(provider.Message) = .empty;
+    var tokens: u64 = 0;
+    _ = try replay(a, a, data.items, &history, &tokens);
+    try t.expectEqualStrings("r3", history.items[2].background_id.?);
+    try t.expectEqualStrings("b2", history.items[2].bash_replacements.?[0].superseded_by.?);
+}
+
+test "background Run completion restores its superseded bash on the originating Run" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var replacements: std.StringHashMap(@import("../tools/bash/registry.zig").Event) = .init(a);
+    try replacements.put("b1", .{ .id = "b1", .run = 1, .state = .superseded, .superseded_by = "b2" });
+    const result: provider.Message = .{ .role = "user", .source = .background, .background_id = "r1", .background_run = .{
+        .step = 1,
+        .run_index = 0,
+        .ok = true,
+        .output = "done",
+        .run_ms = 1,
+        .tool_bytes = 0,
+        .calls_omitted = 0,
+        .changes = &.{},
+        .calls = &.{.{ .name = "bash", .id = "b1", .start_ms = 0, .end_ms = 1, .ok = true, .run_index = 0 }},
+    } };
+    var history = [_]provider.Message{ .{ .role = "tool", .tool_call_id = "call", .background_id = "r1" }, result };
+    try restoreToolSummaries(a, &history, .{ .messages = &.{result} }, &replacements);
+    try t.expectEqualStrings("b2", history[0].bash_replacements.?[0].superseded_by.?);
 }

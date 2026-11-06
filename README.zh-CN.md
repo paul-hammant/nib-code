@@ -2,29 +2,10 @@
 
 [English](README.md) | 中文
 
-用 Zig 写的编码 agent。模型不逐个调用工具，而是写一段 JavaScript，在内嵌的 QuickJS 沙箱里一次完成读文件、搜索、修改、跑测试，只把需要的结果带回对话。
+nib 是用 Zig 写的编码 agent，以 Run 为工作单位：一段 JavaScript 可以完成读取、修改和验证项目的一批工作。
 
-```js
-// 模型的一次 Run：并发读文件，修改，然后构建和测试，只返回失败的部分
-const [a, b] = await Promise.all([tools.read({ path: "src/a.zig" }), tools.read({ path: "src/b.zig" })]);
-await tools.edit({ path: "src/a.zig", old_text: "...", new_text: "..." });
-const r = await tools.bash({ command: "zig build test" });
-r.exit_code === 0 ? "ok" : r.output
-```
+## 安装与登录
 
-当前版本 0.4.0，个人项目，仍在快速迭代。
-
-## 特点
-
-- **代码驱动**：只有一个 `run` 工具，模型可以调用的能力都是沙箱里的 JS 函数：`read`、`edit`、`write`、`grep`、`glob`、`fetch`、`bash`。一个 Run 里可以并发调用多个工具，在 JS 里过滤结果，减少和模型来回的次数。
-- **`tools.llm`**：一次干净的模型推理，不带工具、不带上下文，可以在 JS 里并发调用，适合批量判断、分类、抽取。
-- **`tools.agent`**：派生独立的子 agent 处理多步任务。失败时作为数据返回，不影响同一个 Run 里的其他子 agent，结果里附带它改过的文件；传 `resume: "a1"` 可以在原来的历史上继续使用同一个子 agent。
-- **后台任务**：`agent` 和 `bash` 可以传 `background: true`，立即返回任务 id，主模型继续工作；结果在之后的 Step 里作为消息到达。开发服务器这类长期进程可以用 `detached: true`，`tools.stop({ id, reason })` 按 id 停止任务，reason 需非空白。
-- **逐步调度推理强度**：模型可以为下一步声明更低的 effort。用户的设置是上限，Run 失败或用户插话后自动恢复。
-- **TUI**：回合进行中可以插话；子 agent 和后台任务在 Run 下方显示为状态树；每轮结束显示账单（推理与工具耗时、工具数据量与进入上下文的字节数、token、缓存命中）；用鼠标选中文本即可复制。
-- **可度量、可重放**：会话日志记录每个 Step 的耗时、用量和工具数据量，`scripts/stats.py` 用来统计失败、耗时构成和往返结构。工具调用的参数和结果默认录制在本地，`nib replay` 可以离线重新执行任意 Run，见 [docs/replay.md](docs/replay.md)。`/reflect` 让模型对照日志复盘 harness 本身的问题，并自动提 issue。
-
-## 安装
 
 需要 Zig 0.17。
 
@@ -35,7 +16,7 @@ zig build -Doptimize=ReleaseFast --prefix ~/.local   # 安装到 ~/.local/bin/ni
 nib --version
 ```
 
-## 接入模型
+
 
 **Codex（默认）**：先用 `codex` 命令行完成 ChatGPT 登录，nib 会读取 `~/.codex/auth.json`，不需要 API key。默认模型 `gpt-6.1-sol`。详见 [docs/codex.md](docs/codex.md)。
 
@@ -47,28 +28,74 @@ NIB_PROVIDER=chat_completions DEEPSEEK_API_KEY=... nib
 
 provider、模型和 effort 也可以写进 `~/.nib/config.toml`，见 [docs/config.md](docs/config.md)。
 
-## 使用
+## 第一个请求
+
+在项目目录运行：
 
 ```sh
-nib                          # 打开 TUI
-nib ask '解释一下这个项目的结构'
-nib ask --json '...'         # NDJSON 事件流，供脚本和其他程序调用
-nib -c                       # 继续当前目录最近的会话
-nib --effort high            # 本次进程的推理强度
-nib replay <会话ID> --all     # 离线重放该会话录制的 Run，检查结果是否一致
+nib
+# 输入：解释这个项目的入口，先不要修改文件。
 ```
 
-TUI 里输入 `/` 列出指令：`/new`、`/resume`、`/compact`、`/effort`、`/copy`、`/reflect`、`/js`、`/help`。Esc 中断当前回合，ctrl+o 展开 Run 的脚本、输出和 diff。
+也可以一次性提问：
 
-全局指令放在 `~/.nib/AGENTS.md`，项目约定放在项目根目录的 `AGENTS.md`。
+```sh
+nib ask '解释这个项目的结构'
+nib --help
+```
+
+Enter 发送，Shift+Enter 换行，Esc 取消。运行中可以继续发送要求，尚未送入模型的消息会标为 queued；取消后返回输入框。模型回复跟随你的语言，固定界面文字使用英文。
+
+全局约定放在 `~/.nib/AGENTS.md`，项目约定放在项目根目录的 `AGENTS.md`。
+
+## 如何读懂一个 Run
+
+一个块对应一次脚本执行。下例的标题来自实际工具调用；次行列出文件改动和增删行数，之后是读取/搜索路径与命令结果。
+
+```text
+  Run · read ×3 · grep · edit 2 files · bash
+    src/grep.zig +38 −9 · src/tools.zig +2 −1
+    read src/grep.zig · read src/tools.zig · grep src
+    └─ b1 bash zig build test · 1s · completed ✓ exit 0
+
+  1 Run · 2 steps · 41s · 6.6k tokens · tool data 3.2MB → 18kB
+```
+
+`✓ exit 0` 只确认旁边的命令成功。子任务失败或超时会在 Run 标题提示；脚本正常返回不代表其中的验证都通过。后台 Run 显示 `Run · r3 running`，结果到达后更新原块。被取代的命令显示 superseded，不表示验证成败。
+
+Ctrl+O 按 Changes / Result / Script 的顺序展开。结果可滚动查看；长 diff 明确标注 `Diff preview · 60 of … lines`。轮末统计只出现一次；底栏只保留模型与 context 百分比，详细计时和缓存看 `/status`。重试会移除失败尝试的正文，最终错误的 Details 也由 Ctrl+O 展开。
+
+## 高级能力
+
+- **代码驱动**：模型只有一个 `run` 入口，沙箱里的 `read`、`edit`、`write`、`grep`、`glob`、`fetch`、`bash` 可以在同一 Run 中并发、组合并过滤结果。工具数据完整交给 JS，进入模型上下文的展示预算见 [Run 输出](docs/run-output.md)。
+- **纯模型调用**：`tools.llm` 不带工具与会话历史，适合并发分类、抽取和批量判断。
+- **子 agent**：`tools.agent` 处理独立多步任务，失败作为数据返回，结果附带改动。`resume: "a1"` 接续同一个子任务，`fork: true` 从当前上下文分叉。
+- **后台任务**：agent/bash 支持 `background: true`，长 Run 也可自动转后台；结果自动到达。长期进程可用 `detached: true`。`/tasks` 查看编号、状态和截止时间；`/stop <id>` 停止任务，可能保留部分改动。见 [TUI 任务管理](docs/tui-ux.md)。
+- **推理强度**：`/effort` 设置上限，模型可为下一步声明更低的 effort；Run 失败或用户插话后自动恢复。
+- **日志与重放**：会话日志记录用量和耗时；`scripts/stats.py` 汇总统计；`nib replay` 离线重放工具录制，见 [重放](docs/replay.md)。
+- **反思**：`/reflect` 复盘 harness，默认将 issue 草稿发布到公开仓库 `yyydddkkk/nib-code`。`NIB_ISSUE_REPO` 可指定仓库，设为 `off` 则只保存本地反思。帮助和菜单显示当前设置；见 [反思](docs/reflect.md)。
+
+```sh
+nib -c                         # 继续当前目录最近的会话
+nib --resume <32位会话ID>       # 恢复指定会话
+nib --effort high              # 本次进程的推理强度
+nib ask --json '...'           # NDJSON 事件流
+nib replay <会话ID> --all       # 离线重放
+```
+
+输入 `/` 查看按 Send / View / Session 分组的指令，`/help` 查看全部快捷键。鼠标选区可复制文本。
+
+当前版本 0.4.0，个人项目，仍在快速迭代。
 
 ## 安全
+
 
 工具调用的结果默认录制在 `~/.nib/sessions/<id>.calls.jsonl`（权限 0600，只在本地），其中可能包含模型读过但没有回传的内容，比如 `.env`；不需要时设置 `NIB_RECORD=off`。
 
 bash 有一层防误操作的检查：拒绝提权、关机、删除系统目录等命令，不读取 Codex 凭证。它是防止失误的护栏，不是安全沙箱，**nib 以你的用户权限运行模型生成的代码**。在重要的仓库上使用前，请确认工作区有提交或备份。
 
 ## 文档
+
 
 - [docs/README.md](docs/README.md)：设计原则、决策记录（ADR）索引和暂缓的想法
 - [docs/compromises.md](docs/compromises.md)：为当下做的妥协及其删除条件

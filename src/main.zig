@@ -21,7 +21,10 @@ pub fn main(init: std.process.Init) void {
     } else false;
     run(init, args, &out.interface, json, &detail, &failure) catch |err| {
         if (json) {
-            failure.message = detail orelse errorMessage(err);
+            failure.message = detail orelse switch (err) {
+                error.MissingPrompt, error.InvalidArguments => @errorName(err),
+                else => errorMessage(err),
+            };
             JsonEvent.write(.{ .@"error" = failure }, &out.interface) catch {};
         } else std.debug.print("nib: {s}\n", .{detail orelse errorMessage(err)});
         std.process.exit(1);
@@ -30,6 +33,12 @@ pub fn main(init: std.process.Init) void {
 
 fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer, json: bool, detail: *?[]u8, failure: *JsonEvent.Failure) !void {
     const gpa = init.gpa;
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            try stdout.writeAll(help);
+            return stdout.flush();
+        }
+    }
     if (args.len == 2 and (std.mem.eql(u8, args[1], "--version") or std.mem.eql(u8, args[1], "-V"))) {
         try stdout.print("nib {s}\n", .{@import("build_options").version});
         return stdout.flush();
@@ -67,6 +76,9 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
             i += 1;
             if (i == args.len) return error.MissingSessionId;
             options.resume_id = args[i];
+        } else if (arg.len > 1 and arg[0] == '-') {
+            detail.* = try std.fmt.allocPrint(gpa, "Unknown option: {s} · run nib --help", .{arg});
+            return error.InvalidArguments;
         } else if (ask and prompt == null) {
             prompt = arg;
         } else return error.InvalidArguments;
@@ -158,14 +170,37 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
         try stdout.print("\n", .{});
         try stdout.flush();
         const u = session.usage;
-        std.debug.print("[{s}] turn: {d} steps, in={d} (cache hit {d}) out={d}\n", .{
-            cfg.model, session.steps, u.prompt_tokens, u.prompt_cache_hit_tokens, u.completion_tokens,
+        std.debug.print("[{s}] turn: {d} step{s}, in={d} (cache hit {d}) out={d}\n", .{
+            cfg.model, session.steps, if (session.steps == 1) "" else "s", u.prompt_tokens, u.prompt_cache_hit_tokens, u.completion_tokens,
         });
         return;
     }
 
     try tui.run(init, &session);
 }
+
+const help =
+    \\nib · a coding agent whose unit of work is a Run
+    \\
+    \\Usage:
+    \\  nib [options]                         Open the TUI
+    \\  nib ask [options] <prompt|->           Ask once; - reads stdin
+    \\  nib js <code>                         Run sandbox JavaScript
+    \\  nib replay <session-id> --all [--json] Replay recorded Runs offline
+    \\
+    \\Options:
+    \\  -h, --help            Show help
+    \\  -V, --version         Show version
+    \\  -c, --continue        Continue this directory's latest session
+    \\  --resume <id>         Resume a session (32 lowercase hex characters)
+    \\  --effort <level>      Set reasoning effort; /effort lists levels
+    \\  --json                Stream NDJSON events (ask only)
+    \\
+    \\TUI: Enter sends · Shift+Enter adds a line · Esc cancels · Ctrl+O opens details
+    \\Type / for commands, /help for keys, /status for timing and cache details.
+    \\Setup: see README.md and docs/config.md.
+    \\
+;
 
 var ask_cancel: std.atomic.Value(bool) = .init(false);
 
@@ -178,6 +213,8 @@ fn onSignal(signal: std.posix.SIG) callconv(.c) void {
 
 fn errorMessage(err: anyerror) []const u8 {
     return switch (err) {
+        error.InvalidArguments => "Invalid arguments · run nib --help",
+        error.MissingPrompt => "Missing prompt · run nib --help",
         error.AgentSessionParentMismatch => "Cannot continue a session that is not a child of this parent session.",
         error.SessionBusy => "Session is busy in another process; wait for its current task to finish.",
         error.InvalidSessionId => "Session ID must be exactly 32 lowercase hexadecimal characters.",

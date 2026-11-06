@@ -607,7 +607,7 @@ class ChatTests(BackgroundTests, unittest.TestCase):
     def test_max_steps_result_is_visible_in_next_tui_turn(self):
         mock, terminal, pids, root_log = self.start_limited_terminal()
         (self.cwd / "worker.release").touch()
-        terminal.until(b"stopped after 2 steps")
+        terminal.until(b"The step limit was reached.")
         self.assert_stopped(pids)
         self.assertEqual(len(mock.observed("initial")), 2)
         stored = self.completions([m for r in records(root_log) for m in r.get("messages", [])])
@@ -621,7 +621,7 @@ class ChatTests(BackgroundTests, unittest.TestCase):
     def test_escape_cancels_max_steps_wait(self):
         mock, terminal, pids, root_log = self.start_limited_terminal()
         terminal.send("\x1b")
-        terminal.until(b"canceled")
+        terminal.until(b"Canceled")
         self.assert_stopped(pids)
         self.assertEqual(len(mock.observed("initial")), 2)
         self.assertNotIn(b"stopped after 2 steps", terminal.read())
@@ -634,7 +634,7 @@ class ChatTests(BackgroundTests, unittest.TestCase):
         terminal.send("initial\r")
         pids = list(self.worker_pids())
         terminal.send("\x1b")
-        terminal.until(b"canceled")
+        terminal.until(b"Canceled")
         self.assert_stopped(pids)
         self.assertFalse(self.completions(history(self.home)))
 

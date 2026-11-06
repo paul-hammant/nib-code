@@ -70,9 +70,9 @@ Session 累计这些数据并通过 `turn_end` 按值传给 TUI，TUI 不跨线�
 
 ## Run 标题工具统计
 
-运行中的 TUI Run 标题从源码预估工具名称和次数；结束后改用 Session 的 `run_end.tool_summary: {counts: [{name, count}], omitted}`，只统计实际宿主调用（排除 `dispatched=false` 的准入拒绝，包含已派发但执行失败的调用），按首次调用顺序显示。Step 的 `calls[]` 最多保留 200 条，省略部分显示为 `+N`，不猜测工具名称。
+TUI 始终保留 Run 父标题，运行时只显示已知任务状态，结束后使用 Session 的 `run_end.tool_summary: {counts: [{name, count}], omitted, files: [{tool,path}]}`，只统计实际宿主调用（排除 `dispatched=false` 的准入拒绝，包含已派发但执行失败的调用），按首次调用顺序显示。Step 的 `calls[]` 最多保留 200 条，省略部分显示为 `+N`，不猜测工具名称。
 
-恢复时，主日志 `calls[].run_index` 对应同一 assistant 消息的 `tool_calls` 数组索引，再按 `tool_call_id` 关联结果。新的 `run_results[].calls_omitted` 保存各 Run 的省略次数；只有 Step 级 `calls_omitted` 的过渡日志，单 Run 时可直接归属；多 Run 时不猜测归属，以独立的 `tools +N · omitted calls (Run unknown)` 条目显示，assistant 消息的可选 `step_calls_omitted` 元数据保留这部分计数。无 `calls` 的旧日志保留源码预估。tool 结果消息的可选 `tool_summary` 是界面元数据，用于压缩重写后保留统计，不发送给 provider。
+恢复时，主日志 `calls[].run_index` 对应同一 assistant 消息的 `tool_calls` 数组索引，再按 `tool_call_id` 关联结果。新的 `run_results[].calls_omitted` 保存各 Run 的省略次数；只有 Step 级 `calls_omitted` 的过渡日志，单 Run 时可直接归属；多 Run 时不猜测归属，以独立的 `tools +N · omitted calls (Run unknown)` 条目显示，assistant 消息的可选 `step_calls_omitted` 元数据保留这部分计数。无 `calls` 的旧日志只显示 Run，不从脚本文本推测调用。`calls[].path` 可记录 read/grep/glob 实际派发参数中的路径，省略的 grep/glob 根路径为 `.`；`tool_summary.files` 按 `{tool,path}` 去重。旧日志可缺省这些字段。tool 结果消息的可选 `tool_summary` 是界面元数据，用于压缩重写后保留统计，不发送给 provider。
 
 ## Step effort 字段
 
@@ -162,3 +162,5 @@ Codex 新响应的 `reasoning.includes_output:true` 表示 `reasoning.data` 是�
 事件沿用顶层 `at` 毫秒时间戳，旧日志没有这些事件。恢复跳过事件的历史应用，并从事件 id 恢复 b 计数器；不重启命令。主日志因此也包含完整 shell 命令，分享时应检查其中的敏感参数。
 
 `scripts/stats.py` 的 JSON 字段 `bash_superseded` 统计入选记录中的 `superseded` 次数，文本显示“Bash 被取代次数”。按 --since 的事件 at 过滤；事件不计作 Step、Turn 或失败。被取代的工具 resolve 数据与后台结果仍走原有录制/消息路径；其含义和脚本分支见 [tool-delegation.md](tool-delegation.md#同一命令取代过时执行)。
+
+`task_stop` 是单独的任务控制记录，包含 `id`、`reason`、`stopped`，不改变模型历史；TUI `/stop` 的 reason 为 `user requested stop`。tool 消息中的 `run_ok` 与 `background_id` 供 TUI 恢复显示使用，不改变发给 provider 的工具结果正文。

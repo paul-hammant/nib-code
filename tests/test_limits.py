@@ -49,7 +49,7 @@ class LlmLimits(unittest.TestCase):
         starts = self.starts()
         self.assertEqual(len(starts), 3, self.observed())
         run_end = next(event["run_end"] for event in events if "run_end" in event)
-        self.assertEqual(run_end["tool_summary"], {"counts": [{"name": "llm", "count": 3}], "omitted": 0})
+        self.assertEqual(run_end["tool_summary"], {"counts": [{"name": "llm", "count": 3}], "omitted": 0, "files": []})
         self.assertEqual(max(e["active"] for e in starts), 2, self.observed())
         session = events[0]["start"]["session_id"]
         system = records(Path(self.env["NIB_HOME"]) / "sessions" / (session + ".jsonl"))[0]["messages"][0]["content"]
@@ -101,7 +101,7 @@ class AgentLimits(unittest.TestCase):
         self.assertNotEqual(process.returncode, 0, output)
         events = [json.loads(line) for line in output.splitlines()]
         self.assertIn("error", events[-1], events)
-        self.assertIn(f"stopped after {steps} steps", json.dumps(events[-1]))
+        self.assertIn(f"stopped after {steps} step" + ("s" if steps != 1 else ""), json.dumps(events[-1]))
         self.assertEqual(events[-1]["error"]["steps"], steps)
         self.assertFalse(any("end" in e for e in events), events)
         self.assertEqual([r["step"] for r in records(self.requests)], list(range(steps)))

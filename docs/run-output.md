@@ -115,3 +115,5 @@ console.log("service ready");
 多个 Run 共享 cwd，可能同时使用或修改文件。file_state 的互斥锁保证状态表安全，路径锁串行化单次 read/edit/write，write 能发现当前会话最近观察之后的外部改动；但会话内别的 Run 的 read/write 会更新同一观察状态，因此它不是每个脚本独立的乐观事务，也不能检测所有 Run 间语义冲突。bash 更不参与文件锁。edit/write 修改后可直接重跑相同 command/cwd，旧 bash 按[取代语义](tool-delegation.md#同一命令取代过时执行)停止并返回 `{superseded_by}`；只停止匹配的 bash，原 Run 的后续代码仍会继续，已有副作用不回滚。处理后台结果前按需要重新 read，核对当前文件状态。
 
 进程退出后不恢复 JS 堆或重启命令，未送达任务按原后台机制恢复为 lost；已经提交的结果不重复投递。离线 replay 不重现墙钟切换：按原 Step/Run 定位录制，重放完整脚本，比较最终输出。最终结果尚未提交时，不把提前通知当成脚本的期望输出。
+
+TUI 中原 Run 显示中性的 `→ run background → rN`，只表示已登记；最终结果条目标注 `source Run → rN`，恢复会话同样保留关联。被取代的 bash 显示 `b1 superseded by b2` 和中性箭头，状态树也显示取代者，不作为失败。

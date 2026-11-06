@@ -155,8 +155,16 @@ pub const RunScope = struct {
     id: usize,
     cancel: std.atomic.Value(bool) = .init(false),
     llm_calls: std.atomic.Value(usize) = .init(0),
+    active_tools: [all.len]std.atomic.Value(u32) = @splat(.init(0)),
     changes: @import("tools/changes.zig").Tracker = .{},
     fork: ?@import("tools/agent/input.zig").Fork = null,
+
+    pub fn activeTool(scope: *RunScope) []const u8 {
+        for (all, &scope.active_tools) |tool, *count| {
+            if (count.load(.acquire) > 0) return tool.name;
+        }
+        return "";
+    }
 
     pub fn host(scope: *RunScope) sandbox.Host {
         return .{ .ctx = scope, .names = scope.tools.api().names, .call = call, .cancel = &scope.cancel, .admit = admit };
@@ -200,6 +208,7 @@ pub const Tools = struct {
     background: @import("tools/background.zig").Background = .{},
     run_id: usize = 0,
     background_sink: ?struct { ctx: *anyopaque, emit: *const fn (*anyopaque, @import("session/events.zig").Background) anyerror!void } = null,
+    notice_sink: ?struct { gpa: std.mem.Allocator, ctx: *anyopaque, emit: *const fn (*anyopaque, []const u8) anyerror!void } = null,
     progress: @import("tools/progress.zig").Queue = .{},
     agent_usage: provider.Usage = .{},
     llm_calls: std.atomic.Value(usize) = .init(0),
@@ -207,6 +216,7 @@ pub const Tools = struct {
     cancel: std.atomic.Value(bool) = .init(false),
     file_state: @import("tools/file_state.zig").State = .{},
     bash_commands: @import("tools/bash/registry.zig").Registry = .{},
+    recovery: @import("tools/changes.zig").Recovery = .{},
     track_changes: bool = false,
     changes_mutex: std.Io.Mutex = .init,
     changes: @import("tools/changes.zig").Tracker = .{},
@@ -310,6 +320,13 @@ pub const Tools = struct {
             if (usage.prompt_tokens != 0 or usage.completion_tokens != 0 or usage.prompt_cache_hit_tokens != 0)
                 try sink.emit(sink.ctx, usage);
         }
+        if (t.notice_sink) |sink| while (t.background.takeStop(t.io)) |id| {
+            const gpa = sink.gpa;
+            defer gpa.free(id);
+            const notice = try @import("tools/stop.zig").userStop(t, gpa, id);
+            defer gpa.free(notice);
+            try sink.emit(sink.ctx, notice);
+        };
         if (t.background_sink) |sink| try t.background.poll(t.io, sink.ctx, sink.emit);
         try t.progress.drain(t.io);
     }
@@ -318,9 +335,15 @@ pub const Tools = struct {
         const t: *Tools = @ptrCast(@alignCast(ctx));
         if (t.forked and std.mem.eql(u8, name, "agent"))
             return fail(gpa, "agent is unavailable inside a forked sub-agent", .{}) catch .{ .err = &.{} };
-        const r = for (all) |tool| {
+        const r = for (all, 0..) |tool, i| {
             if (!enabled(tool, t.depth)) continue;
-            if (std.mem.eql(u8, name, tool.name)) break if (tool.run) |run_tool| run_tool(t, gpa, args) else error.SandboxOnlyTool;
+            if (!std.mem.eql(u8, name, tool.name)) continue;
+            const active = if (t.scope()) |run_scope| &run_scope.active_tools[i] else null;
+            if (active) |count| _ = count.fetchAdd(1, .acq_rel);
+            defer if (active) |count| {
+                _ = count.fetchSub(1, .acq_rel);
+            };
+            break if (tool.run) |run_tool| run_tool(t, gpa, args) else error.SandboxOnlyTool;
         } else fail(gpa, "unknown tool", .{});
         return r catch |err| fail(gpa, "{s}", .{@errorName(err)}) catch .{ .err = &.{} };
     }

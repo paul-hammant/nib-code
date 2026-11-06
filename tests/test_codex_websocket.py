@@ -307,7 +307,7 @@ def test_tui_cancel(tmp):
         terminal.until(b"answer")
         started = time.monotonic()
         terminal.send("\x1b")
-        terminal.until(b"canceled")
+        terminal.until(b"Canceled")
         assert time.monotonic() - started < 2
         server.mode = "normal"
         terminal.send("resumed\r")

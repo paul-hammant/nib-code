@@ -11,6 +11,7 @@ pub const Job = struct {
     input_arena: std.heap.ArenaAllocator,
     join_mutex: std.Io.Mutex = .init,
     elapsed_ms: u64 = 0,
+    state: enum { done, failed, canceled, timed_out } = .failed,
     execution: @import("../sandbox/timing.zig").Execution = .{},
     scope: RunScope,
     cancel: std.atomic.Value(bool) = .init(false),
@@ -58,12 +59,13 @@ pub const Job = struct {
             job.done.store(true, .release);
             job.completed.set(job.t.io);
         }
-        defer job.input_arena.deinit();
         defer {
+            job.state = if (job.cancel.load(.acquire)) .canceled else if (job.outcome) |outcome| (if (outcome.ok) .done else if (std.mem.eql(u8, outcome.text, "Error: run timed out")) .timed_out else .failed) else .failed;
             job.elapsed_ms = job.timing.elapsed();
             job.execution.end_ms_epoch = @import("../sandbox/timing.zig").Execution.now(job.t.io);
         }
         var host = job.scope.host();
+        job.timing.detail_allocator = job.input_arena.allocator();
         host.timing = &job.timing;
         host.waiting = &job.waiting;
         if (job.recorder) |*r| host.record = r;
@@ -85,7 +87,7 @@ pub const Job = struct {
         job.cancel.store(true, .release);
         job.join();
         job.releaseExecution();
-        if (job.thread == null and !job.done.load(.acquire)) job.input_arena.deinit();
+        job.input_arena.deinit();
         job.gpa.destroy(job);
     }
 
@@ -95,6 +97,8 @@ pub const Job = struct {
         if (job.recorder) |*r| r.deinit();
         job.recorder = null;
         job.scope.changes.discard(job.gpa);
+        job.input_arena.deinit();
+        job.input_arena = .init(job.gpa);
     }
 
     pub fn completion(job: *Job, a: std.mem.Allocator) !Completion {

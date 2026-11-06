@@ -13,6 +13,8 @@
 
 ## 按需参考
 
+- 修改 TUI、CLI 帮助或固定文案时，先读 [docs/ui-style.md](docs/ui-style.md)。
+
 - provider、凭证、effort、配置与环境变量：[docs/config.md](docs/config.md)、[docs/codex.md](docs/codex.md)、[ADR 0011](docs/adr/0011-provider-wire-protocols.md)。
 - `ask --json` 的 NDJSON 格式：[docs/ask-json.md](docs/ask-json.md)。
 - 会话日志、恢复/取消语义、计时字段与统计口径：[docs/session-log.md](docs/session-log.md)。

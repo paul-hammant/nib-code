@@ -239,7 +239,10 @@ pub const State = struct {
                     continue;
                 }
                 const timing = st.host.?.timing;
-                if (timing) |t| call.timing_index = t.reserve(call.name);
+                if (timing) |t| {
+                    call.timing_index = t.reserve(call.name);
+                    try t.describe(call.timing_index, call.name, call.args);
+                }
                 call.thread = std.Thread.spawn(.{}, Call.work, .{call}) catch |err| {
                     if (timing) |t| t.undoReservation(call.timing_index, call.name);
                     return err;

@@ -12,23 +12,19 @@ const ToolSummary = @import("../../session/tool_summary.zig").Summary;
 const ChangeText = @import("changes.zig").ChangeText;
 const label = @import("label.zig");
 const actualToolSummary = label.actualToolSummary;
-const toolSummary = label.toolSummary;
-const appendAction = label.appendAction;
-const appendTokens = label.appendTokens;
-const appendPreview = label.appendPreview;
 
-pub const run_output_lines = 12;
 pub const max_diff_lines = 60;
-pub const max_segments = 8 + max_diff_lines + 2;
+pub const max_segments = 16 + max_diff_lines;
 
-pub const Kind = enum { user, assistant, run, background, info, err, bill };
+pub const Kind = enum { user, assistant, run, background, info, err, bill, failure };
 
 pub const Entry = struct {
     kind: Kind,
     queued: ?u64 = null,
+    attempt: usize = 0,
     /// For `.run`: the script.
     text: std.ArrayList(u8) = .empty,
-    /// For `.run`: the first lines of its output.
+    /// For `.run`: the complete result delivered by Session.
     output: std.ArrayList(u8) = .empty,
     /// For `.run`: see `ChangeText`.
     changes: ChangeText = .{},
@@ -41,7 +37,8 @@ pub const Entry = struct {
     /// One-line summary of a collapsible entry. vaxis keeps printed slices
     /// until render, so this must outlive draw(); see `refreshLabel`.
     label: std.ArrayList(u8) = .empty,
-    run: enum { running, ok, failed } = .running,
+    files: std.ArrayList(u8) = .empty,
+    run: enum { running, background, superseded, ok, failed, warning, lost, timed_out, canceled } = .running,
     elapsed_ms: u64 = 0,
     step_effort: ?provider.StepEffort = null,
     /// Collapsible entries share the transcript ctrl+o state.
@@ -63,6 +60,7 @@ pub const Entry = struct {
         e.text.deinit(gpa);
         e.output.deinit(gpa);
         e.label.deinit(gpa);
+        e.files.deinit(gpa);
         e.changes.deinit(gpa);
         for (e.agents.items) |*p| p.deinit(gpa);
         e.agents.deinit(gpa);
@@ -73,67 +71,47 @@ pub const Entry = struct {
 
     pub fn refreshLabel(e: *Entry, gpa: std.mem.Allocator) !void {
         e.label.clearRetainingCapacity();
+        e.files.clearRetainingCapacity();
         switch (e.kind) {
             .run => {
-                var buf: [512]u8 = undefined;
-                const used = if (e.tool_summary) |summary| actualToolSummary(summary, &buf) else toolSummary(e.text.items, &buf);
-                var live: std.ArrayList(Progress) = .empty;
-                defer live.deinit(gpa);
-                for (e.agents.items) |p| if (e.isLive(p)) try live.append(gpa, p);
-                const agents = live.items;
-                if (agents.len > 0) {
-                    if (agents.len == 1) {
-                        const p = agents[0];
-                        if (p.kind != .agent) {
-                            try e.label.print(gpa, "{s} · {s} · ", .{ @tagName(p.kind), if (p.background) "background" else "running" });
-                            try appendPreview(gpa, &e.label, p.prompt);
-                            try e.label.appendSlice(gpa, " · ");
-                            try agent_tree.appendElapsed(gpa, &e.label, p.elapsed_ms);
-                            try e.label.print(gpa, " · {s}", .{if (p.background) "background" else @tagName(p.state)});
-                        } else {
-                            try e.label.print(gpa, "agent · {s} · step {d}", .{ if (p.background) "background" else "running", p.step });
-                            try appendAction(gpa, &e.label, p);
-                            try appendTokens(gpa, &e.label, p.usage.prompt_tokens + p.usage.completion_tokens);
-                        }
-                    } else {
-                        var working: usize = 0;
-                        var queued: usize = 0;
-                        var done: usize = 0;
-                        var failed: usize = 0;
-                        var bash_count: usize = 0;
-                        var agent_count: usize = 0;
-                        var tokens: u64 = 0;
-                        for (agents) |p| {
-                            if (p.kind == .bash) bash_count += 1;
-                            if (p.kind == .agent) agent_count += 1;
-                            switch (p.state) {
-                                .working => working += 1,
-                                .queued => queued += 1,
-                                .done => done += 1,
-                                else => failed += 1,
-                            }
-                            tokens += p.usage.prompt_tokens + p.usage.completion_tokens;
-                        }
-                        try e.label.print(gpa, "{s} ×{d} · {s} · {d} working, {d} done", .{ if (bash_count == agents.len) "bash" else if (agent_count == agents.len) "agent" else "task", agents.len, if (e.run == .running) "running" else "background", working, done });
-                        if (queued > 0) try e.label.print(gpa, ", {d} queued", .{queued});
-                        if (failed > 0) try e.label.print(gpa, ", {d} failed", .{failed});
-                        if (bash_count < agents.len) try appendTokens(gpa, &e.label, tokens);
+                try e.label.appendSlice(gpa, "Run");
+                for (e.agents.items) |p| {
+                    if (p.kind == .run or p.superseded_by != null) continue;
+                    if (p.state == .failed or p.state == .timed_out or p.state == .canceled) {
+                        try e.label.print(gpa, " · {s} {s}", .{ p.id, @import("../format.zig").state(@tagName(p.state)) });
                     }
-                } else if (e.run == .running) {
-                    try e.label.print(gpa, "{s} · running", .{used});
-                } else {
-                    try e.label.print(gpa, "{s} · {d}.{d}s", .{ used, e.elapsed_ms / 1000, e.elapsed_ms % 1000 / 100 });
                 }
-                if (e.changes.summary.len > 0) try e.label.print(gpa, " · {s}", .{e.changes.summary});
-                if (e.step_effort) |effort| {
-                    try e.label.print(gpa, " · {s}{s}", .{ effort.effort, if (effort.source == .guard) " (guard)" else "" });
+                if (e.task_id) |id| try e.label.print(gpa, " · {s} {s}", .{ id, switch (e.run) {
+                    .background, .running => "running",
+                    .failed => "failed",
+                    .lost => "lost",
+                    .timed_out => "timed out",
+                    .canceled => "canceled",
+                    else => "completed",
+                } });
+                var buf: [512]u8 = undefined;
+                const used = if (e.tool_summary) |summary| actualToolSummary(summary, e.changes.file_count, &buf) else "";
+                if (e.tool_summary) |summary| for (summary.files, 0..) |file, i| {
+                    if (i > 0) try e.files.appendSlice(gpa, " · ");
+                    try e.files.print(gpa, "{s} {s}", .{ file.tool, file.path });
+                };
+                if (used.len > 0) try e.label.print(gpa, " · {s}", .{used});
+                for (e.agents.items) |p| {
+                    if (!p.background or p.kind == .run or p.state == .failed or p.state == .timed_out or p.state == .canceled) continue;
+                    try e.label.print(gpa, " · {s} {s}", .{ p.id, if (p.state == .queued) "queued" else if (p.state == .working) "running" else "waiting" });
                 }
+                if (e.run == .running) try e.label.appendSlice(gpa, " · running");
             },
             .user => {
                 try e.label.print(gpa, " … +{d} lines", .{long_text.lines(e.text.items) - 1});
             },
             else => {},
         }
+    }
+
+    pub fn hasWarning(e: *const Entry) bool {
+        for (e.agents.items) |p| if (p.superseded_by == null and (p.state == .failed or p.state == .timed_out or p.state == .canceled)) return true;
+        return false;
     }
 
     /// Rows keep their last state; a row is live while its Run runs or its background result is undelivered.
@@ -146,7 +124,7 @@ pub const Entry = struct {
     }
 
     pub fn collapsible(e: *const Entry) bool {
-        return e.kind == .run or e.kind == .background or (e.kind == .user and long_text.isLong(e.text.items));
+        return e.kind == .run or e.kind == .background or e.kind == .failure or (e.kind == .user and long_text.isLong(e.text.items));
     }
 
     pub fn print(e: *const Entry, win: vaxis.Window, commit: bool) u16 {
@@ -157,13 +135,22 @@ pub const Entry = struct {
         }
         var segs: [max_segments]vaxis.Segment = undefined;
         const folded = e.collapsible() and !e.open;
-        const wrap: @FieldType(vaxis.Window.PrintOptions, "wrap") = if (folded) .none else if (e.kind == .run or e.kind == .background) .grapheme else .word;
+        const wrap: @FieldType(vaxis.Window.PrintOptions, "wrap") = if (folded) .none else if (e.kind == .run or e.kind == .background or e.kind == .failure) .grapheme else .word;
         const shown = segments(e, &segs);
-        if (e.kind == .run and e.agent_tree.rows.items.len > 0) {
+        if (e.kind == .run) {
             _ = win.print(shown[0..3], .{ .wrap = .none, .commit = commit });
-            const rows = 1 +| e.agent_tree.print(win.child(.{ .y_off = 1 }), commit);
+            var rows: u16 = 1;
+            if (e.changes.summary.len > 0) {
+                const r = win.child(.{ .x_off = 2, .y_off = rows }).printSegment(.{ .text = e.changes.summary, .style = .{ .dim = true } }, .{ .wrap = .word, .commit = commit });
+                rows +|= @max(1, r.row +| @intFromBool(r.col > 0));
+            }
+            if (e.files.items.len > 0) {
+                const r = win.child(.{ .x_off = 2, .y_off = rows }).printSegment(.{ .text = e.files.items, .style = .{ .dim = true } }, .{ .wrap = .word, .commit = commit });
+                rows +|= @max(1, r.row +| @intFromBool(r.col > 0));
+            }
+            rows +|= e.agent_tree.print(win.child(.{ .y_off = rows }), commit);
             if (!e.open) return rows;
-            const details = win.child(.{ .y_off = @intCast(rows) }).print(shown[4..], .{ .wrap = .grapheme, .commit = commit });
+            const details = win.child(.{ .y_off = rows }).print(shown[4..], .{ .wrap = .grapheme, .commit = commit });
             return rows +| @max(1, details.row +| @intFromBool(details.col > 0));
         }
         if (folded and e.kind == .user) {
@@ -213,50 +200,52 @@ pub const Entry = struct {
             },
             .assistant => segs[0] = .{ .text = e.text.items },
             .run => {
-                segs[0] = switch (e.run) {
-                    .running => .{ .text = "◌ ", .style = .{ .fg = .{ .index = 3 } } },
-                    .ok => .{ .text = "✓ ", .style = .{ .fg = .{ .index = 2 } } },
-                    .failed => .{ .text = "✗ ", .style = .{ .fg = .{ .index = 1 } } },
-                };
-                const any_live = for (e.agents.items) |p| {
-                    if (e.isLive(p)) break true;
-                } else false;
-                segs[1] = .{ .text = if (any_live) "" else "run ", .style = .{ .fg = .{ .index = 3 }, .bold = true } };
+                segs[0] = if (e.run == .failed) .{ .text = "✗ ", .style = .{ .fg = .{ .index = 1 } } } else if (e.run == .warning or e.run == .lost or e.run == .timed_out or e.run == .canceled or e.hasWarning()) .{ .text = "! ", .style = .{ .fg = .{ .index = 3 } } } else .{ .text = "  ", .style = dim };
+                segs[1] = .{ .text = "" };
                 segs[2] = .{ .text = e.label.items, .style = dim };
                 if (!e.open) return segs[0..3];
                 segs[3] = .{ .text = "\n" };
-                segs[4] = .{ .text = e.text.items, .style = .{ .fg = .{ .index = 3 } } };
-                var n: usize = 5;
-                if (e.output.items.len > 0) {
-                    segs[5] = .{ .text = "\n" };
-                    segs[6] = .{ .text = e.output.items, .style = if (e.run == .failed) .{ .fg = .{ .index = 1 }, .dim = true } else dim };
-                    n = 7;
+                segs[4] = .{ .text = "Changes\n", .style = .{ .bold = true, .dim = true } };
+                segs[5] = .{ .text = e.changes.preview, .style = dim };
+                var n: usize = 6;
+                const diff = e.changes.diff;
+                if (diff.len == 0) {
+                    segs[n] = .{ .text = "No file changes\n", .style = dim };
+                    n += 1;
                 }
-                const diff = std.mem.trimEnd(u8, e.changes.diff, "\n");
-                if (diff.len == 0) return segs[0..n];
-                segs[n] = .{ .text = "\n" };
-                n += 1;
                 var start: usize = 0;
-                while (start < diff.len and n < segs.len) : (n += 1) {
+                while (start < diff.len and n < segs.len - 5) : (n += 1) {
                     const end = if (std.mem.indexOfScalarPos(u8, diff, start, '\n')) |nl| nl + 1 else diff.len;
                     const line = diff[start..end];
                     segs[n] = .{ .text = line, .style = switch (line[0]) {
                         '+' => .{ .fg = .{ .index = 2 } },
                         '-' => .{ .fg = .{ .index = 1 } },
                         ' ' => dim,
-                        else => if (std.mem.startsWith(u8, line, "…")) dim else .{ .bold = true },
+                        else => .{ .bold = true, .dim = true },
                     } };
                     start = end;
                 }
+                segs[n] = .{ .text = "Result\n", .style = .{ .bold = true, .dim = true } };
+                segs[n + 1] = .{ .text = if (e.output.items.len == 0) "No result" else std.mem.trimEnd(u8, e.output.items, "\n"), .style = if (e.run == .failed) .{ .fg = .{ .index = 1 }, .dim = true } else dim };
+                segs[n + 2] = .{ .text = "\nScript\n", .style = .{ .bold = true, .dim = true } };
+                segs[n + 3] = .{ .text = e.text.items, .style = dim };
+                n += 4;
                 return segs[0..n];
             },
             .background => {
-                segs[0] = .{ .text = if (e.run == .ok) "✓ " else "✗ ", .style = .{ .fg = .{ .index = if (e.run == .ok) 2 else 1 } } };
+                segs[0] = if (e.run == .warning) .{ .text = "! ", .style = .{ .fg = .{ .index = 3 } } } else if (e.run == .superseded) .{ .text = "  ", .style = dim } else .{ .text = if (e.run == .ok) "✓ " else "✗ ", .style = .{ .fg = .{ .index = if (e.run == .ok) 2 else 1 } } };
                 segs[1] = .{ .text = e.label.items, .style = dim };
                 if (!e.open) return segs[0..2];
                 segs[2] = .{ .text = "\n" };
                 segs[3] = .{ .text = e.text.items, .style = dim };
                 return segs[0..4];
+            },
+            .failure => {
+                segs[0] = .{ .text = e.label.items, .style = .{ .fg = .{ .index = if (e.run == .warning) 3 else 1 } } };
+                if (!e.open) return segs[0..1];
+                segs[1] = .{ .text = "\nDetails\n", .style = dim };
+                segs[2] = .{ .text = e.text.items, .style = dim };
+                return segs[0..3];
             },
             .info, .bill => segs[0] = .{ .text = e.text.items, .style = dim },
             .err => segs[0] = .{ .text = e.text.items, .style = .{ .fg = .{ .index = 1 } } },

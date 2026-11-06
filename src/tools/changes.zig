@@ -125,3 +125,91 @@ test "diff preview combines already-truncated operations" {
     try testing.expect(changes[0].created);
     try testing.expect(std.mem.endsWith(u8, changes[0].diff, "… 300 more lines\n"));
 }
+
+pub const Recovery = struct {
+    enabled: bool = false,
+    mutex: std.Io.Mutex = .init,
+    paths: std.ArrayList([]const u8) = .empty,
+    bash: bool = false,
+
+    pub const Reason = enum { model, tool, timeout, canceled, limit };
+
+    pub fn classify(err: anyerror, canceled: bool, stage: Reason) Reason {
+        if (canceled or err == error.Canceled) return .canceled;
+        return switch (err) {
+            error.Timeout, error.TimedOut, error.StreamIdleTimeout, error.StreamContentTimeout, error.ModelRequestTimeout => .timeout,
+            error.TooManySteps => .limit,
+            else => stage,
+        };
+    }
+
+    pub fn record(r: *Recovery, gpa: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+        if (!r.enabled) return;
+        r.mutex.lockUncancelable(io);
+        defer r.mutex.unlock(io);
+        for (r.paths.items) |old| if (std.mem.eql(u8, old, path)) return;
+        const copy = try gpa.dupe(u8, path);
+        errdefer gpa.free(copy);
+        try r.paths.append(gpa, copy);
+    }
+
+    pub fn noteBash(r: *Recovery, io: std.Io) void {
+        if (!r.enabled) return;
+        r.mutex.lockUncancelable(io);
+        defer r.mutex.unlock(io);
+        r.bash = true;
+    }
+
+    pub fn clear(r: *Recovery, gpa: std.mem.Allocator, io: std.Io) void {
+        r.mutex.lockUncancelable(io);
+        defer r.mutex.unlock(io);
+        for (r.paths.items) |path| gpa.free(path);
+        r.paths.clearAndFree(gpa);
+        r.bash = false;
+    }
+
+    pub fn hint(r: *Recovery, gpa: std.mem.Allocator, io: std.Io, reason: Reason, cwd: []const u8) ![]u8 {
+        r.mutex.lockUncancelable(io);
+        defer r.mutex.unlock(io);
+        var text: std.ArrayList(u8) = .empty;
+        errdefer text.deinit(gpa);
+        try text.appendSlice(gpa, switch (reason) {
+            .model => "model connection/request failed",
+            .tool => "tool/script failed",
+            .timeout => "Timed out",
+            .canceled => "Canceled",
+            .limit => "step limit reached",
+        });
+        try text.appendSlice(gpa, if (r.paths.items.len == 0) " · no recorded edit/write changes" else " · edited: ");
+        for (r.paths.items, 0..) |path, i| {
+            if (i > 0) try text.appendSlice(gpa, ", ");
+            const shown = if (path.len > cwd.len and std.mem.startsWith(u8, path, cwd) and path[cwd.len] == '/') path[cwd.len + 1 ..] else path;
+            try text.appendSlice(gpa, shown);
+        }
+        if (r.bash) try text.appendSlice(gpa, " · bash changes untracked");
+        try text.appendSlice(gpa, " · type continue to resume");
+        for (text.items) |*byte| if (byte.* < 0x20 or byte.* == 0x7f) {
+            byte.* = ' ';
+        };
+        return text.toOwnedSlice(gpa);
+    }
+};
+
+test "recovery records only this Turn's unique paths and distinguishes failure categories" {
+    var r: Recovery = .{ .enabled = true };
+    defer r.clear(testing.allocator, testing.io);
+    try r.record(testing.allocator, testing.io, "/project/a.zig");
+    try r.record(testing.allocator, testing.io, "/project/a.zig");
+    try r.record(testing.allocator, testing.io, "/project/b.zig");
+    r.noteBash(testing.io);
+    const text = try r.hint(testing.allocator, testing.io, .canceled, "/project");
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("Canceled · edited: a.zig, b.zig · bash changes untracked · type continue to resume", text);
+    r.clear(testing.allocator, testing.io);
+    const empty = try r.hint(testing.allocator, testing.io, .model, "/project");
+    defer testing.allocator.free(empty);
+    try testing.expectEqualStrings("model connection/request failed · no recorded edit/write changes · type continue to resume", empty);
+    try testing.expectEqual(Recovery.Reason.timeout, Recovery.classify(error.StreamIdleTimeout, false, .model));
+    try testing.expectEqual(Recovery.Reason.canceled, Recovery.classify(error.ReadFailed, true, .model));
+    try testing.expectEqual(Recovery.Reason.tool, Recovery.classify(error.TestScriptFailure, false, .tool));
+}

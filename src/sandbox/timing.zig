@@ -15,6 +15,7 @@ pub const Call = struct {
     end_ms: u64,
     ok: bool,
     run_index: usize,
+    path: ?[]const u8 = null,
     result_bytes: ?u64 = null,
     dispatched: bool = true,
     background: ?bool = null,
@@ -23,6 +24,7 @@ pub const Call = struct {
 
 pub const Run = struct {
     io: std.Io,
+    detail_allocator: ?std.mem.Allocator = null,
     started: std.Io.Clock.Timestamp,
     run_index: usize = 0,
     entries: [200]Call = undefined,
@@ -64,6 +66,16 @@ pub const Run = struct {
         };
         r.count += 1;
         return index;
+    }
+
+    pub fn describe(r: *Run, index: ?usize, name: []const u8, args: []const u8) !void {
+        const a = r.detail_allocator orelse return;
+        const i = index orelse return;
+        if (!std.mem.eql(u8, name, "read") and !std.mem.eql(u8, name, "grep") and !std.mem.eql(u8, name, "glob")) return;
+        const parsed = std.json.parseFromSlice(struct { path: ?[]const u8 = null }, a, args, .{ .ignore_unknown_fields = true }) catch return;
+        defer parsed.deinit();
+        const path = parsed.value.path orelse if (std.mem.eql(u8, name, "read")) return else ".";
+        r.entries[i].path = try a.dupe(u8, path);
     }
 
     pub fn undoReservation(r: *Run, index: ?usize, name: []const u8) void {

@@ -1,39 +1,64 @@
 const std = @import("std");
+const ui_format = @import("format.zig");
 const TurnSummary = @import("../session/events.zig").TurnSummary;
 
 pub const Text = struct {
-    buf: [512]u8 = undefined,
+    buf: [1024]u8 = undefined,
 
-    pub fn format(text: *Text, summary: TurnSummary, width: u16) []const u8 {
+    pub fn format(text: *Text, summary: TurnSummary, runs: usize, width: u16) []const u8 {
+        var wall: [64]u8 = undefined;
+        var tok: [64]u8 = undefined;
+        var tool: [64]u8 = undefined;
+        var output: [64]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&text.buf);
+        if (runs > 0) w.print("{d} Run{s}", .{ runs, if (runs == 1) "" else "s" }) catch unreachable;
+        if (summary.steps > 0) {
+            separator(&w);
+            w.print("{d} step{s}", .{ summary.steps, if (summary.steps == 1) "" else "s" }) catch unreachable;
+        }
+        if (summary.timing.wall_ms > 0) {
+            separator(&w);
+            w.writeAll(ui_format.duration(&wall, summary.timing.wall_ms)) catch unreachable;
+        }
+        const total = @as(u128, summary.usage.prompt_tokens) + summary.usage.completion_tokens;
+        if (total > 0) {
+            separator(&w);
+            w.print("{s} tokens", .{ui_format.number(&tok, total)}) catch unreachable;
+        }
+        if (summary.timing.tool_bytes > 0) {
+            separator(&w);
+            w.print("tool data {s}", .{ui_format.bytes(&tool, summary.timing.tool_bytes)}) catch unreachable;
+            if (summary.timing.output_bytes > 0) w.print(" → {s}", .{ui_format.bytes(&output, summary.timing.output_bytes)}) catch unreachable;
+        } else if (summary.timing.output_bytes > 0) {
+            separator(&w);
+            w.print("Run result {s}", .{ui_format.bytes(&output, summary.timing.output_bytes)}) catch unreachable;
+        }
+        return fit(w.buffered(), width);
+    }
+
+    pub fn details(text: *Text, summary: TurnSummary) []const u8 {
         var wall: [64]u8 = undefined;
         var model: [64]u8 = undefined;
         var run: [64]u8 = undefined;
-        var tok: [64]u8 = undefined;
-        var tool_bytes: [64]u8 = undefined;
-        var output_bytes: [64]u8 = undefined;
-        var w: std.Io.Writer = .fixed(&text.buf);
-        if (summary.status != .completed) w.print("{s} · ", .{@tagName(summary.status)}) catch unreachable;
-        w.print("{d} steps · {s} · think {s} · tools {s}", .{
-            summary.steps,
-            duration(&wall, summary.timing.wall_ms),
-            componentDuration(&model, summary.timing.model_ms),
-            componentDuration(&run, summary.timing.run_ms),
-        }) catch unreachable;
-        if (summary.timing.tool_bytes > 0 or summary.timing.output_bytes > 0) w.print(" · {s}→{s} B", .{
-            tokens(&tool_bytes, summary.timing.tool_bytes),
-            tokens(&output_bytes, summary.timing.output_bytes),
-        }) catch unreachable;
-        w.print(" · {s} tok ({d}% cached)", .{
-            tokens(&tok, @as(u128, summary.usage.prompt_tokens) + summary.usage.completion_tokens),
+        return std.fmt.bufPrint(&text.buf, "Last turn · {s}\nTotal {s} · model {s} · Run {s}\nInput {d} tokens · output {d} tokens\nCache {d} tokens · {d}% of input\nDelegation · llm {d} · agent {d}", .{
+            @tagName(summary.status),
+            ui_format.duration(&wall, summary.timing.wall_ms),
+            ui_format.duration(&model, summary.timing.model_ms),
+            ui_format.duration(&run, summary.timing.run_ms),
+            summary.usage.prompt_tokens,
+            summary.usage.completion_tokens,
+            summary.usage.prompt_cache_hit_tokens,
             @as(u128, summary.usage.prompt_cache_hit_tokens) * 100 / @max(summary.usage.prompt_tokens, 1),
+            summary.timing.llm_calls,
+            summary.timing.agent_calls,
         }) catch unreachable;
-        if (summary.timing.llm_calls > 0) w.print(" · llm ×{d}", .{summary.timing.llm_calls}) catch unreachable;
-        if (summary.timing.agent_calls > 0) w.print(" · agent ×{d}", .{summary.timing.agent_calls}) catch unreachable;
-        return fit(w.buffered(), width);
     }
 };
 
-// Generated bill text contains only single-cell ASCII, middle dots, arrows and multiplication signs.
+fn separator(w: *std.Io.Writer) void {
+    if (w.end > 0) w.writeAll(" · ") catch unreachable;
+}
+
 pub fn fit(full: []const u8, width: u16) []const u8 {
     var line = full;
     while ((std.unicode.utf8CountCodepoints(line) catch unreachable) > width) {
@@ -43,129 +68,37 @@ pub fn fit(full: []const u8, width: u16) []const u8 {
     return line;
 }
 
-fn duration(buf: []u8, ms: u64) []const u8 {
-    const s = ms / 1000;
-    if (s >= 3600) return std.fmt.bufPrint(buf, "{d}h{d}m{d}s", .{ s / 3600, s % 3600 / 60, s % 60 }) catch unreachable;
-    if (s >= 60) return std.fmt.bufPrint(buf, "{d}m{d}s", .{ s / 60, s % 60 }) catch unreachable;
-    return std.fmt.bufPrint(buf, "{d}s", .{s}) catch unreachable;
-}
-
-fn componentDuration(buf: []u8, ms: u64) []const u8 {
-    const full = duration(buf, ms);
-    return if (ms >= 60_000) full[0 .. full.len - 1] else full;
-}
-
-fn tokens(buf: []u8, n: u128) []const u8 {
-    const unit: u128 = if (n >= 1_000_000) 1_000_000 else if (n >= 1000) 1000 else 1;
-    if (unit == 1) return std.fmt.bufPrint(buf, "{d}", .{n}) catch unreachable;
-    const suffix = if (unit == 1000) "k" else "M";
-    const tenths = n % unit * 10 / unit;
-    if (tenths == 0) return std.fmt.bufPrint(buf, "{d}{s}", .{ n / unit, suffix }) catch unreachable;
-    return std.fmt.bufPrint(buf, "{d}.{d}{s}", .{ n / unit, tenths, suffix }) catch unreachable;
-}
-
 const example: TurnSummary = .{
-    .steps = 12,
-    .usage = .{ .prompt_tokens = 44_000, .completion_tokens = 1000, .prompt_cache_hit_tokens = 40_040 },
-    .timing = .{ .wall_ms = 190_000, .model_ms = 100_000, .run_ms = 80_000, .tool_bytes = 3_200_000, .output_bytes = 18_000, .llm_calls = 8, .agent_calls = 1 },
+    .steps = 3,
+    .usage = .{ .prompt_tokens = 6500, .completion_tokens = 100, .prompt_cache_hit_tokens = 6000 },
+    .timing = .{ .wall_ms = 41_999, .model_ms = 30_000, .run_ms = 11_000, .tool_bytes = 3_200_000, .output_bytes = 18_000 },
 };
 
-test "bill formats turn totals and cache hits over prompt tokens" {
+test "quiet footer names Runs and units and leaves cache and timing details to status" {
     var text: Text = .{};
-    try std.testing.expectEqualStrings("12 steps · 3m10s · think 1m40 · tools 1m20 · 3.2M→18k B · 45k tok (91% cached) · llm ×8 · agent ×1", text.format(example, 200));
-    var summary = example;
-    summary.usage = .{ .prompt_tokens = 1000, .completion_tokens = 1000, .prompt_cache_hit_tokens = 910 };
-    try std.testing.expect(std.mem.indexOf(u8, text.format(summary, 200), "2k tok (91% cached)") != null);
+    try std.testing.expectEqualStrings("2 Runs · 3 steps · 41s · 6.6k tokens · tool data 3.2MB → 18kB", text.format(example, 2, 200));
+    try std.testing.expectEqualStrings("1 Run · 1 step", text.format(.{ .steps = 1 }, 1, 200));
+    const details = text.details(example);
+    try std.testing.expect(std.mem.indexOf(u8, details, "model 30s · Run 11s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, details, "Cache 6000 tokens · 92% of input") != null);
 }
 
-test "bill durations floor milliseconds and retain seconds at minute and hour boundaries" {
-    var buf: [64]u8 = undefined;
-    const cases = .{
-        .{ @as(u64, 0), "0s" },
-        .{ @as(u64, 999), "0s" },
-        .{ @as(u64, 1000), "1s" },
-        .{ @as(u64, 59_999), "59s" },
-        .{ @as(u64, 60_000), "1m0s" },
-        .{ @as(u64, 190_000), "3m10s" },
-        .{ @as(u64, 3_600_000), "1h0m0s" },
-        .{ @as(u64, 3_661_999), "1h1m1s" },
-    };
-    inline for (cases) |case| {
-        try std.testing.expectEqualStrings(case[1], duration(&buf, case[0]));
-        const component = if (case[0] >= 60_000) case[1][0 .. case[1].len - 1] else case[1];
-        try std.testing.expectEqualStrings(component, componentDuration(&buf, case[0]));
-    }
+test "zero statistics and repeated outcomes stay out of the footer" {
+    var text: Text = .{};
+    try std.testing.expectEqualStrings("", text.format(.{}, 0, 200));
+    try std.testing.expectEqualStrings("tool data 320B", text.format(.{ .timing = .{ .tool_bytes = 320 } }, 0, 200));
+    try std.testing.expectEqualStrings("Run result 18kB", text.format(.{ .timing = .{ .output_bytes = 18_000 } }, 0, 200));
+    inline for (.{ .canceled, .failed }) |outcome| try std.testing.expectEqualStrings("1s", text.format(.{ .status = outcome, .timing = .{ .wall_ms = 1000 } }, 0, 200));
 }
 
-test "bill drops complete fields from right to left and never clips UTF-8" {
+test "footer drops complete fields and preserves UTF-8 at every width" {
     var text: Text = .{};
-    const full = text.format(example, 200);
-    var end = full.len;
-    while (true) {
-        const prefix = full[0..end];
-        const width: u16 = @intCast(try std.unicode.utf8CountCodepoints(prefix));
-        try std.testing.expectEqualStrings(prefix, fit(full, width));
-        const next = std.mem.lastIndexOf(u8, prefix, " · ") orelse {
-            try std.testing.expectEqualStrings("", fit(full, width - 1));
-            break;
-        };
-        try std.testing.expectEqualStrings(full[0..next], fit(full, width - 1));
-        end = next;
-    }
+    const full = text.format(example, 2, 200);
     for (0..200) |width| {
         const line = fit(full, @intCast(width));
         try std.testing.expect((try std.unicode.utf8CountCodepoints(line)) <= width);
         try std.testing.expect(std.mem.indexOfScalar(u8, line, '\n') == null);
+        try std.testing.expect(std.mem.startsWith(u8, full, line));
     }
-    try std.testing.expectEqualStrings("", fit(full, 0));
-}
-
-test "bill omits zero delegation counts and handles zero usage" {
-    var text: Text = .{};
-    try std.testing.expectEqualStrings("0 steps · 0s · think 0s · tools 0s · 0 tok (0% cached)", text.format(.{}, 200));
-    var summary: TurnSummary = .{};
-    summary.timing.agent_calls = 1;
-    const agent = text.format(summary, 200);
-    try std.testing.expect(std.mem.endsWith(u8, agent, " · agent ×1"));
-    try std.testing.expect(std.mem.indexOf(u8, agent, "llm") == null);
-    summary.timing = .{ .llm_calls = 8 };
-    const llm = text.format(summary, 200);
-    try std.testing.expect(std.mem.endsWith(u8, llm, " · llm ×8"));
-    try std.testing.expect(std.mem.indexOf(u8, llm, "agent") == null);
-}
-
-test "bill prefixes canceled and failed outcomes" {
-    var text: Text = .{};
-    inline for (.{ .canceled, .failed }) |status| {
-        const summary: TurnSummary = .{ .status = status };
-        const prefix = @tagName(status);
-        try std.testing.expect(std.mem.startsWith(u8, text.format(summary, 200), prefix ++ " · 0 steps"));
-        try std.testing.expectEqualStrings(prefix, text.format(summary, @intCast(prefix.len)));
-        try std.testing.expectEqualStrings("", text.format(summary, @intCast(prefix.len - 1)));
-    }
-}
-
-test "bill omits zero bytes and shows output without tool bytes" {
-    var text: Text = .{};
-    var summary: TurnSummary = .{};
-    try std.testing.expectEqualStrings("0 steps · 0s · think 0s · tools 0s · 0 tok (0% cached)", text.format(summary, 200));
-    summary.timing.output_bytes = 18_000;
-    try std.testing.expectEqualStrings("0 steps · 0s · think 0s · tools 0s · 0→18k B · 0 tok (0% cached)", text.format(summary, 200));
-    summary.timing.tool_bytes = 320;
-    summary.timing.output_bytes = 0;
-    try std.testing.expectEqualStrings("0 steps · 0s · think 0s · tools 0s · 320→0 B · 0 tok (0% cached)", text.format(summary, 200));
-}
-
-test "bill fits delegation counts before tokens and bytes" {
-    var text: Text = .{};
-    const prefixes = [_][]const u8{
-        "12 steps · 3m10s · think 1m40 · tools 1m20 · 3.2M→18k B · 45k tok (91% cached) · llm ×8",
-        "12 steps · 3m10s · think 1m40 · tools 1m20 · 3.2M→18k B · 45k tok (91% cached)",
-        "12 steps · 3m10s · think 1m40 · tools 1m20 · 3.2M→18k B",
-        "12 steps · 3m10s · think 1m40 · tools 1m20",
-    };
-    for (prefixes) |prefix| {
-        const width: u16 = @intCast(try std.unicode.utf8CountCodepoints(prefix));
-        try std.testing.expectEqualStrings(prefix, text.format(example, width));
-    }
+    try std.testing.expectEqualStrings("2 Runs · 3 steps · 41s", fit(full, 22));
 }

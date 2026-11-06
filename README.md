@@ -2,40 +2,10 @@
 
 English | [中文](README.zh-CN.md)
 
-A coding agent written in Zig. Instead of calling tools one at a time, the model writes a JavaScript program. The program runs in an embedded QuickJS sandbox and can read files, search, edit and run tests in a single step. Only the results the model needs come back into the conversation.
+nib is a coding agent written in Zig that works in Runs: one JavaScript script can read, edit and check a project.
 
-```js
-// One Run: read files concurrently, edit, then build and test; return only failures
-const [a, b] = await Promise.all([tools.read({ path: "src/a.zig" }), tools.read({ path: "src/b.zig" })]);
-await tools.edit({ path: "src/a.zig", old_text: "...", new_text: "..." });
-const r = await tools.bash({ command: "zig build test" });
-r.exit_code === 0 ? "ok" : r.output
-```
+## Install and sign in
 
-Version 0.4.0. This is a personal project and still changes quickly.
-
-## Features
-
-- **Code as the interface.** The model has a single `run` tool. Each capability is a JS function in the sandbox: `read`, `edit`, `write`, `grep`, `glob`, `fetch`, `bash`. One Run can call many tools concurrently and filter their results in JS, so the model needs fewer round trips.
-- **`tools.llm`.** Makes one clean model call with no tools and no conversation history. You can call it concurrently from JS, which suits batch judging, classification and extraction.
-- **`tools.agent`.** Starts an independent sub-agent for multi-step work.
-  - A failure comes back as data and does not affect other sub-agents in the same Run.
-  - The result lists the files the sub-agent changed.
-  - Pass `resume: "a1"` to continue an earlier sub-agent with its history intact.
-- **Background tasks.** `agent` and `bash` accept `background: true`. The call returns a task id right away and the main model keeps working. The result arrives as a message in a later Step. Long-lived processes such as dev servers can use `detached: true`. Use `tools.stop({ id, reason })` with a nonblank reason to stop a task.
-- **Per-Step reasoning effort.** The model can ask for lower effort on its next Step. Your setting is the upper bound. Effort is restored automatically after a failed Run or when you interject.
-- **TUI.**
-  - Interject while a turn is running.
-  - Sub-agents and background tasks appear as a status tree under their Run.
-  - Each turn ends with a bill: model and tool time, tool bytes versus the bytes that reached the context, tokens, and cache hits.
-  - Select text with the mouse to copy it.
-- **Measurable and replayable.**
-  - Session logs record the time, usage and tool data volume of every Step.
-  - `scripts/stats.py` summarizes failures, where the time went, and round-trip structure.
-  - Tool call arguments and results are recorded locally by default. `nib replay` re-runs any Run offline (see [docs/replay.md](docs/replay.md)).
-  - `/reflect` has the model review the session log for problems in the harness itself and files issues automatically.
-
-## Install
 
 Requires Zig 0.17.
 
@@ -46,7 +16,7 @@ zig build -Doptimize=ReleaseFast --prefix ~/.local   # installs ~/.local/bin/nib
 nib --version
 ```
 
-## Models
+
 
 **Codex (default).** Sign in to ChatGPT with the `codex` CLI first. nib reads `~/.codex/auth.json`, so no API key is needed. The default model is `gpt-6.1-sol`. See [docs/codex.md](docs/codex.md).
 
@@ -58,28 +28,74 @@ NIB_PROVIDER=chat_completions DEEPSEEK_API_KEY=... nib
 
 Provider, model and effort can also be set in `~/.nib/config.toml`. See [docs/config.md](docs/config.md).
 
-## Usage
+## Your first request
+
+Run it from your project directory:
 
 ```sh
-nib                          # open the TUI
-nib ask 'Explain the structure of this project'
-nib ask --json '...'         # NDJSON event stream for scripts and other programs
-nib -c                       # continue the latest session in this directory
-nib --effort high            # reasoning effort for this process
-nib replay <session-id> --all  # replay a session's recorded Runs offline and check they match
+nib
+# Type: Explain the entry points in this project. Leave files unchanged.
 ```
 
-In the TUI, type `/` to list commands: `/new`, `/resume`, `/compact`, `/effort`, `/copy`, `/reflect`, `/js`, `/help`. Esc interrupts the current turn. ctrl+o expands a Run's script, output and diff.
+Or ask once from the command line:
 
-Put global instructions in `~/.nib/AGENTS.md` and project conventions in `AGENTS.md` at the project root.
+```sh
+nib ask 'Explain the structure of this project'
+nib --help
+```
+
+Enter sends, Shift+Enter adds a line, and Esc cancels. Send another instruction while work is running; messages awaiting delivery are marked queued and return to the input after cancellation. Model replies follow your language; fixed interface text is English.
+
+Put global instructions in `~/.nib/AGENTS.md` and project conventions in the root `AGENTS.md`.
+
+## Reading a Run
+
+Each block represents one script execution. The title comes from actual tool calls, followed by changed files and line counts, read/search paths, and command results.
+
+```text
+  Run · read ×3 · grep · edit 2 files · bash
+    src/grep.zig +38 −9 · src/tools.zig +2 −1
+    read src/grep.zig · read src/tools.zig · grep src
+    └─ b1 bash zig build test · 1s · completed ✓ exit 0
+
+  1 Run · 2 steps · 41s · 6.6k tokens · tool data 3.2MB → 18kB
+```
+
+`✓ exit 0` confirms the command beside it. A failed or timed out child is called out in the Run title; a script returning successfully does not certify every check inside it. A background Run shows `Run · r3 running` and updates the original block when its result arrives. A superseded command was replaced; that says nothing about whether a check passed.
+
+Ctrl+O expands Changes / Result / Script, in that order. Scroll through the result; long diffs are labeled `Diff preview · 60 of … lines`. Turn totals appear once in a quiet footer. The bottom bar keeps the model and context percentage; `/status` has timing and cache details. Retrying removes the failed attempt's draft; Ctrl+O opens Details after a final error.
+
+## Advanced capabilities
+
+- **Code as the interface.** The model has one `run` entry point. Sandbox functions `read`, `edit`, `write`, `grep`, `glob`, `fetch` and `bash` can run concurrently and filter results in JS. Tools return their full data to JS; see the [Run output budget](docs/run-output.md).
+- **Pure model calls.** `tools.llm` makes one call without tools or session history, suitable for concurrent classification, extraction and batch judgments.
+- **Subagents.** `tools.agent` handles independent multistep work, returns failures as data, and lists changes. Use `resume: "a1"` to continue a task or `fork: true` to branch from the current context.
+- **Background tasks.** agent/bash accept `background: true`; long Runs can also move to the background automatically. Results arrive automatically. Long-lived processes can use `detached: true`. `/tasks` lists ids, states and deadlines; `/stop <id>` stops a task and may leave partial changes. See [TUI task controls](docs/tui-ux.md).
+- **Reasoning effort.** `/effort` sets the ceiling. The model can lower its next Step's effort; failed Runs and interjections restore it.
+- **Logs and replay.** Session logs record usage and timing, `scripts/stats.py` summarizes them, and `nib replay` replays recorded tools offline. See [replay](docs/replay.md).
+- **Reflection.** `/reflect` reviews the harness and publishes issue drafts to the public repository `yyydddkkk/nib-code` by default. Set `NIB_ISSUE_REPO` to another repository or `off` to save reflections locally. Help and the menu show the current setting. See [reflection](docs/reflect.md).
+
+```sh
+nib -c                          # continue this directory's latest session
+nib --resume <32-character-id>   # resume a specific session
+nib --effort high               # effort for this process
+nib ask --json '...'            # NDJSON event stream
+nib replay <session-id> --all    # offline replay
+```
+
+Type `/` for commands grouped into Send / View / Session, and `/help` for all keys. Select text with the mouse to copy it.
+
+Version 0.4.0. This is a personal project and still changes quickly.
 
 ## Safety
+
 
 Tool results are recorded by default in `~/.nib/sessions/<id>.calls.jsonl`. The file has mode 0600 and stays on your machine. It may contain data the model read but never sent back, such as `.env` files. To turn recording off, set `NIB_RECORD=off`.
 
 bash has a check against mistakes. It refuses commands that escalate privileges, shut down the machine or delete system directories, and it won't read Codex credentials. It is a guard rail, not a security sandbox: **nib runs model-generated code with your user permissions.** Before you use nib on an important repository, commit or back up your working tree.
 
 ## Docs
+
 
 The detailed docs are currently written in Chinese.
 

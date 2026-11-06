@@ -8,22 +8,22 @@
 
 
 ╭──────────────────────────────────────────────────────────────────────────────╮
-│ Message nib · / for commands                                                 │
-╰─ mock · effort server default · ctx 0% · in 0 (0% cached) · out 0────────────╯
-  ⏎ send · ⇧⏎ newline · / commands · ctrl+o expand
+│ Ask about this project · / for commands                                      │
+╰─ mock────────────────────────────────────────────────────────────────────────╯
+  Enter send · Shift+Enter newline · / commands · Ctrl+O details
 --- short 80x7 ---
  Answer
 
 
 
 ╭──────────────────────────────────────────────────────────────────────────────╮
-│ Message nib · / for commands                                                 │
-╰─ mock · effort server default · ctx 0% · in 0 (0% cached) · out 0────────────╯
+│ Ask about this project · / for commands                                      │
+╰─ mock────────────────────────────────────────────────────────────────────────╯
 --- tiny 80x4 ---
  Answer
 
 
- › Message nib · / for commands
+ › Ask about this project · / for commands
 --- narrow 18x12 ---
  Answer
 
@@ -34,9 +34,9 @@
 
 
 ╭────────────────╮
-│ Message nib ·  │
+│ Ask about this │
 ╰─ mock──────────╯
-  ⏎ send · ⇧⏎ newl
+  Enter send · / c
 --- menu 80x12 ---
  Answer
 
@@ -44,12 +44,12 @@
 
 
 
-
- /help         show help
+  View
+  /help         show help
 ╭──────────────────────────────────────────────────────────────────────────────╮
-│ Message nib · / for commands                                                 │
-╰─ mock · effort server default · ctx 0% · in 0 (0% cached) · out 0────────────╯
-  ⏎ send · ⇧⏎ newline · / commands · ctrl+o expand
+│ Ask about this project · / for commands                                      │
+╰─ mock────────────────────────────────────────────────────────────────────────╯
+  Enter send · Shift+Enter newline · / commands · Ctrl+O details
 --- busy 80x12 ---
  Answer
 
@@ -58,11 +58,11 @@
 
 
 
- ⠹ thinking 1s · step 1 · esc to cancel
+ ⠹ Waiting for model · turn <1s · step 1 · Esc to cancel
 ╭──────────────────────────────────────────────────────────────────────────────╮
-│ Message nib · / for commands                                                 │
-╰─ mock · effort server default · ctx 0% · in 0 (0% cached) · out 0────────────╯
-  ⏎ send · ⇧⏎ newline · / commands · ctrl+o expand
+│ Ask about this project · / for commands                                      │
+╰─ mock────────────────────────────────────────────────────────────────────────╯
+  Enter send · Shift+Enter newline · / commands · Ctrl+O details
 --- history 80x12 ---
  0
  1
@@ -73,9 +73,9 @@
  6
  ↑ history · PgDn to return
 ╭──────────────────────────────────────────────────────────────────────────────╮
-│ Message nib · / for commands                                                 │
-╰─ mock · effort server default · ctx 0% · in 0 (0% cached) · out 0────────────╯
-  ⏎ send · ⇧⏎ newline · / commands · ctrl+o expand
+│ Ask about this project · / for commands                                      │
+╰─ mock────────────────────────────────────────────────────────────────────────╯
+  Enter send · Shift+Enter newline · / commands · Ctrl+O details
 --- notice 80x12 ---
  Answer
 
@@ -86,6 +86,6 @@
 
  copied 3 chars
 ╭──────────────────────────────────────────────────────────────────────────────╮
-│ Message nib · / for commands                                                 │
-╰─ mock · effort server default · ctx 0% · in 0 (0% cached) · out 0────────────╯
-  ⏎ send · ⇧⏎ newline · / commands · ctrl+o expand
+│ Ask about this project · / for commands                                      │
+╰─ mock────────────────────────────────────────────────────────────────────────╯
+  Enter send · Shift+Enter newline · / commands · Ctrl+O details

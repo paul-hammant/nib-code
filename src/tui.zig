@@ -28,12 +28,13 @@ pub const Event = union(enum) {
     paste_end,
     mouse: vaxis.Mouse,
     tick,
+    tool_activity: []const u8,
     model_activity: struct { state: ModelActivity, at: std.Io.Clock.Timestamp },
     /// Slices are owned by the receiver.
     step: struct { n: u32, effort: []u8, source: provider.EffortSource },
     delta: struct { kind: provider.Kind, text: []u8, step: u32 },
     run_start: struct { code: []u8, step: u32 },
-    run_end: struct { ok: bool, output: []u8, changes: ChangeText, tool_summary: ?ToolSummary = null },
+    run_end: struct { background_id: ?[]const u8 = null, ok: bool, output: []u8, changes: ChangeText, tool_summary: ?ToolSummary = null },
     retry: []u8,
     notice: []u8,
     user_inserted: u64,
@@ -41,8 +42,16 @@ pub const Event = union(enum) {
     turn_end: TurnSummary,
     usage: struct { tokens: provider.Usage, context: u64, steps: u32 },
     progress: @import("session/events.zig").Progress,
-    background: @FieldType(SessionEvent, "background"),
-    failed: []u8,
+    background: struct {
+        id: []const u8,
+        kind: @FieldType(@FieldType(SessionEvent, "background"), "kind"),
+        state: @FieldType(@FieldType(SessionEvent, "background"), "state"),
+        ok: ?bool = null,
+        result: ?[]const u8 = null,
+        changes: ChangeText = .{},
+        tool_summary: ?ToolSummary = null,
+    },
+    failed: struct { message: []u8, reason: @import("tools/changes.zig").Recovery.Reason },
     /// One outcome line from automatic issue filing, owned by the receiver.
     issue: []u8,
     issues_done,
@@ -50,6 +59,7 @@ pub const Event = union(enum) {
 
 /// `session` may already hold history (a resumed Session); it is shown first.
 pub fn run(init: std.process.Init, session: *Session) !void {
+    session.tools.recovery.enabled = true;
     const io = init.io;
     const gpa = init.gpa;
 
@@ -132,6 +142,10 @@ pub const App = struct {
     scroll: Viewport = .{},
     menu: Menu,
     status_text: status.Text = .{},
+    reflect_help: [512]u8 = undefined,
+    activity_detail: [256]u8 = undefined,
+    retry_detail: [256]u8 = undefined,
+    retry_len: usize = 0,
     activity: status.Activity,
     usage: provider.Usage = .{},
     steps: u32 = 0,
@@ -139,6 +153,8 @@ pub const App = struct {
     turn: ?*Turn = null,
     // turn_end precedes done/failed; append only after their terminal content.
     pending_bill: ?TurnSummary = null,
+    last_summary: ?TurnSummary = null,
+    turn_runs: usize = 0,
 
     const command = commands.execute;
     const saveReflection = reflect.saveReflection;
@@ -201,8 +217,17 @@ pub const App = struct {
                 defer app.session.tools.progress.sink = null;
                 try app.session.tools.progress.drain(app.io);
             },
+            .tool_activity => |name| {
+                app.activity.tool = name;
+                app.activity.progress(.now(app.io, .awake));
+            },
             .model_activity => |activity| {
-                if (activity.state == .started and app.activity.phase != .compacting) app.activity.set(app.io, .thinking);
+                if (activity.state == .started) {
+                    app.transcript.beginAttempt();
+                    if (app.activity.phase != .compacting and app.activity.phase != .retrying) app.activity.set(app.io, .thinking);
+                }
+                if (activity.state == .script) app.activity.set(app.io, .scripting);
+                if (activity.state == .waiting) app.activity.set(app.io, .waiting);
                 app.activity.modelActivity(activity.state, activity.at);
             },
             .winsize => |ws| {
@@ -217,25 +242,36 @@ pub const App = struct {
             .delta => |d| {
                 defer gpa.free(d.text);
                 app.live_steps = d.step;
-                if (app.activity.phase != .compacting) app.activity.set(app.io, if (d.kind == .reasoning) .thinking else .writing);
+                if (d.text.len > 0) app.activity.progress(.now(app.io, .awake));
+                if (app.activity.phase != .compacting) app.activity.set(app.io, .writing);
                 try app.transcript.appendDelta(gpa, d.kind, d.text);
             },
             .run_start => |r| {
                 defer gpa.free(r.code);
                 app.live_steps = r.step;
+                app.turn_runs += 1;
+                app.activity.tool = "";
                 app.activity.set(app.io, .running);
                 try app.transcript.startRunWithEffort(gpa, r.code, app.step_effort);
             },
             .run_end => |r| {
                 defer gpa.free(r.output);
+                defer if (r.background_id) |id| gpa.free(id);
                 defer if (r.tool_summary) |summary| summary.deinit(gpa);
                 const elapsed = app.activity.label(app.io).ms;
                 app.activity.set(app.io, .thinking);
+                if (r.background_id) |id| try app.transcript.backgroundRun(gpa, id);
                 try app.transcript.endRunWithSummary(gpa, r.ok, r.output, elapsed, r.changes, r.tool_summary);
             },
-            .retry, .notice => |msg| {
+            .retry => |msg| {
                 defer gpa.free(msg);
-                if (std.mem.startsWith(u8, msg, "retry")) app.activity.set(app.io, .retrying);
+                app.transcript.discardAttempt(gpa);
+                app.activity.set(app.io, .retrying);
+                const line = std.fmt.bufPrint(&app.retry_detail, "{s}", .{msg}) catch app.retry_detail[0..0];
+                app.retry_len = line.len;
+            },
+            .notice => |msg| {
+                defer gpa.free(msg);
                 try app.transcript.add(gpa, .info, msg);
             },
             .usage => |u| {
@@ -246,10 +282,15 @@ pub const App = struct {
             .progress => |p| {
                 var owned = p;
                 defer owned.deinit(gpa);
+                if (app.transcript.progressChanged(p)) app.activity.progress(.now(app.io, .awake));
                 try app.transcript.progress(gpa, p);
             },
             .background => |b| {
                 defer gpa.free(b.id);
+                defer if (b.tool_summary) |summary| summary.deinit(gpa);
+                var changes = b.changes;
+                defer changes.deinit(gpa);
+                if (b.kind == .run and b.tool_summary != null) try app.transcript.updateBackgroundRun(gpa, b.id, b.result orelse "", b.changes, b.tool_summary.?);
                 defer if (b.result) |result| gpa.free(result);
                 switch (b.state) {
                     .started => app.background_count += 1,
@@ -270,6 +311,7 @@ pub const App = struct {
                 try app.finishTurn();
                 try app.saveReflection();
                 try app.appendBill();
+                if (canceled) try app.recoveryHint(.canceled);
                 try app.finishQueued(!canceled);
             },
             .issue => |msg| {
@@ -280,13 +322,18 @@ pub const App = struct {
                 if (app.issues) |job| job.finish();
                 app.issues = null;
             },
-            .failed => |msg| {
+            .failed => |failure| {
+                const msg = failure.message;
                 defer gpa.free(msg);
                 app.stopReflecting();
                 const canceled = app.turn.?.cancel.load(.acquire);
-                try app.transcript.add(gpa, if (canceled) .info else .err, if (canceled) "canceled" else msg);
+                if (!canceled) {
+                    app.transcript.discardAttempt(gpa);
+                    try app.transcript.failure(gpa, msg, failure.reason);
+                }
                 try app.finishTurn();
                 try app.appendBill();
+                try app.recoveryHint(failure.reason);
                 try app.finishQueued(false);
             },
         }
@@ -386,6 +433,7 @@ pub const App = struct {
         try app.transcript.add(app.gpa, .user, text);
         app.turn = try Turn.spawn(app.gpa, app.session, app.loop, text, false);
         app.live_steps = 0;
+        app.turn_runs = 0;
         app.activity = .start(app.io, .thinking);
     }
 
@@ -395,10 +443,20 @@ pub const App = struct {
         try app.transcript.add(app.gpa, kind, message);
     }
 
+    fn recoveryHint(app: *App, reason: @import("tools/changes.zig").Recovery.Reason) !void {
+        const cwd = try std.process.currentPathAlloc(app.io, app.gpa);
+        defer app.gpa.free(cwd);
+        const hint = try app.session.tools.recovery.hint(app.gpa, app.io, reason, cwd);
+        defer app.gpa.free(hint);
+        try app.transcript.add(app.gpa, .info, hint);
+    }
+
     fn appendBill(app: *App) !void {
         const summary = app.pending_bill orelse return;
         var text: bill.Text = .{};
-        try app.transcript.add(app.gpa, .bill, text.format(summary, std.math.maxInt(u16)));
+        const footer = text.format(summary, app.turn_runs, std.math.maxInt(u16));
+        if (footer.len > 0) try app.transcript.add(app.gpa, .bill, footer);
+        app.last_summary = summary;
         app.pending_bill = null;
     }
 
@@ -411,6 +469,12 @@ pub const App = struct {
         app.clearStepEffort();
         app.turn.?.finish();
         app.turn = null;
+        while (app.session.tools.background.takeStop(app.io)) |id| {
+            defer app.gpa.free(id);
+            const notice = try @import("tools/stop.zig").userStop(&app.session.tools, app.gpa, id);
+            defer app.gpa.free(notice);
+            try app.transcript.add(app.gpa, .info, notice);
+        }
         if (!app.session.tools.background.anyPending(app.io)) {
             app.background_count = 0;
             try app.transcript.clearBackgroundProgress(app.gpa);
@@ -440,12 +504,27 @@ pub const App = struct {
             defer app.gpa.free(restored);
             try app.input.replace(app.gpa, restored);
             app.menu.inputChanged(app.input.text());
+            try app.report(.info, "{d} queued message{s} returned to input", .{ batch.items.items.len, if (batch.items.items.len == 1) "" else "s" });
         }
+    }
+
+    fn activityDetail(app: *App) []const u8 {
+        if (app.activity.phase == .retrying) return app.retry_detail[0..app.retry_len];
+        if (app.activity.phase == .running) return app.transcript.activityDetail(&app.activity_detail, app.activity.tool);
+        if (app.activity.phase == .waiting) {
+            const task = app.session.tools.background.waitingTask(app.io) orelse return "";
+            var elapsed: [64]u8 = undefined;
+            return std.fmt.bufPrint(&app.activity_detail, "{s} · {s}", .{ task.id, @import("tui/format.zig").duration(&elapsed, task.elapsed_ms) }) catch "";
+        }
+        return "";
     }
 
     fn render(app: *App) !void {
         try app.menu.load(app.io, app.input.text(), app.session);
         const menu = app.menu.items(app.input.text());
+        for (menu) |*candidate| if (candidate.command == .reflect and candidate.value == null) {
+            candidate.detail = commands.reflectHelp(&app.reflect_help, reflect.issueRepo(app));
+        };
         if (app.scroll.pending != 0) app.selection.clear();
         view.draw(app.vx.window(), app.transcript.entries.items, &app.input, &app.scroll, menu, @min(app.menu.sel, menu.len -| 1), .{
             .cfg = app.cfg,
@@ -456,6 +535,7 @@ pub const App = struct {
             .context = app.context,
             .busy = if (app.turn != null) app.activity.label(app.io) else null,
             .notice = app.notice,
+            .detail = app.activityDetail(),
         }, &app.status_text);
         app.selection.highlight(&app.vx.screen);
         try app.vx.render(app.w);
@@ -532,7 +612,7 @@ test "bracketed paste buffers newline and slash keys without executing them" {
     }
     try std.testing.expectEqualStrings("", app.input.text());
     _ = try app.handle(.paste_end);
-    try std.testing.expectEqualStrings("[Pasted #1 · 6 lines]", app.input.text());
+    try std.testing.expectEqualStrings("[Pasted #1 · 6 lines · /help]", app.input.text());
     const expanded = try app.input.expanded(gpa);
     defer gpa.free(expanded);
     try std.testing.expectEqualStrings("/help\nx\nx\nx\nx\nx", expanded);
@@ -616,6 +696,7 @@ test "turn_end forwards by value and defers bills until terminal content" {
     app.transcript = .{};
     defer app.transcript.deinit(t.allocator);
     app.pending_bill = null;
+    app.turn_runs = 0;
     inline for (.{ .completed, .canceled, .failed }) |status_value| {
         const summary: TurnSummary = .{ .status = status_value, .steps = 2, .timing = .{ .wall_ms = 1000 } };
         try app.transcript.add(t.allocator, .assistant, "answer");
@@ -677,7 +758,7 @@ test "background events own their payload and maintain running count" {
     _ = try app.handle((try loop.tryEvent()).?);
     try t.expectEqual(@as(usize, 0), app.background_count);
     try t.expectEqual(EntryKind.background, app.transcript.entries.items[0].kind);
-    try t.expectEqualStrings("a1 agent · ok · done", app.transcript.entries.items[0].label.items);
+    try t.expectEqualStrings("a1 agent · completed", app.transcript.entries.items[0].label.items);
 }
 
 test "Step events own effort and Runs keep their generating Step metadata" {
@@ -699,12 +780,13 @@ test "Step events own effort and Runs keep their generating Step metadata" {
     effort[0] = 'x';
     _ = try app.handle((try loop.tryEvent()).?);
     try t.expectEqual(@as(u32, 3), app.live_steps);
+    app.turn_runs = 0;
     _ = try app.handle(.{ .run_start = .{ .code = try t.allocator.dupe(u8, "tools.read({})"), .step = 3 } });
     _ = try app.handle(.{ .run_end = .{ .ok = true, .output = try t.allocator.dupe(u8, "out"), .changes = .{} } });
     _ = try app.handle(.{ .step = .{ .n = 4, .effort = try t.allocator.dupe(u8, "low"), .source = .model } });
     try t.expectEqualStrings("high", app.transcript.entries.items[0].step_effort.?.effort);
     try t.expectEqualStrings("low", app.step_effort.?.effort);
-    try t.expect(std.mem.endsWith(u8, app.transcript.entries.items[0].label.items, " · high (guard)"));
+    try t.expectEqualStrings("Run", app.transcript.entries.items[0].label.items);
 }
 
 test "Run summary survives event queue and original summary destruction" {
@@ -715,6 +797,7 @@ test "Run summary survives event queue and original summary destruction" {
     app.transcript = .{};
     defer app.transcript.deinit(t.allocator);
     app.activity = .start(t.io, .running);
+    app.turn_runs = 0;
     var loop: vaxis.Loop(Event) = .{ .io = t.io, .tty = undefined, .vaxis = undefined, .queue = .init(t.io) };
     var turn: Turn = undefined;
     turn.gpa = t.allocator;
@@ -728,5 +811,33 @@ test "Run summary survives event queue and original summary destruction" {
     _ = try app.handle((try loop.tryEvent()).?);
     try t.expectEqualStrings("edit", app.transcript.entries.items[0].tool_summary.?.counts[0].name);
     try t.expectEqual(@as(u64, 2), app.transcript.entries.items[0].tool_summary.?.counts[0].count);
-    try t.expect(std.mem.startsWith(u8, app.transcript.entries.items[0].label.items, "edit ×2, +3 · "));
+    try t.expect(std.mem.startsWith(u8, app.transcript.entries.items[0].label.items, "Run · edit ×2 · +3"));
+}
+
+test "cancel returns queued messages alongside an existing draft" {
+    const a = std.testing.allocator;
+    var session: Session = undefined;
+    session.gpa = a;
+    session.io = std.testing.io;
+    session.inbox = .{};
+    defer {
+        var remaining = session.inbox.take(session.io);
+        remaining.deinit(a);
+    }
+    var app: App = undefined;
+    app.gpa = a;
+    app.session = &session;
+    app.transcript = .{};
+    defer app.transcript.deinit(a);
+    app.input = .{};
+    defer app.input.deinit(a);
+    app.menu = .init(a);
+    defer app.menu.deinit();
+    const id = try session.enqueue("queued request");
+    try app.transcript.add(a, .user, "queued request");
+    app.transcript.entries.items[0].queued = id;
+    try app.input.insert(a, "draft");
+    try app.finishQueued(false);
+    try std.testing.expectEqualStrings("queued request\n\ndraft", app.input.text());
+    try std.testing.expectEqualStrings("1 queued message returned to input", app.transcript.entries.items[0].text.items);
 }

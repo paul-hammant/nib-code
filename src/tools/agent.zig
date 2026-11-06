@@ -115,6 +115,7 @@ pub fn execute(t: *Tools, gpa: std.mem.Allocator, args: []const u8, cancel: *con
     defer gpa.free(executable);
     const input = fork_input orelse try std.json.Stringify.valueAlloc(gpa, @import("agent/input.zig").Input{ .prompt = a.value.prompt, .config = cfg }, .{});
     defer if (fork_input == null) gpa.free(input);
+    if (background) t.background.beginTask(t.io, id, a.value.timeout_ms);
     const started = std.Io.Clock.awake.now(t.io);
     const result = process.run(gpa, t.io, .{
         .spawn = .{ .argv = if (session) |child| &.{ executable, "ask", "--json", "--agent-input", "--resume", child, "-" } else &.{ executable, "ask", "--json", "--agent-input", "-" }, .environ_map = &env, .stdout = .pipe, .stderr = .ignore },
