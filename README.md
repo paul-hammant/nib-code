@@ -28,7 +28,7 @@ Against Codex CLI on the same model:
 
 5 MB static binary · no runtime dependencies.
 
-*Nov 2026: gpt-6.1-terra, medium, 4 tasks × 5 runs, nib 0.4 era vs Codex CLI 0.166.0; costs at API prices. Footprint: local idle TUIs, nib 0.5.0 release.*
+*Nov 2026 · gpt-6.1-terra, medium · 20 runs vs Codex CLI 0.166.0 at API prices · memory of idle TUIs.*
 
 [More numbers →](docs/benchmarks.md)
 

@@ -28,7 +28,7 @@ nib 是用 Zig 写的编码 agent，以 Run 为工作单位：一段 JavaScript 
 
 5 MB 静态二进制 · 无运行时依赖。
 
-*2026 年 11 月：gpt-6.1-terra、medium、4 个任务各运行 5 次，nib 0.4 时期构建对比 Codex CLI 0.166.0；按 API 价格计费。资源占用：本地空闲 TUI，nib 0.5.0 release。*
+*2026 年 11 月 · gpt-6.1-terra、medium · 对比 Codex CLI 0.166.0 共 20 次运行，按 API 价格计费 · 内存为空闲 TUI。*
 
 [更多数据 →](docs/benchmarks.md)
 
