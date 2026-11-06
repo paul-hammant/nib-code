@@ -25,6 +25,7 @@ pub const Kind = enum { user, assistant, run, background, info, err, bill };
 
 pub const Entry = struct {
     kind: Kind,
+    user_bg: vaxis.Color = .default,
     queued: ?u64 = null,
     /// For `.run`: the script.
     text: std.ArrayList(u8) = .empty,
@@ -151,6 +152,7 @@ pub const Entry = struct {
 
     pub fn print(e: *const Entry, win: vaxis.Window, commit: bool) u16 {
         if (e.kind == .assistant) return markdown.print(win, e.text.items, commit);
+        if (e.kind == .user and win.width >= 4) return e.printUser(win, commit);
         if (e.kind == .bill) {
             _ = win.print(&.{.{ .text = bill.fit(e.text.items, win.width), .style = .{ .dim = true } }}, .{ .wrap = .none, .commit = commit });
             return 1;
@@ -181,6 +183,41 @@ pub const Entry = struct {
         return if (folded) 1 else @max(1, r.row +| @intFromBool(r.col > 0));
     }
 
+    fn printUser(e: *const Entry, win: vaxis.Window, commit: bool) u16 {
+        var segs: [max_segments]vaxis.Segment = undefined;
+        const shown = e.segments(&segs);
+        segs[0].text = "";
+        const body = win.child(.{ .x_off = 2, .width = win.width - 3 });
+        const folded = e.collapsible() and !e.open;
+        if (folded) {
+            const suffix_width = body.gwidth(e.label.items) + @as(u16, if (e.queued != null) 9 else 0);
+            const available = body.width -| suffix_width;
+            var end: usize = 0;
+            while (end < segs[1].text.len) {
+                const next = end + (std.unicode.utf8ByteSequenceLength(segs[1].text[end]) catch 1);
+                if (body.gwidth(segs[1].text[0..next]) > available) break;
+                end = next;
+            }
+            segs[1].text = segs[1].text[0..end];
+        }
+        const r = body.print(shown, .{ .wrap = if (folded) .none else .word, .commit = commit });
+        const rows = if (folded) 1 else @max(1, r.row +| @intFromBool(r.col > 0));
+        if (commit) {
+            const first: u16 = @intCast(@min(rows, @max(0, -@as(i32, win.y_off))));
+            const last: u16 = @intCast(@min(rows, @max(0, @as(i32, win.screen.height) - win.y_off)));
+            for (first..last) |row| {
+                for (0..win.width) |col| {
+                    var cell = win.readCell(@intCast(col), @intCast(row)) orelse continue;
+                    cell.style.bg = e.user_bg;
+                    cell.default = false;
+                    win.writeCell(@intCast(col), @intCast(row), cell);
+                }
+                win.writeCell(0, @intCast(row), .{ .char = .{ .grapheme = "▎", .width = 1 }, .style = .{ .fg = .{ .index = 4 }, .bg = e.user_bg } });
+            }
+        }
+        return rows;
+    }
+
     pub fn height(e: *Entry, win: vaxis.Window) u16 {
         const len = e.text.items.len + e.output.items.len + e.changes.diff.len;
         if (e.cached) |c| {
@@ -199,7 +236,7 @@ pub const Entry = struct {
             .user => {
                 segs[0] = .{ .text = "› ", .style = .{ .bold = true, .fg = .{ .index = 4 } } };
                 const folded = e.collapsible() and !e.open;
-                segs[1] = .{ .text = if (folded) e.text.items[0 .. std.mem.indexOfScalar(u8, e.text.items, '\n') orelse e.text.items.len] else e.text.items, .style = .{ .bold = true } };
+                segs[1] = .{ .text = if (folded) e.text.items[0 .. std.mem.indexOfScalar(u8, e.text.items, '\n') orelse e.text.items.len] else e.text.items };
                 var n: usize = 2;
                 if (folded) {
                     segs[n] = .{ .text = e.label.items, .style = dim };

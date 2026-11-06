@@ -46,6 +46,7 @@ pub const Activity = struct {
 
 pub const Status = struct {
     cfg: provider.Config,
+    user_bg: @import("vaxis").Color = .default,
     usage: provider.Usage = .{},
     steps: u32 = 0,
     current_step: u32 = 1,

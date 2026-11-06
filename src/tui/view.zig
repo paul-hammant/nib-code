@@ -8,12 +8,18 @@ const Transcript = @import("transcript.zig").Transcript;
 const Viewport = @import("viewport.zig").Viewport;
 const status = @import("status.zig");
 
+pub const Frame = @import("selection/history.zig").Frame;
+
 const max_menu_rows = 8;
 
 pub fn draw(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewport, menu: []const commands.Candidate, menu_sel: usize, s: status.Status, text: *status.Text) void {
+    _ = drawFrame(win, entries, input, scroll, menu, menu_sel, s, text);
+}
+
+pub fn drawFrame(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewport, menu: []const commands.Candidate, menu_sel: usize, s: status.Status, text: *status.Text) ?Frame {
     win.clear();
     win.hideCursor();
-    if (win.height == 0 or win.width == 0) return;
+    if (win.height == 0 or win.width == 0) return null;
 
     const framed = win.height >= 6 and win.width >= 8;
     const hints: u16 = @intFromBool(framed and win.height >= 8);
@@ -39,6 +45,7 @@ pub fn draw(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewpo
     var y: i32 = -@as(i32, top.row);
     for (entries[top.entry..]) |*e| {
         if (y >= body_h) break;
+        e.user_bg = s.user_bg;
         const h = e.height(body);
         if (y + h > 0) _ = e.print(body.child(.{ .y_off = @intCast(y), .height = h }), true);
         y += @as(i32, h) + 1;
@@ -71,6 +78,7 @@ pub fn draw(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewpo
     }
     input.draw(win.child(.{ .x_off = x, .y_off = input_y + @as(u16, if (framed) 1 else 0), .width = input_w, .height = input_h }));
     if (hints > 0) _ = win.child(.{ .x_off = 2, .y_off = win.height - 1, .height = 1 }).printSegment(.{ .text = "⏎ send · ⇧⏎ newline · / commands · ctrl+o expand", .style = .{ .dim = true } }, .{ .wrap = .none });
+    return .{ .top = top, .window = body };
 }
 
 fn put(win: vaxis.Window, x: u16, y: u16, glyph: []const u8) void {

@@ -625,6 +625,33 @@ test "child prompt preview uses forty Unicode characters and one logical line" {
     try testing.expect(e.cached == null);
 }
 
+test "user cards tint wrapped rows, retain terminal foreground and leave gaps unstyled" {
+    const gpa = testing.allocator;
+    var screen = try vaxis.Screen.init(gpa, .{ .cols = 18, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(gpa);
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 18, .height = 8, .screen = &screen };
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    try t.add(gpa, .user, "hello world message\n第二行");
+    const entry = &t.entries.items[0];
+    entry.user_bg = .{ .rgb = .{ 15, 20, 28 } };
+    const height = entry.height(win);
+    try testing.expect(height >= 3);
+    try testing.expectEqual(height, entry.print(win, true));
+    for (0..height) |row| {
+        try testing.expectEqualStrings("▎", screen.readCell(0, @intCast(row)).?.char.grapheme);
+        try testing.expectEqualDeep(entry.user_bg, screen.readCell(17, @intCast(row)).?.style.bg);
+        const body = screen.readCell(2, @intCast(row)).?;
+        try testing.expect(body.style.fg == .default);
+        try testing.expect(!body.style.bold);
+    }
+    try testing.expect(screen.readCell(0, height).?.style.bg == .default);
+    win.clear();
+    _ = entry.print(win.child(.{ .y_off = -1, .height = height }), true);
+    try testing.expectEqualStrings("▎", screen.readCell(0, 0).?.char.grapheme);
+    try testing.expect(screen.readCell(0, height - 1).?.style.bg == .default);
+}
+
 test "long user messages fold live and replayed, truncate the first line, and expand" {
     const gpa = testing.allocator;
     var screen = try vaxis.Screen.init(gpa, .{ .cols = 30, .rows = 12, .x_pixel = 0, .y_pixel = 0 });
@@ -637,8 +664,8 @@ test "long user messages fold live and replayed, truncate the first line, and ex
     var e = &t.entries.items[0];
     try testing.expectEqual(@as(u16, 1), e.height(win));
     _ = e.print(win, true);
-    try testing.expectEqualStrings("s", screen.readCell(29, 0).?.char.grapheme);
-    try testing.expect(screen.readCell(29, 0).?.style.dim);
+    try testing.expectEqualStrings("s", screen.readCell(28, 0).?.char.grapheme);
+    try testing.expect(screen.readCell(28, 0).?.style.dim);
     t.toggleExpanded();
     try testing.expect(e.height(win) > 5);
     t.clear(gpa);

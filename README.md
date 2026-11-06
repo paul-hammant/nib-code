@@ -28,7 +28,8 @@ Version 0.4.0. This is a personal project and still changes quickly.
   - Interject while a turn is running.
   - Sub-agents and background tasks appear as a status tree under their Run.
   - Each turn ends with a bill: model and tool time, tool bytes versus the bytes that reached the context, tokens, and cache hits.
-  - Select text with the mouse to copy it.
+  - User messages stand out with a blue accent bar and a subtle background that adapts to the terminal theme.
+  - Drag to select text and release to copy it. Keep holding the mouse button and use the wheel to select across screens.
 - **Measurable and replayable.**
   - Session logs record the time, usage and tool data volume of every Step.
   - `scripts/stats.py` summarizes failures, where the time went, and round-trip structure.

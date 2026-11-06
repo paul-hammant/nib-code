@@ -1,5 +1,7 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
+const history = @import("selection/history.zig");
+const Entry = @import("transcript.zig").Entry;
 
 pub const Point = struct { col: u16, row: u16 };
 
@@ -8,6 +10,7 @@ pub const Selection = struct {
     end: Point = .{ .col = 0, .row = 0 },
     active: bool = false,
     dragged: bool = false,
+    history: ?history.History = null,
 
     pub fn clear(s: *Selection) void {
         s.* = .{};
@@ -34,6 +37,55 @@ pub const Selection = struct {
             return true;
         }
         return false;
+    }
+
+    pub fn mouseInHistory(s: *Selection, m: vaxis.Mouse, screen: *const vaxis.Screen, frame: ?history.Frame, entries: []Entry) bool {
+        if (s.active and s.history != null) {
+            if (frame) |f| {
+                const col: u16 = @intCast(@min(@max(m.col, 0), screen.width -| 1));
+                const row: u16 = @intCast(@max(m.row, 0));
+                s.updateEnd(f, entries, col, row);
+            }
+        }
+        const copied = s.mouse(m, screen);
+        if (m.type == .press and m.button == .left) {
+            if (frame) |f| {
+                if (m.row >= 0 and m.row < f.window.height and s.anchor != null) {
+                    if (history.position(f, entries, s.end.col, s.end.row)) |p| s.history = .{ .anchor = p, .end = p };
+                }
+            }
+        }
+        return copied;
+    }
+
+    fn updateEnd(s: *Selection, frame: history.Frame, entries: []Entry, col: u16, row: u16) void {
+        if (entries.len == 0) return;
+        const p = history.position(frame, entries, col, row) orelse history.Position{
+            .entry = entries.len - 1,
+            .row = entries[entries.len - 1].height(frame.window),
+            .col = col,
+        };
+        s.history.?.end = p;
+        s.dragged = s.dragged or !std.meta.eql(s.history.?.anchor, p);
+    }
+
+    pub fn updateHistory(s: *Selection, frame: ?history.Frame, entries: []Entry) void {
+        if (s.active and s.history != null) {
+            if (frame) |f| s.updateEnd(f, entries, s.end.col, s.end.row);
+        }
+    }
+
+    pub fn highlightHistory(s: Selection, screen: *vaxis.Screen, frame: ?history.Frame, entries: []Entry) void {
+        if (s.history) |h| {
+            if (s.dragged) if (frame) |f| h.highlight(screen, f, entries);
+        } else s.highlight(screen);
+    }
+
+    pub fn textInHistory(s: Selection, gpa: std.mem.Allocator, screen: *const vaxis.Screen, frame: ?history.Frame, entries: []Entry) ![]u8 {
+        if (s.dragged) if (s.history) |h| {
+            if (frame) |f| return h.text(gpa, f, entries);
+        };
+        return s.text(gpa, screen);
     }
 
     const Range = struct { first: Point, last: Point };
@@ -67,18 +119,9 @@ pub const Selection = struct {
             var row: usize = r.first.row;
             while (row <= r.last.row and row < screen.height) : (row += 1) {
                 if (row != r.first.row) try out.append(gpa, '\n');
-                const start = out.items.len;
-                const first: usize = if (row == r.first.row) r.first.col else 0;
-                const last: usize = if (row == r.last.row) r.last.col else screen.width -| 1;
-                var col: usize = 0;
-                while (col <= last and col < screen.width) {
-                    const cell = screen.readCell(@intCast(col), @intCast(row)).?;
-                    if (col >= first) try out.appendSlice(gpa, cell.char.grapheme);
-                    // Vaxis leaves covered cells untouched; only the leading cell owns the glyph.
-                    const width = if (cell.char.width != 0) cell.char.width else vaxis.gwidth.gwidth(cell.char.grapheme, screen.width_method);
-                    col += @max(1, width);
-                }
-                while (out.items.len > start and out.items[out.items.len - 1] == ' ') out.items.len -= 1;
+                const first: u16 = if (row == r.first.row) r.first.col else 0;
+                const last: u16 = if (row == r.last.row) r.last.col else screen.width -| 1;
+                try history.appendRow(&out, gpa, screen, @intCast(row), first, last);
             }
         }
         return out.toOwnedSlice(gpa);
@@ -145,6 +188,92 @@ fn testScreen() !vaxis.Screen {
     const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 8, .height = 3, .screen = &screen };
     _ = win.printSegment(.{ .text = "abc  \n中x y  \nend" }, .{});
     return screen;
+}
+
+fn drawHistory(screen: *vaxis.Screen, entries: []Entry, top: @import("viewport.zig").Anchor) history.Frame {
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = screen.width, .height = screen.height, .screen = screen };
+    win.clear();
+    var y: i32 = -@as(i32, top.row);
+    for (entries[top.entry..]) |*entry| {
+        if (y >= win.height) break;
+        const height = entry.height(win);
+        if (y + height > 0) _ = entry.print(win.child(.{ .y_off = @intCast(y), .height = height }), true);
+        y += @as(i32, height) + 1;
+    }
+    return .{ .top = top, .window = win };
+}
+
+test "history selection scrolls both ways and copies offscreen rows including gaps and Unicode" {
+    const gpa = std.testing.allocator;
+    var screen = try vaxis.Screen.init(gpa, .{ .cols = 8, .rows = 3, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(gpa);
+    var transcript: @import("transcript.zig").Transcript = .{};
+    defer transcript.deinit(gpa);
+    try transcript.add(gpa, .info, "abc\n中x\nend");
+    try transcript.add(gpa, .info, "four\nfive\nsix");
+    const entries = transcript.entries.items;
+    for ([_]bool{ false, true }) |reverse| {
+        var s: Selection = .{};
+        var frame = drawHistory(&screen, entries, if (reverse) .{ .entry = 1 } else .{});
+        _ = s.mouseInHistory(mouse(1, 0, .press), &screen, frame, entries);
+        frame = drawHistory(&screen, entries, if (reverse) .{} else .{ .entry = 1 });
+        s.updateHistory(frame, entries);
+        try std.testing.expect(s.active);
+        try std.testing.expect(s.dragged);
+        s.highlightHistory(&screen, frame, entries);
+        try std.testing.expect(screen.readCell(1, 0).?.style.reverse);
+        try std.testing.expect(s.mouseInHistory(mouse(1, 0, .release), &screen, frame, entries));
+        const copied = try s.textInHistory(gpa, &screen, frame, entries);
+        defer gpa.free(copied);
+        try std.testing.expectEqualStrings("bc\n中x\nend\n\nfo", copied);
+        try std.testing.expect(!s.active);
+    }
+}
+
+test "history selection clamps the pointer to the body and keeps the start when scrolling back" {
+    const gpa = std.testing.allocator;
+    var screen = try vaxis.Screen.init(gpa, .{ .cols = 8, .rows = 3, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(gpa);
+    var transcript: @import("transcript.zig").Transcript = .{};
+    defer transcript.deinit(gpa);
+    try transcript.add(gpa, .info, "0\n1\n2\n3\n4\n5\n6\n7");
+    const entries = transcript.entries.items;
+    var s: Selection = .{};
+    var frame = drawHistory(&screen, entries, .{ .row = 1 });
+    _ = s.mouseInHistory(mouse(0, 0, .press), &screen, frame, entries);
+    const anchor = s.history.?.anchor;
+    frame = drawHistory(&screen, entries, .{ .row = 5 });
+    _ = s.mouseInHistory(mouse(0, 100, .drag), &screen, frame, entries);
+    try std.testing.expectEqualDeep(anchor, s.history.?.anchor);
+    try std.testing.expectEqual(@as(u16, 7), s.history.?.end.row);
+    frame = drawHistory(&screen, entries, .{ .row = 1 });
+    s.updateHistory(frame, entries);
+    try std.testing.expectEqual(@as(u16, 3), s.history.?.end.row);
+    try std.testing.expect(s.mouseInHistory(mouse(0, 2, .release), &screen, frame, entries));
+    const copied = try s.textInHistory(gpa, &screen, frame, entries);
+    defer gpa.free(copied);
+    try std.testing.expectEqualStrings("1\n2\n3", copied);
+}
+
+test "history copy spans scratch buffers without losing wrapped text or blank lines" {
+    const gpa = std.testing.allocator;
+    var screen = try vaxis.Screen.init(gpa, .{ .cols = 8, .rows = 3, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(gpa);
+    var transcript: @import("transcript.zig").Transcript = .{};
+    defer transcript.deinit(gpa);
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(gpa);
+    for (0..80) |i| try expected.print(gpa, "{d}\n", .{i});
+    try transcript.add(gpa, .info, expected.items);
+    const entries = transcript.entries.items;
+    var s: Selection = .{};
+    var frame = drawHistory(&screen, entries, .{});
+    _ = s.mouseInHistory(mouse(0, 0, .press), &screen, frame, entries);
+    frame = drawHistory(&screen, entries, .{ .row = 78 });
+    try std.testing.expect(s.mouseInHistory(mouse(1, 1, .release), &screen, frame, entries));
+    const copied = try s.textInHistory(gpa, &screen, frame, entries);
+    defer gpa.free(copied);
+    try std.testing.expectEqualStrings(std.mem.trimEnd(u8, expected.items, "\n"), copied);
 }
 
 test "selection forward and reverse on one row, click clears" {

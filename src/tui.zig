@@ -27,6 +27,8 @@ pub const Event = union(enum) {
     paste_start,
     paste_end,
     mouse: vaxis.Mouse,
+    color_report: vaxis.Color.Report,
+    color_scheme: vaxis.Color.Scheme,
     tick,
     model_activity: struct { state: ModelActivity, at: std.Io.Clock.Timestamp },
     /// Slices are owned by the receiver.
@@ -72,6 +74,8 @@ pub fn run(init: std.process.Init, session: *Session) !void {
     // Selection needs cell coordinates; some terminals claim SGR pixel mode yet report cells.
     vx.caps.sgr_pixels = false;
     try vx.setMouseMode(w, true);
+    try vx.queryColor(w, .bg);
+    if (vx.caps.color_scheme_updates) try vx.subscribeToColorSchemeUpdates(w);
 
     var app: App = .{
         .gpa = gpa,
@@ -116,6 +120,8 @@ pub const App = struct {
     loop: *vaxis.Loop(Event),
     environ: *const std.process.Environ.Map,
     selection: selection.Selection = .{},
+    body: ?view.Frame = null,
+    user_bg: vaxis.Color = .default,
     /// Shown on the status line until the next key or click; not part of the transcript.
     notice: ?[]const u8 = null,
     notice_buf: [256]u8 = undefined,
@@ -181,12 +187,12 @@ pub const App = struct {
             .mouse => |m| {
                 if (m.type == .press) app.notice = null;
                 if (m.button == .wheel_up or m.button == .wheel_down) {
-                    if (m.type == .press and !app.selection.active) {
-                        app.selection.clear();
+                    if (m.type == .press) {
+                        if (!app.selection.active or app.selection.history == null) app.selection.clear();
                         app.scroll.pending += if (m.button == .wheel_up) @as(i64, -3) else 3;
                     }
-                } else if (app.selection.mouse(m, &app.vx.screen)) {
-                    const text = try app.selection.text(gpa, &app.vx.screen);
+                } else if (app.selection.mouseInHistory(m, &app.vx.screen, app.body, app.transcript.entries.items)) {
+                    const text = try app.selection.textInHistory(gpa, &app.vx.screen, app.body, app.transcript.entries.items);
                     defer gpa.free(text);
                     if (std.mem.trim(u8, text, " \n").len == 0) {
                         app.selection.clear();
@@ -194,6 +200,9 @@ pub const App = struct {
                         try selection.copy(app.vx, app.w, gpa, app.io, app.environ, text);
                         app.notice = std.fmt.bufPrint(&app.notice_buf, "copied {d} chars", .{std.unicode.utf8CountCodepoints(text) catch text.len}) catch null;
                     }
+                }
+                if (app.selection.active and app.selection.history != null) {
+                    if (app.body) |body| app.scroll.top = body.top;
                 }
             },
             .tick => if (app.turn == null) {
@@ -205,6 +214,10 @@ pub const App = struct {
                 if (activity.state == .started and app.activity.phase != .compacting) app.activity.set(app.io, .thinking);
                 app.activity.modelActivity(activity.state, activity.at);
             },
+            .color_report => |color| {
+                if (color.kind == .bg) app.user_bg = userBackground(color.value);
+            },
+            .color_scheme => try app.vx.queryColor(app.w, .bg),
             .winsize => |ws| {
                 app.selection.clear();
                 try app.vx.resize(gpa, app.w, ws);
@@ -295,6 +308,7 @@ pub const App = struct {
 
     fn onKey(app: *App, k: vaxis.Key) !bool {
         app.notice = null;
+        app.selection.clear();
         const gpa = app.gpa;
         if (app.pasting) {
             if (k.text) |t| {
@@ -429,6 +443,7 @@ pub const App = struct {
             app.gpa.free(text);
             return;
         }
+        app.selection.clear();
         app.transcript.removeQueued(app.gpa);
         if (send) {
             try app.startTurn(text);
@@ -446,9 +461,10 @@ pub const App = struct {
     fn render(app: *App) !void {
         try app.menu.load(app.io, app.input.text(), app.session);
         const menu = app.menu.items(app.input.text());
-        if (app.scroll.pending != 0) app.selection.clear();
-        view.draw(app.vx.window(), app.transcript.entries.items, &app.input, &app.scroll, menu, @min(app.menu.sel, menu.len -| 1), .{
+        if (app.scroll.pending != 0 and (!app.selection.active or app.selection.history == null)) app.selection.clear();
+        app.body = view.drawFrame(app.vx.window(), app.transcript.entries.items, &app.input, &app.scroll, menu, @min(app.menu.sel, menu.len -| 1), .{
             .cfg = app.cfg,
+            .user_bg = app.user_bg,
             .usage = app.usage,
             .steps = app.steps,
             .current_step = @max(1, app.live_steps),
@@ -457,11 +473,32 @@ pub const App = struct {
             .busy = if (app.turn != null) app.activity.label(app.io) else null,
             .notice = app.notice,
         }, &app.status_text);
-        app.selection.highlight(&app.vx.screen);
+        if (app.selection.active and app.selection.history != null) {
+            if (app.body) |body| app.scroll.top = body.top;
+        }
+        app.selection.updateHistory(app.body, app.transcript.entries.items);
+        app.selection.highlightHistory(&app.vx.screen, app.body, app.transcript.entries.items);
         try app.vx.render(app.w);
         try app.w.flush();
     }
 };
+
+fn userBackground(bg: [3]u8) vaxis.Color {
+    const light = @as(u32, bg[0]) * 299 + @as(u32, bg[1]) * 587 + @as(u32, bg[2]) * 114 > 128_000;
+    const accent = if (light) [3]u8{ 40, 80, 150 } else [3]u8{ 120, 160, 230 };
+    var rgb: [3]u8 = undefined;
+    for (bg, accent, 0..) |base, tint, i| rgb[i] = @intCast((@as(u16, base) * 7 + tint) / 8);
+    return .{ .rgb = rgb };
+}
+
+test "user message tint preserves dark and light terminal contrast" {
+    const dark = userBackground(.{ 0, 0, 0 }).rgb;
+    const light = userBackground(.{ 255, 255, 255 }).rgb;
+    try std.testing.expect(dark[0] < 32 and dark[1] < 32 and dark[2] < 32);
+    try std.testing.expect(light[0] > 220 and light[1] > 220 and light[2] > 220);
+    try std.testing.expect(dark[2] > dark[0]);
+    try std.testing.expect(light[2] > light[0]);
+}
 
 fn isNewline(key: vaxis.Key, pasting: bool) bool {
     const enter = vaxis.Key.enter;
@@ -469,46 +506,36 @@ fn isNewline(key: vaxis.Key, pasting: bool) bool {
         key.matches(enter, .{ .alt = true }) or key.matches('j', .{ .ctrl = true });
 }
 
-test "wheel does not interrupt a selection and resumes scrolling after release" {
+test "wheel scrolls during history selection and ignores non-press wheel events" {
     const gpa = std.testing.allocator;
     var vx: vaxis.Vaxis = undefined;
     vx.screen = try vaxis.Screen.init(gpa, .{ .cols = 8, .rows = 3, .x_pixel = 0, .y_pixel = 0 });
     defer vx.screen.deinit(gpa);
-    for (0..3) |col| {
-        vx.screen.writeCell(@intCast(col), 0, .{ .char = .{ .grapheme = "abc"[col .. col + 1], .width = 1 } });
-    }
     var app: App = undefined;
     app.gpa = gpa;
     app.vx = &vx;
     app.selection = .{};
     app.scroll = .{};
     app.notice = null;
+    app.transcript = .{};
+    defer app.transcript.deinit(gpa);
+    try app.transcript.add(gpa, .info, "one\ntwo\nthree\nfour");
+    app.body = .{ .top = .{}, .window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 8, .height = 3, .screen = &vx.screen } };
     for ([_]vaxis.Mouse.Button{ .wheel_up, .wheel_down }) |button| {
         _ = try app.handle(.{ .mouse = .{ .col = 0, .row = 0, .button = .left, .mods = .{}, .type = .press } });
         const pressed = app.selection;
-        _ = try app.handle(.{ .mouse = .{ .col = 0, .row = 0, .button = button, .mods = .{}, .type = .press } });
+        _ = try app.handle(.{ .mouse = .{ .col = 2, .row = 0, .button = button, .mods = .{}, .type = .press } });
         try std.testing.expectEqualDeep(pressed, app.selection);
-        try std.testing.expectEqual(@as(i64, 0), app.scroll.pending);
-        _ = try app.handle(.{ .mouse = .{ .col = 2, .row = 0, .button = .left, .mods = .{}, .type = .drag } });
-        const dragged = app.selection;
-        for ([_]vaxis.Mouse.Type{ .press, .release, .drag, .motion }) |kind| {
-            _ = try app.handle(.{ .mouse = .{ .col = 7, .row = 2, .button = button, .mods = .{}, .type = kind } });
-            try std.testing.expectEqualDeep(dragged, app.selection);
-            try std.testing.expectEqual(@as(i64, 0), app.scroll.pending);
-        }
-        try std.testing.expect(app.selection.mouse(.{ .col = 2, .row = 0, .button = .left, .mods = .{}, .type = .release }, &vx.screen));
-        const text = try app.selection.text(gpa, &vx.screen);
-        defer gpa.free(text);
-        try std.testing.expectEqualStrings("abc", text);
-        const released = app.selection;
+        try std.testing.expectEqual(@as(i64, if (button == .wheel_up) -3 else 3), app.scroll.pending);
+        app.scroll.pending = 0;
         for ([_]vaxis.Mouse.Type{ .release, .drag, .motion }) |kind| {
             _ = try app.handle(.{ .mouse = .{ .col = 7, .row = 2, .button = button, .mods = .{}, .type = kind } });
-            try std.testing.expectEqualDeep(released, app.selection);
+            try std.testing.expectEqualDeep(pressed, app.selection);
             try std.testing.expectEqual(@as(i64, 0), app.scroll.pending);
         }
-        _ = try app.handle(.{ .mouse = .{ .col = 7, .row = 2, .button = button, .mods = .{}, .type = .press } });
+        app.selection.active = false;
+        _ = try app.handle(.{ .mouse = .{ .col = 2, .row = 0, .button = button, .mods = .{}, .type = .press } });
         try std.testing.expectEqualDeep(selection.Selection{}, app.selection);
-        try std.testing.expectEqual(@as(i64, if (button == .wheel_up) -3 else 3), app.scroll.pending);
         app.scroll.pending = 0;
     }
 }
