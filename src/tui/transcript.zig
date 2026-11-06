@@ -309,7 +309,7 @@ pub const Transcript = struct {
                 while (i > 0) {
                     i -= 1;
                     const entry = &t.entries.items[i];
-                    if (entry.kind == .run and entry.run_number == p.run and (entry.run == .running or p.background)) break :target entry;
+                    if (entry.kind == .run and entry.run_number == p.run and (entry.run == .running or entry.run == .background or p.background)) break :target entry;
                 }
                 return;
             }
@@ -1511,4 +1511,19 @@ test "auto-background completion updates its Run and preserves timeout state wit
     try testing.expectEqual(@as(usize, 0), e.agent_tree.rows.items.len);
     var segs: [max_segments]vaxis.Segment = undefined;
     try testing.expectEqualStrings("! ", e.segments(&segs)[0].text);
+}
+
+test "foreground command facts remain attached after their Run moves to background" {
+    const a = testing.allocator;
+    var t: Transcript = .{};
+    defer t.deinit(a);
+    try t.startRun(a, "await tools.bash({})");
+    try t.backgroundRun(a, "r1");
+    try t.endRun(a, true, "registered", 500, .{});
+    try t.progress(a, .{ .id = "b1", .run = 1, .kind = .bash, .prompt = "zig build test", .state = .failed, .exit_code = 1 });
+    try t.backgroundResult(a, .run, "r1", true, "script returned");
+    const e = &t.entries.items[0];
+    try testing.expectEqual(@as(usize, 1), e.agents.items.len);
+    try testing.expectEqualStrings("  └─ b1 bash zig build test · <1s · failed ✗ exit 1", e.agent_tree.rows.items[0].text);
+    try testing.expect(e.hasWarning());
 }

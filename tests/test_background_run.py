@@ -497,7 +497,8 @@ class BackgroundRunTests(unittest.TestCase):
         try:
             terminal.send("initial\r")
             self.assertTrue(self.server.followup.wait(5))
-            terminal.until(b"r1 run")
+            terminal.send("/tasks\r")
+            terminal.until(b"r1 Run")
             pid = int((self.cwd / "worker.pid").read_text())
             terminal.send("\x1b")
             wait_for(lambda: not alive(pid))
