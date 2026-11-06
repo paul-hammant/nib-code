@@ -192,6 +192,7 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
             };
             if (id != null and std.mem.eql(u8, id.?, session.id)) return app.transcript.add(gpa, .info, "already in this session");
             session.reopen(id) catch |err| return app.report(.err, "could not open session: {s}", .{@errorName(err)});
+            session.tools.recovery.enabled = true;
             app.transcript.clear(gpa);
             app.background_count = 0;
             try app.transcript.addHistory(gpa, session.history.items);

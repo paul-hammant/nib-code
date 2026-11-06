@@ -22,3 +22,5 @@
 自动后台 Run 使用 `background.kind:"run"` 和 `rN` ID。提前 `run_end` 的 output 是转后台通知、changes 为空，ok 只表示通知成功；最终 `background.state:"finished"` 的 completion 含原 step/run_index、实际 ok、配置预算内（默认 16 KiB）的 output、完整 run_ms/tool_bytes/calls/calls_omitted/changes 及实际执行区间 execution。该事件不产生第二个 run_end。具体字段与计量见 [session-log.md](session-log.md#自动后台-run-的记录与统计)。
 
 后台 bash 的 finished 事件可带 `execution:{start_ms_epoch,end_ms_epoch}`（Unix 毫秒，spawn 前至 wait 完成）；结束时间早于或等于结果送达时间。未成功启动进程时省略。自动后台 Run 的 completion.execution 从原 Run 创建时开始，包含自动切换前等待。
+
+TUI 的恢复提示不写入 ask 输出。自动转后台的 `run_end` 可带 `background_id`（如 `r3`），`ok:true` 此时仅表示成功登记；最终状态取后台结果。bash 的 progress 可带 `superseded_by`，取代是中性状态；`output_bytes` 是已观察到的命令输出进度，用于区分实际输出和纯计时心跳。

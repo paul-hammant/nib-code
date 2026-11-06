@@ -162,3 +162,5 @@ Codex 新响应的 `reasoning.includes_output:true` 表示 `reasoning.data` 是�
 事件沿用顶层 `at` 毫秒时间戳，旧日志没有这些事件。恢复跳过事件的历史应用，并从事件 id 恢复 b 计数器；不重启命令。主日志因此也包含完整 shell 命令，分享时应检查其中的敏感参数。
 
 `scripts/stats.py` 的 JSON 字段 `bash_superseded` 统计入选记录中的 `superseded` 次数，文本显示“Bash 被取代次数”。按 --since 的事件 at 过滤；事件不计作 Step、Turn 或失败。被取代的工具 resolve 数据与后台结果仍走原有录制/消息路径；其含义和脚本分支见 [tool-delegation.md](tool-delegation.md#同一命令取代过时执行)。
+
+`task_stop` 是单独的任务控制记录，包含 `id`、`reason`、`stopped`，不改变模型历史；TUI `/stop` 的 reason 为 `user requested stop`。tool 消息中的 `run_ok` 与 `background_id` 供 TUI 恢复显示使用，不改变发给 provider 的工具结果正文。

@@ -193,6 +193,7 @@ pub const Session = struct {
         s.tools.progress.deinit(s.gpa);
         s.tools.agent_sessions.deinit(s.gpa);
         s.inbox.batch.deinit(s.gpa);
+        s.tools.recovery.clear(s.gpa, s.io);
         s.tools.discardChanges(s.gpa);
         s.tools.file_state.deinit(s.gpa);
         if (s.recorder) |*recorder| recorder.deinit();

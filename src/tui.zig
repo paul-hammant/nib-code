@@ -43,7 +43,7 @@ pub const Event = union(enum) {
     usage: struct { tokens: provider.Usage, context: u64, steps: u32 },
     progress: @import("session/events.zig").Progress,
     background: @FieldType(SessionEvent, "background"),
-    failed: []u8,
+    failed: struct { message: []u8, reason: @import("tools/changes.zig").Recovery.Reason },
     /// One outcome line from automatic issue filing, owned by the receiver.
     issue: []u8,
     issues_done,
@@ -51,6 +51,7 @@ pub const Event = union(enum) {
 
 /// `session` may already hold history (a resumed Session); it is shown first.
 pub fn run(init: std.process.Init, session: *Session) !void {
+    session.tools.recovery.enabled = true;
     const io = init.io;
     const gpa = init.gpa;
 
@@ -283,6 +284,7 @@ pub const App = struct {
                 try app.finishTurn();
                 try app.saveReflection();
                 try app.appendBill();
+                if (canceled) try app.recoveryHint(.canceled);
                 try app.finishQueued(!canceled);
             },
             .issue => |msg| {
@@ -293,13 +295,15 @@ pub const App = struct {
                 if (app.issues) |job| job.finish();
                 app.issues = null;
             },
-            .failed => |msg| {
+            .failed => |failure| {
+                const msg = failure.message;
                 defer gpa.free(msg);
                 app.stopReflecting();
                 const canceled = app.turn.?.cancel.load(.acquire);
                 try app.transcript.add(gpa, if (canceled) .info else .err, if (canceled) "canceled" else msg);
                 try app.finishTurn();
                 try app.appendBill();
+                try app.recoveryHint(failure.reason);
                 try app.finishQueued(false);
             },
         }
@@ -406,6 +410,14 @@ pub const App = struct {
         const message = try std.fmt.allocPrint(app.gpa, fmt, args);
         defer app.gpa.free(message);
         try app.transcript.add(app.gpa, kind, message);
+    }
+
+    fn recoveryHint(app: *App, reason: @import("tools/changes.zig").Recovery.Reason) !void {
+        const cwd = try std.process.currentPathAlloc(app.io, app.gpa);
+        defer app.gpa.free(cwd);
+        const hint = try app.session.tools.recovery.hint(app.gpa, app.io, reason, cwd);
+        defer app.gpa.free(hint);
+        try app.transcript.add(app.gpa, .info, hint);
     }
 
     fn appendBill(app: *App) !void {

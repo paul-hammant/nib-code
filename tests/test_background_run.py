@@ -52,6 +52,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         index = len(self.server.requests)
         self.server.requests.append(request)
         case = self.server.case
+        if case == "request-failure":
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b'{"error":{"message":"mock refused request"}}')
+            return
         code = None
         if case.startswith("replace-"):
             mode = case.removeprefix("replace-")
@@ -89,6 +94,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 code = "await tools.bash(" + json.dumps({"command": shlex.join([sys.executable, "-c", script])}) + ")"
             elif case == "timeout":
                 code = "await tools.bash(" + json.dumps({"command": "echo $$ > worker.pid; sleep 30", "timeout_ms": 500}) + ")"
+            elif case == "recovery":
+                code = "await tools.write({path:'changed.txt',content:'partial work'}); await tools.bash({command:'echo $$ > worker.pid; sleep 30'})"
             elif case in ("cancel", "crash", "stop"):
                 command = "echo $$ > worker.pid; sleep 30; echo should-not-finish"
                 code = "const r=await tools.bash(" + json.dumps({"command": command}) + "); if(r.exit_code!==null) throw new Error('stop did not kill command'); r"
@@ -434,6 +441,34 @@ class BackgroundRunTests(unittest.TestCase):
                 self.assertIn("lost: process ended", results[0]["content"])
                 self.assertEqual(results[-1]["background_id"], "r2")
                 self.assertIn("resumed-result", results[-1]["content"])
+
+    def test_tui_cancellation_reports_files_even_without_run_result(self):
+        self.server.case = "recovery"
+        (self.home / "config.toml").write_text("[limits]\nrun_background_after_ms = 100000\n")
+        terminal = Terminal(self.cwd, self.env)
+        try:
+            terminal.send("initial\r")
+            wait_for(lambda: (self.cwd / "worker.pid").exists())
+            terminal.send("\x1b")
+            terminal.until("继续".encode())
+            self.assertIn(b"edited: changed.txt", terminal.output)
+            self.assertIn(b"bash changes untracked", terminal.output)
+            self.assertEqual((self.cwd / "changed.txt").read_text(), "partial work")
+            wait_for(lambda: not alive(int((self.cwd / "worker.pid").read_text())))
+        finally:
+            terminal.close()
+
+    def test_tui_request_failure_does_not_claim_file_changes(self):
+        self.server.case = "request-failure"
+        terminal = Terminal(self.cwd, self.env)
+        try:
+            terminal.send("initial\r")
+            terminal.until(b"model connection/request failed")
+            terminal.until("继续".encode())
+            self.assertIn(b"no recorded edit/write changes", terminal.output)
+            self.assertNotIn(b"edited:", terminal.output)
+        finally:
+            terminal.close()
 
     def test_tui_tasks_and_stop_during_model_request(self):
         self.server.case = "cancel"

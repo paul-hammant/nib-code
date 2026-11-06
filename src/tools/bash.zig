@@ -84,6 +84,7 @@ fn execute(t: *Tools, gpa: std.mem.Allocator, command: []const u8, timeout_ms: i
     const script = try std.fmt.allocPrint(gpa, "exec 2>&1\n{s}", .{command});
     defer gpa.free(script);
 
+    t.recovery.noteBash(t.io);
     const executed = process.run(gpa, t.io, .{ .spawn = .{
         .argv = &.{ "bash", "-c", script },
         .environ_map = t.environ,

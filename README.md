@@ -93,3 +93,5 @@ The detailed docs are currently written in Chinese.
 [MIT](LICENSE)
 
 Use `/tasks` to list background agent, bash and Run ids, descriptions, states, elapsed times and deadlines. `/stop <id>` also works during a turn; type `/stop ` to pick a running task. Stopping may leave partial file changes. See [TUI task controls](docs/tui-ux.md).
+
+The TUI shows the current phase and total turn time while waiting. After a failed or canceled turn, it lists directly edited files and tells you to type `继续` to continue; bash changes cannot be tracked.

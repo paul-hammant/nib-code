@@ -216,6 +216,7 @@ pub const Tools = struct {
     cancel: std.atomic.Value(bool) = .init(false),
     file_state: @import("tools/file_state.zig").State = .{},
     bash_commands: @import("tools/bash/registry.zig").Registry = .{},
+    recovery: @import("tools/changes.zig").Recovery = .{},
     track_changes: bool = false,
     changes_mutex: std.Io.Mutex = .init,
     changes: @import("tools/changes.zig").Tracker = .{},

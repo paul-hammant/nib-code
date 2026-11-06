@@ -31,6 +31,7 @@ pub const Turn = struct {
     loop: *vaxis.Loop(Event),
     cancel: std.atomic.Value(bool) = .init(false),
     thread: std.Thread = undefined,
+    failure_stage: @import("../tools/changes.zig").Recovery.Reason = .model,
     last_script_activity: ?std.Io.Clock.Timestamp = null,
     last_model_activity: ?std.Io.Clock.Timestamp = null,
 
@@ -46,13 +47,14 @@ pub const Turn = struct {
         var detail: ?[]u8 = null;
         t.execute(compact, &detail) catch |err| {
             const msg = detail orelse (t.gpa.dupe(u8, @errorName(err)) catch return);
-            t.loop.postEvent(.{ .failed = msg }) catch t.gpa.free(msg);
+            t.loop.postEvent(.{ .failed = .{ .message = msg, .reason = @import("../tools/changes.zig").Recovery.classify(err, t.cancel.load(.acquire), t.failure_stage) } }) catch t.gpa.free(msg);
             return;
         };
         t.loop.postEvent(.done) catch {};
     }
 
     fn execute(t: *Turn, compact: bool, detail: *?[]u8) !void {
+        t.session.tools.recovery.clear(t.gpa, t.session.io);
         const sink: Sink = .{ .ctx = t, .emit = emit, .onModelActivity = modelActivity, .onToolActivity = toolActivity, .onUserInserted = userInserted };
         if (compact) {
             errdefer t.session.tools.background.stop(t.gpa);
@@ -76,7 +78,10 @@ pub const Turn = struct {
     }
 
     pub fn modelActivityAt(t: *Turn, state: ModelActivity, at: std.Io.Clock.Timestamp) !void {
-        if (state == .started) t.last_script_activity = null;
+        if (state == .started) {
+            t.failure_stage = .model;
+            t.last_script_activity = null;
+        }
         if (state == .script) {
             if (t.last_script_activity) |last| {
                 if (last.durationTo(at).raw.toMilliseconds() < 1000) return;
@@ -93,6 +98,7 @@ pub const Turn = struct {
     pub fn emit(ctx: *anyopaque, ev: SessionEvent) !void {
         const t: *Turn = @ptrCast(@alignCast(ctx));
         const gpa = t.gpa;
+        if (ev == .run_start) t.failure_stage = .tool;
         const event: Event = switch (ev) {
             .step => |s| .{ .step = .{ .n = s.n, .effort = try gpa.dupe(u8, s.effort), .source = s.source } },
             .delta => |d| .{ .delta = .{ .kind = d.kind, .text = try gpa.dupe(u8, d.text), .step = t.session.steps + 1 } },
