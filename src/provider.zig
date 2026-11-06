@@ -14,7 +14,27 @@ pub const ModelTiming = model_timing.Model;
 pub const CodexState = @import("provider/codex_ws.zig").State;
 pub const Transport = enum { sse, websocket };
 
+pub const Protocol = enum { responses, chat_completions, anthropic_messages };
 pub const Id = enum { chat_completions, codex };
+
+pub const Definition = struct {
+    id: Id,
+    name: []const u8,
+    protocol: Protocol,
+    base_url: []const u8,
+    api_key_env: []const []const u8,
+    default_model: []const u8,
+};
+
+pub const definitions = [_]Definition{
+    .{ .id = .codex, .name = "Codex", .protocol = .responses, .base_url = "https://chatgpt.com/backend-api", .api_key_env = &.{}, .default_model = codex.default_model },
+    .{ .id = .chat_completions, .name = "Chat Completions", .protocol = .chat_completions, .base_url = "https://api.deepseek.com", .api_key_env = &.{ "NIB_API_KEY", "DEEPSEEK_API_KEY" }, .default_model = chat.default_model },
+};
+
+pub fn definition(id: Id) Definition {
+    for (definitions) |entry| if (entry.id == id) return entry;
+    unreachable;
+}
 
 pub const Limits = struct {
     llm_concurrency: usize = 4,
@@ -229,4 +249,16 @@ test "explicit effort overrides thinking and stores stable names" {
     try t.expectEqualStrings("max", cfg.effectiveEffort());
     try cfg.setEffort("off");
     try t.expectEqualStrings("off", cfg.effectiveEffort());
+}
+
+test "provider definitions cover every identity exactly once" {
+    inline for (std.meta.tags(Id)) |id| {
+        var count: usize = 0;
+        for (definitions) |entry| {
+            if (entry.id == id) count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), count);
+        try std.testing.expect(definition(id).base_url.len > 0);
+        try std.testing.expect(definition(id).default_model.len > 0);
+    }
 }

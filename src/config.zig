@@ -286,8 +286,9 @@ pub fn resolve(a: Allocator, env: *const Env, text: []const u8, path: []const u8
         detail.* = try a.dupe(u8, "NIB_PROVIDER: expected codex or chat_completions");
         return error.InvalidProvider;
     } else file.provider_id orelse .codex;
+    const entry = provider.definition(id);
     const settings = if (id == .codex) file.codex_settings else file.chat_settings;
-    const model = env.get("NIB_MODEL") orelse settings.model orelse if (id == .codex) codex.default_model else @import("provider/openai.zig").default_model;
+    const model = env.get("NIB_MODEL") orelse settings.model orelse entry.default_model;
     const context_window = if (env.get("NIB_CONTEXT_WINDOW")) |v| blk: {
         const n = std.fmt.parseInt(u64, v, 10) catch {
             detail.* = try a.dupe(u8, "NIB_CONTEXT_WINDOW: expected a positive integer");
@@ -341,9 +342,12 @@ pub fn resolve(a: Allocator, env: *const Env, text: []const u8, path: []const u8
     }
     cfg.model = try a.dupe(u8, model);
     errdefer a.free(cfg.model);
-    cfg.base_url = try a.dupe(u8, env.get("NIB_BASE_URL") orelse settings.base_url orelse if (id == .codex) "https://chatgpt.com/backend-api" else "https://api.deepseek.com");
+    cfg.base_url = try a.dupe(u8, env.get("NIB_BASE_URL") orelse settings.base_url orelse entry.base_url);
     errdefer a.free(cfg.base_url);
-    cfg.api_key = try a.dupe(u8, if (id == .codex) "" else env.get("NIB_API_KEY") orelse env.get("DEEPSEEK_API_KEY") orelse "");
+    const key = for (entry.api_key_env) |name| {
+        if (env.get(name)) |value| break value;
+    } else "";
+    cfg.api_key = try a.dupe(u8, key);
     errdefer a.free(cfg.api_key);
     cfg.codex_home = if (env.get("CODEX_HOME")) |v| try a.dupe(u8, v) else try std.fs.path.join(a, &.{ env.get("HOME") orelse "", ".codex" });
     cfg.enabled_skills = try enabledSkills(a, file.skills.items);
