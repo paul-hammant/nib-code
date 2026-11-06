@@ -6,7 +6,7 @@ const session_log = @import("../session/log.zig");
 /// The `/` candidate list above the input: selection, dismissal and session choices.
 pub const Menu = struct {
     /// `items` returns slices of this; a Menu must not move while they are used.
-    buf: [16]commands.Candidate = undefined,
+    buf: [128]commands.Candidate = undefined,
     sel: usize = 0,
     closed: bool = false,
     /// Owns `sessions` and resolved ids; reset when sessions are listed again.
@@ -14,6 +14,7 @@ pub const Menu = struct {
     sessions: []const commands.Choice = &.{},
     sessions_loaded: bool = false,
     tasks: []const commands.Choice = &.{},
+    models: []const commands.Choice = &.{},
 
     pub fn init(gpa: std.mem.Allocator) Menu {
         return .{ .arena = .init(gpa) };
@@ -25,7 +26,7 @@ pub const Menu = struct {
 
     pub fn items(m: *Menu, input: []const u8) []commands.Candidate {
         if (m.closed) return m.buf[0..0];
-        return commands.candidates(input, m.sessions, m.tasks, &m.buf);
+        return commands.candidates(input, m.sessions, m.tasks, m.models, &m.buf);
     }
 
     pub fn selected(m: *Menu, input: []const u8) ?commands.Candidate {
@@ -52,6 +53,19 @@ pub const Menu = struct {
 
     /// Lists this directory's sessions once the input starts asking for one.
     pub fn load(m: *Menu, io: std.Io, input: []const u8, session: *const Session) !void {
+        if (std.mem.startsWith(u8, input, "/model ")) {
+            _ = m.arena.reset(.retain_capacity);
+            const a = m.arena.allocator();
+            const env = session.options.environ orelse return;
+            const entries = try @import("../config.zig").modelEntries(a, io, env, session.options.home);
+            const choices = try a.alloc(commands.Choice, entries.len);
+            for (entries, choices) |entry, *choice| {
+                const active = std.mem.eql(u8, entry.provider, session.cfg.name()) and std.mem.eql(u8, entry.model, session.cfg.model);
+                choice.* = .{ .value = try std.fmt.allocPrint(a, "{s}/{s}", .{ entry.provider, entry.model }), .label = try std.fmt.allocPrint(a, "{s} · {s}", .{ entry.provider, entry.model }), .detail = if (active) "current" else "" };
+            }
+            m.models = choices;
+            return;
+        }
         if (std.mem.startsWith(u8, input, "/stop ")) {
             _ = m.arena.reset(.retain_capacity);
             const a = m.arena.allocator();
@@ -92,7 +106,7 @@ fn sessionChoices(io: std.Io, a: std.mem.Allocator, session: *const Session) ![]
     const choices = try a.alloc(commands.Choice, found.len);
     for (found, choices) |f, *c| {
         const seconds: u64 = @intCast(@max(@divTrunc(now - f.modified_ns, std.time.ns_per_s), 0));
-        var ago_buf: [16]u8 = undefined;
+        var ago_buf: [128]u8 = undefined;
         const ago = if (seconds < 60)
             "now"
         else if (seconds < 3600)

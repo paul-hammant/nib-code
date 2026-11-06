@@ -14,7 +14,9 @@
 
 模型快照：用户提供的 models.dev `api.json`，获取日期 **2026-11-06**。OpenAI 列表为 gpt-6.1-sol、gpt-6.1-terra，均 1050000 窗口、128000 最大输出。Anthropic 列表为 claude-opus-5-5、claude-sonnet-5-5、claude-haiku-5-5、claude-fable-5-1，均 1000000 窗口、128000 最大输出。xAI 列表为 grok-4.7、grok-4.6，均 500000 窗口。DeepSeek 保留 deepseek-flash、deepseek-v4-pro，均 1000000 窗口。Codex 使用原有列表、窗口与默认值，见 [codex.md](codex.md)。这是一份短目录，不保证账号权限，不调用模型发现端点。
 
-例如在 `$NIB_HOME/config.toml` 中切换：
+TUI 中优先使用 `/model`，菜单列出当前有凭证的内置服务模型，以及已在 config.toml 定义的自定义服务；输入可筛选，当前模型标记为 current。`/model openai` 选择该服务的配置/默认模型，`/model openai gpt-6.1-terra` 或 `/model openai/gpt-6.1-terra` 精确选择。未知模型需要已配置的 context_window 或 NIB_CONTEXT_WINDOW。选择原子保存到 `$NIB_HOME/config.toml`，保留其他设置和注释；保留当前 effort 并沿用模型映射。有已提交 Steps 时自动新建会话，旧会话保留原服务并可恢复；空会话原地切换。Turn 运行期间不可切换。NIB_PROVIDER/NIB_MODEL 在下次启动时仍优先，设置时确认行会提示。自定义服务仍需一次性在 config.toml 定义，之后即可在 `/model` 中选择。直接编辑配置或设置环境变量也是可用的替代方式。
+
+也可以在 `$NIB_HOME/config.toml` 中切换：
 
 ```toml
 provider = "anthropic"

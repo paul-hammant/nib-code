@@ -6,9 +6,9 @@ const config = @import("../config.zig");
 const ChangeText = @import("transcript.zig").ChangeText;
 const provider = @import("../provider.zig");
 
-pub const Command = enum { help, new, @"resume", compact, undo, effort, copy, reflect, js, tasks, stop, status, skills };
+pub const Command = enum { help, new, @"resume", compact, undo, model, effort, copy, reflect, js, tasks, stop, status, skills };
 
-pub const Choices = enum { none, efforts, sessions, tasks };
+pub const Choices = enum { none, models, efforts, sessions, tasks };
 
 pub const Group = enum { send, view, session };
 
@@ -33,6 +33,7 @@ pub const specs = std.enums.EnumArray(Command, Spec).init(.{
     .@"resume" = .{ .args = "<id>", .help = "resume a session", .choices = .sessions, .needs_arg = true },
     .undo = .{ .help = "undo last edited Turn; edit/write only", .while_busy = true },
     .compact = .{ .help = "compact earlier history" },
+    .model = .{ .args = "[provider[/model]]", .help = "switch model", .choices = .models, .needs_arg = true },
     .effort = .{ .group = .send, .args = "[level]", .help = "reasoning effort", .choices = .efforts },
     .copy = .{ .group = .view, .help = "copy last answer", .while_busy = true },
     .reflect = .{ .args = "[focus]", .help = "publish issue drafts: yyydddkkk/nib-code" },
@@ -120,7 +121,7 @@ pub const effort_choices = blk: {
 
 /// Prefix matches for `input`: command names before the first space,
 /// then argument choices for commands that have them.
-pub fn candidates(input: []const u8, sessions: []const Choice, tasks: []const Choice, out: []Candidate) []Candidate {
+pub fn candidates(input: []const u8, sessions: []const Choice, tasks: []const Choice, models: []const Choice, out: []Candidate) []Candidate {
     if (input.len == 0 or input[0] != '/' or std.mem.indexOfScalar(u8, input, '\n') != null) return out[0..0];
     var n: usize = 0;
     const space = std.mem.indexOfScalar(u8, input, ' ') orelse {
@@ -144,6 +145,7 @@ pub fn candidates(input: []const u8, sessions: []const Choice, tasks: []const Ch
         .efforts => &effort_choices,
         .sessions => sessions,
         .tasks => tasks,
+        .models => models,
     };
     for (choices) |choice| {
         if (n == out.len) break;
@@ -303,6 +305,44 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
             try app.vx.copyToSystemClipboard(app.w, answer, gpa);
             try app.report(.info, "copied {d} bytes (needs a terminal with OSC 52 clipboard support)", .{answer.len});
         },
+        .model => {
+            const selection = config.parseModel(arg) catch return app.transcript.add(gpa, .err, "usage: /model <provider> [model]");
+            const a = app.config_allocator orelse gpa;
+            var cfg = config.saveModel(a, app.io, app.environ, session.options.home, selection) catch |err| {
+                return app.report(.err, "could not select model: {s} · check provider and context_window", .{@errorName(err)});
+            };
+            cfg.thinking = app.cfg.thinking;
+            cfg.reasoning_effort = app.cfg.reasoning_effort;
+            const fresh = session.log.steps > 0;
+            const previous = session.cfg;
+            session.cfg = cfg;
+            if (fresh) {
+                session.reopen(null) catch |err| {
+                    session.cfg = previous;
+                    return app.report(.err, "could not open session: {s}", .{@errorName(err)});
+                };
+                session.tools.recovery.enabled = true;
+                app.transcript.clear(gpa);
+                app.background_count = 0;
+                app.usage = .{};
+                app.steps = 0;
+                app.last_summary = null;
+            } else {
+                session.tools.cfg = cfg;
+                const cwd = try std.process.currentPathAlloc(app.io, a);
+                session.initializeHistory(cwd) catch |err| {
+                    session.cfg = previous;
+                    session.tools.cfg = previous;
+                    return app.report(.err, "model saved, but could not update session: {s}", .{@errorName(err)});
+                };
+                session.log.provider = cfg.provider;
+                session.log.custom_provider = cfg.custom_provider;
+                session.log.model = cfg.model;
+            }
+            app.cfg = session.cfg;
+            app.context = session.context_tokens;
+            try app.report(.info, "{s} · {s}{s}{s}", .{ cfg.name(), cfg.model, if (fresh) " · new session" else "", if (app.environ.get("NIB_PROVIDER") != null and app.environ.get("NIB_MODEL") != null) " · NIB_PROVIDER/NIB_MODEL override at startup" else if (app.environ.get("NIB_PROVIDER") != null) " · NIB_PROVIDER overrides at startup" else if (app.environ.get("NIB_MODEL") != null) " · NIB_MODEL overrides at startup" else "" });
+        },
         .effort => {
             if (arg.len > 0) {
                 app.cfg.setEffort(arg) catch return app.transcript.add(gpa, .err, "usage: /effort [default|off|none|minimal|low|medium|high|xhigh|max]");
@@ -372,15 +412,15 @@ test "parse tells commands from paths and messages" {
 
 test "candidates complete command names, then argument choices" {
     var buf: [16]Candidate = undefined;
-    try testing.expectEqual(@as(usize, std.enums.values(Command).len), candidates("/", &.{}, &.{}, &buf).len);
-    const co = candidates("/co", &.{}, &.{}, &buf);
+    try testing.expectEqual(@as(usize, std.enums.values(Command).len), candidates("/", &.{}, &.{}, &.{}, &buf).len);
+    const co = candidates("/co", &.{}, &.{}, &.{}, &buf);
     try testing.expectEqual(@as(usize, 2), co.len);
     try testing.expectEqualStrings("/copy", co[0].label);
     try testing.expectEqualStrings("/compact", co[1].label);
-    try testing.expectEqual(@as(usize, 0), candidates("/js 1 + 1", &.{}, &.{}, &buf).len);
-    try testing.expectEqual(@as(usize, 0), candidates("hi /co", &.{}, &.{}, &buf).len);
+    try testing.expectEqual(@as(usize, 0), candidates("/js 1 + 1", &.{}, &.{}, &.{}, &buf).len);
+    try testing.expectEqual(@as(usize, 0), candidates("hi /co", &.{}, &.{}, &.{}, &buf).len);
 
-    const efforts = candidates("/effort h", &.{}, &.{}, &buf);
+    const efforts = candidates("/effort h", &.{}, &.{}, &.{}, &buf);
     try testing.expectEqual(@as(usize, 1), efforts.len);
     try testing.expectEqualStrings("high", efforts[0].value.?);
     const line = try efforts[0].line(testing.allocator);
@@ -388,19 +428,19 @@ test "candidates complete command names, then argument choices" {
     try testing.expectEqualStrings("/effort high", line);
 
     const sessions = [_]Choice{ .{ .value = "abc123", .label = "abc1", .detail = "now" }, .{ .value = "def456", .label = "def4", .detail = "1h" } };
-    const picked = candidates("/resume d", &sessions, &.{}, &buf);
+    const picked = candidates("/resume d", &sessions, &.{}, &.{}, &buf);
     try testing.expectEqual(@as(usize, 1), picked.len);
     try testing.expectEqualStrings("def456", picked[0].value.?);
 }
 
 test "accepting a command waits for required arguments only" {
     var buf: [8]Candidate = undefined;
-    const js = candidates("/j", &.{}, &.{}, &buf)[0];
+    const js = candidates("/j", &.{}, &.{}, &.{}, &buf)[0];
     try testing.expect(!js.runs());
     const tab = try js.completion(testing.allocator);
     defer testing.allocator.free(tab);
     try testing.expectEqualStrings("/js ", tab);
-    const effort = candidates("/ef", &.{}, &.{}, &buf)[0];
+    const effort = candidates("/ef", &.{}, &.{}, &.{}, &buf)[0];
     try testing.expect(effort.runs());
     const help = try helpText(testing.allocator, reflect.Issues.default_repo);
     defer testing.allocator.free(help);
@@ -412,11 +452,11 @@ test "task commands run while busy and stop completes current task ids" {
     try testing.expect(allowedWhileBusy("/stop r3"));
     var buf: [16]Candidate = undefined;
     const tasks = [_]Choice{.{ .value = "r3", .label = "r3", .detail = "Run" }};
-    const selected = candidates("/stop r", &.{}, &tasks, &buf);
+    const selected = candidates("/stop r", &.{}, &tasks, &.{}, &buf);
     try testing.expectEqual(@as(usize, 1), selected.len);
     try testing.expectEqualStrings("r3", selected[0].value.?);
     try testing.expect(selected[0].runs());
-    try testing.expect(!candidates("/stop", &.{}, &tasks, &buf)[0].runs());
+    try testing.expect(!candidates("/stop", &.{}, &tasks, &.{}, &buf)[0].runs());
 }
 
 test "help groups commands and states the real issue destination or disabled state" {
@@ -429,4 +469,17 @@ test "help groups commands and states the real issue destination or disabled sta
     defer a.free(off);
     try testing.expect(std.mem.indexOf(u8, off, "issue publishing off") != null);
     try testing.expect(std.mem.indexOf(u8, off, reflect.Issues.default_repo) == null);
+}
+
+test "model choices filter and complete without running the bare command" {
+    var buf: [16]Candidate = undefined;
+    const models = [_]Choice{ .{ .value = "openai/gpt-6.1-sol", .label = "openai · gpt-6.1-sol", .detail = "current" }, .{ .value = "anthropic/claude-sonnet-5-5", .label = "anthropic · claude-sonnet-5-5", .detail = "" } };
+    try testing.expect(!allowedWhileBusy("/model openai"));
+    try testing.expect(!candidates("/model", &.{}, &.{}, &models, &buf)[0].runs());
+    const selected = candidates("/model openai", &.{}, &.{}, &models, &buf);
+    try testing.expectEqual(@as(usize, 1), selected.len);
+    try testing.expectEqualStrings("current", selected[0].detail);
+    const line = try selected[0].line(testing.allocator);
+    defer testing.allocator.free(line);
+    try testing.expectEqualStrings("/model openai/gpt-6.1-sol", line);
 }

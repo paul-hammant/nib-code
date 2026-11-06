@@ -64,8 +64,9 @@ pub fn drawFrame(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *V
         }
         const chosen = i == menu_sel;
         const row = win.child(.{ .x_off = 2, .y_off = menu_y, .height = 1 });
-        printFitted(row.child(.{ .width = @min(row.width, 12) }), c.label, if (chosen) .{ .reverse = true, .bold = true } else .{ .bold = true });
-        if (row.width > 14) printFitted(row.child(.{ .x_off = 14 }), c.detail, .{ .dim = true });
+        const label_width = if (c.command == .model and c.value != null) row.width -| 10 else @min(row.width, 12);
+        printFitted(row.child(.{ .width = label_width }), c.label, if (chosen) .{ .reverse = true, .bold = true } else .{ .bold = true });
+        if (row.width > label_width + 2) printFitted(row.child(.{ .x_off = label_width + 2 }), c.detail, .{ .dim = true });
         menu_y += 1;
     }
 
@@ -301,7 +302,7 @@ test "minimal terminal dimensions retain an input cursor" {
 
 test "grouped menus keep the selected command visible within their row budget" {
     var buf: [16]commands.Candidate = undefined;
-    const menu = commands.candidates("/", &.{}, &.{}, &buf);
+    const menu = commands.candidates("/", &.{}, &.{}, &.{}, &buf);
     for (2..12) |limit| for (0..menu.len) |selected| {
         const layout = menuLayout(menu, selected, @intCast(limit));
         try testing.expect(layout.rows <= limit);
@@ -324,4 +325,27 @@ test "empty screen has one guidance line and no zero statistics" {
     try testing.expect(std.mem.indexOf(u8, image, "Ask about this project · / for commands") != null);
     try testing.expect(std.mem.indexOf(u8, image, "Enter send") == null);
     try testing.expect(std.mem.indexOf(u8, image, "0%") == null);
+}
+
+test "model menu shows distinct model names and current marker at common widths" {
+    const a = testing.allocator;
+    for ([_]u16{ 60, 120, 160 }) |width| {
+        var screen = try vaxis.Screen.init(a, .{ .cols = width, .rows = 16, .x_pixel = 0, .y_pixel = 0 });
+        defer screen.deinit(a);
+        const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = width, .height = 16, .screen = &screen };
+        var input: Editor = .{};
+        defer input.deinit(a);
+        var scroll: Viewport = .{};
+        var text: status.Text = .{};
+        const menu = [_]commands.Candidate{
+            .{ .command = .model, .value = "openai/gpt-6.1-sol", .label = "openai · gpt-6.1-sol", .detail = "current" },
+            .{ .command = .model, .value = "openai/gpt-6.1-terra", .label = "openai · gpt-6.1-terra", .detail = "" },
+        };
+        draw(win, &.{}, &input, &scroll, &menu, 0, .{ .cfg = mock_cfg }, &text);
+        const rendered = try snapshot(a, &screen);
+        defer a.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "openai · gpt-6.1-sol") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "openai · gpt-6.1-terra") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "current") != null);
+    }
 }
