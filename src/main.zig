@@ -21,7 +21,10 @@ pub fn main(init: std.process.Init) void {
     } else false;
     run(init, args, &out.interface, json, &detail, &failure) catch |err| {
         if (json) {
-            failure.message = detail orelse errorMessage(err);
+            failure.message = detail orelse switch (err) {
+                error.MissingPrompt, error.InvalidArguments => @errorName(err),
+                else => errorMessage(err),
+            };
             JsonEvent.write(.{ .@"error" = failure }, &out.interface) catch {};
         } else std.debug.print("nib: {s}\n", .{detail orelse errorMessage(err)});
         std.process.exit(1);
