@@ -20,6 +20,9 @@ pub const Kind = enum { user, assistant, run, background, info, err, bill, failu
 
 pub const Entry = struct {
     kind: Kind,
+    allocator: ?std.mem.Allocator = null,
+    markdown_cache: markdown.Cache = .{},
+    smooth: ?@import("../smooth.zig").Smooth = null,
     user_bg: vaxis.Color = .default,
     queued: ?u64 = null,
     attempt: usize = 0,
@@ -55,7 +58,12 @@ pub const Entry = struct {
         result: ?bool = null,
     };
 
+    pub fn displayText(e: *const Entry) []const u8 {
+        return e.text.items[0..if (e.smooth) |s| s.visible else e.text.items.len];
+    }
+
     pub fn deinit(e: *Entry, gpa: std.mem.Allocator) void {
+        e.markdown_cache.deinit(gpa);
         if (e.task_id) |id| gpa.free(id);
         if (e.step_effort) |effort| gpa.free(effort.effort);
         if (e.tool_summary) |summary| summary.deinit(gpa);
@@ -129,8 +137,11 @@ pub const Entry = struct {
         return e.kind == .run or e.kind == .background or e.kind == .failure or (e.kind == .user and long_text.isLong(e.text.items));
     }
 
-    pub fn print(e: *const Entry, win: vaxis.Window, commit: bool) u16 {
-        if (e.kind == .assistant) return markdown.print(win, e.text.items, commit);
+    pub fn print(e: *Entry, win: vaxis.Window, commit: bool) u16 {
+        if (e.kind == .assistant) {
+            if (e.allocator) |a| return e.markdown_cache.draw(a, win, e.displayText(), commit);
+            return markdown.print(win, e.displayText(), commit);
+        }
         if (e.kind == .user and win.width >= 4) return e.printUser(win, commit);
         if (e.kind == .bill) {
             _ = win.print(&.{.{ .text = bill.fit(e.text.items, win.width), .style = .{ .dim = true } }}, .{ .wrap = .none, .commit = commit });
@@ -206,7 +217,7 @@ pub const Entry = struct {
     }
 
     pub fn height(e: *Entry, win: vaxis.Window) u16 {
-        const len = e.text.items.len + e.output.items.len + e.changes.diff.len;
+        const len = e.displayText().len + e.output.items.len + e.changes.diff.len;
         if (e.cached) |c| {
             if (c.width == win.width and c.len == len and c.open == e.open) return c.rows;
         }

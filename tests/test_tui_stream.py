@@ -1,6 +1,7 @@
 """Incremental TUI output through a PTY, including a paused stream and live input."""
 import contextlib
 import json
+import random
 import sys
 from pathlib import Path
 import tempfile
@@ -17,7 +18,16 @@ from screen import screen
 class StreamReply(Reply):
     def __init__(self):
         self.prefix = "STREAM_BEGIN "
-        self.chunks = ["中文🙂 " if i % 20 == 0 else "word " for i in range(400)]
+        rng = random.Random(17)
+        answer = ("word English 中文 👩‍💻 🙂 **late bold\n- list `inline\n```zig\n" +
+                  "const value = 123; // 中文\n" * 150 + "```\nclose` bold**\n") * 12
+        answer = answer[:30000]
+        self.chunks = []
+        while answer:
+            n = rng.randint(1, 500)
+            self.chunks.append(answer[:n])
+            answer = answer[n:]
+        self.gaps = [rng.choice([0, .001, .016, .040, .400]) for _ in self.chunks]
         self.tail = " PAUSED_TAIL"
         self.end = " STREAM_END"
         super().__init__(self.prefix + "".join(self.chunks) + self.tail + self.end, gated=True)
@@ -25,6 +35,7 @@ class StreamReply(Reply):
         self.continue_stream = threading.Event()
         self.paused = threading.Event()
         self.elapsed = 0
+        self.sent_chars = 0
 
 
 class StreamHandler(Handler):
@@ -53,9 +64,11 @@ class StreamHandler(Handler):
             if not reply.continue_stream.wait(10):
                 return
             start = time.monotonic()
-            for chunk in reply.chunks:
+            for chunk, gap in zip(reply.chunks, reply.gaps):
                 text(chunk)
-                time.sleep(.001)
+                reply.sent_chars += len(chunk)
+                time.sleep(gap)
+            reply.tail_sent = time.monotonic()
             text(reply.tail)
             reply.elapsed = time.monotonic() - start
             reply.paused.set()
@@ -74,8 +87,11 @@ def test_incremental_stream(tmp):
         with fixture(tmp, [reply]) as (terminal, home, _):
             terminal.send("stream test\r")
             wait_for(lambda: any("Thinking" in row for row in screen(terminal.read(), 120, 32)), "Thinking during reasoning")
+            first_start = time.monotonic()
             reply.reasoning_done.set()
             terminal.until(reply.prefix.strip().encode())
+            first_latency = time.monotonic() - first_start
+            assert first_latency < .15
             wait_for(lambda: any("Generating response" in row for row in screen(terminal.read(), 120, 32)), "Generating response during text")
             assert not reply.paused.is_set(), "first fragment must appear before the rest is sent"
             terminal.send("\x1b[200~live-draft\x1b[201~")
@@ -84,16 +100,28 @@ def test_incremental_stream(tmp):
             reply.continue_stream.set()
             terminal.until(b"word")
             assert not reply.release.is_set(), "incremental text must not wait for completion"
-            wait_for(reply.paused.is_set, "stream pause")
-            terminal.until(b"PAUSED_TAIL")
+            for milestone in (1000, 10000, 30000):
+                wait_for(lambda: reply.sent_chars >= milestone, f"{milestone} chars", timeout=30)
+                input_start = time.monotonic()
+                token = f"input{milestone}"
+                terminal.send("\x1b[200~" + token + "\x1b[201~")
+                terminal.until(token.encode())
+                input_latency = time.monotonic() - input_start
+                assert input_latency < .05
+                print(f"PTY chars={milestone} input={input_latency * 1000:.1f}ms")
+            wait_for(reply.paused.is_set, "stream pause", timeout=30)
+            wait_for(lambda: any("PAUSED_TAIL" in row for row in screen(terminal.read(), 120, 32)), "visible paused tail")
+            tail_lag = time.monotonic() - reply.tail_sent
+            assert tail_lag < .15
+            print(f"PTY first={first_latency * 1000:.1f}ms input={input_latency * 1000:.1f}ms tail={tail_lag * 1000:.1f}ms")
             assert not finished(home, reply.text), "tail must display while the response is still open"
             output = terminal.read()[start:]
             frames = output.count(b"\x1b[?2026h")
-            assert 1 < frames < len(reply.chunks) // 2, frames
+            assert 1 < frames, frames
             print(f"stream: {len(reply.chunks)} deltas in {reply.elapsed:.3f}s, {frames} frames, {len(output)} terminal bytes")
             reply.release.set()
             wait_for(lambda: finished(home, reply.text), "complete stream committed")
-            terminal.until(b"STREAM_END")
+            wait_for(lambda: any("STREAM_END" in row for row in screen(terminal.read(), 120, 32)), "visible final text")
             assert history(home)[-1]["content"] == reply.text
             assert terminal.child.poll() is None
             terminal.send("\x15")
