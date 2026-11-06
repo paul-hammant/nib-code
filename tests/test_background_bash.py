@@ -1077,7 +1077,7 @@ class BackgroundBashTests:
                   if m.get("source") == "background"]
         self.assertEqual({m["background_id"] for m in logged}, {"a2", "b1"})
 
-    def test_foreground_bash_delays_progress_and_keeps_two_completed_ids(self):
+    def test_foreground_bash_delays_live_progress_and_reports_all_completed_ids(self):
         (self.home / "config.toml").write_text("[limits]\nrun_background_after_ms = 30000\n")
         self.mock("foreground_bash")
         started = time.monotonic()
@@ -1107,7 +1107,11 @@ class BackgroundBashTests:
         self.assertEqual((process.returncode, output, error, pending), (0, "", "", b""))
         self.assertIn("end", events[-1])
         self.assertFalse(any("background" in e for e in events))
-        self.assert_progress_ids(events, {"b1": ("bash", False), "b3": ("bash", False)})
+        self.assert_progress_ids(events, {"b1": ("bash", False), "b2": ("bash", False), "b3": ("bash", False)})
+        quick = [p for _, p in updates if p["id"] == "b2"]
+        self.assertEqual(len(quick), 1, quick)
+        self.assertEqual((quick[0]["state"], quick[0]["exit_code"]), ("done", 0))
+        self.assertLess(quick[0]["elapsed_ms"], 3000)
         completed = {}
         for id in ("b1", "b3"):
             samples = [(stamp, p) for stamp, p in updates if p["id"] == id]
