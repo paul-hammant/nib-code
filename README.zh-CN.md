@@ -58,7 +58,7 @@ nib --effort high            # 本次进程的推理强度
 nib replay <会话ID> --all     # 离线重放该会话录制的 Run，检查结果是否一致
 ```
 
-TUI 里输入 `/` 列出指令：`/new`、`/resume`、`/compact`、`/effort`、`/copy`、`/reflect`、`/js`、`/help`。Esc 中断当前回合，ctrl+o 展开 Run 的脚本、输出和 diff。
+TUI 里输入 `/` 列出指令：`/new`、`/resume`、`/compact`、`/effort`、`/copy`、`/reflect`、`/js`、`/tasks`、`/stop <id>`、`/help`。Esc 中断当前回合，ctrl+o 展开 Run 的脚本、输出和 diff。
 
 全局指令放在 `~/.nib/AGENTS.md`，项目约定放在项目根目录的 `AGENTS.md`。
 
@@ -78,3 +78,5 @@ bash 有一层防误操作的检查：拒绝提权、关机、删除系统目录
 ## 许可证
 
 [MIT](LICENSE)
+
+`/tasks` 列出后台 agent、bash、Run 的编号、摘要、状态、运行时长和截止时间。回合进行中也可用 `/stop <id>` 停止任务，输入 `/stop ` 选择当前任务；停止可能留下部分文件改动。见 [TUI 任务管理](docs/tui-ux.md)。

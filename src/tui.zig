@@ -413,6 +413,12 @@ pub const App = struct {
         app.clearStepEffort();
         app.turn.?.finish();
         app.turn = null;
+        while (app.session.tools.background.takeStop(app.io)) |id| {
+            defer app.gpa.free(id);
+            const notice = try @import("tools/stop.zig").userStop(&app.session.tools, app.gpa, id);
+            defer app.gpa.free(notice);
+            try app.transcript.add(app.gpa, .info, notice);
+        }
         if (!app.session.tools.background.anyPending(app.io)) {
             app.background_count = 0;
             try app.transcript.clearBackgroundProgress(app.gpa);

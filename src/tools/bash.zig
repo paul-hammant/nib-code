@@ -76,6 +76,7 @@ fn execute(t: *Tools, gpa: std.mem.Allocator, command: []const u8, timeout_ms: i
         if (registered) _ = t.bash_commands.finish(t, gpa, &active);
     }
     var tracker: Tracker = .{ .t = t, .gpa = gpa, .command = command, .id = id, .value = progress, .started = active.started, .parent_cancel = cancel, .command_cancel = &active.cancel };
+    if (progress != null) t.background.beginTask(t.io, id, timeout_ms);
     var state: @FieldType(@import("../session/events.zig").Progress, "state") = .failed;
     defer tracker.finish(state);
     tracker.tick();

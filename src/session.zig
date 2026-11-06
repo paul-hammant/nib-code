@@ -223,6 +223,7 @@ pub const Session = struct {
         var target: runner.PollTarget = .{ .session = s, .sink = sink };
         s.tools.usage_sink = .{ .ctx = &target, .emit = runner.PollTarget.usage };
         s.tools.progress.sink = .{ .ctx = &target, .emit = runner.PollTarget.progress };
+        s.tools.notice_sink = .{ .gpa = s.gpa, .ctx = &target, .emit = runner.PollTarget.notice };
         s.tools.background_sink = .{ .ctx = &target, .emit = runner.PollTarget.background };
         const started: std.Io.Clock.Timestamp = .now(s.io, .awake);
         defer {
@@ -237,6 +238,7 @@ pub const Session = struct {
             s.summary.?.usage = s.usage;
             s.tools.usage_sink = null;
             s.tools.progress.sink = null;
+            s.tools.notice_sink = null;
             s.tools.background_sink = null;
             if (!s.tools.background.anyPending(s.io)) s.tools.progress.clear(s.gpa);
         }

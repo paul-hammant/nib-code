@@ -27,7 +27,7 @@ def replay(path):
     for line in path.read_text().splitlines():
         record = json.loads(line)
         records.append(record)
-        if not record.get("repair") and not record.get("diagnostic") and not record.get("bash"):
+        if not record.get("repair") and not record.get("diagnostic") and not record.get("bash") and not record.get("task_stop"):
             history[record["from"]:] = record["messages"]
     return history, records
 

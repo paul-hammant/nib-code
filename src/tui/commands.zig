@@ -6,9 +6,9 @@ const config = @import("../config.zig");
 const ChangeText = @import("transcript.zig").ChangeText;
 const provider = @import("../provider.zig");
 
-pub const Command = enum { help, new, @"resume", compact, effort, copy, reflect, js };
+pub const Command = enum { help, new, @"resume", compact, effort, copy, reflect, js, tasks, stop };
 
-pub const Choices = enum { none, efforts, sessions };
+pub const Choices = enum { none, efforts, sessions, tasks };
 
 pub const Spec = struct {
     args: []const u8 = "",
@@ -21,6 +21,8 @@ pub const Spec = struct {
 };
 
 pub const specs = std.enums.EnumArray(Command, Spec).init(.{
+    .tasks = .{ .help = "list background tasks", .while_busy = true },
+    .stop = .{ .args = "<id>", .help = "stop one background task; partial changes may remain", .while_busy = true, .choices = .tasks, .needs_arg = true },
     .help = .{ .help = "list commands and keys", .while_busy = true },
     .new = .{ .help = "start a new session in this directory" },
     .@"resume" = .{ .args = "<id>", .help = "switch to an earlier session in this directory", .choices = .sessions, .needs_arg = true },
@@ -108,7 +110,7 @@ pub const effort_choices = blk: {
 
 /// Prefix matches for `input`: command names before the first space,
 /// then argument choices for commands that have them.
-pub fn candidates(input: []const u8, sessions: []const Choice, out: []Candidate) []Candidate {
+pub fn candidates(input: []const u8, sessions: []const Choice, tasks: []const Choice, out: []Candidate) []Candidate {
     if (input.len == 0 or input[0] != '/' or std.mem.indexOfScalar(u8, input, '\n') != null) return out[0..0];
     var n: usize = 0;
     const space = std.mem.indexOfScalar(u8, input, ' ') orelse {
@@ -128,6 +130,7 @@ pub fn candidates(input: []const u8, sessions: []const Choice, out: []Candidate)
         .none => return out[0..0],
         .efforts => &effort_choices,
         .sessions => sessions,
+        .tasks => tasks,
     };
     for (choices) |choice| {
         if (n == out.len) break;
@@ -155,6 +158,24 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
     const gpa = app.gpa;
     const session = app.session;
     switch (c) {
+        .tasks => {
+            var arena: std.heap.ArenaAllocator = .init(gpa);
+            defer arena.deinit();
+            const list = try session.tools.background.snapshot(arena.allocator(), app.io);
+            const text = try @import("tasks.zig").format(arena.allocator(), list, @import("../sandbox/timing.zig").Execution.now(app.io));
+            try app.transcript.add(gpa, .info, text);
+        },
+        .stop => {
+            if (arg.len == 0 or std.mem.indexOfAny(u8, arg, " \t\n") != null) return app.transcript.add(gpa, .err, "usage: /stop <id>");
+            if (app.turn != null) {
+                try session.tools.background.requestStop(gpa, app.io, arg);
+                try app.report(.info, "{s}: user stop requested", .{arg});
+            } else {
+                const text = try @import("../tools/stop.zig").userStop(&session.tools, gpa, arg);
+                defer gpa.free(text);
+                try app.transcript.add(gpa, .info, text);
+            }
+        },
         .help => {
             const text = try helpText(gpa);
             defer gpa.free(text);
@@ -248,15 +269,15 @@ test "parse tells commands from paths and messages" {
 
 test "candidates complete command names, then argument choices" {
     var buf: [16]Candidate = undefined;
-    try testing.expectEqual(@as(usize, std.enums.values(Command).len), candidates("/", &.{}, &buf).len);
-    const co = candidates("/co", &.{}, &buf);
+    try testing.expectEqual(@as(usize, std.enums.values(Command).len), candidates("/", &.{}, &.{}, &buf).len);
+    const co = candidates("/co", &.{}, &.{}, &buf);
     try testing.expectEqual(@as(usize, 2), co.len);
     try testing.expectEqualStrings("/compact", co[0].label);
     try testing.expectEqualStrings("/copy", co[1].label);
-    try testing.expectEqual(@as(usize, 0), candidates("/js 1 + 1", &.{}, &buf).len);
-    try testing.expectEqual(@as(usize, 0), candidates("hi /co", &.{}, &buf).len);
+    try testing.expectEqual(@as(usize, 0), candidates("/js 1 + 1", &.{}, &.{}, &buf).len);
+    try testing.expectEqual(@as(usize, 0), candidates("hi /co", &.{}, &.{}, &buf).len);
 
-    const efforts = candidates("/effort h", &.{}, &buf);
+    const efforts = candidates("/effort h", &.{}, &.{}, &buf);
     try testing.expectEqual(@as(usize, 1), efforts.len);
     try testing.expectEqualStrings("high", efforts[0].value.?);
     const line = try efforts[0].line(testing.allocator);
@@ -264,21 +285,33 @@ test "candidates complete command names, then argument choices" {
     try testing.expectEqualStrings("/effort high", line);
 
     const sessions = [_]Choice{ .{ .value = "abc123", .label = "abc1", .detail = "now" }, .{ .value = "def456", .label = "def4", .detail = "1h" } };
-    const picked = candidates("/resume d", &sessions, &buf);
+    const picked = candidates("/resume d", &sessions, &.{}, &buf);
     try testing.expectEqual(@as(usize, 1), picked.len);
     try testing.expectEqualStrings("def456", picked[0].value.?);
 }
 
 test "accepting a command waits for required arguments only" {
     var buf: [8]Candidate = undefined;
-    const js = candidates("/j", &.{}, &buf)[0];
+    const js = candidates("/j", &.{}, &.{}, &buf)[0];
     try testing.expect(!js.runs());
     const tab = try js.completion(testing.allocator);
     defer testing.allocator.free(tab);
     try testing.expectEqualStrings("/js ", tab);
-    const effort = candidates("/ef", &.{}, &buf)[0];
+    const effort = candidates("/ef", &.{}, &.{}, &buf)[0];
     try testing.expect(effort.runs());
     const help = try helpText(testing.allocator);
     defer testing.allocator.free(help);
     try testing.expect(std.mem.indexOf(u8, help, "/resume <id>") != null);
+}
+
+test "task commands run while busy and stop completes current task ids" {
+    try testing.expect(allowedWhileBusy("/tasks"));
+    try testing.expect(allowedWhileBusy("/stop r3"));
+    var buf: [16]Candidate = undefined;
+    const tasks = [_]Choice{.{ .value = "r3", .label = "r3", .detail = "Run" }};
+    const selected = candidates("/stop r", &.{}, &tasks, &buf);
+    try testing.expectEqual(@as(usize, 1), selected.len);
+    try testing.expectEqualStrings("r3", selected[0].value.?);
+    try testing.expect(selected[0].runs());
+    try testing.expect(!candidates("/stop", &.{}, &tasks, &buf)[0].runs());
 }

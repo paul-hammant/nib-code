@@ -200,6 +200,7 @@ pub const Tools = struct {
     background: @import("tools/background.zig").Background = .{},
     run_id: usize = 0,
     background_sink: ?struct { ctx: *anyopaque, emit: *const fn (*anyopaque, @import("session/events.zig").Background) anyerror!void } = null,
+    notice_sink: ?struct { gpa: std.mem.Allocator, ctx: *anyopaque, emit: *const fn (*anyopaque, []const u8) anyerror!void } = null,
     progress: @import("tools/progress.zig").Queue = .{},
     agent_usage: provider.Usage = .{},
     llm_calls: std.atomic.Value(usize) = .init(0),
@@ -310,6 +311,13 @@ pub const Tools = struct {
             if (usage.prompt_tokens != 0 or usage.completion_tokens != 0 or usage.prompt_cache_hit_tokens != 0)
                 try sink.emit(sink.ctx, usage);
         }
+        if (t.notice_sink) |sink| while (t.background.takeStop(t.io)) |id| {
+            const gpa = sink.gpa;
+            defer gpa.free(id);
+            const notice = try @import("tools/stop.zig").userStop(t, gpa, id);
+            defer gpa.free(notice);
+            try sink.emit(sink.ctx, notice);
+        };
         if (t.background_sink) |sink| try t.background.poll(t.io, sink.ctx, sink.emit);
         try t.progress.drain(t.io);
     }

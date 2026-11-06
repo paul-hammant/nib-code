@@ -31,7 +31,10 @@ pub const ForkedFrom = struct {
     message_count: usize,
 };
 
+pub const TaskStop = struct { id: []const u8, reason: []const u8, stopped: bool };
+
 pub const Record = struct {
+    task_stop: ?TaskStop = null,
     at: ?i64 = null,
     diagnostic: ?Diagnostic = null,
     agent_session: ?AgentSession = null,
@@ -152,6 +155,12 @@ pub const Log = struct {
         log.mutex.lockUncancelable(io);
         defer log.mutex.unlock(io);
         try log.append(io, a, .{ .bash = event });
+    }
+
+    pub fn taskStop(log: *Log, io: std.Io, a: std.mem.Allocator, event: TaskStop) !void {
+        log.mutex.lockUncancelable(io);
+        defer log.mutex.unlock(io);
+        try log.append(io, a, .{ .task_stop = event });
     }
 
     pub fn agentSession(log: *Log, io: std.Io, a: std.mem.Allocator, mapping: AgentSession) !void {
@@ -353,6 +362,7 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
             try restoreId(event.id, &next_agent_id, &next_bash_id, &next_run_id);
             continue;
         }
+        if (r.task_stop != null) continue;
         if (r.diagnostic != null or (r.transport_fallback != null and r.messages.len == 0)) continue;
         if (r.from > history.items.len) return error.InvalidSessionLog;
         try history.ensureTotalCapacity(gpa, r.from + r.messages.len);

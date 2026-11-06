@@ -13,6 +13,7 @@ pub const Menu = struct {
     arena: std.heap.ArenaAllocator,
     sessions: []const commands.Choice = &.{},
     sessions_loaded: bool = false,
+    tasks: []const commands.Choice = &.{},
 
     pub fn init(gpa: std.mem.Allocator) Menu {
         return .{ .arena = .init(gpa) };
@@ -24,7 +25,7 @@ pub const Menu = struct {
 
     pub fn items(m: *Menu, input: []const u8) []const commands.Candidate {
         if (m.closed) return m.buf[0..0];
-        return commands.candidates(input, m.sessions, &m.buf);
+        return commands.candidates(input, m.sessions, m.tasks, &m.buf);
     }
 
     pub fn selected(m: *Menu, input: []const u8) ?commands.Candidate {
@@ -51,6 +52,18 @@ pub const Menu = struct {
 
     /// Lists this directory's sessions once the input starts asking for one.
     pub fn load(m: *Menu, io: std.Io, input: []const u8, session: *const Session) !void {
+        if (std.mem.startsWith(u8, input, "/stop ")) {
+            _ = m.arena.reset(.retain_capacity);
+            const a = m.arena.allocator();
+            const tasks = try @constCast(&session.tools.background).snapshot(a, io);
+            var choices: std.ArrayList(commands.Choice) = .empty;
+            for (tasks) |task| {
+                if (!std.mem.eql(u8, task.state, "queued") and !std.mem.eql(u8, task.state, "working")) continue;
+                try choices.append(a, .{ .value = task.id, .label = task.id, .detail = task.description });
+            }
+            m.tasks = try choices.toOwnedSlice(a);
+            return;
+        }
         if (m.sessions_loaded or !std.mem.startsWith(u8, input, "/resume ")) return;
         _ = m.arena.reset(.retain_capacity);
         m.sessions = try sessionChoices(io, m.arena.allocator(), session);

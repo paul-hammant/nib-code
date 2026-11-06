@@ -435,6 +435,27 @@ class BackgroundRunTests(unittest.TestCase):
                 self.assertEqual(results[-1]["background_id"], "r2")
                 self.assertIn("resumed-result", results[-1]["content"])
 
+    def test_tui_tasks_and_stop_during_model_request(self):
+        self.server.case = "cancel"
+        terminal = Terminal(self.cwd, self.env)
+        try:
+            terminal.send("initial\r")
+            self.assertTrue(self.server.followup.wait(5))
+            pid = int((self.cwd / "worker.pid").read_text())
+            terminal.send("/tasks\r")
+            terminal.until(b"per-tool deadlines")
+            terminal.send("/stop r1\r")
+            terminal.until(b"stopped by user")
+            wait_for(lambda: not alive(pid))
+            paths = [p for p in (self.home / "sessions").glob("*.jsonl") if not p.name.endswith(".calls.jsonl")]
+            rows = [json.loads(line) for line in paths[0].read_text().splitlines()]
+            self.assertIn({"id": "r1", "reason": "user requested stop", "stopped": True},
+                          [r["task_stop"] for r in rows if "task_stop" in r])
+            self.assertTrue(alive(terminal.child.pid))
+        finally:
+            self.server.release.set()
+            terminal.close()
+
     def test_escape_cancels_background_run_in_tui(self):
         self.server.case = "cancel"
         terminal = Terminal(self.cwd, self.env)

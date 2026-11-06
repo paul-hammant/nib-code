@@ -69,7 +69,7 @@ nib --effort high            # reasoning effort for this process
 nib replay <session-id> --all  # replay a session's recorded Runs offline and check they match
 ```
 
-In the TUI, type `/` to list commands: `/new`, `/resume`, `/compact`, `/effort`, `/copy`, `/reflect`, `/js`, `/help`. Esc interrupts the current turn. ctrl+o expands a Run's script, output and diff.
+In the TUI, type `/` to list commands: `/new`, `/resume`, `/compact`, `/effort`, `/copy`, `/reflect`, `/js`, `/tasks`, `/stop <id>`, `/help`. Esc interrupts the current turn. ctrl+o expands a Run's script, output and diff.
 
 Put global instructions in `~/.nib/AGENTS.md` and project conventions in `AGENTS.md` at the project root.
 
@@ -91,3 +91,5 @@ The detailed docs are currently written in Chinese.
 ## License
 
 [MIT](LICENSE)
+
+Use `/tasks` to list background agent, bash and Run ids, descriptions, states, elapsed times and deadlines. `/stop <id>` also works during a turn; type `/stop ` to pick a running task. Stopping may leave partial file changes. See [TUI task controls](docs/tui-ux.md).

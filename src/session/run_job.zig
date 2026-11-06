@@ -11,6 +11,7 @@ pub const Job = struct {
     input_arena: std.heap.ArenaAllocator,
     join_mutex: std.Io.Mutex = .init,
     elapsed_ms: u64 = 0,
+    state: enum { done, failed, canceled, timed_out } = .failed,
     execution: @import("../sandbox/timing.zig").Execution = .{},
     scope: RunScope,
     cancel: std.atomic.Value(bool) = .init(false),
@@ -60,6 +61,7 @@ pub const Job = struct {
         }
         defer job.input_arena.deinit();
         defer {
+            job.state = if (job.cancel.load(.acquire)) .canceled else if (job.outcome) |outcome| (if (outcome.ok) .done else if (std.mem.eql(u8, outcome.text, "Error: run timed out")) .timed_out else .failed) else .failed;
             job.elapsed_ms = job.timing.elapsed();
             job.execution.end_ms_epoch = @import("../sandbox/timing.zig").Execution.now(job.t.io);
         }

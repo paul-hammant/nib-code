@@ -64,6 +64,11 @@ pub const PollTarget = struct {
         try target.sink.emit(target.sink.ctx, .{ .progress = value });
     }
 
+    pub fn notice(ctx: *anyopaque, value: []const u8) !void {
+        const target: *PollTarget = @ptrCast(@alignCast(ctx));
+        try target.sink.emit(target.sink.ctx, .{ .notice = value });
+    }
+
     pub fn background(ctx: *anyopaque, value: @import("events.zig").Background) !void {
         const target: *PollTarget = @ptrCast(@alignCast(ctx));
         try target.sink.emit(target.sink.ctx, .{ .background = value });
