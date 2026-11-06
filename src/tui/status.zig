@@ -70,6 +70,7 @@ pub const Status = struct {
 pub const Text = struct {
     status: [512]u8 = undefined,
     activity: [512]u8 = undefined,
+    narrow_activity: [512]u8 = undefined,
 
     pub fn format(text: *Text, s: Status, scrolled: bool) []const u8 {
         var w: std.Io.Writer = .fixed(&text.activity);
@@ -108,8 +109,17 @@ pub const Text = struct {
     pub fn formatWidth(text: *Text, s: Status, scrolled: bool, width: u16) []const u8 {
         var line = text.format(s, scrolled);
         const vaxis = @import("vaxis");
+        const turn_at = if (s.busy != null) std.mem.lastIndexOf(u8, line, " · turn ") else null;
         while (vaxis.gwidth.gwidth(line, .unicode) > width) {
             if (std.mem.lastIndexOf(u8, line, " · ")) |separator| {
+                if (turn_at == separator) {
+                    const suffix = line[separator..];
+                    const suffix_width = vaxis.gwidth.gwidth(suffix, .unicode);
+                    if (width > suffix_width) {
+                        const primary = ui_format.fit(line[0..separator], width - suffix_width);
+                        return std.fmt.bufPrint(&text.narrow_activity, "{s}{s}{s}", .{ primary.text, primary.suffix, suffix }) catch line[separator + 3 ..];
+                    }
+                }
                 line = line[0..separator];
             } else {
                 var end: usize = 0;
@@ -203,4 +213,13 @@ test "retry line names the next attempt and a concise cause" {
     const s: Status = .{ .cfg = .{ .base_url = "", .api_key = "", .model = "m" }, .detail = "attempt 2/5 · rate limit", .busy = .{ .phase = .retrying, .ms = 0, .turn_ms = 100_000 } };
     try std.testing.expectEqualStrings("⠋ Retrying · attempt 2/5 · rate limit · turn 1m40s · step 1 · Esc to cancel", text.format(s, false));
     try std.testing.expectEqualStrings("rate limit", retryReason("Codex stream failed: rate_limit_exceeded: mock error"));
+}
+
+test "narrow activity preserves Turn time before long command details" {
+    var text: Text = .{};
+    const s: Status = .{ .cfg = .{ .base_url = "", .api_key = "", .model = "m" }, .detail = "bash 很长的构建命令很长的构建命令很长的构建命令很长的构建命令", .busy = .{ .phase = .running, .ms = 0, .turn_ms = 100_000 } };
+    const line = text.formatWidth(s, false, 60);
+    try std.testing.expect(std.mem.endsWith(u8, line, " · turn 1m40s"));
+    try std.testing.expect(std.mem.indexOf(u8, line, "…") != null);
+    try std.testing.expect(@import("vaxis").gwidth.gwidth(line, .unicode) <= 60);
 }
