@@ -92,6 +92,7 @@ class Terminal:
                                       stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
         os.close(slave)
         self.output = b""
+        self.output_changed = threading.Condition()
         self.reader_stop = threading.Event()
         self.reader = threading.Thread(target=self.drain, daemon=True)
         self.reader.start()
@@ -105,7 +106,9 @@ class Terminal:
                 chunk = os.read(self.master, 65536)
                 if not chunk:
                     break
-                self.output += chunk
+                with self.output_changed:
+                    self.output += chunk
+                    self.output_changed.notify_all()
             except OSError:
                 break
 
@@ -113,10 +116,9 @@ class Terminal:
         return self.output
 
     def until(self, text):
-        try:
-            wait_for(lambda: text in self.read(), repr(text))
-        except AssertionError:
-            raise AssertionError((text, self.child.poll(), self.output[-4000:]))
+        with self.output_changed:
+            if not self.output_changed.wait_for(lambda: text in self.output, timeout=10):
+                raise AssertionError((text, self.child.poll(), self.output[-4000:]))
 
     def send(self, text):
         os.write(self.master, text.encode())
@@ -128,7 +130,6 @@ class Terminal:
             self.send("\x03")
             deadline = time.monotonic() + 5
             while self.child.poll() is None and time.monotonic() < deadline:
-                self.read()
                 time.sleep(.02)
             if self.child.poll() is None:
                 self.child.kill()

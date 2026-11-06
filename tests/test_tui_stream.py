@@ -107,7 +107,7 @@ def test_incremental_stream(tmp):
                 terminal.send("\x1b[200~" + token + "\x1b[201~")
                 terminal.until(token.encode())
                 input_latency = time.monotonic() - input_start
-                assert input_latency < .05
+                assert input_latency < .05, f"input latency: {input_latency * 1000:.1f}ms"
                 print(f"PTY chars={milestone} input={input_latency * 1000:.1f}ms")
             wait_for(reply.paused.is_set, "stream pause", timeout=30)
             wait_for(lambda: any("PAUSED_TAIL" in row for row in screen(terminal.read(), 120, 32)), "visible paused tail")
