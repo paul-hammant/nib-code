@@ -91,7 +91,7 @@ fn execute(t: *Tools, gpa: std.mem.Allocator, command: []const u8, timeout_ms: i
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .ignore,
-    }, .execution = execution, .cancel = &active.cancel, .timeout_ms = timeout_ms, .on_tick = .{ .ctx = &tracker, .emit = Tracker.observe }, .on_line = .{ .ctx = &tracker, .emit = Tracker.line }, .max_output_bytes = 16 * 1024 * 1024 });
+    }, .strip_api_key = if (t.cfg) |cfg| cfg.api_key_env else null, .execution = execution, .cancel = &active.cancel, .timeout_ms = timeout_ms, .on_tick = .{ .ctx = &tracker, .emit = Tracker.observe }, .on_line = .{ .ctx = &tracker, .emit = Tracker.line }, .max_output_bytes = 16 * 1024 * 1024 });
     defer {
         if (executed) |result| gpa.free(result.output) else |_| {}
     }

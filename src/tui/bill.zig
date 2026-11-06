@@ -40,7 +40,7 @@ pub const Text = struct {
         var wall: [64]u8 = undefined;
         var model: [64]u8 = undefined;
         var run: [64]u8 = undefined;
-        return std.fmt.bufPrint(&text.buf, "Last turn · {s}\nTotal {s} · model {s} · Run {s}\nInput {d} tokens · output {d} tokens\nCache {d} tokens · {d}% of input\nDelegation · llm {d} · agent {d}", .{
+        return std.fmt.bufPrint(&text.buf, "Last turn · {s}\nTotal {s} · model {s} · Run {s}\nInput {d} tokens · output {d} tokens\nCache {d} tokens · {d}% of input · writes {d} tokens\nDelegation · llm {d} · agent {d}", .{
             @tagName(summary.status),
             ui_format.duration(&wall, summary.timing.wall_ms),
             ui_format.duration(&model, summary.timing.model_ms),
@@ -49,6 +49,7 @@ pub const Text = struct {
             summary.usage.completion_tokens,
             summary.usage.prompt_cache_hit_tokens,
             @as(u128, summary.usage.prompt_cache_hit_tokens) * 100 / @max(summary.usage.prompt_tokens, 1),
+            summary.usage.prompt_cache_write_tokens,
             summary.timing.llm_calls,
             summary.timing.agent_calls,
         }) catch unreachable;

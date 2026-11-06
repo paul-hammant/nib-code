@@ -267,10 +267,14 @@ pub const Tools = struct {
         var models: std.ArrayList([]const u8) = .empty;
         defer models.deinit(a);
         switch (cfg.provider) {
-            .codex => for (@import("provider/codex.zig").models) |model| {
+            .codex => for (@import("provider/responses.zig").models) |model| {
                 try models.append(a, model.id);
             },
             .chat_completions => try models.append(a, @import("provider/openai.zig").default_model),
+            .custom => {},
+            else => for (provider.definition(cfg.provider).models) |model| {
+                try models.append(a, model.id);
+            },
         }
         const known = for (models.items) |model| {
             if (std.mem.eql(u8, cfg.model, model)) break true;
@@ -510,7 +514,7 @@ const EchoLlm = struct {
 };
 
 test "llm map documentation example reaches the host byte for byte" {
-    var t: Tools = .{ .io = testing.io, .home = "/unused", .cfg = .{ .provider = .codex, .base_url = "", .api_key = "", .model = @import("provider/codex.zig").default_model } };
+    var t: Tools = .{ .io = testing.io, .home = "/unused", .cfg = .{ .provider = .codex, .base_url = "", .api_key = "", .model = @import("provider/responses.zig").default_model } };
     const rendered = try t.documentation(testing.allocator);
     defer testing.allocator.free(rendered);
     const marker = "// Example: ";
@@ -593,7 +597,7 @@ fn expectConciseComments(doc: []const u8) !void {
 }
 
 test "generated llm options stay concise and follow provider catalog for both depths" {
-    const codex = @import("provider/codex.zig");
+    const codex = @import("provider/responses.zig");
     const chat = @import("provider/openai.zig");
     for ([_]provider.Id{ .codex, .chat_completions }) |id| {
         for ([_]u32{ 0, 1 }) |depth| {
@@ -626,7 +630,7 @@ test "generated llm options stay concise and follow provider catalog for both de
 
 test "configured default model is not duplicated in the model choices" {
     for ([_]provider.Id{ .codex, .chat_completions }) |id| {
-        const model = if (id == .codex) @import("provider/codex.zig").default_model else @import("provider/openai.zig").default_model;
+        const model = if (id == .codex) @import("provider/responses.zig").default_model else @import("provider/openai.zig").default_model;
         var t: Tools = .{ .io = testing.io, .home = "/unused", .cfg = .{ .provider = id, .base_url = "", .api_key = "", .model = model } };
         const rendered = try t.documentation(testing.allocator);
         defer testing.allocator.free(rendered);

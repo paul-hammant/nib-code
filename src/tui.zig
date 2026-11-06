@@ -142,7 +142,7 @@ pub fn run(init: std.process.Init, session: *Session) !void {
     for (session.history.items) |m| {
         if (m.source != .undo and std.mem.eql(u8, m.role, "user")) try app.input.remember(gpa, m.content orelse "");
     }
-    if (app.cfg.missingKey()) try app.transcript.add(gpa, .err, "no API key: set DEEPSEEK_API_KEY (or NIB_API_KEY). /js <code> still works.");
+    if (app.cfg.missingKey()) try app.transcript.add(gpa, .err, "No API key: set the active provider key environment variable. /js <code> still works.");
 
     while (try app.handle(try loop.nextEvent())) {
         ticker.busy.store(app.turn != null or app.session.tools.background.anyPending(io), .release);

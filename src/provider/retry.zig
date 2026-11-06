@@ -1,6 +1,6 @@
 const std = @import("std");
 const p = @import("../provider.zig");
-const codex = @import("codex.zig");
+const codex = @import("responses.zig");
 
 pub const max_attempts = 5;
 

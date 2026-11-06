@@ -47,6 +47,7 @@ pub fn agent(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolR
     errdefer if (!transferred) t.agent_sessions.release(t.io, id);
     if (a.value.@"resume" != null)
         try t.progress.restart(gpa, t.io, .{ .id = id, .prompt = a.value.prompt, .run = t.runId(), .background = a.value.background, .fork = t.agent_sessions.isFork(t.io, id), .state = .queued });
+    if (cfg.api_key_env != null) cfg.api_key = "";
     const fork_input = if (a.value.fork) blk: {
         var copy = t.forkSnapshot().?;
         copy.id = id;
@@ -113,6 +114,7 @@ pub fn execute(t: *Tools, gpa: std.mem.Allocator, args: []const u8, cancel: *con
     try env.put("NIB_PARENT_SESSION_ID", t.session_id orelse return error.MissingSessionId);
     const executable = try std.process.executablePathAlloc(t.io, gpa);
     defer gpa.free(executable);
+    if (cfg.api_key_env != null) cfg.api_key = "";
     const input = fork_input orelse try std.json.Stringify.valueAlloc(gpa, @import("agent/input.zig").Input{ .prompt = a.value.prompt, .config = cfg, .undo_dir = t.undo_dir }, .{});
     defer if (fork_input == null) gpa.free(input);
     if (background) t.background.beginTask(t.io, id, a.value.timeout_ms);
@@ -120,6 +122,7 @@ pub fn execute(t: *Tools, gpa: std.mem.Allocator, args: []const u8, cancel: *con
     const result = process.run(gpa, t.io, .{
         .spawn = .{ .argv = if (session) |child| &.{ executable, "ask", "--json", "--agent-input", "--resume", child, "-" } else &.{ executable, "ask", "--json", "--agent-input", "-" }, .environ_map = &env, .stdout = .pipe, .stderr = .ignore },
         .input = input,
+        .inherit_api_key = cfg.api_key_env,
         .cancel = cancel,
         .timeout_ms = a.value.timeout_ms,
         .termination_grace_ms = 500,

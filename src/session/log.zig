@@ -75,6 +75,7 @@ pub const Record = struct {
     patches_off: ?[]const []const u8 = null,
     cwd: ?[]const u8 = null,
     provider: ?provider.Id = null,
+    custom_provider: ?[]const u8 = null,
     model: ?[]const u8 = null,
     parent_session_id: ?[]const u8 = null,
     cache_key: ?[]const u8 = null,
@@ -99,6 +100,7 @@ pub const Log = struct {
     poisoned: bool = false,
     steps: usize = 0,
     provider: provider.Id = .chat_completions,
+    custom_provider: ?[]const u8 = null,
     model: ?[]const u8 = null,
     parent_session_id: ?[]const u8 = null,
     cache_key: ?[]const u8 = null,
@@ -123,7 +125,7 @@ pub const Log = struct {
         if (expected_parent) |parent| {
             if (!std.mem.eql(u8, parent, restored.parent_session_id orelse "")) return error.AgentSessionParentMismatch;
         }
-        var log: Log = .{ .file = file, .skills = restored.skills, .offset = data.len, .parent_session_id = restored.parent_session_id, .cache_key = restored.cache_key, .forked_from = restored.forked_from, .provider = restored.provider, .model = restored.model, .steps = restored.steps, .next_agent_id = restored.next_agent_id, .next_bash_id = restored.next_bash_id, .next_run_id = restored.next_run_id, .agent_sessions = restored.agent_sessions, .lost_background = restored.lost_background, .pending_background_bytes = restored.pending_background_bytes };
+        var log: Log = .{ .file = file, .skills = restored.skills, .offset = data.len, .parent_session_id = restored.parent_session_id, .cache_key = restored.cache_key, .forked_from = restored.forked_from, .provider = restored.provider, .custom_provider = restored.custom_provider, .model = restored.model, .steps = restored.steps, .next_agent_id = restored.next_agent_id, .next_bash_id = restored.next_bash_id, .next_run_id = restored.next_run_id, .agent_sessions = restored.agent_sessions, .lost_background = restored.lost_background, .pending_background_bytes = restored.pending_background_bytes };
         if (restored.needs_repair) try log.append(io, a, .{ .repair = true });
         for (restored.background_repairs) |event| try log.append(io, a, .{ .background = event });
         if (restored.needs_repair or restored.background_repairs.len != 0) try log.file.sync(io);
@@ -280,7 +282,7 @@ fn restoreToolSummaries(a: std.mem.Allocator, history: []provider.Message, recor
     }
 }
 
-pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, history: *std.ArrayList(provider.Message), tokens: *u64) !struct { skills: @import("skills.zig").Summary, needs_repair: bool, steps: usize, parent_session_id: ?[]const u8, cache_key: ?[]const u8, forked_from: ?ForkedFrom, provider: provider.Id, model: ?[]const u8, next_agent_id: u64, next_bash_id: u64, next_run_id: u64, agent_sessions: []const AgentSession, lost_background: []const @import("events.zig").Background, background_repairs: []const @import("events.zig").Background, pending_background_bytes: u64 } {
+pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, history: *std.ArrayList(provider.Message), tokens: *u64) !struct { skills: @import("skills.zig").Summary, needs_repair: bool, steps: usize, parent_session_id: ?[]const u8, cache_key: ?[]const u8, forked_from: ?ForkedFrom, provider: provider.Id, custom_provider: ?[]const u8, model: ?[]const u8, next_agent_id: u64, next_bash_id: u64, next_run_id: u64, agent_sessions: []const AgentSession, lost_background: []const @import("events.zig").Background, background_repairs: []const @import("events.zig").Background, pending_background_bytes: u64 } {
     var parent_session_id: ?[]const u8 = null;
     var skills: @import("skills.zig").Summary = .{};
     var cache_key: ?[]const u8 = null;
@@ -295,6 +297,7 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
     var pending_background: std.ArrayList(Pending) = .empty;
     defer pending_background.deinit(a);
     var id: provider.Id = .chat_completions;
+    var custom_provider: ?[]const u8 = null;
     var model: ?[]const u8 = null;
     var replacements: std.StringHashMap(@import("../tools/bash/registry.zig").Event) = .init(gpa);
     defer replacements.deinit();
@@ -315,6 +318,7 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
             cache_key = r.cache_key;
             forked_from = r.forked_from;
             id = r.provider orelse .chat_completions;
+            custom_provider = r.custom_provider;
         }
         if (r.model) |m| model = m;
         if (r.repair) {
@@ -392,7 +396,7 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
             try background_repairs.append(a, pending.event);
         } else try lost_background.append(a, pending.event);
     }
-    return .{ .skills = skills, .steps = steps, .needs_repair = torn or data[data.len - 1] != '\n', .parent_session_id = parent_session_id, .cache_key = cache_key, .forked_from = forked_from, .provider = id, .model = model, .next_agent_id = next_agent_id, .next_bash_id = next_bash_id, .next_run_id = next_run_id, .agent_sessions = try agent_sessions.toOwnedSlice(a), .lost_background = try lost_background.toOwnedSlice(a), .background_repairs = try background_repairs.toOwnedSlice(a), .pending_background_bytes = pending_background_bytes };
+    return .{ .skills = skills, .steps = steps, .needs_repair = torn or data[data.len - 1] != '\n', .parent_session_id = parent_session_id, .cache_key = cache_key, .forked_from = forked_from, .provider = id, .custom_provider = custom_provider, .model = model, .next_agent_id = next_agent_id, .next_bash_id = next_bash_id, .next_run_id = next_run_id, .agent_sessions = try agent_sessions.toOwnedSlice(a), .lost_background = try lost_background.toOwnedSlice(a), .background_repairs = try background_repairs.toOwnedSlice(a), .pending_background_bytes = pending_background_bytes };
 }
 
 fn restoreId(id: []const u8, next_agent: *u64, next_bash: *u64, next_run: *u64) !void {

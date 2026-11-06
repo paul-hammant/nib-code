@@ -1051,6 +1051,9 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
                 totals['steps_with_usage'] += 1
                 for key in TOKEN_KEYS:
                     usage[key] += u[key]
+                writes = u.get('prompt_cache_write_tokens', 0)
+                if number(writes) and writes > 0:
+                    usage['prompt_cache_write_tokens'] = usage.get('prompt_cache_write_tokens', 0) + writes
             ms = record.get('ms')
             if number(ms):
                 totals['steps_with_ms'] += 1

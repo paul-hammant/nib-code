@@ -1,7 +1,7 @@
 const std = @import("std");
 const atomic_file = @import("tools/atomic_file.zig");
 const provider = @import("provider.zig");
-const codex = @import("provider/codex.zig");
+const codex = @import("provider/responses.zig");
 const Allocator = std.mem.Allocator;
 const Env = std.process.Environ.Map;
 
@@ -34,6 +34,8 @@ const Settings = struct {
     base_url: ?[]const u8 = null,
     context_window: ?u64 = null,
     model_line: usize = 1,
+    protocol: ?provider.Protocol = null,
+    api_key_env: ?[]const u8 = null,
     transport: provider.Transport = .websocket,
     run_tool: @FieldType(provider.Config, "codex_run_tool") = .custom,
     reasoning_summary: @FieldType(provider.Config, "reasoning_summary") = .off,
@@ -47,7 +49,12 @@ pub fn skillEnabled(settings: []const SkillSetting, name: []const u8) bool {
 }
 
 const Span = struct { start: usize, end: usize };
+const ProviderSetting = struct { name: []const u8, settings: Settings = .{}, line: usize, seen: [10]bool = @splat(false), custom: bool };
+
 const File = struct {
+    providers: std.ArrayList(ProviderSetting) = .empty,
+    provider_name: ?[]const u8 = null,
+    provider_line: usize = 1,
     skills: std.ArrayList(SkillSetting) = .empty,
     skills_end: ?usize = null,
     top_end: usize = 0,
@@ -158,10 +165,11 @@ fn secretKey(key: []const u8) bool {
 fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u8, detail: *?[]u8) !File {
     var p: Parser = .{ .a = a, .diagnostics = diagnostics, .path = path, .detail = detail };
     var file: File = .{};
-    const Section = enum { chat_completions, codex, limits, skills };
+    const Section = enum { chat_completions, codex, limits, skills, provider_dynamic };
     var section: ?Section = null;
-    var seen_sections: [4]bool = @splat(false);
-    var seen: [4][10]bool = @splat(@splat(false));
+    var seen_sections: [5]bool = @splat(false);
+    var seen: [6][10]bool = @splat(@splat(false));
+    var current_provider: usize = 0;
     var offset: usize = 0;
     while (offset < text.len) : (p.line += 1) {
         const end = if (std.mem.indexOfScalarPos(u8, text, offset, '\n')) |n| n + 1 else text.len;
@@ -178,20 +186,33 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
         if (line[0] == '[') {
             const close = std.mem.indexOfScalar(u8, line, ']') orelse return p.bad("unterminated section", .{});
             const name = std.mem.trim(u8, line[1..close], " \t");
-            if (secretKey(name)) return p.bad("secrets are not allowed; use NIB_API_KEY or DEEPSEEK_API_KEY (Codex uses CODEX_HOME/auth.json)", .{});
+            if (!std.mem.startsWith(u8, name, "providers.") and secretKey(name)) return p.bad("secrets are not allowed; use NIB_API_KEY or DEEPSEEK_API_KEY (Codex uses CODEX_HOME/auth.json)", .{});
             if (section == .skills) file.skills_end = start;
             if (section == null) file.top_end = start;
-            section = std.meta.stringToEnum(Section, name) orelse return p.bad("unknown section '{s}'", .{name});
+            const builtin = std.meta.stringToEnum(provider.Id, name);
+            const custom = std.mem.startsWith(u8, name, "providers.");
+            if (custom or (builtin != null and builtin != .codex and builtin != .chat_completions and builtin != .custom)) {
+                const id = if (custom) name[10..] else name;
+                if (id.len == 0) return p.bad("empty provider id", .{});
+                for (id) |c| if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return p.bad("invalid provider id", .{});
+                if (custom and std.meta.stringToEnum(provider.Id, id) != null) return p.bad("provider id conflicts with built-in '{s}'", .{id});
+                for (file.providers.items) |item| if (std.mem.eql(u8, item.name, id)) return p.bad("duplicate section '{s}'", .{name});
+                current_provider = file.providers.items.len;
+                try file.providers.append(a, .{ .name = try a.dupe(u8, id), .line = p.line, .custom = custom });
+                section = .provider_dynamic;
+            } else section = (if (std.mem.eql(u8, name, "provider_dynamic")) null else std.meta.stringToEnum(Section, name)) orelse return p.bad("unknown section '{s}'", .{name});
+            if (section == .provider_dynamic and !custom and builtin == null) return p.bad("unknown section '{s}'", .{name});
             const tail = std.mem.trimStart(u8, line[close + 1 ..], " \t");
             if (tail.len > 0 and tail[0] != '#') return p.bad("unexpected text after section", .{});
             const index = @backingInt(section.?);
+            if (section == .provider_dynamic) continue;
             if (seen_sections[index]) return p.bad("duplicate section '{s}'", .{name});
             seen_sections[index] = true;
             continue;
         }
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse return p.bad("expected key = value", .{});
         const key = std.mem.trimEnd(u8, line[0..eq], " \t");
-        if (section != .skills and secretKey(key)) return p.bad("secrets are not allowed; use NIB_API_KEY or DEEPSEEK_API_KEY (Codex uses CODEX_HOME/auth.json)", .{});
+        if (section != .skills and !std.mem.eql(u8, key, "api_key_env") and secretKey(key)) return p.bad("secrets are not allowed; use NIB_API_KEY or DEEPSEEK_API_KEY (Codex uses CODEX_HOME/auth.json)", .{});
         if (key.len == 0) return p.bad("empty key", .{});
         for (key) |c| if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return p.bad("expected a bare key (dotted and quoted keys are unsupported)", .{});
         if (section == .skills) {
@@ -214,13 +235,14 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
                 if (std.mem.eql(u8, key, name)) break :blk i;
             }
             return p.bad("unknown limits key '{s}'", .{key});
-        } else if (std.mem.eql(u8, key, "model")) 0 else if (std.mem.eql(u8, key, "base_url")) 1 else if (std.mem.eql(u8, key, "context_window")) 2 else if (section == .codex and std.mem.eql(u8, key, "transport")) 3 else if (section == .codex and std.mem.eql(u8, key, "reasoning_summary")) 4 else if (section == .codex and std.mem.eql(u8, key, "run_tool")) 5 else return p.bad("unknown provider key '{s}'", .{key});
+        } else if (std.mem.eql(u8, key, "model")) 0 else if (std.mem.eql(u8, key, "base_url")) 1 else if (std.mem.eql(u8, key, "context_window")) 2 else if (section == .codex and std.mem.eql(u8, key, "transport")) 3 else if (section == .codex and std.mem.eql(u8, key, "reasoning_summary")) 4 else if (section == .codex and std.mem.eql(u8, key, "run_tool")) 5 else if (section == .provider_dynamic and file.providers.items[current_provider].custom and std.mem.eql(u8, key, "protocol")) 6 else if (section == .provider_dynamic and file.providers.items[current_provider].custom and std.mem.eql(u8, key, "api_key_env")) 7 else return p.bad("unknown provider key '{s}'", .{key});
         const group: usize = if (section) |id| @as(usize, @backingInt(id)) + 1 else 0;
-        if (seen[group][index]) return p.bad("duplicate key '{s}'", .{key});
-        seen[group][index] = true;
+        const keys = if (section == .provider_dynamic) &file.providers.items[current_provider].seen else &seen[group];
+        if (keys[index]) return p.bad("duplicate key '{s}'", .{key});
+        keys[index] = true;
         const value = std.mem.trimStart(u8, line[eq + 1 ..], " \t");
         var consumed: usize = 0;
-        const settings = if (section == .codex) &file.codex_settings else &file.chat_settings;
+        const settings = if (section == .provider_dynamic) &file.providers.items[current_provider].settings else if (section == .codex) &file.codex_settings else &file.chat_settings;
         const parsed = try p.value(value, &consumed);
         if (section == .limits) {
             if (parsed != .integer) return p.bad("{s} must be an integer", .{key});
@@ -250,7 +272,9 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
             const decoded = parsed.string;
             if (section == null) {
                 if (index == 0) {
-                    file.provider_id = std.meta.stringToEnum(provider.Id, decoded) orelse return p.bad("provider must be codex or chat_completions", .{});
+                    file.provider_id = std.meta.stringToEnum(provider.Id, decoded) orelse .custom;
+                    file.provider_name = decoded;
+                    file.provider_line = p.line;
                 } else {
                     file.effort = knownEffort(decoded) orelse return p.bad("invalid effort; expected default|off|none|minimal|low|medium|high|xhigh|max", .{});
                     const value_start = start + @intFromPtr(value.ptr) - @intFromPtr(raw.ptr);
@@ -260,6 +284,12 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
             } else if (index == 0) {
                 settings.model = decoded;
                 settings.model_line = p.line;
+            } else if (index == 6) {
+                settings.protocol = std.meta.stringToEnum(provider.Protocol, decoded) orelse return p.bad("protocol must be responses, chat_completions or anthropic_messages", .{});
+            } else if (index == 7) {
+                if (decoded.len == 0) return p.bad("api_key_env must name an environment variable", .{});
+                for (decoded, 0..) |c, i| if (!(std.ascii.isAlphabetic(c) or c == '_' or (i > 0 and std.ascii.isDigit(c)))) return p.bad("invalid api_key_env name", .{});
+                settings.api_key_env = decoded;
             } else if (index == 3) {
                 settings.transport = std.meta.stringToEnum(provider.Transport, decoded) orelse return p.bad("transport must be websocket or sse", .{});
             } else if (index == 4) {
@@ -273,6 +303,18 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
     }
     if (section == .skills) file.skills_end = text.len;
     if (section == null) file.top_end = text.len;
+    for (file.providers.items) |item| if (item.custom) {
+        if (item.settings.protocol == null or item.settings.base_url == null or item.settings.model == null or item.settings.context_window == null)
+            return fail(diagnostics, detail, path, item.line, "custom provider '{s}' requires protocol, base_url, model and context_window", .{item.name});
+        if (item.settings.base_url.?.len == 0 or item.settings.model.?.len == 0) return fail(diagnostics, detail, path, item.line, "provider base_url and model must not be empty", .{});
+    };
+    if (file.provider_id == .custom) {
+        const name = file.provider_name.?;
+        const found = for (file.providers.items) |item| {
+            if (item.custom and std.mem.eql(u8, name, item.name)) break true;
+        } else false;
+        if (!found) return fail(diagnostics, detail, path, file.provider_line, "provider must be a built-in id or configured custom provider; unknown '{s}'", .{name});
+    }
     return file;
 }
 
@@ -282,12 +324,20 @@ pub fn resolve(a: Allocator, env: *const Env, text: []const u8, path: []const u8
     var scratch: std.heap.ArenaAllocator = .init(a);
     defer scratch.deinit();
     const file = try parse(scratch.allocator(), a, text, path, detail);
-    const id = if (env.get("NIB_PROVIDER")) |v| std.meta.stringToEnum(provider.Id, v) orelse {
-        detail.* = try a.dupe(u8, "NIB_PROVIDER: expected codex or chat_completions");
+    const name = env.get("NIB_PROVIDER") orelse file.provider_name orelse "codex";
+    const id = std.meta.stringToEnum(provider.Id, name) orelse .custom;
+    var settings: Settings = if (id == .codex) file.codex_settings else if (id == .chat_completions) file.chat_settings else .{};
+    var found = false;
+    for (file.providers.items) |item| if (std.mem.eql(u8, item.name, name)) {
+        settings = item.settings;
+        found = true;
+        break;
+    };
+    if (id == .custom and (!found or std.mem.eql(u8, name, "custom"))) {
+        detail.* = try std.fmt.allocPrint(a, "NIB_PROVIDER: unknown provider '{s}'", .{name});
         return error.InvalidProvider;
-    } else file.provider_id orelse .codex;
-    const entry = provider.definition(id);
-    const settings = if (id == .codex) file.codex_settings else file.chat_settings;
+    }
+    const entry = if (id == .custom) provider.Definition{ .id = name, .name = name, .protocol = settings.protocol.?, .base_url = settings.base_url.?, .default_model = settings.model.?, .api_key_env = &.{} } else provider.definition(id);
     const model = env.get("NIB_MODEL") orelse settings.model orelse entry.default_model;
     const context_window = if (env.get("NIB_CONTEXT_WINDOW")) |v| blk: {
         const n = std.fmt.parseInt(u64, v, 10) catch {
@@ -302,8 +352,17 @@ pub fn resolve(a: Allocator, env: *const Env, text: []const u8, path: []const u8
     } else settings.context_window orelse if (id == .codex) codex.contextWindow(model) catch |err| {
         detail.* = try std.fmt.allocPrint(a, "{s}:{d}: unknown Codex model context window; set context_window or NIB_CONTEXT_WINDOW", .{ path, settings.model_line });
         return err;
-    } else 1_000_000;
+    } else blk: {
+        for (entry.models) |item| if (std.mem.eql(u8, item.id, model)) break :blk item.context_window;
+        if (id == .chat_completions) break :blk 1_000_000;
+        return fail(a, detail, path, settings.model_line, "unknown model context window; set context_window or NIB_CONTEXT_WINDOW", .{});
+    };
     var cfg: provider.Config = .{ .provider = id, .api_key = "", .base_url = "", .model = "", .context_window = context_window, .limits = file.limits };
+    if (id == .custom) {
+        cfg.custom_provider = try a.dupe(u8, name);
+        cfg.custom_protocol = settings.protocol.?;
+    }
+    cfg.api_key_env = if (settings.api_key_env) |value| try a.dupe(u8, value) else if (entry.api_key_env.len > 0) try a.dupe(u8, entry.api_key_env[0]) else null;
     cfg.codex_transport = if (env.get("NIB_CODEX_TRANSPORT")) |v| std.meta.stringToEnum(provider.Transport, v) orelse {
         detail.* = try a.dupe(u8, "NIB_CODEX_TRANSPORT: expected websocket or sse");
         return error.InvalidConfig;
@@ -344,8 +403,11 @@ pub fn resolve(a: Allocator, env: *const Env, text: []const u8, path: []const u8
     errdefer a.free(cfg.model);
     cfg.base_url = try a.dupe(u8, env.get("NIB_BASE_URL") orelse settings.base_url orelse entry.base_url);
     errdefer a.free(cfg.base_url);
-    const key = for (entry.api_key_env) |name| {
-        if (env.get(name)) |value| break value;
+    const key = if (settings.api_key_env) |key_env| env.get(key_env) orelse "" else for (entry.api_key_env) |key_name| {
+        if (env.get(key_name)) |value| {
+            cfg.api_key_env = try a.dupe(u8, key_name);
+            break value;
+        }
     } else "";
     cfg.api_key = try a.dupe(u8, key);
     errdefer a.free(cfg.api_key);
@@ -868,4 +930,57 @@ pub fn enabledSkills(a: Allocator, settings: []const SkillSetting) ![]const []co
         try names.append(a, try a.dupe(u8, setting.name));
     };
     return names.toOwnedSlice(a);
+}
+
+test "built-in catalogs custom providers and environment selection" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: Env = .init(t.allocator);
+    defer env.deinit();
+    var detail: ?[]u8 = null;
+    for (provider.definitions) |entry| {
+        try env.put("NIB_PROVIDER", entry.id);
+        if (entry.api_key_env.len > 0) try env.put(entry.api_key_env[0], "fake-key");
+        const cfg = try resolve(a, &env, "", "config.toml", &detail);
+        try t.expectEqualStrings(entry.id, @tagName(cfg.provider));
+        try t.expectEqualStrings(entry.default_model, cfg.model);
+        try t.expectEqual(entry.protocol, cfg.protocol());
+        if (entry.models.len > 0) try t.expectEqual(entry.models[0].context_window, cfg.context_window);
+    }
+    _ = env.swapRemove("NIB_PROVIDER");
+    try env.put("SITE_KEY", "fake-custom-key");
+    const text = "provider = \"mysite\"\n[providers.mysite]\nprotocol = \"responses\"\nbase_url = \"http://localhost:1234/v1\"\nmodel = \"code\"\ncontext_window = 12345\napi_key_env = \"SITE_KEY\"\n";
+    var cfg = try resolve(a, &env, text, "config.toml", &detail);
+    try t.expectEqualStrings("mysite", cfg.name());
+    try t.expectEqualStrings("fake-custom-key", cfg.api_key);
+    try t.expectEqual(provider.Protocol.responses, cfg.protocol());
+    try t.expectEqual(@as(u64, 12345), cfg.context_window);
+    try env.put("NIB_MODEL", "override");
+    try env.put("NIB_CONTEXT_WINDOW", "9876");
+    cfg = try resolve(a, &env, text, "config.toml", &detail);
+    try t.expectEqualStrings("override", cfg.model);
+    try t.expectEqual(@as(u64, 9876), cfg.context_window);
+}
+
+test "custom configuration rejects incomplete duplicate conflicting and secret fields" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "[providers.site]\nmodel = \"x\"",
+        "[providers.openai]\n",
+        "[providers.site]\n[providers.site]\n",
+        "[providers.site]\napi_key = \"secret\"",
+        "[providers.site]\nprotocol = \"fourth_protocol\"",
+        "[providers.site]\napi_key_env = \"BAD-NAME\"",
+        "[openai]\nmodel = \"a\"\nmodel = \"b\"",
+        "[provider_dynamic]\n",
+    }) |text| {
+        var detail: ?[]u8 = null;
+        try t.expectError(error.InvalidConfig, parse(a, a, text, "bad/config.toml", &detail));
+        try t.expect(std.mem.startsWith(u8, detail.?, "bad/config.toml:"));
+    }
 }

@@ -6,7 +6,7 @@ const body_reader = @import("body.zig");
 const websocket = @import("websocket.zig");
 const ws_state = @import("codex_ws.zig");
 
-const Model = struct { id: []const u8, context_window: u64, can_disable_reasoning: bool = true };
+const Model = p.Model;
 pub const models = [_]Model{
     .{ .id = "gpt-6.1-terra", .context_window = 500_000 },
     .{ .id = "gpt-6.1-sol", .context_window = 500_000, .can_disable_reasoning = false },
@@ -64,6 +64,18 @@ fn authError(gpa: std.mem.Allocator, detail: *?[]u8, message: []const u8) !std.j
 }
 
 pub fn stream(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.Client, cfg: p.Config, cache_key: []const u8, messages: []const p.Message, tools_json: []const u8, max_tokens: ?u32, sink: p.Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, monitor: *idle.Monitor) !p.Reply {
+    if (cfg.provider != .codex) {
+        var reply = streamSse(gpa, out, client, cfg, cache_key, messages, tools_json, max_tokens, sink, cancel, detail, monitor) catch |err| {
+            if (detail.*) |old| {
+                const renamed = try std.mem.replaceOwned(u8, gpa, old, "Codex", cfg.name());
+                gpa.free(old);
+                detail.* = renamed;
+            }
+            return err;
+        };
+        if (reply.reasoning) |*reasoning| reasoning.provider = cfg.provider;
+        return reply;
+    }
     var local: ws_state.State = .{};
     defer local.reset(gpa);
     const state = sink.codex_state orelse &local;
@@ -192,24 +204,24 @@ fn streamWebSocket(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.
 fn streamSse(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.Client, cfg: p.Config, cache_key: []const u8, messages: []const p.Message, tools_json: []const u8, max_tokens: ?u32, sink: p.Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, monitor: *idle.Monitor) !p.Reply {
     const body = try requestBody(gpa, cfg, cache_key, messages, tools_json, max_tokens);
     defer gpa.free(body);
-    const url = try std.fmt.allocPrint(gpa, "{s}/codex/responses", .{std.mem.trimEnd(u8, cfg.base_url, "/")});
+    const url = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ std.mem.trimEnd(u8, cfg.base_url, "/"), if (cfg.provider == .codex) "codex/responses" else "responses" });
     defer gpa.free(url);
     for (0..2) |attempt| {
-        const auth = try credentials(gpa, client.io, cfg, detail);
-        defer auth.deinit();
-        const bearer = try std.fmt.allocPrint(gpa, "Bearer {s}", .{auth.value.tokens.access_token});
+        const auth = if (cfg.provider == .codex) try credentials(gpa, client.io, cfg, detail) else null;
+        defer if (auth) |value| value.deinit();
+        const bearer = try std.fmt.allocPrint(gpa, "Bearer {s}", .{if (auth) |value| value.value.tokens.access_token else cfg.api_key});
         defer gpa.free(bearer);
         var req = try client.request(.POST, try std.Uri.parse(url), .{
             .redirect_behavior = .not_allowed,
-            .headers = .{ .authorization = .{ .override = bearer }, .content_type = .{ .override = "application/json" }, .accept_encoding = .omit },
-            .extra_headers = &.{
+            .headers = .{ .authorization = if (auth != null or cfg.api_key.len > 0) .{ .override = bearer } else .omit, .content_type = .{ .override = "application/json" }, .accept_encoding = .omit },
+            .extra_headers = if (auth != null) &.{
                 .{ .name = "accept", .value = "text/event-stream" },
-                .{ .name = "chatgpt-account-id", .value = auth.value.tokens.account_id },
+                .{ .name = "chatgpt-account-id", .value = auth.?.value.tokens.account_id },
                 .{ .name = "OpenAI-Beta", .value = "responses=experimental" },
                 .{ .name = "originator", .value = "nib" },
                 .{ .name = "session-id", .value = cache_key },
                 .{ .name = "x-client-request-id", .value = cache_key },
-            },
+            } else &.{.{ .name = "accept", .value = "text/event-stream" }},
         });
         defer req.deinit();
         req.transfer_encoding = .{ .content_length = body.len };
@@ -225,6 +237,10 @@ fn streamSse(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.C
         const reader = response.reader(buffer);
         const status = @backingInt(response.head.status);
         if (status == 401) {
+            if (cfg.provider != .codex) {
+                detail.* = try std.fmt.allocPrint(gpa, "{s}: HTTP 401; check {s}.", .{ cfg.name(), cfg.api_key_env orelse "API key" });
+                return error.HttpStatus;
+            }
             if (attempt == 0) continue;
             detail.* = try gpa.dupe(u8, "Codex authentication expired or was revoked (HTTP 401); run codex to log in again.");
             return error.HttpStatus;
@@ -254,7 +270,7 @@ fn requestBody(gpa: std.mem.Allocator, cfg: p.Config, cache_key: []const u8, mes
             instructions = m.content orelse instructions;
             continue;
         }
-        if (m.reasoning) |r| if (r.provider == .codex) {
+        if (m.reasoning) |r| if (r.provider == cfg.provider) {
             const items = try std.json.parseFromSliceLeaky([]const std.json.Value, a, r.data, .{});
             for (items) |raw| {
                 const item = if (r.includes_output) (try ws_state.normalize(a, raw) orelse return error.InvalidResponse) else raw;
@@ -300,14 +316,14 @@ fn requestBody(gpa: std.mem.Allocator, cfg: p.Config, cache_key: []const u8, mes
     try tool_writer.writer.writeByte('[');
     for (tools, 0..) |tool, i| {
         if (i != 0) try tool_writer.writer.writeByte(',');
-        if (cfg.codex_run_tool == .custom and std.mem.eql(u8, tool.function.name, "run")) {
+        if (cfg.customRun() and std.mem.eql(u8, tool.function.name, "run")) {
             try tool_writer.writer.print("{f}", .{std.json.fmt(.{ .type = "custom", .name = "run", .description = custom_run_description, .format = .{ .type = "grammar", .syntax = "lark", .definition = custom_run_grammar } }, .{})});
         } else {
             try tool_writer.writer.print("{f}", .{std.json.fmt(.{ .type = "function", .name = tool.function.name, .description = tool.function.description, .parameters = tool.function.parameters, .strict = false }, .{})});
         }
     }
     try tool_writer.writer.writeByte(']');
-    const effort = reasoningEffort(cfg);
+    const effort = if (cfg.provider == .xai and (cfg.thinking == false or (cfg.reasoning_effort != null and (std.mem.eql(u8, cfg.reasoning_effort.?, "none") or std.mem.eql(u8, cfg.reasoning_effort.?, "minimal"))))) null else reasoningEffort(cfg);
     const reasoning = if (effort != null or cfg.reasoning_summary == .auto) try std.fmt.allocPrint(a, ",\"reasoning\":{f}", .{std.json.fmt(.{ .effort = effort, .summary = if (cfg.reasoning_summary == .auto) @as(?[]const u8, "auto") else null }, .{ .emit_null_optional_fields = false })}) else "";
     const format = if (cfg.output_schema) |schema|
         try std.fmt.allocPrint(a, ",\"text\":{f}", .{std.json.fmt(.{ .format = .{ .type = "json_schema", .name = "result", .strict = true, .schema = schema } }, .{})})
@@ -363,7 +379,7 @@ const ResponseEvent = struct {
         usage: ?struct {
             input_tokens: u64 = 0,
             output_tokens: u64 = 0,
-            input_tokens_details: ?struct { cached_tokens: u64 = 0 } = null,
+            input_tokens_details: ?struct { cached_tokens: u64 = 0, cache_write_tokens: u64 = 0 } = null,
         } = null,
     } = null,
 };
@@ -463,7 +479,7 @@ fn readEvents(gpa: std.mem.Allocator, out: std.mem.Allocator, reader: *std.Io.Re
             };
             if (pending != 0) return incompleteResponse(gpa, detail);
             if (socket != null) if (sink.codex_state) |state| try state.remember(gpa, body, response.id, items.items);
-            if (response.usage) |u| usage = .{ .prompt_tokens = u.input_tokens, .completion_tokens = u.output_tokens, .prompt_cache_hit_tokens = if (u.input_tokens_details) |d| d.cached_tokens else 0 };
+            if (response.usage) |u| usage = .{ .prompt_tokens = u.input_tokens, .completion_tokens = u.output_tokens, .prompt_cache_hit_tokens = if (u.input_tokens_details) |d| d.cached_tokens else 0, .prompt_cache_write_tokens = if (u.input_tokens_details) |d| d.cache_write_tokens else 0 };
             break;
         }
     }
@@ -914,4 +930,20 @@ test "WebSocket protocol fallback keeps cancellation and transient failures on t
     const t = std.testing;
     for ([_]anyerror{ error.WebSocketHandshake, error.WebSocketProtocol, error.WebSocketMessageTooLarge }) |err| try t.expect(fallbackError(err));
     for ([_]anyerror{ error.InvalidResponse, error.Canceled, error.OutOfMemory, error.StreamIdleTimeout, error.RateLimited, error.ProviderFailed, error.WebSocketClosed, error.WebSocketConnectionLimit }) |err| try t.expect(!fallbackError(err));
+}
+
+test "Responses API custom Run is a catalog capability and xAI uses function" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"run\",\"description\":\"execute\",\"parameters\":{\"type\":\"object\",\"properties\":{\"code\":{\"type\":\"string\"}},\"required\":[\"code\"]}}}]";
+    for ([_]p.Id{ .openai, .xai }) |id| {
+        const cfg: p.Config = .{ .provider = id, .base_url = "", .api_key = "fake", .model = "model" };
+        const body = try requestBody(a, cfg, "cache", &.{.{ .role = "user", .content = "task" }}, tools, null);
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
+        try t.expectEqualStrings(if (id == .openai) "custom" else "function", value.object.get("tools").?.array.items[0].object.get("type").?.string);
+        try t.expect(!value.object.get("store").?.bool);
+        try t.expect(std.mem.indexOf(u8, body, "fake") == null);
+    }
 }

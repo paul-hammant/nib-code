@@ -9,6 +9,7 @@ pub const Fork = struct {
     cache_key: []const u8,
     id: []const u8,
     provider: provider.Id,
+    custom_provider: ?[]const u8 = null,
     model: []const u8,
     thinking: ?bool = null,
     reasoning_effort: ?[]const u8 = null,

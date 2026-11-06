@@ -29,7 +29,7 @@ const Chunk = struct {
         prompt_tokens: u64 = 0,
         completion_tokens: u64 = 0,
         prompt_cache_hit_tokens: u64 = 0,
-        prompt_tokens_details: ?struct { cached_tokens: u64 = 0 } = null,
+        prompt_tokens_details: ?struct { cached_tokens: u64 = 0, cache_write_tokens: u64 = 0 } = null,
     } = null,
 };
 
@@ -60,7 +60,7 @@ pub fn stream(
     detail: *?[]u8,
     monitor: *idle.Monitor,
 ) !Reply {
-    const url = try std.fmt.allocPrint(gpa, "{s}/chat/completions", .{cfg.base_url});
+    const url = try std.fmt.allocPrint(gpa, "{s}/chat/completions", .{std.mem.trimEnd(u8, cfg.base_url, "/")});
     defer gpa.free(url);
     const auth = try std.fmt.allocPrint(gpa, "Bearer {s}", .{cfg.api_key});
     defer gpa.free(auth);
@@ -70,7 +70,7 @@ pub fn stream(
     var req = try client.request(.POST, try std.Uri.parse(url), .{
         .redirect_behavior = .not_allowed,
         .headers = .{
-            .authorization = .{ .override = auth },
+            .authorization = if (cfg.api_key.len > 0) .{ .override = auth } else .omit,
             .content_type = .{ .override = "application/json" },
             .accept_encoding = .omit,
         },
@@ -94,6 +94,10 @@ pub fn stream(
 
     if (response.head.status.class() != .success) {
         const status = @backingInt(response.head.status);
+        if (status == 401) {
+            detail.* = try std.fmt.allocPrint(gpa, "{s}: HTTP 401; check {s}.", .{ cfg.name(), cfg.api_key_env orelse "API key" });
+            return error.HttpStatus;
+        }
         const text = response_reader.allocRemaining(gpa, .limited(64 * 1024)) catch "";
         defer if (text.len > 0) gpa.free(text);
         detail.* = try std.fmt.allocPrint(gpa, "HTTP {d}: {s}", .{ status, text });
@@ -138,7 +142,7 @@ pub fn stream(
             .ignore_unknown_fields = true,
         }) catch return error.InvalidResponse;
         if (sink.timing) |timing| observeTiming(timing, chunk);
-        if (chunk.usage) |u| usage = .{ .prompt_tokens = u.prompt_tokens, .completion_tokens = u.completion_tokens, .prompt_cache_hit_tokens = if (u.prompt_tokens_details) |d| d.cached_tokens else u.prompt_cache_hit_tokens };
+        if (chunk.usage) |u| usage = .{ .prompt_tokens = u.prompt_tokens, .completion_tokens = u.completion_tokens, .prompt_cache_hit_tokens = if (u.prompt_tokens_details) |d| d.cached_tokens else u.prompt_cache_hit_tokens, .prompt_cache_write_tokens = if (u.prompt_tokens_details) |d| d.cache_write_tokens else 0 };
         for (chunk.choices) |choice| {
             const d = choice.delta;
             if (d.content) |value| monitor.content(value.len);
@@ -180,7 +184,7 @@ pub fn stream(
     if (sink.timing) |timing| {
         for (tool_calls, 0..) |_, index| timing.bind(index, index);
     }
-    return .{ .text = try out.dupe(u8, text.items), .reasoning = if (reasoning.items.len > 0) .{ .provider = .chat_completions, .data = try out.dupe(u8, reasoning.items) } else null, .tool_calls = tool_calls, .usage = usage };
+    return .{ .text = try out.dupe(u8, text.items), .reasoning = if (reasoning.items.len > 0) .{ .provider = cfg.provider, .data = try out.dupe(u8, reasoning.items) } else null, .tool_calls = tool_calls, .usage = usage };
 }
 
 fn observeTiming(timing: *@import("../provider.zig").ModelTiming, chunk: Chunk) void {
@@ -206,7 +210,7 @@ fn requestBody(gpa: std.mem.Allocator, cfg: Config, messages: []const Message, t
         .content = m.content,
         .tool_calls = m.tool_calls,
         .tool_call_id = m.tool_call_id,
-        .reasoning_content = if (m.reasoning) |r| if (r.provider == .chat_completions) r.data else null else null,
+        .reasoning_content = if (m.reasoning) |r| if (r.provider == cfg.provider) r.data else null else null,
     };
     const opts: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
     const limit = if (max_tokens) |n| try std.fmt.allocPrint(gpa, ",\"max_tokens\":{d}", .{n}) else try gpa.dupe(u8, "");
