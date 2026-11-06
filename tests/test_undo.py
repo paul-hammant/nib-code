@@ -104,7 +104,7 @@ def test_conflict_and_busy(tmp):
         assert gated.received.wait(5)
         before = len(history(home))
         terminal.send("/undo\r")
-        terminal.until(b"press Esc to stop it first")
+        terminal.until(b"Press Esc to stop the Turn before /undo.")
         assert len(history(home)) == before
         assert not gated.release.is_set()
         gated.release.set()
@@ -177,7 +177,7 @@ def test_cancelled_turn(tmp):
         terminal.send("edit and wait\r")
         wait_for(lambda: (tmp / "a").read_text() == "changed", "edit before cancellation")
         terminal.send("\x1b")
-        terminal.until(b"canceled")
+        terminal.until(b"Canceled")
         undo(terminal, home, "restored:")
         assert (tmp / "a").read_text() == "old"
 

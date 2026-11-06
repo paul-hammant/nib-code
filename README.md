@@ -53,7 +53,7 @@ Put global instructions in `~/.nib/AGENTS.md` and project conventions in the roo
 Each block represents one script execution. The title comes from actual tool calls, followed by changed files and line counts, read/search paths, and command results.
 
 ```text
-  Run · read ×3 · grep · edit 2 files · bash
+  Run · edit 2 files · bash
     src/grep.zig +38 −9 · src/tools.zig +2 −1
     read src/grep.zig · read src/tools.zig · grep src
     └─ b1 bash zig build test · 1s · completed ✓ exit 0
@@ -86,7 +86,7 @@ nib replay <session-id> --all    # offline replay
 
 Type `/` for commands grouped into Send / View / Session, and `/help` for all keys. User messages have a blue accent bar and a subtle background adapted to the terminal theme. Drag to select text and release to copy it; hold the mouse button and scroll to select across screens.
 
-Version 0.4.0. This is a personal project and still changes quickly.
+Version 0.5.0. This is a personal project and still changes quickly.
 
 ## Safety
 

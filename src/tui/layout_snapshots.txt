@@ -58,7 +58,7 @@
 
 
 
- ⠹ Waiting for model · turn <1s · step 1 · Esc to cancel
+ ⠹ Waiting for model · turn <1s · Esc to cancel
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │ Ask about this project · / for commands                                      │
 ╰─ mock────────────────────────────────────────────────────────────────────────╯

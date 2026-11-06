@@ -187,6 +187,7 @@ pub const Recovery = struct {
             try text.appendSlice(gpa, shown);
         }
         if (r.bash) try text.appendSlice(gpa, " · bash changes untracked");
+        if (r.paths.items.len > 0) try text.appendSlice(gpa, " · /undo to revert edit/write");
         try text.appendSlice(gpa, " · type continue to resume");
         for (text.items) |*byte| if (byte.* < 0x20 or byte.* == 0x7f) {
             byte.* = ' ';
@@ -204,7 +205,7 @@ test "recovery records only this Turn's unique paths and distinguishes failure c
     r.noteBash(testing.io);
     const text = try r.hint(testing.allocator, testing.io, .canceled, "/project");
     defer testing.allocator.free(text);
-    try testing.expectEqualStrings("Canceled · edited: a.zig, b.zig · bash changes untracked · type continue to resume", text);
+    try testing.expectEqualStrings("Canceled · edited: a.zig, b.zig · bash changes untracked · /undo to revert edit/write · type continue to resume", text);
     r.clear(testing.allocator, testing.io);
     const empty = try r.hint(testing.allocator, testing.io, .model, "/project");
     defer testing.allocator.free(empty);

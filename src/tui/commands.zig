@@ -211,7 +211,7 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
             }
         },
         .undo => {
-            if (app.turn != null) return app.transcript.add(gpa, .err, "Cannot undo during a Turn; press Esc to stop it first.");
+            if (app.turn != null) return app.transcript.add(gpa, .err, "Press Esc to stop the Turn before /undo.");
             if (arg.len != 0) return app.transcript.add(gpa, .err, "usage: /undo");
             const text = session.undo() catch |err| return app.report(.err, "undo failed: {s}; re-read files before continuing", .{@errorName(err)});
             defer gpa.free(text);

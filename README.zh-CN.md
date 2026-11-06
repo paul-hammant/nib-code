@@ -53,7 +53,7 @@ Enter 发送，Shift+Enter 换行，Esc 取消。运行中可以继续发送要�
 一个块对应一次脚本执行。下例的标题来自实际工具调用；次行列出文件改动和增删行数，之后是读取/搜索路径与命令结果。
 
 ```text
-  Run · read ×3 · grep · edit 2 files · bash
+  Run · edit 2 files · bash
     src/grep.zig +38 −9 · src/tools.zig +2 −1
     read src/grep.zig · read src/tools.zig · grep src
     └─ b1 bash zig build test · 1s · completed ✓ exit 0
@@ -86,7 +86,7 @@ nib replay <会话ID> --all       # 离线重放
 
 输入 `/` 查看按 Send / View / Session 分组的指令，`/help` 查看全部快捷键。用户消息带蓝色色条和适配终端主题的淡底色。鼠标拖选后松开即复制；按住左键滚动可跨屏选择。
 
-当前版本 0.4.0，个人项目，仍在快速迭代。
+当前版本 0.5.0，个人项目，仍在快速迭代。
 
 ## 安全
 

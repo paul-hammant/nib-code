@@ -57,7 +57,6 @@ pub const Status = struct {
     user_bg: @import("vaxis").Color = .default,
     usage: provider.Usage = .{},
     steps: u32 = 0,
-    current_step: u32 = 1,
     background_count: usize = 0,
     context: u64 = 0,
     /// Set while a Turn runs.
@@ -90,7 +89,7 @@ pub const Text = struct {
             var elapsed: [64]u8 = undefined;
             w.print(" · turn {s}", .{ui_format.duration(&elapsed, b.turn_ms)}) catch {};
             if (b.quiet_ms >= 30_000) w.print(" · no progress {s}", .{ui_format.duration(&elapsed, b.quiet_ms)}) catch {};
-            w.print(" · step {d} · Esc to cancel", .{s.current_step}) catch {};
+            w.writeAll(" · Esc to cancel") catch {};
         }
         if (s.background_count > 0) {
             if (w.end > 0) w.writeAll(" · ") catch {};
@@ -160,7 +159,7 @@ test "activity is optional and footer shows latest reported usage" {
     const cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "m", .context_window = 1000 };
     try std.testing.expectEqualStrings("", text.format(.{ .cfg = cfg }, false));
     try std.testing.expectEqualStrings("↑ history · PgDn to return", text.format(.{ .cfg = cfg }, true));
-    try std.testing.expectEqualStrings("⠙ Running Run · turn <1s · step 2 · Esc to cancel · copied 3 chars", text.format(.{ .cfg = cfg, .current_step = 2, .busy = .{ .phase = .running, .ms = 150 }, .notice = "copied 3 chars" }, false));
+    try std.testing.expectEqualStrings("⠙ Running Run · turn <1s · Esc to cancel · copied 3 chars", text.format(.{ .cfg = cfg, .busy = .{ .phase = .running, .ms = 150 }, .notice = "copied 3 chars" }, false));
     const line = text.footer(.{ .cfg = cfg, .context = 250, .steps = 2, .usage = .{ .prompt_tokens = 1_800_000, .prompt_cache_hit_tokens = 1_692_000, .completion_tokens = 18_000 } }, 200);
     try std.testing.expectEqualStrings("m · context 25%", line);
     const busy = text.footer(.{ .cfg = cfg, .context = 400, .steps = 1, .usage = .{ .prompt_tokens = 1200, .completion_tokens = 50, .prompt_cache_hit_tokens = 600 }, .busy = .{ .phase = .running, .ms = 100 } }, 200);
@@ -171,7 +170,7 @@ test "background task count remains visible during model work" {
     const t = std.testing;
     var text: Text = .{};
     const s: Status = .{ .cfg = .{ .base_url = "", .api_key = "", .model = "m" }, .busy = .{ .phase = .thinking, .ms = 0 }, .background_count = 2 };
-    try t.expectEqualStrings("⠋ Waiting for model · turn <1s · step 1 · Esc to cancel · 2 background tasks", text.format(s, false));
+    try t.expectEqualStrings("⠋ Waiting for model · turn <1s · Esc to cancel · 2 background tasks", text.format(s, false));
     try t.expectEqualStrings("m", text.footer(s, 200));
     try t.expectEqualStrings("2 background tasks", text.format(.{ .cfg = s.cfg, .background_count = 2 }, false));
 }
@@ -193,7 +192,7 @@ test "only content advances progress; stage changes preserve Turn duration" {
     var text: Text = .{};
     const cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "m" };
     const s: Status = .{ .cfg = cfg, .detail = "r3 · 32s", .busy = .{ .phase = .waiting, .ms = 0, .turn_ms = 574000, .quiet_ms = 30000 } };
-    try t.expectEqualStrings("⠋ Waiting for r3 · 32s · turn 9m34s · no progress 30s · step 1 · Esc to cancel", text.format(s, false));
+    try t.expectEqualStrings("⠋ Waiting for r3 · 32s · turn 9m34s · no progress 30s · Esc to cancel", text.format(s, false));
     for (0..100) |width| {
         const line = text.formatWidth(s, false, @intCast(width));
         try t.expect(@import("vaxis").gwidth.gwidth(line, .unicode) <= width);
@@ -212,7 +211,7 @@ test "footer is quiet initially and contains only model and context" {
 test "retry line names the next attempt and a concise cause" {
     var text: Text = .{};
     const s: Status = .{ .cfg = .{ .base_url = "", .api_key = "", .model = "m" }, .detail = "attempt 2/5 · rate limit", .busy = .{ .phase = .retrying, .ms = 0, .turn_ms = 100_000 } };
-    try std.testing.expectEqualStrings("⠋ Retrying · attempt 2/5 · rate limit · turn 1m40s · step 1 · Esc to cancel", text.format(s, false));
+    try std.testing.expectEqualStrings("⠋ Retrying · attempt 2/5 · rate limit · turn 1m40s · Esc to cancel", text.format(s, false));
     try std.testing.expectEqualStrings("rate limit", retryReason("Codex stream failed: rate_limit_exceeded: mock error"));
 }
 

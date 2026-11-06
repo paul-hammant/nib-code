@@ -546,7 +546,6 @@ pub const App = struct {
             .user_bg = app.user_bg,
             .usage = app.usage,
             .steps = app.steps,
-            .current_step = @max(1, app.live_steps),
             .background_count = app.background_count,
             .context = app.context,
             .busy = if (app.turn != null) app.activity.label(app.io) else null,

@@ -1,9 +1,9 @@
 # `/undo`：按 Turn 撤销文件修改
 
-TUI 空闲时输入 `/undo`，回退最近一个尚未撤销、且确实通过 `tools.edit` / `tools.write` 修改文件的 Turn。重复输入可继续回退。进行中的 Turn 会提示先按 Esc 停止；停止后的半成品修改也在该 Turn 的撤销记录里。纯问答 Turn 不占记录。
+TUI 空闲时输入 `/undo`，回退最近一个尚未撤销、且确实通过 `tools.edit` / `tools.write` 修改文件的 Turn。重复输入可继续回退。进行中的 Turn 会提示 `Press Esc to stop the Turn before /undo.`；停止后的半成品修改也在该 Turn 的撤销记录里。纯问答 Turn 不占记录。
 
 ```text
-> /undo
+› /undo
 [undo] Restoring files to their contents before the latest edited Turn. Re-read listed files before continuing.
 restored: /project/src/main.zig
 deleted: /project/新文件.txt

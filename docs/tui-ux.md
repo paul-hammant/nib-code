@@ -10,8 +10,10 @@ Run 始终保留父标题。自动转后台时显示 `Run · r3 running`；结�
 
 重试显示 `Retrying · attempt 2/5 · rate limit`，移除失败尝试的流式草稿，保留此前成功的回答和排队插话。最终错误用一句说明加 Details，Ctrl+O 查看原始错误。取消仅显示一次恢复提示；未消费的排队消息回到输入框，已有草稿仍保留，并显示返回的消息数。
 
-Turn 失败或取消后显示本轮直接 edit/write 修改的文件及 `type continue to resume`。路径按首次修改去重，包括尚未交回 Run 结果的写入；不把子 agent 的修改当作根 Session 的直接修改。若运行过 bash，会注明 `bash changes untracked`；没有记录时显示 `no recorded edit/write changes`。取消不会回滚文件，下一次普通输入继续沿用 Session 上下文。
+Turn 失败或取消后显示本轮直接 edit/write 修改的文件及 `type continue to resume`，有直接修改时另提示 `/undo to revert edit/write`。路径按首次修改去重，包括尚未交回 Run 结果的写入；不把子 agent 的修改当作根 Session 的直接修改。若运行过 bash，会注明 `bash changes untracked`；没有记录时显示 `no recorded edit/write changes`。取消不会回滚文件，下一次普通输入继续沿用 Session 上下文。
 
 恢复提示仅由 TUI 生成，不进入模型历史；`nib ask`（包括非 TTY 和 NDJSON）不增加恢复提示，保留原来的输出通道和退出码，便于脚本继续解析。`run_end` 新增可选 `background_id` 用于关联自动后台 Run；NDJSON 的事件结构仍保持原格式。
 
 底栏只显示模型和已有用量报告对应的 context 百分比；首次启动只显示模型。轮末页脚显示非零的 Run 数、步数、总时间、tokens 和工具数据量，详细模型/Run 耗时与缓存放在 `/status`（本地命令，运行时也可查看）。
+
+用户消息使用 `›` 前缀、蓝色色条和按终端背景色生成的淡底色，兼容明暗主题。拖选时按住左键滚动可跨屏延伸，松开复制完整历史范围，包含滚出屏幕的行；选择期间暂停底部跟随。`/undo` 的范围与冲突处理见 [undo.md](undo.md)。

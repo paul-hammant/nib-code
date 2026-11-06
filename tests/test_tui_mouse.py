@@ -65,8 +65,9 @@ def test_background_report_and_user_card(tmp):
             wait_for(lambda: len(terminal.read()) > start, "theme redraw")
             assert terminal.child.poll() is None
         start = len(terminal.read())
-        terminal.send(mouse(0, 3, 0) + mouse(32, 12, 0) + mouse(0, 12, 0, release=True))
-        assert clipboard(terminal, start) == "mouse test"
+        terminal.send(mouse(0, 5, 0) + mouse(32, 14, 0) + mouse(0, 14, 0, release=True))
+        copied = clipboard(terminal, start)
+        assert copied == "mouse test", repr(copied)
 
 
 if __name__ == "__main__":

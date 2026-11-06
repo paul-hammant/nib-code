@@ -248,7 +248,7 @@ test "layout snapshots: normal, short, tiny, narrow, menu, busy and history" {
             try testing.expectEqualStrings("╰", screen.readCell(0, if (c.h >= 8) c.h - 2 else c.h - 1).?.char.grapheme);
             try testing.expectEqualStrings("╯", screen.readCell(c.w - 1, if (c.h >= 8) c.h - 2 else c.h - 1).?.char.grapheme);
         } else try testing.expect(std.mem.indexOf(u8, image, "› Ask about this project") != null);
-        if (c.busy) try testing.expect(std.mem.indexOf(u8, image, "Waiting for model · turn <1s · step 1 · Esc to cancel") != null);
+        if (c.busy) try testing.expect(std.mem.indexOf(u8, image, "Waiting for model · turn <1s · Esc to cancel") != null);
         if (c.history) try testing.expect(std.mem.indexOf(u8, image, "↑ history · PgDn to return") != null);
         if (c.notice) try testing.expect(std.mem.indexOf(u8, image, "copied 3 chars") != null);
         if (c.menu) try testing.expect(std.mem.indexOf(u8, image, "/help") != null);

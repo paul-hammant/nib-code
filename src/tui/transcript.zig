@@ -784,10 +784,12 @@ test "user cards tint wrapped rows, retain terminal foreground and leave gaps un
     for (0..height) |row| {
         try testing.expectEqualStrings("▎", screen.readCell(0, @intCast(row)).?.char.grapheme);
         try testing.expectEqualDeep(entry.user_bg, screen.readCell(17, @intCast(row)).?.style.bg);
-        const body = screen.readCell(2, @intCast(row)).?;
+        const body = screen.readCell(if (row == 0) 4 else 2, @intCast(row)).?;
         try testing.expect(body.style.fg == .default);
         try testing.expect(!body.style.bold);
     }
+    try testing.expectEqualStrings("›", screen.readCell(2, 0).?.char.grapheme);
+    try testing.expectEqual(@as(u8, 4), screen.readCell(2, 0).?.style.fg.index);
     try testing.expect(screen.readCell(0, height).?.style.bg == .default);
     win.clear();
     _ = entry.print(win.child(.{ .y_off = -1, .height = height }), true);
@@ -1465,7 +1467,7 @@ test "Run facts name changed files and retain warning without changing script su
     try t.endRunWithSummary(a, true, "result", 10, .{ .file_count = 2 }, summary);
     const e = &t.entries.items[0];
     try testing.expectEqual(.ok, e.run);
-    try testing.expectEqualStrings("Run · a1 timed out · read ×3 · edit 2 files · bash", e.label.items);
+    try testing.expectEqualStrings("Run · a1 timed out · edit 2 files · bash", e.label.items);
     try testing.expectEqualStrings("read a.zig", e.files.items);
     var segs: [max_segments]vaxis.Segment = undefined;
     try testing.expectEqualStrings("! ", e.segments(&segs)[0].text);
