@@ -137,7 +137,8 @@ def main():
             server = subprocess.Popen(["python3", str(ROOT / "tests" / mock), str(port), str(requests_path)],
                                       env=env, stdout=subprocess.DEVNULL)
             try:
-                for _ in range(100):
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline:
                     try:
                         with socket.create_connection(("127.0.0.1", port), timeout=.1):
                             break

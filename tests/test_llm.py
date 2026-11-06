@@ -85,7 +85,7 @@ class LlmTests:
                     return True
             except OSError:
                 return False
-        wait_for(ready)
+        wait_for(ready, timeout=15)
 
     @classmethod
     def stop_server(cls):

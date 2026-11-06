@@ -12,6 +12,7 @@ import shlex
 import signal
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import threading
@@ -84,12 +85,10 @@ class Terminal:
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 32, 120, 0, 0))
 
-        def controlling_tty():
-            os.setsid()
-            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-
-        self.child = subprocess.Popen([str(BIN)], cwd=cwd, env=env, stdin=slave, stdout=slave, stderr=slave,
-                                      preexec_fn=controlling_tty)
+        # Acquire the controlling TTY after exec; preexec_fn can deadlock after threads start.
+        bootstrap = "import fcntl, os, sys, termios; fcntl.ioctl(0, termios.TIOCSCTTY, 0); os.execv(sys.argv[1], sys.argv[1:])"
+        self.child = subprocess.Popen([sys.executable, "-c", bootstrap, str(BIN)], cwd=cwd, env=env,
+                                      stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
         os.close(slave)
         self.output = b""
         self.until(b"Ask about this project")
@@ -97,7 +96,10 @@ class Terminal:
     def read(self):
         while select.select([self.master], [], [], 0)[0]:
             try:
-                self.output += os.read(self.master, 65536)
+                chunk = os.read(self.master, 65536)
+                if not chunk:
+                    break
+                self.output += chunk
             except OSError:
                 break
         return self.output
