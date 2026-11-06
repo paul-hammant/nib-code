@@ -97,12 +97,7 @@ jobs:
           mkdir -p e2e-logs
           failed=0
           for test in $TEST; do
-            if [[ "$RUNNER_OS" == macOS ]]; then
-              (sleep 90; for pid in $(pgrep -x nib); do sample "$pid" 1 -file "e2e-logs/sample-$pid.log"; cat "e2e-logs/sample-$pid.log"; done) &
-              watchdog=$!
-            fi
-            python3 -u -c 'import faulthandler, runpy, sys; faulthandler.dump_traceback_later(60, repeat=True); sys.path.insert(0, "tests"); runpy.run_path(sys.argv.pop(), run_name="__main__")' "$test" 2>&1 | tee "e2e-logs/$(basename "$test").log" || failed=1
-            if [[ "$RUNNER_OS" == macOS ]]; then kill "$watchdog" 2>/dev/null || true; fi
+            python3 -u "$test" 2>&1 | tee "e2e-logs/$(basename "$test").log" || failed=1
           done
           exit "$failed"
       - uses: actions/upload-artifact@v4

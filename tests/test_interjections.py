@@ -92,10 +92,15 @@ class Terminal:
                                       stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
         os.close(slave)
         self.output = b""
+        self.reader_stop = threading.Event()
+        self.reader = threading.Thread(target=self.drain, daemon=True)
+        self.reader.start()
         self.until(b"Ask about this project")
 
-    def read(self):
-        while select.select([self.master], [], [], 0)[0]:
+    def drain(self):
+        while not self.reader_stop.is_set():
+            if not select.select([self.master], [], [], .05)[0]:
+                continue
             try:
                 chunk = os.read(self.master, 65536)
                 if not chunk:
@@ -103,6 +108,8 @@ class Terminal:
                 self.output += chunk
             except OSError:
                 break
+
+    def read(self):
         return self.output
 
     def until(self, text):
@@ -125,7 +132,8 @@ class Terminal:
                 time.sleep(.02)
             if self.child.poll() is None:
                 self.child.kill()
-        self.read()
+        self.reader_stop.set()
+        self.reader.join()
         os.close(self.master)
         self.master = None
         self.child.wait(timeout=5)
