@@ -4,7 +4,7 @@
 
 ## 常用命令
 
-- 构建：`zig build`；测试：`zig build test --summary all`；端到端（本地 mock，无真实 key）：`zig build` 后 `python3 tests/test_session.py`、`python3 tests/test_agent.py`、`python3 tests/test_agent_reuse.py`、`python3 tests/test_agent_fork.py`、`python3 tests/test_background_agent.py`、`python3 tests/test_background_bash.py`、`python3 tests/test_background_run.py`、`python3 tests/test_codex.py`、`python3 tests/test_codex_websocket.py`、`python3 tests/test_llm.py`、`python3 tests/test_stats.py`、`python3 tests/test_effort.py`、`python3 tests/test_interjections.py`、`python3 tests/test_limits.py`、`python3 tests/test_replay.py`、`python3 tests/test_stream_idle.py`、`python3 tests/test_files.py`、`python3 tests/test_cli.py`、`python3 tests/test_undo.py`、`python3 tests/test_tui_mouse.py`
+- 构建：`zig build`；测试：`zig build test --summary all`；端到端（本地 mock，无真实 key）：`zig build` 后 `python3 tests/test_skills.py`、`python3 tests/test_session.py`、`python3 tests/test_agent.py`、`python3 tests/test_agent_reuse.py`、`python3 tests/test_agent_fork.py`、`python3 tests/test_background_agent.py`、`python3 tests/test_background_bash.py`、`python3 tests/test_background_run.py`、`python3 tests/test_codex.py`、`python3 tests/test_codex_websocket.py`、`python3 tests/test_llm.py`、`python3 tests/test_stats.py`、`python3 tests/test_effort.py`、`python3 tests/test_interjections.py`、`python3 tests/test_limits.py`、`python3 tests/test_replay.py`、`python3 tests/test_stream_idle.py`、`python3 tests/test_files.py`、`python3 tests/test_cli.py`、`python3 tests/test_undo.py`、`python3 tests/test_tui_mouse.py`
 - 安装到 `~/.local/bin/nib`：`zig build -Doptimize=ReleaseFast --prefix ~/.local`；版本号在 `build.zig.zon`，`nib --version` 查看。
 - 运行：`./zig-out/bin/nib`（TUI）、`nib ask '<prompt>'`、`nib js '<code>'`；TUI 用 `/compact` 手动压缩上下文。
 - 恢复：`nib -c` / `nib --continue`；`nib --resume <32位小写十六进制ID>`。`ask` 同样支持，选项可放在 prompt 前后。
@@ -13,6 +13,8 @@
 - 发布：更新版本和 release notes 后推送 tag，见 [docs/releasing.md](docs/releasing.md)。
 
 ## 按需参考
+
+- 技能发现、格式、优先级与恢复行为：[docs/skills.md](docs/skills.md)。
 
 - 修改 TUI、CLI 帮助或固定文案时，先读 [docs/ui-style.md](docs/ui-style.md)。
 
@@ -27,8 +29,8 @@
 
 - `src/main.zig`：命令行入口，分派到 TUI、`ask`、`js`、`replay`。
 - `src/replay.zig`：`nib replay`，从主日志和 calls 录制定位 Run 并离线重放（见 [docs/replay.md](docs/replay.md)）。
-- `src/config.zig`：解析 `NIB_HOME/config.toml`、合并环境配置、解析用户目录与原子写回 effort。
-- `src/session.zig`：Session 引擎（Turn/Step 主循环、模型请求、取消）；`session/` 下：`prompt.zig`（system 模板、提示补丁、实验标签、Step 预算文字、run 工具 schema）、`compact.zig`（上下文压缩与 token 估算）、`run.zig`（执行一次 Run 并转发事件）、`run_job.zig`（独立 Run 执行状态，工具等待超阈值后由 Background 持有）、日志、指令拼接、事件、Run 输出格式化。
+- `src/config.zig`：解析 `NIB_HOME/config.toml`、合并环境配置、解析用户目录与原子写回 effort、技能开关。
+- `src/session.zig`：Session 引擎（Turn/Step 主循环、模型请求、取消）；`session/` 下：`prompt.zig`（system 模板、提示补丁、实验标签、Step 预算文字、run 工具 schema）、`compact.zig`（上下文压缩与 token 估算）、`run.zig`（执行一次 Run 并转发事件）、`run_job.zig`（独立 Run 执行状态，工具等待超阈值后由 Background 持有）、`skills.zig`（技能发现、frontmatter 与 system 索引）、日志、指令拼接、事件、Run 输出格式化。
 - `src/provider.zig`：Provider 接口与配置；`provider/` 下是各线路协议、SSE 解析及 `codex_ws.zig`（Session 续接状态）、`websocket.zig`（帧与连接）；Codex 默认 WebSocket，握手/协议失败后本 Session 降级 SSE。`provider/timing.zig` 只负责 run 参数到达进度采样；首个接收活动时间由 Session 复用 Sink.onData 记录。
 - `src/sandbox.zig`：对外类型、JS prelude 与 `eval`；`sandbox/scheduler.zig` 是 Run 的调度器（工具线程、`tools.sleep(ms)` 原生计时器、结算出口；语义见 [docs/run-output.md](docs/run-output.md)），`sandbox/native.zig` 是注册给 QuickJS 的原生函数与 JS 值转换；`sandbox/console.zig` 捕获有界 console 首尾，`sandbox/timing.zig` 在原生工具调度/完成路径记录 Run 内工具调用耗时与结果字节数；`sandbox/record.zig` 在同一个结算出口录制工具参数和结果，`sandbox/replay.zig` + `sandbox/virtual.zig` 用录制结果代替真实工具执行。
 - `src/tools.zig`：工具表（给模型看的 JS 说明集中在这里）、`Tools` 共享状态与调度。`tools/` 下每个工具族一个入口文件，函数名即工具名：`files.zig`（read/edit/write）、`search.zig`（grep/glob）、`web.zig`（fetch）、`bash.zig` + `bash/registry.zig`（同 Session 修改后重跑相同 command/cwd，取代更早 Run 的活动 bash，返回 `{superseded_by}`）、`stop.zig`（按 id 和 reason 停止后台任务）、`agent.zig`、`llm.zig`（进程内单步纯模型调用，限额也集中在这里）、`background.zig`（后台 agent/bash/Run 任务，由 Session 持有，跨 Run 存活）；其余是它们的辅助模块。加工具：在 `tools/` 写入口函数，再在表里加一行。

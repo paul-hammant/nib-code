@@ -45,13 +45,22 @@ stream_content_timeout_s = 120
 request_timeout_s = 300
 run_background_after_ms = 10000
 run_output_bytes = 16384
+
+[skills]
+hallmark = true # 默认全部关闭，按名称逐个启用
 ```
 
 只使用当前 provider 的段落；切换 provider 不需要改写另一段。环境和配置文件均未指定时，默认 provider 为 `codex`，默认模型 `gpt-6.1-sol`、窗口 500000 tokens；使用本机 Codex 登录，无需 API key。Codex 窗口随模型变化，未知模型需要显式提供 `context_window` 或 `NIB_CONTEXT_WINDOW`。模型、恢复和凭证边界见 [codex.md](codex.md) 与 [ADR 0011](adr/0011-provider-wire-protocols.md)。
 
 DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 `DEEPSEEK_API_KEY`（或 `NIB_API_KEY`），默认模型 `deepseek-flash`、窗口 1000000 tokens；其他默认值见上例。
 
-这是无额外依赖的 TOML 子集：支持空行、`#` 注释、单行双引号字符串（支持 `\"`、`\\`、`\n` 转义）、十进制整数（可带符号、下划线分组）和 true/false 布尔值；当前配置键只使用字符串和正整数，布尔值会报告类型错误。仅接受顶层 `provider`、`effort`，`[codex]` / `[chat_completions]` 下的 `model`、`base_url`、`context_window`，`[codex]` 还接受 `transport = "sse"|"websocket"`、`reasoning_summary = "off"|"auto"`、`run_tool = "custom"|"function"`，以及下述 `[limits]` 键。不支持数组、嵌套表、多行字符串等完整 TOML 语法；未知键、重复键/段落和格式错误会报配置文件路径与行号，不静默忽略。
+这是无额外依赖的 TOML 子集：支持空行、`#` 注释、单行双引号字符串（支持 `\"`、`\\`、`\n` 转义）、十进制整数（可带符号、下划线分组）和 true/false 布尔值；仅 `[skills]` 的技能名称键接受布尔值，其余配置键只使用字符串和正整数，布尔值会报告类型错误。仅接受顶层 `provider`、`effort`，`[codex]` / `[chat_completions]` 下的 `model`、`base_url`、`context_window`，`[codex]` 还接受 `transport = "sse"|"websocket"`、`reasoning_summary = "off"|"auto"`、`run_tool = "custom"|"function"`，以及下述 `[limits]` 键和 `[skills]` 技能名称开关。不支持数组、嵌套表、多行字符串等完整 TOML 语法；未知键、重复键/段落和格式错误会报配置文件路径与行号，不静默忽略。
+
+## [skills]
+
+技能默认关闭。键是技能名称，只有 `true` 启用；`false` 和缺省均关闭。找不到文件的启用项不进入提示索引，`/status` 显示 missing。没有环境变量或项目级开关。
+
+TUI `/skills` 列表显示发现的技能与开关；`/skills on <name>`、`/skills off <name>` 原子保存并保留其他配置行。仅新会话使用新设置，当前和恢复会话保留原 system。格式、目录和优先级见 [skills.md](skills.md)。
 
 ## [limits]
 
