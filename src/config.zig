@@ -39,8 +39,17 @@ const Settings = struct {
     reasoning_summary: @FieldType(provider.Config, "reasoning_summary") = .off,
 };
 
+pub const SkillSetting = struct { name: []const u8, enabled: bool, span: Span };
+
+pub fn skillEnabled(settings: []const SkillSetting, name: []const u8) bool {
+    for (settings) |setting| if (std.mem.eql(u8, setting.name, name)) return setting.enabled;
+    return false;
+}
+
 const Span = struct { start: usize, end: usize };
 const File = struct {
+    skills: std.ArrayList(SkillSetting) = .empty,
+    skills_end: ?usize = null,
     top_end: usize = 0,
     limits: provider.Limits = .{},
     provider_id: ?provider.Id = null,
@@ -149,9 +158,9 @@ fn secretKey(key: []const u8) bool {
 fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u8, detail: *?[]u8) !File {
     var p: Parser = .{ .a = a, .diagnostics = diagnostics, .path = path, .detail = detail };
     var file: File = .{};
-    const Section = enum { chat_completions, codex, limits };
+    const Section = enum { chat_completions, codex, limits, skills };
     var section: ?Section = null;
-    var seen_sections: [3]bool = @splat(false);
+    var seen_sections: [4]bool = @splat(false);
     var seen: [4][10]bool = @splat(@splat(false));
     var offset: usize = 0;
     while (offset < text.len) : (p.line += 1) {
@@ -170,6 +179,7 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
             const close = std.mem.indexOfScalar(u8, line, ']') orelse return p.bad("unterminated section", .{});
             const name = std.mem.trim(u8, line[1..close], " \t");
             if (secretKey(name)) return p.bad("secrets are not allowed; use NIB_API_KEY or DEEPSEEK_API_KEY (Codex uses CODEX_HOME/auth.json)", .{});
+            if (section == .skills) file.skills_end = start;
             if (section == null) file.top_end = start;
             section = std.meta.stringToEnum(Section, name) orelse return p.bad("unknown section '{s}'", .{name});
             const tail = std.mem.trimStart(u8, line[close + 1 ..], " \t");
@@ -181,9 +191,21 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
         }
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse return p.bad("expected key = value", .{});
         const key = std.mem.trimEnd(u8, line[0..eq], " \t");
-        if (secretKey(key)) return p.bad("secrets are not allowed; use NIB_API_KEY or DEEPSEEK_API_KEY (Codex uses CODEX_HOME/auth.json)", .{});
+        if (section != .skills and secretKey(key)) return p.bad("secrets are not allowed; use NIB_API_KEY or DEEPSEEK_API_KEY (Codex uses CODEX_HOME/auth.json)", .{});
         if (key.len == 0) return p.bad("empty key", .{});
         for (key) |c| if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return p.bad("expected a bare key (dotted and quoted keys are unsupported)", .{});
+        if (section == .skills) {
+            for (file.skills.items) |setting| if (std.mem.eql(u8, setting.name, key)) return p.bad("duplicate key '{s}'", .{key});
+            const value = std.mem.trimStart(u8, line[eq + 1 ..], " \t");
+            var consumed: usize = 0;
+            const parsed = try p.value(value, &consumed);
+            if (parsed != .boolean) return p.bad("skill enablement must be a boolean", .{});
+            const tail = std.mem.trim(u8, value[consumed..], " \t");
+            if (tail.len > 0 and tail[0] != '#') return p.bad("unexpected text after value", .{});
+            const value_start = start + @intFromPtr(value.ptr) - @intFromPtr(raw.ptr);
+            try file.skills.append(a, .{ .name = try a.dupe(u8, key), .enabled = parsed.boolean, .span = .{ .start = value_start, .end = value_start + consumed } });
+            continue;
+        }
         const index: usize = if (section == null)
             if (std.mem.eql(u8, key, "provider")) 0 else if (std.mem.eql(u8, key, "effort")) 1 else return p.bad("unknown top-level key '{s}'", .{key})
         else if (section == .limits) blk: {
@@ -249,6 +271,7 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
         const tail = std.mem.trimStart(u8, value[consumed..], " \t");
         if (tail.len > 0 and tail[0] != '#') return p.bad("unexpected text after value", .{});
     }
+    if (section == .skills) file.skills_end = text.len;
     if (section == null) file.top_end = text.len;
     return file;
 }
@@ -323,6 +346,7 @@ pub fn resolve(a: Allocator, env: *const Env, text: []const u8, path: []const u8
     cfg.api_key = try a.dupe(u8, if (id == .codex) "" else env.get("NIB_API_KEY") orelse env.get("DEEPSEEK_API_KEY") orelse "");
     errdefer a.free(cfg.api_key);
     cfg.codex_home = if (env.get("CODEX_HOME")) |v| try a.dupe(u8, v) else try std.fs.path.join(a, &.{ env.get("HOME") orelse "", ".codex" });
+    cfg.enabled_skills = try enabledSkills(a, file.skills.items);
     return cfg;
 }
 
@@ -761,4 +785,83 @@ test "Codex Run tool defaults custom with validated file and environment fallbac
     for ([_][]const u8{ "[codex]\nrun_tool = \"invalid\"", "[codex]\nrun_tool = true", "[codex]\nrun_tool = \"custom\"\nrun_tool = \"function\"", "[chat_completions]\nrun_tool = \"custom\"" }) |bad| {
         try t.expectError(error.InvalidConfig, resolve(a, &env, bad, "config.toml", &detail));
     }
+}
+
+// The caller supplies an arena for the parsed settings.
+pub fn loadSkills(a: Allocator, io: std.Io, home_path: []const u8) ![]const SkillSetting {
+    const path = try std.fs.path.join(a, &.{ home_path, "config.toml" });
+    const text = try read(a, io, path);
+    var detail: ?[]u8 = null;
+    return (try parse(a, a, text, path, &detail)).skills.items;
+}
+
+pub fn saveSkill(a: Allocator, io: std.Io, home_path: []const u8, name: []const u8, enabled: bool) !void {
+    if (name.len == 0) return error.InvalidSkillName;
+    for (name) |c| if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return error.InvalidSkillName;
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const path = try std.fs.path.join(scratch, &.{ home_path, "config.toml" });
+    const text = try read(scratch, io, path);
+    var detail: ?[]u8 = null;
+    const file = try parse(scratch, scratch, text, path, &detail);
+    const value = if (enabled) "true" else "false";
+    const newline = if (std.mem.indexOf(u8, text, "\r\n") != null) "\r\n" else "\n";
+    var out: std.ArrayList(u8) = .empty;
+    const span: ?Span = for (file.skills.items) |setting| {
+        if (std.mem.eql(u8, name, setting.name)) break setting.span;
+    } else null;
+    if (span) |range| {
+        try out.appendSlice(scratch, text[0..range.start]);
+        try out.appendSlice(scratch, value);
+        try out.appendSlice(scratch, text[range.end..]);
+    } else {
+        const end = file.skills_end orelse text.len;
+        try out.appendSlice(scratch, text[0..end]);
+        if (end > 0 and text[end - 1] != '\n') try out.appendSlice(scratch, newline);
+        if (file.skills_end == null) try out.print(scratch, "[skills]{s}", .{newline});
+        try out.print(scratch, "{s} = {s}{s}", .{ name, value, newline });
+        try out.appendSlice(scratch, text[end..]);
+    }
+    if (std.mem.eql(u8, text, out.items)) return;
+    try std.Io.Dir.cwd().createDirPath(io, home_path);
+    _ = try atomic_file.replace(io, scratch, path, out.items, .{ .permissions = .fromMode(0o600), .sync = true });
+}
+
+test "skills config booleans and atomic toggles preserve other lines" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const original = "# config\r\neffort = \"high\"\r\n[skills]\r\nhallmark = false # keep\r\n[codex]\r\nmodel = \"mock\"\r\n";
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "config.toml", .data = original });
+    try saveSkill(a, t.io, path, "hallmark", true);
+    const changed = try tmp.dir.readFileAlloc(t.io, "config.toml", a, .unlimited);
+    try t.expectEqualStrings(try std.mem.replaceOwned(u8, a, original, "false", "true"), changed);
+    try saveSkill(a, t.io, path, "other", true);
+    try saveSkill(a, t.io, path, "hallmark", false);
+    const settings = try loadSkills(a, t.io, path);
+    try t.expect(!skillEnabled(settings, "hallmark"));
+    try t.expect(skillEnabled(settings, "other"));
+    try t.expect(!skillEnabled(settings, "absent"));
+    var detail: ?[]u8 = null;
+    try t.expectError(error.InvalidConfig, parse(a, a, "[skills]\na = \"true\"", "test", &detail));
+    try t.expectError(error.InvalidConfig, parse(a, a, "[skills]\na = true\na = false", "test", &detail));
+    try t.expectError(error.InvalidConfig, parse(a, a, "effort = true", "test", &detail));
+    var env: Env = .init(a);
+    defer env.deinit();
+    const resolved = try resolve(a, &env, "[skills]\non = true\noff = false", "test", &detail);
+    try t.expectEqual(@as(usize, 1), resolved.enabled_skills.len);
+    try t.expectEqualStrings("on", resolved.enabled_skills[0]);
+}
+
+pub fn enabledSkills(a: Allocator, settings: []const SkillSetting) ![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    for (settings) |setting| if (setting.enabled) {
+        try names.append(a, try a.dupe(u8, setting.name));
+    };
+    return names.toOwnedSlice(a);
 }

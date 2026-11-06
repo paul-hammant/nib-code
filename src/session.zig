@@ -5,6 +5,7 @@ const sandbox = @import("sandbox.zig");
 const tools = @import("tools.zig");
 const provider = @import("provider.zig");
 const session_log = @import("session/log.zig");
+const skills = @import("session/skills.zig");
 const instructions = @import("session/instructions.zig");
 const effort = @import("session/effort.zig");
 const prompt = @import("session/prompt.zig");
@@ -92,6 +93,10 @@ pub const Session = struct {
         errdefer s.tools.file_state.deinit(gpa);
         s.options.fork = null;
         const a = s.arena.allocator();
+        const enabled = try a.alloc([]const u8, cfg.enabled_skills.len);
+        for (cfg.enabled_skills, enabled) |name, *copy| copy.* = try a.dupe(u8, name);
+        s.cfg.enabled_skills = enabled;
+        s.tools.cfg = s.cfg;
         const cwd = try std.process.currentPathAlloc(io, a);
         const directory = try std.fs.path.join(a, &.{ options.home, "sessions" });
         try std.Io.Dir.cwd().createDirPath(io, directory);
@@ -139,8 +144,12 @@ pub const Session = struct {
                 const template = try prompt.renderSystem(a, cwd, &s.tools, options.environ);
                 const base = try prompt.stepLimitPrompt(a, template, cfg.limits.max_steps);
                 const global = try std.fs.path.join(a, &.{ options.home, "AGENTS.md" });
-                const project = try std.fs.path.join(a, &.{ try instructions.projectRoot(io, a, cwd), "AGENTS.md" });
-                const system = try instructions.append(io, a, base, global, project);
+                const root = try instructions.projectRoot(io, a, cwd);
+                const project = try std.fs.path.join(a, &.{ root, "AGENTS.md" });
+                const discovered = try skills.load(io, a, options.home, options.user_home, root);
+                const found = try skills.select(a, discovered, s.cfg.enabled_skills);
+                const system = try skills.append(a, try instructions.append(io, a, base, global, project), found.skills);
+                s.log.skills = found.summary;
                 const sha = prompt.systemSha(base);
                 try s.log.commit(io, gpa, &s.history, &s.context_tokens, .{
                     .messages = &.{.{ .role = "system", .content = system }},
@@ -151,6 +160,7 @@ pub const Session = struct {
                     .cache_key = s.cache_key,
                     .nib_version = @import("build_options").nib_version,
                     .system_sha = &sha,
+                    .skills = found.summary,
                     .patches_off = try prompt.disabledPatches(a, options.environ),
                 });
             }
@@ -190,7 +200,14 @@ pub const Session = struct {
         var options = s.options;
         options.resume_id = id;
         options.continue_latest = false;
-        const next = try Session.init(s.gpa, s.io, s.client, s.cfg, options);
+        var arena: std.heap.ArenaAllocator = .init(s.gpa);
+        defer arena.deinit();
+        var cfg = s.cfg;
+        if (id == null) {
+            const config = @import("config.zig");
+            cfg.enabled_skills = try config.enabledSkills(arena.allocator(), try config.loadSkills(arena.allocator(), s.io, options.home));
+        }
+        const next = try Session.init(s.gpa, s.io, s.client, cfg, options);
         s.deinit();
         s.* = next;
     }
