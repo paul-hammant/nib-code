@@ -806,7 +806,7 @@ test "bills stay dim and one row when resized or expanded" {
     var transcript: Transcript = .{};
     defer transcript.deinit(gpa);
     var text: bill.Text = .{};
-    const full = text.format(.{ .steps = 12, .timing = .{ .wall_ms = 190_000, .llm_calls = 8, .agent_calls = 1 } }, 120);
+    const full = text.format(.{ .steps = 12, .timing = .{ .wall_ms = 190_000, .llm_calls = 8, .agent_calls = 1 } }, 2, 120);
     try transcript.add(gpa, .bill, full);
     const entry = &transcript.entries.items[0];
     for ([_]u16{ 120, 40, 8, 1, 0, 120 }) |width| {

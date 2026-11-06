@@ -6,7 +6,7 @@ const config = @import("../config.zig");
 const ChangeText = @import("transcript.zig").ChangeText;
 const provider = @import("../provider.zig");
 
-pub const Command = enum { help, new, @"resume", compact, effort, copy, reflect, js, tasks, stop };
+pub const Command = enum { help, new, @"resume", compact, effort, copy, reflect, js, tasks, stop, status };
 
 pub const Choices = enum { none, efforts, sessions, tasks };
 
@@ -21,6 +21,7 @@ pub const Spec = struct {
 };
 
 pub const specs = std.enums.EnumArray(Command, Spec).init(.{
+    .status = .{ .help = "show timing and cache details", .while_busy = true },
     .tasks = .{ .help = "list background tasks", .while_busy = true },
     .stop = .{ .args = "<id>", .help = "stop one background task; partial changes may remain", .while_busy = true, .choices = .tasks, .needs_arg = true },
     .help = .{ .help = "list commands and keys", .while_busy = true },
@@ -158,6 +159,10 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
     const gpa = app.gpa;
     const session = app.session;
     switch (c) {
+        .status => {
+            var text: @import("bill.zig").Text = .{};
+            try app.report(.info, "{s} · effort {s} · context {d}%\n{s}", .{ app.cfg.model, app.cfg.effectiveEffort(), app.context * 100 / @max(app.cfg.context_window, 1), if (app.last_summary) |summary| text.details(summary) else "No completed turn yet." });
+        },
         .tasks => {
             var arena: std.heap.ArenaAllocator = .init(gpa);
             defer arena.deinit();
@@ -198,6 +203,7 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
             try app.transcript.addHistory(gpa, session.history.items);
             app.usage = .{};
             app.steps = 0;
+            app.last_summary = null;
             app.context = session.context_tokens;
             try app.report(.info, "{s} session {s}", .{ if (c == .new) "new" else "resumed", session.id[0..8] });
         },
@@ -241,6 +247,7 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
         .compact => {
             app.turn = try Turn.spawn(gpa, session, app.loop, try gpa.dupe(u8, line), true);
             app.live_steps = 0;
+            app.turn_runs = 0;
             app.activity = .start(app.io, .compacting);
         },
         .reflect => {
@@ -254,6 +261,7 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
             try app.transcript.add(gpa, .user, line);
             app.turn = try Turn.spawn(gpa, session, app.loop, text, false);
             app.live_steps = 0;
+            app.turn_runs = 0;
             app.activity = .start(app.io, .thinking);
             app.reflecting = focus;
         },

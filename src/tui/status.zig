@@ -126,31 +126,10 @@ pub const Text = struct {
     }
 
     pub fn footer(text: *Text, s: Status, width: u16) []const u8 {
-        var input: [32]u8 = undefined;
-        var output: [32]u8 = undefined;
-        var line = std.fmt.bufPrint(&text.status, "{s} · effort {s}{s} · ctx {d}% · in {s} ({d}% cached) · out {s} · {s}: {d} step{s}", .{
-            s.cfg.model,
-            if (s.cfg.thinking != null or s.cfg.reasoning_effort != null) "≤" else "",
-            s.cfg.effectiveEffort(),
-            s.context * 100 / @max(s.cfg.context_window, 1),
-            tokens(&input, s.usage.prompt_tokens),
-            s.usage.prompt_cache_hit_tokens * 100 / @max(s.usage.prompt_tokens, 1),
-            tokens(&output, s.usage.completion_tokens),
-            if (s.busy != null) "turn" else "last turn",
-            s.steps,
-            if (s.steps == 1) "" else "s",
-        }) catch "";
-        var bg_buf: [32]u8 = undefined;
-        const bg = if (s.background_count > 0) std.fmt.bufPrint(&bg_buf, " · bg {d}", .{s.background_count}) catch "" else "";
-        while (std.mem.lastIndexOf(u8, line, " · ")) |separator| {
-            if (@import("vaxis").gwidth.gwidth(line, .unicode) + @import("vaxis").gwidth.gwidth(bg, .unicode) <= width) break;
+        var line = if (s.context > 0) std.fmt.bufPrint(&text.status, "{s} · context {d}%", .{ s.cfg.model, s.context * 100 / @max(s.cfg.context_window, 1) }) catch "" else s.cfg.model;
+        while (@import("vaxis").gwidth.gwidth(line, .unicode) > width) {
+            const separator = std.mem.lastIndexOf(u8, line, " · ") orelse return "";
             line = line[0..separator];
-        }
-        if (bg.len > 0) {
-            const fits = @import("vaxis").gwidth.gwidth(line, .unicode) + @import("vaxis").gwidth.gwidth(bg, .unicode) <= width;
-            if (!fits) line = "";
-            const suffix = std.fmt.bufPrint(text.status[line.len..], "{s}", .{if (fits) bg else bg[3..]}) catch "";
-            line = text.status[0 .. line.len + suffix.len];
         }
         return line;
     }
@@ -165,8 +144,6 @@ pub fn retryReason(reason: []const u8) []const u8 {
     return @import("transcript/label.zig").promptPrefix(line);
 }
 
-const tokens = ui_format.number;
-
 test "activity is optional and footer shows latest reported usage" {
     var text: Text = .{};
     const cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "m", .context_window = 1000 };
@@ -174,9 +151,9 @@ test "activity is optional and footer shows latest reported usage" {
     try std.testing.expectEqualStrings("↑ history · PgDn to return", text.format(.{ .cfg = cfg }, true));
     try std.testing.expectEqualStrings("⠙ Running Run · turn <1s · step 2 · Esc to cancel · copied 3 chars", text.format(.{ .cfg = cfg, .current_step = 2, .busy = .{ .phase = .running, .ms = 150 }, .notice = "copied 3 chars" }, false));
     const line = text.footer(.{ .cfg = cfg, .context = 250, .steps = 2, .usage = .{ .prompt_tokens = 1_800_000, .prompt_cache_hit_tokens = 1_692_000, .completion_tokens = 18_000 } }, 200);
-    try std.testing.expectEqualStrings("m · effort server default · ctx 25% · in 1.8M (94% cached) · out 18k · last turn: 2 steps", line);
+    try std.testing.expectEqualStrings("m · context 25%", line);
     const busy = text.footer(.{ .cfg = cfg, .context = 400, .steps = 1, .usage = .{ .prompt_tokens = 1200, .completion_tokens = 50, .prompt_cache_hit_tokens = 600 }, .busy = .{ .phase = .running, .ms = 100 } }, 200);
-    try std.testing.expectEqualStrings("m · effort server default · ctx 40% · in 1.2k (50% cached) · out 50 · turn: 1 step", busy);
+    try std.testing.expectEqualStrings("m · context 40%", busy);
 }
 
 test "background task count remains visible during model work" {
@@ -184,7 +161,7 @@ test "background task count remains visible during model work" {
     var text: Text = .{};
     const s: Status = .{ .cfg = .{ .base_url = "", .api_key = "", .model = "m" }, .busy = .{ .phase = .thinking, .ms = 0 }, .background_count = 2 };
     try t.expectEqualStrings("⠋ Waiting for model · turn <1s · step 1 · Esc to cancel · 2 background tasks", text.format(s, false));
-    try t.expect(std.mem.endsWith(u8, text.footer(s, 200), " · bg 2"));
+    try t.expectEqualStrings("m", text.footer(s, 200));
     try t.expectEqualStrings("2 background tasks", text.format(.{ .cfg = s.cfg, .background_count = 2 }, false));
 }
 
@@ -213,17 +190,12 @@ test "only content advances progress; stage changes preserve Turn duration" {
     }
 }
 
-test "effort footer marks configured ceilings but preserves default" {
-    const t = std.testing;
+test "footer is quiet initially and contains only model and context" {
     var text: Text = .{};
-    for ([_]provider.Id{ .chat_completions, .codex }) |id| {
-        var cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "m", .provider = id };
-        try t.expect(std.mem.startsWith(u8, text.footer(.{ .cfg = cfg }, 200), "m · effort server default ·"));
-        try cfg.setEffort("high");
-        try t.expect(std.mem.startsWith(u8, text.footer(.{ .cfg = cfg }, 200), "m · effort ≤high ·"));
-        try cfg.setEffort("default");
-        try t.expect(std.mem.startsWith(u8, text.footer(.{ .cfg = cfg }, 200), "m · effort server default ·"));
-    }
+    const cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "m", .context_window = 1000 };
+    try std.testing.expectEqualStrings("m", text.footer(.{ .cfg = cfg }, 200));
+    try std.testing.expectEqualStrings("m · context 25%", text.footer(.{ .cfg = cfg, .context = 250 }, 200));
+    try std.testing.expectEqualStrings("m", text.footer(.{ .cfg = cfg, .context = 250 }, 10));
 }
 
 test "retry line names the next attempt and a concise cause" {

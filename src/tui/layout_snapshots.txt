@@ -9,7 +9,7 @@
 
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │ Message nib · / for commands                                                 │
-╰─ mock · effort server default · ctx 0% · in 0 (0% cached) · out 0────────────╯
+╰─ mock────────────────────────────────────────────────────────────────────────╯
   Enter send · Shift+Enter newline · / commands · Ctrl+O expand
 --- short 80x7 ---
  Answer
@@ -18,7 +18,7 @@
 
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │ Message nib · / for commands                                                 │
-╰─ mock · effort server default · ctx 0% · in 0 (0% cached) · out 0────────────╯
+╰─ mock────────────────────────────────────────────────────────────────────────╯
 --- tiny 80x4 ---
  Answer
 
@@ -48,7 +48,7 @@
  /help         show help
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │ Message nib · / for commands                                                 │
-╰─ mock · effort server default · ctx 0% · in 0 (0% cached) · out 0────────────╯
+╰─ mock────────────────────────────────────────────────────────────────────────╯
   Enter send · Shift+Enter newline · / commands · Ctrl+O expand
 --- busy 80x12 ---
  Answer
@@ -61,7 +61,7 @@
  ⠹ Waiting for model · turn <1s · step 1 · Esc to cancel
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │ Message nib · / for commands                                                 │
-╰─ mock · effort server default · ctx 0% · in 0 (0% cached) · out 0────────────╯
+╰─ mock────────────────────────────────────────────────────────────────────────╯
   Enter send · Shift+Enter newline · / commands · Ctrl+O expand
 --- history 80x12 ---
  0
@@ -74,7 +74,7 @@
  ↑ history · PgDn to return
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │ Message nib · / for commands                                                 │
-╰─ mock · effort server default · ctx 0% · in 0 (0% cached) · out 0────────────╯
+╰─ mock────────────────────────────────────────────────────────────────────────╯
   Enter send · Shift+Enter newline · / commands · Ctrl+O expand
 --- notice 80x12 ---
  Answer
@@ -87,5 +87,5 @@
  copied 3 chars
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │ Message nib · / for commands                                                 │
-╰─ mock · effort server default · ctx 0% · in 0 (0% cached) · out 0────────────╯
+╰─ mock────────────────────────────────────────────────────────────────────────╯
   Enter send · Shift+Enter newline · / commands · Ctrl+O expand

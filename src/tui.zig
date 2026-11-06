@@ -152,6 +152,8 @@ pub const App = struct {
     turn: ?*Turn = null,
     // turn_end precedes done/failed; append only after their terminal content.
     pending_bill: ?TurnSummary = null,
+    last_summary: ?TurnSummary = null,
+    turn_runs: usize = 0,
 
     const command = commands.execute;
     const saveReflection = reflect.saveReflection;
@@ -246,6 +248,7 @@ pub const App = struct {
             .run_start => |r| {
                 defer gpa.free(r.code);
                 app.live_steps = r.step;
+                app.turn_runs += 1;
                 app.activity.tool = "";
                 app.activity.set(app.io, .running);
                 try app.transcript.startRunWithEffort(gpa, r.code, app.step_effort);
@@ -429,6 +432,7 @@ pub const App = struct {
         try app.transcript.add(app.gpa, .user, text);
         app.turn = try Turn.spawn(app.gpa, app.session, app.loop, text, false);
         app.live_steps = 0;
+        app.turn_runs = 0;
         app.activity = .start(app.io, .thinking);
     }
 
@@ -449,7 +453,9 @@ pub const App = struct {
     fn appendBill(app: *App) !void {
         const summary = app.pending_bill orelse return;
         var text: bill.Text = .{};
-        try app.transcript.add(app.gpa, .bill, text.format(summary, std.math.maxInt(u16)));
+        const footer = text.format(summary, app.turn_runs, std.math.maxInt(u16));
+        if (footer.len > 0) try app.transcript.add(app.gpa, .bill, footer);
+        app.last_summary = summary;
         app.pending_bill = null;
     }
 
@@ -686,6 +692,7 @@ test "turn_end forwards by value and defers bills until terminal content" {
     app.transcript = .{};
     defer app.transcript.deinit(t.allocator);
     app.pending_bill = null;
+    app.turn_runs = 0;
     inline for (.{ .completed, .canceled, .failed }) |status_value| {
         const summary: TurnSummary = .{ .status = status_value, .steps = 2, .timing = .{ .wall_ms = 1000 } };
         try app.transcript.add(t.allocator, .assistant, "answer");
@@ -769,6 +776,7 @@ test "Step events own effort and Runs keep their generating Step metadata" {
     effort[0] = 'x';
     _ = try app.handle((try loop.tryEvent()).?);
     try t.expectEqual(@as(u32, 3), app.live_steps);
+    app.turn_runs = 0;
     _ = try app.handle(.{ .run_start = .{ .code = try t.allocator.dupe(u8, "tools.read({})"), .step = 3 } });
     _ = try app.handle(.{ .run_end = .{ .ok = true, .output = try t.allocator.dupe(u8, "out"), .changes = .{} } });
     _ = try app.handle(.{ .step = .{ .n = 4, .effort = try t.allocator.dupe(u8, "low"), .source = .model } });
@@ -785,6 +793,7 @@ test "Run summary survives event queue and original summary destruction" {
     app.transcript = .{};
     defer app.transcript.deinit(t.allocator);
     app.activity = .start(t.io, .running);
+    app.turn_runs = 0;
     var loop: vaxis.Loop(Event) = .{ .io = t.io, .tty = undefined, .vaxis = undefined, .queue = .init(t.io) };
     var turn: Turn = undefined;
     turn.gpa = t.allocator;
