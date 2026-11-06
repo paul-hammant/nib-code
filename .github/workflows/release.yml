@@ -9,31 +9,48 @@ permissions:
 
 jobs:
   build:
+    strategy:
+      matrix:
+        target: [x86_64-linux-musl, aarch64-linux-musl, x86_64-macos, aarch64-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
-      - name: Verify version and build assets
+      - name: Verify version and build
         shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           version=$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' build.zig.zon)
           test "$GITHUB_REF_NAME" = "v$version"
           test -f "docs/releases/$version.md"
           mkdir -p dist
-          for target in x86_64-linux-musl aarch64-linux-musl x86_64-macos aarch64-macos; do
-            zig build -Doptimize=ReleaseFast -Dstrip=true -Dtarget="$target" --prefix "$PWD/out/$target"
-            tar -czf "dist/nib-${target%-musl}.tar.gz" -C "out/$target/bin" nib
-          done
-          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+          zig build -Doptimize=ReleaseFast -Dstrip=true -Dtarget="$TARGET" --prefix "$PWD/out"
+          tar -czf "dist/nib-${TARGET%-musl}.tar.gz" -C out/bin nib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asset-${{ matrix.target }}
+          path: dist/*
+
+  checksums:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: asset-*
+          merge-multiple: true
+          path: dist
+      - run: cd dist && sha256sum *.tar.gz > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: release-assets
           path: dist/*
 
   smoke:
-    needs: build
+    needs: checksums
     strategy:
       matrix:
         include:
@@ -63,7 +80,7 @@ jobs:
           test "$("$NIB_INSTALL_DIR/nib" --version)" = "nib ${GITHUB_REF_NAME#v}"
 
   release:
-    needs: [build, smoke]
+    needs: smoke
     runs-on: ubuntu-latest
     permissions:
       contents: write
