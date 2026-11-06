@@ -143,6 +143,8 @@ pub const App = struct {
     menu: Menu,
     status_text: status.Text = .{},
     activity_detail: [256]u8 = undefined,
+    retry_detail: [256]u8 = undefined,
+    retry_len: usize = 0,
     activity: status.Activity,
     usage: provider.Usage = .{},
     steps: u32 = 0,
@@ -217,7 +219,10 @@ pub const App = struct {
                 app.activity.progress(.now(app.io, .awake));
             },
             .model_activity => |activity| {
-                if (activity.state == .started and app.activity.phase != .compacting) app.activity.set(app.io, .thinking);
+                if (activity.state == .started) {
+                    app.transcript.beginAttempt();
+                    if (app.activity.phase != .compacting and app.activity.phase != .retrying) app.activity.set(app.io, .thinking);
+                }
                 if (activity.state == .script) app.activity.set(app.io, .scripting);
                 if (activity.state == .waiting) app.activity.set(app.io, .waiting);
                 app.activity.modelActivity(activity.state, activity.at);
@@ -235,7 +240,7 @@ pub const App = struct {
                 defer gpa.free(d.text);
                 app.live_steps = d.step;
                 if (d.text.len > 0) app.activity.progress(.now(app.io, .awake));
-                if (app.activity.phase != .compacting) app.activity.set(app.io, if (d.kind == .reasoning) .thinking else .writing);
+                if (app.activity.phase != .compacting) app.activity.set(app.io, .writing);
                 try app.transcript.appendDelta(gpa, d.kind, d.text);
             },
             .run_start => |r| {
@@ -254,9 +259,15 @@ pub const App = struct {
                 if (r.background_id) |id| try app.transcript.backgroundRun(gpa, id);
                 try app.transcript.endRunWithSummary(gpa, r.ok, r.output, elapsed, r.changes, r.tool_summary);
             },
-            .retry, .notice => |msg| {
+            .retry => |msg| {
                 defer gpa.free(msg);
-                if (std.mem.startsWith(u8, msg, "retry")) app.activity.set(app.io, .retrying);
+                app.transcript.discardAttempt(gpa);
+                app.activity.set(app.io, .retrying);
+                const line = std.fmt.bufPrint(&app.retry_detail, "{s}", .{msg}) catch app.retry_detail[0..0];
+                app.retry_len = line.len;
+            },
+            .notice => |msg| {
+                defer gpa.free(msg);
                 try app.transcript.add(gpa, .info, msg);
             },
             .usage => |u| {
@@ -312,7 +323,10 @@ pub const App = struct {
                 defer gpa.free(msg);
                 app.stopReflecting();
                 const canceled = app.turn.?.cancel.load(.acquire);
-                try app.transcript.add(gpa, if (canceled) .info else .err, if (canceled) "canceled" else msg);
+                if (!canceled) {
+                    app.transcript.discardAttempt(gpa);
+                    try app.transcript.failure(gpa, msg, failure.reason);
+                }
                 try app.finishTurn();
                 try app.appendBill();
                 try app.recoveryHint(failure.reason);
@@ -483,7 +497,19 @@ pub const App = struct {
             defer app.gpa.free(restored);
             try app.input.replace(app.gpa, restored);
             app.menu.inputChanged(app.input.text());
+            try app.report(.info, "{d} queued message{s} returned to input", .{ batch.items.items.len, if (batch.items.items.len == 1) "" else "s" });
         }
+    }
+
+    fn activityDetail(app: *App) []const u8 {
+        if (app.activity.phase == .retrying) return app.retry_detail[0..app.retry_len];
+        if (app.activity.phase == .running) return app.transcript.activityDetail(&app.activity_detail, app.activity.tool);
+        if (app.activity.phase == .waiting) {
+            const task = app.session.tools.background.waitingTask(app.io) orelse return "";
+            var elapsed: [64]u8 = undefined;
+            return std.fmt.bufPrint(&app.activity_detail, "{s} · {s}", .{ task.id, @import("tui/format.zig").duration(&elapsed, task.elapsed_ms) }) catch "";
+        }
+        return "";
     }
 
     fn render(app: *App) !void {
@@ -499,7 +525,7 @@ pub const App = struct {
             .context = app.context,
             .busy = if (app.turn != null) app.activity.label(app.io) else null,
             .notice = app.notice,
-            .detail = if (app.activity.phase == .waiting) app.session.tools.background.waitingLabel(app.io, &app.activity_detail) else if (app.activity.phase == .running) app.transcript.activityDetail(&app.activity_detail, app.activity.tool) else "",
+            .detail = app.activityDetail(),
         }, &app.status_text);
         app.selection.highlight(&app.vx.screen);
         try app.vx.render(app.w);
@@ -773,4 +799,32 @@ test "Run summary survives event queue and original summary destruction" {
     try t.expectEqualStrings("edit", app.transcript.entries.items[0].tool_summary.?.counts[0].name);
     try t.expectEqual(@as(u64, 2), app.transcript.entries.items[0].tool_summary.?.counts[0].count);
     try t.expect(std.mem.startsWith(u8, app.transcript.entries.items[0].label.items, "Run · edit ×2 · +3"));
+}
+
+test "cancel returns queued messages alongside an existing draft" {
+    const a = std.testing.allocator;
+    var session: Session = undefined;
+    session.gpa = a;
+    session.io = std.testing.io;
+    session.inbox = .{};
+    defer {
+        var remaining = session.inbox.take(session.io);
+        remaining.deinit(a);
+    }
+    var app: App = undefined;
+    app.gpa = a;
+    app.session = &session;
+    app.transcript = .{};
+    defer app.transcript.deinit(a);
+    app.input = .{};
+    defer app.input.deinit(a);
+    app.menu = .init(a);
+    defer app.menu.deinit();
+    const id = try session.enqueue("queued request");
+    try app.transcript.add(a, .user, "queued request");
+    app.transcript.entries.items[0].queued = id;
+    try app.input.insert(a, "draft");
+    try app.finishQueued(false);
+    try std.testing.expectEqualStrings("queued request\n\ndraft", app.input.text());
+    try std.testing.expectEqualStrings("1 queued message returned to input", app.transcript.entries.items[0].text.items);
 }

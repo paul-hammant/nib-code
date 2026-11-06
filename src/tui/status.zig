@@ -75,16 +75,16 @@ pub const Text = struct {
         var w: std.Io.Writer = .fixed(&text.activity);
         if (s.busy) |b| {
             const phase = switch (b.phase) {
-                .thinking => "waiting model",
-                .writing => "model output",
-                .scripting => "generating run",
-                .running => "tools",
-                .waiting => "waiting tasks",
-                .retrying => "retrying",
-                .compacting => "compacting",
+                .thinking => "Waiting for model",
+                .writing => "Generating response",
+                .scripting => "Writing Run",
+                .running => if (s.detail.len > 0) "Running" else "Running Run",
+                .waiting => if (s.detail.len > 0) "Waiting for" else "Waiting for background tasks",
+                .retrying => "Retrying",
+                .compacting => "Compacting context",
             };
             w.print("{s} {s}", .{ spinner[(b.ms / 100) % spinner.len], phase }) catch {};
-            if (s.detail.len > 0) w.print(" {s}", .{s.detail}) catch {};
+            if (s.detail.len > 0) w.print("{s}{s}", .{ if (b.phase == .retrying) " · " else " ", s.detail }) catch {};
             var elapsed: [64]u8 = undefined;
             w.print(" · turn {s}", .{ui_format.duration(&elapsed, b.turn_ms)}) catch {};
             if (b.quiet_ms >= 30_000) w.print(" · no progress {s}", .{ui_format.duration(&elapsed, b.quiet_ms)}) catch {};
@@ -92,7 +92,7 @@ pub const Text = struct {
         }
         if (s.background_count > 0) {
             if (w.end > 0) w.writeAll(" · ") catch {};
-            w.print("bg {d}", .{s.background_count}) catch {};
+            w.print("{d} background task{s}", .{ s.background_count, if (s.background_count == 1) "" else "s" }) catch {};
         }
         if (scrolled) {
             if (w.end > 0) w.writeAll(" · ") catch {};
@@ -156,6 +156,15 @@ pub const Text = struct {
     }
 };
 
+pub fn retryReason(reason: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, reason, "rate_limit") != null or std.mem.indexOf(u8, reason, "429") != null) return "rate limit";
+    if (std.mem.indexOf(u8, reason, "server_error") != null or std.mem.indexOf(u8, reason, "500") != null) return "provider error";
+    if (std.mem.indexOf(u8, reason, "Timeout") != null or std.mem.indexOf(u8, reason, "timed out") != null) return "connection timed out";
+    if (std.mem.indexOf(u8, reason, "IncompleteResponse") != null) return "response interrupted";
+    const line = reason[0 .. std.mem.indexOfAny(u8, reason, "\r\n") orelse reason.len];
+    return @import("transcript/label.zig").promptPrefix(line);
+}
+
 const tokens = ui_format.number;
 
 test "activity is optional and footer shows latest reported usage" {
@@ -163,7 +172,7 @@ test "activity is optional and footer shows latest reported usage" {
     const cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "m", .context_window = 1000 };
     try std.testing.expectEqualStrings("", text.format(.{ .cfg = cfg }, false));
     try std.testing.expectEqualStrings("↑ history · PgDn to return", text.format(.{ .cfg = cfg }, true));
-    try std.testing.expectEqualStrings("⠙ tools · turn <1s · step 2 · Esc to cancel · copied 3 chars", text.format(.{ .cfg = cfg, .current_step = 2, .busy = .{ .phase = .running, .ms = 150 }, .notice = "copied 3 chars" }, false));
+    try std.testing.expectEqualStrings("⠙ Running Run · turn <1s · step 2 · Esc to cancel · copied 3 chars", text.format(.{ .cfg = cfg, .current_step = 2, .busy = .{ .phase = .running, .ms = 150 }, .notice = "copied 3 chars" }, false));
     const line = text.footer(.{ .cfg = cfg, .context = 250, .steps = 2, .usage = .{ .prompt_tokens = 1_800_000, .prompt_cache_hit_tokens = 1_692_000, .completion_tokens = 18_000 } }, 200);
     try std.testing.expectEqualStrings("m · effort server default · ctx 25% · in 1.8M (94% cached) · out 18k · last turn: 2 steps", line);
     const busy = text.footer(.{ .cfg = cfg, .context = 400, .steps = 1, .usage = .{ .prompt_tokens = 1200, .completion_tokens = 50, .prompt_cache_hit_tokens = 600 }, .busy = .{ .phase = .running, .ms = 100 } }, 200);
@@ -174,9 +183,9 @@ test "background task count remains visible during model work" {
     const t = std.testing;
     var text: Text = .{};
     const s: Status = .{ .cfg = .{ .base_url = "", .api_key = "", .model = "m" }, .busy = .{ .phase = .thinking, .ms = 0 }, .background_count = 2 };
-    try t.expectEqualStrings("⠋ waiting model · turn <1s · step 1 · Esc to cancel · bg 2", text.format(s, false));
+    try t.expectEqualStrings("⠋ Waiting for model · turn <1s · step 1 · Esc to cancel · 2 background tasks", text.format(s, false));
     try t.expect(std.mem.endsWith(u8, text.footer(s, 200), " · bg 2"));
-    try t.expectEqualStrings("bg 2", text.format(.{ .cfg = s.cfg, .background_count = 2 }, false));
+    try t.expectEqualStrings("2 background tasks", text.format(.{ .cfg = s.cfg, .background_count = 2 }, false));
 }
 
 test "only content advances progress; stage changes preserve Turn duration" {
@@ -195,8 +204,8 @@ test "only content advances progress; stage changes preserve Turn duration" {
     try t.expectEqualDeep(later, activity.last_progress);
     var text: Text = .{};
     const cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "m" };
-    const s: Status = .{ .cfg = cfg, .detail = "r3 32s", .busy = .{ .phase = .waiting, .ms = 0, .turn_ms = 574000, .quiet_ms = 30000 } };
-    try t.expectEqualStrings("⠋ waiting tasks r3 32s · turn 9m34s · no progress 30s · step 1 · Esc to cancel", text.format(s, false));
+    const s: Status = .{ .cfg = cfg, .detail = "r3 · 32s", .busy = .{ .phase = .waiting, .ms = 0, .turn_ms = 574000, .quiet_ms = 30000 } };
+    try t.expectEqualStrings("⠋ Waiting for r3 · 32s · turn 9m34s · no progress 30s · step 1 · Esc to cancel", text.format(s, false));
     for (0..100) |width| {
         const line = text.formatWidth(s, false, @intCast(width));
         try t.expect(@import("vaxis").gwidth.gwidth(line, .unicode) <= width);
@@ -215,4 +224,11 @@ test "effort footer marks configured ceilings but preserves default" {
         try cfg.setEffort("default");
         try t.expect(std.mem.startsWith(u8, text.footer(.{ .cfg = cfg }, 200), "m · effort server default ·"));
     }
+}
+
+test "retry line names the next attempt and a concise cause" {
+    var text: Text = .{};
+    const s: Status = .{ .cfg = .{ .base_url = "", .api_key = "", .model = "m" }, .detail = "attempt 2/5 · rate limit", .busy = .{ .phase = .retrying, .ms = 0, .turn_ms = 100_000 } };
+    try std.testing.expectEqualStrings("⠋ Retrying · attempt 2/5 · rate limit · turn 1m40s · step 1 · Esc to cancel", text.format(s, false));
+    try std.testing.expectEqualStrings("rate limit", retryReason("Codex stream failed: rate_limit_exceeded: mock error"));
 }

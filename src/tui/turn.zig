@@ -112,7 +112,7 @@ pub const Turn = struct {
                 errdefer if (background_id) |id| gpa.free(id);
                 break :blk .{ .run_end = .{ .background_id = background_id, .ok = r.ok, .output = output, .changes = changes, .tool_summary = if (r.tool_summary) |summary| try summary.clone(gpa) else null } };
             },
-            .retry => |r| .{ .retry = try std.fmt.allocPrint(gpa, "retry {d} in {d}s: {s}", .{ r.attempt, r.delay_ms / 1000, r.reason }) },
+            .retry => |r| .{ .retry = try std.fmt.allocPrint(gpa, "attempt {d}/{d} · {s}", .{ r.attempt + 1, @import("../provider.zig").max_attempts, @import("status.zig").retryReason(r.reason) }) },
             .notice => |m| .{ .notice = try gpa.dupe(u8, m) },
             .usage => |u| .{ .usage = .{ .tokens = u, .context = t.session.context_tokens, .steps = t.session.steps } },
             .progress => |p| .{ .progress = try p.clone(gpa) },

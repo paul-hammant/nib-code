@@ -23,6 +23,7 @@ pub const Transcript = struct {
     entries: std.ArrayList(Entry) = .empty,
     /// ctrl+o state; streamed collapsible entries start in it.
     expanded: bool = false,
+    attempt: usize = 0,
     next_run: usize = 0,
     pending_results: std.ArrayList(PendingResult) = .empty,
 
@@ -37,6 +38,7 @@ pub const Transcript = struct {
         for (t.entries.items) |*e| e.deinit(gpa);
         t.entries.clearRetainingCapacity();
         t.next_run = 0;
+        t.attempt = 0;
         t.clearPendingResults(gpa, 0);
         t.pending_results.deinit(gpa);
         t.pending_results = .empty;
@@ -66,6 +68,11 @@ pub const Transcript = struct {
                 e.label.clearRetainingCapacity();
                 try e.label.print(gpa, "{s} superseded by {s}", .{ id, replacement });
                 try t.replaceBash(gpa, id, replacement);
+            }
+            if (!ok and std.mem.indexOf(u8, summary.value.@"error" orelse "", "timed out") != null) {
+                e.run = .warning;
+                e.label.clearRetainingCapacity();
+                try e.label.print(gpa, "{s} {s} · timed out", .{ id, @tagName(kind) });
             }
             const output = if (kind == .agent) summary.value.text orelse "" else summary.value.output orelse "";
             const preview = if (output.len > 0) output else summary.value.@"error" orelse "";
@@ -109,7 +116,7 @@ pub const Transcript = struct {
 
     pub fn lostBackground(t: *Transcript, gpa: std.mem.Allocator, kind: BackgroundKind, id: []const u8, result: []const u8) !void {
         try t.settleBackgroundProgress(gpa, kind, id, false);
-        var e: Entry = .{ .kind = .background, .run = .failed, .open = t.expanded };
+        var e: Entry = .{ .kind = .background, .run = .warning, .open = t.expanded };
         errdefer e.deinit(gpa);
         e.task_id = try gpa.dupe(u8, id);
         try e.label.print(gpa, "{s} {s} · lost", .{ id, @tagName(kind) });
@@ -215,9 +222,38 @@ pub const Transcript = struct {
         if (kind == .reasoning) return;
         const entry_kind: Kind = .assistant;
         const items = t.entries.items;
-        if (items.len == 0 or items[items.len - 1].kind != entry_kind) try t.entries.append(gpa, .{ .kind = entry_kind, .open = t.expanded });
+        if (items.len == 0 or items[items.len - 1].kind != entry_kind or items[items.len - 1].attempt != t.attempt) try t.entries.append(gpa, .{ .kind = entry_kind, .open = t.expanded, .attempt = t.attempt });
         const current = &t.entries.items[t.entries.items.len - 1];
         try current.text.appendSlice(gpa, text);
+    }
+
+    pub fn beginAttempt(t: *Transcript) void {
+        t.attempt += 1;
+    }
+
+    pub fn discardAttempt(t: *Transcript, gpa: std.mem.Allocator) void {
+        var i: usize = 0;
+        while (i < t.entries.items.len) {
+            const e = &t.entries.items[i];
+            if (e.kind == .assistant and e.attempt == t.attempt) {
+                var removed = t.entries.orderedRemove(i);
+                removed.deinit(gpa);
+            } else i += 1;
+        }
+    }
+
+    pub fn failure(t: *Transcript, gpa: std.mem.Allocator, message: []const u8, reason: @import("../tools/changes.zig").Recovery.Reason) !void {
+        var e: Entry = .{ .kind = .failure, .open = t.expanded, .run = if (reason == .timeout) .warning else .failed };
+        errdefer e.deinit(gpa);
+        try e.text.appendSlice(gpa, message);
+        const sentence = switch (reason) {
+            .timeout => "The request timed out.",
+            .limit => "The step limit was reached.",
+            .tool => "The Run failed.",
+            else => "The model request failed.",
+        };
+        try e.label.print(gpa, "{s} · Details (Ctrl+O)", .{sentence});
+        try t.entries.append(gpa, e);
     }
 
     pub fn startRun(t: *Transcript, gpa: std.mem.Allocator, code: []const u8) !void {
@@ -1093,7 +1129,7 @@ test "live and restored mixed results have identical folded labels and complete 
     for (live.entries.items, restored.entries.items, labels, 0..) |*a, *b, label, i| {
         try testing.expectEqualStrings(label, a.label.items);
         try testing.expectEqualStrings(label, b.label.items);
-        try testing.expectEqualStrings(if (i == 0) "✓ " else "✗ ", a.segments(&left)[0].text);
+        try testing.expectEqualStrings(if (i == 0) "✓ " else if (i == 2) "! " else "✗ ", a.segments(&left)[0].text);
         try testing.expectEqualStrings(a.segments(&left)[0].text, b.segments(&right)[0].text);
         try testing.expectEqual(@as(usize, 2), b.segments(&right).len);
     }
@@ -1143,7 +1179,7 @@ test "background failures without output preview the error and keep complete JSO
     defer t.deinit(gpa);
     const result = "{\"error\":\"timed out after 4000 ms\"}";
     try t.backgroundResult(gpa, .bash, "b1", false, result);
-    try testing.expectEqualStrings("b1 bash · failed · timed out after 4000 ms", t.entries.items[0].label.items);
+    try testing.expectEqualStrings("b1 bash · timed out · timed out after 4000 ms", t.entries.items[0].label.items);
     try testing.expectEqualStrings(result, t.entries.items[0].text.items);
 }
 
@@ -1427,4 +1463,28 @@ test "expanded Runs retain all result lines and label bounded diffs as previews"
     try testing.expect(std.mem.endsWith(u8, shown[shown.len - 3].text, "result 239"));
     try testing.expectEqualStrings("\nScript\n", shown[shown.len - 2].text);
     try testing.expectEqualStrings("script", shown[shown.len - 1].text);
+}
+
+test "retry removes only the failed attempt and preserves interjections and prior answers" {
+    const a = testing.allocator;
+    var t: Transcript = .{};
+    defer t.deinit(a);
+    try t.add(a, .assistant, "previous Step");
+    t.beginAttempt();
+    try t.appendDelta(a, .text, "failed draft");
+    try t.add(a, .user, "interjection");
+    t.entries.items[2].queued = 1;
+    try t.appendDelta(a, .text, "failed tail");
+    t.discardAttempt(a);
+    try testing.expectEqual(@as(usize, 2), t.entries.items.len);
+    try testing.expectEqualStrings("previous Step", t.entries.items[0].text.items);
+    try testing.expectEqualStrings("interjection", t.entries.items[1].text.items);
+    t.beginAttempt();
+    try t.appendDelta(a, .text, "valid answer");
+    try testing.expectEqualStrings("valid answer", t.lastAnswer().?);
+    try t.failure(a, "server detail", .model);
+    const e = &t.entries.items[3];
+    try testing.expect(e.collapsible());
+    try testing.expectEqualStrings("The model request failed. · Details (Ctrl+O)", e.label.items);
+    try testing.expectEqualStrings("server detail", e.text.items);
 }

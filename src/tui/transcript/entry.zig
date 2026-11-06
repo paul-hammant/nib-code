@@ -17,11 +17,12 @@ const appendPreview = label.appendPreview;
 pub const max_diff_lines = 60;
 pub const max_segments = 16 + max_diff_lines;
 
-pub const Kind = enum { user, assistant, run, background, info, err, bill };
+pub const Kind = enum { user, assistant, run, background, info, err, bill, failure };
 
 pub const Entry = struct {
     kind: Kind,
     queued: ?u64 = null,
+    attempt: usize = 0,
     /// For `.run`: the script.
     text: std.ArrayList(u8) = .empty,
     /// For `.run`: the complete result delivered by Session.
@@ -38,7 +39,7 @@ pub const Entry = struct {
     /// until render, so this must outlive draw(); see `refreshLabel`.
     label: std.ArrayList(u8) = .empty,
     files: std.ArrayList(u8) = .empty,
-    run: enum { running, background, superseded, ok, failed } = .running,
+    run: enum { running, background, superseded, ok, failed, warning } = .running,
     elapsed_ms: u64 = 0,
     step_effort: ?provider.StepEffort = null,
     /// Collapsible entries share the transcript ctrl+o state.
@@ -117,7 +118,7 @@ pub const Entry = struct {
     }
 
     pub fn collapsible(e: *const Entry) bool {
-        return e.kind == .run or e.kind == .background or (e.kind == .user and long_text.isLong(e.text.items));
+        return e.kind == .run or e.kind == .background or e.kind == .failure or (e.kind == .user and long_text.isLong(e.text.items));
     }
 
     pub fn print(e: *const Entry, win: vaxis.Window, commit: bool) u16 {
@@ -128,7 +129,7 @@ pub const Entry = struct {
         }
         var segs: [max_segments]vaxis.Segment = undefined;
         const folded = e.collapsible() and !e.open;
-        const wrap: @FieldType(vaxis.Window.PrintOptions, "wrap") = if (folded) .none else if (e.kind == .run or e.kind == .background) .grapheme else .word;
+        const wrap: @FieldType(vaxis.Window.PrintOptions, "wrap") = if (folded) .none else if (e.kind == .run or e.kind == .background or e.kind == .failure) .grapheme else .word;
         const shown = segments(e, &segs);
         if (e.kind == .run) {
             _ = win.print(shown[0..3], .{ .wrap = .none, .commit = commit });
@@ -193,7 +194,7 @@ pub const Entry = struct {
             },
             .assistant => segs[0] = .{ .text = e.text.items },
             .run => {
-                segs[0] = if (e.run == .failed) .{ .text = "✗ ", .style = .{ .fg = .{ .index = 1 } } } else if (e.hasWarning()) .{ .text = "! ", .style = .{ .fg = .{ .index = 3 } } } else .{ .text = "  ", .style = dim };
+                segs[0] = if (e.run == .failed) .{ .text = "✗ ", .style = .{ .fg = .{ .index = 1 } } } else if (e.run == .warning or e.hasWarning()) .{ .text = "! ", .style = .{ .fg = .{ .index = 3 } } } else .{ .text = "  ", .style = dim };
                 segs[1] = .{ .text = "" };
                 segs[2] = .{ .text = e.label.items, .style = dim };
                 if (!e.open) return segs[0..3];
@@ -226,12 +227,19 @@ pub const Entry = struct {
                 return segs[0..n];
             },
             .background => {
-                segs[0] = if (e.run == .superseded) .{ .text = "  ", .style = dim } else .{ .text = if (e.run == .ok) "✓ " else "✗ ", .style = .{ .fg = .{ .index = if (e.run == .ok) 2 else 1 } } };
+                segs[0] = if (e.run == .warning) .{ .text = "! ", .style = .{ .fg = .{ .index = 3 } } } else if (e.run == .superseded) .{ .text = "  ", .style = dim } else .{ .text = if (e.run == .ok) "✓ " else "✗ ", .style = .{ .fg = .{ .index = if (e.run == .ok) 2 else 1 } } };
                 segs[1] = .{ .text = e.label.items, .style = dim };
                 if (!e.open) return segs[0..2];
                 segs[2] = .{ .text = "\n" };
                 segs[3] = .{ .text = e.text.items, .style = dim };
                 return segs[0..4];
+            },
+            .failure => {
+                segs[0] = .{ .text = e.label.items, .style = .{ .fg = .{ .index = if (e.run == .warning) 3 else 1 } } };
+                if (!e.open) return segs[0..1];
+                segs[1] = .{ .text = "\nDetails\n", .style = dim };
+                segs[2] = .{ .text = e.text.items, .style = dim };
+                return segs[0..3];
             },
             .info, .bill => segs[0] = .{ .text = e.text.items, .style = dim },
             .err => segs[0] = .{ .text = e.text.items, .style = .{ .fg = .{ .index = 1 } } },

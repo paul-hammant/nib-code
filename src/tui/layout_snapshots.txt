@@ -58,7 +58,7 @@
 
 
 
- ⠹ waiting model · turn <1s · step 1 · Esc to cancel
+ ⠹ Waiting for model · turn <1s · step 1 · Esc to cancel
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │ Message nib · / for commands                                                 │
 ╰─ mock · effort server default · ctx 0% · in 0 (0% cached) · out 0────────────╯

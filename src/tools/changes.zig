@@ -176,8 +176,8 @@ pub const Recovery = struct {
         try text.appendSlice(gpa, switch (reason) {
             .model => "model connection/request failed",
             .tool => "tool/script failed",
-            .timeout => "timeout",
-            .canceled => "user canceled",
+            .timeout => "Timed out",
+            .canceled => "Canceled",
             .limit => "step limit reached",
         });
         try text.appendSlice(gpa, if (r.paths.items.len == 0) " · no recorded edit/write changes" else " · edited: ");
@@ -204,7 +204,7 @@ test "recovery records only this Turn's unique paths and distinguishes failure c
     r.noteBash(testing.io);
     const text = try r.hint(testing.allocator, testing.io, .canceled, "/project");
     defer testing.allocator.free(text);
-    try testing.expectEqualStrings("user canceled · edited: a.zig, b.zig · bash changes untracked · type continue to resume", text);
+    try testing.expectEqualStrings("Canceled · edited: a.zig, b.zig · bash changes untracked · type continue to resume", text);
     r.clear(testing.allocator, testing.io);
     const empty = try r.hint(testing.allocator, testing.io, .model, "/project");
     defer testing.allocator.free(empty);

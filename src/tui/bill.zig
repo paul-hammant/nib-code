@@ -13,7 +13,7 @@ pub const Text = struct {
         var tool_bytes: [64]u8 = undefined;
         var output_bytes: [64]u8 = undefined;
         var w: std.Io.Writer = .fixed(&text.buf);
-        if (summary.status != .completed) w.print("{s} · ", .{@tagName(summary.status)}) catch unreachable;
+        if (summary.status == .failed) w.print("{s} · ", .{@tagName(summary.status)}) catch unreachable;
         w.print("{d} step{s} · {s} · model {s} · tools {s}", .{
             summary.steps,
             if (summary.steps == 1) "" else "s",
@@ -118,7 +118,7 @@ test "bill omits zero delegation counts and handles zero usage" {
 
 test "bill prefixes canceled and failed outcomes" {
     var text: Text = .{};
-    inline for (.{ .canceled, .failed }) |status| {
+    inline for (.{.failed}) |status| {
         const summary: TurnSummary = .{ .status = status };
         const prefix = @tagName(status);
         try std.testing.expect(std.mem.startsWith(u8, text.format(summary, 200), prefix ++ " · 0 steps"));
