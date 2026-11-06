@@ -1,24 +1,24 @@
 <?xml version='1.0' encoding='utf-8'?>
-<svg xmlns="http://www.w3.org/2000/svg" width="720" height="226" viewBox="0 0 720 226" font-family="-apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, Helvetica, Arial, sans-serif" font-size="13">
-  <text x="185" y="25" fill="#9198a1" text-anchor="end" font-weight="400">pi (clean)</text>
-  <rect x="200" y="12" width="45.48115299334812" height="16" rx="4" fill="#6E7781" opacity="0.5" />
-  <text x="253.48115299334813" y="25" fill="#9198a1" text-anchor="start" font-weight="400">1,282 tokens</text>
-  <text x="185" y="55" fill="#4C8DFF" text-anchor="end" font-weight="700">nib</text>
-  <rect x="200" y="42" width="77.69401330376941" height="16" rx="4" fill="#4C8DFF" opacity="1" />
-  <text x="285.6940133037694" y="55" fill="#4C8DFF" text-anchor="start" font-weight="700">2,190 tokens</text>
-  <text x="185" y="85" fill="#9198a1" text-anchor="end" font-weight="400">pi (everyday extensions)</text>
-  <rect x="200" y="72" width="85.74722838137473" height="16" rx="4" fill="#6E7781" opacity="0.5" />
-  <text x="293.7472283813747" y="85" fill="#9198a1" text-anchor="start" font-weight="400">2,417 tokens</text>
-  <text x="185" y="115" fill="#9198a1" text-anchor="end" font-weight="400">dsh</text>
-  <rect x="200" y="102" width="221.2328159645233" height="16" rx="4" fill="#6E7781" opacity="0.5" />
-  <text x="429.2328159645233" y="115" fill="#9198a1" text-anchor="start" font-weight="400">6,236 tokens</text>
-  <text x="185" y="145" fill="#9198a1" text-anchor="end" font-weight="400">prime-agent</text>
-  <rect x="200" y="132" width="315.42350332594236" height="16" rx="4" fill="#6E7781" opacity="0.5" />
-  <text x="523.4235033259424" y="145" fill="#9198a1" text-anchor="start" font-weight="400">8,891 tokens</text>
-  <text x="185" y="175" fill="#9198a1" text-anchor="end" font-weight="400">Codex CLI</text>
-  <rect x="200" y="162" width="363.9911308203991" height="16" rx="4" fill="#6E7781" opacity="0.5" />
-  <text x="571.9911308203991" y="175" fill="#9198a1" text-anchor="start" font-weight="400">10,260 tokens</text>
-  <text x="185" y="205" fill="#9198a1" text-anchor="end" font-weight="400">Claude Code</text>
-  <rect x="200" y="192" width="400.0" height="16" rx="4" fill="#6E7781" opacity="0.5" />
-  <text x="608.0" y="205" fill="#9198a1" text-anchor="start" font-weight="400">11,275 tokens</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="236" viewBox="0 0 880 236" font-family="-apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, Helvetica, Arial, sans-serif" font-size="13">
+  <text x="124" y="25" fill="#9198a1" text-anchor="end" font-weight="400">pi</text>
+  <rect x="136" y="11" width="73.7" height="18" rx="3" fill="#3D444D" />
+  <text x="219.67946784922395" y="25" fill="#e6edf3" text-anchor="start" font-weight="400">1,282 tokens</text>
+  <text x="124" y="57" fill="#4C8DFF" text-anchor="end" font-weight="700">nib</text>
+  <rect x="136" y="43" width="125.9" height="18" rx="3" fill="#4C8DFF" />
+  <text x="271.86430155210644" y="57" fill="#4C8DFF" text-anchor="start" font-weight="700">2,190 tokens</text>
+  <text x="124" y="89" fill="#9198a1" text-anchor="end" font-weight="400">pi + extensions</text>
+  <rect x="136" y="75" width="138.9" height="18" rx="3" fill="#3D444D" />
+  <text x="284.910509977827" y="89" fill="#e6edf3" text-anchor="start" font-weight="400">2,417 tokens</text>
+  <text x="124" y="121" fill="#9198a1" text-anchor="end" font-weight="400">dsh</text>
+  <rect x="136" y="107" width="358.4" height="18" rx="3" fill="#3D444D" />
+  <text x="504.39716186252775" y="121" fill="#e6edf3" text-anchor="start" font-weight="400">6,236 tokens</text>
+  <text x="124" y="153" fill="#9198a1" text-anchor="end" font-weight="400">prime</text>
+  <rect x="136" y="139" width="511.0" height="18" rx="3" fill="#3D444D" />
+  <text x="656.9860753880266" y="153" fill="#e6edf3" text-anchor="start" font-weight="400">8,891 tokens</text>
+  <text x="124" y="185" fill="#9198a1" text-anchor="end" font-weight="400">Codex</text>
+  <rect x="136" y="171" width="589.7" height="18" rx="3" fill="#3D444D" />
+  <text x="735.6656319290466" y="185" fill="#e6edf3" text-anchor="start" font-weight="400">10,260 tokens</text>
+  <text x="124" y="217" fill="#9198a1" text-anchor="end" font-weight="400">Claude Code</text>
+  <rect x="136" y="203" width="648.0" height="18" rx="3" fill="#3D444D" />
+  <text x="794.0" y="217" fill="#e6edf3" text-anchor="start" font-weight="400">11,275 tokens</text>
 </svg>

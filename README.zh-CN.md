@@ -23,7 +23,7 @@ nib 是用 Zig 写的编码 agent，以 Run 为工作单位：一段 JavaScript 
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/bench-memory-dark.svg">
-  <img src="docs/assets/bench-memory-light.svg" alt="十个空闲实例的总 RSS：nib 38 MB；pi 纯净版 1,134 MB；Codex CLI 1,164 MB；prime-agent 1,460 MB；Claude Code 1,750 MB；pi 日常扩展版 1,984 MB；dsh 5,459 MB。" width="720">
+  <img src="docs/assets/bench-memory-light.svg" alt="十个空闲实例的总 RSS：nib 38 MB；pi 纯净版 1,134 MB；Codex CLI 1,164 MB；prime-agent 1,460 MB；Claude Code 1,750 MB；pi 日常扩展版 1,984 MB；dsh 5,459 MB。" width="880">
 </picture>
 
 5 MB 静态二进制 · 无运行时依赖。

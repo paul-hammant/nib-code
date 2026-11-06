@@ -1,24 +1,24 @@
 <?xml version='1.0' encoding='utf-8'?>
-<svg xmlns="http://www.w3.org/2000/svg" width="720" height="226" viewBox="0 0 720 226" font-family="-apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, Helvetica, Arial, sans-serif" font-size="13">
-  <text x="185" y="25" fill="#4C8DFF" text-anchor="end" font-weight="700">nib</text>
-  <rect x="200" y="12" width="2.784392745924162" height="16" rx="4" fill="#4C8DFF" opacity="1" />
-  <text x="210.78439274592415" y="25" fill="#4C8DFF" text-anchor="start" font-weight="700">38 MB</text>
-  <text x="185" y="55" fill="#9198a1" text-anchor="end" font-weight="400">pi (clean)</text>
-  <rect x="200" y="42" width="83.09214141784209" height="16" rx="4" fill="#6E7781" opacity="0.5" />
-  <text x="291.0921414178421" y="55" fill="#9198a1" text-anchor="start" font-weight="400">1,134 MB</text>
-  <text x="185" y="85" fill="#9198a1" text-anchor="end" font-weight="400">Codex CLI</text>
-  <rect x="200" y="72" width="85.2903462172559" height="16" rx="4" fill="#6E7781" opacity="0.5" />
-  <text x="293.2903462172559" y="85" fill="#9198a1" text-anchor="start" font-weight="400">1,164 MB</text>
-  <text x="185" y="115" fill="#9198a1" text-anchor="end" font-weight="400">prime-agent</text>
-  <rect x="200" y="102" width="106.97930023813886" height="16" rx="4" fill="#6E7781" opacity="0.5" />
-  <text x="314.9793002381389" y="115" fill="#9198a1" text-anchor="start" font-weight="400">1,460 MB</text>
-  <text x="185" y="145" fill="#9198a1" text-anchor="end" font-weight="400">Claude Code</text>
-  <rect x="200" y="132" width="128.22861329913903" height="16" rx="4" fill="#6E7781" opacity="0.5" />
-  <text x="336.22861329913906" y="145" fill="#9198a1" text-anchor="start" font-weight="400">1,750 MB</text>
-  <text x="185" y="175" fill="#9198a1" text-anchor="end" font-weight="400">pi (everyday extensions)</text>
-  <rect x="200" y="162" width="145.37461073456677" height="16" rx="4" fill="#6E7781" opacity="0.5" />
-  <text x="353.3746107345668" y="175" fill="#9198a1" text-anchor="start" font-weight="400">1,984 MB</text>
-  <text x="185" y="205" fill="#9198a1" text-anchor="end" font-weight="400">dsh</text>
-  <rect x="200" y="192" width="400.0" height="16" rx="4" fill="#6E7781" opacity="0.5" />
-  <text x="608.0" y="205" fill="#9198a1" text-anchor="start" font-weight="400">5,459 MB</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="236" viewBox="0 0 880 236" font-family="-apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, Helvetica, Arial, sans-serif" font-size="13">
+  <text x="124" y="25" fill="#4C8DFF" text-anchor="end" font-weight="700">nib</text>
+  <rect x="136" y="11" width="4.5" height="18" rx="3" fill="#4C8DFF" />
+  <text x="150.51071624839713" y="25" fill="#4C8DFF" text-anchor="start" font-weight="700">38 MB</text>
+  <text x="124" y="57" fill="#9198a1" text-anchor="end" font-weight="400">pi</text>
+  <rect x="136" y="43" width="134.6" height="18" rx="3" fill="#3D444D" />
+  <text x="280.6092690969042" y="57" fill="#e6edf3" text-anchor="start" font-weight="400">1,134 MB</text>
+  <text x="124" y="89" fill="#9198a1" text-anchor="end" font-weight="400">Codex</text>
+  <rect x="136" y="75" width="138.2" height="18" rx="3" fill="#3D444D" />
+  <text x="284.1703608719546" y="89" fill="#e6edf3" text-anchor="start" font-weight="400">1,164 MB</text>
+  <text x="124" y="121" fill="#9198a1" text-anchor="end" font-weight="400">prime</text>
+  <rect x="136" y="107" width="173.3" height="18" rx="3" fill="#3D444D" />
+  <text x="319.306466385785" y="121" fill="#e6edf3" text-anchor="start" font-weight="400">1,460 MB</text>
+  <text x="124" y="153" fill="#9198a1" text-anchor="end" font-weight="400">Claude Code</text>
+  <rect x="136" y="139" width="207.7" height="18" rx="3" fill="#3D444D" />
+  <text x="353.73035354460524" y="153" fill="#e6edf3" text-anchor="start" font-weight="400">1,750 MB</text>
+  <text x="124" y="185" fill="#9198a1" text-anchor="end" font-weight="400">pi + extensions</text>
+  <rect x="136" y="171" width="235.5" height="18" rx="3" fill="#3D444D" />
+  <text x="381.5068693899982" y="185" fill="#e6edf3" text-anchor="start" font-weight="400">1,984 MB</text>
+  <text x="124" y="217" fill="#9198a1" text-anchor="end" font-weight="400">dsh</text>
+  <rect x="136" y="203" width="648.0" height="18" rx="3" fill="#3D444D" />
+  <text x="794.0" y="217" fill="#e6edf3" text-anchor="start" font-weight="400">5,459 MB</text>
 </svg>

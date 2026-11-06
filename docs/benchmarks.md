@@ -18,7 +18,7 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/bench-prompt-dark.svg">
-  <img src="assets/bench-prompt-light.svg" alt="每次请求的固定提示 tokens，按从少到多排序：pi clean 1,282；nib 2,190；pi 日常扩展版 2,417；dsh 6,236；prime-agent 8,891；Codex CLI 10,260；Claude Code 11,275。" width="720">
+  <img src="assets/bench-prompt-light.svg" alt="每次请求的固定提示 tokens，按从少到多排序：pi clean 1,282；nib 2,190；pi 日常扩展版 2,417；dsh 6,236；prime-agent 8,891；Codex CLI 10,260；Claude Code 11,275。" width="880">
 </picture>
 
 *2026 年 11 月，system + 工具定义，单位为 tokens。*
@@ -46,7 +46,7 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/bench-cost-dark.svg">
-  <img src="assets/bench-cost-light.svg" alt="各任务费用对比：timers $0.052 / $0.109；bash-amp $0.029 / $0.062；grep-column $0.038 / $0.054；console-tail $0.059 / $0.090（nib / Codex CLI）。" width="720">
+  <img src="assets/bench-cost-light.svg" alt="各任务费用对比：timers $0.052 / $0.109；bash-amp $0.029 / $0.062；grep-column $0.038 / $0.054；console-tail $0.059 / $0.090（nib / Codex CLI）。" width="880">
 </picture>
 
 *同一组对比运行，美元，按 API 价格计算；各任务为接近中位数的均值。*
