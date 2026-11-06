@@ -13,7 +13,13 @@ pub const Info = struct {
     mismatch_index: ?usize = null,
 };
 
+// Observed Codex server idle closes occur around 60 seconds.
+pub const idle_reconnect_ms = 50_000;
+
 pub const State = struct {
+    completed_at: ?std.Io.Clock.Timestamp = null,
+    reused: bool = false,
+    stale_socket: bool = false,
     socket: ?websocket.Connection = null,
     scope: ?[32]u8 = null,
     previous_id: ?[]u8 = null,
@@ -27,8 +33,17 @@ pub const State = struct {
     pub fn reset(s: *State, gpa: std.mem.Allocator) void {
         if (s.socket) |*socket| socket.close(gpa);
         s.socket = null;
+        s.completed_at = null;
         s.scope = null;
         s.clearPrevious(gpa);
+    }
+
+    pub fn reconnectIfIdle(s: *State, gpa: std.mem.Allocator, now: std.Io.Clock.Timestamp) void {
+        const completed = s.completed_at orelse return;
+        if (s.socket != null and completed.durationTo(now).raw.toMilliseconds() > idle_reconnect_ms) {
+            s.reset(gpa);
+            s.reset_reason = "idle_reconnect";
+        }
     }
 
     pub fn clearPrevious(s: *State, gpa: std.mem.Allocator) void {

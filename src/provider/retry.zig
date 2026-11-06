@@ -83,6 +83,7 @@ fn completeWith(
     attempts: *u32,
     retry_sink: ?Sink,
 ) !p.Reply {
+    var immediate_reconnect = false;
     var attempt: u32 = 1;
     while (true) : (attempt += 1) {
         attempts.* = attempt;
@@ -100,6 +101,14 @@ fn completeWith(
             if ((!is_codex and fwd.emitted and !sink.replay_safe) or attempt == max_attempts or !transient(err)) {
                 try Sink.emit(retry_sink, .{ .failed = .{ .attempt = attempt, .err = err, .reason = detail.* orelse @errorName(err) } });
                 return err;
+            }
+            if (is_codex and !immediate_reconnect and !fwd.emitted) {
+                if (sink.codex_state) |state| if (state.stale_socket) {
+                    immediate_reconnect = true;
+                    if (detail.*) |d| gpa.free(d);
+                    detail.* = null;
+                    continue;
+                };
             }
             var delay_ms = @as(u64, 1000) << @intCast(attempt - 1);
             if (is_codex and err == error.RateLimited) if (detail.*) |message| {

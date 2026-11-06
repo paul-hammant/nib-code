@@ -10,6 +10,10 @@ pub const Reader = struct {
 
     pub fn init(gpa: std.mem.Allocator, input: *std.Io.Reader, monitor: *idle.Monitor, sink: p.Sink) !Reader {
         const buffer = try gpa.alloc(u8, 64 * 1024);
+        return initBuffer(buffer, input, monitor, sink);
+    }
+
+    pub fn initBuffer(buffer: []u8, input: *std.Io.Reader, monitor: *idle.Monitor, sink: p.Sink) Reader {
         monitor.body = true;
         monitor.last = .now(monitor.io, .awake);
         return .{
