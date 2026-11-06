@@ -110,9 +110,10 @@ def test_incremental_stream(tmp):
                 assert input_latency < .05, f"input latency: {input_latency * 1000:.1f}ms"
                 print(f"PTY chars={milestone} input={input_latency * 1000:.1f}ms")
             wait_for(reply.paused.is_set, "stream pause", timeout=30)
-            wait_for(lambda: any("PAUSED_TAIL" in row for row in screen(terminal.read(), 120, 32)), "visible paused tail")
+            terminal.until(b"PAUSED_TAIL")
             tail_lag = time.monotonic() - reply.tail_sent
-            assert tail_lag < .15
+            assert tail_lag < .15, f"tail latency: {tail_lag * 1000:.1f}ms"
+            wait_for(lambda: any("PAUSED_TAIL" in row for row in screen(terminal.read(), 120, 32)), "visible paused tail")
             print(f"PTY first={first_latency * 1000:.1f}ms input={input_latency * 1000:.1f}ms tail={tail_lag * 1000:.1f}ms")
             assert not finished(home, reply.text), "tail must display while the response is still open"
             output = terminal.read()[start:]
