@@ -115,6 +115,8 @@ class Terminal:
         os.write(self.master, text.encode())
 
     def close(self):
+        if self.master is None:
+            return
         if self.child.poll() is None:
             self.send("\x03")
             deadline = time.monotonic() + 5
@@ -125,6 +127,7 @@ class Terminal:
                 self.child.kill()
         self.read()
         os.close(self.master)
+        self.master = None
         self.child.wait(timeout=5)
         assert self.child.returncode == 0, self.output[-4000:]
 
