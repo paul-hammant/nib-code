@@ -1,22 +1,6 @@
 const std = @import("std");
 const ToolSummary = @import("../../session/tool_summary.zig").Summary;
 
-/// What a Run changed, as shown: the one-line summary and the colored diff.
-pub fn appendHead(gpa: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8, max_lines: usize) !void {
-    var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, text, "\n"), '\n');
-    var n: usize = 0;
-    while (it.next()) |line| : (n += 1) {
-        if (n == max_lines) {
-            var rest: usize = 1;
-            while (it.next()) |_| rest += 1;
-            try out.print(gpa, "\n… {d} more lines", .{rest});
-            return;
-        }
-        if (n > 0) try out.append(gpa, '\n');
-        try out.appendSlice(gpa, line);
-    }
-}
-
 pub fn actualToolSummary(summary: ToolSummary, changed_files: usize, buf: []u8) []const u8 {
     if (summary.counts.len == 0 and summary.omitted == 0) return "";
     var w: std.Io.Writer = .fixed(buf);

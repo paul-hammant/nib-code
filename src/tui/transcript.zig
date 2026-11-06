@@ -11,9 +11,7 @@ const label_text = @import("transcript/label.zig");
 pub const Kind = entries.Kind;
 pub const Entry = entries.Entry;
 pub const ChangeText = @import("transcript/changes.zig").ChangeText;
-const run_output_lines = entries.run_output_lines;
 const max_segments = entries.max_segments;
-const appendHead = label_text.appendHead;
 const actualToolSummary = label_text.actualToolSummary;
 const promptPrefix = label_text.promptPrefix;
 const appendPreview = label_text.appendPreview;
@@ -339,7 +337,7 @@ pub const Transcript = struct {
         e.changes.deinit(gpa);
         e.changes = changes;
         if (summary) |value| e.tool_summary = try value.clone(gpa);
-        try appendHead(gpa, &e.output, output, run_output_lines);
+        try e.output.appendSlice(gpa, output);
         try e.refreshLabel(gpa);
         e.cached = null;
     }
@@ -425,7 +423,7 @@ pub const Transcript = struct {
                     }
                     try e.refreshAgents(gpa);
                     if (m.tool_summary) |summary| e.tool_summary = try summary.clone(gpa);
-                    try appendHead(gpa, &e.output, content, run_output_lines);
+                    try e.output.appendSlice(gpa, content);
                     try e.refreshLabel(gpa);
                 }
             }
@@ -584,7 +582,7 @@ test "runs fold to one line until expanded" {
     var segs: [max_segments]vaxis.Segment = undefined;
     try testing.expectEqualStrings("Run", e.segments(&segs)[2].text);
     t.toggleExpanded();
-    try testing.expectEqual(@as(u16, 6), e.height(win));
+    try testing.expectEqual(@as(u16, 10), e.height(win));
 }
 
 test "entry height cache reuses measurements and invalidates on width or append" {
@@ -658,8 +656,8 @@ test "a Run shows changed files in its summary and a colored diff when open" {
     const shown = e.segments(&segs);
     try testing.expectEqualStrings("-old\n", shown[8].text);
     try testing.expectEqual(@as(u8, 1), shown[8].style.fg.index);
-    try testing.expectEqualStrings("+hi", shown[11].text);
-    try testing.expectEqual(@as(u16, 9), e.height(win));
+    try testing.expectEqualStrings("+hi\n", shown[11].text);
+    try testing.expectEqual(@as(u16, 13), e.height(win));
 
     var many: [3]Change = undefined;
     for (&many) |*c| c.* = .{ .path = "x", .added = 2, .removed = 1, .diff = "" };
@@ -680,12 +678,12 @@ test "agent tree stays visible folded, expanded and after Run ends" {
     try testing.expectEqualStrings("", e.segments(&segs)[1].text);
     t.toggleExpanded();
     try testing.expectEqualStrings("  └─ a1 fix it · running · step 3 · edit src/x.zig", e.agent_tree.rows.items[0].text);
-    try testing.expectEqualStrings(e.text.items, e.segments(&segs)[4].text);
+    try testing.expectEqualStrings(e.text.items, e.segments(&segs)[10].text);
     try t.progress(gpa, .{ .id = "a1", .prompt = "fix it", .state = .done, .step = 3, .tools = &.{"edit"}, .files = &.{"src/x.zig"} });
     try t.endRun(gpa, true, "done", 1234, .{});
     try testing.expectEqualStrings("Run", e.segments(&segs)[2].text);
     try testing.expectEqualStrings("", e.segments(&segs)[1].text);
-    try testing.expectEqualStrings("done", e.segments(&segs)[6].text);
+    try testing.expectEqualStrings("done", e.segments(&segs)[8].text);
     try testing.expectEqualStrings("  └─ a1 fix it · completed · step 3 · edit src/x.zig", e.agent_tree.rows.items[0].text);
     try t.progress(gpa, .{ .id = "a1", .prompt = "late" });
     try testing.expectEqualStrings("Run", e.label.items);
@@ -877,15 +875,15 @@ test "agent rows have stable heights across folding resizing completion and scro
     try testing.expectEqualStrings("└", screen.readCell(2, 2).?.char.grapheme);
     try testing.expectEqualStrings(" ", screen.readCell(0, 3).?.char.grapheme);
     t.toggleExpanded();
-    try testing.expectEqual(@as(u16, 4), e.height(win));
+    try testing.expectEqual(@as(u16, 9), e.height(win));
     _ = e.print(win, true);
-    try testing.expectEqualStrings("a", screen.readCell(0, 3).?.char.grapheme);
+    try testing.expectEqualStrings("C", screen.readCell(0, 3).?.char.grapheme);
     try t.progress(gpa, .{ .id = "a2", .prompt = "second", .state = .failed, .step = 4, .tools = &.{"bash"} });
-    try testing.expectEqual(@as(u16, 4), e.height(win));
+    try testing.expectEqual(@as(u16, 9), e.height(win));
     try t.endRun(gpa, true, "result", 2000, .{});
-    try testing.expectEqual(@as(u16, 5), e.height(win));
+    try testing.expectEqual(@as(u16, 9), e.height(win));
     _ = e.print(win, true);
-    try testing.expectEqualStrings("r", screen.readCell(0, 4).?.char.grapheme);
+    try testing.expectEqualStrings("R", screen.readCell(0, 5).?.char.grapheme);
     try testing.expectEqualStrings("  ├─ a2 second · failed · step 4 · bash", e.agent_tree.rows.items[0].text);
     t.toggleExpanded();
     try testing.expectEqual(@as(u16, 3), e.height(win));
@@ -1401,4 +1399,32 @@ test "Run facts name changed files and retain warning without changing script su
     var segs: [max_segments]vaxis.Segment = undefined;
     try testing.expectEqualStrings("! ", e.segments(&segs)[0].text);
     try testing.expectEqual(@as(u8, 3), segs[0].style.fg.index);
+}
+
+test "expanded Runs retain all result lines and label bounded diffs as previews" {
+    const a = testing.allocator;
+    var t: Transcript = .{};
+    defer t.deinit(a);
+    var result: std.ArrayList(u8) = .empty;
+    defer result.deinit(a);
+    var diff: std.ArrayList(u8) = .empty;
+    defer diff.deinit(a);
+    for (0..240) |i| {
+        try result.print(a, "result {d}\n", .{i});
+        try diff.print(a, "+line {d}\n", .{i});
+    }
+    try t.startRun(a, "script");
+    try t.endRun(a, true, result.items, 1, try .init(a, &.{.{ .path = "a", .added = 240, .removed = 0, .diff = diff.items }}));
+    const e = &t.entries.items[0];
+    try testing.expectEqualStrings(result.items, e.output.items);
+    try testing.expectEqualStrings("Diff preview · 60 of 241 lines\n", e.changes.preview);
+    try testing.expect(std.mem.indexOf(u8, e.changes.diff, "more lines") == null);
+    t.toggleExpanded();
+    var segs: [max_segments]vaxis.Segment = undefined;
+    const shown = e.segments(&segs);
+    try testing.expectEqualStrings("Changes\n", shown[4].text);
+    try testing.expectEqualStrings("Result\n", shown[shown.len - 4].text);
+    try testing.expect(std.mem.endsWith(u8, shown[shown.len - 3].text, "result 239"));
+    try testing.expectEqualStrings("\nScript\n", shown[shown.len - 2].text);
+    try testing.expectEqualStrings("script", shown[shown.len - 1].text);
 }

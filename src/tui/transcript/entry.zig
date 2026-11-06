@@ -14,9 +14,8 @@ const label = @import("label.zig");
 const actualToolSummary = label.actualToolSummary;
 const appendPreview = label.appendPreview;
 
-pub const run_output_lines = 12;
 pub const max_diff_lines = 60;
-pub const max_segments = 8 + max_diff_lines + 2;
+pub const max_segments = 16 + max_diff_lines;
 
 pub const Kind = enum { user, assistant, run, background, info, err, bill };
 
@@ -25,7 +24,7 @@ pub const Entry = struct {
     queued: ?u64 = null,
     /// For `.run`: the script.
     text: std.ArrayList(u8) = .empty,
-    /// For `.run`: the first lines of its output.
+    /// For `.run`: the complete result delivered by Session.
     output: std.ArrayList(u8) = .empty,
     /// For `.run`: see `ChangeText`.
     changes: ChangeText = .{},
@@ -199,29 +198,31 @@ pub const Entry = struct {
                 segs[2] = .{ .text = e.label.items, .style = dim };
                 if (!e.open) return segs[0..3];
                 segs[3] = .{ .text = "\n" };
-                segs[4] = .{ .text = e.text.items, .style = .{ .fg = .{ .index = 3 } } };
-                var n: usize = 5;
-                if (e.output.items.len > 0) {
-                    segs[5] = .{ .text = "\n" };
-                    segs[6] = .{ .text = e.output.items, .style = if (e.run == .failed) .{ .fg = .{ .index = 1 }, .dim = true } else dim };
-                    n = 7;
+                segs[4] = .{ .text = "Changes\n", .style = .{ .bold = true, .dim = true } };
+                segs[5] = .{ .text = e.changes.preview, .style = dim };
+                var n: usize = 6;
+                const diff = e.changes.diff;
+                if (diff.len == 0) {
+                    segs[n] = .{ .text = "No file changes\n", .style = dim };
+                    n += 1;
                 }
-                const diff = std.mem.trimEnd(u8, e.changes.diff, "\n");
-                if (diff.len == 0) return segs[0..n];
-                segs[n] = .{ .text = "\n" };
-                n += 1;
                 var start: usize = 0;
-                while (start < diff.len and n < segs.len) : (n += 1) {
+                while (start < diff.len and n < segs.len - 5) : (n += 1) {
                     const end = if (std.mem.indexOfScalarPos(u8, diff, start, '\n')) |nl| nl + 1 else diff.len;
                     const line = diff[start..end];
                     segs[n] = .{ .text = line, .style = switch (line[0]) {
                         '+' => .{ .fg = .{ .index = 2 } },
                         '-' => .{ .fg = .{ .index = 1 } },
                         ' ' => dim,
-                        else => if (std.mem.startsWith(u8, line, "…")) dim else .{ .bold = true },
+                        else => .{ .bold = true, .dim = true },
                     } };
                     start = end;
                 }
+                segs[n] = .{ .text = "Result\n", .style = .{ .bold = true, .dim = true } };
+                segs[n + 1] = .{ .text = if (e.output.items.len == 0) "No result" else std.mem.trimEnd(u8, e.output.items, "\n"), .style = if (e.run == .failed) .{ .fg = .{ .index = 1 }, .dim = true } else dim };
+                segs[n + 2] = .{ .text = "\nScript\n", .style = .{ .bold = true, .dim = true } };
+                segs[n + 3] = .{ .text = e.text.items, .style = dim };
+                n += 4;
                 return segs[0..n];
             },
             .background => {
