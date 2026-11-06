@@ -659,7 +659,7 @@ echo https://example.invalid/issues/1
             calls.write_text("".join(json.dumps(row) + "\n" for row in secret_rows))
             calls.chmod(0o600)
             self.mock.reply(codes=["console.log(await tools.read({path: " + json.dumps(str(log)) + "}));"])
-            self.mock.reply(text="### Issue 草稿\n```json\n" + json.dumps([
+            self.mock.reply(text="### Issue drafts\n```json\n" + json.dumps([
                 {"title": "Replay privacy regression probe", "body": "Synthetic harness-only evidence."}]) + "\n```")
             before = len(self.mock.requests)
             terminal.send("/reflect\r")
@@ -669,12 +669,12 @@ echo https://example.invalid/issues/1
             self.assertGreaterEqual(len(reflection_requests), 2)
             self.assertNotIn(marker, json.dumps(reflection_requests, ensure_ascii=False))
             prompt = next(m["content"] for m in reflection_requests[0]["messages"]
-                          if m["role"] == "user" and "这是一次反思" in m.get("content", ""))
+                          if m["role"] == "user" and "This is a reflection" in m.get("content", ""))
             self.assertIn(str(log), prompt)
-            self.assertIn("只允许读取上面明确指定的本会话主日志路径", prompt)
-            self.assertIn("不要枚举、glob 或搜索 sessions 目录", prompt)
+            self.assertIn("Read only the explicitly specified main log path for this session", prompt)
+            self.assertIn("Do not enumerate, glob, or search the sessions directory", prompt)
             self.assertIn("`.calls.jsonl`", prompt)
-            self.assertNotIn("parent_session_id 是", prompt)
+            self.assertNotIn("parent_session_id is", prompt)
             self.assertNotIn(marker, body_path.read_text())
             self.assertNotIn(marker, args_path.read_text())
             self.assertIn("Synthetic harness-only evidence.", body_path.read_text())

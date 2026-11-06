@@ -86,10 +86,10 @@ class H(http.server.BaseHTTPRequestHandler):
         elif last['role']=='user' and lastuser == 'child probe':
             if thinking: ev({"choices":[{"delta":{"reasoning_content":"Probe."}}]})
             ev({"choices":[{"delta":{"content":"probe complete"}}], "usage":{"prompt_tokens":prompt_tokens(100),"completion_tokens":10}})
-        elif last['role']=='user' and lastuser.startswith('这是一次反思'):
-            ev({"choices":[{"delta":{"content":"### 摘要\n反思完成。\n\n### Issue 草稿\n```json\n[{\"title\": \"write: escaping friction\", \"body\": \"seen in " + os.getcwd() + "/x.py\"}, {\"title\": \"leaky\", \"body\": \"ghp_secret\"}]\n```"}}]})
+        elif last['role']=='user' and lastuser.startswith('This is a reflection'):
+            ev({"choices":[{"delta":{"content":"### Summary\nReflection complete.\n\n### Issue drafts\n```json\n[{\"title\": \"write: escaping friction\", \"body\": \"seen in " + os.getcwd() + "/x.py\"}, {\"title\": \"leaky\", \"body\": \"ghp_secret\"}]\n```"}}]})
         elif last['role']=='user' and lastuser in ('interrupt me', 'interrupt stalled'):
-            if thinking: ev({"choices":[{"delta":{"reasoning_content":"想一想。"}}]})
+            if thinking: ev({"choices":[{"delta":{"reasoning_content":"Let me think."}}]})
             ev({"choices":[{"delta":{"content":"partial answer"}}]})
             time.sleep(30 if lastuser == 'interrupt stalled' else 1)
             try: ev({"choices":[{"delta":{"content":" never seen"}}]}); self.wfile.write(b'0\r\n\r\n')
@@ -189,16 +189,16 @@ class H(http.server.BaseHTTPRequestHandler):
                         'await tools.read({path: "timing.txt"})')
             code = llm_run_code(lastuser) or code
             args=json.dumps({"code":code}, ensure_ascii=lastuser != "timing")
-            if thinking: ev({"choices":[{"delta":{"reasoning_content":"先用 bash 看看。"}}]})
-            ev({"choices":[{"delta":{"content":"我先跑一下。"}}]})
+            if thinking: ev({"choices":[{"delta":{"reasoning_content":"Let me check with bash."}}]})
+            ev({"choices":[{"delta":{"content":"I will run it first."}}]})
             # stream the arguments in fragments, as real providers do
             ev({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"run","arguments":""}}]}}]})
             for i in range(0,len(args),7):
                 ev({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":args[i:i+7]}}]}}]})
             ev({"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":prompt_tokens(100),"completion_tokens":20,"prompt_cache_hit_tokens":64}})
         else:
-            if thinking: ev({"choices":[{"delta":{"reasoning_content":"结果出来了。"}}]})
-            ev({"choices":[{"delta":{"content":"工具返回：" + last['content'].replace('\n',' | ')}}]})
+            if thinking: ev({"choices":[{"delta":{"reasoning_content":"The result is ready."}}]})
+            ev({"choices":[{"delta":{"content":"Tool output: " + last['content'].replace('\n',' | ')}}]})
             ev({"choices":[],"usage":{"prompt_tokens":prompt_tokens(150),"completion_tokens":10,"prompt_cache_hit_tokens":128}})
         if 'truncated' in lastuser:
             self.wfile.write(b'0\r\n\r\n'); return

@@ -8,7 +8,7 @@ const template = @embedFile("reflect.md");
 
 /// The reflection request sent to the model as the user message. Caller owns it.
 pub fn prompt(gpa: std.mem.Allocator, session_id: []const u8, log_path: []const u8, issue_repo: []const u8, focus: []const u8) ![]u8 {
-    const focus_text = if (focus.len == 0) try gpa.dupe(u8, "") else try std.fmt.allocPrint(gpa, "\n用户特别想了解：{s}", .{focus});
+    const focus_text = if (focus.len == 0) try gpa.dupe(u8, "") else try std.fmt.allocPrint(gpa, "\nThe user particularly wants to understand: {s}", .{focus});
     defer gpa.free(focus_text);
     const with_id = try std.mem.replaceOwned(u8, gpa, template, "{{session_id}}", session_id);
     defer gpa.free(with_id);
@@ -267,18 +267,18 @@ pub fn stopReflecting(app: *App) void {
 test "prompt fills the session, log path, issue repo and optional focus" {
     const plain = try prompt(testing.allocator, "abc123", "/h/.nib/sessions/abc123.jsonl", "o/r", "");
     defer testing.allocator.free(plain);
-    try testing.expect(std.mem.indexOf(u8, plain, "本会话日志是 /h/.nib/sessions/abc123.jsonl") != null);
-    try testing.expect(std.mem.indexOf(u8, plain, "本会话 ID 是 abc123") != null);
-    try testing.expect(std.mem.indexOf(u8, plain, "只允许读取上面明确指定的本会话主日志路径") != null);
-    try testing.expect(std.mem.indexOf(u8, plain, "不要枚举、glob 或搜索 sessions 目录") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "This session's log is /h/.nib/sessions/abc123.jsonl") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "This session's ID is abc123") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "Read only the explicitly specified main log path for this session") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "Do not enumerate, glob, or search the sessions directory") != null);
     try testing.expect(std.mem.indexOf(u8, plain, "`.calls.jsonl`") != null);
     try testing.expect(std.mem.indexOf(u8, plain, "gh issue list --repo o/r ") != null);
     try testing.expect(std.mem.indexOf(u8, plain, "{{") == null);
-    try testing.expect(std.mem.indexOf(u8, plain, "用户特别想了解") == null);
+    try testing.expect(std.mem.indexOf(u8, plain, "The user particularly wants to understand") == null);
 
-    const focused = try prompt(testing.allocator, "abc123", "/l", "o/r", "子 agent");
+    const focused = try prompt(testing.allocator, "abc123", "/l", "o/r", "subagents");
     defer testing.allocator.free(focused);
-    try testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, focused, "\n"), "用户特别想了解：子 agent"));
+    try testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, focused, "\n"), "The user particularly wants to understand: subagents"));
 }
 
 test "append creates the file, then adds entries after earlier ones" {
@@ -286,24 +286,24 @@ test "append creates the file, then adds entries after earlier ones" {
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/nib/reflections.md", .{tmp.sub_path});
     defer testing.allocator.free(path);
-    const base: Entry = .{ .unix_seconds = 1_793_600_000, .session_id = "0123456789abcdef", .cwd = "/p", .model = "m", .effort = "high", .answer = "\n### 摘要\n一切正常\n" };
+    const base: Entry = .{ .unix_seconds = 1_793_600_000, .session_id = "0123456789abcdef", .cwd = "/p", .model = "m", .effort = "high", .answer = "\n### Summary\nEverything is normal\n" };
     try append(testing.io, testing.allocator, path, base);
     var second = base;
-    second.focus = "超时";
-    second.answer = "第二次";
+    second.focus = "timeout";
+    second.answer = "Second time";
     try append(testing.io, testing.allocator, path, second);
     const data = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, testing.allocator, .limited(4096));
     defer testing.allocator.free(data);
     try testing.expectEqualStrings(
         \\## 2026-11-02 06:13 UTC · session 01234567 · /p · m · effort high
         \\
-        \\### 摘要
-        \\一切正常
+        \\### Summary
+        \\Everything is normal
         \\
         \\## 2026-11-02 06:13 UTC · session 01234567 · /p · m · effort high
-        \\focus: 超时
+        \\focus: timeout
         \\
-        \\第二次
+        \\Second time
         \\
         \\
     , data);
@@ -314,20 +314,20 @@ test "drafts come from the last json block, trimmed and capped" {
     defer arena.deinit();
     const a = arena.allocator();
     const answer =
-        \\### 摘要
+        \\### Summary
         \\```json
         \\[{"title": "old"}]
         \\```
-        \\### Issue 草稿
+        \\### Issue drafts
         \\```json
-        \\[{"title": " grep: misses dotfiles ", "body": "\n现象\n"}, {"title": "", "body": "x"},
+        \\[{"title": " grep: misses dotfiles ", "body": "\nSymptom\n"}, {"title": "", "body": "x"},
         \\ {"title": "b", "body": ""}, {"title": "c", "body": ""}, {"title": "d", "body": "", "extra": 1}]
         \\```
     ;
     const found = try drafts(a, answer);
     try testing.expectEqual(@as(usize, 3), found.len);
     try testing.expectEqualStrings("grep: misses dotfiles", found[0].title);
-    try testing.expectEqualStrings("现象", found[0].body);
+    try testing.expectEqualStrings("Symptom", found[0].body);
     try testing.expectEqualStrings("c", found[2].title);
     try testing.expectEqual(@as(usize, 0), (try drafts(a, "no block")).len);
     try testing.expectEqual(@as(usize, 0), (try drafts(a, "```json\nnot json\n```")).len);
