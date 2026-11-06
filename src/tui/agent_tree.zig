@@ -54,7 +54,7 @@ const Row = struct {
         try text.appendSlice(gpa, p.prompt[0..end]);
         const prompt_end = text.items.len;
         const live = p.state == .queued or p.state == .working;
-        const state = if (p.detached) (if (live) "detached" else @tagName(p.state)) else if (p.background) "background" else @tagName(p.state);
+        const state = if (p.detached) (if (live) "detached" else @import("format.zig").state(@tagName(p.state))) else if (p.background) "background" else @import("format.zig").state(@tagName(p.state));
         if (p.kind != .agent) {
             try text.appendSlice(gpa, " · ");
             try appendElapsed(gpa, &text, p.elapsed_ms);
@@ -109,11 +109,8 @@ const Row = struct {
 };
 
 pub fn appendElapsed(gpa: std.mem.Allocator, out: *std.ArrayList(u8), elapsed_ms: u64) !void {
-    if (elapsed_ms >= 60_000) {
-        try out.print(gpa, "{d}m{d}s", .{ elapsed_ms / 60_000, elapsed_ms / 1000 % 60 });
-    } else {
-        try out.print(gpa, "{d}.{d}s", .{ elapsed_ms / 1000, elapsed_ms % 1000 / 100 });
-    }
+    var buf: [64]u8 = undefined;
+    try out.appendSlice(gpa, @import("format.zig").duration(&buf, elapsed_ms));
 }
 
 fn width(win: vaxis.Window, text: []const u8) u16 {
@@ -164,20 +161,20 @@ test "tree rows fit Unicode prompts and files around state step and tools" {
         .{ .id = "a3", .prompt = "test", .state = .failed, .step = 38, .files = &.{"docs/config.md"} },
     });
     try testing.expectEqual(@as(u16, 3), tree.print(win, true));
-    try expectLine(&screen, 0, "  ├─ a1 修复登录流程，补充测试 · working · step 56 · edit, bash src/auth.zig");
-    try expectLine(&screen, 1, "  ├─ a2 check config · done · step 27 · grep, read");
+    try expectLine(&screen, 0, "  ├─ a1 修复登录流程，补充测试 · running · step 56 · edit, bash src/auth.zig");
+    try expectLine(&screen, 1, "  ├─ a2 check config · completed · step 27 · grep, read");
     try expectLine(&screen, 2, "  └─ a3 test · failed · step 38 · docs/config.md");
     try expectLine(&screen, 3, "");
 
     win.clear();
     win.width = 48;
     _ = tree.print(win, true);
-    try expectLine(&screen, 0, "  ├─ a1 修复登… · working · step 56 · edit, bash");
+    try expectLine(&screen, 0, "  ├─ a1 修复登… · running · step 56 · edit, bash");
     win.width = 120;
     win.clear();
     win.width = 75;
     _ = tree.print(win, true);
-    try expectLine(&screen, 0, "  ├─ a1 修复登录流程，补充测试 · working · step 56 · edit, bash src/auth.z…");
+    try expectLine(&screen, 0, "  ├─ a1 修复登录流程，补充测试 · running · step 56 · edit, bash src/auth.z…");
 }
 
 test "tree previews sanitize control bytes and cap prompts without wrapping" {
@@ -193,7 +190,7 @@ test "tree previews sanitize control bytes and cap prompts without wrapping" {
     });
     _ = tree.print(win, true);
     try expectLine(&screen, 0, "  ├─ a1 line next    · queued · step 0 · a b");
-    try expectLine(&screen, 1, "  └─ a2 1234567890123456789012345678901234567890… · timed_out · step 4");
+    try expectLine(&screen, 1, "  └─ a2 1234567890123456789012345678901234567890… · timed out · step 4");
     try expectLine(&screen, 2, "");
     for (0..121) |columns| {
         win.width = 120;
@@ -223,7 +220,7 @@ test "mixed task ids retain input order and background hides terminal states unt
         .{ .id = "b2", .kind = .bash, .prompt = "echo ready", .background = true, .state = .done, .elapsed_ms = 192_900 },
         .{ .id = "a2", .prompt = "last", .background = true, .state = .failed, .step = 7 },
     });
-    try testing.expectEqualStrings("  ├─ a10 first · working · step 2", tree.rows.items[0].text);
+    try testing.expectEqualStrings("  ├─ a10 first · running · step 2", tree.rows.items[0].text);
     try testing.expectEqualStrings("  ├─ b2 bash echo ready · 3m12s · background", tree.rows.items[1].text);
     try testing.expectEqualStrings("  └─ a2 last · background · step 7", tree.rows.items[2].text);
 }
@@ -231,12 +228,12 @@ test "mixed task ids retain input order and background hides terminal states unt
 test "bash elapsed formatting at the minute boundary" {
     const gpa = testing.allocator;
     const cases = .{
-        .{ 0, "0.0s" },
-        .{ 42_399, "42.3s" },
-        .{ 59_999, "59.9s" },
+        .{ 0, "<1s" },
+        .{ 42_399, "42s" },
+        .{ 59_999, "59s" },
         .{ 60_000, "1m0s" },
         .{ 192_999, "3m12s" },
-        .{ 3_600_000, "60m0s" },
+        .{ 3_600_000, "1h0m0s" },
     };
     inline for (cases) |case| {
         var text: std.ArrayList(u8) = .empty;
@@ -258,7 +255,7 @@ test "narrow bash rows preserve id duration and delivery state before command" {
         .{ .id = "b3", .kind = .bash, .prompt = "abcdefghijklmnopqrstuvwxyz", .background = true, .state = .done, .elapsed_ms = 192_000 },
     });
     _ = tree.print(win, true);
-    try expectLine(&screen, 0, "  ├─ b2 bash a… · 42.3s · background");
+    try expectLine(&screen, 0, "  ├─ b2 bash abc… · 42s · background");
     try expectLine(&screen, 1, "  └─ b3 bash a… · 3m12s · background");
     try expectLine(&screen, 2, "");
 }
@@ -272,11 +269,11 @@ test "narrow agent rows reserve state and step before long tool and file names" 
     defer tree.deinit(gpa);
     try tree.update(gpa, &.{.{ .id = "a2", .prompt = "a long prompt", .step = 12, .tools = &.{ "read", "edit", "write" }, .files = &.{"src/a_very_long_path.zig"} }});
     _ = tree.print(win, true);
-    try expectLine(&screen, 0, "  └─ a2  · working · step 12 · …");
+    try expectLine(&screen, 0, "  └─ a2  · running · step 12 · …");
     win.clear();
     win.width = 28;
     _ = tree.print(win, true);
-    try expectLine(&screen, 0, "  └─ a2  · working · step 12");
+    try expectLine(&screen, 0, "  └─ a2  · running · step 12");
     try expectLine(&screen, 1, "");
 }
 
@@ -290,15 +287,15 @@ test "detached shows terminal states while ordinary background waits for deliver
         .{ .id = "b3", .kind = .bash, .prompt = "exit", .background = true, .detached = true, .state = .done },
         .{ .id = "b4", .kind = .bash, .prompt = "stop", .background = true, .detached = true, .state = .canceled },
     });
-    try testing.expectEqualStrings("  ├─ b1 bash server · 0.0s · detached", tree.rows.items[0].text);
-    try testing.expectEqualStrings("  ├─ b2 bash test · 0.0s · background", tree.rows.items[1].text);
-    try testing.expectEqualStrings("  ├─ b3 bash exit · 0.0s · done", tree.rows.items[2].text);
-    try testing.expectEqualStrings("  └─ b4 bash stop · 0.0s · canceled", tree.rows.items[3].text);
+    try testing.expectEqualStrings("  ├─ b1 bash server · <1s · detached", tree.rows.items[0].text);
+    try testing.expectEqualStrings("  ├─ b2 bash test · <1s · background", tree.rows.items[1].text);
+    try testing.expectEqualStrings("  ├─ b3 bash exit · <1s · completed", tree.rows.items[2].text);
+    try testing.expectEqualStrings("  └─ b4 bash stop · <1s · canceled", tree.rows.items[3].text);
 }
 
 test "fork label follows task id" {
     var tree: Tree = .{};
     defer tree.deinit(testing.allocator);
     try tree.update(testing.allocator, &.{.{ .id = "a3", .fork = true, .prompt = "child" }});
-    try testing.expectEqualStrings("  └─ a3 fork child · working · step 0", tree.rows.items[0].text);
+    try testing.expectEqualStrings("  └─ a3 fork child · running · step 0", tree.rows.items[0].text);
 }

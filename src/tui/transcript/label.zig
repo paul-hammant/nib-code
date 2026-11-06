@@ -80,9 +80,8 @@ pub fn appendAction(gpa: std.mem.Allocator, out: *std.ArrayList(u8), p: Progress
 }
 
 pub fn appendTokens(gpa: std.mem.Allocator, out: *std.ArrayList(u8), tokens: u64) !void {
-    if (tokens >= 1000) {
-        try out.print(gpa, " · {d}k tok", .{tokens / 1000});
-    } else try out.print(gpa, " · {d} tok", .{tokens});
+    var buf: [64]u8 = undefined;
+    try out.print(gpa, " · {s} tokens", .{@import("../format.zig").number(&buf, tokens)});
 }
 
 pub fn promptPrefix(prompt: []const u8) []const u8 {

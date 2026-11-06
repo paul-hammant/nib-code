@@ -95,7 +95,7 @@ pub const Entry = struct {
                             try agent_tree.appendElapsed(gpa, &e.label, p.elapsed_ms);
                             if (p.superseded_by) |id| {
                                 try e.label.print(gpa, " · {s} superseded by {s}", .{ p.id, id });
-                            } else try e.label.print(gpa, " · {s}", .{if (p.background) "background" else @tagName(p.state)});
+                            } else try e.label.print(gpa, " · {s}", .{if (p.background) "background" else @import("../format.zig").state(@tagName(p.state))});
                         } else {
                             try e.label.print(gpa, "agent · {s} · step {d}", .{ if (p.background) "background" else "running", p.step });
                             try appendAction(gpa, &e.label, p);
@@ -120,7 +120,7 @@ pub const Entry = struct {
                             }
                             tokens += p.usage.prompt_tokens + p.usage.completion_tokens;
                         }
-                        try e.label.print(gpa, "{s} ×{d} · {s} · {d} working, {d} done", .{ if (bash_count == agents.len) "bash" else if (agent_count == agents.len) "agent" else "task", agents.len, if (e.run == .running) "running" else "background", working, done });
+                        try e.label.print(gpa, "{s} ×{d} · {s} · {d} running, {d} completed", .{ if (bash_count == agents.len) "bash" else if (agent_count == agents.len) "agent" else "task", agents.len, if (e.run == .running) "running" else "background", working, done });
                         if (queued > 0) try e.label.print(gpa, ", {d} queued", .{queued});
                         if (failed > 0) try e.label.print(gpa, ", {d} failed", .{failed});
                         if (bash_count < agents.len) try appendTokens(gpa, &e.label, tokens);
@@ -128,7 +128,8 @@ pub const Entry = struct {
                 } else if (e.run == .running) {
                     try e.label.print(gpa, "{s} · running", .{used});
                 } else {
-                    try e.label.print(gpa, "{s} · {d}.{d}s", .{ used, e.elapsed_ms / 1000, e.elapsed_ms % 1000 / 100 });
+                    try e.label.print(gpa, "{s} · ", .{used});
+                    try agent_tree.appendElapsed(gpa, &e.label, e.elapsed_ms);
                 }
                 if (e.changes.summary.len > 0) try e.label.print(gpa, " · {s}", .{e.changes.summary});
                 if (e.step_effort) |effort| {

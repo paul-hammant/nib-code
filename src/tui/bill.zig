@@ -1,4 +1,5 @@
 const std = @import("std");
+const ui_format = @import("format.zig");
 const TurnSummary = @import("../session/events.zig").TurnSummary;
 
 pub const Text = struct {
@@ -13,17 +14,18 @@ pub const Text = struct {
         var output_bytes: [64]u8 = undefined;
         var w: std.Io.Writer = .fixed(&text.buf);
         if (summary.status != .completed) w.print("{s} · ", .{@tagName(summary.status)}) catch unreachable;
-        w.print("{d} steps · {s} · think {s} · tools {s}", .{
+        w.print("{d} step{s} · {s} · model {s} · tools {s}", .{
             summary.steps,
+            if (summary.steps == 1) "" else "s",
             duration(&wall, summary.timing.wall_ms),
-            componentDuration(&model, summary.timing.model_ms),
-            componentDuration(&run, summary.timing.run_ms),
+            duration(&model, summary.timing.model_ms),
+            duration(&run, summary.timing.run_ms),
         }) catch unreachable;
-        if (summary.timing.tool_bytes > 0 or summary.timing.output_bytes > 0) w.print(" · {s}→{s} B", .{
-            tokens(&tool_bytes, summary.timing.tool_bytes),
-            tokens(&output_bytes, summary.timing.output_bytes),
+        if (summary.timing.tool_bytes > 0 or summary.timing.output_bytes > 0) w.print(" · tool data {s} → {s}", .{
+            ui_format.bytes(&tool_bytes, summary.timing.tool_bytes),
+            ui_format.bytes(&output_bytes, summary.timing.output_bytes),
         }) catch unreachable;
-        w.print(" · {s} tok ({d}% cached)", .{
+        w.print(" · {s} tokens ({d}% cached)", .{
             tokens(&tok, @as(u128, summary.usage.prompt_tokens) + summary.usage.completion_tokens),
             @as(u128, summary.usage.prompt_cache_hit_tokens) * 100 / @max(summary.usage.prompt_tokens, 1),
         }) catch unreachable;
@@ -43,26 +45,8 @@ pub fn fit(full: []const u8, width: u16) []const u8 {
     return line;
 }
 
-fn duration(buf: []u8, ms: u64) []const u8 {
-    const s = ms / 1000;
-    if (s >= 3600) return std.fmt.bufPrint(buf, "{d}h{d}m{d}s", .{ s / 3600, s % 3600 / 60, s % 60 }) catch unreachable;
-    if (s >= 60) return std.fmt.bufPrint(buf, "{d}m{d}s", .{ s / 60, s % 60 }) catch unreachable;
-    return std.fmt.bufPrint(buf, "{d}s", .{s}) catch unreachable;
-}
-
-fn componentDuration(buf: []u8, ms: u64) []const u8 {
-    const full = duration(buf, ms);
-    return if (ms >= 60_000) full[0 .. full.len - 1] else full;
-}
-
-fn tokens(buf: []u8, n: u128) []const u8 {
-    const unit: u128 = if (n >= 1_000_000) 1_000_000 else if (n >= 1000) 1000 else 1;
-    if (unit == 1) return std.fmt.bufPrint(buf, "{d}", .{n}) catch unreachable;
-    const suffix = if (unit == 1000) "k" else "M";
-    const tenths = n % unit * 10 / unit;
-    if (tenths == 0) return std.fmt.bufPrint(buf, "{d}{s}", .{ n / unit, suffix }) catch unreachable;
-    return std.fmt.bufPrint(buf, "{d}.{d}{s}", .{ n / unit, tenths, suffix }) catch unreachable;
-}
+const duration = ui_format.duration;
+const tokens = ui_format.number;
 
 const example: TurnSummary = .{
     .steps = 12,
@@ -72,17 +56,17 @@ const example: TurnSummary = .{
 
 test "bill formats turn totals and cache hits over prompt tokens" {
     var text: Text = .{};
-    try std.testing.expectEqualStrings("12 steps · 3m10s · think 1m40 · tools 1m20 · 3.2M→18k B · 45k tok (91% cached) · llm ×8 · agent ×1", text.format(example, 200));
+    try std.testing.expectEqualStrings("12 steps · 3m10s · model 1m40s · tools 1m20s · tool data 3.2MB → 18kB · 45k tokens (91% cached) · llm ×8 · agent ×1", text.format(example, 200));
     var summary = example;
     summary.usage = .{ .prompt_tokens = 1000, .completion_tokens = 1000, .prompt_cache_hit_tokens = 910 };
-    try std.testing.expect(std.mem.indexOf(u8, text.format(summary, 200), "2k tok (91% cached)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text.format(summary, 200), "2k tokens (91% cached)") != null);
 }
 
 test "bill durations floor milliseconds and retain seconds at minute and hour boundaries" {
     var buf: [64]u8 = undefined;
     const cases = .{
-        .{ @as(u64, 0), "0s" },
-        .{ @as(u64, 999), "0s" },
+        .{ @as(u64, 0), "<1s" },
+        .{ @as(u64, 999), "<1s" },
         .{ @as(u64, 1000), "1s" },
         .{ @as(u64, 59_999), "59s" },
         .{ @as(u64, 60_000), "1m0s" },
@@ -92,8 +76,6 @@ test "bill durations floor milliseconds and retain seconds at minute and hour bo
     };
     inline for (cases) |case| {
         try std.testing.expectEqualStrings(case[1], duration(&buf, case[0]));
-        const component = if (case[0] >= 60_000) case[1][0 .. case[1].len - 1] else case[1];
-        try std.testing.expectEqualStrings(component, componentDuration(&buf, case[0]));
     }
 }
 
@@ -122,7 +104,7 @@ test "bill drops complete fields from right to left and never clips UTF-8" {
 
 test "bill omits zero delegation counts and handles zero usage" {
     var text: Text = .{};
-    try std.testing.expectEqualStrings("0 steps · 0s · think 0s · tools 0s · 0 tok (0% cached)", text.format(.{}, 200));
+    try std.testing.expectEqualStrings("0 steps · <1s · model <1s · tools <1s · 0 tokens (0% cached)", text.format(.{}, 200));
     var summary: TurnSummary = .{};
     summary.timing.agent_calls = 1;
     const agent = text.format(summary, 200);
@@ -148,21 +130,21 @@ test "bill prefixes canceled and failed outcomes" {
 test "bill omits zero bytes and shows output without tool bytes" {
     var text: Text = .{};
     var summary: TurnSummary = .{};
-    try std.testing.expectEqualStrings("0 steps · 0s · think 0s · tools 0s · 0 tok (0% cached)", text.format(summary, 200));
+    try std.testing.expectEqualStrings("0 steps · <1s · model <1s · tools <1s · 0 tokens (0% cached)", text.format(summary, 200));
     summary.timing.output_bytes = 18_000;
-    try std.testing.expectEqualStrings("0 steps · 0s · think 0s · tools 0s · 0→18k B · 0 tok (0% cached)", text.format(summary, 200));
+    try std.testing.expectEqualStrings("0 steps · <1s · model <1s · tools <1s · tool data 0B → 18kB · 0 tokens (0% cached)", text.format(summary, 200));
     summary.timing.tool_bytes = 320;
     summary.timing.output_bytes = 0;
-    try std.testing.expectEqualStrings("0 steps · 0s · think 0s · tools 0s · 320→0 B · 0 tok (0% cached)", text.format(summary, 200));
+    try std.testing.expectEqualStrings("0 steps · <1s · model <1s · tools <1s · tool data 320B → 0B · 0 tokens (0% cached)", text.format(summary, 200));
 }
 
 test "bill fits delegation counts before tokens and bytes" {
     var text: Text = .{};
     const prefixes = [_][]const u8{
-        "12 steps · 3m10s · think 1m40 · tools 1m20 · 3.2M→18k B · 45k tok (91% cached) · llm ×8",
-        "12 steps · 3m10s · think 1m40 · tools 1m20 · 3.2M→18k B · 45k tok (91% cached)",
-        "12 steps · 3m10s · think 1m40 · tools 1m20 · 3.2M→18k B",
-        "12 steps · 3m10s · think 1m40 · tools 1m20",
+        "12 steps · 3m10s · model 1m40s · tools 1m20s · tool data 3.2MB → 18kB · 45k tokens (91% cached) · llm ×8",
+        "12 steps · 3m10s · model 1m40s · tools 1m20s · tool data 3.2MB → 18kB · 45k tokens (91% cached)",
+        "12 steps · 3m10s · model 1m40s · tools 1m20s · tool data 3.2MB → 18kB",
+        "12 steps · 3m10s · model 1m40s · tools 1m20s",
     };
     for (prefixes) |prefix| {
         const width: u16 = @intCast(try std.unicode.utf8CountCodepoints(prefix));

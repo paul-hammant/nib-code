@@ -10,7 +10,7 @@
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │ Message nib · / for commands                                                 │
 ╰─ mock · effort server default · ctx 0% · in 0 (0% cached) · out 0────────────╯
-  ⏎ send · ⇧⏎ newline · / commands · ctrl+o expand
+  Enter send · Shift+Enter newline · / commands · Ctrl+O expand
 --- short 80x7 ---
  Answer
 
@@ -36,7 +36,7 @@
 ╭────────────────╮
 │ Message nib ·  │
 ╰─ mock──────────╯
-  ⏎ send · ⇧⏎ newl
+  Enter send · Shi
 --- menu 80x12 ---
  Answer
 
@@ -49,7 +49,7 @@
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │ Message nib · / for commands                                                 │
 ╰─ mock · effort server default · ctx 0% · in 0 (0% cached) · out 0────────────╯
-  ⏎ send · ⇧⏎ newline · / commands · ctrl+o expand
+  Enter send · Shift+Enter newline · / commands · Ctrl+O expand
 --- busy 80x12 ---
  Answer
 
@@ -58,11 +58,11 @@
 
 
 
- ⠹ waiting model · turn 0s · step 1 · esc to cancel
+ ⠹ waiting model · turn <1s · step 1 · Esc to cancel
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │ Message nib · / for commands                                                 │
 ╰─ mock · effort server default · ctx 0% · in 0 (0% cached) · out 0────────────╯
-  ⏎ send · ⇧⏎ newline · / commands · ctrl+o expand
+  Enter send · Shift+Enter newline · / commands · Ctrl+O expand
 --- history 80x12 ---
  0
  1
@@ -75,7 +75,7 @@
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │ Message nib · / for commands                                                 │
 ╰─ mock · effort server default · ctx 0% · in 0 (0% cached) · out 0────────────╯
-  ⏎ send · ⇧⏎ newline · / commands · ctrl+o expand
+  Enter send · Shift+Enter newline · / commands · Ctrl+O expand
 --- notice 80x12 ---
  Answer
 
@@ -88,4 +88,4 @@
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │ Message nib · / for commands                                                 │
 ╰─ mock · effort server default · ctx 0% · in 0 (0% cached) · out 0────────────╯
-  ⏎ send · ⇧⏎ newline · / commands · ctrl+o expand
+  Enter send · Shift+Enter newline · / commands · Ctrl+O expand

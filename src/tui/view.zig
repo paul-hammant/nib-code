@@ -70,7 +70,7 @@ pub fn draw(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewpo
         _ = win.child(.{ .x_off = 1, .y_off = input_y, .height = 1 }).printSegment(.{ .text = "› ", .style = .{ .fg = .{ .index = 4 } } }, .{ .wrap = .none });
     }
     input.draw(win.child(.{ .x_off = x, .y_off = input_y + @as(u16, if (framed) 1 else 0), .width = input_w, .height = input_h }));
-    if (hints > 0) _ = win.child(.{ .x_off = 2, .y_off = win.height - 1, .height = 1 }).printSegment(.{ .text = "⏎ send · ⇧⏎ newline · / commands · ctrl+o expand", .style = .{ .dim = true } }, .{ .wrap = .none });
+    if (hints > 0) _ = win.child(.{ .x_off = 2, .y_off = win.height - 1, .height = 1 }).printSegment(.{ .text = "Enter send · Shift+Enter newline · / commands · Ctrl+O expand", .style = .{ .dim = true } }, .{ .wrap = .none });
 }
 
 fn put(win: vaxis.Window, x: u16, y: u16, glyph: []const u8) void {
@@ -204,7 +204,7 @@ test "layout snapshots: normal, short, tiny, narrow, menu, busy and history" {
             try testing.expectEqualStrings("╰", screen.readCell(0, if (c.h >= 8) c.h - 2 else c.h - 1).?.char.grapheme);
             try testing.expectEqualStrings("╯", screen.readCell(c.w - 1, if (c.h >= 8) c.h - 2 else c.h - 1).?.char.grapheme);
         } else try testing.expect(std.mem.indexOf(u8, image, "› Message nib") != null);
-        if (c.busy) try testing.expect(std.mem.indexOf(u8, image, "waiting model · turn 0s · step 1 · esc to cancel") != null);
+        if (c.busy) try testing.expect(std.mem.indexOf(u8, image, "waiting model · turn <1s · step 1 · Esc to cancel") != null);
         if (c.history) try testing.expect(std.mem.indexOf(u8, image, "↑ history · PgDn to return") != null);
         if (c.notice) try testing.expect(std.mem.indexOf(u8, image, "copied 3 chars") != null);
         if (c.menu) try testing.expect(std.mem.indexOf(u8, image, "/help") != null);

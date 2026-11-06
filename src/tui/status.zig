@@ -1,4 +1,5 @@
 const std = @import("std");
+const ui_format = @import("format.zig");
 const provider = @import("../provider.zig");
 const ModelActivity = @import("../session/events.zig").ModelActivity;
 
@@ -84,9 +85,10 @@ pub const Text = struct {
             };
             w.print("{s} {s}", .{ spinner[(b.ms / 100) % spinner.len], phase }) catch {};
             if (s.detail.len > 0) w.print(" {s}", .{s.detail}) catch {};
-            w.print(" · turn {d}s", .{b.turn_ms / 1000}) catch {};
-            if (b.quiet_ms >= 30_000) w.print(" · no progress {d}s", .{b.quiet_ms / 1000}) catch {};
-            w.print(" · step {d} · esc to cancel", .{s.current_step}) catch {};
+            var elapsed: [64]u8 = undefined;
+            w.print(" · turn {s}", .{ui_format.duration(&elapsed, b.turn_ms)}) catch {};
+            if (b.quiet_ms >= 30_000) w.print(" · no progress {s}", .{ui_format.duration(&elapsed, b.quiet_ms)}) catch {};
+            w.print(" · step {d} · Esc to cancel", .{s.current_step}) catch {};
         }
         if (s.background_count > 0) {
             if (w.end > 0) w.writeAll(" · ") catch {};
@@ -126,7 +128,7 @@ pub const Text = struct {
     pub fn footer(text: *Text, s: Status, width: u16) []const u8 {
         var input: [32]u8 = undefined;
         var output: [32]u8 = undefined;
-        var line = std.fmt.bufPrint(&text.status, "{s} · effort {s}{s} · ctx {d}% · in {s} ({d}% cached) · out {s} · {s}: {d} steps", .{
+        var line = std.fmt.bufPrint(&text.status, "{s} · effort {s}{s} · ctx {d}% · in {s} ({d}% cached) · out {s} · {s}: {d} step{s}", .{
             s.cfg.model,
             if (s.cfg.thinking != null or s.cfg.reasoning_effort != null) "≤" else "",
             s.cfg.effectiveEffort(),
@@ -136,6 +138,7 @@ pub const Text = struct {
             tokens(&output, s.usage.completion_tokens),
             if (s.busy != null) "turn" else "last turn",
             s.steps,
+            if (s.steps == 1) "" else "s",
         }) catch "";
         var bg_buf: [32]u8 = undefined;
         const bg = if (s.background_count > 0) std.fmt.bufPrint(&bg_buf, " · bg {d}", .{s.background_count}) catch "" else "";
@@ -153,32 +156,25 @@ pub const Text = struct {
     }
 };
 
-fn tokens(buf: []u8, n: u64) []const u8 {
-    const unit: u64 = if (n >= 1_000_000) 1_000_000 else if (n >= 1000) 1000 else 1;
-    if (unit == 1) return std.fmt.bufPrint(buf, "{d}", .{n}) catch "";
-    const suffix = if (unit == 1000) "k" else "M";
-    const tenths = n % unit * 10 / unit;
-    if (tenths == 0) return std.fmt.bufPrint(buf, "{d}{s}", .{ n / unit, suffix }) catch "";
-    return std.fmt.bufPrint(buf, "{d}.{d}{s}", .{ n / unit, tenths, suffix }) catch "";
-}
+const tokens = ui_format.number;
 
 test "activity is optional and footer shows latest reported usage" {
     var text: Text = .{};
     const cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "m", .context_window = 1000 };
     try std.testing.expectEqualStrings("", text.format(.{ .cfg = cfg }, false));
     try std.testing.expectEqualStrings("↑ history · PgDn to return", text.format(.{ .cfg = cfg }, true));
-    try std.testing.expectEqualStrings("⠙ tools · turn 0s · step 2 · esc to cancel · copied 3 chars", text.format(.{ .cfg = cfg, .current_step = 2, .busy = .{ .phase = .running, .ms = 150 }, .notice = "copied 3 chars" }, false));
+    try std.testing.expectEqualStrings("⠙ tools · turn <1s · step 2 · Esc to cancel · copied 3 chars", text.format(.{ .cfg = cfg, .current_step = 2, .busy = .{ .phase = .running, .ms = 150 }, .notice = "copied 3 chars" }, false));
     const line = text.footer(.{ .cfg = cfg, .context = 250, .steps = 2, .usage = .{ .prompt_tokens = 1_800_000, .prompt_cache_hit_tokens = 1_692_000, .completion_tokens = 18_000 } }, 200);
     try std.testing.expectEqualStrings("m · effort server default · ctx 25% · in 1.8M (94% cached) · out 18k · last turn: 2 steps", line);
     const busy = text.footer(.{ .cfg = cfg, .context = 400, .steps = 1, .usage = .{ .prompt_tokens = 1200, .completion_tokens = 50, .prompt_cache_hit_tokens = 600 }, .busy = .{ .phase = .running, .ms = 100 } }, 200);
-    try std.testing.expectEqualStrings("m · effort server default · ctx 40% · in 1.2k (50% cached) · out 50 · turn: 1 steps", busy);
+    try std.testing.expectEqualStrings("m · effort server default · ctx 40% · in 1.2k (50% cached) · out 50 · turn: 1 step", busy);
 }
 
 test "background task count remains visible during model work" {
     const t = std.testing;
     var text: Text = .{};
     const s: Status = .{ .cfg = .{ .base_url = "", .api_key = "", .model = "m" }, .busy = .{ .phase = .thinking, .ms = 0 }, .background_count = 2 };
-    try t.expectEqualStrings("⠋ waiting model · turn 0s · step 1 · esc to cancel · bg 2", text.format(s, false));
+    try t.expectEqualStrings("⠋ waiting model · turn <1s · step 1 · Esc to cancel · bg 2", text.format(s, false));
     try t.expect(std.mem.endsWith(u8, text.footer(s, 200), " · bg 2"));
     try t.expectEqualStrings("bg 2", text.format(.{ .cfg = s.cfg, .background_count = 2 }, false));
 }
@@ -200,7 +196,7 @@ test "only content advances progress; stage changes preserve Turn duration" {
     var text: Text = .{};
     const cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "m" };
     const s: Status = .{ .cfg = cfg, .detail = "r3 32s", .busy = .{ .phase = .waiting, .ms = 0, .turn_ms = 574000, .quiet_ms = 30000 } };
-    try t.expectEqualStrings("⠋ waiting tasks r3 32s · turn 574s · no progress 30s · step 1 · esc to cancel", text.format(s, false));
+    try t.expectEqualStrings("⠋ waiting tasks r3 32s · turn 9m34s · no progress 30s · step 1 · Esc to cancel", text.format(s, false));
     for (0..100) |width| {
         const line = text.formatWidth(s, false, @intCast(width));
         try t.expect(@import("vaxis").gwidth.gwidth(line, .unicode) <= width);

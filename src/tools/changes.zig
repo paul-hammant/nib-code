@@ -187,7 +187,7 @@ pub const Recovery = struct {
             try text.appendSlice(gpa, shown);
         }
         if (r.bash) try text.appendSlice(gpa, " · bash changes untracked");
-        try text.appendSlice(gpa, " · type 继续 to continue");
+        try text.appendSlice(gpa, " · type continue to resume");
         for (text.items) |*byte| if (byte.* < 0x20 or byte.* == 0x7f) {
             byte.* = ' ';
         };
@@ -204,11 +204,11 @@ test "recovery records only this Turn's unique paths and distinguishes failure c
     r.noteBash(testing.io);
     const text = try r.hint(testing.allocator, testing.io, .canceled, "/project");
     defer testing.allocator.free(text);
-    try testing.expectEqualStrings("user canceled · edited: a.zig, b.zig · bash changes untracked · type 继续 to continue", text);
+    try testing.expectEqualStrings("user canceled · edited: a.zig, b.zig · bash changes untracked · type continue to resume", text);
     r.clear(testing.allocator, testing.io);
     const empty = try r.hint(testing.allocator, testing.io, .model, "/project");
     defer testing.allocator.free(empty);
-    try testing.expectEqualStrings("model connection/request failed · no recorded edit/write changes · type 继续 to continue", empty);
+    try testing.expectEqualStrings("model connection/request failed · no recorded edit/write changes · type continue to resume", empty);
     try testing.expectEqual(Recovery.Reason.timeout, Recovery.classify(error.StreamIdleTimeout, false, .model));
     try testing.expectEqual(Recovery.Reason.canceled, Recovery.classify(error.ReadFailed, true, .model));
     try testing.expectEqual(Recovery.Reason.tool, Recovery.classify(error.TestScriptFailure, false, .tool));

@@ -33,7 +33,7 @@ pub const specs = std.enums.EnumArray(Command, Spec).init(.{
     .js = .{ .args = "<code>", .help = "run JavaScript in the sandbox", .needs_arg = true },
 });
 
-pub const keys = "enter send · shift+enter newline · esc cancel · ctrl+o expand folded entries · PgUp/PgDn, shift+↑↓ or wheel scroll · ↑ input history · ctrl+c quit";
+pub const keys = "Enter send · Shift+Enter newline · Esc cancel · Ctrl+O expand folded entries · PgUp/PgDn, Shift+↑↓ or wheel scroll · ↑ input history · Ctrl+C quit";
 
 const slash_names = blk: {
     var names: [std.enums.values(Command).len][]const u8 = undefined;

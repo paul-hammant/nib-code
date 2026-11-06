@@ -58,7 +58,7 @@ pub const Transcript = struct {
         errdefer e.deinit(gpa);
         e.task_id = try gpa.dupe(u8, id);
         try e.text.appendSlice(gpa, result);
-        try e.label.print(gpa, "{s} {s} · {s}", .{ id, @tagName(kind), if (ok) "ok" else "failed" });
+        try e.label.print(gpa, "{s} {s} · {s}", .{ id, @tagName(kind), if (ok) "completed" else "failed" });
         const Summary = struct { superseded_by: ?[]const u8 = null, text: ?[]const u8 = null, output: ?[]const u8 = null, @"error": ?[]const u8 = null };
         const parsed = std.json.parseFromSlice(Summary, gpa, result, .{ .ignore_unknown_fields = true }) catch null;
         if (parsed) |summary| {
@@ -438,7 +438,7 @@ test "background results fold to an id and text summary and expand to complete J
     var segs: [max_segments]vaxis.Segment = undefined;
     try testing.expect(e.collapsible());
     try testing.expectEqual(@as(usize, 2), e.segments(&segs).len);
-    try testing.expectEqualStrings("bg_1 agent · ok · found it second line", segs[1].text);
+    try testing.expectEqualStrings("bg_1 agent · completed · found it second line", segs[1].text);
     t.toggleExpanded();
     try testing.expectEqual(@as(usize, 4), e.segments(&segs).len);
     try testing.expectEqualStrings(result, segs[3].text);
@@ -456,7 +456,7 @@ test "restored background results retain their kind and complete result" {
     try t.addHistory(gpa, &.{.{ .role = "user", .content = "background agent bg_1 finished\n" ++ result, .source = .background, .background_kind = .agent, .background_id = "bg_1" }});
     try testing.expectEqual(Kind.background, t.entries.items[0].kind);
     try testing.expectEqualStrings(result, t.entries.items[0].text.items);
-    try testing.expectEqualStrings("bg_1 agent · ok · result", t.entries.items[0].label.items);
+    try testing.expectEqualStrings("bg_1 agent · completed · result", t.entries.items[0].label.items);
 }
 
 test "background progress stays with its Run until the matching result arrives" {
@@ -476,7 +476,7 @@ test "background progress stays with its Run until the matching result arrives" 
     try testing.expectEqual(@as(usize, 1), t.entries.items[0].agent_tree.rows.items.len);
     try t.progress(gpa, .{ .id = "a1", .run = 1, .prompt = "first", .background = true, .state = .done, .step = 3 });
     try testing.expect(!t.entries.items[0].agents.items[0].background);
-    try testing.expectEqualStrings("agent · 0.1s", t.entries.items[0].label.items);
+    try testing.expectEqualStrings("agent · <1s", t.entries.items[0].label.items);
     try testing.expectEqual(Kind.background, t.entries.items[2].kind);
 }
 
@@ -492,9 +492,9 @@ test "turn cleanup removes background working rows without removing delivered re
     try testing.expectEqual(@as(usize, 2), t.entries.items[0].agents.items.len);
     try t.clearBackgroundProgress(gpa);
     try testing.expectEqual(@as(usize, 1), t.entries.items[0].agents.items.len);
-    try testing.expectEqualStrings("  └─ b2 bash echo done · 0.0s · done", t.entries.items[0].agent_tree.rows.items[0].text);
-    try testing.expectEqualStrings("bash · 0.1s", t.entries.items[0].label.items);
-    try testing.expectEqualStrings("b2 bash · ok · done", t.entries.items[1].label.items);
+    try testing.expectEqualStrings("  └─ b2 bash echo done · <1s · completed", t.entries.items[0].agent_tree.rows.items[0].text);
+    try testing.expectEqualStrings("bash · <1s", t.entries.items[0].label.items);
+    try testing.expectEqualStrings("b2 bash · completed · done", t.entries.items[1].label.items);
 }
 
 test "truncated background result still previews text and lost result is visible" {
@@ -515,13 +515,13 @@ test "background bash shows command and elapsed time until its result arrives" {
     try t.startRun(gpa, "tools.bash({})");
     try t.progress(gpa, .{ .id = "b1", .run = 1, .kind = .bash, .background = true, .prompt = "sleep 2\necho done", .elapsed_ms = 1200 });
     try t.endRun(gpa, true, "started", 100, .{});
-    try testing.expectEqualStrings("bash · background · sleep 2 echo done · 1.2s · background", t.entries.items[0].label.items);
+    try testing.expectEqualStrings("bash · background · sleep 2 echo done · 1s · background", t.entries.items[0].label.items);
     t.toggleExpanded();
     var segs: [max_segments]vaxis.Segment = undefined;
-    try testing.expectEqualStrings("  └─ b1 bash sleep 2 echo done · 1.2s · background", t.entries.items[0].agent_tree.rows.items[0].text);
+    try testing.expectEqualStrings("  └─ b1 bash sleep 2 echo done · 1s · background", t.entries.items[0].agent_tree.rows.items[0].text);
     try t.backgroundResult(gpa, .bash, "b1", true, "{\"exit_code\":0,\"output\":\"done\\n\"}");
-    try testing.expectEqualStrings("bash · 0.1s", t.entries.items[0].label.items);
-    try testing.expectEqualStrings("b1 bash · ok · done ", t.entries.items[1].label.items);
+    try testing.expectEqualStrings("bash · <1s", t.entries.items[0].label.items);
+    try testing.expectEqualStrings("b1 bash · completed · done ", t.entries.items[1].label.items);
     try testing.expectEqualStrings("{\"exit_code\":0,\"output\":\"done\\n\"}", t.entries.items[1].segments(&segs)[3].text);
 }
 
@@ -530,11 +530,11 @@ test "restored background bash uses its persisted kind" {
     var t: Transcript = .{};
     defer t.deinit(gpa);
     try t.addHistory(gpa, &.{.{ .role = "user", .content = "[background bash b1 finished]\n{\"exit_code\":0,\"output\":\"ready\"}", .source = .background, .background_kind = .bash, .background_id = "b1" }});
-    try testing.expectEqualStrings("b1 bash · ok · ready", t.entries.items[0].label.items);
+    try testing.expectEqualStrings("b1 bash · completed · ready", t.entries.items[0].label.items);
     try t.addHistory(gpa, &.{.{ .role = "user", .content = "[background bash b2 finished]\n{\"exit_code\":1,\"output\":\"failed\"}", .source = .background, .background_kind = .bash, .background_id = "b2" }});
     try testing.expectEqualStrings("b2 bash · failed · failed", t.entries.items[1].label.items);
     try t.addHistory(gpa, &.{.{ .role = "user", .content = "[background bash b3 finished]\n{\"output\":\"partial", .source = .background, .background_kind = .bash, .background_id = "b3", .background_ok = true }});
-    try testing.expectEqualStrings("b3 bash · ok · partial", t.entries.items[2].label.items);
+    try testing.expectEqualStrings("b3 bash · completed · partial", t.entries.items[2].label.items);
 }
 
 test "runs fold to one line until expanded" {
@@ -548,7 +548,7 @@ test "runs fold to one line until expanded" {
     const e = &t.entries.items[0];
     try testing.expectEqual(@as(u16, 1), e.height(win));
     var segs: [max_segments]vaxis.Segment = undefined;
-    try testing.expectEqualStrings("bash ×2, read · 1.2s", e.segments(&segs)[2].text);
+    try testing.expectEqualStrings("bash ×2, read · 1s", e.segments(&segs)[2].text);
     t.toggleExpanded();
     try testing.expectEqual(@as(u16, 6), e.height(win));
 }
@@ -617,7 +617,7 @@ test "a Run shows changed files in its summary and a colored diff when open" {
     };
     try t.endRun(gpa, true, "", 300, try .init(gpa, &changes));
     const e = &t.entries.items[0];
-    try testing.expectEqualStrings("edit · 0.3s · src/a.zig +1 −1, b.md (new) +1 −0", e.label.items);
+    try testing.expectEqualStrings("edit · <1s · src/a.zig +1 −1, b.md (new) +1 −0", e.label.items);
     try testing.expectEqual(@as(u16, 1), e.height(win));
     t.toggleExpanded();
     var segs: [max_segments]vaxis.Segment = undefined;
@@ -642,19 +642,19 @@ test "agent tree stays visible folded, expanded and after Run ends" {
     try t.progress(gpa, .{ .id = "a1", .prompt = "fix it", .step = 3, .tools = &.{"edit"}, .files = &.{"src/x.zig"}, .usage = .{ .prompt_tokens = 41000 } });
     const e = &t.entries.items[0];
     var segs: [max_segments]vaxis.Segment = undefined;
-    try testing.expectEqualStrings("agent · running · step 3 · edit src/x.zig · 41k tok", e.segments(&segs)[2].text);
+    try testing.expectEqualStrings("agent · running · step 3 · edit src/x.zig · 41k tokens", e.segments(&segs)[2].text);
     try testing.expectEqualStrings("", e.segments(&segs)[1].text);
     t.toggleExpanded();
-    try testing.expectEqualStrings("  └─ a1 fix it · working · step 3 · edit src/x.zig", e.agent_tree.rows.items[0].text);
+    try testing.expectEqualStrings("  └─ a1 fix it · running · step 3 · edit src/x.zig", e.agent_tree.rows.items[0].text);
     try testing.expectEqualStrings(e.text.items, e.segments(&segs)[4].text);
     try t.progress(gpa, .{ .id = "a1", .prompt = "fix it", .state = .done, .step = 3, .tools = &.{"edit"}, .files = &.{"src/x.zig"} });
     try t.endRun(gpa, true, "done", 1234, .{});
-    try testing.expectEqualStrings("agent · 1.2s", e.segments(&segs)[2].text);
+    try testing.expectEqualStrings("agent · 1s", e.segments(&segs)[2].text);
     try testing.expectEqualStrings("run ", e.segments(&segs)[1].text);
     try testing.expectEqualStrings("done", e.segments(&segs)[6].text);
-    try testing.expectEqualStrings("  └─ a1 fix it · done · step 3 · edit src/x.zig", e.agent_tree.rows.items[0].text);
+    try testing.expectEqualStrings("  └─ a1 fix it · completed · step 3 · edit src/x.zig", e.agent_tree.rows.items[0].text);
     try t.progress(gpa, .{ .id = "a1", .prompt = "late" });
-    try testing.expectEqualStrings("agent · 1.2s", e.label.items);
+    try testing.expectEqualStrings("agent · 1s", e.label.items);
 }
 
 test "multiple child progress keeps creation order, is replaced and summed without double counting cache" {
@@ -667,17 +667,17 @@ test "multiple child progress keeps creation order, is replaced and summed witho
     try t.progress(gpa, .{ .id = "a2", .prompt = "second", .step = 3, .tools = &.{"edit"}, .files = &.{"a.zig"}, .usage = .{ .prompt_tokens = 40000 } });
     const e = &t.entries.items[0];
     var segs: [max_segments]vaxis.Segment = undefined;
-    try testing.expectEqualStrings("agent ×3 · running · 2 working, 1 done · 120k tok", e.segments(&segs)[2].text);
+    try testing.expectEqualStrings("agent ×3 · running · 2 running, 1 completed · 120k tokens", e.segments(&segs)[2].text);
     t.toggleExpanded();
     try testing.expectEqual(@as(usize, 3), e.agent_tree.rows.items.len);
-    try testing.expectEqualStrings("  ├─ a3 third · working · step 1", e.agent_tree.rows.items[0].text);
-    try testing.expectEqualStrings("  ├─ a1 first · done · step 2 · read", e.agent_tree.rows.items[1].text);
-    try testing.expectEqualStrings("  └─ a2 second · working · step 3 · edit a.zig", e.agent_tree.rows.items[2].text);
+    try testing.expectEqualStrings("  ├─ a3 third · running · step 1", e.agent_tree.rows.items[0].text);
+    try testing.expectEqualStrings("  ├─ a1 first · completed · step 2 · read", e.agent_tree.rows.items[1].text);
+    try testing.expectEqualStrings("  └─ a2 second · running · step 3 · edit a.zig", e.agent_tree.rows.items[2].text);
     try t.progress(gpa, .{ .id = "a3", .prompt = "third", .state = .timed_out, .step = 1, .usage = .{ .prompt_tokens = 40000 } });
     try testing.expectEqual(@as(usize, 3), e.agents.items.len);
-    try testing.expectEqualStrings("agent ×3 · running · 1 working, 1 done, 1 failed · 120k tok", e.label.items);
+    try testing.expectEqualStrings("agent ×3 · running · 1 running, 1 completed, 1 failed · 120k tokens", e.label.items);
     try t.endRun(gpa, true, "out", 9000, .{});
-    try testing.expectEqualStrings("agent ×3 · 9.0s", e.label.items);
+    try testing.expectEqualStrings("agent ×3 · 9s", e.label.items);
 }
 
 test "child prompt preview uses forty Unicode characters and one logical line" {
@@ -819,8 +819,8 @@ test "history Run effort is copied from assistant metadata and absent in legacy 
     });
     effort[0] = 'x';
     try t.entries.items[0].refreshLabel(gpa);
-    try testing.expectEqualStrings("bash · 0.0s · high (guard)", t.entries.items[0].label.items);
-    try testing.expectEqualStrings("bash · 0.0s", t.entries.items[1].label.items);
+    try testing.expectEqualStrings("bash · <1s · high (guard)", t.entries.items[0].label.items);
+    try testing.expectEqualStrings("bash · <1s", t.entries.items[1].label.items);
 }
 
 test "agent rows have stable heights across folding resizing completion and scrolling" {
@@ -881,7 +881,7 @@ test "completed Run replaces source estimate with dispatched host tools" {
     const summary = try ToolSummary.init(gpa, &calls, 0, 0);
     defer summary.deinit(gpa);
     try t.endRunWithSummary(gpa, false, "failed bash", 200, .{}, summary);
-    try testing.expectEqualStrings("edit, bash · 0.2s", t.entries.items[0].label.items);
+    try testing.expectEqualStrings("edit, bash · <1s", t.entries.items[0].label.items);
 }
 
 test "completed Run includes omitted calls without guessing their names" {
@@ -894,7 +894,7 @@ test "completed Run includes omitted calls without guessing their names" {
     const summary = try ToolSummary.init(gpa, timing.entries[0..timing.count], 0, timing.omitted);
     defer summary.deinit(gpa);
     try t.endRunWithSummary(gpa, true, "done", 0, .{}, summary);
-    try testing.expectEqualStrings("read ×200, +3 · 0.0s", t.entries.items[0].label.items);
+    try testing.expectEqualStrings("read ×200, +3 · <1s", t.entries.items[0].label.items);
     var buf: [128]u8 = undefined;
     try testing.expectEqualStrings("+3", actualToolSummary(.{ .omitted = 3 }, &buf));
 }
@@ -904,7 +904,7 @@ test "empty actual summary does not fall back to source text" {
     defer t.deinit(testing.allocator);
     try t.startRun(testing.allocator, "// tools.llm({})");
     try t.endRunWithSummary(testing.allocator, true, "done", 0, .{}, .{});
-    try testing.expectEqualStrings("js · 0.0s", t.entries.items[0].label.items);
+    try testing.expectEqualStrings("js · <1s", t.entries.items[0].label.items);
 }
 
 test "restored Run summaries follow run_index and tool_call_id and survive compaction" {
@@ -936,8 +936,8 @@ test "restored Run summaries follow run_index and tool_call_id and survive compa
     var t: Transcript = .{};
     defer t.deinit(testing.allocator);
     try t.addHistory(testing.allocator, history.items);
-    try testing.expectEqualStrings("edit, +2 · 0.0s", t.entries.items[0].label.items);
-    try testing.expectEqualStrings("bash ×2, +3 · 0.0s", t.entries.items[1].label.items);
+    try testing.expectEqualStrings("edit, +2 · <1s", t.entries.items[0].label.items);
+    try testing.expectEqualStrings("bash ×2, +3 · <1s", t.entries.items[1].label.items);
     try testing.expectEqualStrings("first output", t.entries.items[0].output.items);
     try testing.expectEqualStrings("second output", t.entries.items[1].output.items);
     const compacted = try std.fmt.allocPrint(a, "{f}\n", .{std.json.fmt(log.Record{ .messages = history.items }, .{ .emit_null_optional_fields = false })});
@@ -945,8 +945,8 @@ test "restored Run summaries follow run_index and tool_call_id and survive compa
     _ = try log.replay(a, a, compacted, &history, &tokens);
     t.clear(testing.allocator);
     try t.addHistory(testing.allocator, history.items);
-    try testing.expectEqualStrings("edit, +2 · 0.0s", t.entries.items[0].label.items);
-    try testing.expectEqualStrings("bash ×2, +3 · 0.0s", t.entries.items[1].label.items);
+    try testing.expectEqualStrings("edit, +2 · <1s", t.entries.items[0].label.items);
+    try testing.expectEqualStrings("bash ×2, +3 · <1s", t.entries.items[1].label.items);
 }
 
 test "legacy logs without calls retain the source estimate" {
@@ -961,7 +961,7 @@ test "legacy logs without calls retain the source estimate" {
     var t: Transcript = .{};
     defer t.deinit(testing.allocator);
     try t.addHistory(testing.allocator, history.items);
-    try testing.expectEqualStrings("llm ×2 · 0.0s", t.entries.items[0].label.items);
+    try testing.expectEqualStrings("llm ×2 · <1s", t.entries.items[0].label.items);
 }
 
 test "legacy Step overflow is not attributed to a pure JS Run" {
@@ -988,8 +988,8 @@ test "legacy Step overflow is not attributed to a pure JS Run" {
         var t: Transcript = .{};
         defer t.deinit(testing.allocator);
         try t.addHistory(testing.allocator, history.items);
-        try testing.expectEqualStrings("read ×200 · 0.0s", t.entries.items[0].label.items);
-        try testing.expectEqualStrings("js · 0.0s", t.entries.items[1].label.items);
+        try testing.expectEqualStrings("read ×200 · <1s", t.entries.items[0].label.items);
+        try testing.expectEqualStrings("js · <1s", t.entries.items[1].label.items);
         try testing.expectEqualStrings("tools +3 · omitted calls (Run unknown)", t.entries.items[2].text.items);
         data = try std.fmt.allocPrint(a, "{f}\n", .{std.json.fmt(log.Record{ .messages = history.items }, .{ .emit_null_optional_fields = false })});
     }
@@ -1021,7 +1021,7 @@ test "mixed ids replace in creation order and settle only when delivered" {
     try testing.expectEqualStrings("a10", t.entries.items[0].agents.items[0].id);
     try testing.expectEqualStrings("b2", t.entries.items[0].agents.items[1].id);
     try testing.expectEqualStrings("a2", t.entries.items[0].agents.items[2].id);
-    try testing.expectEqualStrings("  ├─ a10 updated · working · step 3", t.entries.items[0].agent_tree.rows.items[0].text);
+    try testing.expectEqualStrings("  ├─ a10 updated · running · step 3", t.entries.items[0].agent_tree.rows.items[0].text);
     try testing.expectEqualStrings("  ├─ b2 bash echo ready · 3m12s · background", t.entries.items[0].agent_tree.rows.items[1].text);
     try testing.expectEqualStrings("  └─ a2 last · background · step 2", t.entries.items[0].agent_tree.rows.items[2].text);
     try t.endRun(gpa, true, "started", 100, .{});
@@ -1029,14 +1029,14 @@ test "mixed ids replace in creation order and settle only when delivered" {
     try t.progress(gpa, .{ .id = "b2", .kind = .bash, .prompt = "echo ready", .background = true, .state = .done, .elapsed_ms = 192_000 });
     try testing.expectEqual(@as(usize, 0), t.entries.items[1].agents.items.len);
     try t.backgroundResult(gpa, .bash, "b2", true, "{\"exit_code\":0,\"output\":\"ready\"}");
-    try testing.expectEqualStrings("  ├─ b2 bash echo ready · 3m12s · done", t.entries.items[0].agent_tree.rows.items[1].text);
+    try testing.expectEqualStrings("  ├─ b2 bash echo ready · 3m12s · completed", t.entries.items[0].agent_tree.rows.items[1].text);
     try testing.expect(t.entries.items[0].agents.items[2].background);
     try t.lostBackground(gpa, .agent, "a2", "[background agent a2 lost: process ended]");
     try testing.expectEqualStrings("  └─ a2 last · failed · step 2", t.entries.items[0].agent_tree.rows.items[2].text);
     try t.progress(gpa, .{ .id = "a2", .run = 1, .prompt = "last", .background = true, .state = .done, .step = 4 });
     try testing.expect(!t.entries.items[0].agents.items[2].background);
     try testing.expectEqualStrings("  └─ a2 last · failed · step 4", t.entries.items[0].agent_tree.rows.items[2].text);
-    try testing.expectEqualStrings("b2 bash · ok · ready", t.entries.items[2].label.items);
+    try testing.expectEqualStrings("b2 bash · completed · ready", t.entries.items[2].label.items);
     try testing.expectEqualStrings("a2 agent · lost", t.entries.items[3].label.items);
 }
 
@@ -1059,7 +1059,7 @@ test "live and restored mixed results have identical folded labels and complete 
     });
     var left: [max_segments]vaxis.Segment = undefined;
     var right: [max_segments]vaxis.Segment = undefined;
-    const labels = [_][]const u8{ "b2 bash · ok · ready more output", "a2 agent · failed · failed to build", "a10 agent · lost" };
+    const labels = [_][]const u8{ "b2 bash · completed · ready more output", "a2 agent · failed · failed to build", "a10 agent · lost" };
     for (live.entries.items, restored.entries.items, labels, 0..) |*a, *b, label, i| {
         try testing.expectEqualStrings(label, a.label.items);
         try testing.expectEqualStrings(label, b.label.items);
@@ -1086,7 +1086,7 @@ test "delivered failures retain terminal cancellation and timeout states" {
     try t.backgroundResult(gpa, .agent, "a1", false, "{}");
     try t.backgroundResult(gpa, .agent, "a2", false, "{}");
     try testing.expectEqualStrings("  ├─ a1 canceled · canceled · step 0", t.entries.items[0].agent_tree.rows.items[0].text);
-    try testing.expectEqualStrings("  └─ a2 timed out · timed_out · step 0", t.entries.items[0].agent_tree.rows.items[1].text);
+    try testing.expectEqualStrings("  └─ a2 timed out · timed out · step 0", t.entries.items[0].agent_tree.rows.items[1].text);
 }
 
 test "session IDs route progress across repeated Turn Run numbers and late terminal events" {
@@ -1104,7 +1104,7 @@ test "session IDs route progress across repeated Turn Run numbers and late termi
     try t.progress(gpa, .{ .id = "b1", .run = 1, .kind = .bash, .prompt = "sleep 30", .elapsed_ms = 4000 });
     try t.endRun(gpa, false, "stop", 4000, .{});
     try t.progress(gpa, .{ .id = "b1", .run = 1, .kind = .bash, .prompt = "sleep 30", .elapsed_ms = 4100, .state = .canceled });
-    try testing.expectEqualStrings("  └─ b1 bash sleep 30 · 4.1s · canceled", t.entries.items[1].agent_tree.rows.items[1].text);
+    try testing.expectEqualStrings("  └─ b1 bash sleep 30 · 4s · canceled", t.entries.items[1].agent_tree.rows.items[1].text);
 }
 
 test "background failures without output preview the error and keep complete JSON" {
@@ -1128,13 +1128,13 @@ test "foreground agent reuse creates a new Run row and late progress stays in th
     try t.progress(gpa, .{ .id = "a1", .run = 2, .prompt = "resume", .step = 1 });
     try testing.expectEqual(@as(usize, 1), t.entries.items[0].agents.items.len);
     try testing.expectEqual(@as(usize, 1), t.entries.items[1].agents.items.len);
-    try testing.expectEqualStrings("  └─ a1 first · done · step 2", t.entries.items[0].agent_tree.rows.items[0].text);
-    try testing.expectEqualStrings("  └─ a1 resume · working · step 1", t.entries.items[1].agent_tree.rows.items[0].text);
+    try testing.expectEqualStrings("  └─ a1 first · completed · step 2", t.entries.items[0].agent_tree.rows.items[0].text);
+    try testing.expectEqualStrings("  └─ a1 resume · running · step 1", t.entries.items[1].agent_tree.rows.items[0].text);
     try t.progress(gpa, .{ .id = "a1", .run = 1, .prompt = "first", .state = .done, .step = 3 });
-    try testing.expectEqualStrings("  └─ a1 first · done · step 3", t.entries.items[0].agent_tree.rows.items[0].text);
-    try testing.expectEqualStrings("  └─ a1 resume · working · step 1", t.entries.items[1].agent_tree.rows.items[0].text);
+    try testing.expectEqualStrings("  └─ a1 first · completed · step 3", t.entries.items[0].agent_tree.rows.items[0].text);
+    try testing.expectEqualStrings("  └─ a1 resume · running · step 1", t.entries.items[1].agent_tree.rows.items[0].text);
     try t.progress(gpa, .{ .id = "a1", .run = 2, .prompt = "resume", .state = .done, .step = 4 });
-    try testing.expectEqualStrings("  └─ a1 resume · done · step 4", t.entries.items[1].agent_tree.rows.items[0].text);
+    try testing.expectEqualStrings("  └─ a1 resume · completed · step 4", t.entries.items[1].agent_tree.rows.items[0].text);
 }
 
 test "delivered background agent results do not settle foreground or background reuse" {
@@ -1160,7 +1160,7 @@ test "delivered background agent results do not settle foreground or background 
         if (background) {
             try t.backgroundResult(gpa, .agent, "a1", true, "{}");
             try t.progress(gpa, .{ .id = "a1", .run = 2, .prompt = "resume", .background = true, .step = 4 });
-            try testing.expectEqualStrings("  └─ a1 resume · done · step 4", t.entries.items[2].agent_tree.rows.items[0].text);
+            try testing.expectEqualStrings("  └─ a1 resume · completed · step 4", t.entries.items[2].agent_tree.rows.items[0].text);
             try testing.expect(!t.entries.items[2].agents.items[0].background);
             try testing.expectEqualStrings("  └─ a1 first · failed · step 3", t.entries.items[0].agent_tree.rows.items[0].text);
         }
@@ -1185,10 +1185,10 @@ test "delayed background results settle only the oldest undelivered invocation o
     try testing.expectEqualStrings("  └─ a1 first · failed · step 3", t.entries.items[0].agent_tree.rows.items[0].text);
     try testing.expectEqualStrings("  └─ a1 resume · background · step 1", t.entries.items[1].agent_tree.rows.items[0].text);
     try t.backgroundResult(gpa, .agent, "a1", true, "{}");
-    try testing.expectEqualStrings("  └─ a1 resume · done · step 1", t.entries.items[1].agent_tree.rows.items[0].text);
+    try testing.expectEqualStrings("  └─ a1 resume · completed · step 1", t.entries.items[1].agent_tree.rows.items[0].text);
     try testing.expectEqualStrings("  └─ a1 first · failed · step 3", t.entries.items[0].agent_tree.rows.items[0].text);
     try t.progress(gpa, .{ .id = "a1", .run = 2, .prompt = "resume", .background = true, .state = .done, .step = 5 });
-    try testing.expectEqualStrings("  └─ a1 resume · done · step 5", t.entries.items[1].agent_tree.rows.items[0].text);
+    try testing.expectEqualStrings("  └─ a1 resume · completed · step 5", t.entries.items[1].agent_tree.rows.items[0].text);
 }
 
 test "restored background results cannot settle a reused ID in a new Run" {
@@ -1221,7 +1221,7 @@ test "same Run foreground and background reuse keep invocation results separate 
             try testing.expectEqualStrings("second", t.entries.items[0].agents.items[0].prompt);
             if (second_background) try t.backgroundResult(gpa, .agent, "a1", true, "{}");
             try t.progress(gpa, .{ .id = "a1", .invocation = 2, .run = 1, .prompt = "second", .background = second_background, .state = .done, .step = 2 });
-            try testing.expectEqualStrings("  └─ a1 second · done · step 2", t.entries.items[0].agent_tree.rows.items[0].text);
+            try testing.expectEqualStrings("  └─ a1 second · completed · step 2", t.entries.items[0].agent_tree.rows.items[0].text);
             try testing.expect(!t.entries.items[0].agents.items[0].background);
         }
     }
