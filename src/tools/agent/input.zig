@@ -28,6 +28,7 @@ test "agent stdin round trip preserves unset and explicit step limits" {
         const input: Input = .{
             .prompt = "child prompt",
             .config = .{
+                .enabled_skills = &.{"hallmark"},
                 .base_url = "https://example.com",
                 .api_key = "mock-key",
                 .model = "mock-model",

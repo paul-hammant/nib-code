@@ -6,7 +6,7 @@ const config = @import("../config.zig");
 const ChangeText = @import("transcript.zig").ChangeText;
 const provider = @import("../provider.zig");
 
-pub const Command = enum { help, new, @"resume", compact, undo, effort, copy, reflect, js, tasks, stop, status };
+pub const Command = enum { help, new, @"resume", compact, undo, effort, copy, reflect, js, tasks, stop, status, skills };
 
 pub const Choices = enum { none, efforts, sessions, tasks };
 
@@ -24,6 +24,7 @@ pub const Spec = struct {
 };
 
 pub const specs = std.enums.EnumArray(Command, Spec).init(.{
+    .skills = .{ .group = .view, .args = "[on|off <name>]", .help = "list or enable skills for new sessions" },
     .status = .{ .group = .view, .help = "timing and cache details", .while_busy = true },
     .tasks = .{ .group = .view, .help = "background tasks", .while_busy = true },
     .stop = .{ .args = "<id>", .help = "stop a task; changes may remain", .while_busy = true, .choices = .tasks, .needs_arg = true },
@@ -189,8 +190,61 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
     const session = app.session;
     switch (c) {
         .status => {
+            const skills = session.log.skills;
+            var suffix: std.ArrayList(u8) = .empty;
+            defer suffix.deinit(gpa);
+            if (skills.skipped.len > 0) try suffix.print(gpa, " · {d} invalid/skipped", .{skills.skipped.len});
+            if (skills.missing > 0) try suffix.print(gpa, " · {d} missing", .{skills.missing});
+            try app.report(.info, "Skills: {d} on · {d} found{s}", .{ skills.count, skills.found, suffix.items });
             var text: @import("bill.zig").Text = .{};
             try app.report(.info, "{s} · effort {s} · context {d}%\n{s}", .{ app.cfg.model, app.cfg.effectiveEffort(), app.context * 100 / @max(app.cfg.context_window, 1), if (app.last_summary) |summary| text.details(summary) else "No completed turn yet." });
+        },
+        .skills => {
+            var arena: std.heap.ArenaAllocator = .init(gpa);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const module = @import("../session/skills.zig");
+            const cwd = try std.process.currentPathAlloc(app.io, a);
+            const root = try @import("../session/instructions.zig").projectRoot(app.io, a, cwd);
+            const found = try module.load(app.io, a, session.options.home, session.options.user_home, root);
+            const settings = try config.loadSkills(a, app.io, session.options.home);
+            if (arg.len > 0) {
+                var words = std.mem.tokenizeAny(u8, arg, " \t");
+                const action = words.next().?;
+                const name = words.next() orelse return app.transcript.add(gpa, .err, "usage: /skills [on|off <name>]");
+                if (words.next() != null or (!std.mem.eql(u8, action, "on") and !std.mem.eql(u8, action, "off"))) return app.transcript.add(gpa, .err, "usage: /skills [on|off <name>]");
+                const enabled = std.mem.eql(u8, action, "on");
+                const skill = for (found.skills) |skill| {
+                    if (std.mem.eql(u8, skill.name, name)) break skill;
+                } else null;
+                if (enabled and skill == null) return app.report(.err, "skill not found: {s}", .{name});
+                if (enabled and skill.?.disabled) return app.report(.err, "skill disables model invocation: {s}", .{name});
+                config.saveSkill(gpa, app.io, session.options.home, name, enabled) catch |err| return app.report(.err, "could not save skills: {s}", .{@errorName(err)});
+                return app.report(.info, "{s}: {s} · Applies to new sessions.", .{ name, action });
+            }
+            var text: std.ArrayList(u8) = .empty;
+            for (found.skills) |skill| {
+                const source = try module.source(a, skill.location, session.options.home, session.options.user_home, root);
+                const on = !skill.disabled and config.skillEnabled(settings, skill.name);
+                try text.print(a, "{s} · {s} · {s}\n  ", .{ skill.name, source, if (on) @as([]const u8, "on") else "off" });
+                const description = try a.dupe(u8, skill.description);
+                for (description) |*byte| if (std.ascii.isWhitespace(byte.*)) {
+                    byte.* = ' ';
+                };
+                const preview = @import("format.zig").fit(description, 48);
+                try text.print(a, "{s}{s}", .{ preview.text, preview.suffix });
+                try text.append(a, '\n');
+            }
+            if (found.skills.len == 0) try text.appendSlice(a, "No skills found.\n");
+            for (settings) |setting| {
+                if (!setting.enabled) continue;
+                const exists = for (found.skills) |skill| {
+                    if (std.mem.eql(u8, setting.name, skill.name)) break true;
+                } else false;
+                if (!exists) try text.print(a, "{s} · missing · on\n", .{setting.name});
+            }
+            try text.appendSlice(a, "Applies to new sessions.");
+            try app.transcript.add(gpa, .info, text.items);
         },
         .tasks => {
             var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -252,8 +306,9 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
         .effort => {
             if (arg.len > 0) {
                 app.cfg.setEffort(arg) catch return app.transcript.add(gpa, .err, "usage: /effort [default|off|none|minimal|low|medium|high|xhigh|max]");
-                session.cfg = app.cfg;
-                session.tools.cfg = app.cfg;
+                session.cfg.thinking = app.cfg.thinking;
+                session.cfg.reasoning_effort = app.cfg.reasoning_effort;
+                session.tools.cfg = session.cfg;
                 config.saveEffort(gpa, app.io, session.options.home, arg) catch |err| {
                     try app.report(.err, "effort applied, but could not save {s}/config.toml: {s}", .{ session.options.home, @errorName(err) });
                     return;

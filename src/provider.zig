@@ -30,6 +30,7 @@ pub const Limits = struct {
 };
 
 pub const Config = struct {
+    enabled_skills: []const []const u8 = &.{},
     limits: Limits = .{},
     provider: Id = .chat_completions,
     codex_transport: Transport = .websocket,
