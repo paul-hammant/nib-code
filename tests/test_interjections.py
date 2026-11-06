@@ -92,7 +92,7 @@ class Terminal:
                                       preexec_fn=controlling_tty)
         os.close(slave)
         self.output = b""
-        self.until(b"Message nib")
+        self.until(b"Ask about this project")
 
     def read(self):
         while select.select([self.master], [], [], 0)[0]:
@@ -211,6 +211,10 @@ def test_during_run_and_resume(tmp):
             message.pop("step_effort", None)
             message.pop("tool_summary", None)
             message.pop("step_calls_omitted", None)
+            message.pop("run_ok", None)
+            message.pop("bash_replacements", None)
+            if message["role"] == "tool":
+                message.pop("background_id", None)
             wire.append(message)
         assert resumed.messages == wire + [{"role": "user", "content": "after resume"}]
         events = [json.loads(line) for line in result.stdout.splitlines()]
@@ -243,7 +247,7 @@ def test_escape_restores_draft(tmp):
         terminal.send("queued one\rqueued two\runsubmitted draft")
         terminal.until(b"queued")
         terminal.send("\x1b")
-        terminal.until(b"canceled")
+        terminal.until(b"Canceled")
         assert not second.received.is_set(), "Esc must not automatically resend"
         assert users(history(home)) == ["initial"], history(home)
         terminal.send("\r")
@@ -259,7 +263,7 @@ def test_tool_bytes_bill(tmp):
         (tmp / "b.txt").write_text("x" * 48000)
         terminal.send("measure tool bytes\r")
         wait_for(lambda: finished(home, "bytes-final"), "byte measurement final Step")
-        terminal.until("96k→12 B".encode())
+        terminal.until("tool data 96kB → 12B".encode())
         assert terminal.child.poll() is None
         records = [json.loads(line) for path in (home / "sessions").glob("*.jsonl")
                    for line in path.read_text().splitlines()]

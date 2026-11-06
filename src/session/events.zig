@@ -10,7 +10,10 @@ pub const Progress = struct {
     run: usize = 0,
     invocation: usize = 0,
     kind: Background.Kind = .agent,
+    exit_code: ?u8 = null,
+    output_bytes: u64 = 0,
     elapsed_ms: u64 = 0,
+    superseded_by: ?[]const u8 = null,
     background: bool = false,
     detached: bool = false,
     fork: bool = false,
@@ -28,11 +31,14 @@ pub const Progress = struct {
         errdefer freeStrings(gpa, used);
         const files = try cloneStrings(gpa, p.files);
         errdefer freeStrings(gpa, files);
+        const replacement = if (p.superseded_by) |id| try gpa.dupe(u8, id) else null;
+        errdefer if (replacement) |id| gpa.free(id);
         const id = try gpa.dupe(u8, p.id);
-        return .{ .kind = p.kind, .elapsed_ms = p.elapsed_ms, .run = p.run, .invocation = p.invocation, .background = p.background, .detached = p.detached, .fork = p.fork, .id = id, .prompt = prompt, .state = p.state, .step = p.step, .tools = used, .files = files, .usage = p.usage };
+        return .{ .exit_code = p.exit_code, .output_bytes = p.output_bytes, .superseded_by = replacement, .kind = p.kind, .elapsed_ms = p.elapsed_ms, .run = p.run, .invocation = p.invocation, .background = p.background, .detached = p.detached, .fork = p.fork, .id = id, .prompt = prompt, .state = p.state, .step = p.step, .tools = used, .files = files, .usage = p.usage };
     }
 
     pub fn deinit(p: *Progress, gpa: std.mem.Allocator) void {
+        if (p.superseded_by) |id| gpa.free(id);
         gpa.free(p.prompt);
         gpa.free(p.id);
         freeStrings(gpa, p.tools);
@@ -77,7 +83,7 @@ pub const TurnSummary = struct {
     timing: Timing = .{},
 };
 
-pub const ModelActivity = enum { started, data, finished };
+pub const ModelActivity = enum { started, data, script, waiting, finished };
 
 pub const RunCompletion = struct {
     execution: ?@import("../sandbox/timing.zig").Execution = null,
@@ -109,7 +115,7 @@ pub const Event = union(enum) {
     /// Slices are valid only during the callback.
     delta: struct { kind: provider.Kind, text: []const u8 },
     run_start: []const u8,
-    run_end: struct { ok: bool, output: []const u8, changes: []const Change = &.{}, tool_summary: ?Summary = null },
+    run_end: struct { background_id: ?[]const u8 = null, ok: bool, output: []const u8, changes: []const Change = &.{}, tool_summary: ?Summary = null },
     retry: struct { attempt: u32, delay_ms: u64, reason: []const u8 },
     notice: []const u8,
     usage: provider.Usage,
@@ -161,14 +167,14 @@ test "run_end JSON includes actual tool summary including empty counts" {
         .tool_summary = .{ .counts = &counts, .omitted = 3 },
     } } }, .{ .emit_null_optional_fields = false });
     defer t.allocator.free(populated);
-    try t.expectEqualStrings("{\"run_end\":{\"ok\":false,\"output\":\"failed\",\"changes\":[],\"tool_summary\":{\"counts\":[{\"name\":\"bash\",\"count\":2},{\"name\":\"read\",\"count\":1}],\"omitted\":3}}}", populated);
+    try t.expectEqualStrings("{\"run_end\":{\"ok\":false,\"output\":\"failed\",\"changes\":[],\"tool_summary\":{\"counts\":[{\"name\":\"bash\",\"count\":2},{\"name\":\"read\",\"count\":1}],\"omitted\":3,\"files\":[]}}}", populated);
     const empty = try std.json.Stringify.valueAlloc(t.allocator, JsonEvent{ .event = .{ .run_end = .{
         .ok = true,
         .output = "",
         .tool_summary = .{},
     } } }, .{ .emit_null_optional_fields = false });
     defer t.allocator.free(empty);
-    try t.expectEqualStrings("{\"run_end\":{\"ok\":true,\"output\":\"\",\"changes\":[],\"tool_summary\":{\"counts\":[],\"omitted\":0}}}", empty);
+    try t.expectEqualStrings("{\"run_end\":{\"ok\":true,\"output\":\"\",\"changes\":[],\"tool_summary\":{\"counts\":[],\"omitted\":0,\"files\":[]}}}", empty);
     const legacy = try std.json.Stringify.valueAlloc(t.allocator, JsonEvent{ .event = .{ .run_end = .{ .ok = true, .output = "" } } }, .{ .emit_null_optional_fields = false });
     defer t.allocator.free(legacy);
     try t.expectEqualStrings("{\"run_end\":{\"ok\":true,\"output\":\"\",\"changes\":[]}}", legacy);

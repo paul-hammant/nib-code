@@ -52,6 +52,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         index = len(self.server.requests)
         self.server.requests.append(request)
         case = self.server.case
+        if case == "request-failure":
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b'{"error":{"message":"mock refused request"}}')
+            return
         code = None
         if case.startswith("replace-"):
             mode = case.removeprefix("replace-")
@@ -89,6 +94,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 code = "await tools.bash(" + json.dumps({"command": shlex.join([sys.executable, "-c", script])}) + ")"
             elif case == "timeout":
                 code = "await tools.bash(" + json.dumps({"command": "echo $$ > worker.pid; sleep 30", "timeout_ms": 500}) + ")"
+            elif case == "recovery":
+                code = "await tools.write({path:'changed.txt',content:'partial work'}); await tools.bash({command:'echo $$ > worker.pid; sleep 30'})"
             elif case in ("cancel", "crash", "stop"):
                 command = "echo $$ > worker.pid; sleep 30; echo should-not-finish"
                 code = "const r=await tools.bash(" + json.dumps({"command": command}) + "); if(r.exit_code!==null) throw new Error('stop did not kill command'); r"
@@ -435,17 +442,67 @@ class BackgroundRunTests(unittest.TestCase):
                 self.assertEqual(results[-1]["background_id"], "r2")
                 self.assertIn("resumed-result", results[-1]["content"])
 
+    def test_tui_cancellation_reports_files_even_without_run_result(self):
+        self.server.case = "recovery"
+        (self.home / "config.toml").write_text("[limits]\nrun_background_after_ms = 100000\n")
+        terminal = Terminal(self.cwd, self.env)
+        try:
+            terminal.send("initial\r")
+            wait_for(lambda: (self.cwd / "worker.pid").exists())
+            terminal.send("\x1b")
+            terminal.until(b"type continue to resume")
+            self.assertIn(b"edited: changed.txt", terminal.output)
+            self.assertIn(b"bash changes untracked", terminal.output)
+            self.assertEqual((self.cwd / "changed.txt").read_text(), "partial work")
+            wait_for(lambda: not alive(int((self.cwd / "worker.pid").read_text())))
+        finally:
+            terminal.close()
+
+    def test_tui_request_failure_does_not_claim_file_changes(self):
+        self.server.case = "request-failure"
+        terminal = Terminal(self.cwd, self.env)
+        try:
+            terminal.send("initial\r")
+            terminal.until(b"model connection/request failed")
+            terminal.until(b"type continue to resume")
+            self.assertIn(b"no recorded edit/write changes", terminal.output)
+            self.assertNotIn(b"edited:", terminal.output)
+        finally:
+            terminal.close()
+
+    def test_tui_tasks_and_stop_during_model_request(self):
+        self.server.case = "cancel"
+        terminal = Terminal(self.cwd, self.env)
+        try:
+            terminal.send("initial\r")
+            self.assertTrue(self.server.followup.wait(5))
+            pid = int((self.cwd / "worker.pid").read_text())
+            terminal.send("/tasks\r")
+            terminal.until(b"per-tool deadlines")
+            terminal.send("/stop r1\r")
+            terminal.until(b"stopped by user")
+            wait_for(lambda: not alive(pid))
+            paths = [p for p in (self.home / "sessions").glob("*.jsonl") if not p.name.endswith(".calls.jsonl")]
+            rows = [json.loads(line) for line in paths[0].read_text().splitlines()]
+            self.assertIn({"id": "r1", "reason": "user requested stop", "stopped": True},
+                          [r["task_stop"] for r in rows if "task_stop" in r])
+            self.assertTrue(alive(terminal.child.pid))
+        finally:
+            self.server.release.set()
+            terminal.close()
+
     def test_escape_cancels_background_run_in_tui(self):
         self.server.case = "cancel"
         terminal = Terminal(self.cwd, self.env)
         try:
             terminal.send("initial\r")
             self.assertTrue(self.server.followup.wait(5))
-            terminal.until(b"r1 run")
+            terminal.send("/tasks\r")
+            terminal.until(b"r1 Run")
             pid = int((self.cwd / "worker.pid").read_text())
             terminal.send("\x1b")
             wait_for(lambda: not alive(pid))
-            terminal.until(b"canceled")
+            terminal.until(b"Canceled")
         finally:
             self.server.release.set()
             terminal.close()

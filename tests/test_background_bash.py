@@ -496,8 +496,7 @@ class BackgroundBashTests:
 
         def terminal_state_visible():
             delta = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", terminal.read()[rendered:])
-            # vaxis may reuse the leading d when replacing detached with done.
-            return b"one" in delta
+            return b"completed" in delta
 
         wait_for(terminal_state_visible)
         self.assertEqual(len(mock.observed()), 2)
@@ -546,7 +545,7 @@ class BackgroundBashTests:
         terminal.send("hold\r")
         wait_for(lambda: len(mock.observed()) == 3)
         terminal.send("\x1b")
-        terminal.until(b"canceled")
+        terminal.until(b"Canceled")
         wait_for(lambda: all(not alive(pid) for pid in pids))
         mock.child_gate.set()
 
@@ -762,7 +761,7 @@ class BackgroundBashTests:
         self.assertEqual(len(mock.observed()), 1)
         self.assertFalse(self.completions(history(self.home), "b1"))
         self.release("ordinary")
-        terminal.until(b"stopped after 1 steps")
+        terminal.until(b"The step limit was reached.")
         self.assertFalse(self.completions(history(self.home), "b1"))
         terminal.send("next turn\r")
         self.wait_final("next turn complete")
@@ -1078,7 +1077,7 @@ class BackgroundBashTests:
                   if m.get("source") == "background"]
         self.assertEqual({m["background_id"] for m in logged}, {"a2", "b1"})
 
-    def test_foreground_bash_delays_progress_and_keeps_two_completed_ids(self):
+    def test_foreground_bash_delays_live_progress_and_reports_all_completed_ids(self):
         (self.home / "config.toml").write_text("[limits]\nrun_background_after_ms = 30000\n")
         self.mock("foreground_bash")
         started = time.monotonic()
@@ -1108,7 +1107,11 @@ class BackgroundBashTests:
         self.assertEqual((process.returncode, output, error, pending), (0, "", "", b""))
         self.assertIn("end", events[-1])
         self.assertFalse(any("background" in e for e in events))
-        self.assert_progress_ids(events, {"b1": ("bash", False), "b3": ("bash", False)})
+        self.assert_progress_ids(events, {"b1": ("bash", False), "b2": ("bash", False), "b3": ("bash", False)})
+        quick = [p for _, p in updates if p["id"] == "b2"]
+        self.assertEqual(len(quick), 1, quick)
+        self.assertEqual((quick[0]["state"], quick[0]["exit_code"]), ("done", 0))
+        self.assertLess(quick[0]["elapsed_ms"], 3000)
         completed = {}
         for id in ("b1", "b3"):
             samples = [(stamp, p) for stamp, p in updates if p["id"] == id]
@@ -1360,7 +1363,7 @@ class ChatTests(BackgroundBashTests, unittest.TestCase):
     def test_max_steps_result_is_visible_in_next_tui_turn(self):
         mock, terminal, pid, root_log = self.start_limited_terminal()
         self.release()
-        terminal.until(b"stopped after 5 steps")
+        terminal.until(b"The step limit was reached.")
         wait_for(lambda: not alive(pid))
         self.assertEqual(len(mock.observed()), 5)
         stored = self.completion([m for r in records(root_log) for m in r.get("messages", [])])
@@ -1373,7 +1376,7 @@ class ChatTests(BackgroundBashTests, unittest.TestCase):
     def test_escape_cancels_max_steps_wait(self):
         mock, terminal, pid, root_log = self.start_limited_terminal()
         terminal.send("\x1b")
-        terminal.until(b"canceled")
+        terminal.until(b"Canceled")
         wait_for(lambda: not alive(pid))
         self.assertEqual(len(mock.observed()), 5)
         self.assertNotIn(b"stopped after 5 steps", terminal.read())
@@ -1389,7 +1392,7 @@ class ChatTests(BackgroundBashTests, unittest.TestCase):
         wait_for(lambda: path.exists())
         pid = int(path.read_text())
         terminal.send("\x1b")
-        terminal.until(b"canceled")
+        terminal.until(b"Canceled")
         wait_for(lambda: not alive(pid))
         self.assertFalse(any(m.get("source") == "background" for m in history(self.home)))
 

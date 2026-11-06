@@ -49,6 +49,11 @@ const Forward = struct {
         try f.sink.received();
     }
 
+    fn onToolArguments(ctx: *anyopaque) !void {
+        const f: *@This() = @ptrCast(@alignCast(ctx));
+        try f.sink.toolArguments();
+    }
+
     fn onFallback(ctx: *anyopaque, info: @import("codex_ws.zig").Info) !void {
         const f: *@This() = @ptrCast(@alignCast(ctx));
         try f.sink.fallback(info);
@@ -82,7 +87,7 @@ fn completeWith(
     while (true) : (attempt += 1) {
         attempts.* = attempt;
         var fwd: Forward = .{ .sink = sink };
-        const forwarded: p.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .onFallback = Forward.onFallback, .timing = sink.timing, .codex_state = sink.codex_state };
+        const forwarded: p.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .onToolArguments = Forward.onToolArguments, .onFallback = Forward.onFallback, .timing = sink.timing, .codex_state = sink.codex_state };
         const attempt_start = if (sink.timing) |timing| timing.elapsed() else 0;
         const result = response: {
             try Sink.emit(retry_sink, .started);

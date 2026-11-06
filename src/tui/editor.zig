@@ -160,9 +160,11 @@ pub const Editor = struct {
 
     pub fn paste(e: *Editor, gpa: std.mem.Allocator, s: []const u8) !void {
         if (!long_text.isLong(s)) return e.insert(gpa, s);
-        var label: [96]u8 = undefined;
+        var label: [256]u8 = undefined;
         const n = long_text.lines(s);
-        const shown = try std.fmt.bufPrint(&label, "[Pasted #{d} · {d} {s}]", .{ e.number, if (n < 2) long_text.chars(s) else n, if (n < 2) "chars" else "lines" });
+        const first = s[0 .. std.mem.indexOfAny(u8, s, "\r\n") orelse s.len];
+        const preview = @import("format.zig").fit(first, 32);
+        const shown = try std.fmt.bufPrint(&label, "[Pasted #{d} · {d} {s} · {s}{s}]", .{ e.number, if (n < 2) long_text.chars(s) else n, if (n < 2) "chars" else "lines", preview.text, preview.suffix });
         const original = try gpa.dupe(u8, s);
         errdefer gpa.free(original);
         try e.blocks.ensureUnusedCapacity(gpa, 1);
@@ -234,7 +236,7 @@ pub const Editor = struct {
         if (at.row < e.top_row) e.top_row = at.row;
         if (at.row >= @as(u32, e.top_row) + win.height) e.top_row = at.row - win.height + 1;
         if (e.buf.items.len == 0) {
-            _ = win.printSegment(.{ .text = "Message nib · / for commands", .style = .{ .dim = true } }, .{ .wrap = .none });
+            _ = win.printSegment(.{ .text = "Ask about this project · / for commands", .style = .{ .dim = true } }, .{ .wrap = .none });
         } else {
             _ = win.child(.{ .y_off = -@as(i17, @intCast(e.top_row)) }).print(&.{.{ .text = e.buf.items }}, .{ .wrap = .grapheme });
         }
@@ -437,7 +439,7 @@ test "paste thresholds count characters and keep literal private-use codepoints"
     try unicode_text.appendSlice(gpa, "\u{e000}\u{f0000}");
     try e.replace(gpa, "\u{e000} ");
     try e.paste(gpa, unicode_text.items);
-    try testing.expectEqualStrings("\u{e000} [Pasted #1 · 802 chars]", e.text());
+    try testing.expectEqualStrings("\u{e000} [Pasted #1 · 802 chars · 你你你你你你你你你你你你你你你…]", e.text());
     const expanded = try e.expanded(gpa);
     defer gpa.free(expanded);
     try testing.expect(std.mem.endsWith(u8, expanded, unicode_text.items));
@@ -494,11 +496,11 @@ test "send expands blocks and history restores process drafts or folds log text"
     try testing.expectEqual(@as(usize, 1), e.blocks.items.len);
     try testing.expectEqual(@as(usize, 2), e.number);
     try press(&e, Key.down, .{});
-    try testing.expectEqualStrings("[Pasted #1 · 6 lines]", e.text());
+    try testing.expectEqualStrings("[Pasted #1 · 6 lines · 1]", e.text());
     try testing.expectEqual(draft_end, e.cursor);
     try e.remember(gpa, sent);
     try press(&e, Key.up, .{});
-    try testing.expectEqualStrings("[Pasted #1 · 6 lines]", e.text());
+    try testing.expectEqualStrings("[Pasted #1 · 6 lines · prefix 1]", e.text());
     const restored = try e.expanded(gpa);
     defer gpa.free(restored);
     try testing.expectEqualStrings(sent, restored);
@@ -511,15 +513,15 @@ test "block columns use label width and drawing wraps labels not payload" {
     try e.insert(gpa, "你");
     try e.paste(gpa, "1\n2\n3\n4\n5\n6");
     const end = e.cursor;
-    try testing.expectEqual(@as(usize, 23), e.column(end));
+    try testing.expectEqual(@as(usize, 27), e.column(end));
     try testing.expectEqual(@as(usize, "你".len), e.atColumn(0, 10));
-    try e.insert(gpa, "\n12345678901234567890123");
+    try e.insert(gpa, "\n123456789012345678901234567");
     try press(&e, Key.up, .{});
     try testing.expectEqual(end, e.cursor);
     var screen = try vaxis.Screen.init(gpa, .{ .cols = 12, .rows = 4, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(gpa);
     const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 12, .height = 4, .screen = &screen };
     e.draw(win);
-    try testing.expectEqual(@as(u16, 11), screen.cursor.col);
-    try testing.expectEqual(@as(u16, 1), screen.cursor.row);
+    try testing.expectEqual(@as(u16, 3), screen.cursor.col);
+    try testing.expectEqual(@as(u16, 2), screen.cursor.row);
 }

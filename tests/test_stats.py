@@ -1020,6 +1020,16 @@ class StatsTest(unittest.TestCase):
         self.assertEqual(empty['round_trips']['steps_per_turn'], dict(samples=0, median=None, p90=None))
         self.assertIn('写→仅验证: 0/0 = n/a', stats.text_report(empty))
 
+    def test_undo_notifications_do_not_start_turns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'undo.jsonl'
+            records = synthetic_log(path, [[None]])
+            before = stats.summarize([path])['round_trips']['steps_per_turn']
+            records.append(dict({'from': 3}, messages=[dict(role='user', source='undo', content='[undo requested]')]))
+            records.append(dict({'from': 4}, messages=[dict(role='user', source='undo', content='restored: a')]))
+            path.write_text('\n'.join(map(json.dumps, records)) + '\n')
+            self.assertEqual(stats.summarize([path])['round_trips']['steps_per_turn'], before)
+
     def test_group_by_header_mixed_versions_systems_patches_and_cli(self):
         write_a = 'tools.write({path: "a", content: "x"})'
         write_b = 'tools.edit({path: "b", old_text: "x", new_text: "y"})'

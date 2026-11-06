@@ -19,6 +19,7 @@ pub const ModelActivity = @import("session/events.zig").ModelActivity;
 pub const Sink = struct {
     ctx: *anyopaque,
     emit: *const fn (ctx: *anyopaque, event: Event) anyerror!void,
+    onToolActivity: ?*const fn (ctx: *anyopaque, name: []const u8) anyerror!void = null,
     onModelActivity: ?*const fn (ctx: *anyopaque, activity: ModelActivity) anyerror!void = null,
     onUserInserted: ?*const fn (ctx: *anyopaque, id: u64) anyerror!void = null,
 
@@ -56,6 +57,7 @@ pub const Session = struct {
     parent_session_id: ?[]const u8 = null,
     options: Options = undefined,
     inbox: @import("session/inbox.zig").Inbox = .{},
+    undo_history: @import("tools/undo.zig").History = .{},
 
     /// Thread-safe while a Turn runs; other Session mutation is exclusive.
     pub fn enqueue(s: *Session, text: []const u8) !u64 {
@@ -67,7 +69,7 @@ pub const Session = struct {
         return s.inbox.takeUsers(s.gpa, s.io);
     }
 
-    pub const Options = struct { environ: ?*const std.process.Environ.Map = null, depth: u32 = 0, parent_session_id: ?[]const u8 = null, home: []const u8, user_home: []const u8, resume_id: ?[]const u8 = null, continue_latest: bool = false, fork: ?Fork = null };
+    pub const Options = struct { environ: ?*const std.process.Environ.Map = null, depth: u32 = 0, parent_session_id: ?[]const u8 = null, home: []const u8, user_home: []const u8, resume_id: ?[]const u8 = null, continue_latest: bool = false, fork: ?Fork = null, undo_enabled: bool = false, undo_dir: ?[]const u8 = null };
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, client: *std.http.Client, cfg: provider.Config, options: Options) !Session {
         if (options.fork) |fork| {
@@ -172,6 +174,13 @@ pub const Session = struct {
             defer gpa.free(text);
             _ = try s.inbox.enqueueBackground(gpa, io, id, lost.kind, .lost, null, text, false, 0, null);
         }
+        s.tools.undo_dir = options.undo_dir;
+        if (options.undo_enabled and s.parent_session_id == null) {
+            const root = try std.fmt.allocPrint(a, "{s}/{s}.undo", .{ directory, s.id });
+            std.Io.Dir.cwd().deleteTree(io, root) catch {};
+            std.Io.Dir.cwd().createDir(io, root, .fromMode(0o700)) catch {};
+            s.undo_history.root = root;
+        }
         return s;
     }
 
@@ -189,9 +198,11 @@ pub const Session = struct {
     pub fn deinit(s: *Session) void {
         s.codex_state.reset(s.gpa);
         s.tools.background.stop(s.gpa);
+        s.undo_history.deinit(s.io, s.gpa);
         s.tools.progress.deinit(s.gpa);
         s.tools.agent_sessions.deinit(s.gpa);
         s.inbox.batch.deinit(s.gpa);
+        s.tools.recovery.clear(s.gpa, s.io);
         s.tools.discardChanges(s.gpa);
         s.tools.file_state.deinit(s.gpa);
         if (s.recorder) |*recorder| recorder.deinit();
@@ -211,7 +222,22 @@ pub const Session = struct {
     pub const run = runner.run;
     const execute = runner.execute;
 
+    pub fn undo(s: *Session) ![]u8 {
+        const a = s.arena.allocator();
+        const intent = "[undo requested] File restoration may follow. Re-read affected files before continuing.";
+        try s.commit(s.history.items.len, &.{.{ .role = "user", .content = intent, .source = .undo }}, s.context_tokens + compaction.estimateTokens(&.{.{ .role = "user", .content = intent }}), null);
+        const text = try s.undo_history.undo(&s.tools, s.gpa);
+        errdefer s.gpa.free(text);
+        try s.commit(s.history.items.len, &.{.{ .role = "user", .content = try a.dupe(u8, text), .source = .undo }}, s.context_tokens + compaction.estimateTokens(&.{.{ .role = "user", .content = text }}), null);
+        return text;
+    }
+
     pub fn turn(s: *Session, user_text: []const u8, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
+        try s.undo_history.begin(&s.tools, s.gpa);
+        defer {
+            s.undo_history.finish(&s.tools, s.gpa);
+            if (s.undo_history.notice != null) sink.emit(sink.ctx, .{ .notice = "This Turn has no complete undo record; /undo cannot cross it." }) catch {};
+        }
         if (s.codex_state.socket) |*socket| {
             if (socket.turn_state) |value| s.gpa.free(value);
             socket.turn_state = null;
@@ -223,6 +249,7 @@ pub const Session = struct {
         var target: runner.PollTarget = .{ .session = s, .sink = sink };
         s.tools.usage_sink = .{ .ctx = &target, .emit = runner.PollTarget.usage };
         s.tools.progress.sink = .{ .ctx = &target, .emit = runner.PollTarget.progress };
+        s.tools.notice_sink = .{ .gpa = s.gpa, .ctx = &target, .emit = runner.PollTarget.notice };
         s.tools.background_sink = .{ .ctx = &target, .emit = runner.PollTarget.background };
         const started: std.Io.Clock.Timestamp = .now(s.io, .awake);
         defer {
@@ -237,6 +264,7 @@ pub const Session = struct {
             s.summary.?.usage = s.usage;
             s.tools.usage_sink = null;
             s.tools.progress.sink = null;
+            s.tools.notice_sink = null;
             s.tools.background_sink = null;
             if (!s.tools.background.anyPending(s.io)) s.tools.progress.clear(s.gpa);
         }
@@ -334,6 +362,7 @@ pub const Session = struct {
             const notice = try std.fmt.allocPrint(s.arena.allocator(), "Step limit reached; waiting for background tasks: {s}", .{waited});
             try sink.emit(sink.ctx, .{ .notice = notice });
         }
+        if (waited.len > 0) try sink.modelActivity(.waiting);
         while (s.tools.background.pending(s.io)) {
             if (cancel.load(.acquire)) return error.Canceled;
             try tools.Tools.poll(&s.tools);
@@ -344,9 +373,9 @@ pub const Session = struct {
         }
         if (cancel.load(.acquire)) return error.Canceled;
         detail.* = if (waited.len > 0)
-            try std.fmt.allocPrint(s.gpa, "stopped after {d} steps (waited for background tasks: {s})", .{ max_steps, waited })
+            try std.fmt.allocPrint(s.gpa, "stopped after {d} step{s} (waited for background tasks: {s})", .{ max_steps, if (max_steps == 1) "" else "s", waited })
         else
-            try std.fmt.allocPrint(s.gpa, "stopped after {d} steps", .{max_steps});
+            try std.fmt.allocPrint(s.gpa, "stopped after {d} step{s}", .{ max_steps, if (max_steps == 1) "" else "s" });
         return error.TooManySteps;
     }
 
@@ -442,7 +471,7 @@ pub const Session = struct {
                 effort.Pending.record(&next_effort, result.effort, result.ok);
                 run_ms += result.run_ms orelse 0;
                 try sink.emit(sink.ctx, .{ .usage = s.usage });
-                try pending.append(s.gpa, .{ .role = "tool", .content = result.output, .tool_call_id = call.id, .tool_summary = result.tool_summary });
+                try pending.append(s.gpa, .{ .role = "tool", .content = result.output, .tool_call_id = call.id, .background_id = result.background_id, .run_ok = if (result.background_id == null) result.ok else null, .tool_summary = result.tool_summary });
                 try run_results.append(s.gpa, .{
                     .tool_call_id = call.id,
                     .background_id = result.background_id,
@@ -513,6 +542,7 @@ pub const Session = struct {
                 if (s.cfg.limits.max_steps) |max_steps| {
                     if (s.steps >= max_steps) continue;
                 }
+                try sink.modelActivity(.waiting);
                 while (s.inbox.empty(s.io) and s.tools.background.pending(s.io)) {
                     if (cancel.load(.acquire)) return error.Canceled;
                     try tools.Tools.poll(&s.tools);
@@ -541,12 +571,18 @@ pub const Session = struct {
                 f.mutex.lockUncancelable(f.io);
                 defer f.mutex.unlock(f.io);
                 if (f.first_data_ms.* == null) f.first_data_ms.* = @intCast(@max(f.started.untilNow(f.io).raw.toMilliseconds(), 0));
-                try f.sink.modelActivity(.data);
+            }
+            fn onToolArguments(ctx: *anyopaque) !void {
+                const f: *@This() = @ptrCast(@alignCast(ctx));
+                f.mutex.lockUncancelable(f.io);
+                defer f.mutex.unlock(f.io);
+                try f.sink.modelActivity(.script);
             }
             fn onDelta(ctx: *anyopaque, kind: provider.Kind, text: []const u8) !void {
                 const f: *@This() = @ptrCast(@alignCast(ctx));
                 f.mutex.lockUncancelable(f.io);
                 defer f.mutex.unlock(f.io);
+                if (text.len > 0) try f.sink.modelActivity(.data);
                 try (if (kind == .text) &f.partial.text else &f.partial.reasoning).appendSlice(f.gpa, text);
                 if (!f.buffer_text or kind != .text) try f.sink.emit(f.sink.ctx, .{ .delta = .{ .kind = kind, .text = text } });
             }
@@ -579,7 +615,7 @@ pub const Session = struct {
             }
         };
         var fwd: Forward = .{ .sink = sink, .gpa = s.gpa, .partial = partial, .io = s.io, .started = timing.started, .first_data_ms = first_data_ms, .session = s, .buffer_text = buffer_text, .timing = timing };
-        const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .onFallback = Forward.onFallback, .timing = timing, .codex_state = &s.codex_state };
+        const provider_sink: provider.Sink = .{ .ctx = &fwd, .onDelta = Forward.onDelta, .onData = Forward.onData, .onToolArguments = Forward.onToolArguments, .onFallback = Forward.onFallback, .timing = timing, .codex_state = &s.codex_state };
         if (!s.tools.background.anyPending(s.io))
             return provider.complete(s.gpa, s.arena.allocator(), s.client, request_cfg, s.cache_key, messages, prompt.tools_json, null, provider_sink, cancel, detail, attempts, .{ .ctx = &fwd, .onEvent = Forward.onRetry });
         const Request = struct {

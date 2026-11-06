@@ -8,15 +8,21 @@ const Transcript = @import("transcript.zig").Transcript;
 const Viewport = @import("viewport.zig").Viewport;
 const status = @import("status.zig");
 
-const max_menu_rows = 8;
+pub const Frame = @import("selection/history.zig").Frame;
+
+const max_menu_rows = 11;
 
 pub fn draw(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewport, menu: []const commands.Candidate, menu_sel: usize, s: status.Status, text: *status.Text) void {
+    _ = drawFrame(win, entries, input, scroll, menu, menu_sel, s, text);
+}
+
+pub fn drawFrame(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewport, menu: []const commands.Candidate, menu_sel: usize, s: status.Status, text: *status.Text) ?Frame {
     win.clear();
     win.hideCursor();
-    if (win.height == 0 or win.width == 0) return;
+    if (win.height == 0 or win.width == 0) return null;
 
     const framed = win.height >= 6 and win.width >= 8;
-    const hints: u16 = @intFromBool(framed and win.height >= 8);
+    const hints: u16 = @intFromBool(framed and win.height >= 8 and (entries.len > 0 or input.text().len > 0));
     const borders: u16 = if (framed) 2 else 0;
     const x: u16 = if (framed) 2 else @min(3, win.width - 1);
     const input_w = win.width - x - @as(u16, if (framed) 2 else 0);
@@ -24,11 +30,12 @@ pub fn draw(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewpo
     const saved_scroll = scroll.*;
     var activity_h: u16 = @intFromBool(s.busy != null or s.background_count > 0 or s.notice != null or scroll.top != null or scroll.pending < 0);
     activity_h = @min(activity_h, win.height - input_h - borders - hints);
-    const menu_h: u16 = @intCast(@min(menu.len, max_menu_rows, (win.height - input_h - borders - hints - activity_h) / 2));
+    const menu_layout = menuLayout(menu, menu_sel, @min(max_menu_rows, (win.height - input_h - borders - hints - activity_h) / 2));
+    const menu_h = menu_layout.rows;
     var body_h = win.height - input_h - borders - hints - menu_h - activity_h;
     var body = win.child(.{ .x_off = @min(1, win.width - 1), .width = @max(1, win.width -| 2), .height = body_h });
     var top = scroll.layout(entries, body);
-    const actual_h: u16 = @intFromBool(text.format(s, scroll.top != null).len > 0 and win.height > input_h + borders + hints + menu_h);
+    const actual_h: u16 = @intFromBool(text.formatWidth(s, scroll.top != null, win.width -| 2).len > 0 and win.height > input_h + borders + hints + menu_h);
     if (actual_h != activity_h) {
         activity_h = actual_h;
         body_h = win.height - input_h - borders - hints - menu_h - activity_h;
@@ -39,21 +46,27 @@ pub fn draw(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewpo
     var y: i32 = -@as(i32, top.row);
     for (entries[top.entry..]) |*e| {
         if (y >= body_h) break;
+        e.user_bg = s.user_bg;
         const h = e.height(body);
         if (y + h > 0) _ = e.print(body.child(.{ .y_off = @intCast(y), .height = h }), true);
         y += @as(i32, h) + 1;
     }
 
     if (activity_h > 0) {
-        _ = win.child(.{ .x_off = 1, .y_off = body_h, .height = 1 }).printSegment(.{ .text = text.format(s, scroll.top != null), .style = if (s.busy != null) .{ .fg = .{ .index = 3 } } else .{ .dim = true } }, .{ .wrap = .none });
+        _ = win.child(.{ .x_off = 1, .y_off = body_h, .height = 1 }).printSegment(.{ .text = text.formatWidth(s, scroll.top != null, win.width -| 2), .style = if (s.busy != null) .{ .fg = .{ .index = 3 } } else .{ .dim = true } }, .{ .wrap = .none });
     }
-    const first = if (menu_sel >= menu_h) menu_sel + 1 - menu_h else 0;
-    for (0..menu_h) |i| {
-        const c = menu[first + i];
-        const chosen = first + i == menu_sel;
-        const row = win.child(.{ .x_off = 1, .y_off = @intCast(body_h + activity_h + i), .height = 1 });
-        _ = row.printSegment(.{ .text = c.label, .style = if (chosen) .{ .reverse = true, .bold = true } else .{ .bold = true } }, .{ .wrap = .none });
-        if (win.width > 16) _ = row.child(.{ .x_off = 14 }).printSegment(.{ .text = c.detail, .style = .{ .dim = true } }, .{ .wrap = .none });
+    var menu_y = body_h + activity_h;
+    for (menu_layout.first..menu_layout.end) |i| {
+        const c = menu[i];
+        if (groupHeader(menu, i, menu_layout.first)) |group| {
+            _ = win.child(.{ .x_off = 2, .y_off = menu_y, .height = 1 }).printSegment(.{ .text = commands.groupName(group), .style = .{ .bold = true, .dim = true } }, .{ .wrap = .none });
+            menu_y += 1;
+        }
+        const chosen = i == menu_sel;
+        const row = win.child(.{ .x_off = 2, .y_off = menu_y, .height = 1 });
+        printFitted(row.child(.{ .width = @min(row.width, 12) }), c.label, if (chosen) .{ .reverse = true, .bold = true } else .{ .bold = true });
+        if (row.width > 14) printFitted(row.child(.{ .x_off = 14 }), c.detail, .{ .dim = true });
+        menu_y += 1;
     }
 
     const input_y = body_h + activity_h + menu_h;
@@ -70,7 +83,38 @@ pub fn draw(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewpo
         _ = win.child(.{ .x_off = 1, .y_off = input_y, .height = 1 }).printSegment(.{ .text = "› ", .style = .{ .fg = .{ .index = 4 } } }, .{ .wrap = .none });
     }
     input.draw(win.child(.{ .x_off = x, .y_off = input_y + @as(u16, if (framed) 1 else 0), .width = input_w, .height = input_h }));
-    if (hints > 0) _ = win.child(.{ .x_off = 2, .y_off = win.height - 1, .height = 1 }).printSegment(.{ .text = "⏎ send · ⇧⏎ newline · / commands · ctrl+o expand", .style = .{ .dim = true } }, .{ .wrap = .none });
+    if (hints > 0) _ = win.child(.{ .x_off = 2, .y_off = win.height - 1, .height = 1 }).printSegment(.{ .text = if (win.width < 70) "Enter send · / commands · Ctrl+O details" else "Enter send · Shift+Enter newline · / commands · Ctrl+O details", .style = .{ .dim = true } }, .{ .wrap = .none });
+    return .{ .top = top, .window = body };
+}
+
+const MenuLayout = struct { first: usize = 0, end: usize = 0, rows: u16 = 0 };
+
+fn groupHeader(menu: []const commands.Candidate, index: usize, first: usize) ?commands.Group {
+    const group = menu[index].group() orelse return null;
+    return if (index == first or menu[index - 1].group() != group) group else null;
+}
+
+fn menuLayout(menu: []const commands.Candidate, selected: usize, limit: u16) MenuLayout {
+    if (menu.len == 0 or limit == 0) return .{};
+    var first: usize = 0;
+    while (first < selected) : (first += 1) {
+        var needed: usize = 0;
+        for (first..selected + 1) |i| needed += 1 + @as(usize, @intFromBool(groupHeader(menu, i, first) != null));
+        if (needed <= limit) break;
+    }
+    var layout: MenuLayout = .{ .first = first, .end = first };
+    while (layout.end < menu.len) {
+        const rows: u16 = 1 + @as(u16, @intFromBool(groupHeader(menu, layout.end, first) != null));
+        if (layout.rows + rows > limit) break;
+        layout.rows += rows;
+        layout.end += 1;
+    }
+    return layout;
+}
+
+fn printFitted(win: vaxis.Window, text: []const u8, style: vaxis.Style) void {
+    const fitted = @import("format.zig").fit(text, win.width);
+    _ = win.print(&.{ .{ .text = fitted.text, .style = style }, .{ .text = fitted.suffix, .style = style } }, .{ .wrap = .none });
 }
 
 fn put(win: vaxis.Window, x: u16, y: u16, glyph: []const u8) void {
@@ -203,8 +247,8 @@ test "layout snapshots: normal, short, tiny, narrow, menu, busy and history" {
         if (c.h >= 6) {
             try testing.expectEqualStrings("╰", screen.readCell(0, if (c.h >= 8) c.h - 2 else c.h - 1).?.char.grapheme);
             try testing.expectEqualStrings("╯", screen.readCell(c.w - 1, if (c.h >= 8) c.h - 2 else c.h - 1).?.char.grapheme);
-        } else try testing.expect(std.mem.indexOf(u8, image, "› Message nib") != null);
-        if (c.busy) try testing.expect(std.mem.indexOf(u8, image, "thinking 1s · step 1 · esc to cancel") != null);
+        } else try testing.expect(std.mem.indexOf(u8, image, "› Ask about this project") != null);
+        if (c.busy) try testing.expect(std.mem.indexOf(u8, image, "Waiting for model · turn <1s · Esc to cancel") != null);
         if (c.history) try testing.expect(std.mem.indexOf(u8, image, "↑ history · PgDn to return") != null);
         if (c.notice) try testing.expect(std.mem.indexOf(u8, image, "copied 3 chars") != null);
         if (c.menu) try testing.expect(std.mem.indexOf(u8, image, "/help") != null);
@@ -225,15 +269,15 @@ test "selection copies displayed blocks at the framed input coordinates" {
     var viewport: Viewport = .{};
     var text: status.Text = .{};
     draw(win, &.{}, &input, &viewport, &.{}, 0, .{ .cfg = mock_cfg }, &text);
-    try testing.expectEqual(@as(u16, 25), screen.cursor.col);
+    try testing.expectEqual(@as(u16, 29), screen.cursor.col);
     try testing.expectEqual(@as(u16, 9), screen.cursor.row);
     var selection: Selection = .{};
-    _ = selection.mouse(.{ .col = 24, .row = 9, .type = .press, .button = .left, .mods = .{} }, &screen);
+    _ = selection.mouse(.{ .col = 28, .row = 9, .type = .press, .button = .left, .mods = .{} }, &screen);
     _ = selection.mouse(.{ .col = 2, .row = 9, .type = .drag, .button = .left, .mods = .{} }, &screen);
     try testing.expect(selection.mouse(.{ .col = 2, .row = 9, .type = .release, .button = .left, .mods = .{} }, &screen));
     const copied = try selection.text(gpa, &screen);
     defer gpa.free(copied);
-    try testing.expectEqualStrings("你[Pasted #1 · 6 lines]", copied);
+    try testing.expectEqualStrings("你[Pasted #1 · 6 lines · 1]", copied);
     selection.highlight(&screen);
     try testing.expect(screen.readCell(2, 9).?.style.reverse);
     try testing.expect(!screen.readCell(0, 9).?.style.reverse);
@@ -253,4 +297,31 @@ test "minimal terminal dimensions retain an input cursor" {
         try testing.expect(screen.cursor_vis);
         try testing.expect(screen.cursor.col < w and screen.cursor.row < h);
     };
+}
+
+test "grouped menus keep the selected command visible within their row budget" {
+    var buf: [16]commands.Candidate = undefined;
+    const menu = commands.candidates("/", &.{}, &.{}, &buf);
+    for (2..12) |limit| for (0..menu.len) |selected| {
+        const layout = menuLayout(menu, selected, @intCast(limit));
+        try testing.expect(layout.rows <= limit);
+        try testing.expect(layout.first <= selected and layout.end > selected);
+    };
+}
+
+test "empty screen has one guidance line and no zero statistics" {
+    const a = testing.allocator;
+    var screen = try vaxis.Screen.init(a, .{ .cols = 60, .rows = 12, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 60, .height = 12, .screen = &screen };
+    var input: Editor = .{};
+    defer input.deinit(a);
+    var scroll: Viewport = .{};
+    var text: status.Text = .{};
+    draw(win, &.{}, &input, &scroll, &.{}, 0, .{ .cfg = mock_cfg }, &text);
+    const image = try snapshot(a, &screen);
+    defer a.free(image);
+    try testing.expect(std.mem.indexOf(u8, image, "Ask about this project · / for commands") != null);
+    try testing.expect(std.mem.indexOf(u8, image, "Enter send") == null);
+    try testing.expect(std.mem.indexOf(u8, image, "0%") == null);
 }

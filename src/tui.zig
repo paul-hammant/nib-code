@@ -27,13 +27,16 @@ pub const Event = union(enum) {
     paste_start,
     paste_end,
     mouse: vaxis.Mouse,
+    color_report: vaxis.Color.Report,
+    color_scheme: vaxis.Color.Scheme,
     tick,
+    tool_activity: []const u8,
     model_activity: struct { state: ModelActivity, at: std.Io.Clock.Timestamp },
     /// Slices are owned by the receiver.
     step: struct { n: u32, effort: []u8, source: provider.EffortSource },
     delta: struct { kind: provider.Kind, text: []u8, step: u32 },
     run_start: struct { code: []u8, step: u32 },
-    run_end: struct { ok: bool, output: []u8, changes: ChangeText, tool_summary: ?ToolSummary = null },
+    run_end: struct { background_id: ?[]const u8 = null, ok: bool, output: []u8, changes: ChangeText, tool_summary: ?ToolSummary = null },
     retry: []u8,
     notice: []u8,
     user_inserted: u64,
@@ -41,15 +44,53 @@ pub const Event = union(enum) {
     turn_end: TurnSummary,
     usage: struct { tokens: provider.Usage, context: u64, steps: u32 },
     progress: @import("session/events.zig").Progress,
-    background: @FieldType(SessionEvent, "background"),
-    failed: []u8,
+    background: struct {
+        id: []const u8,
+        kind: @FieldType(@FieldType(SessionEvent, "background"), "kind"),
+        state: @FieldType(@FieldType(SessionEvent, "background"), "state"),
+        ok: ?bool = null,
+        result: ?[]const u8 = null,
+        changes: ChangeText = .{},
+        tool_summary: ?ToolSummary = null,
+    },
+    failed: struct { message: []u8, reason: @import("tools/changes.zig").Recovery.Reason },
     /// One outcome line from automatic issue filing, owned by the receiver.
     issue: []u8,
     issues_done,
+
+    pub fn deinit(event: Event, gpa: std.mem.Allocator) void {
+        switch (event) {
+            .step => |s| gpa.free(s.effort),
+            .delta => |d| gpa.free(d.text),
+            .run_start => |r| gpa.free(r.code),
+            .run_end => |r| {
+                if (r.background_id) |id| gpa.free(id);
+                gpa.free(r.output);
+                var changes = r.changes;
+                changes.deinit(gpa);
+                if (r.tool_summary) |summary| summary.deinit(gpa);
+            },
+            .retry, .notice, .issue => |text| gpa.free(text),
+            .failed => |failure| gpa.free(failure.message),
+            .progress => |p| {
+                var owned = p;
+                owned.deinit(gpa);
+            },
+            .background => |b| {
+                gpa.free(b.id);
+                if (b.result) |result| gpa.free(result);
+                var changes = b.changes;
+                changes.deinit(gpa);
+                if (b.tool_summary) |summary| summary.deinit(gpa);
+            },
+            .key_press, .winsize, .paste_start, .paste_end, .mouse, .color_report, .color_scheme, .tick, .tool_activity, .model_activity, .user_inserted, .done, .turn_end, .usage, .issues_done => {},
+        }
+    }
 };
 
 /// `session` may already hold history (a resumed Session); it is shown first.
 pub fn run(init: std.process.Init, session: *Session) !void {
+    session.tools.recovery.enabled = true;
     const io = init.io;
     const gpa = init.gpa;
 
@@ -72,6 +113,15 @@ pub fn run(init: std.process.Init, session: *Session) !void {
     // Selection needs cell coordinates; some terminals claim SGR pixel mode yet report cells.
     vx.caps.sgr_pixels = false;
     try vx.setMouseMode(w, true);
+    try vx.queryColor(w, .bg);
+    if (vx.caps.color_scheme_updates) try vx.subscribeToColorSchemeUpdates(w);
+
+    var ticker: Ticker = .{ .io = io, .loop = &loop };
+    const ticker_thread = try std.Thread.spawn(.{}, Ticker.work, .{&ticker});
+    defer {
+        ticker.stop.store(true, .release);
+        ticker_thread.join();
+    }
 
     var app: App = .{
         .gpa = gpa,
@@ -87,16 +137,10 @@ pub fn run(init: std.process.Init, session: *Session) !void {
         .context = session.context_tokens,
     };
     defer app.deinit();
-    var ticker: Ticker = .{ .io = io, .loop = &loop };
-    const ticker_thread = try std.Thread.spawn(.{}, Ticker.work, .{&ticker});
-    defer {
-        ticker.stop.store(true, .release);
-        ticker_thread.join();
-    }
 
     try app.transcript.addHistory(gpa, session.history.items);
     for (session.history.items) |m| {
-        if (std.mem.eql(u8, m.role, "user")) try app.input.remember(gpa, m.content orelse "");
+        if (m.source != .undo and std.mem.eql(u8, m.role, "user")) try app.input.remember(gpa, m.content orelse "");
     }
     if (app.cfg.missingKey()) try app.transcript.add(gpa, .err, "no API key: set DEEPSEEK_API_KEY (or NIB_API_KEY). /js <code> still works.");
 
@@ -116,6 +160,8 @@ pub const App = struct {
     loop: *vaxis.Loop(Event),
     environ: *const std.process.Environ.Map,
     selection: selection.Selection = .{},
+    body: ?view.Frame = null,
+    user_bg: vaxis.Color = .default,
     /// Shown on the status line until the next key or click; not part of the transcript.
     notice: ?[]const u8 = null,
     notice_buf: [256]u8 = undefined,
@@ -132,6 +178,10 @@ pub const App = struct {
     scroll: Viewport = .{},
     menu: Menu,
     status_text: status.Text = .{},
+    reflect_help: [512]u8 = undefined,
+    activity_detail: [256]u8 = undefined,
+    retry_detail: [256]u8 = undefined,
+    retry_len: usize = 0,
     activity: status.Activity,
     usage: provider.Usage = .{},
     steps: u32 = 0,
@@ -139,12 +189,16 @@ pub const App = struct {
     turn: ?*Turn = null,
     // turn_end precedes done/failed; append only after their terminal content.
     pending_bill: ?TurnSummary = null,
+    last_summary: ?TurnSummary = null,
+    turn_runs: usize = 0,
 
     const command = commands.execute;
     const saveReflection = reflect.saveReflection;
     const stopReflecting = reflect.stopReflecting;
 
     fn deinit(app: *App) void {
+        // Close before joining producers: a full queue must not block shutdown.
+        app.loop.queue.close(error.Closed);
         if (app.turn) |t| {
             t.cancel.store(true, .release);
             t.finish();
@@ -152,6 +206,9 @@ pub const App = struct {
         app.stopReflecting();
         app.clearStepEffort();
         if (app.issues) |job| job.finish();
+        app.loop.queue.mutex.lockUncancelable(app.io);
+        while (app.loop.queue.drain()) |event| event.deinit(app.gpa);
+        app.loop.queue.mutex.unlock(app.io);
         app.menu.deinit();
         app.transcript.deinit(app.gpa);
         app.input.deinit(app.gpa);
@@ -164,8 +221,10 @@ pub const App = struct {
     }
 
     /// False to quit.
-    fn handle(app: *App, event: Event) !bool {
+    fn handle(app: *App, value: Event) !bool {
         const gpa = app.gpa;
+        var event = value;
+        defer event.deinit(gpa);
         switch (event) {
             .key_press => |k| return app.onKey(k),
             .paste_start => {
@@ -181,12 +240,12 @@ pub const App = struct {
             .mouse => |m| {
                 if (m.type == .press) app.notice = null;
                 if (m.button == .wheel_up or m.button == .wheel_down) {
-                    if (m.type == .press and !app.selection.active) {
-                        app.selection.clear();
+                    if (m.type == .press) {
+                        if (!app.selection.active or app.selection.history == null) app.selection.clear();
                         app.scroll.pending += if (m.button == .wheel_up) @as(i64, -3) else 3;
                     }
-                } else if (app.selection.mouse(m, &app.vx.screen)) {
-                    const text = try app.selection.text(gpa, &app.vx.screen);
+                } else if (app.selection.mouseInHistory(m, &app.vx.screen, app.body, app.transcript.entries.items)) {
+                    const text = try app.selection.textInHistory(gpa, &app.vx.screen, app.body, app.transcript.entries.items);
                     defer gpa.free(text);
                     if (std.mem.trim(u8, text, " \n").len == 0) {
                         app.selection.clear();
@@ -195,16 +254,32 @@ pub const App = struct {
                         app.notice = std.fmt.bufPrint(&app.notice_buf, "copied {d} chars", .{std.unicode.utf8CountCodepoints(text) catch text.len}) catch null;
                     }
                 }
+                if (app.selection.active and app.selection.history != null) {
+                    if (app.body) |body| app.scroll.top = body.top;
+                }
             },
             .tick => if (app.turn == null) {
                 app.session.tools.progress.sink = .{ .ctx = app, .emit = idleProgress };
                 defer app.session.tools.progress.sink = null;
                 try app.session.tools.progress.drain(app.io);
             },
+            .tool_activity => |name| {
+                app.activity.tool = name;
+                app.activity.progress(.now(app.io, .awake));
+            },
             .model_activity => |activity| {
-                if (activity.state == .started and app.activity.phase != .compacting) app.activity.set(app.io, .thinking);
+                if (activity.state == .started) {
+                    app.transcript.beginAttempt();
+                    if (app.activity.phase != .compacting and app.activity.phase != .retrying) app.activity.set(app.io, .thinking);
+                }
+                if (activity.state == .script) app.activity.set(app.io, .scripting);
+                if (activity.state == .waiting) app.activity.set(app.io, .waiting);
                 app.activity.modelActivity(activity.state, activity.at);
             },
+            .color_report => |color| {
+                if (color.kind == .bg) app.user_bg = userBackground(color.value);
+            },
+            .color_scheme => try app.vx.queryColor(app.w, .bg),
             .winsize => |ws| {
                 app.selection.clear();
                 try app.vx.resize(gpa, app.w, ws);
@@ -212,30 +287,36 @@ pub const App = struct {
             .step => |s| {
                 app.clearStepEffort();
                 app.step_effort = .{ .effort = s.effort, .source = s.source };
+                event.step.effort = &.{};
                 app.live_steps = s.n;
             },
             .delta => |d| {
-                defer gpa.free(d.text);
                 app.live_steps = d.step;
-                if (app.activity.phase != .compacting) app.activity.set(app.io, if (d.kind == .reasoning) .thinking else .writing);
+                if (d.text.len > 0) app.activity.progress(.now(app.io, .awake));
+                if (app.activity.phase != .compacting) app.activity.set(app.io, .writing);
                 try app.transcript.appendDelta(gpa, d.kind, d.text);
             },
             .run_start => |r| {
-                defer gpa.free(r.code);
                 app.live_steps = r.step;
+                app.turn_runs += 1;
+                app.activity.tool = "";
                 app.activity.set(app.io, .running);
                 try app.transcript.startRunWithEffort(gpa, r.code, app.step_effort);
             },
             .run_end => |r| {
-                defer gpa.free(r.output);
-                defer if (r.tool_summary) |summary| summary.deinit(gpa);
                 const elapsed = app.activity.label(app.io).ms;
                 app.activity.set(app.io, .thinking);
+                if (r.background_id) |id| try app.transcript.backgroundRun(gpa, id);
+                event.run_end.changes = .{};
                 try app.transcript.endRunWithSummary(gpa, r.ok, r.output, elapsed, r.changes, r.tool_summary);
             },
-            .retry, .notice => |msg| {
-                defer gpa.free(msg);
-                if (std.mem.startsWith(u8, msg, "retry")) app.activity.set(app.io, .retrying);
+            .retry => |msg| {
+                app.transcript.discardAttempt(gpa);
+                app.activity.set(app.io, .retrying);
+                const line = std.fmt.bufPrint(&app.retry_detail, "{s}", .{msg}) catch app.retry_detail[0..0];
+                app.retry_len = line.len;
+            },
+            .notice => |msg| {
                 try app.transcript.add(gpa, .info, msg);
             },
             .usage => |u| {
@@ -244,13 +325,11 @@ pub const App = struct {
                 app.steps = u.steps;
             },
             .progress => |p| {
-                var owned = p;
-                defer owned.deinit(gpa);
+                if (app.transcript.progressChanged(p)) app.activity.progress(.now(app.io, .awake));
                 try app.transcript.progress(gpa, p);
             },
             .background => |b| {
-                defer gpa.free(b.id);
-                defer if (b.result) |result| gpa.free(result);
+                if (b.kind == .run and b.tool_summary != null) try app.transcript.updateBackgroundRun(gpa, b.id, b.result orelse "", b.changes, b.tool_summary.?);
                 switch (b.state) {
                     .started => app.background_count += 1,
                     .finished => {
@@ -270,23 +349,27 @@ pub const App = struct {
                 try app.finishTurn();
                 try app.saveReflection();
                 try app.appendBill();
+                if (canceled) try app.recoveryHint(.canceled);
                 try app.finishQueued(!canceled);
             },
             .issue => |msg| {
-                defer gpa.free(msg);
                 try app.transcript.add(gpa, .info, msg);
             },
             .issues_done => {
                 if (app.issues) |job| job.finish();
                 app.issues = null;
             },
-            .failed => |msg| {
-                defer gpa.free(msg);
+            .failed => |failure| {
+                const msg = failure.message;
                 app.stopReflecting();
                 const canceled = app.turn.?.cancel.load(.acquire);
-                try app.transcript.add(gpa, if (canceled) .info else .err, if (canceled) "canceled" else msg);
+                if (!canceled) {
+                    app.transcript.discardAttempt(gpa);
+                    try app.transcript.failure(gpa, msg, failure.reason);
+                }
                 try app.finishTurn();
                 try app.appendBill();
+                try app.recoveryHint(failure.reason);
                 try app.finishQueued(false);
             },
         }
@@ -295,6 +378,7 @@ pub const App = struct {
 
     fn onKey(app: *App, k: vaxis.Key) !bool {
         app.notice = null;
+        app.selection.clear();
         const gpa = app.gpa;
         if (app.pasting) {
             if (k.text) |t| {
@@ -386,6 +470,7 @@ pub const App = struct {
         try app.transcript.add(app.gpa, .user, text);
         app.turn = try Turn.spawn(app.gpa, app.session, app.loop, text, false);
         app.live_steps = 0;
+        app.turn_runs = 0;
         app.activity = .start(app.io, .thinking);
     }
 
@@ -395,10 +480,20 @@ pub const App = struct {
         try app.transcript.add(app.gpa, kind, message);
     }
 
+    fn recoveryHint(app: *App, reason: @import("tools/changes.zig").Recovery.Reason) !void {
+        const cwd = try std.process.currentPathAlloc(app.io, app.gpa);
+        defer app.gpa.free(cwd);
+        const hint = try app.session.tools.recovery.hint(app.gpa, app.io, reason, cwd);
+        defer app.gpa.free(hint);
+        try app.transcript.add(app.gpa, .info, hint);
+    }
+
     fn appendBill(app: *App) !void {
         const summary = app.pending_bill orelse return;
         var text: bill.Text = .{};
-        try app.transcript.add(app.gpa, .bill, text.format(summary, std.math.maxInt(u16)));
+        const footer = text.format(summary, app.turn_runs, std.math.maxInt(u16));
+        if (footer.len > 0) try app.transcript.add(app.gpa, .bill, footer);
+        app.last_summary = summary;
         app.pending_bill = null;
     }
 
@@ -411,6 +506,12 @@ pub const App = struct {
         app.clearStepEffort();
         app.turn.?.finish();
         app.turn = null;
+        while (app.session.tools.background.takeStop(app.io)) |id| {
+            defer app.gpa.free(id);
+            const notice = try @import("tools/stop.zig").userStop(&app.session.tools, app.gpa, id);
+            defer app.gpa.free(notice);
+            try app.transcript.add(app.gpa, .info, notice);
+        }
         if (!app.session.tools.background.anyPending(app.io)) {
             app.background_count = 0;
             try app.transcript.clearBackgroundProgress(app.gpa);
@@ -429,6 +530,7 @@ pub const App = struct {
             app.gpa.free(text);
             return;
         }
+        app.selection.clear();
         app.transcript.removeQueued(app.gpa);
         if (send) {
             try app.startTurn(text);
@@ -440,28 +542,65 @@ pub const App = struct {
             defer app.gpa.free(restored);
             try app.input.replace(app.gpa, restored);
             app.menu.inputChanged(app.input.text());
+            try app.report(.info, "{d} queued message{s} returned to input", .{ batch.items.items.len, if (batch.items.items.len == 1) "" else "s" });
         }
+    }
+
+    fn activityDetail(app: *App) []const u8 {
+        if (app.activity.phase == .retrying) return app.retry_detail[0..app.retry_len];
+        if (app.activity.phase == .running) return app.transcript.activityDetail(&app.activity_detail, app.activity.tool);
+        if (app.activity.phase == .waiting) {
+            const task = app.session.tools.background.waitingTask(app.io) orelse return "";
+            var elapsed: [64]u8 = undefined;
+            return std.fmt.bufPrint(&app.activity_detail, "{s} · {s}", .{ task.id, @import("tui/format.zig").duration(&elapsed, task.elapsed_ms) }) catch "";
+        }
+        return "";
     }
 
     fn render(app: *App) !void {
         try app.menu.load(app.io, app.input.text(), app.session);
         const menu = app.menu.items(app.input.text());
-        if (app.scroll.pending != 0) app.selection.clear();
-        view.draw(app.vx.window(), app.transcript.entries.items, &app.input, &app.scroll, menu, @min(app.menu.sel, menu.len -| 1), .{
+        for (menu) |*candidate| if (candidate.command == .reflect and candidate.value == null) {
+            candidate.detail = commands.reflectHelp(&app.reflect_help, reflect.issueRepo(app));
+        };
+        if (app.scroll.pending != 0 and (!app.selection.active or app.selection.history == null)) app.selection.clear();
+        app.body = view.drawFrame(app.vx.window(), app.transcript.entries.items, &app.input, &app.scroll, menu, @min(app.menu.sel, menu.len -| 1), .{
             .cfg = app.cfg,
+            .user_bg = app.user_bg,
             .usage = app.usage,
             .steps = app.steps,
-            .current_step = @max(1, app.live_steps),
             .background_count = app.background_count,
             .context = app.context,
             .busy = if (app.turn != null) app.activity.label(app.io) else null,
             .notice = app.notice,
+            .detail = app.activityDetail(),
         }, &app.status_text);
-        app.selection.highlight(&app.vx.screen);
+        if (app.selection.active and app.selection.history != null) {
+            if (app.body) |body| app.scroll.top = body.top;
+        }
+        app.selection.updateHistory(app.body, app.transcript.entries.items);
+        app.selection.highlightHistory(&app.vx.screen, app.body, app.transcript.entries.items);
         try app.vx.render(app.w);
         try app.w.flush();
     }
 };
+
+fn userBackground(bg: [3]u8) vaxis.Color {
+    const light = @as(u32, bg[0]) * 299 + @as(u32, bg[1]) * 587 + @as(u32, bg[2]) * 114 > 128_000;
+    const accent = if (light) [3]u8{ 40, 80, 150 } else [3]u8{ 120, 160, 230 };
+    var rgb: [3]u8 = undefined;
+    for (bg, accent, 0..) |base, tint, i| rgb[i] = @intCast((@as(u16, base) * 7 + tint) / 8);
+    return .{ .rgb = rgb };
+}
+
+test "user message tint preserves dark and light terminal contrast" {
+    const dark = userBackground(.{ 0, 0, 0 }).rgb;
+    const light = userBackground(.{ 255, 255, 255 }).rgb;
+    try std.testing.expect(dark[0] < 32 and dark[1] < 32 and dark[2] < 32);
+    try std.testing.expect(light[0] > 220 and light[1] > 220 and light[2] > 220);
+    try std.testing.expect(dark[2] > dark[0]);
+    try std.testing.expect(light[2] > light[0]);
+}
 
 fn isNewline(key: vaxis.Key, pasting: bool) bool {
     const enter = vaxis.Key.enter;
@@ -469,46 +608,36 @@ fn isNewline(key: vaxis.Key, pasting: bool) bool {
         key.matches(enter, .{ .alt = true }) or key.matches('j', .{ .ctrl = true });
 }
 
-test "wheel does not interrupt a selection and resumes scrolling after release" {
+test "wheel scrolls during history selection and ignores non-press wheel events" {
     const gpa = std.testing.allocator;
     var vx: vaxis.Vaxis = undefined;
     vx.screen = try vaxis.Screen.init(gpa, .{ .cols = 8, .rows = 3, .x_pixel = 0, .y_pixel = 0 });
     defer vx.screen.deinit(gpa);
-    for (0..3) |col| {
-        vx.screen.writeCell(@intCast(col), 0, .{ .char = .{ .grapheme = "abc"[col .. col + 1], .width = 1 } });
-    }
     var app: App = undefined;
     app.gpa = gpa;
     app.vx = &vx;
     app.selection = .{};
     app.scroll = .{};
     app.notice = null;
+    app.transcript = .{};
+    defer app.transcript.deinit(gpa);
+    try app.transcript.add(gpa, .info, "one\ntwo\nthree\nfour");
+    app.body = .{ .top = .{}, .window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 8, .height = 3, .screen = &vx.screen } };
     for ([_]vaxis.Mouse.Button{ .wheel_up, .wheel_down }) |button| {
         _ = try app.handle(.{ .mouse = .{ .col = 0, .row = 0, .button = .left, .mods = .{}, .type = .press } });
         const pressed = app.selection;
-        _ = try app.handle(.{ .mouse = .{ .col = 0, .row = 0, .button = button, .mods = .{}, .type = .press } });
+        _ = try app.handle(.{ .mouse = .{ .col = 2, .row = 0, .button = button, .mods = .{}, .type = .press } });
         try std.testing.expectEqualDeep(pressed, app.selection);
-        try std.testing.expectEqual(@as(i64, 0), app.scroll.pending);
-        _ = try app.handle(.{ .mouse = .{ .col = 2, .row = 0, .button = .left, .mods = .{}, .type = .drag } });
-        const dragged = app.selection;
-        for ([_]vaxis.Mouse.Type{ .press, .release, .drag, .motion }) |kind| {
-            _ = try app.handle(.{ .mouse = .{ .col = 7, .row = 2, .button = button, .mods = .{}, .type = kind } });
-            try std.testing.expectEqualDeep(dragged, app.selection);
-            try std.testing.expectEqual(@as(i64, 0), app.scroll.pending);
-        }
-        try std.testing.expect(app.selection.mouse(.{ .col = 2, .row = 0, .button = .left, .mods = .{}, .type = .release }, &vx.screen));
-        const text = try app.selection.text(gpa, &vx.screen);
-        defer gpa.free(text);
-        try std.testing.expectEqualStrings("abc", text);
-        const released = app.selection;
+        try std.testing.expectEqual(@as(i64, if (button == .wheel_up) -3 else 3), app.scroll.pending);
+        app.scroll.pending = 0;
         for ([_]vaxis.Mouse.Type{ .release, .drag, .motion }) |kind| {
             _ = try app.handle(.{ .mouse = .{ .col = 7, .row = 2, .button = button, .mods = .{}, .type = kind } });
-            try std.testing.expectEqualDeep(released, app.selection);
+            try std.testing.expectEqualDeep(pressed, app.selection);
             try std.testing.expectEqual(@as(i64, 0), app.scroll.pending);
         }
-        _ = try app.handle(.{ .mouse = .{ .col = 7, .row = 2, .button = button, .mods = .{}, .type = .press } });
+        app.selection.active = false;
+        _ = try app.handle(.{ .mouse = .{ .col = 2, .row = 0, .button = button, .mods = .{}, .type = .press } });
         try std.testing.expectEqualDeep(selection.Selection{}, app.selection);
-        try std.testing.expectEqual(@as(i64, if (button == .wheel_up) -3 else 3), app.scroll.pending);
         app.scroll.pending = 0;
     }
 }
@@ -532,7 +661,7 @@ test "bracketed paste buffers newline and slash keys without executing them" {
     }
     try std.testing.expectEqualStrings("", app.input.text());
     _ = try app.handle(.paste_end);
-    try std.testing.expectEqualStrings("[Pasted #1 · 6 lines]", app.input.text());
+    try std.testing.expectEqualStrings("[Pasted #1 · 6 lines · /help]", app.input.text());
     const expanded = try app.input.expanded(gpa);
     defer gpa.free(expanded);
     try std.testing.expectEqualStrings("/help\nx\nx\nx\nx\nx", expanded);
@@ -616,6 +745,7 @@ test "turn_end forwards by value and defers bills until terminal content" {
     app.transcript = .{};
     defer app.transcript.deinit(t.allocator);
     app.pending_bill = null;
+    app.turn_runs = 0;
     inline for (.{ .completed, .canceled, .failed }) |status_value| {
         const summary: TurnSummary = .{ .status = status_value, .steps = 2, .timing = .{ .wall_ms = 1000 } };
         try app.transcript.add(t.allocator, .assistant, "answer");
@@ -677,7 +807,99 @@ test "background events own their payload and maintain running count" {
     _ = try app.handle((try loop.tryEvent()).?);
     try t.expectEqual(@as(usize, 0), app.background_count);
     try t.expectEqual(EntryKind.background, app.transcript.entries.items[0].kind);
-    try t.expectEqualStrings("a1 agent · ok · done", app.transcript.entries.items[0].label.items);
+    try t.expectEqualStrings("a1 agent · completed", app.transcript.entries.items[0].label.items);
+}
+
+test "quit drains owned events and closed queues reject Turn payloads without leaks" {
+    const t = std.testing;
+    for ([_]bool{ false, true }) |closed| {
+        var loop: vaxis.Loop(Event) = .{ .io = t.io, .tty = undefined, .vaxis = undefined, .queue = .init(t.io) };
+        var vx: vaxis.Vaxis = undefined;
+        vx.screen = try vaxis.Screen.init(t.allocator, .{ .cols = 80, .rows = 24, .x_pixel = 0, .y_pixel = 0 });
+        defer vx.screen.deinit(t.allocator);
+        var app: App = .{
+            .gpa = t.allocator,
+            .io = t.io,
+            .session = undefined,
+            .cfg = undefined,
+            .vx = &vx,
+            .w = undefined,
+            .loop = &loop,
+            .environ = undefined,
+            .menu = .init(t.allocator),
+            .activity = .start(t.io, .thinking),
+        };
+        if (closed) loop.queue.close(error.Closed) else try loop.postEvent(.{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } });
+        var session: Session = undefined;
+        session.steps = 0;
+        var turn: Turn = .{ .gpa = t.allocator, .session = &session, .loop = &loop, .text = "" };
+        const changes: []const @import("tools/diff.zig").Change = &.{.{ .path = "changed.txt", .added = 1, .removed = 0, .diff = "+new\n" }};
+        const events = [_]SessionEvent{
+            .{ .step = .{ .n = 1, .effort = "high", .source = .model } },
+            .{ .delta = .{ .kind = .text, .text = "answer" } },
+            .{ .run_start = "tools.write({})" },
+            .{ .run_end = .{ .background_id = "r1", .ok = true, .output = "registered", .changes = changes, .tool_summary = .{ .counts = &.{.{ .name = "write", .count = 1 }} } } },
+            .{ .retry = .{ .attempt = 1, .delay_ms = 0, .reason = "retry" } },
+            .{ .notice = "notice" },
+            .{ .progress = .{ .id = "b1", .prompt = "work", .tools = &.{"bash"}, .files = &.{"changed.txt"}, .superseded_by = "b2" } },
+            .{ .background = .{ .id = "r1", .kind = .run, .state = .finished, .ok = false, .completion = .{
+                .step = 1,
+                .run_index = 0,
+                .ok = false,
+                .output = "stopped",
+                .run_ms = 1,
+                .tool_bytes = 0,
+                .calls = &.{.{ .name = "bash", .start_ms = 0, .end_ms = 1, .ok = false, .run_index = 0 }},
+                .calls_omitted = 0,
+                .changes = changes,
+            } } },
+        };
+        for (events) |event| {
+            if (closed) try t.expectError(error.Closed, Turn.emit(&turn, event)) else try Turn.emit(&turn, event);
+        }
+        if (!closed) {
+            try loop.postEvent(.{ .failed = .{ .message = try t.allocator.dupe(u8, "canceled"), .reason = .canceled } });
+            try loop.postEvent(.{ .issue = try t.allocator.dupe(u8, "issue outcome") });
+            try t.expect(!try app.handle(try loop.nextEvent()));
+        }
+        app.deinit();
+        try t.expect(try loop.queue.isEmpty());
+    }
+}
+
+test "shutdown closes a full queue before joining the canceled Turn" {
+    const t = std.testing;
+    var loop: vaxis.Loop(Event) = .{ .io = t.io, .tty = undefined, .vaxis = undefined, .queue = .init(t.io) };
+    while (try loop.tryPostEvent(.tick)) {}
+    var app: App = .{
+        .gpa = t.allocator,
+        .io = t.io,
+        .session = undefined,
+        .cfg = undefined,
+        .vx = undefined,
+        .w = undefined,
+        .loop = &loop,
+        .environ = undefined,
+        .menu = .init(t.allocator),
+        .activity = .start(t.io, .thinking),
+    };
+    app.turn = blk: {
+        const turn = try t.allocator.create(Turn);
+        errdefer t.allocator.destroy(turn);
+        const text = try t.allocator.dupe(u8, "initial");
+        errdefer t.allocator.free(text);
+        turn.* = .{ .gpa = t.allocator, .session = undefined, .loop = &loop, .text = text };
+        turn.thread = try std.Thread.spawn(.{}, struct {
+            fn work(worker: *Turn) void {
+                while (!worker.cancel.load(.acquire)) std.Thread.yield() catch {};
+                std.testing.expectError(error.Closed, Turn.emit(worker, .{ .background = .{ .id = "r1", .kind = .run, .state = .finished, .result = "canceled" } })) catch @panic("shutdown accepted an event");
+            }
+        }.work, .{turn});
+        break :blk turn;
+    };
+    app.deinit();
+    try t.expect(try loop.queue.isEmpty());
+    try t.expectError(error.Closed, loop.postEvent(.tick));
 }
 
 test "Step events own effort and Runs keep their generating Step metadata" {
@@ -699,12 +921,13 @@ test "Step events own effort and Runs keep their generating Step metadata" {
     effort[0] = 'x';
     _ = try app.handle((try loop.tryEvent()).?);
     try t.expectEqual(@as(u32, 3), app.live_steps);
+    app.turn_runs = 0;
     _ = try app.handle(.{ .run_start = .{ .code = try t.allocator.dupe(u8, "tools.read({})"), .step = 3 } });
     _ = try app.handle(.{ .run_end = .{ .ok = true, .output = try t.allocator.dupe(u8, "out"), .changes = .{} } });
     _ = try app.handle(.{ .step = .{ .n = 4, .effort = try t.allocator.dupe(u8, "low"), .source = .model } });
     try t.expectEqualStrings("high", app.transcript.entries.items[0].step_effort.?.effort);
     try t.expectEqualStrings("low", app.step_effort.?.effort);
-    try t.expect(std.mem.endsWith(u8, app.transcript.entries.items[0].label.items, " · high (guard)"));
+    try t.expectEqualStrings("Run", app.transcript.entries.items[0].label.items);
 }
 
 test "Run summary survives event queue and original summary destruction" {
@@ -715,6 +938,7 @@ test "Run summary survives event queue and original summary destruction" {
     app.transcript = .{};
     defer app.transcript.deinit(t.allocator);
     app.activity = .start(t.io, .running);
+    app.turn_runs = 0;
     var loop: vaxis.Loop(Event) = .{ .io = t.io, .tty = undefined, .vaxis = undefined, .queue = .init(t.io) };
     var turn: Turn = undefined;
     turn.gpa = t.allocator;
@@ -728,5 +952,33 @@ test "Run summary survives event queue and original summary destruction" {
     _ = try app.handle((try loop.tryEvent()).?);
     try t.expectEqualStrings("edit", app.transcript.entries.items[0].tool_summary.?.counts[0].name);
     try t.expectEqual(@as(u64, 2), app.transcript.entries.items[0].tool_summary.?.counts[0].count);
-    try t.expect(std.mem.startsWith(u8, app.transcript.entries.items[0].label.items, "edit ×2, +3 · "));
+    try t.expect(std.mem.startsWith(u8, app.transcript.entries.items[0].label.items, "Run · edit ×2 · +3"));
+}
+
+test "cancel returns queued messages alongside an existing draft" {
+    const a = std.testing.allocator;
+    var session: Session = undefined;
+    session.gpa = a;
+    session.io = std.testing.io;
+    session.inbox = .{};
+    defer {
+        var remaining = session.inbox.take(session.io);
+        remaining.deinit(a);
+    }
+    var app: App = undefined;
+    app.gpa = a;
+    app.session = &session;
+    app.transcript = .{};
+    defer app.transcript.deinit(a);
+    app.input = .{};
+    defer app.input.deinit(a);
+    app.menu = .init(a);
+    defer app.menu.deinit();
+    const id = try session.enqueue("queued request");
+    try app.transcript.add(a, .user, "queued request");
+    app.transcript.entries.items[0].queued = id;
+    try app.input.insert(a, "draft");
+    try app.finishQueued(false);
+    try std.testing.expectEqualStrings("queued request\n\ndraft", app.input.text());
+    try std.testing.expectEqualStrings("1 queued message returned to input", app.transcript.entries.items[0].text.items);
 }

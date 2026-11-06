@@ -106,6 +106,10 @@ const WsForward = struct {
         f.emitted = true;
         try f.sink.onDelta(f.sink.ctx, kind, text);
     }
+    fn arguments(ctx: *anyopaque) !void {
+        const f: *@This() = @ptrCast(@alignCast(ctx));
+        try f.sink.toolArguments();
+    }
     fn data(ctx: *anyopaque) !void {
         const f: *@This() = @ptrCast(@alignCast(ctx));
         try f.sink.received();
@@ -123,7 +127,7 @@ fn fallbackError(err: anyerror) bool {
 }
 
 fn streamWebSocket(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.Client, cfg: p.Config, cache_key: []const u8, messages: []const p.Message, tools_json: []const u8, max_tokens: ?u32, forward: *WsForward, cancel: *const std.atomic.Value(bool), detail: *?[]u8, monitor: *idle.Monitor, state: *ws_state.State) anyerror!p.Reply {
-    const sink: p.Sink = .{ .ctx = forward, .onDelta = WsForward.delta, .onData = WsForward.data, .timing = forward.sink.timing, .codex_state = state, .monitor = monitor };
+    const sink: p.Sink = .{ .ctx = forward, .onDelta = WsForward.delta, .onData = WsForward.data, .onToolArguments = WsForward.arguments, .timing = forward.sink.timing, .codex_state = state, .monitor = monitor };
     errdefer state.reset(gpa);
     const body = try requestBody(gpa, cfg, cache_key, messages, tools_json, max_tokens);
     defer gpa.free(body);
@@ -418,6 +422,9 @@ fn readEvents(gpa: std.mem.Allocator, out: std.mem.Allocator, reader: *std.Io.Re
                     std.mem.eql(u8, ev.type, "response.reasoning_summary_text.delta") or std.mem.eql(u8, ev.type, "response.reasoning_text.delta") or
                     std.mem.eql(u8, ev.type, "response.function_call_arguments.delta") or std.mem.eql(u8, ev.type, "response.custom_tool_call_input.delta")) monitor.content(delta.len);
             }
+        }
+        if (ev.delta) |delta| {
+            if (delta.len > 0 and (std.mem.eql(u8, ev.type, "response.function_call_arguments.delta") or std.mem.eql(u8, ev.type, "response.custom_tool_call_input.delta"))) try sink.toolArguments();
         }
         if (socket) |ws| if (ws.turn_state == null and std.mem.eql(u8, ev.type, "response.metadata")) {
             if (ev.headers) |headers| if (headers == .object) {
@@ -778,6 +785,11 @@ test "Codex stream activity covers non-text events and SSE heartbeats" {
     const t = std.testing;
     const State = struct {
         received: usize = 0,
+        arguments: usize = 0,
+        fn argument(ctx: *anyopaque) !void {
+            const state: *@This() = @ptrCast(@alignCast(ctx));
+            state.arguments += 1;
+        }
         fn data(ctx: *anyopaque) !void {
             const state: *@This() = @ptrCast(@alignCast(ctx));
             state.received += 1;
@@ -800,12 +812,13 @@ test "Codex stream activity covers non-text events and SSE heartbeats" {
         var cancel: std.atomic.Value(bool) = .init(false);
         var detail: ?[]u8 = null;
         defer if (detail) |d| t.allocator.free(d);
-        const sink: p.Sink = .{ .ctx = &state, .onDelta = State.delta, .onData = State.data };
+        const sink: p.Sink = .{ .ctx = &state, .onDelta = State.delta, .onData = State.data, .onToolArguments = State.argument };
         var monitor: idle.Monitor = .init(t.io, 1, null);
         var observed = try body_reader.Reader.init(t.allocator, &reader, &monitor, sink);
         defer observed.deinit(t.allocator);
         _ = try readStream(t.allocator, arena.allocator(), &observed.reader, sink, &cancel, &detail);
         try t.expectEqual(@as(usize, 1), state.received);
+        try t.expectEqual(@as(usize, if (std.mem.indexOf(u8, prefix, "arguments.delta") != null) 1 else 0), state.arguments);
     }
 }
 
