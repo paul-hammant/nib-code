@@ -58,6 +58,7 @@ nib 面向越来越强的模型：给模型事实和能力，不替它做判断�
   - [0018 Codex custom Run 复用现有执行与历史](adr/0018-custom-run.md)
 - [ask-json.md](ask-json.md)：`ask --json` 的 NDJSON 事件格式、进度与用量
 - [session-log.md](session-log.md)：会话日志、恢复/取消、计时字段与统计口径
+- [undo.md](undo.md)：TUI 按 Turn 撤销 edit/write、冲突拒绝、快照额度与恢复边界
 - [replay.md](replay.md)：工具结果录制、离线 Run 重放、诊断脚本与隐私边界
 - [reflect.md](reflect.md)：只读反思、回答保存与 issue 自动发布
 - [config.md](config.md)：NIB_HOME、配置文件、环境变量、覆盖优先级与 effort 持久化

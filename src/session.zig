@@ -56,6 +56,7 @@ pub const Session = struct {
     parent_session_id: ?[]const u8 = null,
     options: Options = undefined,
     inbox: @import("session/inbox.zig").Inbox = .{},
+    undo_history: @import("tools/undo.zig").History = .{},
 
     /// Thread-safe while a Turn runs; other Session mutation is exclusive.
     pub fn enqueue(s: *Session, text: []const u8) !u64 {
@@ -67,7 +68,7 @@ pub const Session = struct {
         return s.inbox.takeUsers(s.gpa, s.io);
     }
 
-    pub const Options = struct { environ: ?*const std.process.Environ.Map = null, depth: u32 = 0, parent_session_id: ?[]const u8 = null, home: []const u8, user_home: []const u8, resume_id: ?[]const u8 = null, continue_latest: bool = false, fork: ?Fork = null };
+    pub const Options = struct { environ: ?*const std.process.Environ.Map = null, depth: u32 = 0, parent_session_id: ?[]const u8 = null, home: []const u8, user_home: []const u8, resume_id: ?[]const u8 = null, continue_latest: bool = false, fork: ?Fork = null, undo_enabled: bool = false, undo_dir: ?[]const u8 = null };
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, client: *std.http.Client, cfg: provider.Config, options: Options) !Session {
         if (options.fork) |fork| {
@@ -172,6 +173,13 @@ pub const Session = struct {
             defer gpa.free(text);
             _ = try s.inbox.enqueueBackground(gpa, io, id, lost.kind, .lost, null, text, false, 0, null);
         }
+        s.tools.undo_dir = options.undo_dir;
+        if (options.undo_enabled and s.parent_session_id == null) {
+            const root = try std.fmt.allocPrint(a, "{s}/{s}.undo", .{ directory, s.id });
+            try std.Io.Dir.cwd().deleteTree(io, root);
+            try std.Io.Dir.cwd().createDir(io, root, .fromMode(0o700));
+            s.undo_history.root = root;
+        }
         return s;
     }
 
@@ -189,6 +197,7 @@ pub const Session = struct {
     pub fn deinit(s: *Session) void {
         s.codex_state.reset(s.gpa);
         s.tools.background.stop(s.gpa);
+        s.undo_history.deinit(s.io, s.gpa);
         s.tools.progress.deinit(s.gpa);
         s.tools.agent_sessions.deinit(s.gpa);
         s.inbox.batch.deinit(s.gpa);
@@ -211,7 +220,19 @@ pub const Session = struct {
     pub const run = runner.run;
     const execute = runner.execute;
 
+    pub fn undo(s: *Session) ![]u8 {
+        const a = s.arena.allocator();
+        const intent = "[undo requested] File restoration may follow. Re-read affected files before continuing.";
+        try s.commit(s.history.items.len, &.{.{ .role = "user", .content = intent, .source = .undo }}, s.context_tokens + compaction.estimateTokens(&.{.{ .role = "user", .content = intent }}), null);
+        const text = try s.undo_history.undo(&s.tools, s.gpa);
+        errdefer s.gpa.free(text);
+        try s.commit(s.history.items.len, &.{.{ .role = "user", .content = try a.dupe(u8, text), .source = .undo }}, s.context_tokens + compaction.estimateTokens(&.{.{ .role = "user", .content = text }}), null);
+        return text;
+    }
+
     pub fn turn(s: *Session, user_text: []const u8, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
+        try s.undo_history.begin(&s.tools, s.gpa);
+        defer s.undo_history.finish(&s.tools, s.gpa);
         if (s.codex_state.socket) |*socket| {
             if (socket.turn_state) |value| s.gpa.free(value);
             socket.turn_state = null;

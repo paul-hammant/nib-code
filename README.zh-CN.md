@@ -22,6 +22,7 @@ r.exit_code === 0 ? "ok" : r.output
 - **后台任务**：`agent` 和 `bash` 可以传 `background: true`，立即返回任务 id，主模型继续工作；结果在之后的 Step 里作为消息到达。开发服务器这类长期进程可以用 `detached: true`，`tools.stop({ id, reason })` 按 id 停止任务，reason 需非空白。
 - **逐步调度推理强度**：模型可以为下一步声明更低的 effort。用户的设置是上限，Run 失败或用户插话后自动恢复。
 - **TUI**：回合进行中可以插话；子 agent 和后台任务在 Run 下方显示为状态树；每轮结束显示账单（推理与工具耗时、工具数据量与进入上下文的字节数、token、缓存命中）；用鼠标选中文本即可复制。
+- **`/undo`**：按 Turn 回退 nib 的 edit/write 修改，包含子 agent，新建文件则删除；发现外部修改时整轮拒绝。仅支持当前打开的 TUI 会话实例，bash、格式化器和脚本修改不在范围内，见 [撤销语义与限制](docs/undo.md)。
 - **可度量、可重放**：会话日志记录每个 Step 的耗时、用量和工具数据量，`scripts/stats.py` 用来统计失败、耗时构成和往返结构。工具调用的参数和结果默认录制在本地，`nib replay` 可以离线重新执行任意 Run，见 [docs/replay.md](docs/replay.md)。`/reflect` 让模型对照日志复盘 harness 本身的问题，并自动提 issue。
 
 ## 安装
@@ -58,7 +59,9 @@ nib --effort high            # 本次进程的推理强度
 nib replay <会话ID> --all     # 离线重放该会话录制的 Run，检查结果是否一致
 ```
 
-TUI 里输入 `/` 列出指令：`/new`、`/resume`、`/compact`、`/effort`、`/copy`、`/reflect`、`/js`、`/help`。Esc 中断当前回合，ctrl+o 展开 Run 的脚本、输出和 diff。
+TUI 里输入 `/` 列出指令：`/new`、`/resume`、`/compact`、`/undo`、`/effort`、`/copy`、`/reflect`、`/js`、`/help`。Esc 中断当前回合，ctrl+o 展开 Run 的脚本、输出和 diff。
+
+重复 `/undo` 可继续撤销更早的修改，保留最近 8 个有修改的 Turn。恢复前校验全部文件哈希，结果会进入模型历史，提醒重新读取文件。快照位于 `NIB_HOME/sessions/<id>.undo/`：单文件 16 MiB，每轮最多 256 个路径、64 MiB 原始内容；超过撤销额度的写入会在改文件前拒绝。退出或切换会话清空撤销栈，恢复后只能撤销新产生的 Turn。
 
 全局指令放在 `~/.nib/AGENTS.md`，项目约定放在项目根目录的 `AGENTS.md`。
 

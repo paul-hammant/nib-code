@@ -6,7 +6,7 @@ const config = @import("../config.zig");
 const ChangeText = @import("transcript.zig").ChangeText;
 const provider = @import("../provider.zig");
 
-pub const Command = enum { help, new, @"resume", compact, effort, copy, reflect, js };
+pub const Command = enum { help, new, @"resume", compact, undo, effort, copy, reflect, js };
 
 pub const Choices = enum { none, efforts, sessions };
 
@@ -25,6 +25,7 @@ pub const specs = std.enums.EnumArray(Command, Spec).init(.{
     .new = .{ .help = "start a new session in this directory" },
     .@"resume" = .{ .args = "<id>", .help = "switch to an earlier session in this directory", .choices = .sessions, .needs_arg = true },
     .compact = .{ .help = "summarize earlier history now" },
+    .undo = .{ .help = "undo the latest edited Turn (edit/write, current process only; stop working first)", .while_busy = true },
     .effort = .{ .args = "[level]", .help = "show or set reasoning effort", .choices = .efforts },
     .copy = .{ .help = "copy the last answer to the clipboard", .while_busy = true },
     .reflect = .{ .args = "[focus]", .help = "review this session for harness problems; saved to reflections.md" },
@@ -143,7 +144,7 @@ pub fn helpText(gpa: std.mem.Allocator) ![]u8 {
     errdefer text.deinit(gpa);
     for (std.enums.values(Command)) |c| {
         const spec = specs.get(c);
-        try text.print(gpa, "{s}{s}{s} — {s}{s}\n", .{ slashName(c), if (spec.args.len > 0) " " else "", spec.args, spec.help, if (spec.while_busy) " (also while working)" else "" });
+        try text.print(gpa, "{s}{s}{s} — {s}{s}\n", .{ slashName(c), if (spec.args.len > 0) " " else "", spec.args, spec.help, if (spec.while_busy and c != .undo) " (also while working)" else "" });
     }
     try text.appendSlice(gpa, keys);
     return text.toOwnedSlice(gpa);
@@ -155,6 +156,14 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
     const gpa = app.gpa;
     const session = app.session;
     switch (c) {
+        .undo => {
+            if (app.turn != null) return app.transcript.add(gpa, .err, "Cannot undo during a Turn; press Esc to stop it first.");
+            if (arg.len != 0) return app.transcript.add(gpa, .err, "usage: /undo");
+            const text = session.undo() catch |err| return app.report(.err, "undo failed: {s}; re-read files before continuing", .{@errorName(err)});
+            defer gpa.free(text);
+            app.context = session.context_tokens;
+            try app.transcript.add(gpa, .info, text);
+        },
         .help => {
             const text = try helpText(gpa);
             defer gpa.free(text);
@@ -244,6 +253,8 @@ test "parse tells commands from paths and messages" {
     try testing.expectEqual(Command.effort, parse("/effort high").?.known.command);
     try testing.expectEqualStrings("high", parse("/effort  high ").?.known.arg);
     try testing.expectEqualStrings("nope", parse("/nope x").?.unknown);
+    try testing.expectEqual(Command.undo, parse("/undo").?.known.command);
+    try testing.expect(allowedWhileBusy("/undo"));
 }
 
 test "candidates complete command names, then argument choices" {

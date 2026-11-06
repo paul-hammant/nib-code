@@ -5,6 +5,7 @@ const Tools = tools.Tools;
 const fail = tools.fail;
 const atomic_file = @import("atomic_file.zig");
 const file_state = @import("file_state.zig");
+const undo = @import("undo.zig");
 
 pub fn read(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolResult {
     const A = struct { path: []const u8, offset: usize = 1, limit: usize = 2000 };
@@ -22,7 +23,7 @@ pub fn read(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
     defer file.close(t.io);
     const stat = try file.stat(t.io);
     var reader = file.reader(t.io, &.{});
-    const data = reader.interface.allocRemaining(gpa, .limited(16 * 1024 * 1024)) catch |err|
+    const data = reader.interface.allocRemaining(gpa, .limited(undo.file_limit + 1)) catch |err|
         return fail(gpa, "{s}: {s}", .{ a.value.path, @errorName(err) });
     defer gpa.free(data);
 
@@ -58,7 +59,7 @@ pub fn edit(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
     if (v.old_text.len == 0) return fail(gpa, "old_text is empty; use write to create a file", .{});
 
     const dir = std.Io.Dir.cwd();
-    const data = dir.readFileAlloc(t.io, path, gpa, .limited(16 * 1024 * 1024)) catch |err|
+    const data = dir.readFileAlloc(t.io, path, gpa, .limited(undo.file_limit + 1)) catch |err|
         return fail(gpa, "{s}: {s}", .{ v.path, @errorName(err) });
     defer gpa.free(data);
 
@@ -69,8 +70,12 @@ pub fn edit(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
 
     const out = try std.mem.replaceOwned(u8, gpa, data, v.old_text, v.new_text);
     defer gpa.free(out);
+    var snapshot = undo.prepare(t, gpa, path, data, out) catch |err|
+        return fail(gpa, "{s}: undo snapshot failed ({s}); edit refused", .{ v.path, @errorName(err) });
+    defer if (snapshot) |*s| s.deinit(t, gpa);
     const written = atomic_file.replace(t.io, gpa, path, out, .{}) catch |err|
         return fail(gpa, "{s}: {s}", .{ v.path, @errorName(err) });
+    if (snapshot) |*s| try s.commit(t, gpa, out);
     try t.file_state.remember(t.io, gpa, path, written);
     try t.noteChange(gpa, path, data, out);
     return .{ .ok = try std.fmt.allocPrint(gpa, "{{\"replaced\":{d}}}", .{count}) };
@@ -99,15 +104,20 @@ pub fn write(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolR
             return fail(gpa, "{s} changed since this session last read or wrote it (by bash, a background agent, or the user); read it again before overwriting", .{v.path});
     }
     var can_track = true;
-    const before = dir.readFileAlloc(t.io, path, gpa, .limited(16 * 1024 * 1024)) catch |err| before: {
+    const before = dir.readFileAlloc(t.io, path, gpa, .limited(undo.file_limit + 1)) catch |err| before: {
         if (err != error.FileNotFound) can_track = false;
         break :before null;
     };
     defer if (before) |data| gpa.free(data);
+    if (!can_track and t.undo_dir != null) return fail(gpa, "{s}: undo snapshot unavailable (file unreadable or larger than 16 MiB); write refused", .{v.path});
+    var snapshot = undo.prepare(t, gpa, path, before, v.content) catch |err|
+        return fail(gpa, "{s}: undo snapshot failed ({s}); write refused", .{ v.path, @errorName(err) });
+    defer if (snapshot) |*s| s.deinit(t, gpa);
     if (std.fs.path.dirname(path)) |parent| dir.createDirPath(t.io, parent) catch |err|
         return fail(gpa, "{s}: {s}", .{ parent, @errorName(err) });
     const written = atomic_file.replace(t.io, gpa, path, v.content, .{}) catch |err|
         return fail(gpa, "{s}: {s}", .{ v.path, @errorName(err) });
+    if (snapshot) |*s| try s.commit(t, gpa, v.content);
     try t.file_state.remember(t.io, gpa, path, written);
     if (can_track) try t.noteChange(gpa, path, before, v.content) else t.bash_commands.changed(t.io);
     return .{ .ok = try std.fmt.allocPrint(gpa, "{{\"bytes\":{d}}}", .{v.content.len}) };

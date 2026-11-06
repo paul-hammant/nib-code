@@ -301,6 +301,8 @@ pub const Transcript = struct {
                 const shown = if (m.background_run) |completion| try runResultText(gpa, completion.output, completion.changes) else null;
                 defer if (shown) |text| gpa.free(text);
                 try t.backgroundResult(gpa, kind, m.background_id orelse "?", m.background_ok orelse parsed_ok, shown orelse result);
+            } else if (m.source == .undo) {
+                try t.add(gpa, .info, content);
             } else if (std.mem.eql(u8, m.role, "user")) {
                 try t.add(gpa, .user, content);
             } else if (std.mem.eql(u8, m.role, "assistant")) {

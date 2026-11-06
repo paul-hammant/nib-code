@@ -26,6 +26,7 @@ Version 0.4.0. This is a personal project and still changes quickly.
 - **Per-Step reasoning effort.** The model can ask for lower effort on its next Step. Your setting is the upper bound. Effort is restored automatically after a failed Run or when you interject.
 - **TUI.**
   - Interject while a turn is running.
+  - `/undo` restores the latest turn's `edit`/`write` changes, including sub-agents, and deletes files it created. Conflicts refuse the entire undo. Available only in the current TUI session instance; bash/script changes are outside its scope. See [undo details and limits](docs/undo.md).
   - Sub-agents and background tasks appear as a status tree under their Run.
   - Each turn ends with a bill: model and tool time, tool bytes versus the bytes that reached the context, tokens, and cache hits.
   - Select text with the mouse to copy it.
@@ -69,7 +70,9 @@ nib --effort high            # reasoning effort for this process
 nib replay <session-id> --all  # replay a session's recorded Runs offline and check they match
 ```
 
-In the TUI, type `/` to list commands: `/new`, `/resume`, `/compact`, `/effort`, `/copy`, `/reflect`, `/js`, `/help`. Esc interrupts the current turn. ctrl+o expands a Run's script, output and diff.
+In the TUI, type `/` to list commands: `/new`, `/resume`, `/compact`, `/undo`, `/effort`, `/copy`, `/reflect`, `/js`, `/help`. Esc interrupts the current turn. ctrl+o expands a Run's script, output and diff.
+
+Repeat `/undo` to undo earlier edited turns (up to 8 retained). It checks file hashes before restoring anything and tells the model to re-read restored files. Snapshots live under `NIB_HOME/sessions/<id>.undo/`: 16 MiB per file, 256 paths and 64 MiB of original contents per turn; writes that exceed undo limits are refused before changing a file. Exiting or switching sessions clears undo history; resumed sessions can undo only new turns.
 
 Put global instructions in `~/.nib/AGENTS.md` and project conventions in `AGENTS.md` at the project root.
 

@@ -86,6 +86,7 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
         cfg = envelope.config;
         prompt = envelope.prompt;
         options.fork = envelope.fork;
+        options.undo_dir = envelope.undo_dir;
     } else {
         var config_detail: ?[]u8 = null;
         cfg = config.load(init.arena.allocator(), init.io, init.environ_map, options.home, &config_detail) catch |err| {
@@ -103,6 +104,7 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
     }
     if (effort) |value| try cfg.setEffort(value);
     if (ask and cfg.missingKey()) return error.MissingApiKey;
+    options.undo_enabled = !ask;
     var session = try Session.init(gpa, init.io, &client, cfg, options);
     defer session.deinit();
     defer {

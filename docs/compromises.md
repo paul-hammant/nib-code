@@ -24,6 +24,7 @@
 | 名称 | 位置 | 原因 | 删除条件 |
 |---|---|---|---|
 | 子 agent 深度上限 1 | `src/tools.zig`（agent 仅根会话可用） | 没有成本预算机制时，防止递归派生失控 | 有按预算限制的机制后改为预算 |
+| `/undo` 不跨 Session 实例恢复 | `src/tools/undo.zig`、`src/session.zig` | 撤销栈只在进程内持有，避免重启后误用中断或旧版本快照 | 有已提交 Turn/撤销事务的持久索引与崩溃恢复后再加载快照 |
 | 流式响应空闲超时通过替换 HTTP 连接底层 reader 的 Io vtable 实现 | `src/provider/idle.zig` | `std.http.Client` 没有读取超时；替换 `connection.stream_reader.io` 依赖标准库内部结构，升级 Zig 时可能失效 | 标准库 HTTP 客户端支持读取超时或截止时间 |
 | bash 命令部分超过 256 个 shell 词即拒绝 | `src/tools/policy.zig` | 检查器用固定缓冲区存放命令部分的词；heredoc 正文已不计入 | 检查器不再需要固定缓冲区 |
 
@@ -37,3 +38,4 @@ llm/agent 的并发、调用次数、输入大小和 Step 上限已改为可配�
 |---|---|---|---|
 | 后台 bash 同时运行上限，超出即 reject | `src/tools/background.zig`（复用 `sandbox.tool_concurrency`） | 8 | 移入 `[limits]` |
 | 工具录制的单条结果上限；calls 文件没有总量上限或轮转 | `src/sandbox/record.zig` | 1 MiB | 有存储预算与清理配置后移入配置 |
+| TUI 撤销快照额度 | `src/tools/undo.zig` | 8 个已结束修改 Turn；每轮 256 路径、64 MiB 原始字节；单文件 16 MiB | 有实际额度需求与统一会话清理配置后移入配置 |
