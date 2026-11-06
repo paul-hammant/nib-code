@@ -17,6 +17,7 @@ const selection = @import("tui/selection.zig");
 const reflect = @import("tui/reflect.zig");
 const Turn = @import("tui/turn.zig").Turn;
 const Ticker = @import("tui/turn.zig").Ticker;
+const Frames = @import("tui/frames.zig").Frames;
 const bill = @import("tui/bill.zig");
 const TurnSummary = @import("session/events.zig").TurnSummary;
 const ToolSummary = @import("session/tool_summary.zig").Summary;
@@ -57,6 +58,14 @@ pub const Event = union(enum) {
     /// One outcome line from automatic issue filing, owned by the receiver.
     issue: []u8,
     issues_done,
+
+    pub fn refresh(event: Event) Frames.Refresh {
+        return switch (event) {
+            .tick => .animation,
+            .key_press, .paste_end, .mouse, .winsize, .color_report, .color_scheme, .done, .failed, .issues_done => .immediate,
+            else => .content,
+        };
+    }
 
     pub fn deinit(event: Event, gpa: std.mem.Allocator) void {
         switch (event) {
@@ -145,9 +154,16 @@ pub fn run(init: std.process.Init, session: *Session) !void {
     }
     if (app.cfg.missingKey()) try app.transcript.add(gpa, .err, "No API key: set the active provider key environment variable. /js <code> still works.");
 
-    while (try app.handle(try loop.nextEvent())) {
-        ticker.busy.store(app.turn != null or app.session.tools.background.anyPending(io), .release);
-        try app.render();
+    var frames: Frames = .{};
+    while (true) {
+        const event = try loop.nextEvent();
+        const refresh = event.refresh();
+        if (!try app.handle(event)) break;
+        if (frames.due(.now(io, .awake), refresh)) {
+            try app.render();
+            frames.painted(.now(io, .awake));
+        }
+        ticker.busy.store(frames.pending or app.turn != null or app.session.tools.background.anyPending(io), .release);
     }
 }
 
@@ -593,6 +609,15 @@ fn userBackground(bg: [3]u8) vaxis.Color {
     var rgb: [3]u8 = undefined;
     for (bg, accent, 0..) |base, tint, i| rgb[i] = @intCast((@as(u16, base) * 7 + tint) / 8);
     return .{ .rgb = rgb };
+}
+
+test "stream events are paced while interaction and completion refresh immediately" {
+    const t = std.testing;
+    try t.expectEqual(Frames.Refresh.animation, Event.refresh(.tick));
+    try t.expectEqual(Frames.Refresh.content, Event.refresh(.{ .delta = .{ .kind = .text, .text = &.{}, .step = 1 } }));
+    try t.expectEqual(Frames.Refresh.immediate, Event.refresh(.done));
+    try t.expectEqual(Frames.Refresh.immediate, Event.refresh(.{ .key_press = .{ .codepoint = vaxis.Key.escape } }));
+    try t.expectEqual(Frames.Refresh.immediate, Event.refresh(.paste_end));
 }
 
 test "user message tint preserves dark and light terminal contrast" {

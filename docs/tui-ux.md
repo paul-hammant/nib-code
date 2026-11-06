@@ -1,10 +1,14 @@
 # TUI 任务管理与进展
 
+流式文本和任务进展按约 16 ms 的帧间隔合并刷新，不按网络分包逐次重绘；数据始终按接收顺序完整进入对话，不逐字播放、不增加输出队列，也不改变 Session 日志或 `ask` 的流式事件。待刷新内容由定时 tick 兜底，即使服务端暂停发送也不会卡住最后一段。按键、滚动、窗口大小变化和 Turn 结束立即刷新；只有等待动画时按 100 ms 刷新，空闲时不持续重绘。
+
 `/tasks` 不调用模型，列出本进程在当前 Session 登记的后台 agent、bash 和自动转后台的 Run。每行显示 id、类型、状态、已运行时长、截止时间及简短描述；没有任务时显示一句提示。排队中的任务显示等待确定截止时间，开始执行后使用工具本身的 timeout；截止时间显示 UTC 时分秒和剩余秒数。detached 显示无截止时间（显式 timeout 仍由工具执行）。Run 没有墙钟截止时间，显示 `per-tool deadlines`，各工具原有截止时间继续生效。已完成任务的时长冻结，不会继续增加。
 
 `/stop <id>` 在 Turn 运行时也立即受理。停止请求由 Session 线程处理，复用 tools.stop 的取消、join 和进程组清理，日志的 `task_stop` 记录理由 `user requested stop`；停止完成后提示可能留有部分改动。已完成任务返回 already finished，未知 id 显示错误。输入 `/stop ` 时，菜单按 id 前缀提供仍在运行的任务候选；无需让模型发起工具调用。切换 Session 后不再显示旧 Session 的任务；恢复不会重启进程。
 
 Run 始终保留父标题。自动转后台时显示 `Run · r3 running`；结束后把改动、工具摘要和结果更新回原块。bash 被取代时显示 `b1 superseded by b2`，取代不代表验证通过或失败。父标题会提示子任务失败或超时，但不改变脚本的返回值。Ctrl+O 依次展开 Changes / Result / Script；结果全文可滚动查看，长 diff 标注 `Diff preview · 60 of … lines`。
+
+活动行与上方对话之间保留一行空白，历史浏览和临时提示也沿用该留白；终端不足 10 行或正文可用高度不足时收紧，不挤掉输入框。没有活动行时不额外占行。
 
 活动行显示已知阶段：`Waiting for model`、`Generating response`、`Writing Run`、`Running bash zig build test`、`Waiting for r3 · 32s`，并保留整个 Turn 的累计时间。只有有内容的推理、文本、工具参数和工具状态/输出进度会更新最后活动；网络心跳、metadata、usage 和单纯经过的时间都不重置它。超过 30 秒无进展显示 `no progress 30s`，不预测 ETA。窄屏从右往左去掉字段，仍为单行。
 

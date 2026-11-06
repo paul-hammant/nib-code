@@ -28,14 +28,13 @@ pub fn drawFrame(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *V
     const input_w = win.width - x - @as(u16, if (framed) 2 else 0);
     const input_h = @min(input.rows(win.child(.{ .width = input_w })), @max(1, win.height / 3));
     const saved_scroll = scroll.*;
-    var activity_h: u16 = @intFromBool(s.busy != null or s.background_count > 0 or s.notice != null or scroll.top != null or scroll.pending < 0);
-    activity_h = @min(activity_h, win.height - input_h - borders - hints);
+    var activity_h = activityHeight(s.busy != null or s.background_count > 0 or s.notice != null or scroll.top != null or scroll.pending < 0, win.height - input_h - borders - hints, win.height);
     const menu_layout = menuLayout(menu, menu_sel, @min(max_menu_rows, (win.height - input_h - borders - hints - activity_h) / 2));
     const menu_h = menu_layout.rows;
     var body_h = win.height - input_h - borders - hints - menu_h - activity_h;
     var body = win.child(.{ .x_off = @min(1, win.width - 1), .width = @max(1, win.width -| 2), .height = body_h });
     var top = scroll.layout(entries, body);
-    const actual_h: u16 = @intFromBool(text.formatWidth(s, scroll.top != null, win.width -| 2).len > 0 and win.height > input_h + borders + hints + menu_h);
+    const actual_h = activityHeight(text.formatWidth(s, scroll.top != null, win.width -| 2).len > 0, win.height - input_h - borders - hints - menu_h, win.height);
     if (actual_h != activity_h) {
         activity_h = actual_h;
         body_h = win.height - input_h - borders - hints - menu_h - activity_h;
@@ -53,7 +52,7 @@ pub fn drawFrame(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *V
     }
 
     if (activity_h > 0) {
-        _ = win.child(.{ .x_off = 1, .y_off = body_h, .height = 1 }).printSegment(.{ .text = text.formatWidth(s, scroll.top != null, win.width -| 2), .style = if (s.busy != null) .{ .fg = .{ .index = 3 } } else .{ .dim = true } }, .{ .wrap = .none });
+        _ = win.child(.{ .x_off = 1, .y_off = body_h + activity_h - 1, .height = 1 }).printSegment(.{ .text = text.formatWidth(s, scroll.top != null, win.width -| 2), .style = if (s.busy != null) .{ .fg = .{ .index = 3 } } else .{ .dim = true } }, .{ .wrap = .none });
     }
     var menu_y = body_h + activity_h;
     for (menu_layout.first..menu_layout.end) |i| {
@@ -86,6 +85,11 @@ pub fn drawFrame(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *V
     input.draw(win.child(.{ .x_off = x, .y_off = input_y + @as(u16, if (framed) 1 else 0), .width = input_w, .height = input_h }));
     if (hints > 0) _ = win.child(.{ .x_off = 2, .y_off = win.height - 1, .height = 1 }).printSegment(.{ .text = if (win.width < 70) "Enter send · / commands · Ctrl+O details" else "Enter send · Shift+Enter newline · / commands · Ctrl+O details", .style = .{ .dim = true } }, .{ .wrap = .none });
     return .{ .top = top, .window = body };
+}
+
+fn activityHeight(visible: bool, available: u16, terminal_height: u16) u16 {
+    if (!visible or available == 0) return 0;
+    return if (terminal_height >= 10 and available >= 4) 2 else 1;
 }
 
 const MenuLayout = struct { first: usize = 0, end: usize = 0, rows: u16 = 0 };
@@ -255,6 +259,46 @@ test "layout snapshots: normal, short, tiny, narrow, menu, busy and history" {
         if (c.menu) try testing.expect(std.mem.indexOf(u8, image, "/help") != null);
     }
     try testing.expectEqualStrings(@embedFile("layout_snapshots.txt"), images.items);
+}
+
+test "activity has breathing room at 60, 120 and 160 columns without wasting short terminals" {
+    const gpa = testing.allocator;
+    for ([_]u16{ 60, 120, 160 }) |width| for ([_]u16{ 7, 9, 12, 32 }) |height| {
+        var screen = try vaxis.Screen.init(gpa, .{ .cols = width, .rows = height, .x_pixel = 0, .y_pixel = 0 });
+        defer screen.deinit(gpa);
+        const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = width, .height = height, .screen = &screen };
+        var input: Editor = .{};
+        defer input.deinit(gpa);
+        var transcript: Transcript = .{};
+        defer transcript.deinit(gpa);
+        var lines: std.ArrayList(u8) = .empty;
+        defer lines.deinit(gpa);
+        for (0..40) |i| try lines.print(gpa, "line-{d}\n", .{i});
+        try transcript.add(gpa, .assistant, lines.items);
+        const states = [_]status.Status{
+            .{ .cfg = mock_cfg, .busy = .{ .phase = .scripting, .ms = 0 } },
+            .{ .cfg = mock_cfg, .background_count = 1 },
+            .{ .cfg = mock_cfg, .notice = "copied 3 chars" },
+            .{ .cfg = mock_cfg },
+        };
+        for (states, 0..) |s, index| {
+            var viewport: Viewport = .{ .pending = if (index == 3) -100 else 0 };
+            var text: status.Text = .{};
+            const frame = drawFrame(win, transcript.entries.items, &input, &viewport, &.{}, 0, s, &text).?;
+            const status_y = height - @as(u16, if (height >= 8) 5 else 4);
+            try testing.expectEqual(status_y - @as(u16, @intFromBool(height >= 10)), frame.window.height);
+            if (height >= 10) for (0..width) |col| {
+                try testing.expectEqualStrings(" ", screen.readCell(@intCast(col), status_y - 1).?.char.grapheme);
+            };
+            try testing.expect(!std.mem.eql(u8, " ", screen.readCell(1, status_y).?.char.grapheme));
+            try testing.expect(screen.cursor_vis);
+            try testing.expectEqual(height - @as(u16, if (height >= 8) 3 else 2), screen.cursor.row);
+        }
+        var viewport: Viewport = .{};
+        var text: status.Text = .{};
+        const frame = drawFrame(win, transcript.entries.items, &input, &viewport, &.{}, 0, .{ .cfg = mock_cfg }, &text).?;
+        try testing.expectEqual(height - @as(u16, if (height >= 8) 4 else 3), frame.window.height);
+    };
 }
 
 test "selection copies displayed blocks at the framed input coordinates" {
