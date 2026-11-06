@@ -92,27 +92,32 @@ fn codeLine(win: vaxis.Window, text: []const u8, commit: bool) u16 {
     return rows(result);
 }
 
+fn printLine(row: vaxis.Window, line: Line, commit: bool) u16 {
+    var used: u16 = 1;
+    if (line.code) {
+        if (row.width > 2) {
+            _ = row.printSegment(.{ .text = "│ ", .style = .{ .dim = true, .fg = .{ .index = 4 } } }, .{ .commit = commit });
+            used = codeLine(row.child(.{ .x_off = 2 }), line.text, commit);
+        } else {
+            used = codeLine(row, line.text, commit);
+        }
+    } else {
+        var spans: Inline = .{ .text = line.text, .base = if (line.heading) .{ .bold = true, .fg = .{ .index = 4 } } else .{} };
+        var result: vaxis.Window.PrintResult = .{ .row = 0, .col = 0, .overflow = false };
+        while (spans.next()) |segment| {
+            result = row.printSegment(segment, .{ .row_offset = result.row, .col_offset = result.col, .wrap = .word, .commit = commit });
+        }
+        used = rows(result);
+    }
+    return used;
+}
+
 pub fn print(win: vaxis.Window, text: []const u8, commit: bool) u16 {
     var lines: Lines = .{ .text = text };
     var height: u16 = 0;
     while (lines.next()) |line| {
         const row = win.child(.{ .y_off = @intCast(height) });
-        var used: u16 = 1;
-        if (line.code) {
-            if (row.width > 2) {
-                _ = row.printSegment(.{ .text = "│ ", .style = .{ .dim = true, .fg = .{ .index = 4 } } }, .{ .commit = commit });
-                used = codeLine(row.child(.{ .x_off = 2 }), line.text, commit);
-            } else {
-                used = codeLine(row, line.text, commit);
-            }
-        } else {
-            var spans: Inline = .{ .text = line.text, .base = if (line.heading) .{ .bold = true, .fg = .{ .index = 4 } } else .{} };
-            var result: vaxis.Window.PrintResult = .{ .row = 0, .col = 0, .overflow = false };
-            while (spans.next()) |segment| {
-                result = row.printSegment(segment, .{ .row_offset = result.row, .col_offset = result.col, .wrap = .word, .commit = commit });
-            }
-            used = rows(result);
-        }
+        const used = printLine(row, line, commit);
         height +|= used;
     }
     return @max(1, height);
@@ -169,4 +174,78 @@ test "rendered rows and styles match measurement" {
     screen.clear();
     try std.testing.expectEqual(@as(u16, 2), print(win, "~~~\n1234567", false));
     try std.testing.expectEqual(@as(u16, 2), print(win, "~~~\n1234567", true));
+}
+
+pub const Cache = struct {
+    const CachedLine = struct { offset: usize, len: usize, code: bool, heading: bool, y: u16, rows: u16 };
+    lines: std.ArrayList(CachedLine) = .empty,
+    width: u16 = 0,
+    pos: usize = 0,
+    fence: @FieldType(Lines, "fence") = null,
+    height: u16 = 0,
+
+    pub fn deinit(c: *Cache, gpa: std.mem.Allocator) void {
+        c.lines.deinit(gpa);
+    }
+
+    pub fn draw(c: *Cache, gpa: std.mem.Allocator, win: vaxis.Window, text: []const u8, commit: bool) u16 {
+        if (c.width != win.width or c.pos > text.len) {
+            c.lines.clearRetainingCapacity();
+            c.width = win.width;
+            c.pos = 0;
+            c.fence = null;
+            c.height = 0;
+        }
+        var parser: Lines = .{ .text = text, .pos = c.pos, .fence = c.fence };
+        while (true) {
+            const before = parser;
+            const line = parser.next() orelse break;
+            if (parser.pos > text.len) {
+                parser = before;
+                break;
+            }
+            const h = printLine(win, line, false);
+            c.lines.append(gpa, .{ .offset = @intFromPtr(line.text.ptr) - @intFromPtr(text.ptr), .len = line.text.len, .code = line.code, .heading = line.heading, .y = c.height, .rows = h }) catch return print(win, text, commit);
+            c.height +|= h;
+            c.pos = parser.pos;
+            c.fence = parser.fence;
+        }
+        if (commit) for (c.lines.items) |line| {
+            if (@as(i32, win.y_off) + line.y + line.rows <= 0) continue;
+            if (@as(i32, win.y_off) + line.y >= win.screen.height) break;
+            _ = printLine(win.child(.{ .y_off = @intCast(line.y) }), .{ .text = text[line.offset..][0..line.len], .code = line.code, .heading = line.heading }, true);
+        };
+        var height = c.height;
+        parser = .{ .text = text, .pos = c.pos, .fence = c.fence };
+        while (parser.next()) |line| height +|= printLine(win.child(.{ .y_off = @intCast(height) }), line, commit);
+        return @max(1, height);
+    }
+};
+
+test "cached append and resize match uncached markdown" {
+    const a = std.testing.allocator;
+    var cache: Cache = .{};
+    defer cache.deinit(a);
+    var screen = try vaxis.Screen.init(a, .{ .cols = 60, .rows = 32, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    var win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 60, .height = 32, .screen = &screen };
+    const text = "# Heading\n**late\nclose**\n```zig\ncode\n```\n中文 👩‍💻 tail";
+    for ([_]u16{ 60, 20, 60 }) |width| {
+        win.width = width;
+        for (0..text.len + 1) |n| {
+            if (!std.unicode.utf8ValidateSlice(text[0..n])) continue;
+            try std.testing.expectEqual(print(win, text[0..n], false), cache.draw(a, win, text[0..n], false));
+            for ([_]i17{ 0, -3, -10 }) |offset| {
+                win.y_off = offset;
+                win.clear();
+                _ = print(win, text[0..n], true);
+                const expected = try a.dupe(vaxis.Cell, screen.buf);
+                defer a.free(expected);
+                win.clear();
+                _ = cache.draw(a, win, text[0..n], true);
+                try std.testing.expectEqualDeep(expected, screen.buf);
+            }
+            win.y_off = 0;
+        }
+    }
 }

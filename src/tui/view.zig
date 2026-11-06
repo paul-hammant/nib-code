@@ -397,7 +397,7 @@ test "model menu shows distinct model names and current marker at common widths"
     }
 }
 
- test "stream stress frame timings" {
+test "stream stress frame timings" {
     const a = testing.allocator;
     var screen = try vaxis.Screen.init(a, .{ .cols = 120, .rows = 32, .x_pixel = 0, .y_pixel = 0 });
     defer screen.deinit(a);
@@ -412,7 +412,7 @@ test "model menu shows distinct model names and current marker at common widths"
     var answer: std.ArrayList(u8) = .empty;
     defer answer.deinit(a);
     while ((std.unicode.utf8CountCodepoints(answer.items) catch 0) < 30000) try answer.appendSlice(a, sample);
-    for ([_]usize{1000, 10000, 30000}) |size| {
+    for ([_]usize{ 1000, 10000, 30000 }) |size| {
         transcript.clear(a);
         var it = (try std.unicode.Utf8View.init(answer.items)).iterator();
         var end: usize = 0;
@@ -427,6 +427,6 @@ test "model menu shows distinct model names and current marker at common widths"
             elapsed.* = @intCast(start.durationTo(.now(testing.io, .awake)).raw.toNanoseconds());
         }
         std.mem.sort(i64, &times, {}, std.sort.asc(i64));
-        std.debug.print("stress chars={d} frame p95={d}us max={d}us input-to-draw max={d}us\n", .{size, @divTrunc(times[94],1000), @divTrunc(times[99],1000), @divTrunc(times[99],1000)});
+        std.debug.print("stress chars={d} frame p95={d}us max={d}us input-to-draw max={d}us\n", .{ size, @divTrunc(times[94], 1000), @divTrunc(times[99], 1000), @divTrunc(times[99], 1000) });
     }
 }

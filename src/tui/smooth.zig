@@ -59,3 +59,53 @@ test "bursts drain proportionally within three frames on grapheme boundaries" {
     big.flush(1001);
     try t.expect(big.deadline == null);
 }
+
+test "new arrivals preserve the deadline and a paused stream drains" {
+    const t = std.testing;
+    const now = std.Io.Clock.Timestamp.now(t.io, .awake);
+    var s: Smooth = .{};
+    s.arrive(0, 1, now);
+    s.arrive(1, 100, now);
+    const deadline = s.deadline.?;
+    const bytes: [1000]u8 = @splat('x');
+    for ([_]i64{ 0, 16, 32 }) |ms| {
+        const at = now.addDuration(.{ .raw = .fromMilliseconds(ms), .clock = .awake });
+        s.arrive(100, bytes.len, at);
+        try t.expectEqualDeep(deadline, s.deadline.?);
+        s.advance(&bytes, at);
+    }
+    try t.expectEqual(bytes.len, s.visible);
+    try t.expect(s.deadline == null);
+}
+
+test "irregular bursts have bounded arrival to display lag" {
+    const t = std.testing;
+    const start = std.Io.Clock.Timestamp.now(t.io, .awake);
+    const text: [30000]u8 = @splat('a');
+    var arrivals: [30000]i64 = undefined;
+    var s: Smooth = .{};
+    var len: usize = 0;
+    var next: i64 = 0;
+    var max_lag: i64 = 0;
+    var seed: u32 = 17;
+    var ms: i64 = 0;
+    while (len < text.len or s.deadline != null) : (ms += 1) {
+        const now = start.addDuration(.{ .raw = .fromMilliseconds(ms), .clock = .awake });
+        if (len < text.len and ms >= next) {
+            seed = seed *% 1664525 +% 1013904223;
+            const end = @min(text.len, len + 1 + seed % 2000);
+            @memset(arrivals[len..end], ms);
+            s.arrive(len, end, now);
+            len = end;
+            next = ms + seed % 401;
+        }
+        if (@mod(ms, 16) == 0) {
+            const before = s.visible;
+            s.advance(text[0..len], now);
+            for (arrivals[before..s.visible]) |at| max_lag = @max(max_lag, ms - at);
+        }
+    }
+    try t.expectEqual(text.len, s.visible);
+    try t.expect(max_lag <= 56);
+    std.debug.print("smoothing irregular bursts max display lag={d}ms\n", .{max_lag});
+}

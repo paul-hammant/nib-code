@@ -46,7 +46,7 @@ pub const Transcript = struct {
 
     pub fn add(t: *Transcript, gpa: std.mem.Allocator, kind: Kind, text: []const u8) !void {
         t.revision +%= 1;
-        var e: Entry = .{ .kind = kind, .open = t.expanded };
+        var e: Entry = .{ .kind = kind, .open = t.expanded, .allocator = gpa };
         errdefer e.deinit(gpa);
         try e.text.appendSlice(gpa, text);
         try e.refreshLabel(gpa);
@@ -224,6 +224,7 @@ pub const Transcript = struct {
         const items = t.entries.items;
         if (items.len == 0 or items[items.len - 1].kind != entry_kind or items[items.len - 1].attempt != t.attempt) try t.entries.append(gpa, .{ .kind = entry_kind, .open = t.expanded, .attempt = t.attempt });
         const current = &t.entries.items[t.entries.items.len - 1];
+        current.allocator = gpa;
         try current.text.appendSlice(gpa, text);
     }
 
@@ -1655,4 +1656,22 @@ test "retry placeholder survives reasoning and replaces draft without losing his
     try t.appendDelta(a, .text, "answer");
     try testing.expectEqualStrings("answer", t.lastAnswer().?);
     t.clearRetry(a, &scroll);
+}
+
+test "display smoothing keeps complete answers and resets at a new attempt" {
+    const a = std.testing.allocator;
+    var t: Transcript = .{};
+    defer t.deinit(a);
+    const now = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
+    try t.smoothDelta(a, "first", now);
+    try std.testing.expectEqualStrings("first", t.entries.items[0].displayText());
+    try t.smoothDelta(a, " burst 中文👩‍💻", now);
+    try std.testing.expect(t.hasBacklog());
+    try std.testing.expectEqualStrings("first burst 中文👩‍💻", t.lastAnswer().?);
+    t.flushVisible();
+    try std.testing.expect(!t.hasBacklog());
+    try std.testing.expectEqualStrings(t.lastAnswer().?, t.entries.items[0].displayText());
+    t.beginAttempt();
+    try t.smoothDelta(a, "next", now);
+    try std.testing.expectEqualStrings("next", t.entries.items[1].displayText());
 }

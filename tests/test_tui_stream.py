@@ -35,6 +35,7 @@ class StreamReply(Reply):
         self.continue_stream = threading.Event()
         self.paused = threading.Event()
         self.elapsed = 0
+        self.sent_chars = 0
 
 
 class StreamHandler(Handler):
@@ -65,7 +66,9 @@ class StreamHandler(Handler):
             start = time.monotonic()
             for chunk, gap in zip(reply.chunks, reply.gaps):
                 text(chunk)
+                reply.sent_chars += len(chunk)
                 time.sleep(gap)
+            reply.tail_sent = time.monotonic()
             text(reply.tail)
             reply.elapsed = time.monotonic() - start
             reply.paused.set()
@@ -87,7 +90,8 @@ def test_incremental_stream(tmp):
             first_start = time.monotonic()
             reply.reasoning_done.set()
             terminal.until(reply.prefix.strip().encode())
-            assert time.monotonic() - first_start < .5
+            first_latency = time.monotonic() - first_start
+            assert first_latency < .15
             wait_for(lambda: any("Generating response" in row for row in screen(terminal.read(), 120, 32)), "Generating response during text")
             assert not reply.paused.is_set(), "first fragment must appear before the rest is sent"
             terminal.send("\x1b[200~live-draft\x1b[201~")
@@ -96,8 +100,20 @@ def test_incremental_stream(tmp):
             reply.continue_stream.set()
             terminal.until(b"word")
             assert not reply.release.is_set(), "incremental text must not wait for completion"
-            wait_for(reply.paused.is_set, "stream pause")
-            terminal.until(b"PAUSED_TAIL")
+            for milestone in (1000, 10000, 30000):
+                wait_for(lambda: reply.sent_chars >= milestone, f"{milestone} chars", timeout=30)
+                input_start = time.monotonic()
+                token = f"input{milestone}"
+                terminal.send("\x1b[200~" + token + "\x1b[201~")
+                terminal.until(token.encode())
+                input_latency = time.monotonic() - input_start
+                assert input_latency < .05
+                print(f"PTY chars={milestone} input={input_latency * 1000:.1f}ms")
+            wait_for(reply.paused.is_set, "stream pause", timeout=30)
+            wait_for(lambda: any("PAUSED_TAIL" in row for row in screen(terminal.read(), 120, 32)), "visible paused tail")
+            tail_lag = time.monotonic() - reply.tail_sent
+            assert tail_lag < .15
+            print(f"PTY first={first_latency * 1000:.1f}ms input={input_latency * 1000:.1f}ms tail={tail_lag * 1000:.1f}ms")
             assert not finished(home, reply.text), "tail must display while the response is still open"
             output = terminal.read()[start:]
             frames = output.count(b"\x1b[?2026h")
@@ -105,7 +121,7 @@ def test_incremental_stream(tmp):
             print(f"stream: {len(reply.chunks)} deltas in {reply.elapsed:.3f}s, {frames} frames, {len(output)} terminal bytes")
             reply.release.set()
             wait_for(lambda: finished(home, reply.text), "complete stream committed")
-            terminal.until(b"STREAM_END")
+            wait_for(lambda: any("STREAM_END" in row for row in screen(terminal.read(), 120, 32)), "visible final text")
             assert history(home)[-1]["content"] == reply.text
             assert terminal.child.poll() is None
             terminal.send("\x15")

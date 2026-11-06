@@ -59,6 +59,13 @@ pub const Event = union(enum) {
     issue: []u8,
     issues_done,
 
+    pub fn flushesVisible(event: Event) bool {
+        return switch (event) {
+            .delta, .tick, .model_activity, .usage, .progress, .tool_activity => false,
+            else => true,
+        };
+    }
+
     pub fn refresh(event: Event) Frames.Refresh {
         return switch (event) {
             .tick => .animation,
@@ -158,10 +165,7 @@ pub fn run(init: std.process.Init, session: *Session) !void {
     while (true) {
         const event = try loop.nextEvent();
         const refresh = event.refresh();
-        switch (event) {
-            .delta, .tick, .model_activity, .usage, .progress, .tool_activity => {},
-            else => app.transcript.flushVisible(),
-        }
+        if (event.flushesVisible()) app.transcript.flushVisible();
         if (!try app.handle(event)) break;
         const frame_start = std.Io.Clock.Timestamp.now(io, .awake);
         if (frames.due(frame_start, if (refresh != .immediate and app.transcript.hasBacklog()) .content else refresh)) {
@@ -1045,4 +1049,15 @@ test "stream events distinguish reasoning text and Run arguments through retry" 
     _ = try app.handle(.{ .delta = .{ .kind = .text, .text = try t.allocator.dupe(u8, "answer"), .step = 1 } });
     try t.expectEqual(@as(usize, 1), app.transcript.entries.items.len);
     try t.expectEqualStrings("answer", app.transcript.lastAnswer().?);
+}
+
+test "terminal, interaction and Run boundaries flush visible backlog" {
+    const events = [_]Event{
+        .done,                                                              .{ .failed = .{ .message = @constCast("canceled"), .reason = .canceled } },
+        .{ .retry = @constCast("retry") },                                  .{ .run_start = .{ .code = @constCast("run"), .step = 1 } },
+        .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } }, .{ .mouse = .{ .col = 0, .row = 0, .button = .wheel_up, .type = .press, .mods = .{} } },
+    };
+    for (events) |event| try std.testing.expect(event.flushesVisible());
+    try std.testing.expect(!Event.flushesVisible(.tick));
+    try std.testing.expect(!Event.flushesVisible(.{ .delta = .{ .kind = .text, .text = @constCast("text"), .step = 1 } }));
 }

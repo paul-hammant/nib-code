@@ -20,6 +20,8 @@ pub const Kind = enum { user, assistant, run, background, info, err, bill, failu
 
 pub const Entry = struct {
     kind: Kind,
+    allocator: ?std.mem.Allocator = null,
+    markdown_cache: markdown.Cache = .{},
     smooth: ?@import("../smooth.zig").Smooth = null,
     user_bg: vaxis.Color = .default,
     queued: ?u64 = null,
@@ -61,6 +63,7 @@ pub const Entry = struct {
     }
 
     pub fn deinit(e: *Entry, gpa: std.mem.Allocator) void {
+        e.markdown_cache.deinit(gpa);
         if (e.task_id) |id| gpa.free(id);
         if (e.step_effort) |effort| gpa.free(effort.effort);
         if (e.tool_summary) |summary| summary.deinit(gpa);
@@ -136,6 +139,7 @@ pub const Entry = struct {
 
     pub fn print(e: *Entry, win: vaxis.Window, commit: bool) u16 {
         if (e.kind == .assistant) {
+            if (e.allocator) |a| return e.markdown_cache.draw(a, win, e.displayText(), commit);
             return markdown.print(win, e.displayText(), commit);
         }
         if (e.kind == .user and win.width >= 4) return e.printUser(win, commit);

@@ -1,6 +1,6 @@
 # TUI 任务管理与进展
 
-流式文本和任务进展按约 16 ms 的帧间隔合并刷新，不按网络分包逐次重绘；数据始终按接收顺序完整进入对话，不逐字播放、不增加输出队列，也不改变 Session 日志或 `ask` 的流式事件。待刷新内容由定时 tick 兜底，即使服务端暂停发送也不会卡住最后一段。按键、滚动、窗口大小变化和 Turn 结束立即刷新；只有等待动画时按 100 ms 刷新，空闲时不持续重绘。
+Streaming redraws are paced from frame start at roughly 16 ms. The first assistant fragment is visible immediately; later bursts release a backlog-proportional share per frame against a 40 ms display deadline, on grapheme boundaries. Complete text enters the transcript and Session immediately. Ticks drain pending display text during server pauses. Interaction, retry, Run and Turn boundaries flush the display prefix. Reasoning stays hidden and Run arguments are unchanged. Completed Markdown lines cache layout by width; the active tail is reparsed as it grows. Waiting animations refresh at 100 ms; idle does not redraw.
 
 `/tasks` 不调用模型，列出本进程在当前 Session 登记的后台 agent、bash 和自动转后台的 Run。每行显示 id、类型、状态、已运行时长、截止时间及简短描述；没有任务时显示一句提示。排队中的任务显示等待确定截止时间，开始执行后使用工具本身的 timeout；截止时间显示 UTC 时分秒和剩余秒数。detached 显示无截止时间（显式 timeout 仍由工具执行）。Run 没有墙钟截止时间，显示 `per-tool deadlines`，各工具原有截止时间继续生效。已完成任务的时长冻结，不会继续增加。
 
