@@ -14,7 +14,15 @@ nib 是用 Zig 写的编码 agent，以 Run 为工作单位：一段 JavaScript 
 ## 安装与登录
 
 
-需要 Zig 0.17。
+预编译二进制支持 Linux 和 macOS 的 x86_64、arm64：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/yyydddkkk/nib-code/main/install.sh | sh
+```
+
+默认安装到 `~/.local/bin`。设置 `NIB_VERSION=0.5.0`（或 `v0.5.0`）选择版本，`NIB_INSTALL_DIR` 修改安装目录。变量应传给 `sh`，例如 `curl -fsSL https://raw.githubusercontent.com/yyydddkkk/nib-code/main/install.sh | NIB_VERSION=0.5.0 NIB_INSTALL_DIR="$HOME/.local/bin" sh`。
+
+从源码构建（需要 Zig 0.17）：
 
 ```sh
 git clone https://github.com/yyydddkkk/nib-code.git
