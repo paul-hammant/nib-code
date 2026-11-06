@@ -55,7 +55,7 @@ python3 scripts/stats.py ~/.nib/sessions --json
 
 ## 接口与限额
 
-Run 中可调用 `await tools.llm({ prompt, input, schema, model, effort })`，返回 `{ text, data, usage }`，执行一次无工具模型请求。prompt 必填，input 可省略；字符串原样传入，其他可 JSON 序列化值按 JSON 编码，与 prompt 分开，不继承会话历史、项目 AGENTS.md 或 nib system。model/effort 默认跟随有效配置，覆盖只影响本次调用。宿主在当前进程代发一次无工具请求，凭证不进入 JS；子 agent 也可用 llm。schema 可选对象：Codex 用 strict json_schema，Chat Completions 用 json_object 加提示约束；schema 仍受服务端支持的子集限制（如 Codex strict 对象的 additionalProperties:false / required）；宿主只验证合法 JSON，不做完整 schema 校验，返回解析后的 data（无 schema 时为 null）。JSON 解析失败附错误重试一次，仍失败 reject 并带有界原始输出片段；两次已报告 usage 都计入本轮累计用量，与 agent 共用归集路径，TUI/ask --json 更新 usage 快照，calls 记录名为 llm。缓存 key 使用 `<session_id>:llm`，与主会话隔离。
+Run 中可调用 `await tools.llm({ prompt, input, schema, model, effort })`，返回 `{ text, data, usage }`，执行一次无工具模型请求。prompt 必填，input 可省略；字符串原样传入，其他可 JSON 序列化值按 JSON 编码，与 prompt 分开，不继承会话历史、项目 AGENTS.md 或 nib system。model/effort 默认跟随有效配置，覆盖只影响本次调用。宿主在当前进程代发一次无工具请求，凭证不进入 JS；子 agent 也可用 llm。schema 可选对象：Responses 用 strict json_schema，Chat Completions 用 json_object 加提示约束，Anthropic 用提示约束；schema 仍受服务端支持的子集限制（如 Responses strict 对象的 additionalProperties:false / required）；宿主只验证合法 JSON，不做完整 schema 校验，返回解析后的 data（无 schema 时为 null）。JSON 解析失败附错误重试一次，仍失败 reject 并带有界原始输出片段；两次已报告 usage 都计入本轮累计用量，与 agent 共用归集路径，TUI/ask --json 更新 usage 快照，calls 记录名为 llm。缓存 key 使用 `<session_id>:llm`，与主会话隔离。
 
 llm 限额由 [config.toml 的 `[limits]`](config.md#limits) 配置：同进程并发调用默认 4，可配置，超出排队（不计请求超时）；每 Run 调用上限默认 100，可配置，超出时在沙箱入队前 reject；单次 prompt + 序列化 input 合计上限默认 256 KiB（UTF-8 字节），可配置，超出 reject，不截断。请求超时沿用 provider（当前无额外读超时），限流/临时错误复用 `src/provider/retry.zig` 的主会话重试、退避与服务端延迟提示。Esc/SIGINT/SIGTERM 同时取消在途和排队调用。各 Run 仍是无状态沙箱，中间结果用 JSON 文件传递，见 [ADR 0013](adr/0013-llm-functions.md)。
 
@@ -67,13 +67,13 @@ llm 限额由 [config.toml 的 `[limits]`](config.md#limits) 配置：同进程�
 
 文件版本观察只在新建 fork 时复制，不写入会话日志；与普通恢复一致，后续 resume 重新开始观察。
 
-fork 的 model/effort 可覆盖，默认继承产生当前 assistant 请求的实际有效配置（包括一次性的 Run effort），显式覆盖优先；只有 model 与 effort 都相同时才保留父前缀的缓存复用优势，改变任一项就失去这一优势。Codex fork 与 resume 使用相同的模型一致性约束：不能把父历史中的加密推理条目带到另一模型；覆盖 model 也不绕过此检查。Codex fork 的 `prompt_cache_key` 沿用父值，旨在路由到同一缓存；实际能否命中、节省多少仍是待实测假设，不是协议保证，见 [codex.md](codex.md#fork-与父缓存路由) 与 [ADR 0015](adr/0015-agent-fork.md)。
+fork 的 model/effort 可覆盖，默认继承产生当前 assistant 请求的实际有效配置（包括一次性的 Run effort），显式覆盖优先；只有 model 与 effort 都相同时才保留父前缀的缓存复用优势，改变任一项就失去这一优势。Responses/Messages 的 fork 与 resume 使用相同的模型一致性约束：不能把父历史中的密文或签名推理条目带到另一模型；覆盖 model 也不绕过此检查。Codex fork 的 `prompt_cache_key` 沿用父值，旨在路由到同一缓存；实际能否命中、节省多少仍是待实测假设，不是协议保证，见 [codex.md](codex.md#fork-与父缓存路由) 与 [ADR 0015](adr/0015-agent-fork.md)。
 
 前台成功返回 `{ ok: true, id, text, usage, changes }`；子会话超时、崩溃、非零退出或 NDJSON error 返回 `{ ok: false, id, error, text, usage, changes }`，不会 reject，也不会取消同一 Run 中的其他子 agent。id 为任务 id（接续时沿用原 id），不是内部子会话 ID；工具返回值、错误诊断和后台结果不向模型暴露内部子会话 ID。只有参数错误（包括 resume 格式错误）和用户取消（Esc/SIGINT/SIGTERM）仍 reject。text 成功时取 end.text；失败时保留已收到的最终文本（text delta，不含思考或工具代码），没有则为空串。error 保留失败原因、实际耗时（含终止宽限）、任务 id 和文件可能不完整的诊断。usage 和 changes 只统计本次调用，不重复累计子会话之前的历史。
 
 父会话日志持久化任务 id 到内部子会话 ID 的映射，恢复父会话时重建；模型只使用任务 id。只能接续当前父会话的 agent 任务：目标子会话日志的 `parent_session_id` 必须等于当前父会话 id；不存在的任务、非本会话 agent（包括非 agent 任务）或没有内部子会话映射的任务均返回 `ok:false`，不 reject；传入内部子会话 ID 也不能接续。父会话恢复后仍可接续其原有子会话，根会话或其他父会话的子会话不能接续，返回 `ok:false`。执行阶段在等待并发槽之前预留目标 agent；同一 agent 一次只允许一个在途调用（含排队、前台和后台），busy 时立即返回 `ok:false`，不排队、不分配新 id。预留在完成、失败或取消时释放，前台和后台共用；日志独占锁另外阻止跨进程同时接续，包括 CLI。失败、超时或取消不删除已有映射；内部子会话日志可恢复时仍可接续，尚未取得内部子会话 ID 的任务没有可接续映射。停止不回滚文件，日志或 changes 不保证包含中断前的全部改动。
 
-timeout_ms 可省略，默认 30 分钟，不计排队时间。model/effort 省略时继承父会话的当前有效配置，接续时也不改为沿用子会话上次覆盖值；覆盖只影响本次子调用，不影响父会话或切换 provider，effort 沿用现有校验与映射。恢复的 provider 必须与日志一致，Codex 模型也必须相同（见 [codex.md](codex.md)）；父会话当前模型与子会话原模型不同时，省略 model 的接续调用仍受此约束。同时运行的子会话上限默认 4，可配置（全部工具最多同时运行 8 个）。子会话沿用 cwd、有效 provider/模型配置及限额（通过 stdin 管道传递，子会话跳过配置文件读取；Codex 凭证各自读取）。内部环境变量 `NIB_AGENT_DEPTH` 从 0 递增，深度达到 1 时，默认新建子会话的工具说明与实际 JS API 都移除 agent；fork 为保留父请求前缀不改写说明/schema，但运行时同样不能调用 agent。`NIB_PARENT_SESSION_ID` 写入新子会话日志首条记录的 `parent_session_id`。显式 `--resume` 子会话仍保留深度限制；`--continue` 跳过子会话。
+timeout_ms 可省略，默认 30 分钟，不计排队时间。model/effort 省略时继承父会话的当前有效配置，接续时也不改为沿用子会话上次覆盖值；覆盖只影响本次子调用，不影响父会话或切换 provider，effort 沿用现有校验与映射。恢复的 provider 必须与日志一致，Responses/Messages 模型也必须相同（见 [providers.md](providers.md)）；父会话当前模型与子会话原模型不同时，省略 model 的接续调用仍受此约束。同时运行的子会话上限默认 4，可配置（全部工具最多同时运行 8 个）。子会话沿用 cwd、有效 provider/模型配置及限额（通过 stdin 管道传递，子会话跳过配置文件读取；Codex 凭证各自读取）。内部环境变量 `NIB_AGENT_DEPTH` 从 0 递增，深度达到 1 时，默认新建子会话的工具说明与实际 JS API 都移除 agent；fork 为保留父请求前缀不改写说明/schema，但运行时同样不能调用 agent。`NIB_PARENT_SESSION_ID` 写入新子会话日志首条记录的 `parent_session_id`。显式 `--resume` 子会话仍保留深度限制；`--continue` 跳过子会话。
 
 `background` 可选，默认 false，保留上述前台等待行为。设为 true 时，调用在成功登记后台任务后立即返回 `{ id }` 启动确认；接续 `a1` 时仍为 `{ id: "a1" }`，busy、不存在或非本会话 agent 直接返回 `ok:false`，不登记后台任务。子会话由父会话持有，可跨 Run 继续工作；父模型可继续其他 Step，不需要额外的查询或等待工具。任务完成后，Session 在下一次主模型请求前，把 `[background agent <id> finished]` 和截断后的 `{ok,id,text,changes,error?}` JSON（id 与启动确认相同）作为 user 消息插入历史，不含 usage。结果不会在模型流式响应或 Run 执行中途插入，也不会当作用户新 Turn。若模型已给出无工具回答但仍有后台任务，Session 等待下一条 inbox 消息（后台结果或用户插话），按 FIFO 插入后发起新 Step；不必等待全部后台任务完成。
 
@@ -103,7 +103,7 @@ bash 与子会话复用标准库子进程等待和进程组执行器。所有 ba
 
 ## 工具说明的生成
 
-新会话构建 system 时，`src/tools.zig` 根据有效 provider 配置生成 llm 的模型列表：Codex 模型取自 `src/provider/codex.zig` 的目录；Chat Completions 至少提供 `src/provider/openai.zig` 的默认模型，另加入当前配置模型并去重。effort 说明只列常用的 low/medium/high，省略 model/effort 仍继承当前配置；完整档位与映射见 [config.md](config.md) 和 [codex.md](codex.md)。选择只在当前 provider 内进行，不隐式切换 provider。
+新会话构建 system 时，`src/tools.zig` 根据有效 provider 配置生成 llm 的模型列表：内置模型取自 `src/provider.zig` 的表（Codex 的原目录保留在 `src/provider/responses.zig`）；旧 Chat Completions 至少提供 `src/provider/openai.zig` 的默认模型，另加入当前配置模型并去重。effort 说明只列常用的 low/medium/high，省略 model/effort 仍继承当前配置；完整档位与映射见 [config.md](config.md) 和 [codex.md](codex.md)。选择只在当前 provider 内进行，不隐式切换 provider。
 
 工具说明中的模型名按 JSON 字符串编码，不直接插入原始配置文本。根会话与默认新建子会话使用同一生成路径，但默认子会话隐藏 agent；fork 复用父 system/schema，不重新生成，agent 的不可递归边界由运行时执行。恢复会话仍沿用日志原始 system，不改写历史。架构理由见 [ADR 0010](adr/0010-subagents.md)、[ADR 0013](adr/0013-llm-functions.md) 与 [ADR 0015](adr/0015-agent-fork.md)。
 
@@ -122,3 +122,5 @@ bash 与子会话复用标准库子进程等待和进程组执行器。所有 ba
 旧调用 resolve 为 `{superseded_by:"bN"}`，没有 exit_code、output 或 error：它表示已被更新的同一验证取代，不表示验证通过或失败。后台 bash 的消息带 `background_ok:true`；自动后台 Run 的 await 拿到同样的数据，脚本继续执行，Run 最终状态由脚本决定。需要检查退出码的脚本可用 `if (!r.superseded_by && r.exit_code !== 0) ...`；无条件检查退出码的旧脚本仍可能自行抛错。只取代该 bash，不停止整个 Run 或其余工具，继续脚本仍可产生副作用。
 
 修改代数在成功 edit/write 后推进，与界面 changes 统计是否启用无关；最多读取 16 MiB 比较旧内容，无效 edit、失败写入、已确认内容相同的覆盖不计，创建空文件也计。旧内容超过读取上限或不可读时，成功 write 保守地计为修改。它是 Session 级记录，不推断文件依赖，因此任何 edit/write 都可能使旧命令过时；bash 自身副作用、用户编辑、其他 Session/子 agent 的写入无法据此识别。进程组清理沿用 stop/取消路径，20 ms 轮询观察停止标志，新执行不等旧进程自然退出。匹配的全部旧命令各取代一次；后台并发准入限额仍正常检查。停止前已产生的文件或其他副作用不会回滚。设计取舍见 [ADR 0016](adr/0016-superseded-bash.md)，独立启动/取代事件及统计见 [日志](session-log.md#bash-启动与取代事件)。
+
+API key 服务的有效配置经 stdin 只传密钥环境变量名，各子进程独立读取；仅选定密钥进入 nib 子进程，bash 仍清除密钥。新增缓存写入用量字段见 [providers.md](providers.md)。

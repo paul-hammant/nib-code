@@ -36,6 +36,12 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try stdout.writeAll(help);
+            var config_detail: ?[]u8 = null;
+            const active: ?provider.Config = blk: {
+                const home_path = config.home(init.arena.allocator(), init.environ_map) catch break :blk null;
+                break :blk config.load(init.arena.allocator(), init.io, init.environ_map, home_path, &config_detail) catch null;
+            };
+            if (active) |cfg| try stdout.print("Active provider: {s}\n", .{cfg.name()}) else try stdout.writeAll("Active provider: unavailable (invalid configuration)\n");
             return stdout.flush();
         }
     }
@@ -96,6 +102,7 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
         const data = try input.interface.allocRemaining(init.arena.allocator(), .unlimited);
         const envelope = try std.json.parseFromSliceLeaky(@import("tools/agent/input.zig").Input, init.arena.allocator(), data, .{});
         cfg = envelope.config;
+        if (cfg.api_key_env) |key_env| cfg.api_key = init.environ_map.get(key_env) orelse "";
         prompt = envelope.prompt;
         options.fork = envelope.fork;
         options.undo_dir = envelope.undo_dir;
@@ -115,7 +122,10 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
         return;
     }
     if (effort) |value| try cfg.setEffort(value);
-    if (ask and cfg.missingKey()) return error.MissingApiKey;
+    if (ask and cfg.missingKey()) {
+        detail.* = try std.fmt.allocPrint(gpa, "{s}: no API key; set {s}.", .{ cfg.name(), cfg.api_key_env orelse "the provider key environment variable" });
+        return error.MissingApiKey;
+    }
     options.undo_enabled = !ask;
     var session = try Session.init(gpa, init.io, &client, cfg, options);
     defer session.deinit();

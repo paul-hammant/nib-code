@@ -1,6 +1,6 @@
 const std = @import("std");
 const chat = @import("provider/openai.zig");
-const codex = @import("provider/codex.zig");
+const codex = @import("provider/responses.zig");
 const cancelable = @import("provider/cancel.zig");
 const model_timing = @import("provider/timing.zig");
 const retry = @import("provider/retry.zig");
@@ -14,7 +14,45 @@ pub const ModelTiming = model_timing.Model;
 pub const CodexState = @import("provider/codex_ws.zig").State;
 pub const Transport = enum { sse, websocket };
 
-pub const Id = enum { chat_completions, codex };
+pub const Protocol = enum { responses, chat_completions, anthropic_messages };
+pub const Id = blk: {
+    var names: [definitions.len + 1][:0]const u8 = undefined;
+    var values: [definitions.len + 1]u8 = undefined;
+    for (definitions, 0..) |entry, i| {
+        names[i] = std.fmt.comptimePrint("{s}", .{entry.id});
+        values[i] = i;
+    }
+    names[definitions.len] = "custom";
+    values[definitions.len] = definitions.len;
+    break :blk @Enum(u8, .exhaustive, &names, &values);
+};
+
+pub const Model = struct { id: []const u8, context_window: u64, max_output: u32 = 128000, can_disable_reasoning: bool = true };
+
+pub const Definition = struct {
+    id: []const u8,
+    name: []const u8,
+    protocol: Protocol,
+    base_url: []const u8,
+    api_key_env: []const []const u8,
+    default_model: []const u8,
+    models: []const Model = &.{},
+    custom_run: bool = false,
+};
+
+pub const definitions = [_]Definition{
+    .{ .id = "codex", .models = &codex.models, .name = "Codex", .protocol = .responses, .base_url = "https://chatgpt.com/backend-api", .api_key_env = &.{}, .default_model = codex.default_model },
+    .{ .id = "chat_completions", .name = "Chat Completions", .protocol = .chat_completions, .base_url = "https://api.deepseek.com", .api_key_env = &.{ "NIB_API_KEY", "DEEPSEEK_API_KEY" }, .default_model = chat.default_model },
+    .{ .id = "openai", .custom_run = true, .name = "OpenAI", .protocol = .responses, .base_url = "https://api.openai.com/v1", .api_key_env = &.{"OPENAI_API_KEY"}, .default_model = "gpt-6.1-sol", .models = &.{ .{ .id = "gpt-6.1-sol", .context_window = 1050000 }, .{ .id = "gpt-6.1-terra", .context_window = 1050000 } } },
+    .{ .id = "anthropic", .name = "Anthropic", .protocol = .anthropic_messages, .base_url = "https://api.anthropic.com", .api_key_env = &.{"ANTHROPIC_API_KEY"}, .default_model = "claude-sonnet-5-5", .models = &.{ .{ .id = "claude-opus-5-5", .context_window = 1000000 }, .{ .id = "claude-sonnet-5-5", .context_window = 1000000 }, .{ .id = "claude-haiku-5-5", .context_window = 1000000 }, .{ .id = "claude-fable-5-1", .context_window = 1000000 } } },
+    .{ .id = "deepseek", .name = "DeepSeek", .protocol = .chat_completions, .base_url = "https://api.deepseek.com", .api_key_env = &.{"DEEPSEEK_API_KEY"}, .default_model = "deepseek-flash", .models = &.{ .{ .id = "deepseek-flash", .context_window = 1000000 }, .{ .id = "deepseek-v4-pro", .context_window = 1000000 } } },
+    .{ .id = "xai", .name = "xAI", .protocol = .responses, .base_url = "https://api.x.ai/v1", .api_key_env = &.{"XAI_API_KEY"}, .default_model = "grok-4.7", .models = &.{ .{ .id = "grok-4.7", .context_window = 500000 }, .{ .id = "grok-4.6", .context_window = 500000 } } },
+};
+
+pub fn definition(id: Id) Definition {
+    for (definitions) |entry| if (std.mem.eql(u8, entry.id, @tagName(id))) return entry;
+    unreachable;
+}
 
 pub const Limits = struct {
     llm_concurrency: usize = 4,
@@ -33,6 +71,9 @@ pub const Config = struct {
     enabled_skills: []const []const u8 = &.{},
     limits: Limits = .{},
     provider: Id = .chat_completions,
+    custom_provider: ?[]const u8 = null,
+    custom_protocol: Protocol = .chat_completions,
+    api_key_env: ?[]const u8 = null,
     codex_transport: Transport = .websocket,
     codex_run_tool: enum { custom, function } = .custom,
     reasoning_summary: enum { off, auto } = .off,
@@ -48,6 +89,18 @@ pub const Config = struct {
     prompt_cache_key: ?[]const u8 = null,
     /// Values `setEffort` accepts; `default` and `off` first, then levels.
     pub const effort_values = [_][]const u8{ "default", "off", "none", "minimal", "low", "medium", "high", "xhigh", "max" };
+
+    pub fn name(cfg: Config) []const u8 {
+        return cfg.custom_provider orelse @tagName(cfg.provider);
+    }
+
+    pub fn protocol(cfg: Config) Protocol {
+        return if (cfg.provider == .custom) cfg.custom_protocol else definition(cfg.provider).protocol;
+    }
+
+    pub fn customRun(cfg: Config) bool {
+        return (cfg.provider == .codex and cfg.codex_run_tool == .custom) or (cfg.provider != .custom and cfg.provider != .codex and definition(cfg.provider).custom_run);
+    }
 
     pub fn setEffort(cfg: *Config, value: []const u8) !void {
         const known = for (effort_values) |v| {
@@ -66,18 +119,19 @@ pub const Config = struct {
     }
 
     pub fn effectiveEffort(cfg: Config) []const u8 {
-        if (cfg.provider == .codex) return codex.reasoningEffort(cfg) orelse "server default";
+        if (cfg.protocol() == .responses) return codex.reasoningEffort(cfg) orelse "server default";
+        if (cfg.protocol() == .anthropic_messages) return @import("provider/anthropic.zig").effort(cfg) orelse "server default";
         if (cfg.thinking == false) return "off";
         return cfg.reasoning_effort orelse if (cfg.thinking == true) "on (server default effort)" else "server default";
     }
 
     pub fn missingKey(cfg: Config) bool {
-        return cfg.provider == .chat_completions and cfg.api_key.len == 0;
+        return cfg.provider != .codex and cfg.api_key.len == 0 and (cfg.provider != .custom or cfg.api_key_env != null);
     }
 
     pub fn checkSession(cfg: Config, id: Id, model: ?[]const u8) !void {
         if (cfg.provider != id) return error.SessionProviderMismatch;
-        if (cfg.provider == .codex) if (model) |original| {
+        if (cfg.protocol() != .chat_completions) if (model) |original| {
             if (!std.mem.eql(u8, original, cfg.model)) return error.SessionModelMismatch;
         };
     }
@@ -129,11 +183,28 @@ pub const Usage = struct {
     prompt_tokens: u64 = 0,
     completion_tokens: u64 = 0,
     prompt_cache_hit_tokens: u64 = 0,
+    prompt_cache_write_tokens: u64 = 0,
+
+    pub fn jsonStringify(u: Usage, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("prompt_tokens");
+        try jw.write(u.prompt_tokens);
+        try jw.objectField("completion_tokens");
+        try jw.write(u.completion_tokens);
+        try jw.objectField("prompt_cache_hit_tokens");
+        try jw.write(u.prompt_cache_hit_tokens);
+        if (u.prompt_cache_write_tokens > 0) {
+            try jw.objectField("prompt_cache_write_tokens");
+            try jw.write(u.prompt_cache_write_tokens);
+        }
+        try jw.endObject();
+    }
 
     pub fn add(u: *Usage, other: Usage) void {
         u.prompt_tokens += other.prompt_tokens;
         u.completion_tokens += other.completion_tokens;
         u.prompt_cache_hit_tokens += other.prompt_cache_hit_tokens;
+        u.prompt_cache_write_tokens += other.prompt_cache_write_tokens;
     }
 };
 
@@ -192,9 +263,10 @@ pub fn stream(
     monitor.request_duration.raw = .fromSeconds(@intCast(cfg.limits.request_timeout_s));
     var observed_sink = sink;
     observed_sink.monitor = &monitor;
-    return switch (cfg.provider) {
+    return switch (cfg.protocol()) {
         .chat_completions => cancelable.run(client.io, cancel, monitor.started.addDuration(monitor.request_duration), chat.stream, .{ gpa, out, client, cfg, messages, tools_json, max_tokens, observed_sink, cancel, detail, &monitor }),
-        .codex => cancelable.run(client.io, cancel, monitor.started.addDuration(monitor.request_duration), codex.stream, .{ gpa, out, client, cfg, cache_key, messages, tools_json, max_tokens, observed_sink, cancel, detail, &monitor }),
+        .responses => cancelable.run(client.io, cancel, monitor.started.addDuration(monitor.request_duration), codex.stream, .{ gpa, out, client, cfg, cache_key, messages, tools_json, max_tokens, observed_sink, cancel, detail, &monitor }),
+        .anthropic_messages => cancelable.run(client.io, cancel, monitor.started.addDuration(monitor.request_duration), @import("provider/anthropic.zig").stream, .{ gpa, out, client, cfg, messages, tools_json, max_tokens, observed_sink, cancel, detail, &monitor }),
     } catch |err| {
         if (cfg.provider == .codex) if (sink.codex_state) |state| {
             state.reset(gpa);
@@ -229,4 +301,17 @@ test "explicit effort overrides thinking and stores stable names" {
     try t.expectEqualStrings("max", cfg.effectiveEffort());
     try cfg.setEffort("off");
     try t.expectEqualStrings("off", cfg.effectiveEffort());
+}
+
+test "provider definitions cover every identity exactly once" {
+    for (std.meta.tags(Id)) |id| {
+        if (id == .custom) continue;
+        var count: usize = 0;
+        for (definitions) |entry| {
+            if (std.mem.eql(u8, entry.id, @tagName(id))) count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), count);
+        try std.testing.expect(definition(id).base_url.len > 0);
+        try std.testing.expect(definition(id).default_model.len > 0);
+    }
 }

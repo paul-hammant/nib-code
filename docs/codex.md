@@ -1,5 +1,7 @@
 # 用本机 Codex 登录运行 nib
 
+其他 API key 服务与自定义站点见 [providers.md](providers.md)。Codex 是共享 Responses 协议上的 ChatGPT 登录与 WS 扩展；默认行为保持不变。
+
 先通过 `codex` 完成 ChatGPT 登录，再运行：
 
 ```sh

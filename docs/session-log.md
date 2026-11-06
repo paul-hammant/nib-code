@@ -166,3 +166,5 @@ Codex 新响应的 `reasoning.includes_output:true` 表示 `reasoning.data` 是�
 `scripts/stats.py` 的 JSON 字段 `bash_superseded` 统计入选记录中的 `superseded` 次数，文本显示“Bash 被取代次数”。按 --since 的事件 at 过滤；事件不计作 Step、Turn 或失败。被取代的工具 resolve 数据与后台结果仍走原有录制/消息路径；其含义和脚本分支见 [tool-delegation.md](tool-delegation.md#同一命令取代过时执行)。
 
 `task_stop` 是单独的任务控制记录，包含 `id`、`reason`、`stopped`，不改变模型历史；TUI `/stop` 的 reason 为 `user requested stop`。tool 消息中的 `run_ok` 与 `background_id` 供 TUI 恢复显示使用，不改变发给 provider 的工具结果正文。
+
+自定义服务以 header 的 `provider:"custom"` 与 `custom_provider` 共同标识，跨自定义 id 恢复仍拒绝。usage 新增可选 `prompt_cache_write_tokens`，缺省为零；输入总 tokens 已含缓存创建。`scripts/stats.py` 对有写入的日志累加该字段。

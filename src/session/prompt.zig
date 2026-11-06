@@ -122,7 +122,7 @@ pub fn stepLimitPrompt(a: std.mem.Allocator, base: []const u8, max_steps: ?usize
 
 test "system prompt documents every tool in JavaScript" {
     const gpa = std.testing.allocator;
-    var host: tools.Tools = .{ .io = std.testing.io, .home = "/unused", .cfg = .{ .provider = .codex, .base_url = "", .api_key = "", .model = @import("../provider/codex.zig").default_model } };
+    var host: tools.Tools = .{ .io = std.testing.io, .home = "/unused", .cfg = .{ .provider = .codex, .base_url = "", .api_key = "", .model = @import("../provider/responses.zig").default_model } };
     const prompt = try renderSystem(gpa, "/work", &host, null);
     defer gpa.free(prompt);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "```js\n") != null);
@@ -157,7 +157,7 @@ test "system prompt renders configured Run display budget" {
 
 test "only Codex system prompts include effort cache facts, independent of patches" {
     const t = std.testing;
-    var host: tools.Tools = .{ .io = t.io, .home = "/unused", .cfg = .{ .provider = .codex, .base_url = "", .api_key = "", .model = @import("../provider/codex.zig").default_model } };
+    var host: tools.Tools = .{ .io = t.io, .home = "/unused", .cfg = .{ .provider = .codex, .base_url = "", .api_key = "", .model = @import("../provider/responses.zig").default_model } };
     var env: std.process.Environ.Map = .init(t.allocator);
     defer env.deinit();
     try env.put("NIB_PATCHES_OFF", "all");

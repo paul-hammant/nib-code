@@ -49,7 +49,7 @@ _Avoid_: function, programmatic tool, native tool
 ## 模型
 
 **Provider**：
-一个模型服务及其线路协议，如 OpenAI 兼容的 Chat Completions。
+一个有独立身份、凭证和模型目录的服务，如 Codex、OpenAI 或用户自定义站点；多个 Provider 可以使用同一种线路协议。
 _Avoid_: backend, API（太宽泛）
 
 **Reasoning**（推理内容）：

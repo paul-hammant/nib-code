@@ -8,7 +8,7 @@ pub const environment_names = [_][]const u8{
     "MISTRAL_API_KEY",     "COHERE_API_KEY",         "TOGETHER_API_KEY",      "OPENROUTER_API_KEY",
     "HF_TOKEN",            "HUGGING_FACE_HUB_TOKEN", "GITHUB_TOKEN",          "GH_TOKEN",
     "GITLAB_TOKEN",        "AWS_ACCESS_KEY_ID",      "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
-    "AZURE_CLIENT_SECRET",
+    "AZURE_CLIENT_SECRET", "XAI_API_KEY",
 };
 
 pub fn removeFrom(env: *std.process.Environ.Map) void {

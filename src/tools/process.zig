@@ -12,6 +12,8 @@ const Stop = error{ Canceled, TimedOut };
 
 pub const Options = struct {
     execution: ?*Execution = null,
+    inherit_api_key: ?[]const u8 = null,
+    strip_api_key: ?[]const u8 = null,
     spawn: std.process.SpawnOptions,
     cancel: *const std.atomic.Value(bool),
     timeout_ms: i64,
@@ -44,6 +46,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Result {
     var env = if (opts.environ_map) |map| try map.clone(gpa) else try inheritedEnvironment(gpa);
     defer env.deinit();
     secrets.removeFrom(&env);
+    if (options.strip_api_key) |name| _ = env.swapRemove(name);
+    if (options.inherit_api_key) |name| if (options.spawn.environ_map) |source| {
+        if (source.get(name)) |value| try env.put(name, value);
+    };
     opts.environ_map = &env;
     if (options.input != null) opts.stdin = .pipe;
     opts.pgid = 0;
@@ -305,4 +311,25 @@ test "process zero timeout still honors cancellation" {
     });
     defer testing.allocator.free(result.output);
     try testing.expectEqual(error.Canceled, result.stop.?);
+}
+
+test "only the selected API key reaches nib children and custom keys are stripped from bash" {
+    const t = std.testing;
+    var env: std.process.Environ.Map = .init(t.allocator);
+    defer env.deinit();
+    try env.put("SITE_KEY", "fake-custom-secret");
+    try env.put("OPENAI_API_KEY", "other-fake-secret");
+    var cancel: std.atomic.Value(bool) = .init(false);
+    for ([_]bool{ false, true }) |inherit| {
+        const result = try run(t.allocator, t.io, .{
+            .spawn = .{ .argv = &.{"env"}, .environ_map = &env, .stdout = .pipe, .stderr = .ignore },
+            .cancel = &cancel,
+            .timeout_ms = 1000,
+            .strip_api_key = if (inherit) null else "SITE_KEY",
+            .inherit_api_key = if (inherit) "SITE_KEY" else null,
+        });
+        defer t.allocator.free(result.output);
+        try t.expectEqual(inherit, std.mem.indexOf(u8, result.output, "fake-custom-secret") != null);
+        try t.expect(std.mem.indexOf(u8, result.output, "other-fake-secret") == null);
+    }
 }

@@ -76,6 +76,7 @@ pub const Session = struct {
         if (options.fork) |fork| {
             if (options.resume_id != null or options.continue_latest) return error.ConflictingForkOptions;
             try cfg.checkSession(fork.provider, fork.model);
+            if (!std.mem.eql(u8, cfg.custom_provider orelse "", fork.custom_provider orelse "")) return error.SessionProviderMismatch;
         }
         var s: Session = .{
             .gpa = gpa,
@@ -110,6 +111,7 @@ pub const Session = struct {
             s.pending_background_bytes = s.log.pending_background_bytes;
             errdefer s.log.close(io);
             try cfg.checkSession(s.log.provider, s.log.model);
+            if (!std.mem.eql(u8, cfg.custom_provider orelse "", s.log.custom_provider orelse "")) return error.SessionProviderMismatch;
             s.cache_key = s.log.cache_key orelse s.id;
             s.tools.forked = s.log.forked_from != null;
             s.parent_session_id = s.log.parent_session_id;
@@ -134,6 +136,7 @@ pub const Session = struct {
                     .context_tokens = compaction.estimateTokens(messages),
                     .cwd = cwd,
                     .provider = cfg.provider,
+                    .custom_provider = cfg.custom_provider,
                     .model = cfg.model,
                     .parent_session_id = s.parent_session_id,
                     .cache_key = s.cache_key,
@@ -155,6 +158,7 @@ pub const Session = struct {
                     .messages = &.{.{ .role = "system", .content = system }},
                     .cwd = cwd,
                     .provider = cfg.provider,
+                    .custom_provider = cfg.custom_provider,
                     .model = cfg.model,
                     .parent_session_id = s.parent_session_id,
                     .cache_key = s.cache_key,
@@ -229,7 +233,7 @@ pub const Session = struct {
     }
 
     pub fn commit(s: *Session, from: usize, messages: []const provider.Message, tokens: u64, cwd: ?[]const u8) !void {
-        try s.log.commit(s.io, s.gpa, &s.history, &s.context_tokens, .{ .from = from, .messages = messages, .context_tokens = tokens, .task_ids = s.tools.progress.highWater(s.io), .cwd = cwd, .provider = if (cwd != null) s.cfg.provider else null, .model = s.cfg.model, .parent_session_id = if (cwd != null) s.parent_session_id else null });
+        try s.log.commit(s.io, s.gpa, &s.history, &s.context_tokens, .{ .from = from, .messages = messages, .context_tokens = tokens, .task_ids = s.tools.progress.highWater(s.io), .cwd = cwd, .provider = if (cwd != null) s.cfg.provider else null, .custom_provider = if (cwd != null) s.cfg.custom_provider else null, .model = s.cfg.model, .parent_session_id = if (cwd != null) s.parent_session_id else null });
     }
 
     pub const Compaction = compaction.Compaction;
@@ -330,9 +334,9 @@ pub const Session = struct {
         const marker = if (terminated) "[interrupted: process terminated]" else "[interrupted by user]";
         const text = if (partial.text.items.len == 0) marker else try std.fmt.allocPrint(a, "{s}\n\n{s}", .{ partial.text.items, marker });
         var reasoning: ?provider.Reasoning = null;
-        if (s.cfg.provider == .chat_completions and s.cfg.thinking != false) {
+        if (s.cfg.protocol() == .chat_completions and s.cfg.thinking != false) {
             // DeepSeek thinking mode rejects any later request whose assistant messages lack reasoning_content.
-            reasoning = .{ .provider = .chat_completions, .data = if (partial.reasoning.items.len == 0) marker else try a.dupe(u8, partial.reasoning.items) };
+            reasoning = .{ .provider = s.cfg.provider, .data = if (partial.reasoning.items.len == 0) marker else try a.dupe(u8, partial.reasoning.items) };
         }
         var messages: std.ArrayList(provider.Message) = .empty;
         defer messages.deinit(s.gpa);
@@ -466,6 +470,7 @@ pub const Session = struct {
                     .cache_key = s.cache_key,
                     .id = "",
                     .provider = s.cfg.provider,
+                    .custom_provider = s.cfg.custom_provider,
                     .model = s.cfg.model,
                     .thinking = decision.cfg.thinking,
                     .reasoning_effort = decision.cfg.reasoning_effort,
@@ -769,7 +774,7 @@ test "fork initialization copies history and resume retains independent identity
             .{ .id = "second", .function = .{ .name = "run", .arguments = "{}" } },
         } },
     };
-    const fork: Fork = .{ .session = "parent-session", .message_count = messages.len, .history = &messages, .cache_key = "root-cache-key", .id = "a2", .provider = cfg.provider, .model = cfg.model };
+    const fork: Fork = .{ .session = "parent-session", .message_count = messages.len, .history = &messages, .cache_key = "root-cache-key", .id = "a2", .provider = cfg.provider, .custom_provider = cfg.custom_provider, .model = cfg.model };
     var codex_fork = fork;
     codex_fork.provider = .codex;
     var wrong_model = cfg;
