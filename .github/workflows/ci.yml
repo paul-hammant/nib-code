@@ -101,7 +101,7 @@ jobs:
               (sleep 90; for pid in $(pgrep -x nib); do sample "$pid" 1 -file "e2e-logs/sample-$pid.log"; cat "e2e-logs/sample-$pid.log"; done) &
               watchdog=$!
             fi
-            python3 -u -c 'import faulthandler, runpy, sys; faulthandler.dump_traceback_later(60, repeat=True); sys.path.insert(0, "tests"); runpy.run_path(sys.argv[1], run_name="__main__")' "$test" 2>&1 | tee "e2e-logs/$(basename "$test").log" || failed=1
+            python3 -u -c 'import faulthandler, runpy, sys; faulthandler.dump_traceback_later(60, repeat=True); sys.path.insert(0, "tests"); runpy.run_path(sys.argv.pop(), run_name="__main__")' "$test" 2>&1 | tee "e2e-logs/$(basename "$test").log" || failed=1
             if [[ "$RUNNER_OS" == macOS ]]; then kill "$watchdog" 2>/dev/null || true; fi
           done
           exit "$failed"
