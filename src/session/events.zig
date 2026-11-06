@@ -11,6 +11,7 @@ pub const Progress = struct {
     invocation: usize = 0,
     kind: Background.Kind = .agent,
     elapsed_ms: u64 = 0,
+    superseded_by: ?[]const u8 = null,
     background: bool = false,
     detached: bool = false,
     fork: bool = false,
@@ -28,11 +29,14 @@ pub const Progress = struct {
         errdefer freeStrings(gpa, used);
         const files = try cloneStrings(gpa, p.files);
         errdefer freeStrings(gpa, files);
+        const replacement = if (p.superseded_by) |id| try gpa.dupe(u8, id) else null;
+        errdefer if (replacement) |id| gpa.free(id);
         const id = try gpa.dupe(u8, p.id);
-        return .{ .kind = p.kind, .elapsed_ms = p.elapsed_ms, .run = p.run, .invocation = p.invocation, .background = p.background, .detached = p.detached, .fork = p.fork, .id = id, .prompt = prompt, .state = p.state, .step = p.step, .tools = used, .files = files, .usage = p.usage };
+        return .{ .superseded_by = replacement, .kind = p.kind, .elapsed_ms = p.elapsed_ms, .run = p.run, .invocation = p.invocation, .background = p.background, .detached = p.detached, .fork = p.fork, .id = id, .prompt = prompt, .state = p.state, .step = p.step, .tools = used, .files = files, .usage = p.usage };
     }
 
     pub fn deinit(p: *Progress, gpa: std.mem.Allocator) void {
+        if (p.superseded_by) |id| gpa.free(id);
         gpa.free(p.prompt);
         gpa.free(p.id);
         freeStrings(gpa, p.tools);
@@ -109,7 +113,7 @@ pub const Event = union(enum) {
     /// Slices are valid only during the callback.
     delta: struct { kind: provider.Kind, text: []const u8 },
     run_start: []const u8,
-    run_end: struct { ok: bool, output: []const u8, changes: []const Change = &.{}, tool_summary: ?Summary = null },
+    run_end: struct { background_id: ?[]const u8 = null, ok: bool, output: []const u8, changes: []const Change = &.{}, tool_summary: ?Summary = null },
     retry: struct { attempt: u32, delay_ms: u64, reason: []const u8 },
     notice: []const u8,
     usage: provider.Usage,

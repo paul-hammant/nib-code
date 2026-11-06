@@ -58,7 +58,9 @@ const Row = struct {
         if (p.kind != .agent) {
             try text.appendSlice(gpa, " · ");
             try appendElapsed(gpa, &text, p.elapsed_ms);
-            try text.print(gpa, " · {s}", .{state});
+            if (p.superseded_by) |id| {
+                try text.print(gpa, " · superseded by {s}", .{id});
+            } else try text.print(gpa, " · {s}", .{state});
         } else {
             try text.print(gpa, " · {s} · step {d}", .{ state, p.step });
         }

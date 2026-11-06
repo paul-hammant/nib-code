@@ -59,10 +59,16 @@ pub const Transcript = struct {
         e.task_id = try gpa.dupe(u8, id);
         try e.text.appendSlice(gpa, result);
         try e.label.print(gpa, "{s} {s} · {s}", .{ id, @tagName(kind), if (ok) "ok" else "failed" });
-        const Summary = struct { text: ?[]const u8 = null, output: ?[]const u8 = null, @"error": ?[]const u8 = null };
+        const Summary = struct { superseded_by: ?[]const u8 = null, text: ?[]const u8 = null, output: ?[]const u8 = null, @"error": ?[]const u8 = null };
         const parsed = std.json.parseFromSlice(Summary, gpa, result, .{ .ignore_unknown_fields = true }) catch null;
         if (parsed) |summary| {
             defer summary.deinit();
+            if (summary.value.superseded_by) |replacement| {
+                e.run = .superseded;
+                e.label.clearRetainingCapacity();
+                try e.label.print(gpa, "{s} superseded by {s}", .{ id, replacement });
+                try t.replaceBash(gpa, id, replacement);
+            }
             const output = if (kind == .agent) summary.value.text orelse "" else summary.value.output orelse "";
             const preview = if (output.len > 0) output else summary.value.@"error" orelse "";
             if (preview.len > 0) {
@@ -83,7 +89,24 @@ pub const Transcript = struct {
                 }
             }
         }
+        if (kind == .run) try e.label.print(gpa, " · source Run → {s}", .{id});
         try t.entries.append(gpa, e);
+    }
+
+    fn replaceBash(t: *Transcript, gpa: std.mem.Allocator, id: []const u8, replacement: []const u8) !void {
+        for (t.entries.items) |*entry| {
+            for (entry.agents.items) |*p| {
+                if (!std.mem.eql(u8, p.id, id)) continue;
+                const copy = try gpa.dupe(u8, replacement);
+                if (p.superseded_by) |old| gpa.free(old);
+                p.superseded_by = copy;
+                p.state = .done;
+                p.background = false;
+            }
+            try entry.refreshAgents(gpa);
+            try entry.refreshLabel(gpa);
+            entry.cached = null;
+        }
     }
 
     pub fn lostBackground(t: *Transcript, gpa: std.mem.Allocator, kind: BackgroundKind, id: []const u8, result: []const u8) !void {
@@ -270,7 +293,7 @@ pub const Transcript = struct {
             c.deinit(gpa);
             return;
         };
-        e.run = if (ok) .ok else .failed;
+        e.run = if (e.task_id != null) .background else if (ok) .ok else .failed;
         e.elapsed_ms = elapsed_ms;
         e.changes.deinit(gpa);
         e.changes = changes;
@@ -278,6 +301,11 @@ pub const Transcript = struct {
         try appendHead(gpa, &e.output, output, run_output_lines);
         try e.refreshLabel(gpa);
         e.cached = null;
+    }
+
+    pub fn backgroundRun(t: *Transcript, gpa: std.mem.Allocator, id: []const u8) !void {
+        const entry = t.lastRunning() orelse return;
+        entry.task_id = try gpa.dupe(u8, id);
     }
 
     pub fn addHistory(t: *Transcript, gpa: std.mem.Allocator, history: []const provider.Message) !void {
@@ -320,7 +348,13 @@ pub const Transcript = struct {
             } else if (std.mem.eql(u8, m.role, "tool")) {
                 if (runs.get(m.tool_call_id orelse "")) |index| {
                     const e = &t.entries.items[index];
-                    e.run = .ok;
+                    e.run = if (m.background_id != null) .background else if (m.run_ok orelse true) .ok else .failed;
+                    if (m.background_id) |id| e.task_id = try gpa.dupe(u8, id);
+                    for (m.bash_replacements orelse &.{}) |b| {
+                        const p: Progress = .{ .id = b.id, .kind = .bash, .prompt = b.command orelse "", .state = .done, .elapsed_ms = b.elapsed_ms orelse 0, .superseded_by = b.superseded_by };
+                        try e.agents.append(gpa, try p.clone(gpa));
+                    }
+                    try e.refreshAgents(gpa);
                     if (m.tool_summary) |summary| e.tool_summary = try summary.clone(gpa);
                     try appendHead(gpa, &e.output, content, run_output_lines);
                     try e.refreshLabel(gpa);
@@ -1237,4 +1271,33 @@ test "automatic Run and its agent have a mixed task label" {
     try transcript.progress(testing.allocator, .{ .id = "a1", .kind = .agent, .prompt = "task" });
     try transcript.progress(testing.allocator, .{ .id = "r1", .kind = .run, .prompt = "Run", .background = true });
     try testing.expect(std.mem.startsWith(u8, transcript.entries.items[0].label.items, "task ×2"));
+}
+
+test "background Run notifications and superseded bash stay neutral live and restored" {
+    const gpa = testing.allocator;
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    try t.startRun(gpa, "await tools.bash({command:'check'})");
+    try t.progress(gpa, .{ .id = "b1", .run = 1, .kind = .bash, .prompt = "check", .background = true });
+    try t.backgroundRun(gpa, "r3");
+    try t.endRun(gpa, true, "registered", 10000, .{});
+    var segs: [max_segments]vaxis.Segment = undefined;
+    try testing.expectEqualStrings("→ ", t.entries.items[0].segments(&segs)[0].text);
+    try testing.expectEqualStrings("background → r3", t.entries.items[0].label.items);
+    try t.backgroundResult(gpa, .bash, "b1", true, "{\"superseded_by\":\"b2\"}");
+    try testing.expectEqualStrings("b1 superseded by b2", t.entries.items[1].label.items);
+    try testing.expectEqualStrings("→ ", t.entries.items[1].segments(&segs)[0].text);
+    try testing.expect(std.mem.endsWith(u8, t.entries.items[0].agent_tree.rows.items[0].text, "superseded by b2"));
+    try t.backgroundResult(gpa, .run, "r3", false, "late error");
+    try testing.expect(std.mem.endsWith(u8, t.entries.items[2].label.items, "source Run → r3"));
+    t.clear(gpa);
+    try t.addHistory(gpa, &.{
+        .{ .role = "assistant", .tool_calls = &.{.{ .id = "call", .function = .{ .name = "run", .arguments = "{\"code\":\"check\"}" } }} },
+        .{ .role = "tool", .tool_call_id = "call", .content = "registered", .background_id = "r3", .bash_replacements = &.{.{ .id = "b1", .run = 1, .state = .superseded, .superseded_by = "b2" }} },
+        .{ .role = "user", .content = "[background run r3 finished]\nlate error", .source = .background, .background_kind = .run, .background_id = "r3", .background_ok = false },
+    });
+    try testing.expectEqualStrings("background → r3", t.entries.items[0].label.items);
+    try testing.expectEqualStrings("→ ", t.entries.items[0].segments(&segs)[0].text);
+    try testing.expect(std.mem.endsWith(u8, t.entries.items[0].agent_tree.rows.items[0].text, "superseded by b2"));
+    try testing.expect(std.mem.endsWith(u8, t.entries.items[1].label.items, "source Run → r3"));
 }

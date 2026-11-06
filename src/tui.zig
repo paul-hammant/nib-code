@@ -33,7 +33,7 @@ pub const Event = union(enum) {
     step: struct { n: u32, effort: []u8, source: provider.EffortSource },
     delta: struct { kind: provider.Kind, text: []u8, step: u32 },
     run_start: struct { code: []u8, step: u32 },
-    run_end: struct { ok: bool, output: []u8, changes: ChangeText, tool_summary: ?ToolSummary = null },
+    run_end: struct { background_id: ?[]const u8 = null, ok: bool, output: []u8, changes: ChangeText, tool_summary: ?ToolSummary = null },
     retry: []u8,
     notice: []u8,
     user_inserted: u64,
@@ -228,9 +228,11 @@ pub const App = struct {
             },
             .run_end => |r| {
                 defer gpa.free(r.output);
+                defer if (r.background_id) |id| gpa.free(id);
                 defer if (r.tool_summary) |summary| summary.deinit(gpa);
                 const elapsed = app.activity.label(app.io).ms;
                 app.activity.set(app.io, .thinking);
+                if (r.background_id) |id| try app.transcript.backgroundRun(gpa, id);
                 try app.transcript.endRunWithSummary(gpa, r.ok, r.output, elapsed, r.changes, r.tool_summary);
             },
             .retry, .notice => |msg| {

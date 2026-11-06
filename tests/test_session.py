@@ -37,6 +37,10 @@ def replay(path):
             message.pop("step_effort", None)
             message.pop("tool_summary", None)
             message.pop("step_calls_omitted", None)
+            message.pop("run_ok", None)
+            message.pop("bash_replacements", None)
+            if message["role"] == "tool":
+                message.pop("background_id", None)
             if "reasoning" in message:
                 reasoning = message.pop("reasoning")
                 assert reasoning["provider"] == "chat_completions"

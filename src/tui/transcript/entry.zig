@@ -41,7 +41,7 @@ pub const Entry = struct {
     /// One-line summary of a collapsible entry. vaxis keeps printed slices
     /// until render, so this must outlive draw(); see `refreshLabel`.
     label: std.ArrayList(u8) = .empty,
-    run: enum { running, ok, failed } = .running,
+    run: enum { running, background, superseded, ok, failed } = .running,
     elapsed_ms: u64 = 0,
     step_effort: ?provider.StepEffort = null,
     /// Collapsible entries share the transcript ctrl+o state.
@@ -75,6 +75,10 @@ pub const Entry = struct {
         e.label.clearRetainingCapacity();
         switch (e.kind) {
             .run => {
+                if (e.task_id) |id| {
+                    try e.label.print(gpa, "background → {s}", .{id});
+                    return;
+                }
                 var buf: [512]u8 = undefined;
                 const used = if (e.tool_summary) |summary| actualToolSummary(summary, &buf) else toolSummary(e.text.items, &buf);
                 var live: std.ArrayList(Progress) = .empty;
@@ -89,7 +93,9 @@ pub const Entry = struct {
                             try appendPreview(gpa, &e.label, p.prompt);
                             try e.label.appendSlice(gpa, " · ");
                             try agent_tree.appendElapsed(gpa, &e.label, p.elapsed_ms);
-                            try e.label.print(gpa, " · {s}", .{if (p.background) "background" else @tagName(p.state)});
+                            if (p.superseded_by) |id| {
+                                try e.label.print(gpa, " · {s} superseded by {s}", .{ p.id, id });
+                            } else try e.label.print(gpa, " · {s}", .{if (p.background) "background" else @tagName(p.state)});
                         } else {
                             try e.label.print(gpa, "agent · {s} · step {d}", .{ if (p.background) "background" else "running", p.step });
                             try appendAction(gpa, &e.label, p);
@@ -214,6 +220,7 @@ pub const Entry = struct {
             .assistant => segs[0] = .{ .text = e.text.items },
             .run => {
                 segs[0] = switch (e.run) {
+                    .background, .superseded => .{ .text = "→ ", .style = dim },
                     .running => .{ .text = "◌ ", .style = .{ .fg = .{ .index = 3 } } },
                     .ok => .{ .text = "✓ ", .style = .{ .fg = .{ .index = 2 } } },
                     .failed => .{ .text = "✗ ", .style = .{ .fg = .{ .index = 1 } } },
@@ -251,7 +258,7 @@ pub const Entry = struct {
                 return segs[0..n];
             },
             .background => {
-                segs[0] = .{ .text = if (e.run == .ok) "✓ " else "✗ ", .style = .{ .fg = .{ .index = if (e.run == .ok) 2 else 1 } } };
+                segs[0] = if (e.run == .superseded) .{ .text = "→ ", .style = dim } else .{ .text = if (e.run == .ok) "✓ " else "✗ ", .style = .{ .fg = .{ .index = if (e.run == .ok) 2 else 1 } } };
                 segs[1] = .{ .text = e.label.items, .style = dim };
                 if (!e.open) return segs[0..2];
                 segs[2] = .{ .text = "\n" };

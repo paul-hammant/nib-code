@@ -89,7 +89,9 @@ pub const Turn = struct {
                 errdefer gpa.free(output);
                 var changes = try ChangeText.init(gpa, r.changes);
                 errdefer changes.deinit(gpa);
-                break :blk .{ .run_end = .{ .ok = r.ok, .output = output, .changes = changes, .tool_summary = if (r.tool_summary) |summary| try summary.clone(gpa) else null } };
+                const background_id = if (r.background_id) |id| try gpa.dupe(u8, id) else null;
+                errdefer if (background_id) |id| gpa.free(id);
+                break :blk .{ .run_end = .{ .background_id = background_id, .ok = r.ok, .output = output, .changes = changes, .tool_summary = if (r.tool_summary) |summary| try summary.clone(gpa) else null } };
             },
             .retry => |r| .{ .retry = try std.fmt.allocPrint(gpa, "retry {d} in {d}s: {s}", .{ r.attempt, r.delay_ms / 1000, r.reason }) },
             .notice => |m| .{ .notice = try gpa.dupe(u8, m) },
@@ -104,6 +106,7 @@ pub const Turn = struct {
         };
         errdefer switch (event) {
             .run_end => |r| {
+                if (r.background_id) |id| gpa.free(id);
                 gpa.free(r.output);
                 var changes = r.changes;
                 changes.deinit(gpa);

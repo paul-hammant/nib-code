@@ -211,6 +211,10 @@ def test_during_run_and_resume(tmp):
             message.pop("step_effort", None)
             message.pop("tool_summary", None)
             message.pop("step_calls_omitted", None)
+            message.pop("run_ok", None)
+            message.pop("bash_replacements", None)
+            if message["role"] == "tool":
+                message.pop("background_id", None)
             wire.append(message)
         assert resumed.messages == wire + [{"role": "user", "content": "after resume"}]
         events = [json.loads(line) for line in result.stdout.splitlines()]

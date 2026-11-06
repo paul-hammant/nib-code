@@ -96,6 +96,7 @@ fn execute(t: *Tools, gpa: std.mem.Allocator, command: []const u8, timeout_ms: i
     const superseded_by = t.bash_commands.finish(t, gpa, &active);
     registered = false;
     if (superseded_by) |new_id| {
+        tracker.replaced(new_id);
         state = .done;
         return .{ .ok = try std.json.Stringify.valueAlloc(gpa, .{ .superseded_by = new_id }, .{}) };
     }
@@ -156,6 +157,11 @@ const Tracker = struct {
         value.state = .working;
         tr.value = value;
         tr.t.progress.update(tr.gpa, tr.t.io, value) catch {};
+    }
+
+    fn replaced(tr: *Tracker, id: []const u8) void {
+        if (tr.value == null) tr.tickAt(foreground_progress_threshold_ms);
+        if (tr.value) |*value| value.superseded_by = id;
     }
 
     fn finish(tr: *Tracker, state: @FieldType(@import("../session/events.zig").Progress, "state")) void {
