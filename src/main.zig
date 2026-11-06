@@ -36,13 +36,12 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try stdout.writeAll(help);
-            const home_path = try config.home(init.arena.allocator(), init.environ_map);
             var config_detail: ?[]u8 = null;
-            const active = config.load(init.arena.allocator(), init.io, init.environ_map, home_path, &config_detail) catch |err| {
-                if (config_detail) |message| detail.* = try gpa.dupe(u8, message);
-                return err;
+            const active: ?provider.Config = blk: {
+                const home_path = config.home(init.arena.allocator(), init.environ_map) catch break :blk null;
+                break :blk config.load(init.arena.allocator(), init.io, init.environ_map, home_path, &config_detail) catch null;
             };
-            try stdout.print("Active provider: {s}\n", .{active.name()});
+            if (active) |cfg| try stdout.print("Active provider: {s}\n", .{cfg.name()}) else try stdout.writeAll("Active provider: unavailable (invalid configuration)\n");
             return stdout.flush();
         }
     }
