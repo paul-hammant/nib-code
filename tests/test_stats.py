@@ -75,7 +75,7 @@ class StatsTest(unittest.TestCase):
 
     def test_child_costs_parent_system_groups_and_cli(self):
         with tempfile.TemporaryDirectory() as directory:
-            directory = Path(directory)
+            directory = Path(directory).resolve()
             paths = []
             for name, sha, steps in [('before', 'old', 2), ('after', 'new', 3)]:
                 parent = directory / (name + '.jsonl')
@@ -110,7 +110,7 @@ class StatsTest(unittest.TestCase):
 
     def test_child_costs_missing_invalid_zero_and_interrupted(self):
         with tempfile.TemporaryDirectory() as directory:
-            directory = Path(directory)
+            directory = Path(directory).resolve()
             paths = []
             for name, steps in [('missing', 2), ('invalid', 1), ('zero', 1), ('interrupted', 1), ('empty', 0)]:
                 path = directory / (name + '.jsonl')
@@ -191,7 +191,7 @@ class StatsTest(unittest.TestCase):
 
     def test_child_costs_since_partial_range_and_cwd(self):
         with tempfile.TemporaryDirectory() as directory:
-            directory = Path(directory)
+            directory = Path(directory).resolve()
             parent = directory / 'parent.jsonl'
             parent_rows = synthetic_log(parent, [[None]], system_sha='original')
             child = directory / 'child.jsonl'
@@ -214,7 +214,7 @@ class StatsTest(unittest.TestCase):
 
     def test_child_costs_fork_new_groups_first_request_and_cli(self):
         with tempfile.TemporaryDirectory() as directory:
-            directory = Path(directory)
+            directory = Path(directory).resolve()
             paths = []
             for name, sha in [('parent-a', 'old'), ('parent-b', 'new')]:
                 path = directory / (name + '.jsonl')
@@ -320,7 +320,7 @@ class StatsTest(unittest.TestCase):
 
     def test_child_costs_fork_since_and_interrupted(self):
         with tempfile.TemporaryDirectory() as directory:
-            directory = Path(directory)
+            directory = Path(directory).resolve()
             cutoff = int(datetime(2025, 1, 2).timestamp() * 1000)
             paths = []
             for name, times in [('first-excluded', [cutoff - 1, cutoff]),
@@ -877,7 +877,7 @@ class StatsTest(unittest.TestCase):
         edit = 'tools.edit({path: "a", old_text: "x", new_text: "y"})'
         read = 'tools.read({path: "a"})'
         with tempfile.TemporaryDirectory() as directory:
-            directory = Path(directory)
+            directory = Path(directory).resolve()
             plain, patched = directory / "plain.jsonl", directory / "patched.jsonl"
             synthetic_log(plain, [[edit, read]], nib_version="test")
             synthetic_log(patched, [[edit, edit, 'tools.bash({command: dynamic})']], patches_off=["b", "a"])

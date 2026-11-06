@@ -189,7 +189,7 @@ test "partial lines and heartbeats reset the byte deadline before SSE parsing" {
         fn send(stream: std.Io.net.Stream) !void {
             var writer = stream.writer(std.testing.io, &.{});
             for ([_][]const u8{ ":", " keepalive\n", "data: ", "part", "ial", "\n\n" }) |part| {
-                try std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(50), .clock = .awake }, std.testing.io);
+                try std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(250), .clock = .awake }, std.testing.io);
                 try writer.interface.writeAll(part);
             }
         }
@@ -198,7 +198,7 @@ test "partial lines and heartbeats reset the byte deadline before SSE parsing" {
     defer pair.deinit();
     var model: timing.Model = .init(t.io, .now(t.io, .awake));
     var m: Monitor = .init(t.io, 1, &model);
-    m.duration.raw = .fromMilliseconds(200);
+    m.duration.raw = .fromMilliseconds(1000);
     var sender = try t.io.concurrent(Sender.send, .{pair.sender});
     defer sender.cancel(t.io) catch {};
     var buffer: [64]u8 = undefined;

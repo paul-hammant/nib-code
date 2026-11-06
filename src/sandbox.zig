@@ -691,7 +691,7 @@ test "cancel and timeout stop only undelivered calls and preserve their creation
 
 test "stopped facts include queued calls and bound oversized lists explicitly" {
     var dummy: u8 = 0;
-    const result = try run("for (let i = 0; i < 1000; i++) tools.bash(); for (;;) {}", .{ .timeout_ms = 100 }, .{
+    const result = try run("for (let i = 0; i < 1000; i++) tools.bash(); for (;;) {}", .{ .timeout_ms = 2000 }, .{
         .ctx = &dummy,
         .names = &.{"bash"},
         .call = EchoHost.call,

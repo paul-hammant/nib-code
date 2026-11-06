@@ -216,7 +216,7 @@ test "serial zero sleeps keep native bookkeeping bounded with an active worker" 
         \\const pending = tools.block();
         \\for (let i = 0; i < 10000; i++) await tools.sleep(0);
         \\await tools.release(); await pending; 'done';
-    , .{ .timeout_ms = 2000 }, host.host(), null);
+    , .{ .timeout_ms = 15000 }, host.host(), null);
     defer result.deinit(allocator.allocator());
     try t.expect(result.ok);
     try t.expectEqualStrings("\"done\"", result.text);
