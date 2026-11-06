@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - name: Verify version and build assets
+        shell: bash
+        run: |
+          version=$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' build.zig.zon)
+          test "$GITHUB_REF_NAME" = "v$version"
+          test -f "docs/releases/$version.md"
+          mkdir -p dist
+          for target in x86_64-linux-musl aarch64-linux-musl x86_64-macos aarch64-macos; do
+            zig build -Doptimize=ReleaseFast -Dstrip=true -Dtarget="$target" --prefix "$PWD/out/$target"
+            tar -czf "dist/nib-${target%-musl}.tar.gz" -C "out/$target/bin" nib
+          done
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/*
+
+  smoke:
+    needs: build
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            platform: aarch64-linux
+          - runner: macos-latest
+            platform: aarch64-macos
+          - runner: macos-15-intel
+            platform: x86_64-macos
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+      - name: Install and check version
+        shell: bash
+        env:
+          NIB_INSTALL_DIR: ${{ runner.temp }}/nib-bin
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          test -f "dist/nib-$PLATFORM.tar.gz"
+          NIB_DOWNLOAD_BASE="file://$PWD/dist" sh install.sh
+          test "$("$NIB_INSTALL_DIR/nib" --version)" = "nib ${GITHUB_REF_NAME#v}"
+
+  release:
+    needs: [build, smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+            gh release edit "$GITHUB_REF_NAME" --latest
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --latest --title "nib $version" --notes-file "docs/releases/$version.md"
+          fi

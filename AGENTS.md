@@ -10,6 +10,7 @@
 - 恢复：`nib -c` / `nib --continue`；`nib --resume <32位小写十六进制ID>`。`ask` 同样支持，选项可放在 prompt 前后。
 - 统计：`python3 scripts/stats.py [日志文件或目录] [--since YYYY-MM-DD] [--cwd 目录] [--group-by version|system|patches] [--json]`。
 - 反思：TUI `/reflect [focus]`（会自动发布 issue，开关与安全边界见 [docs/reflect.md](docs/reflect.md)）。
+- 发布：更新版本和 release notes 后推送 tag，见 [docs/releasing.md](docs/releasing.md)。
 
 ## 按需参考
 

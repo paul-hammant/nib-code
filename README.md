@@ -14,7 +14,15 @@ nib is a coding agent written in Zig that works in Runs: one JavaScript script c
 ## Install and sign in
 
 
-Requires Zig 0.17.
+Prebuilt binaries support Linux and macOS on x86_64 and arm64:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/yyydddkkk/nib-code/main/install.sh | sh
+```
+
+Installs to `~/.local/bin`. Set `NIB_VERSION=0.5.0` (or `v0.5.0`) to select a release and `NIB_INSTALL_DIR` to change the directory. Pass these variables to `sh`, for example `curl -fsSL https://raw.githubusercontent.com/yyydddkkk/nib-code/main/install.sh | NIB_VERSION=0.5.0 NIB_INSTALL_DIR="$HOME/.local/bin" sh`.
+
+Build from source (requires Zig 0.17):
 
 ```sh
 git clone https://github.com/yyydddkkk/nib-code.git

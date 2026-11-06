@@ -55,6 +55,7 @@ pub fn build(b: *std.Build) void {
     mod.linkLibrary(qjs);
 
     const exe = b.addExecutable(.{ .name = "nib", .root_module = mod });
+    exe.root_module.strip = b.option(bool, "strip", "Strip the nib executable");
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
