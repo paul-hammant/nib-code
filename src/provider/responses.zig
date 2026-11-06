@@ -166,7 +166,6 @@ fn streamWebSocket(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.
             state.reset_reason = "connection_closed";
         }
     }
-    state.reconnectIfIdle(gpa, .now(client.io, .awake));
     state.reused = state.socket != null;
     if (state.socket == null) {
         const url = try std.fmt.allocPrint(gpa, "{s}/codex/responses", .{std.mem.trimEnd(u8, cfg.base_url, "/")});
@@ -207,7 +206,6 @@ fn streamWebSocket(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.
             }
             return if (err == error.PreviousResponseNotFound) error.ProviderFailed else err;
         };
-        state.completed_at = .now(client.io, .awake);
         return reply;
     }
     unreachable;

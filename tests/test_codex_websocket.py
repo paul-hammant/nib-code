@@ -219,7 +219,7 @@ def response(inputs, response_id, mode, body):
             args["code"] = "await tools.sleep(1500); 'background-result🙂'"
         if mode in ("idle-closed", "idle-partial", "idle-ping"):
             args["code"] = "await tools.sleep(300); console.log('idle result')"
-        if mode == "idle-reconnect":
+        if mode == "idle-alive":
             args["code"] = "await tools.sleep(51000); console.log('idle result')"
         if mode == "fork":
             args["code"] = 'console.log(await tools.agent({prompt: "resumed", fork: true}))'
@@ -275,7 +275,7 @@ def run_case(tmp, mode, *, resume=None, home=None, extra=None):
     server = Mock(mode, idle_close_s=.1 if mode == "idle-closed" else None)
     home = home or tmp / mode
     home.mkdir(exist_ok=True)
-    if mode == "idle-reconnect":
+    if mode == "idle-alive":
         (home / "config.toml").write_text("[limits]\nrun_background_after_ms = 60000\n")
     if mode.startswith("background"):
         (home / "config.toml").write_text("[limits]\nrun_background_after_ms = 50\nstream_idle_timeout_s = 1\n")
@@ -293,7 +293,7 @@ def run_case(tmp, mode, *, resume=None, home=None, extra=None):
     if resume:
         args += ["--resume", resume]
     try:
-        result = subprocess.run(args, cwd=tmp, env=env, capture_output=True, timeout=65 if mode == "idle-reconnect" else 15)
+        result = subprocess.run(args, cwd=tmp, env=env, capture_output=True, timeout=65 if mode == "idle-alive" else 15)
         assert result.returncode == 0 and result.stderr == b"", (mode, result.stdout, result.stderr)
         events = [json.loads(line) for line in result.stdout.splitlines()]
         server.events = events
@@ -440,13 +440,19 @@ def main():
                     assert "output_index=300" in attempts[0]["detail"] and "output_item.done" in attempts[0]["detail"]
                 else:
                     assert attempts[0]["content_bytes"] > 0 if mode == "request-progress" else attempts[0]["content_bytes"] == 0
-        for mode in ("idle-reconnect", "idle-closed", "idle-partial", "stale-close", "stale-twice", "mid-output"):
+        for mode in ("idle-alive", "idle-closed", "idle-partial", "stale-close", "stale-twice", "mid-output"):
             server, steps, _, _ = run_case(tmp, mode)
             retries = [e for e in server.events if "retry" in e]
             attempts = steps[-1]["model_attempts"]
-            if mode in ("idle-reconnect", "idle-closed", "idle-partial"):
+            if mode == "idle-alive":
+                assert server.connections == 1 and len(server.requests) == 2
+                assert server.requests[1]["at"] - server.requests[0]["at"] > 50
+                assert server.requests[1]["body"]["previous_response_id"] == "resp-1-1"
+                assert steps[-1]["incremental"] and steps[-1]["attempts"] == 1
+                assert len(attempts) == 1 and not retries
+            elif mode in ("idle-closed", "idle-partial"):
                 assert server.connections == 2 and len(server.requests) == 2, (mode, server.connections, server.requests)
-                assert steps[-1]["full_reason"] == ("idle_reconnect" if mode == "idle-reconnect" else "connection_closed") and steps[-1]["attempts"] == 1
+                assert steps[-1]["full_reason"] == "connection_closed" and steps[-1]["attempts"] == 1
                 assert not retries
             elif mode == "stale-close":
                 assert len(attempts) == 2 and attempts[0]["error_name"] == "WebSocketClosed"
