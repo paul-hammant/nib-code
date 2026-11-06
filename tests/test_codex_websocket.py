@@ -1,6 +1,7 @@
 """Responses WebSocket prototype E2E; Python stdlib, local mocks and fake credentials only."""
 import base64
 import hashlib
+from mock_http import ThreadingHTTPServer
 import http.server
 import json
 import os
@@ -48,7 +49,7 @@ def receive(reader):
     return head[0] & 15, bytes(v ^ mask[i % 4] for i, v in enumerate(payload))
 
 
-class Mock(http.server.ThreadingHTTPServer):
+class Mock(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, mode, idle_close_s=None):

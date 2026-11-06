@@ -1,4 +1,5 @@
 """Local wire fixtures for Responses, Messages and Chat Completions; fake keys only."""
+from mock_http import ThreadingHTTPServer
 import http.server
 import json
 import threading
@@ -24,7 +25,7 @@ class Mock:
                     owner.errors.append(repr(error))
                     self.send_error(500)
 
-        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.server.server_port}"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()

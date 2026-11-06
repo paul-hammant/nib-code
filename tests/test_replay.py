@@ -4,6 +4,7 @@ Run after zig build: python3 tests/test_replay.py
 """
 import contextlib
 import hashlib
+from mock_http import ThreadingHTTPServer
 import http.server
 import json
 import os
@@ -28,7 +29,7 @@ def jsonl(path):
     return [json.loads(line) for line in path.read_text().splitlines() if line]
 
 
-class Mock(http.server.ThreadingHTTPServer):
+class Mock(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self):

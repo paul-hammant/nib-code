@@ -1,6 +1,7 @@
 """Turn undo through the TUI and real child processes, using only local mock models."""
 import json
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
+from mock_http import ThreadingHTTPServer
 import os
 from pathlib import Path
 import tempfile

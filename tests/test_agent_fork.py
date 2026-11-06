@@ -2,6 +2,7 @@
 
     zig build && python3 tests/test_agent_fork.py
 """
+from mock_http import ThreadingHTTPServer
 import http.server
 import json
 import threading
@@ -77,7 +78,7 @@ def raw_json_values(text):
         position += 1
 
 
-class Mock(http.server.ThreadingHTTPServer):
+class Mock(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self):

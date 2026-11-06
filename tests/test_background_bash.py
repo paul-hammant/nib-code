@@ -1,5 +1,6 @@
 """Background bash E2E against local provider mocks. Run after `zig build`."""
 import contextlib
+from mock_http import ThreadingHTTPServer
 import http.server
 import json
 import os
@@ -52,7 +53,7 @@ def reply_codex_high_usage(handler, code, text):
     handler.wfile.write(data)
 
 
-class Mock(http.server.ThreadingHTTPServer):
+class Mock(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, case, cwd):

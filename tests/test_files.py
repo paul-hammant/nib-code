@@ -1,7 +1,8 @@
 """File-tool Session E2E via local HTTP mock; no API key. Run after `zig build`."""
 import fcntl
 import hashlib
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
+from mock_http import ThreadingHTTPServer
 import json
 import os
 from pathlib import Path

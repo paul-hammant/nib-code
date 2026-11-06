@@ -5,6 +5,7 @@ Only use fabricated credentials: requests (including headers) are logged verbati
 the same arguments only in response.output_item.done, without argument deltas.
 MOCK_CODEX_AUTH names the temporary auth.json rotated by the 'rotate auth' probe.
 """
+from mock_http import ThreadingHTTPServer
 import http.server
 import json
 import os
@@ -185,4 +186,4 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
-http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()

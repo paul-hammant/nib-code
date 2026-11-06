@@ -21,6 +21,7 @@ edits files. "fetch_test" fetches GET /redirect (to /page) and
 /slow (3 s) with a short timeout; GET serves those pages.
 Child Runs report the exposed tools, allowing depth-limit checks.
 Each request is logged to LOGFILE as one JSON line, with a monotonic received time."""
+from mock_http import ThreadingHTTPServer
 import http.server, json, os, shlex, sys, threading, time
 from mock_llm_tool import run_code as llm_run_code, serve as serve_llm, serve_effort
 LOG=open(sys.argv[2],'a')
@@ -203,4 +204,4 @@ class H(http.server.BaseHTTPRequestHandler):
         if 'truncated' in lastuser:
             self.wfile.write(b'0\r\n\r\n'); return
         d=b'data: [DONE]\n\n'; self.wfile.write(b'%x\r\n'%len(d)+d+b'\r\n0\r\n\r\n')
-http.server.ThreadingHTTPServer(('127.0.0.1',int(sys.argv[1])),H).serve_forever()
+ThreadingHTTPServer(('127.0.0.1',int(sys.argv[1])),H).serve_forever()

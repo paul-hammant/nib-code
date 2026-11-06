@@ -98,11 +98,13 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
     server = subprocess.Popen(["python3", str(ROOT / "tests/mock_codex.py"), str(port), str(requests_path)],
                               env=dict(env, MOCK_CODEX_AUTH=str(auth_path)), stdout=subprocess.DEVNULL)
     try:
-        for _ in range(100):
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
             try:
                 with socket.create_connection(("127.0.0.1", port), timeout=.1):
                     break
             except OSError:
+                assert server.poll() is None, "Codex mock exited"
                 time.sleep(.02)
         else:
             raise AssertionError("Codex mock did not start")

@@ -1,4 +1,5 @@
 """Local tools.agent provider mock and observable child-process fault worker."""
+from mock_http import ThreadingHTTPServer
 import http.server
 import json
 import os
@@ -208,7 +209,7 @@ def serve(port, logfile):
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
-    http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
 
 if __name__ == "__main__":

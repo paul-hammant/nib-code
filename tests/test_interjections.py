@@ -1,6 +1,7 @@
 """TUI interjections through a PTY and a gated local mock. Run after zig build."""
 import contextlib
 import fcntl
+from mock_http import ThreadingHTTPServer
 import http.server
 import json
 import os
@@ -41,7 +42,7 @@ class Reply:
             self.release.set()
 
 
-class Mock(http.server.ThreadingHTTPServer):
+class Mock(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, replies):

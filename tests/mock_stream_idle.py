@@ -1,5 +1,6 @@
 """Loopback SSE timing probes shared by the chat and Codex idle-timeout tests."""
 import contextlib
+from mock_http import ThreadingHTTPServer
 import http.server
 import json
 import threading
@@ -9,7 +10,7 @@ import traceback
 from mock_llm_tool import content
 
 
-class Mock(http.server.ThreadingHTTPServer):
+class Mock(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, provider):

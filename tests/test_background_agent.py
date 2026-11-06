@@ -1,5 +1,6 @@
 """Background tools.agent E2E with gated local mocks. Run after `zig build`."""
 import contextlib
+from mock_http import ThreadingHTTPServer
 import http.server
 import json
 import os
@@ -26,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "zig-out/bin/nib"
 
 
-class Mock(http.server.ThreadingHTTPServer):
+class Mock(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, case, cwd):

@@ -3,6 +3,7 @@
     zig build && python3 tests/test_agent_reuse.py
 """
 import fcntl
+from mock_http import ThreadingHTTPServer
 import http.server
 import json
 import shlex
@@ -54,7 +55,7 @@ def system(body):
     return body["instructions"]
 
 
-class Mock(http.server.ThreadingHTTPServer):
+class Mock(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, parent, cwd):
