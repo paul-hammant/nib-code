@@ -227,6 +227,28 @@ pub const Transcript = struct {
         try current.text.appendSlice(gpa, text);
     }
 
+    pub fn smoothDelta(t: *Transcript, gpa: std.mem.Allocator, text: []const u8, now: std.Io.Clock.Timestamp) !void {
+        const old = if (t.entries.items.len > 0 and t.entries.items[t.entries.items.len - 1].kind == .assistant and t.entries.items[t.entries.items.len - 1].attempt == t.attempt) t.entries.items[t.entries.items.len - 1].text.items.len else 0;
+        try t.appendDelta(gpa, .text, text);
+        if (text.len == 0) return;
+        const entry = &t.entries.items[t.entries.items.len - 1];
+        if (entry.smooth == null) entry.smooth = .{ .visible = old };
+        entry.smooth.?.arrive(old, entry.text.items.len, now);
+    }
+
+    pub fn flushVisible(t: *Transcript) void {
+        for (t.entries.items) |*e| if (e.smooth) |*s| s.flush(e.text.items.len);
+    }
+
+    pub fn advanceVisible(t: *Transcript, now: std.Io.Clock.Timestamp) void {
+        for (t.entries.items) |*e| if (e.smooth) |*s| s.advance(e.text.items, now);
+    }
+
+    pub fn hasBacklog(t: *const Transcript) bool {
+        for (t.entries.items) |e| if (e.smooth) |s| if (s.deadline != null) return true;
+        return false;
+    }
+
     pub fn beginAttempt(t: *Transcript) void {
         t.attempt += 1;
     }

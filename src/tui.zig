@@ -158,12 +158,18 @@ pub fn run(init: std.process.Init, session: *Session) !void {
     while (true) {
         const event = try loop.nextEvent();
         const refresh = event.refresh();
-        if (!try app.handle(event)) break;
-        if (frames.due(.now(io, .awake), refresh)) {
-            try app.render();
-            frames.painted(.now(io, .awake));
+        switch (event) {
+            .delta, .tick, .model_activity, .usage, .progress, .tool_activity => {},
+            else => app.transcript.flushVisible(),
         }
-        ticker.busy.store(frames.pending or app.turn != null or app.session.tools.background.anyPending(io), .release);
+        if (!try app.handle(event)) break;
+        const frame_start = std.Io.Clock.Timestamp.now(io, .awake);
+        if (frames.due(frame_start, if (refresh != .immediate and app.transcript.hasBacklog()) .content else refresh)) {
+            app.transcript.advanceVisible(frame_start);
+            try app.render();
+            frames.painted(frame_start);
+        }
+        ticker.busy.store(frames.pending or app.transcript.hasBacklog() or app.turn != null or app.session.tools.background.anyPending(io), .release);
     }
 }
 
@@ -313,7 +319,7 @@ pub const App = struct {
                 if (d.text.len > 0) app.activity.progress(.now(app.io, .awake));
                 if (d.text.len > 0 and app.activity.phase != .compacting) app.activity.set(app.io, status.Activity.deltaPhase(d.kind));
                 if (d.kind == .text and d.text.len > 0) app.transcript.clearRetry(gpa, &app.scroll);
-                try app.transcript.appendDelta(gpa, d.kind, d.text);
+                if (d.kind == .text) try app.transcript.smoothDelta(gpa, d.text, .now(app.io, .awake));
             },
             .run_start => |r| {
                 app.transcript.clearRetry(gpa, &app.scroll);
