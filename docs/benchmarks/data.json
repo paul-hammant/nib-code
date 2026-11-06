@@ -1,0 +1,31 @@
+{
+  "date": "2026-11",
+  "comparison": {
+    "model": "gpt-6.1-terra",
+    "effort": "medium",
+    "tasks": 4,
+    "runs_per_task": 5,
+    "versions": {"nib": "0.4 era build", "codex": "codex-cli 0.166.0"},
+    "headline_percent": {"faster": 12, "cheaper": 44, "fewer_requests": 32, "fewer_input_tokens": 69},
+    "median_wall_seconds": {"nib": 128, "codex": 144},
+    "cost_usd_per_task": {"nib": 0.044, "codex": 0.079},
+    "median_requests": {"nib": 13, "codex": 19},
+    "input_tokens_per_task": {"nib": 192000, "codex": 623000},
+    "passed": {"nib": 20, "codex": 20},
+    "task_cost_usd": [
+      {"task": "timers", "nib": 0.052, "codex": 0.109},
+      {"task": "bash-amp", "nib": 0.029, "codex": 0.062},
+      {"task": "grep-column", "nib": 0.038, "codex": 0.054},
+      {"task": "console-tail", "nib": 0.059, "codex": 0.090}
+    ]
+  },
+  "footprint": [
+    {"name": "nib", "version": "0.5.0 (release, static)", "install": "5 MB", "idle_rss_mb": 3.8, "ten_rss_mb": 38, "prompt_tokens_approx": "2.2k", "prompt_tokens": 2190},
+    {"name": "pi (clean)", "version": "1.4.0", "install": "108 MB + Node (121 MB)", "idle_rss_mb": 124, "ten_rss_mb": 1134, "prompt_tokens_approx": "1.3k", "prompt_tokens": 1282},
+    {"name": "pi (everyday extensions)", "version": "1.4.0", "install": "620 MB + Node", "idle_rss_mb": 358, "ten_rss_mb": 1984, "prompt_tokens_approx": "2.4k", "prompt_tokens": 2417},
+    {"name": "Codex CLI", "version": "0.166.0", "install": "305 MB", "idle_rss_mb": 275, "ten_rss_mb": 1164, "prompt_tokens_approx": "10.3k", "prompt_tokens": 10260},
+    {"name": "Claude Code", "version": "2.1.319", "install": "324 MB", "idle_rss_mb": 174, "ten_rss_mb": 1750, "prompt_tokens_approx": "11.3k", "prompt_tokens": 11275},
+    {"name": "prime-agent", "version": "0.10.2", "install": "63 MB + Python worker", "idle_rss_mb": 335, "ten_rss_mb": 1460, "prompt_tokens_approx": "8.9k", "prompt_tokens": 8891},
+    {"name": "dsh", "version": "dst TUI 0.16.1", "install": "141 MB + Node", "idle_rss_mb": 544, "ten_rss_mb": 5459, "prompt_tokens_approx": "6.2k", "prompt_tokens": 6236}
+  ]
+}

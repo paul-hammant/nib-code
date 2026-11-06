@@ -9,7 +9,28 @@
 
 <p align="center"><a href="README.md">English</a> | 中文</p>
 
+专注 coding 的小而美 agent，安静地和你一起写代码。
+
 nib 是用 Zig 写的编码 agent，以 Run 为工作单位：一段 JavaScript 可以完成读取、修改和验证项目的一批工作。
+
+## 数据
+
+与 Codex CLI 使用同一模型：
+
+**快 12% · 费用低 44% · 请求少 32% · 20/20 通过**
+
+**同时打开十个 agent：**
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/bench-memory-dark.svg">
+  <img src="docs/assets/bench-memory-light.svg" alt="十个空闲实例的总 RSS：nib 38 MB；pi 纯净版 1,134 MB；Codex CLI 1,164 MB；prime-agent 1,460 MB；Claude Code 1,750 MB；pi 日常扩展版 1,984 MB；dsh 5,459 MB。" width="720">
+</picture>
+
+5 MB 静态二进制 · 无运行时依赖。
+
+*2026 年 11 月 · gpt-6.1-terra、medium · 对比 Codex CLI 0.166.0 共 20 次运行，按 API 价格计费 · 内存为空闲 TUI。*
+
+[更多数据 →](docs/benchmarks.md)
 
 ## 安装与登录
 

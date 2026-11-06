@@ -1,0 +1,31 @@
+<?xml version='1.0' encoding='utf-8'?>
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="172" viewBox="0 0 720 172" font-family="-apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, Helvetica, Arial, sans-serif" font-size="13">
+  <text x="185" y="25" fill="#9198a1" text-anchor="end" font-weight="400">bash-amp</text>
+  <line x1="333.11926605504584" x2="439.0825688073395" y1="20" y2="20" stroke="#6E7781" stroke-opacity="0.5" stroke-width="1" />
+  <circle cx="333.11926605504584" cy="20" r="4" fill="#4C8DFF" />
+  <circle cx="439.0825688073395" cy="20" r="4" fill="#6E7781" />
+  <text x="321.11926605504584" y="25" fill="#4C8DFF" text-anchor="end" font-weight="700">$0.029</text>
+  <text x="451.0825688073395" y="25" fill="#9198a1" text-anchor="start" font-weight="400">$0.062</text>
+  <text x="185" y="55" fill="#9198a1" text-anchor="end" font-weight="400">grep-column</text>
+  <line x1="362.0183486238532" x2="413.39449541284404" y1="50" y2="50" stroke="#6E7781" stroke-opacity="0.5" stroke-width="1" />
+  <circle cx="362.0183486238532" cy="50" r="4" fill="#4C8DFF" />
+  <circle cx="413.39449541284404" cy="50" r="4" fill="#6E7781" />
+  <text x="350.0183486238532" y="55" fill="#4C8DFF" text-anchor="end" font-weight="700">$0.038</text>
+  <text x="425.39449541284404" y="55" fill="#9198a1" text-anchor="start" font-weight="400">$0.054</text>
+  <text x="185" y="85" fill="#9198a1" text-anchor="end" font-weight="400">timers</text>
+  <line x1="406.9724770642202" x2="590.0" y1="80" y2="80" stroke="#6E7781" stroke-opacity="0.5" stroke-width="1" />
+  <circle cx="406.9724770642202" cy="80" r="4" fill="#4C8DFF" />
+  <circle cx="590.0" cy="80" r="4" fill="#6E7781" />
+  <text x="394.9724770642202" y="85" fill="#4C8DFF" text-anchor="end" font-weight="700">$0.052</text>
+  <text x="602.0" y="85" fill="#9198a1" text-anchor="start" font-weight="400">$0.109</text>
+  <text x="185" y="115" fill="#9198a1" text-anchor="end" font-weight="400">console-tail</text>
+  <line x1="429.44954128440367" x2="528.9908256880733" y1="110" y2="110" stroke="#6E7781" stroke-opacity="0.5" stroke-width="1" />
+  <circle cx="429.44954128440367" cy="110" r="4" fill="#4C8DFF" />
+  <circle cx="528.9908256880733" cy="110" r="4" fill="#6E7781" />
+  <text x="417.44954128440367" y="115" fill="#4C8DFF" text-anchor="end" font-weight="700">$0.059</text>
+  <text x="540.9908256880733" y="115" fill="#9198a1" text-anchor="start" font-weight="400">$0.090</text>
+  <circle cx="245" cy="141" r="4" fill="#4C8DFF" />
+  <text x="257" y="145" fill="#4C8DFF" text-anchor="start" font-weight="700">nib</text>
+  <circle cx="320" cy="141" r="4" fill="#6E7781" />
+  <text x="332" y="145" fill="#9198a1" text-anchor="start" font-weight="400">Codex CLI</text>
+</svg>
