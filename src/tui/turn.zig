@@ -127,28 +127,7 @@ pub const Turn = struct {
             },
             .turn_end => |summary| .{ .turn_end = summary },
         };
-        errdefer switch (event) {
-            .run_end => |r| {
-                if (r.background_id) |id| gpa.free(id);
-                gpa.free(r.output);
-                var changes = r.changes;
-                changes.deinit(gpa);
-                if (r.tool_summary) |summary| summary.deinit(gpa);
-            },
-            .step => |s| gpa.free(s.effort),
-            .background => |b| {
-                gpa.free(b.id);
-                if (b.result) |result| gpa.free(result);
-                var changes = b.changes;
-                changes.deinit(gpa);
-                if (b.tool_summary) |summary| summary.deinit(gpa);
-            },
-            .progress => |p| {
-                var owned = p;
-                owned.deinit(gpa);
-            },
-            else => {},
-        };
+        errdefer event.deinit(gpa);
         try t.loop.postEvent(event);
     }
 

@@ -57,6 +57,35 @@ pub const Event = union(enum) {
     /// One outcome line from automatic issue filing, owned by the receiver.
     issue: []u8,
     issues_done,
+
+    pub fn deinit(event: Event, gpa: std.mem.Allocator) void {
+        switch (event) {
+            .step => |s| gpa.free(s.effort),
+            .delta => |d| gpa.free(d.text),
+            .run_start => |r| gpa.free(r.code),
+            .run_end => |r| {
+                if (r.background_id) |id| gpa.free(id);
+                gpa.free(r.output);
+                var changes = r.changes;
+                changes.deinit(gpa);
+                if (r.tool_summary) |summary| summary.deinit(gpa);
+            },
+            .retry, .notice, .issue => |text| gpa.free(text),
+            .failed => |failure| gpa.free(failure.message),
+            .progress => |p| {
+                var owned = p;
+                owned.deinit(gpa);
+            },
+            .background => |b| {
+                gpa.free(b.id);
+                if (b.result) |result| gpa.free(result);
+                var changes = b.changes;
+                changes.deinit(gpa);
+                if (b.tool_summary) |summary| summary.deinit(gpa);
+            },
+            .key_press, .winsize, .paste_start, .paste_end, .mouse, .color_report, .color_scheme, .tick, .tool_activity, .model_activity, .user_inserted, .done, .turn_end, .usage, .issues_done => {},
+        }
+    }
 };
 
 /// `session` may already hold history (a resumed Session); it is shown first.
@@ -87,6 +116,13 @@ pub fn run(init: std.process.Init, session: *Session) !void {
     try vx.queryColor(w, .bg);
     if (vx.caps.color_scheme_updates) try vx.subscribeToColorSchemeUpdates(w);
 
+    var ticker: Ticker = .{ .io = io, .loop = &loop };
+    const ticker_thread = try std.Thread.spawn(.{}, Ticker.work, .{&ticker});
+    defer {
+        ticker.stop.store(true, .release);
+        ticker_thread.join();
+    }
+
     var app: App = .{
         .gpa = gpa,
         .io = io,
@@ -101,12 +137,6 @@ pub fn run(init: std.process.Init, session: *Session) !void {
         .context = session.context_tokens,
     };
     defer app.deinit();
-    var ticker: Ticker = .{ .io = io, .loop = &loop };
-    const ticker_thread = try std.Thread.spawn(.{}, Ticker.work, .{&ticker});
-    defer {
-        ticker.stop.store(true, .release);
-        ticker_thread.join();
-    }
 
     try app.transcript.addHistory(gpa, session.history.items);
     for (session.history.items) |m| {
@@ -167,6 +197,8 @@ pub const App = struct {
     const stopReflecting = reflect.stopReflecting;
 
     fn deinit(app: *App) void {
+        // Close before joining producers: a full queue must not block shutdown.
+        app.loop.queue.close(error.Closed);
         if (app.turn) |t| {
             t.cancel.store(true, .release);
             t.finish();
@@ -174,6 +206,9 @@ pub const App = struct {
         app.stopReflecting();
         app.clearStepEffort();
         if (app.issues) |job| job.finish();
+        app.loop.queue.mutex.lockUncancelable(app.io);
+        while (app.loop.queue.drain()) |event| event.deinit(app.gpa);
+        app.loop.queue.mutex.unlock(app.io);
         app.menu.deinit();
         app.transcript.deinit(app.gpa);
         app.input.deinit(app.gpa);
@@ -186,8 +221,10 @@ pub const App = struct {
     }
 
     /// False to quit.
-    fn handle(app: *App, event: Event) !bool {
+    fn handle(app: *App, value: Event) !bool {
         const gpa = app.gpa;
+        var event = value;
+        defer event.deinit(gpa);
         switch (event) {
             .key_press => |k| return app.onKey(k),
             .paste_start => {
@@ -250,17 +287,16 @@ pub const App = struct {
             .step => |s| {
                 app.clearStepEffort();
                 app.step_effort = .{ .effort = s.effort, .source = s.source };
+                event.step.effort = &.{};
                 app.live_steps = s.n;
             },
             .delta => |d| {
-                defer gpa.free(d.text);
                 app.live_steps = d.step;
                 if (d.text.len > 0) app.activity.progress(.now(app.io, .awake));
                 if (app.activity.phase != .compacting) app.activity.set(app.io, .writing);
                 try app.transcript.appendDelta(gpa, d.kind, d.text);
             },
             .run_start => |r| {
-                defer gpa.free(r.code);
                 app.live_steps = r.step;
                 app.turn_runs += 1;
                 app.activity.tool = "";
@@ -268,23 +304,19 @@ pub const App = struct {
                 try app.transcript.startRunWithEffort(gpa, r.code, app.step_effort);
             },
             .run_end => |r| {
-                defer gpa.free(r.output);
-                defer if (r.background_id) |id| gpa.free(id);
-                defer if (r.tool_summary) |summary| summary.deinit(gpa);
                 const elapsed = app.activity.label(app.io).ms;
                 app.activity.set(app.io, .thinking);
                 if (r.background_id) |id| try app.transcript.backgroundRun(gpa, id);
+                event.run_end.changes = .{};
                 try app.transcript.endRunWithSummary(gpa, r.ok, r.output, elapsed, r.changes, r.tool_summary);
             },
             .retry => |msg| {
-                defer gpa.free(msg);
                 app.transcript.discardAttempt(gpa);
                 app.activity.set(app.io, .retrying);
                 const line = std.fmt.bufPrint(&app.retry_detail, "{s}", .{msg}) catch app.retry_detail[0..0];
                 app.retry_len = line.len;
             },
             .notice => |msg| {
-                defer gpa.free(msg);
                 try app.transcript.add(gpa, .info, msg);
             },
             .usage => |u| {
@@ -293,18 +325,11 @@ pub const App = struct {
                 app.steps = u.steps;
             },
             .progress => |p| {
-                var owned = p;
-                defer owned.deinit(gpa);
                 if (app.transcript.progressChanged(p)) app.activity.progress(.now(app.io, .awake));
                 try app.transcript.progress(gpa, p);
             },
             .background => |b| {
-                defer gpa.free(b.id);
-                defer if (b.tool_summary) |summary| summary.deinit(gpa);
-                var changes = b.changes;
-                defer changes.deinit(gpa);
                 if (b.kind == .run and b.tool_summary != null) try app.transcript.updateBackgroundRun(gpa, b.id, b.result orelse "", b.changes, b.tool_summary.?);
-                defer if (b.result) |result| gpa.free(result);
                 switch (b.state) {
                     .started => app.background_count += 1,
                     .finished => {
@@ -328,7 +353,6 @@ pub const App = struct {
                 try app.finishQueued(!canceled);
             },
             .issue => |msg| {
-                defer gpa.free(msg);
                 try app.transcript.add(gpa, .info, msg);
             },
             .issues_done => {
@@ -337,7 +361,6 @@ pub const App = struct {
             },
             .failed => |failure| {
                 const msg = failure.message;
-                defer gpa.free(msg);
                 app.stopReflecting();
                 const canceled = app.turn.?.cancel.load(.acquire);
                 if (!canceled) {
@@ -785,6 +808,98 @@ test "background events own their payload and maintain running count" {
     try t.expectEqual(@as(usize, 0), app.background_count);
     try t.expectEqual(EntryKind.background, app.transcript.entries.items[0].kind);
     try t.expectEqualStrings("a1 agent · completed", app.transcript.entries.items[0].label.items);
+}
+
+test "quit drains owned events and closed queues reject Turn payloads without leaks" {
+    const t = std.testing;
+    for ([_]bool{ false, true }) |closed| {
+        var loop: vaxis.Loop(Event) = .{ .io = t.io, .tty = undefined, .vaxis = undefined, .queue = .init(t.io) };
+        var vx: vaxis.Vaxis = undefined;
+        vx.screen = try vaxis.Screen.init(t.allocator, .{ .cols = 80, .rows = 24, .x_pixel = 0, .y_pixel = 0 });
+        defer vx.screen.deinit(t.allocator);
+        var app: App = .{
+            .gpa = t.allocator,
+            .io = t.io,
+            .session = undefined,
+            .cfg = undefined,
+            .vx = &vx,
+            .w = undefined,
+            .loop = &loop,
+            .environ = undefined,
+            .menu = .init(t.allocator),
+            .activity = .start(t.io, .thinking),
+        };
+        if (closed) loop.queue.close(error.Closed) else try loop.postEvent(.{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } });
+        var session: Session = undefined;
+        session.steps = 0;
+        var turn: Turn = .{ .gpa = t.allocator, .session = &session, .loop = &loop, .text = "" };
+        const changes: []const @import("tools/diff.zig").Change = &.{.{ .path = "changed.txt", .added = 1, .removed = 0, .diff = "+new\n" }};
+        const events = [_]SessionEvent{
+            .{ .step = .{ .n = 1, .effort = "high", .source = .model } },
+            .{ .delta = .{ .kind = .text, .text = "answer" } },
+            .{ .run_start = "tools.write({})" },
+            .{ .run_end = .{ .background_id = "r1", .ok = true, .output = "registered", .changes = changes, .tool_summary = .{ .counts = &.{.{ .name = "write", .count = 1 }} } } },
+            .{ .retry = .{ .attempt = 1, .delay_ms = 0, .reason = "retry" } },
+            .{ .notice = "notice" },
+            .{ .progress = .{ .id = "b1", .prompt = "work", .tools = &.{"bash"}, .files = &.{"changed.txt"}, .superseded_by = "b2" } },
+            .{ .background = .{ .id = "r1", .kind = .run, .state = .finished, .ok = false, .completion = .{
+                .step = 1,
+                .run_index = 0,
+                .ok = false,
+                .output = "stopped",
+                .run_ms = 1,
+                .tool_bytes = 0,
+                .calls = &.{.{ .name = "bash", .start_ms = 0, .end_ms = 1, .ok = false, .run_index = 0 }},
+                .calls_omitted = 0,
+                .changes = changes,
+            } } },
+        };
+        for (events) |event| {
+            if (closed) try t.expectError(error.Closed, Turn.emit(&turn, event)) else try Turn.emit(&turn, event);
+        }
+        if (!closed) {
+            try loop.postEvent(.{ .failed = .{ .message = try t.allocator.dupe(u8, "canceled"), .reason = .canceled } });
+            try loop.postEvent(.{ .issue = try t.allocator.dupe(u8, "issue outcome") });
+            try t.expect(!try app.handle(try loop.nextEvent()));
+        }
+        app.deinit();
+        try t.expect(try loop.queue.isEmpty());
+    }
+}
+
+test "shutdown closes a full queue before joining the canceled Turn" {
+    const t = std.testing;
+    var loop: vaxis.Loop(Event) = .{ .io = t.io, .tty = undefined, .vaxis = undefined, .queue = .init(t.io) };
+    while (try loop.tryPostEvent(.tick)) {}
+    var app: App = .{
+        .gpa = t.allocator,
+        .io = t.io,
+        .session = undefined,
+        .cfg = undefined,
+        .vx = undefined,
+        .w = undefined,
+        .loop = &loop,
+        .environ = undefined,
+        .menu = .init(t.allocator),
+        .activity = .start(t.io, .thinking),
+    };
+    app.turn = blk: {
+        const turn = try t.allocator.create(Turn);
+        errdefer t.allocator.destroy(turn);
+        const text = try t.allocator.dupe(u8, "initial");
+        errdefer t.allocator.free(text);
+        turn.* = .{ .gpa = t.allocator, .session = undefined, .loop = &loop, .text = text };
+        turn.thread = try std.Thread.spawn(.{}, struct {
+            fn work(worker: *Turn) void {
+                while (!worker.cancel.load(.acquire)) std.Thread.yield() catch {};
+                std.testing.expectError(error.Closed, Turn.emit(worker, .{ .background = .{ .id = "r1", .kind = .run, .state = .finished, .result = "canceled" } })) catch @panic("shutdown accepted an event");
+            }
+        }.work, .{turn});
+        break :blk turn;
+    };
+    app.deinit();
+    try t.expect(try loop.queue.isEmpty());
+    try t.expectError(error.Closed, loop.postEvent(.tick));
 }
 
 test "Step events own effort and Runs keep their generating Step metadata" {
