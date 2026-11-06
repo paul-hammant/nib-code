@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.tests.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: tests
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, re
+          tests = list(dict.fromkeys(re.findall(r'tests/test_\w+\.py', pathlib.Path('AGENTS.md').read_text())))
+          assert tests, 'No e2e tests found in AGENTS.md'
+          # These tests inspect /proc directly or share the agent process-liveness fixtures.
+          linux_only = {'session', 'agent', 'agent_reuse', 'agent_fork', 'background_agent',
+                        'background_bash', 'background_run', 'limits'}
+          matrix = [{'os': os_name, 'test': test, 'name': pathlib.Path(test).stem}
+                    for os_name in ('ubuntu-latest', 'macos-latest') for test in tests
+                    if os_name == 'ubuntu-latest' or pathlib.Path(test).stem.removeprefix('test_') not in linux_only]
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('matrix=' + json.dumps({'include': matrix}) + '\n')
+          PY
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+          use-cache: true
+      - run: zig build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nib-${{ matrix.os }}
+          path: zig-out/bin/nib
+
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+          use-cache: true
+      - run: zig build test --summary all
+
+  e2e:
+    needs: [list, build]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.list.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: nib-${{ matrix.os }}
+          path: zig-out/bin
+      - run: chmod +x zig-out/bin/nib
+      - name: Run mock e2e test
+        shell: bash
+        env:
+          TEST: ${{ matrix.test }}
+          LANG: en_US.UTF-8
+        run: |
+          mkdir -p e2e-logs
+          python3 "$TEST" > e2e-logs/test.log 2>&1 || { cat e2e-logs/test.log; exit 1; }
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e-${{ matrix.os }}-${{ matrix.name }}
+          path: e2e-logs/*.log
+          if-no-files-found: ignore
