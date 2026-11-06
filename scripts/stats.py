@@ -544,12 +544,12 @@ class ChildCosts:
             groups.setdefault(session['parent_system'], []).append(session)
         return dict(with_creation(self.sessions),
                     by_parent_system={key: with_creation(sessions) for key, sessions in sorted(groups.items())},
-                    notes=["每个带 parent_session_id 的入选子日志一个样本，含前台/后台；只计已提交完整 Step，失败、取消或仍运行的日志也是已记录成本的下界，不推断完成状态。",
-                           "分布要求非零 Step 且所有完整 Step 都入选；--since 截断的子会话列 partial_range_sessions，不当作整次成本。model_ms/prompt_tokens/uncached_prompt_tokens 各自要求所有 Step 字段有效，缺失不补零，samples 表示覆盖；p90=nearest-rank。",
-                           "model_ms 为累计模型时间（含重试/退避），非墙钟耗时；prompt_tokens 为累计输入（含重复上下文和缓存），非费用，不加父会话 usage 或工具结果 usage；uncached_prompt_tokens=prompt_tokens-prompt_cache_hit_tokens，要求两字段为非负整数且 cache<=prompt。",
-                           "by_creation 按子 header.forked_from 分为 fork/new：有效的 {session,message_count} 为 fork，缺失为 new（含旧日志），显式无效为 unknown；session 要求非空字符串，message_count 要求非负整数。父 system 组内也按此分组。",
-                           "first_request_cache_hit_rate 为每子会话首个完整 Step 的 cache/prompt 分布（逐会话等权），仅全范围子会话且首 Step 的 prompt/cache 有效、cache<=prompt、prompt>0 时入样；不以之后的有效 usage 替代，不计 header 继承历史。",
-                           "by_parent_system 通过 parent_session_id 关联本次输入日志的父 header.system_sha；父日志缺失或标签无效为 unknown，不回退到子 system_sha。--group-by 仍按每个日志自己的 header 分组。"])
+                    notes=["Each selected child log with parent_session_id is one sample, foreground or background; count only committed complete Steps. Failed, canceled, or still-running logs also give a lower bound on recorded cost; completion is not inferred.",
+                           "Distributions require nonzero Steps and selection of every complete Step; children truncated by --since appear in partial_range_sessions, not whole-session costs. model_ms/prompt_tokens/uncached_prompt_tokens each require valid fields on every Step; missing values are not zero-filled, samples shows coverage; p90=nearest-rank.",
+                           "model_ms is cumulative model time (including retries/backoff), not wall time; prompt_tokens is cumulative input (including repeated context and cache), not fees, and excludes parent-session usage and tool-result usage; uncached_prompt_tokens=prompt_tokens-prompt_cache_hit_tokens requires nonnegative integer fields and cache<=prompt.",
+                           "by_creation groups child header.forked_from as fork/new: valid {session,message_count} means fork, missing means new (including old logs), explicitly invalid means unknown; session must be a nonempty string and message_count a nonnegative integer. Parent-system groups use the same grouping.",
+                           "first_request_cache_hit_rate distributes cache/prompt for each child session's first complete Step (equal session weights); requires full-range sessions and valid first-Step prompt/cache with cache<=prompt and prompt>0. Later valid usage does not substitute; inherited header history is excluded.",
+                           "by_parent_system joins parent_session_id to the parent header.system_sha in the input logs; missing parent logs or invalid tags mean unknown, with no fallback to the child system_sha. --group-by still uses each log's own header."])
 
 
 class EffortStats:
@@ -657,8 +657,8 @@ class ToolData:
                     result_bytes=total,
                     tools={name: dict(item, ratio=item['result_bytes'] / total if total else None)
                            for name, item in sorted(self.tools.items())},
-                    notes=["Step 顶层 tool_bytes/output_bytes 独立累计，不与 Run 或 calls 相加，不从其他层回填；缺失或无效字段跳过。",
-                           "output_tool_ratio 为每 Run output_bytes/tool_bytes（非总量之比），仅取两字段有效且 tool_bytes>0 的样本，p90=nearest-rank；可大于 1。工具占比以有效 calls[].result_bytes 总和为分母，按 name 汇总，不依赖计时；缺失或省略调用不补零，总字节为零时占比 n/a。"])
+                    notes=["Step-level tool_bytes/output_bytes accumulate independently, without adding Run or calls values or backfilling from other levels; missing or invalid fields are skipped.",
+                           "output_tool_ratio is output_bytes/tool_bytes per Run (not a ratio of totals), requiring valid fields and tool_bytes>0; p90=nearest-rank; it may exceed 1. Tool shares use the sum of valid calls[].result_bytes, grouped by name, independent of timing; missing or omitted calls are not zero-filled, and zero total bytes means n/a."])
 
 
 class AgentStats:
@@ -722,8 +722,8 @@ class AgentStats:
         return dict(foreground_calls=counts['foreground_calls'],
                     background_calls=counts['background_calls'],
                     background_steps=distribution(counts['steps']),
-                    notes=["前台调用取有效 calls[]；agent 只计根会话，bash 含子会话。后台优先取 background.started 生命周期记录，旧日志回退 calls[]；dispatched=false 不计，缺失明细不补前台调用。",
-                           "background_steps 按 id 关联 started、finished/lost 与 source=background 的结果消息；旧日志按 calls[].id 与结果消息关联。只计启动 Step 后、结果插入前已完成的主模型 Step，同一根会话且范围全入选、未中断。"])
+                    notes=["Foreground counts use valid calls[]; agent counts only root sessions, bash includes children. Background counts prefer background.started lifecycle records, falling back to calls[] for old logs; dispatched=false is excluded, and missing details do not add foreground calls.",
+                           "background_steps joins started, finished/lost, and source=background result messages by id; old logs join calls[].id to result messages. Count only complete main-model Steps after the starting Step and before result insertion, in the same root session, fully selected and uninterrupted."])
 
 
 class Timing:
@@ -1174,13 +1174,13 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
                                write_to_validation=pair_summary(write_validation_pairs, adjacent_pairs),
                                mechanical_followups=mechanical,
                                disjoint_write_files=pair_summary(disjoint_pairs, file_pairs),
-                               notes=["机械收尾样本为同 Turn 相邻 Step，后步 turn_step>1（旧日志按 Turn 内序号估算），前步至少一个 Run 且全部显式 ok=true；不跨过滤、取消或压缩替换。命中后步仅调用 bash/read，全部 bash 复用写→仅验证的验证/状态启发式；无调用不命中。ratio=count/samples；time_ratio=命中且有 ms 的后步耗时/样本中有 ms 的后步耗时，缺计时不补零。完整逐 Run 录制优先使用实际工具和 args.command，缺失/不完整回退静态提取；sources/hit_sources 按样本/命中 Step 计 recorded/static/mixed（部分 Run 回退）。",
-                                      "Step 分布按入选 Turn（含零步；旧日志按 user 估算边界）；相邻对限同 Turn、不跨过滤/取消断点。写→验证分母为全部相邻对，后步仅含静态验证 bash，沿用首两词启发式。",
-                                      "连续写以双方直接 edit/write 的完整字面量路径为样本（按 cwd 规范化）；文件集合不相交才计不同文件。动态/未知调用跳过；不推断 bash 副作用，fmt 也归验证。"]),
-            'notes': ["仅统计入选记录；失败率只用显式 run_results；token=prompt+completion（不重复加缓存），缓存率以 prompt 为分母；错误可重叠，工具/命令数为静态估计。",
-                      "Turn 平均耗时只含已结束、全部 Step 入选且有 ms 的 Turn；--since 按记录 at（本地日期），缺失或无效 at 回退到文件修改时间。",
-                      f"时间来源：{time_filter['selected_records_with_at']} 条按 at，{time_filter['selected_records_using_mtime']} 条回退文件时间（其中 {time_filter['selected_steps_using_mtime']} 个完整 Step）；计时仅有效字段、缺失不补零；p90=nearest-rank；first_data_ms 是首次收到任何流数据，非内容 token；model_ms 含重试/退避。",
-                      "run_ms 为 Step 内 Run 总耗时，run_result_ms 为单 Run；code_first_ms 为首段代码等待，code_span_ms=last-first，streaming 为 >50 ms 比例；calls 含失败、并行耗时可重叠；bash 计时按 &&/||/;/|/换行拆段（不拆引号、heredoc 正文），各段首两词以 → 连接；优先关联 calls.jsonl 的实际 args.command，旧日志回退静态字面量；timing.bash.sources 计成功分组的 recorded/static 条数，无法关联或分组列 unmatched，耗时仍为整个 bash、非子命令耗时；写→仅验证仍只用静态提取，但共享分类器现也认可 git status/log/fetch/show、gh pr view/checks、tail/cat/ls/head/pwd；这些状态命令可使其命中数增加，read 仍不算仅验证。timing.effort.by_effort 按完整 Step 顶层 effort 分组，缺 effort 跳过、缺计时仍计 Step；缓存率为有效 prompt/cache 成对字段的总和之比。timing.effort.cache_transitions 按 header provider/model（缺失为 unknown）分组，比较同 Turn 相邻入选完整 Step 的 effort 相同/不同，统计后一步 cache/prompt 的 samples/median/mean（逐 Step 等权，非 token 加权）；两步缺 effort 或有效 prompt/cache 跳过，后步 prompt 必须大于零，不跨过滤/取消/压缩断点，不补零。各组及 timing.effort.downgraded：effort_source=model 且（effort_downgraded=true 或缺失/null）视为降档（已知等档应记录 false）；run_failure_rate=steps_with_failed_run/steps_with_runs，仅关联本 Step 模型响应产生的 Run，任一显式 ok=false 即失败；未知状态仍入分母，并列 steps_with_unknown_run_status；无 Run 不入分母。"]}
+                               notes=["Mechanical follow-up samples are adjacent Steps in the same Turn, with later turn_step>1 (estimated from Turn order for old logs), and at least one Run in the earlier Step, all explicitly ok=true; do not cross filters, cancellations, or compaction replacements. A hit later Step calls only bash/read; all bash commands use the write-to-validation validation/status heuristic; no calls means no hit. ratio=count/samples; time_ratio=later-Step ms for timed hits/later-Step ms for timed samples, with no zero-fill. Complete per-Run recordings prefer actual tools and args.command; missing/incomplete recordings fall back to static extraction; sources/hit_sources count sampled/hit Steps as recorded/static/mixed (some Runs fall back).",
+                                      "Step distributions use selected Turns (including zero-Step Turns; old logs estimate boundaries from user messages); adjacent pairs stay within a Turn and do not cross filtering/cancellation gaps. Write-to-validation uses all adjacent pairs as denominator; the later Step contains only static validation bash, using the first-two-words heuristic.",
+                                      "Consecutive-write samples require complete literal paths in direct edit/write calls on both sides (normalized by cwd); only disjoint file sets count as different files. Dynamic/unknown calls are skipped; bash side effects are not inferred, and fmt counts as validation."]),
+            'notes': ["Only selected records count; failure rates use explicit run_results only; token=prompt+completion (cache is not added again), cache rate uses prompt as denominator; error categories may overlap, and tool/command counts are static estimates.",
+                      "Average Turn time includes only finished Turns with all Steps selected and ms present; --since uses record at (local dates), with missing or invalid at falling back to file modification time.",
+                      f"Time sources: {time_filter['selected_records_with_at']} records by at, {time_filter['selected_records_using_mtime']} records using file time (including {time_filter['selected_steps_using_mtime']} complete Steps); timing uses valid fields only, without zero-fill; p90=nearest-rank; first_data_ms is the first receipt of any stream data, not a content token; model_ms includes retries/backoff.",
+                      "run_ms is total Run time within a Step; run_result_ms is per Run; code_first_ms is the wait for the first code fragment, code_span_ms=last-first, and streaming is the fraction >50 ms. calls includes failures; parallel durations can overlap. Bash timing splits on &&/||/;/|/newlines (excluding quoted text and heredoc bodies), joining each segment's first two words with \u2192; prefer actual args.command from calls.jsonl, falling back to static literals for old logs. timing.bash.sources counts successfully grouped recorded/static entries; unjoinable or ungroupable entries are unmatched. Durations remain whole-bash durations, not subcommand durations. Write-to-validation still uses only static extraction; the shared classifier also recognizes git status/log/fetch/show, gh pr view/checks, and tail/cat/ls/head/pwd. These status commands may increase hits; read still does not count as validation-only. timing.effort.by_effort groups complete Steps by top-level effort, skipping missing effort but counting Steps without timing; cache rate is the ratio of sums of valid prompt/cache pairs. timing.effort.cache_transitions groups by header provider/model (unknown if missing), comparing equal/different effort in adjacent selected complete Steps of the same Turn, and reports samples/median/mean of later-Step cache/prompt (equal Step weights, not token weights). Skip pairs missing effort or valid prompt/cache; later prompt must be positive. Do not cross filters/cancellations/compaction gaps or zero-fill. For each group and timing.effort.downgraded, effort_source=model with effort_downgraded=true or missing/null counts as downgraded (known equal effort should record false). run_failure_rate=steps_with_failed_run/steps_with_runs, joining only Runs produced by this Step's model response; any explicit ok=false means failure. Unknown statuses remain in the denominator and are listed as steps_with_unknown_run_status; Steps without Runs are excluded."]}
 
     if group_by is not None:
         report['group_by'] = group_by
@@ -1190,9 +1190,9 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
                               _step_filter=(group_by, key) if group_by in ('transport', 'incremental', 'full_reason') else None)
             if group['overall']['sessions']:
                 report['groups'][key] = group
-        report['notes'][0] += (' --group-by transport/incremental/full_reason 按完整 Step 的实际线路/续接状态分组，同会话可在多个组出现；缺字段归 unknown；按记录筛选，不把混合线路 Turn 当作完整墙钟样本。其他分组 按 header nib_version/system_sha/patches_off 分组，'
-            '缺失/无效值为 unknown；patches_off 缺失但 nib_version 或 system_sha 有效时为 none，'
-            '显式空补丁集也为 none；补丁数组按去重排序的集合分组，每组重新汇总完整核心报告。')
+        report['notes'][0] += (' --group-by transport/incremental/full_reason groups complete Steps by actual transport/continuation state; one session may appear in multiple groups; missing fields mean unknown. Filter by record; mixed-transport Turns are not complete wall-time samples. Other groups use header nib_version/system_sha/patches_off; '
+            'missing/invalid values mean unknown; missing patches_off with valid nib_version or system_sha means none; '
+            'explicitly empty patch sets also mean none; patch arrays group as deduplicated sorted sets, with the complete core report recomputed per group.')
     return report
 
 
@@ -1205,23 +1205,23 @@ def text_report(report):
     def ratio_fmt(value):
         return 'n/a' if value is None else f'{value:.6g}'
     token_total = str(u['total_tokens']) if t['steps_with_usage'] else 'n/a'
-    lines = [f"会话 {t['sessions']}（根 {t['root_sessions']} / 子 {t['child_sessions']}）；Turn {t['turns']}；Step {t['steps']}；Run {t['runs']}",
-             f"Run 失败 {t['runs_failed']}/{t['runs_with_status']} = {pct(t['run_failure_rate'])}（状态未知 {t['runs_unknown']}）",
-             f"Token {token_total}（prompt {u['prompt_tokens']} / completion {u['completion_tokens']}）；缓存命中 {pct(u['cache_hit_rate'])}；usage 覆盖 {t['steps_with_usage']}/{t['steps']} Step",
-             f"每 Turn 平均 {fmt(t['avg_steps_per_turn'])} Step；平均耗时 {fmt(t['avg_turn_ms'], ' ms')}（完整计时 {t['timed_turns']}/{t['turns']} Turn，{t['steps_with_ms']} Step）",
-             '工具（静态调用点）：' + (', '.join(f'{k} {v}' for k, v in report['tools'].items()) or '无'),
-             'bash 命令 Top 10：' + (', '.join(f"{v['command']} {v['count']}" for v in report['bash_top10']) or '无')]
-    lines.append(f"Bash 被取代次数：{report['bash_superseded']}")
+    lines = [f"Sessions {t['sessions']} (root {t['root_sessions']} / child {t['child_sessions']}); Turn {t['turns']}; Step {t['steps']}; Run {t['runs']}",
+             f"Run failures {t['runs_failed']}/{t['runs_with_status']} = {pct(t['run_failure_rate'])} (unknown status {t['runs_unknown']})",
+             f"Token {token_total} (prompt {u['prompt_tokens']} / completion {u['completion_tokens']}); cache hits {pct(u['cache_hit_rate'])}; usage coverage {t['steps_with_usage']}/{t['steps']} Step",
+             f"Average per Turn {fmt(t['avg_steps_per_turn'])} Steps; average time {fmt(t['avg_turn_ms'], ' ms')} (fully timed {t['timed_turns']}/{t['turns']} Turns, {t['steps_with_ms']} Steps)",
+             'Tools (static call sites): ' + (', '.join(f'{k} {v}' for k, v in report['tools'].items()) or 'None'),
+             'Top 10 bash commands: ' + (', '.join(f"{v['command']} {v['count']}" for v in report['bash_top10']) or 'None')]
+    lines.append(f"Bash supersessions: {report['bash_superseded']}")
     for name, key in (('Agent', 'agents'), ('Bash', 'bash_calls'), ('Run', 'background_runs')):
         calls = report[key]
         overlap = calls['background_steps']
-        lines.extend([f"{name} 调用：前台 {calls['foreground_calls']} / 后台 {calls['background_calls']}",
-                      f"{'' if key == 'agents' else name + ' '}后台期间主模型 Step: samples={overlap['samples']} median={fmt(overlap['median'])} p90={fmt(overlap['p90'])}"])
+        lines.extend([f"{name} calls: foreground {calls['foreground_calls']} / background {calls['background_calls']}",
+                      f"{'' if key == 'agents' else name + ' '}Main-model Steps during background work: samples={overlap['samples']} median={fmt(overlap['median'])} p90={fmt(overlap['p90'])}"])
     lines.extend('  ' + note for note in report['agents']['notes'])
     costs = report['child_costs']
-    lines.append('子会话已记录成本（每子会话；非费用）：')
+    lines.append('Recorded child-session costs (per child; not fees):')
     cost_groups = []
-    for label, item in [('全部', costs)] + list(costs['by_parent_system'].items()):
+    for label, item in [('all', costs)] + list(costs['by_parent_system'].items()):
         cost_groups.append((f'parent_system={label}', item))
         cost_groups.extend((f'parent_system={label} creation={kind}', group)
                            for kind, group in item['by_creation'].items())
@@ -1234,81 +1234,81 @@ def text_report(report):
     lines.extend('  ' + note for note in costs['notes'])
     structure = report['round_trips']
     steps = structure['steps_per_turn']
-    section = ["往返结构：", f"  每 Turn Step: samples={steps['samples']} median={fmt(steps['median'])} p90={fmt(steps['p90'])}"]
-    for name, label in (('write_to_validation', '写→仅验证'), ('disjoint_write_files', '连续写不同文件（不相交）')):
+    section = ["Round-trip structure:", f"  Steps per Turn: samples={steps['samples']} median={fmt(steps['median'])} p90={fmt(steps['p90'])}"]
+    for name, label in (('write_to_validation', 'write→validation only'), ('disjoint_write_files', 'consecutive writes to different files (disjoint)')):
         item = structure[name]
-        section.append(f"  {label}: {item['count']}/{item['pairs']} = {pct(item['ratio'])}（samples={item['pairs']}）")
+        section.append(f"  {label}: {item['count']}/{item['pairs']} = {pct(item['ratio'])} (samples={item['pairs']})")
     followups = structure["mechanical_followups"]
-    section.append(f"  成功后的机械收尾 Step（mechanical follow-ups）: {followups['count']}/{followups['samples']} = {pct(followups['ratio'])}；Step 时间 {followups['ms']}/{followups['sample_ms']} ms = {pct(followups['time_ratio'])}（计时 {followups['timed_count']}/{followups['timed_samples']}）")
-    for key, label in (("sources", "样本来源"), ("hit_sources", "命中来源")):
+    section.append(f"  Mechanical follow-up Steps after success (mechanical follow-ups): {followups['count']}/{followups['samples']} = {pct(followups['ratio'])}; Step time {followups['ms']}/{followups['sample_ms']} ms = {pct(followups['time_ratio'])} (timed {followups['timed_count']}/{followups['timed_samples']})")
+    for key, label in (("sources", "sample sources"), ("hit_sources", "hit sources")):
         section.append(f"    {label}: " + ", ".join(f"{name}={count}" for name, count in followups[key].items()))
     section.extend("  " + note for note in structure['notes'])
     lines[4:4] = section
-    lines.append('错误分类：')
+    lines.append('Error categories:')
     for name, item in report['errors'].items():
         lines.append(f"  {name}: {item['count']}")
         lines.extend(f"    [{e['session_id']}] {e['text']}" for e in item['examples'])
-    lines.append('最慢的 5 个 Step：')
+    lines.append('5 slowest Steps:')
     lines.extend(f"  {s['session_id']}  {s['ms']} ms" for s in report['slowest_steps'])
     if not report['slowest_steps']:
-        lines.append('  无计时记录')
+        lines.append('  No timing records')
     timing = report['timing']
-    lines.append('耗时构成 / 计时 Timing（ms，attempts 为次数；缺失字段不补零）：')
+    lines.append('Time breakdown / Timing (ms; attempts are counts; missing fields are not zero-filled):')
     for name in ('step_ms', 'model_ms', 'run_ms', 'run_result_ms', 'first_data_ms', 'max_gap_ms', 'code_first_ms', 'code_span_ms', 'attempts'):
         item = timing[name]
         maximum = f" max={fmt(item['max'])}" if name == 'max_gap_ms' else ''
         lines.append(f"  {name}: samples={item['samples']} median={fmt(item['median'])} p90={fmt(item['p90'])}{maximum}")
     effort = timing['effort']
-    lines.append('  Step effort（顶层元数据）：')
+    lines.append('  Step effort (top-level metadata):')
     for level, item in effort['by_effort'].items():
         down = item['downgraded']
-        lines.append(f"    {level}: steps={item['steps']} model_ms median={fmt(item['model_ms']['median'])} samples={item['model_ms']['samples']} cache_hit_rate={pct(item['cache_hit_rate'])}（{item['prompt_cache_hit_tokens']}/{item['prompt_tokens']}）")
-        lines.append(f"      downgraded steps={down['steps']}; 本 Step Run 失败 {down['steps_with_failed_run']}/{down['steps_with_runs']} = {pct(down['run_failure_rate'])}（状态未知 Step={down['steps_with_unknown_run_status']}）")
+        lines.append(f"    {level}: steps={item['steps']} model_ms median={fmt(item['model_ms']['median'])} samples={item['model_ms']['samples']} cache_hit_rate={pct(item['cache_hit_rate'])} ({item['prompt_cache_hit_tokens']}/{item['prompt_tokens']})")
+        lines.append(f"      downgraded steps={down['steps']}; Run failures in this Step {down['steps_with_failed_run']}/{down['steps_with_runs']} = {pct(down['run_failure_rate'])} (unknown status Step={down['steps_with_unknown_run_status']})")
     if not effort['by_effort']:
-        lines.append('    无 effort 记录')
-    lines.append('    effort 缓存转换（同 Turn 相邻完整入选 Step；后一步 cache/prompt）：')
+        lines.append('    No effort records')
+    lines.append('    effort cache transitions (adjacent fully selected complete Steps in the same Turn; later-Step cache/prompt):')
     for item in effort['cache_transitions']:
         lines.append(f"      provider={item['provider']} model={item['model']}")
         for kind in ('same_effort', 'different_effort'):
             summary = item[kind]
             lines.append(f"        {kind}: samples={summary['samples']} median={pct(summary['median'])} mean={pct(summary['mean'])}")
     if not effort['cache_transitions']:
-        lines.append('      无有效转换样本')
+        lines.append('      No valid transition samples')
     down = effort['downgraded']
-    lines.append(f"  降档 Step 合计 {down['steps']}；本 Step Run 失败 {down['steps_with_failed_run']}/{down['steps_with_runs']} = {pct(down['run_failure_rate'])}（状态未知 Step={down['steps_with_unknown_run_status']}）")
+    lines.append(f"  Total downgraded Steps {down['steps']}; Run failures in this Step {down['steps_with_failed_run']}/{down['steps_with_runs']} = {pct(down['run_failure_rate'])} (unknown status Step={down['steps_with_unknown_run_status']})")
     streaming = timing['streaming']
     lines.append(f"  code streaming (last-first > 50 ms): {streaming['over_50_ms']}/{streaming['samples']} = {pct(streaming['ratio'])}")
-    lines.append(f"  工具运行时计时（calls Step={timing['calls_steps']}, omitted={timing['calls_omitted']}）：")
+    lines.append(f"  Tool runtime timing (calls Steps={timing['calls_steps']}, omitted={timing['calls_omitted']}):")
     for name, item in timing['tools'].items():
         lines.append(f"    {name}: count={item['count']} total={item['total_ms']} ms median={fmt(item['median_ms'])} ms")
     if not timing['tools']:
-        lines.append('    无计时记录')
+        lines.append('    No timing records')
     bash = timing['bash']
-    lines.append(f"  bash 计时 Top 10（heuristic 各段首两词 →；录制={bash['sources']['recorded']}, 静态={bash['sources']['static']}; matched={bash['matched_calls']}, unmatched={bash['unmatched_calls']}）：")
+    lines.append(f"  Top 10 bash timings (heuristic first two words per segment →; recorded={bash['sources']['recorded']}, static={bash['sources']['static']}; matched={bash['matched_calls']}, unmatched={bash['unmatched_calls']}):")
     for item in bash['top10']:
         lines.append(f"    {item['command']}: count={item['count']} total={item['total_ms']} ms median={fmt(item['median_ms'])} ms")
     if not bash['top10']:
-        lines.append('    无可匹配计时记录')
+        lines.append('    No matching timing records')
     data = report['tool_data']
-    lines.append('工具数据度量（bytes；缺失字段不补零）：')
+    lines.append('Tool data metrics (bytes; missing fields are not zero-filled):')
     for name, item in data['step_bytes'].items():
         lines.append(f"  Step {name}: samples={item['samples']} total={item['total_bytes']} bytes")
     ratio = data['output_tool_ratio']
-    lines.append(f"  每 Run output_bytes/tool_bytes: samples={ratio['samples']} median={ratio_fmt(ratio['median'])} p90={ratio_fmt(ratio['p90'])}")
-    lines.append(f"  工具 result_bytes 占比（总计 {data['result_bytes']} bytes）：")
+    lines.append(f"  Per-Run output_bytes/tool_bytes: samples={ratio['samples']} median={ratio_fmt(ratio['median'])} p90={ratio_fmt(ratio['p90'])}")
+    lines.append(f"  Tool result_bytes shares (total {data['result_bytes']} bytes):")
     for name, item in data['tools'].items():
         lines.append(f"    {name}: count={item['count']} result_bytes={item['result_bytes']} ratio={pct(item['ratio'])}")
     if not data['tools']:
-        lines.append('    无字节记录')
+        lines.append('    No byte records')
     lines.extend('  ' + note for note in data['notes'])
-    lines.extend(['口径：'] + ['  ' + note for note in report['notes']])
+    lines.extend(['Methodology:'] + ['  ' + note for note in report['notes']])
     if 'groups' in report:
-        lines.append(f"分组 group_by={report['group_by']}：")
+        lines.append(f"Groups group_by={report['group_by']}:")
         for key, group in report['groups'].items():
             lines.append(f"=== {report['group_by']}={key} ===")
             lines.append(text_report(group))
         if not report['groups']:
-            lines.append('  无入选分组')
+            lines.append('  No selected groups')
     return '\n'.join(lines)
 
 

@@ -70,7 +70,7 @@ class StatsTest(unittest.TestCase):
             actual = stats.summarize([path])
             self.assertEqual(actual['bash_superseded'], 1)
             self.assertEqual(actual['overall'], expected['overall'])
-            self.assertIn('Bash 被取代次数：1', stats.text_report(actual))
+            self.assertIn('Bash supersessions: 1', stats.text_report(actual))
 
 
     def test_child_costs_parent_system_groups_and_cli(self):
@@ -103,7 +103,7 @@ class StatsTest(unittest.TestCase):
             cli = [sys.executable, str(ROOT / 'scripts/stats.py'), str(directory), '--group-by', 'system']
             self.assertEqual(json.loads(subprocess.check_output(cli + ['--json'])), report)
             text = subprocess.check_output(cli).decode()
-            self.assertIn('子会话已记录成本', text)
+            self.assertIn('Recorded child-session costs', text)
             self.assertIn('parent_system=old', text)
             self.assertIn('parent_system=new', text)
             self.assertIn('uncached_prompt_tokens: samples=2 median=15.00 p90=18.00', text)
@@ -268,7 +268,7 @@ class StatsTest(unittest.TestCase):
             cli = [sys.executable, str(ROOT / 'scripts/stats.py'), str(directory), '--group-by', 'system']
             self.assertEqual(json.loads(subprocess.check_output(cli + ['--json'])), report)
             text = subprocess.check_output(cli, text=True)
-            self.assertIn('parent_system=全部 creation=fork: sessions=2', text)
+            self.assertIn('parent_system=all creation=fork: sessions=2', text)
             self.assertIn('parent_system=old creation=new: sessions=1', text)
             self.assertIn('first_request_cache_hit_rate: samples=2 median=50.00% p90=80.00%', text)
 
@@ -378,7 +378,7 @@ class StatsTest(unittest.TestCase):
             self.assertEqual(json.loads(cli)['tool_data'], data)
             text = subprocess.check_output([sys.executable, str(ROOT / 'scripts/stats.py'),
                                             str(path)], text=True)
-            self.assertIn('工具数据度量', text)
+            self.assertIn('Tool data metrics', text)
             self.assertIn('output_bytes/tool_bytes: samples=11 median=0.6 p90=1', text)
             self.assertIn('read: count=2 result_bytes=400 ratio=40.00%', text)
             report['tool_data']['output_tool_ratio'] = dict(samples=1, median=12/96060, p90=12/96060)
@@ -523,8 +523,8 @@ class StatsTest(unittest.TestCase):
             self.assertEqual(report['overall']['turns'], 1)
             self.assertEqual(report['overall']['steps'], 4)
             self.assertEqual(report['groups']['background']['agents'], agents)
-            self.assertIn('Agent 调用：前台 1 / 后台 3', stats.text_report(report))
-            self.assertIn('后台期间主模型 Step: samples=3 median=1.00 p90=1.00', stats.text_report(report))
+            self.assertIn('Agent calls: foreground 1 / background 3', stats.text_report(report))
+            self.assertIn('Main-model Steps during background work: samples=3 median=1.00 p90=1.00', stats.text_report(report))
             records[0]['parent_session_id'] = 'parent'
             path.write_text('\n'.join(map(json.dumps, records)))
             self.assertEqual(stats.summarize([path])['agents'], stats.AgentStats().report())
@@ -580,10 +580,10 @@ class StatsTest(unittest.TestCase):
             result = json.loads(subprocess.check_output(cli + ['--json']))
             self.assertRoundTrips(result['round_trips'], expected)
             text = subprocess.check_output(cli).decode()
-            self.assertIn('往返结构：', text)
-            self.assertIn('每 Turn Step: samples=3 median=7.00 p90=7.00', text)
-            self.assertIn('写→仅验证: 2/16 = 12.50%', text)
-            self.assertIn('连续写不同文件（不相交）: 2/5 = 40.00%', text)
+            self.assertIn('Round-trip structure:', text)
+            self.assertIn('Steps per Turn: samples=3 median=7.00 p90=7.00', text)
+            self.assertIn('write→validation only: 2/16 = 12.50%', text)
+            self.assertIn('consecutive writes to different files (disjoint): 2/5 = 40.00%', text)
             self.assertEqual(path.read_bytes(), before)
 
     def test_mechanical_followups_static_hits_misses_and_timing(self):
@@ -898,10 +898,10 @@ class StatsTest(unittest.TestCase):
             cli = [sys.executable, str(ROOT / "scripts/stats.py"), str(directory), "--group-by", "patches"]
             self.assertEqual(json.loads(subprocess.check_output(cli + ["--json"])), report)
             text = subprocess.check_output(cli).decode()
-            self.assertEqual(text.count("成功后的机械收尾 Step（mechanical follow-ups）:"), 3)
-            self.assertIn("2/3 = 66.67%；Step 时间 20/30 ms = 66.67%（计时 2/3）", text)
-            self.assertIn("1/1 = 100.00%；Step 时间 10/10 ms = 100.00%（计时 1/1）", text)
-            self.assertIn("1/2 = 50.00%；Step 时间 10/20 ms = 50.00%（计时 1/2）", text)
+            self.assertEqual(text.count("Mechanical follow-up Steps after success (mechanical follow-ups):"), 3)
+            self.assertIn("2/3 = 66.67%; Step time 20/30 ms = 66.67% (timed 2/3)", text)
+            self.assertIn("1/1 = 100.00%; Step time 10/10 ms = 100.00% (timed 1/1)", text)
+            self.assertIn("1/2 = 50.00%; Step time 10/20 ms = 50.00% (timed 1/2)", text)
             self.assertEqual({path: path.read_bytes() for path in before}, before)
 
     def test_turn_step_keeps_interjections_in_the_same_turn(self):
@@ -1018,7 +1018,7 @@ class StatsTest(unittest.TestCase):
                              dict(count=0, pairs=0, ratio=None))
         empty = stats.summarize([])
         self.assertEqual(empty['round_trips']['steps_per_turn'], dict(samples=0, median=None, p90=None))
-        self.assertIn('写→仅验证: 0/0 = n/a', stats.text_report(empty))
+        self.assertIn('write→validation only: 0/0 = n/a', stats.text_report(empty))
 
     def test_undo_notifications_do_not_start_turns(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1075,11 +1075,11 @@ class StatsTest(unittest.TestCase):
                     cli = ['python3', str(ROOT / 'scripts/stats.py'), directory, '--group-by', group_by]
                     self.assertEqual(json.loads(subprocess.check_output(cli + ['--json'])), report)
                     text = subprocess.check_output(cli).decode()
-                    self.assertIn('分组 group_by=' + group_by, text)
+                    self.assertIn('Groups group_by=' + group_by, text)
                     for key in members:
                         self.assertIn(f'=== {group_by}={key} ===', text)
-                    self.assertEqual(text.count('每 Turn Step:'), len(members) + 1)
-                    self.assertEqual(text.count('写→仅验证:'), len(members) + 1)
+                    self.assertEqual(text.count('Steps per Turn:'), len(members) + 1)
+                    self.assertEqual(text.count('write→validation only:'), len(members) + 1)
             version = stats.summarize(paths.values(), group_by='version')['groups']['1.0']
             self.assertRoundTrips(version['round_trips'], dict(
                 steps_per_turn=dict(samples=2, median=3, p90=4),
@@ -1094,7 +1094,7 @@ class StatsTest(unittest.TestCase):
                 os.utime(path, (0, 0))
             empty = stats.summarize(paths.values(), since=date(2099, 1, 1), group_by='patches')
             self.assertEqual(empty['groups'], {})
-            self.assertIn('无入选分组', stats.text_report(empty))
+            self.assertIn('No selected groups', stats.text_report(empty))
             self.assertEqual(stats.summarize(paths.values(), cwd=ROOT, group_by='version')['groups'], {})
         for metadata, expected in [({}, 'unknown'), ({'nib_version': ''}, 'unknown'),
                                    ({'system_sha': 's'}, 'none'), ({'nib_version': 'v'}, 'none'),
@@ -1246,7 +1246,7 @@ class StatsTest(unittest.TestCase):
                     self.assertEqual(report['overall']['avg_turn_ms'], 30)
                     self.assertEqual(report['time_filter'], dict(selected_records_with_at=0,
                         selected_records_using_mtime=1, selected_steps_using_mtime=1))
-                    self.assertIn('1 条回退文件时间', stats.text_report(report))
+                    self.assertIn('1 records using file time', stats.text_report(report))
                     os.utime(path, (cutoff / 1000 - 1,) * 2)
                     self.assertEqual(stats.summarize([path], date(2025, 1, 2))['overall']['steps'], 0)
 
@@ -1434,9 +1434,9 @@ class StatsTest(unittest.TestCase):
             json_report = json.loads(subprocess.check_output(cli + ['--json']))
             self.assertEqual(json_report['timing'], timing)
             text = subprocess.check_output(cli).decode()
-            self.assertLessEqual(len(text.split('口径：\n', 1)[1].splitlines()) + 1, 5)
+            self.assertLessEqual(len(text.split('Methodology:\n', 1)[1].splitlines()) + 1, 5)
             self.assertLessEqual(len(json_report['notes']), 4)
-            for snippet in ('计时 Timing', '无 effort 记录', 'step_ms: samples=3 median=100.00 p90=300.00',
+            for snippet in ('Timing', 'No effort records', 'step_ms: samples=3 median=100.00 p90=300.00',
                             'model_ms: samples=2', 'run_result_ms: samples=2',
                             'code_first_ms: samples=2', 'code_span_ms: samples=2',
                             'code streaming (last-first > 50 ms): 1/2 = 50.00%',
@@ -1512,11 +1512,11 @@ class StatsTest(unittest.TestCase):
             self.assertEqual(json.loads(subprocess.check_output(cli + ['--json']))['timing']['effort'], effort)
             text = subprocess.check_output(cli).decode()
             for snippet in ('Step effort', 'low: steps=7 model_ms median=20.00 samples=2',
-                            'cache_hit_rate=12.50%（50/400）', '本 Step Run 失败 1/2 = 50.00%',
-                            '降档 Step 合计 5；本 Step Run 失败 1/3 = 33.33%',
+                            'cache_hit_rate=12.50% (50/400)', 'Run failures in this Step 1/2 = 50.00%',
+                            'Total downgraded Steps 5; Run failures in this Step 1/3 = 33.33%',
                             'high: steps=1 model_ms median=n/a samples=0 cache_hit_rate=n/a',
                             'timing.effort.by_effort', 'steps_with_failed_run/steps_with_runs',
-                            'effort_downgraded', '未知状态仍入分母'):
+                            'effort_downgraded', 'Unknown statuses remain in the denominator'):
                 self.assertIn(snippet, text)
 
     def test_effort_cache_transitions_rates_median_mean_and_text(self):
@@ -1754,10 +1754,10 @@ class StatsTest(unittest.TestCase):
                     self.assertEqual(json.loads(subprocess.check_output(cli + ['--json'])), report)
                     text = subprocess.check_output(cli).decode()
                     self.assertEqual(text, stats.text_report(report) + '\n')
-                    for snippet in (f'Step {steps}；Run {count}', '计时 Timing',
+                    for snippet in (f'Step {steps}; Run {count}', 'Timing',
                                     f'model_ms: samples={count}', f'median={expected["median"]:.2f}',
-                                    'first_data_ms 是首次收到任何流数据',
-                                    '--since 按记录 at', '缺失或无效 at 回退到文件修改时间'):
+                                    'first_data_ms is the first receipt of any stream data',
+                                    '--since uses record at', 'missing or invalid at falling back to file modification time'):
                         self.assertIn(snippet, text)
             excluded = stats.summarize([path], date(2025, 1, 2), cwd=ROOT)
             self.assertEqual(excluded['overall']['steps'], 0)
@@ -1880,7 +1880,7 @@ class StatsTest(unittest.TestCase):
             cli = ['python3', str(ROOT / 'scripts/stats.py'), directory]
             self.assertEqual(json.loads(subprocess.check_output(cli + ['--json']))['timing']['bash'], bash)
             text = subprocess.check_output(cli).decode()
-            self.assertIn('录制=4, 静态=1', text)
+            self.assertIn('recorded=4, static=1', text)
             self.assertIn('zig fmt → zig build: count=1 total=180 ms', text)
             self.assertEqual((path.read_bytes(), calls_path.read_bytes()), before)
             calls_path.unlink()
