@@ -436,6 +436,8 @@ pub const Transcript = struct {
                     try t.updateBackgroundRun(gpa, m.background_id orelse "?", completion.output, changes, summary);
                 }
                 try t.backgroundResult(gpa, kind, m.background_id orelse "?", m.background_ok orelse parsed_ok, shown orelse result);
+            } else if (m.source == .undo) {
+                try t.add(gpa, .info, content);
             } else if (std.mem.eql(u8, m.role, "user")) {
                 try t.add(gpa, .user, content);
             } else if (std.mem.eql(u8, m.role, "assistant")) {

@@ -106,7 +106,7 @@ pub fn run(init: std.process.Init, session: *Session) !void {
 
     try app.transcript.addHistory(gpa, session.history.items);
     for (session.history.items) |m| {
-        if (std.mem.eql(u8, m.role, "user")) try app.input.remember(gpa, m.content orelse "");
+        if (m.source != .undo and std.mem.eql(u8, m.role, "user")) try app.input.remember(gpa, m.content orelse "");
     }
     if (app.cfg.missingKey()) try app.transcript.add(gpa, .err, "no API key: set DEEPSEEK_API_KEY (or NIB_API_KEY). /js <code> still works.");
 

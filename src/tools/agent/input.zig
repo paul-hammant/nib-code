@@ -19,6 +19,7 @@ pub const Input = struct {
     prompt: []const u8,
     config: provider.Config,
     fork: ?Fork = null,
+    undo_dir: ?[]const u8 = null,
 };
 
 test "agent stdin round trip preserves unset and explicit step limits" {

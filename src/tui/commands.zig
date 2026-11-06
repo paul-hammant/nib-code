@@ -6,7 +6,7 @@ const config = @import("../config.zig");
 const ChangeText = @import("transcript.zig").ChangeText;
 const provider = @import("../provider.zig");
 
-pub const Command = enum { help, new, @"resume", compact, effort, copy, reflect, js, tasks, stop, status };
+pub const Command = enum { help, new, @"resume", compact, undo, effort, copy, reflect, js, tasks, stop, status };
 
 pub const Choices = enum { none, efforts, sessions, tasks };
 
@@ -30,6 +30,7 @@ pub const specs = std.enums.EnumArray(Command, Spec).init(.{
     .help = .{ .group = .view, .help = "commands and keys", .while_busy = true },
     .new = .{ .help = "new session" },
     .@"resume" = .{ .args = "<id>", .help = "resume a session", .choices = .sessions, .needs_arg = true },
+    .undo = .{ .help = "undo last edited Turn; edit/write only", .while_busy = true },
     .compact = .{ .help = "compact earlier history" },
     .effort = .{ .group = .send, .args = "[level]", .help = "reasoning effort", .choices = .efforts },
     .copy = .{ .group = .view, .help = "copy last answer", .while_busy = true },
@@ -209,6 +210,14 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
                 try app.transcript.add(gpa, .info, text);
             }
         },
+        .undo => {
+            if (app.turn != null) return app.transcript.add(gpa, .err, "Cannot undo during a Turn; press Esc to stop it first.");
+            if (arg.len != 0) return app.transcript.add(gpa, .err, "usage: /undo");
+            const text = session.undo() catch |err| return app.report(.err, "undo failed: {s}; re-read files before continuing", .{@errorName(err)});
+            defer gpa.free(text);
+            app.context = session.context_tokens;
+            try app.transcript.add(gpa, .info, text);
+        },
         .help => {
             const text = try helpText(gpa, reflect.issueRepo(app));
             defer gpa.free(text);
@@ -302,6 +311,8 @@ test "parse tells commands from paths and messages" {
     try testing.expectEqual(Command.effort, parse("/effort high").?.known.command);
     try testing.expectEqualStrings("high", parse("/effort  high ").?.known.arg);
     try testing.expectEqualStrings("nope", parse("/nope x").?.unknown);
+    try testing.expectEqual(Command.undo, parse("/undo").?.known.command);
+    try testing.expect(allowedWhileBusy("/undo"));
 }
 
 test "candidates complete command names, then argument choices" {

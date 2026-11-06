@@ -50,7 +50,7 @@ pub fn agent(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolR
     const fork_input = if (a.value.fork) blk: {
         var copy = t.forkSnapshot().?;
         copy.id = id;
-        break :blk try std.json.Stringify.valueAlloc(gpa, @import("agent/input.zig").Input{ .prompt = a.value.prompt, .config = cfg, .fork = copy }, .{});
+        break :blk try std.json.Stringify.valueAlloc(gpa, @import("agent/input.zig").Input{ .prompt = a.value.prompt, .config = cfg, .fork = copy, .undo_dir = t.undo_dir }, .{});
     } else null;
     defer if (fork_input) |input| gpa.free(input);
     if (a.value.background) {
@@ -113,7 +113,7 @@ pub fn execute(t: *Tools, gpa: std.mem.Allocator, args: []const u8, cancel: *con
     try env.put("NIB_PARENT_SESSION_ID", t.session_id orelse return error.MissingSessionId);
     const executable = try std.process.executablePathAlloc(t.io, gpa);
     defer gpa.free(executable);
-    const input = fork_input orelse try std.json.Stringify.valueAlloc(gpa, @import("agent/input.zig").Input{ .prompt = a.value.prompt, .config = cfg }, .{});
+    const input = fork_input orelse try std.json.Stringify.valueAlloc(gpa, @import("agent/input.zig").Input{ .prompt = a.value.prompt, .config = cfg, .undo_dir = t.undo_dir }, .{});
     defer if (fork_input == null) gpa.free(input);
     if (background) t.background.beginTask(t.io, id, a.value.timeout_ms);
     const started = std.Io.Clock.awake.now(t.io);

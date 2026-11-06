@@ -71,6 +71,7 @@ Ctrl+O 按 Changes / Result / Script 的顺序展开。结果可滚动查看；�
 - **纯模型调用**：`tools.llm` 不带工具与会话历史，适合并发分类、抽取和批量判断。
 - **子 agent**：`tools.agent` 处理独立多步任务，失败作为数据返回，结果附带改动。`resume: "a1"` 接续同一个子任务，`fork: true` 从当前上下文分叉。
 - **后台任务**：agent/bash 支持 `background: true`，长 Run 也可自动转后台；结果自动到达。长期进程可用 `detached: true`。`/tasks` 查看编号、状态和截止时间；`/stop <id>` 停止任务，可能保留部分改动。见 [TUI 任务管理](docs/tui-ux.md)。
+- **撤销**：`/undo` 回退最近一轮的 edit/write 修改，包含子 agent，新建文件则删除；外部修改会使整轮撤销被拒绝。当前 TUI 实例保留最近 8 个有修改的 Turn，bash/脚本副作用不在范围内。快照超限或失败不阻止编辑，但该轮无法撤销。见 [撤销语义与限制](docs/undo.md)。
 - **推理强度**：`/effort` 设置上限，模型可为下一步声明更低的 effort；Run 失败或用户插话后自动恢复。
 - **日志与重放**：会话日志记录用量和耗时；`scripts/stats.py` 汇总统计；`nib replay` 离线重放工具录制，见 [重放](docs/replay.md)。
 - **反思**：`/reflect` 复盘 harness，默认将 issue 草稿发布到公开仓库 `yyydddkkk/nib-code`。`NIB_ISSUE_REPO` 可指定仓库，设为 `off` 则只保存本地反思。帮助和菜单显示当前设置；见 [反思](docs/reflect.md)。

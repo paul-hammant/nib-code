@@ -995,7 +995,7 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
                 continue
             turn_step = record.get('turn_step')
             explicit_turn = number(turn_step) and turn_step > 0
-            new_turn = (turn_step == 1 if explicit_turn else any(m['role'] == 'user' and m.get('source') not in ('background', 'background_agent') for m in messages))
+            new_turn = (turn_step == 1 if explicit_turn else any(m['role'] == 'user' and m.get('source') not in ('background', 'background_agent', 'undo') for m in messages))
             if new_turn or (explicit_turn and current is None):
                 finish_turn()
                 current = dict(steps=0, full_steps=0, timed=0, ms=0, complete=False, selected=False,
