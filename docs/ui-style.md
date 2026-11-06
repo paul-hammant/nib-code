@@ -14,3 +14,5 @@
 - 用户消息保留 `›` 前缀；前缀与左侧 `▎` 强调条使用终端蓝色（index 4），正文保留默认前景色且不整段加粗。底色按终端报告的背景色混入 1/8 蓝色，适配明暗主题；主题变化后重新查询，不支持颜色报告时保留默认底色与蓝色强调。折叠和 queued 标记继续使用淡色。
 - 读取/搜索路径明细与 Run 标题只保留一处：有实际路径时保留明细，标题省略对应工具名；没有路径元数据时仍显示工具名与调用次数。活动行省略 Step 编号，步数统计放轮末页脚和 /status。
 - `/undo` 提示使用简短英文，明确 edit/write 范围；快照失败或超限说明该 Turn 不可完整撤销，编辑照常进行。失败/取消后的恢复提示可建议 `/undo`，不暗示 bash 副作用可撤销。
+
+- Activity phases use `Waiting for model`, `Thinking` (streaming reasoning), `Generating response` (visible text), and `Writing Run` (Run arguments). Normal activity is dim; retrying and no progress for at least 30s are yellow. History keeps `PgDn to return` ahead of timing fields; new content changes the hint to `New output below · PgDn to return`. A removed retry draft leaves `Interrupted · retrying` until visible output or Turn completion.

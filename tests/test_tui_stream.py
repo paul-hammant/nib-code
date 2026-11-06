@@ -1,6 +1,7 @@
 """Incremental TUI output through a PTY, including a paused stream and live input."""
 import contextlib
 import json
+import sys
 from pathlib import Path
 import tempfile
 import threading
@@ -8,6 +9,9 @@ import time
 from unittest.mock import patch
 
 from test_interjections import Handler, Reply, fixture, finished, history, wait_for
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from screen import screen
 
 
 class StreamReply(Reply):
@@ -17,6 +21,7 @@ class StreamReply(Reply):
         self.tail = " PAUSED_TAIL"
         self.end = " STREAM_END"
         super().__init__(self.prefix + "".join(self.chunks) + self.tail + self.end, gated=True)
+        self.reasoning_done = threading.Event()
         self.continue_stream = threading.Event()
         self.paused = threading.Event()
         self.elapsed = 0
@@ -41,6 +46,9 @@ class StreamHandler(Handler):
             emit({"choices": [{"delta": {"content": value}}]})
 
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            emit({"choices": [{"delta": {"reasoning_content": "hidden thinking"}}]})
+            if not reply.reasoning_done.wait(10):
+                return
             text(reply.prefix)
             if not reply.continue_stream.wait(10):
                 return
@@ -65,7 +73,10 @@ def test_incremental_stream(tmp):
     with patch("test_interjections.Handler", StreamHandler):
         with fixture(tmp, [reply]) as (terminal, home, _):
             terminal.send("stream test\r")
+            wait_for(lambda: any("Thinking" in row for row in screen(terminal.read(), 120, 32)), "Thinking during reasoning")
+            reply.reasoning_done.set()
             terminal.until(reply.prefix.strip().encode())
+            wait_for(lambda: any("Generating response" in row for row in screen(terminal.read(), 120, 32)), "Generating response during text")
             assert not reply.paused.is_set(), "first fragment must appear before the rest is sent"
             terminal.send("\x1b[200~live-draft\x1b[201~")
             terminal.until(b"live-draft")

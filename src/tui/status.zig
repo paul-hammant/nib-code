@@ -3,7 +3,7 @@ const ui_format = @import("format.zig");
 const provider = @import("../provider.zig");
 const ModelActivity = @import("../session/events.zig").ModelActivity;
 
-pub const Phase = enum { thinking, writing, scripting, running, waiting, retrying, compacting };
+pub const Phase = enum { thinking, reasoning, writing, scripting, running, waiting, retrying, compacting };
 
 const spinner = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
 
@@ -25,6 +25,10 @@ pub const Activity = struct {
         if (a.phase == phase) return;
         a.phase = phase;
         a.since = .now(io, .awake);
+    }
+
+    pub fn deltaPhase(kind: provider.Kind) Phase {
+        return if (kind == .reasoning) .reasoning else .writing;
     }
 
     pub fn modelActivity(a: *Activity, activity: ModelActivity, at: std.Io.Clock.Timestamp) void {
@@ -64,6 +68,15 @@ pub const Status = struct {
     /// A transient message, such as a copy confirmation.
     notice: ?[]const u8 = null,
     detail: []const u8 = "",
+    revision: usize = 0,
+    new_output: bool = false,
+
+    pub fn activityStyle(s: Status) @import("vaxis").Style {
+        if (s.busy) |b| {
+            if (b.phase == .retrying or b.quiet_ms >= 30_000) return .{ .fg = .{ .index = 3 } };
+        }
+        return .{ .dim = true };
+    }
 };
 
 /// Printed slices must survive until vaxis renders the frame.
@@ -77,6 +90,7 @@ pub const Text = struct {
         if (s.busy) |b| {
             const phase = switch (b.phase) {
                 .thinking => "Waiting for model",
+                .reasoning => "Thinking",
                 .writing => "Generating response",
                 .scripting => "Writing Run",
                 .running => if (s.detail.len > 0) "Running" else "Running Run",
@@ -97,7 +111,7 @@ pub const Text = struct {
         }
         if (scrolled) {
             if (w.end > 0) w.writeAll(" · ") catch {};
-            w.writeAll("↑ history · PgDn to return") catch {};
+            w.writeAll(if (s.new_output) "New output below · PgDn to return" else "↑ history · PgDn to return") catch {};
         }
         if (s.notice) |notice| {
             if (w.end > 0) w.writeAll(" · ") catch {};
@@ -108,6 +122,18 @@ pub const Text = struct {
 
     pub fn formatWidth(text: *Text, s: Status, scrolled: bool, width: u16) []const u8 {
         var line = text.format(s, scrolled);
+        if (scrolled and @import("vaxis").gwidth.gwidth(line, .unicode) > width) {
+            const hint = if (s.new_output) "New output below · PgDn to return" else "↑ history · PgDn to return";
+            const hint_width = @import("vaxis").gwidth.gwidth(hint, .unicode);
+            if (width <= hint_width + 3) {
+                const fitted = ui_format.fit(hint, width);
+                return std.fmt.bufPrint(&text.narrow_activity, "{s}{s}", .{ fitted.text, fitted.suffix }) catch "";
+            }
+            const full = text.format(s, false);
+            const primary = full[0 .. std.mem.indexOf(u8, full, " · turn ") orelse full.len];
+            const fitted = ui_format.fit(primary, width - hint_width - 3);
+            return std.fmt.bufPrint(&text.narrow_activity, "{s}{s} · {s}", .{ fitted.text, fitted.suffix, hint }) catch hint;
+        }
         const vaxis = @import("vaxis");
         const turn_at = if (s.busy != null) std.mem.lastIndexOf(u8, line, " · turn ") else null;
         while (vaxis.gwidth.gwidth(line, .unicode) > width) {
@@ -222,4 +248,28 @@ test "narrow activity preserves Turn time before long command details" {
     try std.testing.expect(std.mem.endsWith(u8, line, " · turn 1m40s"));
     try std.testing.expect(std.mem.indexOf(u8, line, "…") != null);
     try std.testing.expect(@import("vaxis").gwidth.gwidth(line, .unicode) <= 60);
+}
+
+test "reasoning and text phases and attention colors describe known facts" {
+    const t = std.testing;
+    try t.expectEqual(Phase.reasoning, Activity.deltaPhase(.reasoning));
+    try t.expectEqual(Phase.writing, Activity.deltaPhase(.text));
+    const cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "m" };
+    var text: Text = .{};
+    for (std.enums.values(Phase)) |phase| {
+        var s: Status = .{ .cfg = cfg, .busy = .{ .phase = phase, .ms = 0 } };
+        try t.expectEqual(phase != .retrying, s.activityStyle().dim);
+        s.busy.?.quiet_ms = 30_000;
+        try t.expectEqual(@as(u8, 3), s.activityStyle().fg.index);
+    }
+    for ([_]struct { Phase, []const u8 }{ .{ .reasoning, "Thinking" }, .{ .writing, "Generating response" }, .{ .scripting, "Writing Run" } }) |case| {
+        try t.expect(std.mem.indexOf(u8, text.format(.{ .cfg = cfg, .busy = .{ .phase = case[0], .ms = 0 } }, false), case[1]) != null);
+    }
+    for ([_]u16{ 58, 60, 120, 160 }) |width| {
+        for ([_]bool{ false, true }) |new| {
+            const line = text.formatWidth(.{ .cfg = cfg, .new_output = new, .detail = "bash a very long command with many arguments that will not fit", .busy = .{ .phase = .running, .ms = 0, .turn_ms = 120000 } }, true, width);
+            try t.expect(std.mem.indexOf(u8, line, if (new) "New output below · PgDn to return" else "↑ history · PgDn to return") != null);
+            try t.expect(@import("vaxis").gwidth.gwidth(line, .unicode) <= width);
+        }
+    }
 }

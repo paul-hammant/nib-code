@@ -51,8 +51,11 @@ pub fn drawFrame(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *V
         y += @as(i32, h) + 1;
     }
 
+    scroll.observe(s.revision, saved_scroll.top != null);
+    var activity_status = s;
+    activity_status.new_output = scroll.new_output;
     if (activity_h > 0) {
-        _ = win.child(.{ .x_off = 1, .y_off = body_h + activity_h - 1, .height = 1 }).printSegment(.{ .text = text.formatWidth(s, scroll.top != null, win.width -| 2), .style = if (s.busy != null) .{ .fg = .{ .index = 3 } } else .{ .dim = true } }, .{ .wrap = .none });
+        _ = win.child(.{ .x_off = 1, .y_off = body_h + activity_h - 1, .height = 1 }).printSegment(.{ .text = text.formatWidth(activity_status, scroll.top != null, win.width -| 2), .style = s.activityStyle() }, .{ .wrap = .none });
     }
     var menu_y = body_h + activity_h;
     for (menu_layout.first..menu_layout.end) |i| {

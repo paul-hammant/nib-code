@@ -20,6 +20,20 @@ pub const Viewport = struct {
     /// Rows to scroll at the next layout; negative is up.
     pending: i64 = 0,
 
+    revision: usize = 0,
+    new_output: bool = false,
+
+    pub fn observe(v: *Viewport, revision: usize, was_scrolled: bool) void {
+        if (v.top == null or !was_scrolled) v.new_output = false else if (v.revision != revision) v.new_output = true;
+        v.revision = revision;
+    }
+
+    pub fn removed(v: *Viewport, index: usize) void {
+        if (v.top) |*top| {
+            if (top.entry > index) top.entry -= 1 else if (top.entry == index) top.row = 0;
+        }
+    }
+
     pub fn bottom(entries: []Entry, win: vaxis.Window) Anchor {
         var i = entries.len;
         var rows: i64 = -1;
@@ -33,6 +47,7 @@ pub const Viewport = struct {
     pub fn layout(v: *Viewport, entries: []Entry, win: vaxis.Window) Anchor {
         const end = bottom(entries, win);
         var top = v.top orelse end;
+        if (entries.len > 0) top.entry = @min(top.entry, entries.len - 1);
         if (entries.len > 0) top.row = @min(top.row, entries[top.entry].height(win));
         var left = @abs(v.pending);
         while (left > 0 and entries.len > 0) {
@@ -105,4 +120,19 @@ test "viewport can traverse all 5000 entries and gaps in both directions" {
     view.pending = 100_000;
     try testing.expectEqualDeep(Viewport.bottom(entries, win), view.layout(entries, win));
     try testing.expect(view.top == null);
+}
+
+test "new output is sticky only while browsing history" {
+    var v: Viewport = .{ .top = .{} };
+    v.observe(1, false);
+    try testing.expect(!v.new_output);
+    v.observe(1, true);
+    try testing.expect(!v.new_output);
+    v.observe(2, true);
+    try testing.expect(v.new_output);
+    v.observe(2, true);
+    try testing.expect(v.new_output);
+    v.top = null;
+    v.observe(3, true);
+    try testing.expect(!v.new_output);
 }
