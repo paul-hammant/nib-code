@@ -104,7 +104,7 @@ JSON `agents` 和 `bash_calls` 分别统计 agent、bash 的前台/后台调用�
 
 `count/samples/ratio` 是命中数/候选 Step 数/比例；`ms/sample_ms/time_ratio` 是有计时的命中后步时长/候选后步时长/比例，`timed_count/timed_samples` 给出计时覆盖，缺计时不补零、零总时长的比例为 null。不是全体 Step 的占比，也不是 model_ms 的占比。`sources` 给候选 Step 的录制/静态/混合（`recorded/static/mixed`）来源数，`hit_sources` 给命中来源数。逐 Run 的完整 `<id>.calls.jsonl` 录制优先使用实际工具及 `args.command`（可识别动态 JS 组装的命令）；没有完整录制的 Run 回退静态直线代码提取（控制流/未执行函数体等保守跳过），有些 Run 回退则为 mixed。完整指只有一个结束 meta（ok/error）、无 incomplete 且调用 index 连续无重复；损坏、不完整记录不作完整执行证据。无调用的最终回答不是命中。
 
-`--group-by version|system|patches|transport|incremental|full_reason` 的各组会重新计算全部字段，文本与 `--json` 均展示该指标。共享分类器扩充了状态命令，因此历史“写→仅验证”的命中数可能增加；该旧指标仍只认静态 bash，不把 read 算验证，也不改用录制。新补丁对比见 [compromises.md](compromises.md#expected-continuation-基线与测量)。
+`--group-by version|system|patches|transport|incremental|full_reason` 的各组会重新计算全部字段，文本与 `--json` 均展示该指标。共享分类器扩充了状态命令，因此历史“写→仅验证”的命中数可能增加；该旧指标仍只认静态 bash，不把 read 算验证，也不改用录制。新补丁对比见 [compromises.md](compromises.md#expected-continuation-baseline-and-measurement)。
 
 耗时构成的 `timing.effort.by_effort` 按完整 Step 的顶层 effort 分组，列出 Step 数、model_ms 分布（含中位数和样本数）、prompt/cache token 总量与缓存命中率。缺 effort 的旧记录跳过，缺计时仍计 Step；缓存率为有效 prompt/cache 成对字段的总和之比，不是各 Step 比例的平均。
 

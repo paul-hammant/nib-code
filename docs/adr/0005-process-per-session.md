@@ -3,20 +3,20 @@ status: accepted
 date: 2026-11-01
 ---
 
-# 一个 Session 一个进程，不做共享守护进程
+# One process per Session, without a shared daemon
 
-每个 Session 是一个独立的 `nib` 进程。不学 jcode 的"单个守护进程托管所有 Session、TUI 只是客户端"。但 Session 引擎（回合循环、Provider、Run、Session log）不依赖 TUI，只通过事件流与界面交互，以后若需要守护进程，引擎可以原样搬进去。
+Each Session is an independent `nib` process, unlike jcode's single daemon hosting all Sessions with a client-only TUI. The Session engine (Turn loop, Provider, Run, Session log) is independent of the TUI and communicates through events, so it could move unchanged into a daemon later.
 
-**为什么：** jcode 用守护进程省内存，主要省的是运行时：pi 每个 Session 约 80 MB，是因为每个都是一个 Node 进程（数字来自 jcode README 自己的基准测试，属于一手资料，但是 jcode 一方的测量）。Zig 进程本身就很轻，实测每个进程的开销已经和 jcode 在共享服务端里"每增加一个 Session"的开销同一量级，见下。一个 Session 一个进程，还带来天然的故障隔离：进程退出，操作系统就回收全部内存，也不需要 jcode `docs/SESSION_RUNTIME_OWNERSHIP.md` 里那一整套共享运行时的所有权机制（预留、执行租约、墓碑、过时事件隔离）。
+**Why:** jcode's daemon saves mainly runtime memory: pi uses about 80 MB per Session because each is a Node process (jcode README's own benchmark, a primary source but measured by jcode). Zig processes are already light; measured per-process overhead is comparable to jcode's incremental shared-server Session overhead below. One process per Session also isolates failures naturally: the OS reclaims all memory on exit, without jcode's shared-runtime ownership machinery in `docs/SESSION_RUNTIME_OWNERSHIP.md` (reservations, execution leases, tombstones, stale-event isolation).
 
-**实测（2026-11-01，ReleaseFast，本机）：** 10 个 TUI 进程同时运行，各自和本地模拟服务器完成一轮对话后，空闲时 PSS 每个约 3.08 MB，合计 30.8 MB；RSS 每个约 6.5 MB。一次真实的 HTTPS 请求（到 api.deepseek.com，带 TLS）峰值 RSS 为 7.6 MB。对照：jcode README 公布第一个 Session 71.3 MB，之后每个约 3.3 MB（PSS）。
+**Measured (2026-11-01, ReleaseFast, locally):** 10 concurrent TUI processes each completed a Turn with a local mock server; idle PSS was about 3.08 MB each, 30.8 MB total; RSS about 6.5 MB each. One real HTTPS request to api.deepseek.com with TLS peaked at 7.6 MB RSS. Comparison: jcode README reports 71.3 MB for the first Session and about 3.3 MB PSS for each additional Session.
 
-**局限：** 上述 TUI 测量没有走 TLS，历史只有一轮，也没有执行 Run；和 jcode 的测法、机器、负载都不同，只能比量级，不能逐项比较。
+**Limits:** The TUI measurement used no TLS, one Turn of history, and no Runs. Methods, machines, and workloads differ from jcode; compare orders of magnitude only, not individual figures.
 
-**放弃了什么：** 只有共享服务端才能直接做到的三件事：跨 Session 协作（通知文件变更、agent 之间发消息）、多个 Session 共用 MCP 这类昂贵的外部进程、关掉终端后正在进行的 Turn 继续跑。
+**What this gives up:** Three things directly enabled only by a shared server: cross-Session collaboration (file-change notifications, agent messaging), sharing expensive external processes such as MCP, and continuing active Turns after terminal closure.
 
-**何时重新考虑：**
-- 要做多 agent 协作。注意，这不一定意味着要上 jcode 式守护进程，一个只负责转发消息的轻量协调进程也可能够用；
-- 接入了 MCP，而且每个 Session 各起一套 MCP 已经成了实际负担；
-- 用户需要"关掉终端，任务继续跑"；
-- 带 TLS、长历史、执行过 Run 的真实负载下，每个进程的 PSS 明显高于上面的量级。
+**When to reconsider:**
+- Multi-agent collaboration is needed; this need not mean a jcode-style daemon, as a lightweight message relay might suffice;
+- MCP integration makes a separate MCP setup per Session a real burden;
+- Users need tasks to continue after terminal closure;
+- Real workloads with TLS, long histories, and executed Runs have materially higher per-process PSS than the figures above.

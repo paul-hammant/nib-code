@@ -272,6 +272,8 @@ test "prompt fills the session, log path, issue repo and optional focus" {
     try testing.expect(std.mem.indexOf(u8, plain, "Read only the explicitly specified main log path for this session") != null);
     try testing.expect(std.mem.indexOf(u8, plain, "Do not enumerate, glob, or search the sessions directory") != null);
     try testing.expect(std.mem.indexOf(u8, plain, "`.calls.jsonl`") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "Answer in English") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "Write all issue titles and bodies in English.") != null);
     try testing.expect(std.mem.indexOf(u8, plain, "gh issue list --repo o/r ") != null);
     try testing.expect(std.mem.indexOf(u8, plain, "{{") == null);
     try testing.expect(std.mem.indexOf(u8, plain, "The user particularly wants to understand") == null);

@@ -1,61 +1,61 @@
 # nibcode
 
-一个用 Zig 写的编码 agent：模型通过写代码来行动，代码在宿主内嵌的沙箱里执行。
+A coding agent written in Zig: the model acts by writing code, which runs in a sandbox embedded in the host.
 
-## 会话与回合
+## Sessions and Turns
 
-**Session**（会话）：
-用户与 agent 的一段完整对话，可通过 Session log 在进程退出后恢复。一个进程一次只持有一个 Session。
+**Session**:
+A complete conversation between the user and agent, resumable through the Session log after the process exits. A process holds one Session at a time.
 _Avoid_: conversation, thread, chat
 
-**Session log**（会话日志）：
-一个 Session 的模型上下文的只追加记录，是模型上下文的唯一事实来源。恢复从它重建 system、已完成的 Step 和压缩后的上下文；它不记录完整界面事件，也不能撤销或重放文件、命令的外部副作用。
-_Avoid_: history, transcript（transcript 只指界面上显示的内容）
+**Session log**:
+An append-only record of a Session's model context and its sole source of truth. Resume reconstructs system, completed Steps, and compacted context from it. It does not record all UI events and cannot undo or replay external side effects on files or commands.
+_Avoid_: history, transcript (transcript refers only to displayed UI content)
 
-**Turn**（回合）：
-从一条用户消息开始，到 agent 把控制权交还用户为止的全部过程。一个 Turn 包含一个或多个 Step。
-_Avoid_: round。注意：pi 的 `turn_start` 指的是单次模型调用，相当于这里的 Step。
+**Turn**:
+The entire process from a user message until the agent returns control to the user. A Turn contains one or more Steps.
+_Avoid_: round. Note: pi's `turn_start` means one model call, equivalent to a Step here.
 
-**Step**（步）：
-一个 Turn 内的一次模型请求与响应，以及随后发起的全部 Run（如果有）。Run 可以在工具等待超过阈值时自动转后台，Step 先以通知完成，最终结果作为后续消息送达。Step 完整后才提交日志；首个 Step 同时提交该 Turn 的用户消息。
+**Step**:
+One model request and response within a Turn, plus all Runs it initiates, if any. Runs may automatically move to the background when tool waits exceed the threshold; the Step finishes with a notification first, and final results arrive as later messages. The log is committed only after a complete Step; the first Step also commits the Turn's user message.
 _Avoid_: iteration, turn
 
-**Subagent**（子 agent）：
-父 Session 委派任务后创建的独立 Session，完成一个 Turn 后把最终回答与用量交还父 Session。默认由任务 prompt 提供上下文；fork 继承父会话当前上下文，resume 在同一子会话中继续。
-_Avoid_: worker（仅指工具工作线程）, 常驻 agent
+**Subagent**:
+An independent Session created when a parent Session delegates a task, returning its final answer and usage to the parent after one Turn. By default the task prompt supplies context; fork inherits the parent's current context, and resume continues the same child Session.
+_Avoid_: worker (reserved for tool worker threads), persistent agent
 
-## 执行
+## Execution
 
-**Run**：
-模型写的一段代码在一个全新 Sandbox 里的一次执行。也是模型 API 层面唯一的调用入口。
+**Run**:
+One execution of model-written code in a fresh Sandbox. Also the only invocation entry point at the model API level.
 _Avoid_: eval, cell, code-mode call, PTC call
 
-**Background Run**（后台 Run）：
-等待工具的长 Run 自动转后台后继续原脚本，完成结果延后交付；转后台通知只表示成功登记。它仍是同一次 Run，不是新脚本或子会话。
-_Avoid_: background agent（指子 agent）, detached Run
+**Background Run**:
+A long Run waiting for tools continues its original script after automatically moving to the background, delivering its result later. The background notification confirms registration only. It remains the same Run, not a new script or child Session.
+_Avoid_: background agent (a subagent), detached Run
 
-**Superseded execution**（被取代的执行）：
-本 Session 修改文件后，新启动的同一 bash 命令取代较早 Run 的活动执行。被取代只表示旧执行停止，不表示验证通过或失败，也不终止原 Run 的后续代码。
-_Avoid_: 验证通过, 验证失败（描述取代本身时）
+**Superseded execution**:
+After this Session modifies files, a newly started identical bash command supersedes an active execution from an earlier Run. Supersession means only that the old execution stopped, not that validation passed or failed; it does not terminate subsequent code in the original Run.
+_Avoid_: validation passed, validation failed (when describing supersession itself)
 
-**Sandbox**（沙箱）：
-一次 Run 所在的隔离执行环境，除 Tool 之外没有任何宿主能力，Run 结束即销毁。
-_Avoid_: VM, REPL, kernel（这些词暗示跨 Run 的持久状态）
+**Sandbox**:
+The isolated environment for one Run, with no host capabilities except Tools; destroyed when the Run ends.
+_Avoid_: VM, REPL, kernel (these imply persistent state across Runs)
 
-**Tool**（工具）：
-宿主暴露给 Run 内脚本的一项能力，如 `tools.read`；调用参数经过宿主校验。Session log 记录 Run 代码与最终返回给模型的结果，不逐项记录脚本内部的 Tool 调用。`run` 本身不叫 Tool。
+**Tool**:
+A host capability exposed to scripts within a Run, such as `tools.read`; the host validates call arguments. The Session log records Run code and the final result returned to the model, not individual Tool calls inside the script. `run` itself is not called a Tool.
 _Avoid_: function, programmatic tool, native tool
 
-## 模型
+## Models
 
-**Provider**：
-一个有独立身份、凭证和模型目录的服务，如 Codex、OpenAI 或用户自定义站点；多个 Provider 可以使用同一种线路协议。
-_Avoid_: backend, API（太宽泛）
+**Provider**:
+A service with its own identity, credentials, and model catalog, such as Codex, OpenAI, or a user-defined endpoint. Multiple Providers may use the same wire protocol.
+_Avoid_: backend, API (too broad)
 
-**Reasoning**（推理内容）：
-模型输出的思考摘要与后续请求需要的推理数据。按 provider 保存并回传；可读内容展示给用户，加密条目只用于延续会话。
-_Avoid_: thinking（在本项目中两者同义，统一用 Reasoning）
+**Reasoning**:
+Model-generated thought summaries and reasoning data needed by subsequent requests. Stored and returned according to the provider; readable content is shown to the user, while encrypted items serve only to continue the session.
+_Avoid_: thinking (synonymous here; use Reasoning consistently)
 
-**Context compaction**（上下文压缩）：
-用摘要替换较早的模型上下文，保留 system 和近期完整的 Turn 或 Step。Session log 追加替换记录，原始记录仍在文件里；恢复使用最新替换结果。
-_Avoid_: 清空会话、删除日志
+**Context compaction**:
+Replacing older model context with a summary, preserving system and recent complete Turns or Steps. The Session log appends a replacement record; original records remain in the file, and resume uses the latest replacement.
+_Avoid_: clearing the session, deleting the log

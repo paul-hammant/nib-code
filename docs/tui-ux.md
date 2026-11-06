@@ -1,23 +1,23 @@
-# TUI 任务管理与进展
+# TUI task management and progress
 
-流式文本和任务进展按约 16 ms 的帧间隔合并刷新，不按网络分包逐次重绘；数据始终按接收顺序完整进入对话，不逐字播放、不增加输出队列，也不改变 Session 日志或 `ask` 的流式事件。待刷新内容由定时 tick 兜底，即使服务端暂停发送也不会卡住最后一段。按键、滚动、窗口大小变化和 Turn 结束立即刷新；只有等待动画时按 100 ms 刷新，空闲时不持续重绘。
+Streaming text and task progress batch refreshes at about 16 ms per frame rather than redrawing per network packet. Data enters the conversation completely and in receive order, without character-by-character playback, added output queues, or changes to Session logs or `ask` streaming events. Timer ticks flush pending content even when the server pauses. Keys, scrolling, resizing, and Turn completion refresh immediately; animation-only waits refresh at 100 ms, with no continuous idle redraws.
 
-`/tasks` 不调用模型，列出本进程在当前 Session 登记的后台 agent、bash 和自动转后台的 Run。每行显示 id、类型、状态、已运行时长、截止时间及简短描述；没有任务时显示一句提示。排队中的任务显示等待确定截止时间，开始执行后使用工具本身的 timeout；截止时间显示 UTC 时分秒和剩余秒数。detached 显示无截止时间（显式 timeout 仍由工具执行）。Run 没有墙钟截止时间，显示 `per-tool deadlines`，各工具原有截止时间继续生效。已完成任务的时长冻结，不会继续增加。
+`/tasks` makes no model requests and lists background agents, bash, and automatically backgrounded Runs registered in this process's current Session. Each row shows id, type, status, elapsed time, deadline, and a short description; an empty list shows a short message. Queued tasks wait for a definite deadline; once started, they use the tool's timeout. Deadlines show UTC hours/minutes/seconds and remaining seconds. Detached tasks show no deadline (explicit timeouts still execute in the tool). Runs have no wall-clock deadline and show `per-tool deadlines`; existing tool deadlines remain effective. Finished tasks' durations freeze.
 
-`/stop <id>` 在 Turn 运行时也立即受理。停止请求由 Session 线程处理，复用 tools.stop 的取消、join 和进程组清理，日志的 `task_stop` 记录理由 `user requested stop`；停止完成后提示可能留有部分改动。已完成任务返回 already finished，未知 id 显示错误。输入 `/stop ` 时，菜单按 id 前缀提供仍在运行的任务候选；无需让模型发起工具调用。切换 Session 后不再显示旧 Session 的任务；恢复不会重启进程。
+`/stop <id>` is accepted immediately even during a Turn. The Session thread handles stopping, reusing tools.stop cancellation, join, and process-group cleanup; log `task_stop` records reason `user requested stop`. Completion warns that partial changes may remain. Finished tasks return already finished; unknown ids show errors. After `/stop `, the menu suggests active tasks by id prefix without model tool calls. Switching Sessions hides old tasks; resume does not restart processes.
 
-Run 始终保留父标题。自动转后台时显示 `Run · r3 running`；结束后把改动、工具摘要和结果更新回原块。bash 被取代时显示 `b1 superseded by b2`，取代不代表验证通过或失败。父标题会提示子任务失败或超时，但不改变脚本的返回值。Ctrl+O 依次展开 Changes / Result / Script；结果全文可滚动查看，长 diff 标注 `Diff preview · 60 of … lines`。
+Runs retain parent titles. Automatic backgrounding shows `Run · r3 running`; completion updates changes, tool summaries, and results in the original block. Superseded bash shows `b1 superseded by b2`, indicating neither validation pass nor failure. Parent titles flag child failures/timeouts without changing script return values. Ctrl+O expands Changes / Result / Script; full results scroll, and long diffs say `Diff preview · 60 of … lines`.
 
-活动行与上方对话之间保留一行空白，历史浏览和临时提示也沿用该留白；终端不足 10 行或正文可用高度不足时收紧，不挤掉输入框。没有活动行时不额外占行。
+One blank line separates the activity line from the transcript, also during history browsing and temporary notices. Tighten spacing below 10 terminal rows or when body height is insufficient, preserving input. No extra row is reserved without an activity line.
 
-活动行显示已知阶段：`Waiting for model`、`Generating response`、`Writing Run`、`Running bash zig build test`、`Waiting for r3 · 32s`，并保留整个 Turn 的累计时间。只有有内容的推理、文本、工具参数和工具状态/输出进度会更新最后活动；网络心跳、metadata、usage 和单纯经过的时间都不重置它。超过 30 秒无进展显示 `no progress 30s`，不预测 ETA。窄屏从右往左去掉字段，仍为单行。
+Activity states known phases: `Waiting for model`, `Generating response`, `Writing Run`, `Running bash zig build test`, `Waiting for r3 · 32s`, retaining cumulative Turn time. Only nonempty reasoning, text, tool arguments, and tool status/output progress update last activity; network heartbeats, metadata, usage, and elapsed time do not reset it. After 30 seconds without progress, show `no progress 30s`, without predicting ETA. Narrow screens drop fields from right to left, keeping one line.
 
-重试显示 `Retrying · attempt 2/5 · rate limit`，移除失败尝试的流式草稿，保留此前成功的回答和排队插话。最终错误用一句说明加 Details，Ctrl+O 查看原始错误。取消仅显示一次恢复提示；未消费的排队消息回到输入框，已有草稿仍保留，并显示返回的消息数。
+Retries show `Retrying · attempt 2/5 · rate limit`, removing failed attempts' streamed drafts while preserving earlier successful answers and queued interjections. Final errors get one explanatory sentence plus Details; Ctrl+O reveals raw errors. Cancellation shows one recovery notice; unconsumed queued messages return to input, preserving existing drafts and showing the returned message count.
 
-Turn 失败或取消后显示本轮直接 edit/write 修改的文件及 `type continue to resume`，有直接修改时另提示 `/undo to revert edit/write`。路径按首次修改去重，包括尚未交回 Run 结果的写入；不把子 agent 的修改当作根 Session 的直接修改。若运行过 bash，会注明 `bash changes untracked`；没有记录时显示 `no recorded edit/write changes`。取消不会回滚文件，下一次普通输入继续沿用 Session 上下文。
+After Turn failure/cancellation, list files directly changed by edit/write in that Turn and `type continue to resume`; direct changes also prompt `/undo to revert edit/write`. Deduplicate paths by first change, including writes whose Run result has not returned; child-agent changes are not direct root-Session changes. If bash ran, say `bash changes untracked`; absent records show `no recorded edit/write changes`. Cancellation does not roll files back; the next ordinary input continues the Session context.
 
-恢复提示仅由 TUI 生成，不进入模型历史；`nib ask`（包括非 TTY 和 NDJSON）不增加恢复提示，保留原来的输出通道和退出码，便于脚本继续解析。`run_end` 新增可选 `background_id` 用于关联自动后台 Run；NDJSON 的事件结构仍保持原格式。
+Recovery notices come only from the TUI, outside model history. `nib ask` (including non-TTY and NDJSON) adds no notices, preserving output channels and exit codes for scripts. `run_end` adds optional `background_id` to associate automatic background Runs; NDJSON event structure otherwise remains unchanged.
 
-底栏只显示模型和已有用量报告对应的 context 百分比；首次启动只显示模型。轮末页脚显示非零的 Run 数、步数、总时间、tokens 和工具数据量，详细模型/Run 耗时与缓存放在 `/status`（本地命令，运行时也可查看）。
+The bottom bar shows only the model and context percentage from existing usage reports; initially, only the model. Turn footers show nonzero Run counts, Steps, total time, tokens, and tool data. Detailed model/Run timing and cache data live in `/status` (local, also available while running).
 
-用户消息使用 `›` 前缀、蓝色色条和按终端背景色生成的淡底色，兼容明暗主题。拖选时按住左键滚动可跨屏延伸，松开复制完整历史范围，包含滚出屏幕的行；选择期间暂停底部跟随。`/undo` 的范围与冲突处理见 [undo.md](undo.md)。
+User messages use `›`, a blue accent, and subtle terminal-background-derived shading for light/dark themes. During drag selection, hold the left button and scroll across screens; release copies the complete historical range, including offscreen lines. Bottom following pauses during selection. See [undo.md](undo.md) for `/undo` scope and conflict handling.

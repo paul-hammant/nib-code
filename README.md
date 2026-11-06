@@ -7,7 +7,7 @@
 
 <h1 align="center">nib</h1>
 
-<p align="center">English | <a href="README.zh-CN.md">中文</a></p>
+<p align="center">English | <a href="README.zh-CN.md">Chinese</a></p>
 
 A small, focused, quiet coding agent.
 
@@ -78,4 +78,4 @@ nib runs model-written code with your permissions. bash refuses obviously destru
 
 ## More
 
-[Docs](docs/README.md) (Chinese) · [Providers](docs/providers.md) · [Config](docs/config.md) · [Releases](docs/releases/) · [MIT](LICENSE)
+[Docs](docs/README.md) · [Providers](docs/providers.md) · [Config](docs/config.md) · [Releases](docs/releases/) · [MIT](LICENSE)

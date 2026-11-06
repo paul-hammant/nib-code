@@ -3,22 +3,22 @@ status: deferred
 date: 2026-11-01
 ---
 
-# 两层隔离
+# Two layers of isolation
 
-**暂缓（2026-11-01）：** 用户决定系统层沙箱暂时不做，改为宿主侧拒绝危险命令，见 [0006](0006-deny-dangerous-commands.md)。语言层隔离已实现并保留。以下是当初的方案，留作将来参考。
+**Deferred (2026-11-01):** The user decided to defer system-level sandboxing in favor of host-side rejection of dangerous commands; see [0006](0006-deny-dangerous-commands.md). Language-level isolation is implemented and retained. The original proposal follows for future reference.
 
-隔离分两层：语言层，Sandbox 里除 Tool 外没有任何宿主能力；系统层，bash 和文件类 Tool 在 Linux 上用 Landlock + bwrap 限制。先只支持 Linux。
+Two layers: language-level isolation gives the Sandbox no host capabilities except Tools; system-level isolation restricts bash and file Tools with Landlock + bwrap on Linux. Initially support Linux only.
 
-**为什么：** 只要有 bash 这个 Tool，语言层隔离就挡不住任何事，系统层不可省。反过来，语言层让 Sandbox 只能通过 Tool 影响外界，而每次 Tool 调用都经过校验、写日志，这让审计和将来可能的限制策略有了唯一的关口。
+**Why:** With a bash Tool, language-level isolation cannot stop anything; the system layer is indispensable. Conversely, language-level isolation confines external effects to Tools, with each call validated and logged, providing one checkpoint for auditing and possible future restrictions.
 
-**不做审批：** 用户决定不需要逐次审批 Tool 调用（2026-11-01）。安全只靠这两层隔离和日志。
+**No approvals:** The user decided against approving individual Tool calls (2026-11-01). Safety relies solely on these two isolation layers and logs.
 
-**参考：** DeepSeek Harness 依赖系统层沙箱（Linux 上 bwrap + Landlock），并明确否定 `node:vm` 作为安全边界（**二手**：第三方博客，未核实）。它否定 `node:vm` 的理由，是 vm 与 Node 共享全部系统能力；这一点不适用于不加载 quickjs-libc 的 QuickJS。
+**Reference:** DeepSeek Harness relies on a system sandbox (bwrap + Landlock on Linux) and explicitly rejects `node:vm` as a security boundary (**secondary source**: third-party blog, unverified). Its reason is that vm shares all of Node's system capabilities; this does not apply to QuickJS without quickjs-libc.
 
-**把握程度：**
-- 实测：语言层。`src/sandbox.zig` 中的测试确认 `require/process/std/os/fetch` 均不存在。
-- 未实现：系统层。Landlock 与 bwrap 的具体组合、对网络的限制方式、在用户机器上的可用性都还没验证。
+**Confidence:**
+- Measured: language layer. Tests in `src/sandbox.zig` confirm that `require/process/std/os/fetch` are absent.
+- Unimplemented: system layer. The exact Landlock/bwrap combination, network restrictions, and availability on user machines remain unverified.
 
-**何时重新考虑：**
-- 目标机器上 bwrap 或 Landlock 普遍不可用；
-- 系统层限制导致常见开发任务（构建、测试、包管理）频繁失败，需要重新划定边界。
+**When to reconsider:**
+- bwrap or Landlock is widely unavailable on target machines;
+- System restrictions frequently break common development tasks (builds, tests, package management), requiring revised boundaries.

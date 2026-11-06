@@ -1,16 +1,16 @@
 # UI style
 
-面向修改 TUI、CLI 帮助和固定文案的 agent。
+For agents changing the TUI, CLI help, or fixed text.
 
-- 固定 UI 文字用英文；模型输出保留原语言。标题取自工具摘要、diff、退出码与任务事件，不为界面增加模型输出或提示词要求。
-- Run 是稳定的父块。折叠层放事实摘要、文件改动、命令结果和任务状态；展开顺序为 Changes / Result / Script。省略内容明确标成 preview 并注明范围。
-- 状态词：queued / running / waiting / completed / failed / canceled / timed out / superseded / lost。内部枚举通过展示映射输出；不将 JS 返回值 `ok` 当作任务完成状态。
-- 数量用单复数：1 step、2 steps、1 Run、2 Runs、1 file、2 files。快捷键写 Enter、Shift+Enter、Esc、Ctrl+O、Ctrl+C、PgUp、PgDn。
-- 时间向下取整到秒：<1s、24s、1m40s、1h0m0s。数字以十进制 k/M 缩写，保留至多一位小数（向下取整，无尾随 .0）；写明 tokens、B、kB、MB。共用 `src/tui/format.zig`。
-- `·` 分隔字段；`→` 只表示数据去向。`✓` 只确认旁边明确命名的对象完成；`✗` 表示失败。超时、丢失及需检查用终端黄色并写明状态；失败用红色，其余尽量淡色。使用终端原生色。
-- 成功无声，偏离显眼。活动行陈述已知事实，整轮计时持续累积；轮末统计只出现一次，零值项省略。详细计时与缓存放 /status。
-- 在 60 / 120 / 160 列检查布局；菜单与单行预览截断用 `…`，保留 UTF-8 字素边界。工具返回给 JS 的数据不受展示预算影响。
+- Use English for fixed UI text; preserve the language of model output. Derive titles from tool summaries, diffs, exit codes, and task events; do not add model output or prompt requirements for the UI.
+- Run is the stable parent block. The collapsed layer shows factual summaries, file changes, command results, and task status; expand in Changes / Result / Script order. Explicitly label omitted content as a preview and state its scope.
+- Status words: queued / running / waiting / completed / failed / canceled / timed out / superseded / lost. Map internal enums to display text; do not treat the JS return value `ok` as task completion status.
+- Use singular/plural counts: 1 step, 2 steps, 1 Run, 2 Runs, 1 file, 2 files. Write shortcuts as Enter, Shift+Enter, Esc, Ctrl+O, Ctrl+C, PgUp, PgDn.
+- Round time down to seconds: <1s, 24s, 1m40s, 1h0m0s. Abbreviate numbers with decimal k/M, at most one decimal place (rounded down, no trailing .0); specify tokens, B, kB, MB. Share `src/tui/format.zig`.
+- Separate fields with `·`; use `→` only for data direction. `✓` confirms completion only of the explicitly named adjacent object; `✗` means failure. Use terminal yellow and explicit status for timeouts, lost tasks, and items needing inspection; red for failures, muted colors elsewhere where possible. Use native terminal colors.
+- Success is quiet; deviations stand out. The activity line states known facts, accumulating time throughout the Turn; show end-of-Turn statistics once, omitting zero values. Put detailed timing and cache data in /status.
+- Check layouts at 60 / 120 / 160 columns; truncate menus and single-line previews with `…`, preserving UTF-8 grapheme boundaries. The display budget does not affect tool data returned to JS.
 
-- 用户消息保留 `›` 前缀；前缀与左侧 `▎` 强调条使用终端蓝色（index 4），正文保留默认前景色且不整段加粗。底色按终端报告的背景色混入 1/8 蓝色，适配明暗主题；主题变化后重新查询，不支持颜色报告时保留默认底色与蓝色强调。折叠和 queued 标记继续使用淡色。
-- 读取/搜索路径明细与 Run 标题只保留一处：有实际路径时保留明细，标题省略对应工具名；没有路径元数据时仍显示工具名与调用次数。活动行省略 Step 编号，步数统计放轮末页脚和 /status。
-- `/undo` 提示使用简短英文，明确 edit/write 范围；快照失败或超限说明该 Turn 不可完整撤销，编辑照常进行。失败/取消后的恢复提示可建议 `/undo`，不暗示 bash 副作用可撤销。
+- Keep the `›` prefix on user messages; use terminal blue (index 4) for the prefix and left `▎` accent, leaving body text in the default foreground without bolding the whole message. Blend 1/8 blue into the terminal-reported background for light/dark themes; query again on theme changes. Without color reports, keep the default background and blue accent. Collapsed and queued markers remain muted.
+- Show read/search path details and Run titles in only one place: when actual paths exist, keep details and omit corresponding tool names from the title; without path metadata, show tool names and counts. Omit Step numbers from the activity line; put Step counts in the Turn footer and /status.
+- Keep `/undo` messages short and English, explicitly scoped to edit/write. If snapshots fail or exceed limits, explain that the Turn cannot be fully undone; editing continues normally. Recovery messages after failure/cancellation may suggest `/undo`, without implying that bash side effects can be undone.
