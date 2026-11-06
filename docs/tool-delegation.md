@@ -103,7 +103,7 @@ bash 与子会话复用标准库子进程等待和进程组执行器。所有 ba
 
 ## 工具说明的生成
 
-新会话构建 system 时，`src/tools.zig` 根据有效 provider 配置生成 llm 的模型列表：Codex 模型取自 `src/provider/codex.zig` 的目录；Chat Completions 至少提供 `src/provider/openai.zig` 的默认模型，另加入当前配置模型并去重。effort 说明只列常用的 low/medium/high，省略 model/effort 仍继承当前配置；完整档位与映射见 [config.md](config.md) 和 [codex.md](codex.md)。选择只在当前 provider 内进行，不隐式切换 provider。
+新会话构建 system 时，`src/tools.zig` 根据有效 provider 配置生成 llm 的模型列表：内置模型取自 `src/provider.zig` 的表（Codex 的原目录保留在 `src/provider/responses.zig`）；旧 Chat Completions 至少提供 `src/provider/openai.zig` 的默认模型，另加入当前配置模型并去重。effort 说明只列常用的 low/medium/high，省略 model/effort 仍继承当前配置；完整档位与映射见 [config.md](config.md) 和 [codex.md](codex.md)。选择只在当前 provider 内进行，不隐式切换 provider。
 
 工具说明中的模型名按 JSON 字符串编码，不直接插入原始配置文本。根会话与默认新建子会话使用同一生成路径，但默认子会话隐藏 agent；fork 复用父 system/schema，不重新生成，agent 的不可递归边界由运行时执行。恢复会话仍沿用日志原始 system，不改写历史。架构理由见 [ADR 0010](adr/0010-subagents.md)、[ADR 0013](adr/0013-llm-functions.md) 与 [ADR 0015](adr/0015-agent-fork.md)。
 
@@ -122,3 +122,5 @@ bash 与子会话复用标准库子进程等待和进程组执行器。所有 ba
 旧调用 resolve 为 `{superseded_by:"bN"}`，没有 exit_code、output 或 error：它表示已被更新的同一验证取代，不表示验证通过或失败。后台 bash 的消息带 `background_ok:true`；自动后台 Run 的 await 拿到同样的数据，脚本继续执行，Run 最终状态由脚本决定。需要检查退出码的脚本可用 `if (!r.superseded_by && r.exit_code !== 0) ...`；无条件检查退出码的旧脚本仍可能自行抛错。只取代该 bash，不停止整个 Run 或其余工具，继续脚本仍可产生副作用。
 
 修改代数在成功 edit/write 后推进，与界面 changes 统计是否启用无关；最多读取 16 MiB 比较旧内容，无效 edit、失败写入、已确认内容相同的覆盖不计，创建空文件也计。旧内容超过读取上限或不可读时，成功 write 保守地计为修改。它是 Session 级记录，不推断文件依赖，因此任何 edit/write 都可能使旧命令过时；bash 自身副作用、用户编辑、其他 Session/子 agent 的写入无法据此识别。进程组清理沿用 stop/取消路径，20 ms 轮询观察停止标志，新执行不等旧进程自然退出。匹配的全部旧命令各取代一次；后台并发准入限额仍正常检查。停止前已产生的文件或其他副作用不会回滚。设计取舍见 [ADR 0016](adr/0016-superseded-bash.md)，独立启动/取代事件及统计见 [日志](session-log.md#bash-启动与取代事件)。
+
+API key 服务的有效配置经 stdin 只传密钥环境变量名，各子进程独立读取；仅选定密钥进入 nib 子进程，bash 仍清除密钥。新增缓存写入用量字段见 [providers.md](providers.md)。

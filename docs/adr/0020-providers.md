@@ -9,7 +9,7 @@ date: 2026-11-05
 
 ## 服务与模型
 
-内置表项包含 id、显示名、protocol、base_url、api_key_env 列表、default_model 和少量带 context_window 的模型。快照日期为 2026-11-05；模型不是发现接口，也不保证账号有权限。
+内置表项包含 id、显示名、protocol、base_url、api_key_env 列表、default_model 和少量带 context_window 的模型。快照日期为 2026-11-06；模型不是发现接口，也不保证账号有权限。
 
 | id | 显示名 | protocol | base_url | 凭证 | 默认模型 |
 | --- | --- | --- | --- | --- | --- |
@@ -63,3 +63,5 @@ Anthropic Usage.prompt_tokens = input_tokens + cache_read_input_tokens + cache_c
 不做非 Codex OAuth、模型发现端点、provider marketplace、逐 provider UI、跨协议历史转换。/status 和 CLI 帮助显示服务 id，固定 UI 文案英文。
 
 **来源：** 本机 pi `packages/ai/src/providers/{openai-codex,openai,anthropic,deepseek,xai}.ts`、同名 models wrapper、`catalog/providers`、`catalog/families` 及 `src/api/{openai-responses,openai-responses-shared,anthropic-messages,openai-completions}.ts`。本 ADR 已获批准；交付状态以代码与验证为准。
+
+**实现取舍：** 自定义服务沿用现有枚举日志布局，以 provider=custom 与 custom_provider=<id> 组成完整身份，恢复/fork 同时比较；保留旧日志解析和旧 provider 名称。缓存写入字段默认零、序列化时为零省略，旧用量输出形状不变。自定义 Responses 采用 function Run 以适配未支持 custom 工具的站点；自定义 Chat Completions 不发送 DeepSeek 专用 thinking 字段。共享 Responses 实现在 responses.zig，Codex 的认证与 WS 扩展也留在该模块，不复制协议代码。Anthropic 逐消息 effort 沿用 pi 的 managed-effort 标记和 block_binding。验证只用本地 mock，未调用真实服务。

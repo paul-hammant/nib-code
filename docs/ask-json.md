@@ -24,3 +24,5 @@
 后台 bash 的 finished 事件可带 `execution:{start_ms_epoch,end_ms_epoch}`（Unix 毫秒，spawn 前至 wait 完成）；结束时间早于或等于结果送达时间。未成功启动进程时省略。自动后台 Run 的 completion.execution 从原 Run 创建时开始，包含自动切换前等待。
 
 TUI 的恢复提示不写入 ask 输出。自动转后台的 `run_end` 可带 `background_id`（如 `r3`），`ok:true` 此时仅表示成功登记；最终状态取后台结果。bash 的 progress 可带 `superseded_by`，取代是中性状态；`output_bytes` 是已观察到的命令输出进度，用于区分实际输出和纯计时心跳。
+
+Usage 可包含 `prompt_cache_write_tokens`（缓存创建输入 tokens）。为零时省略，缺省按零读取；prompt_tokens 已包含这些输入，不要重复计入总 tokens。原有字段保持不变。

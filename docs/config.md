@@ -52,9 +52,26 @@ hallmark = true # 默认全部关闭，按名称逐个启用
 
 只使用当前 provider 的段落；切换 provider 不需要改写另一段。环境和配置文件均未指定时，默认 provider 为 `codex`，默认模型 `gpt-6.1-sol`、窗口 500000 tokens；使用本机 Codex 登录，无需 API key。Codex 窗口随模型变化，未知模型需要显式提供 `context_window` 或 `NIB_CONTEXT_WINDOW`。模型、恢复和凭证边界见 [codex.md](codex.md) 与 [ADR 0011](adr/0011-provider-wire-protocols.md)。
 
-DeepSeek 使用 Chat Completions：设置 `NIB_PROVIDER=chat_completions`，配 `DEEPSEEK_API_KEY`（或 `NIB_API_KEY`），默认模型 `deepseek-flash`、窗口 1000000 tokens；其他默认值见上例。
+内置 provider 为 codex（默认）、openai、anthropic、deepseek、xai；旧 chat_completions 是保留独立会话身份的 DeepSeek 兼容入口。内置服务表、模型窗口、认证方式、effort 映射与自定义站点示例见 [providers.md](providers.md)。
 
-这是无额外依赖的 TOML 子集：支持空行、`#` 注释、单行双引号字符串（支持 `\"`、`\\`、`\n` 转义）、十进制整数（可带符号、下划线分组）和 true/false 布尔值；仅 `[skills]` 的技能名称键接受布尔值，其余配置键只使用字符串和正整数，布尔值会报告类型错误。仅接受顶层 `provider`、`effort`，`[codex]` / `[chat_completions]` 下的 `model`、`base_url`、`context_window`，`[codex]` 还接受 `transport = "sse"|"websocket"`、`reasoning_summary = "off"|"auto"`、`run_tool = "custom"|"function"`，以及下述 `[limits]` 键和 `[skills]` 技能名称开关。不支持数组、嵌套表、多行字符串等完整 TOML 语法；未知键、重复键/段落和格式错误会报配置文件路径与行号，不静默忽略。
+```toml
+provider = "openai"
+
+[openai]
+model = "gpt-6.1-sol"
+
+# 切换到自己的 OpenAI 兼容站点时，将顶层 provider 改成 mysite
+[providers.mysite]
+protocol = "chat_completions"
+base_url = "https://models.example.com/v1"
+model = "my-code-model"
+context_window = 128000
+api_key_env = "MYSITE_API_KEY"
+```
+
+openai 使用环境 OPENAI_API_KEY；mysite 使用 MYSITE_API_KEY。密钥内容不写进文件。自定义 provider 的 protocol/base_url/model/context_window 必填；无认证本地服务省略 api_key_env。设置 NIB_PROVIDER=mysite 可覆盖顶层选择。
+
+这是无额外依赖的 TOML 子集：支持空行、`#` 注释、单行双引号字符串（支持 `\"`、`\\`、`\n` 转义）、十进制整数（可带符号、下划线分组）和 true/false 布尔值；仅 `[skills]` 的技能名称键接受布尔值，其余配置键只使用字符串和正整数，布尔值会报告类型错误。仅接受顶层 `provider`、`effort`，内置 provider 同名段落下的 `model`、`base_url`、`context_window`，`[codex]` 还接受 `transport = "sse"|"websocket"`、`reasoning_summary = "off"|"auto"`、`run_tool = "custom"|"function"`，以及下述 `[limits]` 键和 `[skills]` 技能名称开关。另接受 `[providers.<id>]` 的 protocol/base_url/model/context_window/api_key_env；除此之外不支持数组、一般嵌套表、多行字符串等完整 TOML 语法；未知键、重复键/段落和格式错误会报配置文件路径与行号，不静默忽略。
 
 ## [skills]
 
@@ -102,7 +119,7 @@ TUI `/skills` 列表显示发现的技能与开关；`/skills on <name>`、`/ski
 
 环境中设置 thinking 或 effort 时，不采用文件 effort。`NIB_THINKING=off` 优先于环境 effort；显式 CLI effort 又覆盖两者。未指定任何推理配置时使用服务端默认。CLI `--effort default` 清除本进程的 thinking/effort 覆盖，不修改文件。
 
-子会话通过匿名 stdin 管道继承父会话的有效 provider/模型配置及限额，跳过配置文件读取，不会因文件在中途变化而采用另一套配置；Codex 凭证仍由各进程独立读取。
+子会话通过匿名 stdin 管道继承父会话的有效 provider/模型配置及限额，跳过配置文件读取，不会因文件在中途变化而采用另一套配置；各进程独立读取选定密钥环境变量，stdin 不传密钥内容；Codex 凭证仍由各进程独立读取。
 
 ## 环境变量
 
@@ -110,7 +127,7 @@ TUI `/skills` 列表显示发现的技能与开关；`/skills on <name>`、`/ski
 |---|---|
 | `NIB_RECORD` | 默认开启工具结果录制；仅 `off` 关闭，不删除已有 calls 文件，见 [replay.md](replay.md) |
 | `NIB_HOME` | 用户目录，默认 `~/.nib`；不改变 Codex 凭证位置 |
-| `NIB_PROVIDER` | `codex` / `chat_completions` |
+| `NIB_PROVIDER` | codex / openai / anthropic / deepseek / xai / chat_completions 或已配置自定义 id |
 | `NIB_BASE_URL` | 当前 provider 的服务地址 |
 | `NIB_CODEX_TRANSPORT` | Codex 传输：`websocket`（默认）或 `sse`；覆盖 `[codex].transport`，握手/协议失败后本 Session 降级 SSE，见 [Codex 传输](codex.md#responses-websocket-传输) |
 | `NIB_CODEX_RUN_TOOL` | `custom`（默认，直接发送 JS）或 `function`（JSON code/effort）；覆盖 `[codex].run_tool`，不改写既有历史类型，Chat Completions 始终使用 function |
@@ -121,7 +138,8 @@ TUI `/skills` 列表显示发现的技能与开关；`/skills on <name>`、`/ski
 | `NIB_THINKING` | `on` / `off`，不设时用服务端默认（若无其他推理配置） |
 | `NIB_REASONING_EFFORT` | 推理档位，如 `low` / `high` / `max` |
 | `CODEX_HOME` | Codex 登录目录，凭证为其中的 `auth.json`，默认 `~/.codex/auth.json` |
-| `NIB_API_KEY` / `DEEPSEEK_API_KEY` | Chat Completions 的凭证，仅从环境读取 |
+| `NIB_API_KEY` / `DEEPSEEK_API_KEY` | 旧 chat_completions 优先用 NIB_API_KEY；deepseek 使用 DEEPSEEK_API_KEY，仅从环境读取 |
+| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `XAI_API_KEY` | 对应内置 provider 的 API key，仅从环境读取 |
 | `NIB_PATCHES_OFF` | 关闭提示词中的模型补丁：`all` 或逗号分隔的 id，见 [compromises.md](compromises.md) |
 | `NIB_ISSUE_REPO` | `/reflect` 自动发布的目标仓库或 `off`，见 [reflect.md](reflect.md) |
 
