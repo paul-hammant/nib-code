@@ -42,7 +42,15 @@ pub const Event = union(enum) {
     turn_end: TurnSummary,
     usage: struct { tokens: provider.Usage, context: u64, steps: u32 },
     progress: @import("session/events.zig").Progress,
-    background: @FieldType(SessionEvent, "background"),
+    background: struct {
+        id: []const u8,
+        kind: @FieldType(@FieldType(SessionEvent, "background"), "kind"),
+        state: @FieldType(@FieldType(SessionEvent, "background"), "state"),
+        ok: ?bool = null,
+        result: ?[]const u8 = null,
+        changes: ChangeText = .{},
+        tool_summary: ?ToolSummary = null,
+    },
     failed: struct { message: []u8, reason: @import("tools/changes.zig").Recovery.Reason },
     /// One outcome line from automatic issue filing, owned by the receiver.
     issue: []u8,
@@ -264,6 +272,10 @@ pub const App = struct {
             },
             .background => |b| {
                 defer gpa.free(b.id);
+                defer if (b.tool_summary) |summary| summary.deinit(gpa);
+                var changes = b.changes;
+                defer changes.deinit(gpa);
+                if (b.kind == .run and b.tool_summary != null) try app.transcript.updateBackgroundRun(gpa, b.id, b.result orelse "", b.changes, b.tool_summary.?);
                 defer if (b.result) |result| gpa.free(result);
                 switch (b.state) {
                     .started => app.background_count += 1,
@@ -736,7 +748,7 @@ test "Step events own effort and Runs keep their generating Step metadata" {
     _ = try app.handle(.{ .step = .{ .n = 4, .effort = try t.allocator.dupe(u8, "low"), .source = .model } });
     try t.expectEqualStrings("high", app.transcript.entries.items[0].step_effort.?.effort);
     try t.expectEqualStrings("low", app.step_effort.?.effort);
-    try t.expect(std.mem.endsWith(u8, app.transcript.entries.items[0].label.items, " · high (guard)"));
+    try t.expectEqualStrings("Run", app.transcript.entries.items[0].label.items);
 }
 
 test "Run summary survives event queue and original summary destruction" {
@@ -760,5 +772,5 @@ test "Run summary survives event queue and original summary destruction" {
     _ = try app.handle((try loop.tryEvent()).?);
     try t.expectEqualStrings("edit", app.transcript.entries.items[0].tool_summary.?.counts[0].name);
     try t.expectEqual(@as(u64, 2), app.transcript.entries.items[0].tool_summary.?.counts[0].count);
-    try t.expect(std.mem.startsWith(u8, app.transcript.entries.items[0].label.items, "edit ×2, +3 · "));
+    try t.expect(std.mem.startsWith(u8, app.transcript.entries.items[0].label.items, "Run · edit ×2 · +3"));
 }

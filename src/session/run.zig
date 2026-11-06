@@ -147,6 +147,9 @@ fn executeTimed(s: *Session, code: []const u8, cancel: *const std.atomic.Value(b
     if (job.failure) |err| return err;
     const count = @min(job.timing.count, timing.entries.len - timing.count);
     @memcpy(timing.entries[timing.count..][0..count], job.timing.entries[0..count]);
+    for (timing.entries[timing.count..][0..count]) |*entry| {
+        if (entry.path) |path| entry.path = try s.arena.allocator().dupe(u8, path);
+    }
     timing.count += count;
     timing.omitted += job.timing.omitted + job.timing.count - count;
     timing.tool_bytes += job.timing.tool_bytes;

@@ -5,6 +5,7 @@ const max_diff_lines = @import("entry.zig").max_diff_lines;
 pub const ChangeText = struct {
     /// "src/a.zig +3 −1", or "4 files +20 −5"; empty when nothing changed.
     summary: []u8 = &.{},
+    file_count: usize = 0,
     /// Per file a header line, then its diff lines; at most `max_diff_lines` in all.
     diff: []u8 = &.{},
 
@@ -12,19 +13,9 @@ pub const ChangeText = struct {
         if (changes.len == 0) return .{};
         var summary: std.ArrayList(u8) = .empty;
         errdefer summary.deinit(gpa);
-        if (changes.len <= 2) {
-            for (changes, 0..) |c, i| {
-                if (i > 0) try summary.appendSlice(gpa, ", ");
-                try summary.print(gpa, "{s}{s} +{d} −{d}", .{ c.path, if (c.created) " (new)" else "", c.added, c.removed });
-            }
-        } else {
-            var added: usize = 0;
-            var removed: usize = 0;
-            for (changes) |c| {
-                added += c.added;
-                removed += c.removed;
-            }
-            try summary.print(gpa, "{d} files +{d} −{d}", .{ changes.len, added, removed });
+        for (changes, 0..) |c, i| {
+            if (i > 0) try summary.appendSlice(gpa, " · ");
+            try summary.print(gpa, "{s}{s} +{d} −{d}", .{ c.path, if (c.created) " (new)" else "", c.added, c.removed });
         }
         var diff: std.ArrayList(u8) = .empty;
         errdefer diff.deinit(gpa);
@@ -45,7 +36,13 @@ pub const ChangeText = struct {
             }
         }
         if (hidden > 0) try diff.print(gpa, "… {d} more lines\n", .{hidden});
-        return .{ .summary = try summary.toOwnedSlice(gpa), .diff = try diff.toOwnedSlice(gpa) };
+        return .{ .file_count = changes.len, .summary = try summary.toOwnedSlice(gpa), .diff = try diff.toOwnedSlice(gpa) };
+    }
+
+    pub fn clone(c: ChangeText, gpa: std.mem.Allocator) !ChangeText {
+        const summary = try gpa.dupe(u8, c.summary);
+        errdefer gpa.free(summary);
+        return .{ .summary = summary, .file_count = c.file_count, .diff = try gpa.dupe(u8, c.diff) };
     }
 
     pub fn deinit(c: *ChangeText, gpa: std.mem.Allocator) void {

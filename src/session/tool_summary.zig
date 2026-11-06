@@ -2,11 +2,14 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const timing = @import("../sandbox/timing.zig");
 
+pub const File = struct { tool: []const u8, path: []const u8 };
+
 pub const Count = struct { name: []const u8, count: u64 };
 
 pub const Summary = struct {
     counts: []const Count = &.{},
     omitted: u64 = 0,
+    files: []const File = &.{},
 
     pub fn init(gpa: Allocator, calls: []const timing.Call, run_index: usize, omitted: u64) !Summary {
         var counts: std.ArrayList(Count) = .empty;
@@ -27,7 +30,36 @@ pub const Summary = struct {
                 try counts.append(gpa, .{ .name = name, .count = 1 });
             }
         }
-        return .{ .counts = try counts.toOwnedSlice(gpa), .omitted = omitted };
+        var files: std.ArrayList(File) = .empty;
+        errdefer {
+            for (files.items) |file| {
+                gpa.free(file.tool);
+                gpa.free(file.path);
+            }
+            files.deinit(gpa);
+        }
+        for (calls) |call| {
+            if (!call.dispatched or call.run_index != run_index) continue;
+            const path = call.path orelse continue;
+            for (files.items) |file| {
+                if (std.mem.eql(u8, file.tool, call.name) and std.mem.eql(u8, file.path, path)) break;
+            } else {
+                const tool = try gpa.dupe(u8, call.name);
+                errdefer gpa.free(tool);
+                const copy = try gpa.dupe(u8, path);
+                errdefer gpa.free(copy);
+                try files.append(gpa, .{ .tool = tool, .path = copy });
+            }
+        }
+        const owned_files = try files.toOwnedSlice(gpa);
+        errdefer {
+            for (owned_files) |file| {
+                gpa.free(file.tool);
+                gpa.free(file.path);
+            }
+            gpa.free(owned_files);
+        }
+        return .{ .counts = try counts.toOwnedSlice(gpa), .omitted = omitted, .files = owned_files };
     }
 
     pub fn clone(s: Summary, gpa: Allocator) !Summary {
@@ -41,12 +73,32 @@ pub const Summary = struct {
             copy.* = .{ .name = try gpa.dupe(u8, item.name), .count = item.count };
             copied += 1;
         }
-        return .{ .counts = counts, .omitted = s.omitted };
+        const files = try gpa.alloc(File, s.files.len);
+        var copied_files: usize = 0;
+        errdefer {
+            for (files[0..copied_files]) |file| {
+                gpa.free(file.tool);
+                gpa.free(file.path);
+            }
+            gpa.free(files);
+        }
+        for (s.files, files) |file, *copy| {
+            const tool = try gpa.dupe(u8, file.tool);
+            errdefer gpa.free(tool);
+            copy.* = .{ .tool = tool, .path = try gpa.dupe(u8, file.path) };
+            copied_files += 1;
+        }
+        return .{ .counts = counts, .omitted = s.omitted, .files = files };
     }
 
     pub fn deinit(s: Summary, gpa: Allocator) void {
         for (s.counts) |item| gpa.free(item.name);
         gpa.free(s.counts);
+        for (s.files) |file| {
+            gpa.free(file.tool);
+            gpa.free(file.path);
+        }
+        gpa.free(s.files);
     }
 };
 
@@ -129,4 +181,19 @@ fn allocationFailures(gpa: Allocator) !void {
 
 test "summary allocation failures release counts and names" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationFailures, .{});
+}
+
+test "summary owns unique dispatched file facts" {
+    const a = std.testing.allocator;
+    const calls = [_]timing.Call{
+        .{ .name = "read", .path = "a.zig", .start_ms = 0, .end_ms = 1, .ok = true, .run_index = 1 },
+        .{ .name = "read", .path = "a.zig", .start_ms = 0, .end_ms = 1, .ok = true, .run_index = 1 },
+        .{ .name = "grep", .path = ".", .start_ms = 0, .end_ms = 1, .ok = true, .run_index = 1 },
+    };
+    const summary = try Summary.init(a, &calls, 1, 0);
+    defer summary.deinit(a);
+    const copy = try summary.clone(a);
+    defer copy.deinit(a);
+    try std.testing.expectEqualDeep(&[_]File{ .{ .tool = "read", .path = "a.zig" }, .{ .tool = "grep", .path = "." } }, copy.files);
+    try std.testing.expect(summary.files[0].path.ptr != copy.files[0].path.ptr);
 }

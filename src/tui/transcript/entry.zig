@@ -12,9 +12,6 @@ const ToolSummary = @import("../../session/tool_summary.zig").Summary;
 const ChangeText = @import("changes.zig").ChangeText;
 const label = @import("label.zig");
 const actualToolSummary = label.actualToolSummary;
-const toolSummary = label.toolSummary;
-const appendAction = label.appendAction;
-const appendTokens = label.appendTokens;
 const appendPreview = label.appendPreview;
 
 pub const run_output_lines = 12;
@@ -41,6 +38,7 @@ pub const Entry = struct {
     /// One-line summary of a collapsible entry. vaxis keeps printed slices
     /// until render, so this must outlive draw(); see `refreshLabel`.
     label: std.ArrayList(u8) = .empty,
+    files: std.ArrayList(u8) = .empty,
     run: enum { running, background, superseded, ok, failed } = .running,
     elapsed_ms: u64 = 0,
     step_effort: ?provider.StepEffort = null,
@@ -63,6 +61,7 @@ pub const Entry = struct {
         e.text.deinit(gpa);
         e.output.deinit(gpa);
         e.label.deinit(gpa);
+        e.files.deinit(gpa);
         e.changes.deinit(gpa);
         for (e.agents.items) |*p| p.deinit(gpa);
         e.agents.deinit(gpa);
@@ -73,74 +72,40 @@ pub const Entry = struct {
 
     pub fn refreshLabel(e: *Entry, gpa: std.mem.Allocator) !void {
         e.label.clearRetainingCapacity();
+        e.files.clearRetainingCapacity();
         switch (e.kind) {
             .run => {
-                if (e.task_id) |id| {
-                    try e.label.print(gpa, "background → {s}", .{id});
-                    return;
-                }
-                var buf: [512]u8 = undefined;
-                const used = if (e.tool_summary) |summary| actualToolSummary(summary, &buf) else toolSummary(e.text.items, &buf);
-                var live: std.ArrayList(Progress) = .empty;
-                defer live.deinit(gpa);
-                for (e.agents.items) |p| if (e.isLive(p)) try live.append(gpa, p);
-                const agents = live.items;
-                if (agents.len > 0) {
-                    if (agents.len == 1) {
-                        const p = agents[0];
-                        if (p.kind != .agent) {
-                            try e.label.print(gpa, "{s} · {s} · ", .{ @tagName(p.kind), if (p.background) "background" else "running" });
-                            try appendPreview(gpa, &e.label, p.prompt);
-                            try e.label.appendSlice(gpa, " · ");
-                            try agent_tree.appendElapsed(gpa, &e.label, p.elapsed_ms);
-                            if (p.superseded_by) |id| {
-                                try e.label.print(gpa, " · {s} superseded by {s}", .{ p.id, id });
-                            } else try e.label.print(gpa, " · {s}", .{if (p.background) "background" else @import("../format.zig").state(@tagName(p.state))});
-                        } else {
-                            try e.label.print(gpa, "agent · {s} · step {d}", .{ if (p.background) "background" else "running", p.step });
-                            try appendAction(gpa, &e.label, p);
-                            try appendTokens(gpa, &e.label, p.usage.prompt_tokens + p.usage.completion_tokens);
-                        }
-                    } else {
-                        var working: usize = 0;
-                        var queued: usize = 0;
-                        var done: usize = 0;
-                        var failed: usize = 0;
-                        var bash_count: usize = 0;
-                        var agent_count: usize = 0;
-                        var tokens: u64 = 0;
-                        for (agents) |p| {
-                            if (p.kind == .bash) bash_count += 1;
-                            if (p.kind == .agent) agent_count += 1;
-                            switch (p.state) {
-                                .working => working += 1,
-                                .queued => queued += 1,
-                                .done => done += 1,
-                                else => failed += 1,
-                            }
-                            tokens += p.usage.prompt_tokens + p.usage.completion_tokens;
-                        }
-                        try e.label.print(gpa, "{s} ×{d} · {s} · {d} running, {d} completed", .{ if (bash_count == agents.len) "bash" else if (agent_count == agents.len) "agent" else "task", agents.len, if (e.run == .running) "running" else "background", working, done });
-                        if (queued > 0) try e.label.print(gpa, ", {d} queued", .{queued});
-                        if (failed > 0) try e.label.print(gpa, ", {d} failed", .{failed});
-                        if (bash_count < agents.len) try appendTokens(gpa, &e.label, tokens);
+                try e.label.appendSlice(gpa, "Run");
+                for (e.agents.items) |p| {
+                    if (p.superseded_by != null) continue;
+                    if (p.state == .failed or p.state == .timed_out or p.state == .canceled) {
+                        try e.label.print(gpa, " · {s} {s}", .{ p.id, @import("../format.zig").state(@tagName(p.state)) });
                     }
-                } else if (e.run == .running) {
-                    try e.label.print(gpa, "{s} · running", .{used});
-                } else {
-                    try e.label.print(gpa, "{s} · ", .{used});
-                    try agent_tree.appendElapsed(gpa, &e.label, e.elapsed_ms);
                 }
-                if (e.changes.summary.len > 0) try e.label.print(gpa, " · {s}", .{e.changes.summary});
-                if (e.step_effort) |effort| {
-                    try e.label.print(gpa, " · {s}{s}", .{ effort.effort, if (effort.source == .guard) " (guard)" else "" });
+                if (e.task_id) |id| try e.label.print(gpa, " · {s} {s}", .{ id, if (e.run == .background) "running" else if (e.run == .failed) "failed" else "completed" });
+                var buf: [512]u8 = undefined;
+                const used = if (e.tool_summary) |summary| actualToolSummary(summary, e.changes.file_count, &buf) else "";
+                if (e.tool_summary) |summary| for (summary.files, 0..) |file, i| {
+                    if (i > 0) try e.files.appendSlice(gpa, " · ");
+                    try e.files.print(gpa, "{s} {s}", .{ file.tool, file.path });
+                };
+                if (used.len > 0) try e.label.print(gpa, " · {s}", .{used});
+                for (e.agents.items) |p| {
+                    if (!p.background or p.kind == .run or p.state == .failed or p.state == .timed_out or p.state == .canceled) continue;
+                    try e.label.print(gpa, " · {s} {s}", .{ p.id, if (p.state == .queued) "queued" else if (p.state == .working) "running" else "waiting" });
                 }
+                if (e.run == .running) try e.label.appendSlice(gpa, " · running");
             },
             .user => {
                 try e.label.print(gpa, " … +{d} lines", .{long_text.lines(e.text.items) - 1});
             },
             else => {},
         }
+    }
+
+    pub fn hasWarning(e: *const Entry) bool {
+        for (e.agents.items) |p| if (p.superseded_by == null and (p.state == .failed or p.state == .timed_out or p.state == .canceled)) return true;
+        return false;
     }
 
     /// Rows keep their last state; a row is live while its Run runs or its background result is undelivered.
@@ -166,11 +131,20 @@ pub const Entry = struct {
         const folded = e.collapsible() and !e.open;
         const wrap: @FieldType(vaxis.Window.PrintOptions, "wrap") = if (folded) .none else if (e.kind == .run or e.kind == .background) .grapheme else .word;
         const shown = segments(e, &segs);
-        if (e.kind == .run and e.agent_tree.rows.items.len > 0) {
+        if (e.kind == .run) {
             _ = win.print(shown[0..3], .{ .wrap = .none, .commit = commit });
-            const rows = 1 +| e.agent_tree.print(win.child(.{ .y_off = 1 }), commit);
+            var rows: u16 = 1;
+            if (e.changes.summary.len > 0) {
+                const r = win.child(.{ .x_off = 2, .y_off = rows }).printSegment(.{ .text = e.changes.summary, .style = .{ .dim = true } }, .{ .wrap = .word, .commit = commit });
+                rows +|= @max(1, r.row +| @intFromBool(r.col > 0));
+            }
+            if (e.files.items.len > 0) {
+                const r = win.child(.{ .x_off = 2, .y_off = rows }).printSegment(.{ .text = e.files.items, .style = .{ .dim = true } }, .{ .wrap = .word, .commit = commit });
+                rows +|= @max(1, r.row +| @intFromBool(r.col > 0));
+            }
+            rows +|= e.agent_tree.print(win.child(.{ .y_off = rows }), commit);
             if (!e.open) return rows;
-            const details = win.child(.{ .y_off = @intCast(rows) }).print(shown[4..], .{ .wrap = .grapheme, .commit = commit });
+            const details = win.child(.{ .y_off = rows }).print(shown[4..], .{ .wrap = .grapheme, .commit = commit });
             return rows +| @max(1, details.row +| @intFromBool(details.col > 0));
         }
         if (folded and e.kind == .user) {
@@ -220,16 +194,8 @@ pub const Entry = struct {
             },
             .assistant => segs[0] = .{ .text = e.text.items },
             .run => {
-                segs[0] = switch (e.run) {
-                    .background, .superseded => .{ .text = "→ ", .style = dim },
-                    .running => .{ .text = "◌ ", .style = .{ .fg = .{ .index = 3 } } },
-                    .ok => .{ .text = "✓ ", .style = .{ .fg = .{ .index = 2 } } },
-                    .failed => .{ .text = "✗ ", .style = .{ .fg = .{ .index = 1 } } },
-                };
-                const any_live = for (e.agents.items) |p| {
-                    if (e.isLive(p)) break true;
-                } else false;
-                segs[1] = .{ .text = if (any_live) "" else "run ", .style = .{ .fg = .{ .index = 3 }, .bold = true } };
+                segs[0] = if (e.run == .failed) .{ .text = "✗ ", .style = .{ .fg = .{ .index = 1 } } } else if (e.hasWarning()) .{ .text = "! ", .style = .{ .fg = .{ .index = 3 } } } else .{ .text = "  ", .style = dim };
+                segs[1] = .{ .text = "" };
                 segs[2] = .{ .text = e.label.items, .style = dim };
                 if (!e.open) return segs[0..3];
                 segs[3] = .{ .text = "\n" };
@@ -259,7 +225,7 @@ pub const Entry = struct {
                 return segs[0..n];
             },
             .background => {
-                segs[0] = if (e.run == .superseded) .{ .text = "→ ", .style = dim } else .{ .text = if (e.run == .ok) "✓ " else "✗ ", .style = .{ .fg = .{ .index = if (e.run == .ok) 2 else 1 } } };
+                segs[0] = if (e.run == .superseded) .{ .text = "  ", .style = dim } else .{ .text = if (e.run == .ok) "✓ " else "✗ ", .style = .{ .fg = .{ .index = if (e.run == .ok) 2 else 1 } } };
                 segs[1] = .{ .text = e.label.items, .style = dim };
                 if (!e.open) return segs[0..2];
                 segs[2] = .{ .text = "\n" };

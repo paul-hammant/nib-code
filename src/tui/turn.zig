@@ -119,7 +119,11 @@ pub const Turn = struct {
             .background => |b| blk: {
                 const id = try gpa.dupe(u8, b.id);
                 errdefer gpa.free(id);
-                break :blk .{ .background = .{ .id = id, .kind = b.kind, .state = b.state, .ok = b.ok, .result = if (b.completion) |value| try @import("transcript.zig").runResultText(gpa, value.output, value.changes) else if (b.result) |result| try gpa.dupe(u8, result) else null } };
+                var changes: ChangeText = if (b.completion) |value| try .init(gpa, value.changes) else .{};
+                errdefer changes.deinit(gpa);
+                const summary: ?@import("../session/tool_summary.zig").Summary = if (b.completion) |value| try .init(gpa, value.calls, value.run_index, value.calls_omitted) else null;
+                errdefer if (summary) |value| value.deinit(gpa);
+                break :blk .{ .background = .{ .id = id, .kind = b.kind, .state = b.state, .ok = b.ok, .result = if (b.completion) |value| try gpa.dupe(u8, value.output) else if (b.result) |result| try gpa.dupe(u8, result) else null, .changes = changes, .tool_summary = summary } };
             },
             .turn_end => |summary| .{ .turn_end = summary },
         };
@@ -135,6 +139,9 @@ pub const Turn = struct {
             .background => |b| {
                 gpa.free(b.id);
                 if (b.result) |result| gpa.free(result);
+                var changes = b.changes;
+                changes.deinit(gpa);
+                if (b.tool_summary) |summary| summary.deinit(gpa);
             },
             .progress => |p| {
                 var owned = p;

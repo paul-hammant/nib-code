@@ -118,6 +118,7 @@ fn execute(t: *Tools, gpa: std.mem.Allocator, command: []const u8, timeout_ms: i
         .exited => |e| e,
         else => null,
     };
+    tracker.exit_code = code;
     state = if (code != null and code.? == 0) .done else .failed;
     return .{ .ok = try std.json.Stringify.valueAlloc(gpa, .{ .exit_code = code, .output = stdout }, .{}) };
 }
@@ -133,6 +134,7 @@ const Tracker = struct {
     started: std.Io.Clock.Timestamp,
     last_second: ?u64 = null,
     output_bytes: u64 = 0,
+    exit_code: ?u8 = null,
 
     fn line(ctx: *anyopaque, bytes: []const u8) void {
         const tr: *Tracker = @ptrCast(@alignCast(ctx));
@@ -175,10 +177,11 @@ const Tracker = struct {
     }
 
     fn finish(tr: *Tracker, state: @FieldType(@import("../session/events.zig").Progress, "state")) void {
-        tr.tick();
+        if (tr.value == null) tr.tickAt(foreground_progress_threshold_ms);
         var value = tr.value orelse return;
         value.elapsed_ms = @intCast(@max(tr.started.untilNow(tr.t.io).raw.toMilliseconds(), 0));
         value.state = state;
+        value.exit_code = tr.exit_code;
         tr.value = value;
         tr.t.progress.update(tr.gpa, tr.t.io, value) catch {};
     }
@@ -336,7 +339,7 @@ test "foreground bash allocates only at the visibility threshold and advances on
     try testing.expectEqual(.done, t.progress.slots.items[0].value.state);
 }
 
-test "foreground bash logs every call ID while keeping short commands invisible" {
+test "foreground bash reports terminal command facts even for short commands" {
     var t: Tools = .{ .io = testing.io, .home = "/home/nobody", .run_id = 1 };
     defer t.progress.deinit(testing.allocator);
     var timing: sandbox.RunTiming = .init(testing.io, .now(testing.io, .awake));
@@ -350,9 +353,11 @@ test "foreground bash logs every call ID while keeping short commands invisible"
     try testing.expectEqualStrings("b1", timing.entries[0].id.?);
     try testing.expectEqualStrings("b2", timing.entries[1].id.?);
     try testing.expectEqual(@as(?bool, false), timing.entries[1].background);
-    try testing.expectEqual(@as(usize, 1), t.progress.slots.items.len);
-    try testing.expectEqual(.failed, t.progress.slots.items[0].value.state);
-    try testing.expect(t.progress.slots.items[0].value.elapsed_ms >= 3000);
+    try testing.expectEqual(@as(usize, 2), t.progress.slots.items.len);
+    try testing.expectEqual(@as(?u8, 0), t.progress.slots.items[0].value.exit_code);
+    try testing.expectEqual(.failed, t.progress.slots.items[1].value.state);
+    try testing.expectEqual(@as(?u8, 7), t.progress.slots.items[1].value.exit_code);
+    try testing.expect(t.progress.slots.items[1].value.elapsed_ms >= 3000);
     t.progress.clear(testing.allocator);
     try testing.expectEqualStrings("b2", timing.entries[1].id.?);
 }
