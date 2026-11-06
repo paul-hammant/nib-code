@@ -27,4 +27,4 @@ Codex 摘要不沿用原来的 32–2048-token 总输出限制：跟随 pi 不�
 
 **验证（2026-11-01）：** `zig build test --summary all` 62/62 通过；`tests/test_session.py`、`tests/test_codex.py` 与 ReleaseFast 构建通过。Responses mock 额外覆盖超过 100KB 的加密条目、assistant phase、同模型摘要 low、空/截断摘要后继续，以及跨模型恢复拒绝。真实请求用 ReleaseFast 从临时空目录发出“你好。”，隔离全局/项目指令，不带仓库内容：gpt-6.1-sol 返回“你好！有什么我可以帮你的吗？”，1 Step，输入 479、输出 13 tokens，无 Run，stderr 为空。真实工具、长会话和压缩未额外调用服务，覆盖来自本地 mock。
 
-**何时重新考虑：** 三协议与数据化服务表的后续设计见 [0020](0020-providers.md)（待实现）；后端协议或模型窗口变更，或实际需要跨 provider 转换历史、OAuth 登录、服务器端压缩。
+**何时重新考虑：** 三协议与数据化服务表的后续设计见 [0020](0020-providers.md)；后端协议或模型窗口变更，或实际需要跨 provider 转换历史、OAuth 登录、服务器端压缩。

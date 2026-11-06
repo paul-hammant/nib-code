@@ -41,7 +41,7 @@ nib --version
 NIB_PROVIDER=chat_completions DEEPSEEK_API_KEY=... nib
 ```
 
-Provider, model and effort can also be set in `~/.nib/config.toml`. See [docs/config.md](docs/config.md).
+OpenAI, Anthropic, DeepSeek and xAI API keys, plus custom compatible endpoints, are supported. Provider, model and effort can be set in `~/.nib/config.toml`. See [docs/providers.md](docs/providers.md) for provider selection and custom sites, and [docs/config.md](docs/config.md) for all settings.
 
 ## Your first request
 
