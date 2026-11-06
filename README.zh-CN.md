@@ -34,7 +34,7 @@ nib 以 Run 为工作单位：模型写一段 JavaScript，一步完成读取、
 
 ## 安装
 
-支持 Linux 和 macOS，x86_64 与 arm64：
+支持 Linux（x86_64、arm64）和 macOS（Apple 芯片）：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/yyydddkkk/nib-code/main/install.sh | sh

@@ -8,7 +8,7 @@ arch=$(uname -m)
 case "$os/$arch" in
     Linux/x86_64|Linux/amd64) platform=x86_64-linux ;;
     Linux/aarch64|Linux/arm64) platform=aarch64-linux ;;
-    Darwin/x86_64) platform=x86_64-macos ;;
+    Darwin/x86_64) fail "Intel Macs are not supported; build from source with Zig 0.17" ;;
     Darwin/arm64) platform=aarch64-macos ;;
     *) fail "Unsupported platform: $os/$arch" ;;
 esac

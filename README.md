@@ -34,7 +34,7 @@ Against Codex CLI on the same model:
 
 ## Install
 
-Linux and macOS, x86_64 and arm64:
+Linux (x86_64, arm64) and macOS (Apple silicon):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/yyydddkkk/nib-code/main/install.sh | sh
