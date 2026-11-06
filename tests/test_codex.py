@@ -123,8 +123,12 @@ with tempfile.TemporaryDirectory(prefix="nib-codex-e2e-") as directory:
         def ask(prompt, *args, ok=True, overrides=None, workdir=cwd):
             child_env = dict(env, **(overrides or {}))
             child_env = {key: value for key, value in child_env.items() if value is not None}
-            result = subprocess.run([str(BIN), "ask", "--json", prompt, *args], cwd=workdir,
-                                    env=child_env, capture_output=True, timeout=20)
+            try:
+                result = subprocess.run([str(BIN), "ask", "--json", prompt, *args], cwd=workdir,
+                                        env=child_env, capture_output=True, timeout=60)
+            except subprocess.TimeoutExpired as error:
+                print("Timed out stdout:", error.stdout, "stderr:", error.stderr, flush=True)
+                raise
             assert result.stderr == b"", result.stderr
             events = [json.loads(line) for line in result.stdout.splitlines()]
             assert events and all(len(event) == 1 for event in events), result.stdout

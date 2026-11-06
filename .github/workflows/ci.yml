@@ -50,7 +50,7 @@ jobs:
         with:
           version: 0.17.0
           use-cache: true
-      - run: zig build
+      - run: zig build -Dcpu=baseline
       - uses: actions/upload-artifact@v4
         with:
           name: nib-${{ matrix.os }}
@@ -95,9 +95,11 @@ jobs:
           LANG: en_US.UTF-8
         run: |
           mkdir -p e2e-logs
+          failed=0
           for test in $TEST; do
-            python3 -u "$test" > "e2e-logs/$(basename "$test").log" 2>&1 || { cat "e2e-logs/$(basename "$test").log"; exit 1; }
+            python3 -u "$test" > "e2e-logs/$(basename "$test").log" 2>&1 || { cat "e2e-logs/$(basename "$test").log"; failed=1; }
           done
+          exit "$failed"
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
