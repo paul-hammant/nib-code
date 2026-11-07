@@ -26,6 +26,7 @@ pub const Entry = struct {
     markdown_cache: markdown.Cache = .{},
     smooth: ?@import("../smooth.zig").Smooth = null,
     user_bg: vaxis.Color = .default,
+    code_bg: vaxis.Color = .default,
     queued: ?u64 = null,
     attempt: usize = 0,
     retry_placeholder: bool = false,
@@ -157,8 +158,8 @@ pub const Entry = struct {
     pub fn print(e: *Entry, win: vaxis.Window, commit: bool) u16 {
         if (e.simple and e.kind == .bill) return 0;
         if (e.kind == .assistant) {
-            if (e.allocator) |a| return e.markdown_cache.draw(a, win, e.displayText(), commit);
-            return markdown.print(win, e.displayText(), commit);
+            if (e.allocator) |a| return e.markdown_cache.draw(a, win, e.displayText(), .{ .tint = e.code_bg }, commit);
+            return markdown.print(win, e.displayText(), .{ .tint = e.code_bg }, commit);
         }
         if (e.kind == .user and win.width >= 4) return e.printUser(win, commit);
         if (e.kind == .bill) {
@@ -278,7 +279,7 @@ pub const Entry = struct {
             .run => {
                 segs[0] = if (e.run == .failed) .{ .text = "✗ ", .style = .{ .fg = .{ .index = 1 } } } else if (e.run == .warning or e.run == .lost or e.run == .timed_out or e.run == .canceled or e.hasWarning()) .{ .text = "! ", .style = .{ .fg = .{ .index = 3 } } } else .{ .text = "  ", .style = dim };
                 segs[1] = .{ .text = "", .style = dim };
-                segs[2] = .{ .text = e.label.items, .style = dim };
+                segs[2] = .{ .text = e.label.items };
                 if (!e.open) return segs[0..3];
                 segs[3] = .{ .text = "\n" };
                 segs[4] = .{ .text = "Changes\n", .style = .{ .bold = true, .dim = true } };
@@ -310,7 +311,7 @@ pub const Entry = struct {
             },
             .background => {
                 segs[0] = if (e.run == .warning) .{ .text = "! ", .style = .{ .fg = .{ .index = 3 } } } else if (e.run == .superseded) .{ .text = "  ", .style = dim } else .{ .text = if (e.run == .ok) "✓ " else "✗ ", .style = .{ .fg = .{ .index = if (e.run == .ok) 2 else 1 } } };
-                segs[1] = .{ .text = e.label.items, .style = dim };
+                segs[1] = .{ .text = e.label.items };
                 if (!e.open) return segs[0..2];
                 segs[2] = .{ .text = "\n" };
                 segs[3] = .{ .text = e.text.items, .style = dim };

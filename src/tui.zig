@@ -218,6 +218,7 @@ pub const App = struct {
     selection: selection.Selection = .{},
     body: ?view.Frame = null,
     user_bg: vaxis.Color = .default,
+    code_bg: vaxis.Color = .default,
     hover_bg: vaxis.Color = .default,
     terminal_bg: ?[3]u8 = null,
     hovered: ?usize = null,
@@ -383,6 +384,7 @@ pub const App = struct {
                 if (color.kind == .bg) {
                     app.terminal_bg = color.value;
                     app.user_bg = userBackground(color.value);
+                    app.code_bg = codeBackground(color.value);
                     app.hover_bg = hoverBackground(color.value);
                 }
             },
@@ -788,6 +790,7 @@ pub const App = struct {
         app.body = view.drawFrame(app.vx.window(), app.transcript.entries.items, visible_input, &app.scroll, menu, @min(app.menu.sel, menu.len -| 1), .{
             .cfg = app.cfg,
             .user_bg = app.user_bg,
+            .code_bg = app.code_bg,
             .hovered = app.hovered,
             .hover_bg = app.hover_bg,
             .usage = app.usage,
@@ -825,6 +828,13 @@ fn hoverFallback(scheme: ?vaxis.Color.Scheme) vaxis.Color {
     };
 }
 
+fn codeBackground(bg: [3]u8) vaxis.Color {
+    const light = @as(u32, bg[0]) * 299 + @as(u32, bg[1]) * 587 + @as(u32, bg[2]) * 114 > 128_000;
+    var rgb: [3]u8 = undefined;
+    for (bg, 0..) |base, i| rgb[i] = if (light) base -| 10 else base +| 10;
+    return .{ .rgb = rgb };
+}
+
 fn userBackground(bg: [3]u8) vaxis.Color {
     const light = @as(u32, bg[0]) * 299 + @as(u32, bg[1]) * 587 + @as(u32, bg[2]) * 114 > 128_000;
     const accent = if (light) [3]u8{ 40, 80, 150 } else [3]u8{ 120, 160, 230 };
@@ -840,6 +850,13 @@ test "stream events are paced while interaction and completion refresh immediate
     try t.expectEqual(Frames.Refresh.immediate, Event.refresh(.done));
     try t.expectEqual(Frames.Refresh.immediate, Event.refresh(.{ .key_press = .{ .codepoint = vaxis.Key.escape } }));
     try t.expectEqual(Frames.Refresh.immediate, Event.refresh(.paste_end));
+}
+
+test "code tint is a neutral shade subtler than the user tint" {
+    const dark = codeBackground(.{ 0, 0, 0 }).rgb;
+    const light = codeBackground(.{ 255, 255, 255 }).rgb;
+    try std.testing.expectEqual([3]u8{ 10, 10, 10 }, dark);
+    try std.testing.expectEqual([3]u8{ 245, 245, 245 }, light);
 }
 
 test "user message tint preserves dark and light terminal contrast" {

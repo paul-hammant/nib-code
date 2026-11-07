@@ -50,7 +50,7 @@ def test_history_ignores_incomplete_record(tmp):
 
 
 def test_cross_screen_selection(tmp):
-    reply = Reply("\n".join(f"line-{i:03}" for i in range(80)))
+    reply = Reply("\n".join(f"- line-{i:03}" for i in range(80)))
     with terminal_fixture(tmp, reply) as terminal:
         for reverse in (True, False):
             if not reverse:
@@ -70,7 +70,7 @@ def test_cross_screen_selection(tmp):
 
 
 def test_background_report_and_user_card(tmp):
-    reply = Reply("\n".join(f"line-{i:03}" for i in range(80)))
+    reply = Reply("\n".join(f"- line-{i:03}" for i in range(80)))
     with terminal_fixture(tmp, reply) as terminal:
         terminal.send(mouse(64, 1, 1) * 40)
         terminal.until("▎".encode())

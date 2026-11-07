@@ -22,6 +22,23 @@ For agents changing the TUI, CLI help, or fixed text.
 
 Hooks: successful commands are silent. After-edit failure adds one warning-colored line in the Run block: `hook <command> · exit <code>`. Turn-end failure adds a dim notice: `hook turn_end · exit <code>`. `/status` adds `Hooks: after_edit <count> · turn_end <count>` only when any hooks are configured.
 
+## Typography and color
+
+Assistant Markdown stays plain and quiet: three emphasis levels (bold, normal, dim), one accent color.
+
+- Accent: terminal blue (index 4), used only for the user message bar `▎`, headings, the input prompt `›`, and selection/focus. Red, green and yellow mean state only (failure, success, warning, diff −/+). Nothing else in the transcript is decorated with color.
+- Paragraphs: outside code, a blank source line or a single newline between two prose lines is a paragraph break, rendered as exactly one blank row (runs of blank lines collapse). No blank row is added inside lists (including continuation lines), quotes, tables or code, and none at the very top or bottom of a message.
+- Headings: bold blue without the `#`, one blank row above (not for the first line of a message), none below.
+- Inline code: normal foreground on a neutral background tint. Code blocks: normal foreground on the same tint across the full width with one space of padding on each side; the fence and its info string are not shown. The tint is the terminal background shifted by 10 per RGB channel (lighter on dark, darker on light), so it stays subtler than the user-message shade. Without a background report there is no tint: inline code is plain text and code blocks keep a dim `│ ` bar.
+- Italic `*text*` / `_text_` (not inside words for `_`) renders italic with hidden markers. Links `[text](url)` render the text followed by a dim ` (url)`; bare URLs are unchanged. Quotes `> text` render a dim `│ ` bar and normal text. Lists are unchanged.
+- Run and background-result titles (`Run · edit 2 files · bash`) use the normal foreground; status marks keep their colors. The summary lines below (changed files, reads, bash lines, agent tree) are dim. Expanded details are unchanged.
+
+### Tables
+
+A pipe table (header row, delimiter row such as `|---|:---:|---:|`, body rows; outer pipes optional) outside code renders without pipes: bold header cells, one dim `─` rule under the header spanning the table's width, body rows in normal style. Columns are aligned by terminal display width (CJK counts 2) with 2 spaces between columns; `:---`, `---`, `:---:` and `---:` select left, left, center and right alignment. Cells keep inline styles (`code`, **bold**, italic, links); `\|` shows as `|`. Short rows are padded with empty cells and extra cells are ignored. A table with more than 16 columns, or wider than the available width, is shown as the original lines (never truncated or wrapped). A line containing `|` without a valid header and delimiter pair is ordinary text, and tables inside code fences are untouched. A table block ends at a blank line or a line without `|`.
+
+Streaming: once the header and delimiter rows are complete the table renders aligned, and the whole block is laid out again as each row arrives (column widths may grow). The finished-line cache keeps a table out until a terminated line after its last row closes the block, and a possible header line stays out until the next line is known. Mouse selection copies the screen text; `/copy` returns the original Markdown.
+
 ## Simple mode
 
 `/simple` or Ctrl+S toggles a persisted reading mode without a notice, including during a Turn. Normal mode is the default. Kitty binds Ctrl+Shift+S to paste-from-selection by default; use Ctrl+S there. Ctrl+Shift+S also toggles Simple mode when delivered distinctly by the terminal. Raw mode disables IXON so Ctrl+S does not freeze output. `/help` lists `Ctrl+S simple mode`.

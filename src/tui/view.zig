@@ -58,6 +58,7 @@ pub fn drawFrame(outer: vaxis.Window, entries: []Entry, input: *Editor, scroll: 
     for (entries[top.entry..], top.entry..) |*e, index| {
         if (y >= body_h) break;
         e.user_bg = s.user_bg;
+        e.code_bg = s.code_bg;
         const h = e.height(body);
         if (y + h > 0) _ = e.print(body.child(.{ .y_off = @intCast(y), .height = h }), true);
         if (s.hovered == index) {

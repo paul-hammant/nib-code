@@ -782,6 +782,30 @@ test "restored waiting replies are notices rather than answers" {
     try testing.expect(t.lastAnswer() == null);
 }
 
+test "Run and background titles use the normal foreground while summaries stay dim" {
+    const gpa = testing.allocator;
+    var screen = try vaxis.Screen.init(gpa, .{ .cols = 60, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(gpa);
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 60, .height = 8, .screen = &screen };
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    try t.startRun(gpa, "await tools.edit({})");
+    const changes = [_]Change{.{ .path = "src/a.zig", .added = 1, .removed = 1, .diff = " keep\n-old\n+new\n" }};
+    try t.endRun(gpa, true, "", 300, try .init(gpa, &changes));
+    const e = &t.entries.items[0];
+    _ = e.print(win, true);
+    try testing.expectEqualStrings("R", screen.readCell(2, 0).?.char.grapheme);
+    try testing.expect(!screen.readCell(2, 0).?.style.dim);
+    try testing.expect(screen.readCell(2, 1).?.style.dim);
+    var segs: [max_segments]vaxis.Segment = undefined;
+    var b: Entry = .{ .kind = .background, .run = .failed };
+    defer b.deinit(gpa);
+    try b.label.appendSlice(gpa, "b1 failed");
+    const shown = b.segments(&segs);
+    try testing.expectEqual(@as(u8, 1), shown[0].style.fg.index);
+    try testing.expect(!shown[1].style.dim);
+}
+
 test "a Run shows changed files in its summary and a colored diff when open" {
     const gpa = testing.allocator;
     var screen: vaxis.Screen = .{};
