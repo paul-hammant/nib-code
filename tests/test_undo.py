@@ -103,7 +103,7 @@ def test_conflict_and_busy(tmp):
         assert gated.received.wait(5)
         before = len(history(home))
         terminal.send("/undo\r")
-        terminal.until(b"Press Esc to stop the Turn before /undo.")
+        terminal.until("Turn running · retry command when it ends".encode())
         assert len(history(home)) == before
         assert not gated.release.is_set()
         gated.release.set()
