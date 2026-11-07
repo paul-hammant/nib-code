@@ -9,6 +9,11 @@ fn version(text: []const u8) ![]const u8 {
     return v;
 }
 
+fn newer(candidate: []const u8, installed: []const u8) !bool {
+    const installed_version = std.SemanticVersion.parse(installed) catch return true;
+    return (try std.SemanticVersion.parse(candidate)).order(installed_version) == .gt;
+}
+
 fn asset(os: std.Target.Os.Tag, arch: std.Target.Cpu.Arch) ![]const u8 {
     return switch (os) {
         .linux => switch (arch) {
@@ -84,6 +89,10 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Wri
         const location = response.head.location orelse return error.MissingReleaseRedirect;
         break :latest try a.dupe(u8, try version(std.fs.path.basename(location)));
     };
+    if (args.len == 0 and !try newer(wanted, current)) {
+        try stdout.print("nib {s} is the latest\n", .{current});
+        return stdout.flush();
+    }
     const base = init.environ_map.get("NIB_DOWNLOAD_BASE") orelse try std.fmt.allocPrint(a, "https://github.com/yyydddkkk/nib-code/releases/download/v{s}", .{wanted});
     const bytes = try download(a, init.io, &client, base, name);
     if (!std.mem.eql(u8, init.environ_map.get("NIB_SKIP_VERIFY") orelse "", "1")) {
@@ -98,7 +107,7 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Wri
         detail.* = try std.fmt.allocPrint(init.gpa, "could not replace {s}: {s}", .{ path, @errorName(err) });
         return err;
     };
-    if (std.mem.eql(u8, wanted, current)) try stdout.print("nib {s} is {s}\n", .{ wanted, if (args.len == 0) "the latest" else "installed" }) else try stdout.print("nib {s} → {s}\n", .{ current, wanted });
+    if (std.mem.eql(u8, wanted, current)) try stdout.print("nib {s} is installed\n", .{wanted}) else try stdout.print("nib {s} → {s}\n", .{ current, wanted });
     try stdout.flush();
 }
 
@@ -121,4 +130,11 @@ test "extract a gzip release containing only nib" {
     defer arena.deinit();
     try std.testing.expectEqualStrings("test", try extract(arena.allocator(), @embedFile("update/tiny.tar.gz")));
     try std.testing.expectError(error.ReadFailed, extract(arena.allocator(), "bad"));
+}
+
+test "update without a version only moves forward" {
+    try std.testing.expect(try newer("0.9.0", "0.8.0"));
+    try std.testing.expect(!try newer("0.8.0", "0.8.0"));
+    try std.testing.expect(!try newer("0.8.0", "0.9.0"));
+    try std.testing.expect(try newer("0.10.0", "0.9.0"));
 }
