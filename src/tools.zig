@@ -408,7 +408,7 @@ pub const Tools = struct {
     pub fn sandboxedArgv(t: *Tools, a: std.mem.Allocator, inner: []const []const u8) ![]const []const u8 {
         const roots = (try t.writableRoots(a)) orelse return inner;
         if (jail.unavailable(t.io)) |reason| {
-            if (t.jail_unavailable.load(.acquire) == 0) t.jail_unavailable.store(@as(u8, @intFromEnum(reason)) + 1, .release);
+            if (t.jail_unavailable.load(.acquire) == 0) t.jail_unavailable.store(@as(u8, @backingInt(reason)) + 1, .release);
             return inner;
         }
         return jail.wrap(a, t.io, roots, inner);
@@ -419,7 +419,7 @@ pub const Tools = struct {
         const value = t.jail_unavailable.load(.acquire);
         if (value == 0) return null;
         t.jail_noticed = true;
-        return @enumFromInt(value - 1);
+        return @fromBackingInt(@intCast(value - 1));
     }
 
     pub fn sandboxStatus(t: *const Tools) []const u8 {

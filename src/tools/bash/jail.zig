@@ -104,9 +104,9 @@ var probed: std.atomic.Value(u8) = .init(0);
 /// Result of the first probe is cached for the process.
 pub fn unavailable(io: std.Io) ?Unavailable {
     const state = probed.load(.acquire);
-    if (state != 0) return if (state == 1) null else @enumFromInt(state - 2);
+    if (state != 0) return if (state == 1) null else @fromBackingInt(@intCast(state - 2));
     const found = probe(io);
-    probed.store(if (found) |u| @as(u8, @intFromEnum(u)) + 2 else 1, .release);
+    probed.store(if (found) |u| @as(u8, @backingInt(u)) + 2 else 1, .release);
     return found;
 }
 
@@ -219,7 +219,7 @@ fn restrict(writable: []const []const u8) !void {
             if (linux.errno(linux.syscall4(.landlock_add_rule, @intCast(fd), landlock.rule_path_beneath, @intFromPtr(&rule), 0)) == .SUCCESS) break;
         }
     }
-    if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0)) != .SUCCESS) return error.LandlockUnavailable;
+    if (linux.errno(linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0)) != .SUCCESS) return error.LandlockUnavailable;
     if (linux.errno(linux.syscall2(.landlock_restrict_self, @intCast(fd), 0)) != .SUCCESS) return error.LandlockUnavailable;
     _ = linux.close(fd);
 }
