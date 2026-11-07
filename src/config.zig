@@ -169,6 +169,7 @@ const File = struct {
     top_end: usize = 0,
     limits: provider.Limits = .{},
     sandbox: provider.Sandbox = .{},
+    hooks: provider.Hooks = .{},
     provider_id: ?provider.Id = null,
     effort: ?[]const u8 = null,
     codex_settings: Settings = .{},
@@ -293,9 +294,10 @@ fn secretKey(key: []const u8) bool {
 fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u8, detail: *?[]u8) !File {
     var p: Parser = .{ .a = a, .diagnostics = diagnostics, .path = path, .detail = detail };
     var file: File = .{};
-    const Section = enum { chat_completions, codex, limits, skills, sandbox, provider_dynamic };
+    const Section = enum { chat_completions, codex, limits, skills, sandbox, hooks, provider_dynamic };
     var section: ?Section = null;
-    var seen_sections: [6]bool = @splat(false);
+    var seen_sections: [7]bool = @splat(false);
+    var hooks_seen: [2]bool = @splat(false);
     var sandbox_seen: [2]bool = @splat(false);
     var seen: [7][10]bool = @splat(@splat(false));
     var current_provider: usize = 0;
@@ -354,6 +356,18 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
             if (tail.len > 0 and tail[0] != '#') return p.bad("unexpected text after value", .{});
             const value_start = start + @intFromPtr(value.ptr) - @intFromPtr(raw.ptr);
             try file.skills.append(a, .{ .name = try a.dupe(u8, key), .enabled = parsed.boolean, .span = .{ .start = value_start, .end = value_start + consumed } });
+            continue;
+        }
+        if (section == .hooks) {
+            const which: usize = if (std.mem.eql(u8, key, "after_edit")) 0 else if (std.mem.eql(u8, key, "turn_end")) 1 else return p.bad("unknown hooks key '{s}'", .{key});
+            if (hooks_seen[which]) return p.bad("duplicate key '{s}'", .{key});
+            hooks_seen[which] = true;
+            const value = std.mem.trimStart(u8, line[eq + 1 ..], " \t");
+            var consumed: usize = 0;
+            const commands = try p.stringArray(value, &consumed);
+            if (which == 0) file.hooks.after_edit = commands else file.hooks.turn_end = commands;
+            const tail = std.mem.trimStart(u8, value[consumed..], " \t");
+            if (tail.len > 0 and tail[0] != '#') return p.bad("unexpected text after value", .{});
             continue;
         }
         if (section == .sandbox) {
@@ -568,6 +582,11 @@ pub fn resolve(a: Allocator, env: *const Env, text: []const u8, path: []const u8
     cfg.auth_issuer = if (env.get("NIB_AUTH_ISSUER")) |v| try a.dupe(u8, v) else null;
     cfg.codex_home = if (env.get("CODEX_HOME")) |v| try a.dupe(u8, v) else try std.fs.path.join(a, &.{ env.get("HOME") orelse "", ".codex" });
     cfg.enabled_skills = try enabledSkills(a, file.skills.items);
+    inline for (.{ "after_edit", "turn_end" }) |event| {
+        const commands = try a.alloc([]const u8, @field(file.hooks, event).len);
+        for (@field(file.hooks, event), commands) |command, *copy| copy.* = try a.dupe(u8, command);
+        @field(cfg.hooks, event) = commands;
+    }
     cfg.sandbox.mode = if (env.get("NIB_SANDBOX")) |v| std.meta.stringToEnum(@FieldType(provider.Sandbox, "mode"), v) orelse {
         detail.* = try a.dupe(u8, "NIB_SANDBOX: expected workspace or off");
         return error.InvalidConfig;
@@ -1446,4 +1465,18 @@ test "adding an endpoint appends one section and validates ids" {
     try t.expect(endpointIdProblem("custom", &.{}) != null);
     try t.expect(endpointIdProblem("my-site", &.{"my-site"}) != null);
     try t.expect(endpointIdProblem("ok_1", &.{"other"}) == null);
+}
+
+test "hooks parse command arrays and reject unknown duplicate and malformed values" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var detail: ?[]u8 = null;
+    const file = try parse(a, a, "[hooks]\nafter_edit = [\"zig fmt {files}\"]\nturn_end = []", "config.toml", &detail);
+    try t.expectEqualStrings("zig fmt {files}", file.hooks.after_edit[0]);
+    try t.expectEqual(@as(usize, 0), file.hooks.turn_end.len);
+    for ([_][]const u8{ "[hooks]\nother = []", "[hooks]\nafter_edit = true", "[hooks]\nafter_edit = [1]", "[hooks]\nafter_edit = []\nafter_edit = []", "[hooks]\n[hooks]", "[hooks]\nturn_end = [\"a\" \"b\"]" }) |bad| {
+        try t.expectError(error.InvalidConfig, parse(a, a, bad, "config.toml", &detail));
+    }
 }

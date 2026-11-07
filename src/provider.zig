@@ -78,6 +78,7 @@ pub const KeySource = enum { none, env, store };
 
 pub const Config = struct {
     sandbox: Sandbox = .{},
+    hooks: Hooks = .{},
     enabled_skills: []const []const u8 = &.{},
     limits: Limits = .{},
     provider: Id = .chat_completions,
@@ -364,3 +365,5 @@ test "vision follows provider tables and custom declarations" {
     custom.custom_vision = false;
     try t.expect(!custom.vision());
 }
+
+pub const Hooks = struct { after_edit: []const []const u8 = &.{}, turn_end: []const []const u8 = &.{} };

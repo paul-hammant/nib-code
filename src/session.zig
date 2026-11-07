@@ -58,6 +58,7 @@ pub const Session = struct {
     parent_session_id: ?[]const u8 = null,
     options: Options = undefined,
     inbox: @import("session/inbox.zig").Inbox = .{},
+    hook_jobs: std.ArrayList(*@import("session/hooks.zig").TurnJob) = .empty,
     undo_history: @import("tools/undo.zig").History = .{},
 
     /// Thread-safe while a Turn runs; other Session mutation is exclusive.
@@ -222,7 +223,17 @@ pub const Session = struct {
         s.* = next;
     }
 
+    pub fn finishHooks(s: *Session) void {
+        for (s.hook_jobs.items) |job| {
+            job.thread.join();
+            s.gpa.destroy(job);
+        }
+        s.hook_jobs.deinit(s.gpa);
+        s.hook_jobs = .empty;
+    }
+
     pub fn deinit(s: *Session) void {
+        s.finishHooks();
         s.codex_state.reset(s.gpa);
         s.tools.background.stop(s.gpa);
         s.undo_history.deinit(s.io, s.gpa);
@@ -270,6 +281,7 @@ pub const Session = struct {
     }
 
     pub fn turnWithImages(s: *Session, user_text: []const u8, images: []const @import("image.zig").Image, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
+        if (s.tools.background.log == null) s.tools.background.log = &s.log;
         try s.undo_history.begin(&s.tools, s.gpa);
         defer {
             s.undo_history.finish(&s.tools, s.gpa);

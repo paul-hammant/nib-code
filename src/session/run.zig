@@ -46,9 +46,10 @@ fn runTimed(s: *Session, code: []const u8, cancel: ?*const std.atomic.Value(bool
     }
     var end: @import("../sandbox/record.zig").End = .@"error";
     defer if (recorder) |r| r.finish(end);
-    const outcome = try sandbox.eval(s.gpa, s.io, code, .{}, host, cancel);
-    end = if (cancel != null and cancel.?.load(.acquire)) .cancelled else if (outcome.ok) .ok else if (std.mem.eql(u8, outcome.text, "Error: run timed out")) .timeout else .@"error";
+    var outcome = try sandbox.eval(s.gpa, s.io, code, .{}, host, cancel);
     errdefer outcome.deinit(s.gpa);
+    try @import("hooks.zig").afterEdit(&s.tools, s.gpa, &s.tools.changes, &outcome);
+    end = if (cancel != null and cancel.?.load(.acquire)) .cancelled else if (outcome.ok) .ok else if (std.mem.eql(u8, outcome.text, "Error: run timed out")) .timeout else .@"error";
     return .{ .outcome = outcome, .changes = try s.tools.takeChanges(s.gpa, s.arena.allocator()) };
 }
 
@@ -109,6 +110,7 @@ pub fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const 
     const o = ran.?.outcome;
     defer o.deinit(s.gpa);
 
+    if (o.hook_notice.len > 0) try sink.emit(sink.ctx, .{ .notice = o.hook_notice });
     const remaining_steps = if (s.cfg.limits.max_steps) |limit| limit -| s.steps else null;
     const output = try output_format.stepLimitOutput(a, try output_format.format(a, o, s.cfg.limits.run_output_bytes), remaining_steps);
     const run_ms = timing.elapsed();

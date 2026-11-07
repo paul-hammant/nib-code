@@ -73,6 +73,9 @@ pub const Job = struct {
             job.failure = err;
             break :result null;
         };
+        if (job.outcome) |*o| @import("hooks.zig").afterEdit(job.t, job.gpa, &job.scope.changes, o) catch |err| {
+            job.failure = err;
+        };
         if (job.recorder) |*r| r.finish(if (job.cancel.load(.acquire)) .cancelled else if (job.outcome) |o| (if (o.ok) .ok else if (std.mem.eql(u8, o.text, "Error: run timed out")) .timeout else .@"error") else .@"error");
     }
 
@@ -108,6 +111,6 @@ pub const Job = struct {
         const o = job.outcome.?;
         const cwd = try std.process.currentPathAlloc(job.t.io, job.gpa);
         defer job.gpa.free(cwd);
-        return .{ .execution = job.execution, .step = job.step, .run_index = job.timing.run_index, .ok = o.ok, .output = try output.format(a, o, if (job.t.cfg) |cfg| cfg.limits.run_output_bytes else output.max_bytes), .run_ms = job.elapsed_ms, .tool_bytes = job.timing.tool_bytes, .calls = job.timing.entries[0..job.timing.count], .calls_omitted = job.timing.omitted, .changes = try job.scope.changes.take(job.gpa, a, cwd) };
+        return .{ .hook_notice = if (o.hook_notice.len > 0) try a.dupe(u8, o.hook_notice) else null, .execution = job.execution, .step = job.step, .run_index = job.timing.run_index, .ok = o.ok, .output = try output.format(a, o, if (job.t.cfg) |cfg| cfg.limits.run_output_bytes else output.max_bytes), .run_ms = job.elapsed_ms, .tool_bytes = job.timing.tool_bytes, .calls = job.timing.entries[0..job.timing.count], .calls_omitted = job.timing.omitted, .changes = try job.scope.changes.take(job.gpa, a, cwd) };
     }
 };

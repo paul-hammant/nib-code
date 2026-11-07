@@ -51,6 +51,7 @@ pub const Event = union(enum) {
     usage: struct { tokens: provider.Usage, context: u64, steps: u32 },
     progress: @import("session/events.zig").Progress,
     background: struct {
+        hook_notice: ?[]const u8 = null,
         id: []const u8,
         kind: @FieldType(@FieldType(SessionEvent, "background"), "kind"),
         state: @FieldType(@FieldType(SessionEvent, "background"), "state"),
@@ -101,6 +102,7 @@ pub const Event = union(enum) {
                 owned.deinit(gpa);
             },
             .background => |b| {
+                if (b.hook_notice) |notice| gpa.free(notice);
                 gpa.free(b.id);
                 if (b.result) |result| gpa.free(result);
                 var changes = b.changes;
@@ -133,6 +135,7 @@ pub fn run(init: std.process.Init, session: *Session) !void {
     var loop: vaxis.Loop(Event) = .init(io, &tty, &vx);
     try loop.start();
     defer loop.stop();
+    defer session.finishHooks();
 
     try vx.enterAltScreen(w);
     try w.flush();
@@ -418,7 +421,9 @@ pub const App = struct {
                 app.retry_len = line.len;
             },
             .notice => |msg| {
-                try app.transcript.add(gpa, .info, msg);
+                if (std.mem.startsWith(u8, msg, "hook ") and !std.mem.startsWith(u8, msg, "hook turn_end ")) {
+                    try app.transcript.hookNotice(gpa, msg);
+                } else try app.transcript.add(gpa, .info, msg);
             },
             .usage => |u| {
                 app.usage = u.tokens;
@@ -430,6 +435,7 @@ pub const App = struct {
                 try app.transcript.progress(gpa, p);
             },
             .background => |b| {
+                if (b.hook_notice) |notice| try app.transcript.backgroundHookNotice(gpa, b.id, notice);
                 if (b.kind == .run and b.tool_summary != null) try app.transcript.updateBackgroundRun(gpa, b.id, b.result orelse "", b.changes, b.tool_summary.?);
                 switch (b.state) {
                     .started => app.background_count += 1,

@@ -35,3 +35,7 @@ Snapshots live in `$NIB_HOME/sessions/<session-id>.undo/<turn-id>/`, with parent
 Snapshot data resides mainly on disk; recording reuses existing before contents from file tools. Undo loads at most one Turn's 64 MiB original snapshots and reads current contents file by file. Crashes may leave snapshots; next opening the same Session in the TUI cleans them after acquiring the main log's exclusive lock, without restoring the undo stack. The project currently has no retention policy automatically deleting old Session logs; when deleting Session data, also delete the matching `.undo` directory. Cleaning the entire sessions directory covers it too. Snapshots may contain secrets; like tool recordings they stay local, and require inspection before sharing log directories.
 
 Verification: `zig build test --summary all`; after `zig build`, run `python3 tests/test_undo.py`, using local mocks only.
+
+## Hook commands
+
+Hook writes do not create undo snapshots. A formatter changing a file after edit/write can cause `/undo` to report a content conflict; hook-only files remain untouched. Reread and reconcile those changes before undoing.

@@ -46,6 +46,8 @@ From source (Zig 0.17): `zig build -Doptimize=ReleaseFast --prefix ~/.local`
 
 ## Use
 
+Optional sandboxed `after_edit` and `turn_end` commands: [hooks](docs/config.md#hooks).
+
 ```sh
 cd your-project
 nib                          # interactive

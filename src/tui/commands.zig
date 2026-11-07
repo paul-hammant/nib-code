@@ -265,6 +265,7 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
             if (skills.skipped.len > 0) try suffix.print(gpa, " · {d} invalid/skipped", .{skills.skipped.len});
             if (skills.missing > 0) try suffix.print(gpa, " · {d} missing", .{skills.missing});
             try app.report(.info, "Skills: {d} on · {d} found{s}", .{ skills.count, skills.found, suffix.items });
+            if (app.cfg.hooks.after_edit.len + app.cfg.hooks.turn_end.len > 0) try app.report(.info, "Hooks: after_edit {d} · turn_end {d}", .{ app.cfg.hooks.after_edit.len, app.cfg.hooks.turn_end.len });
             try app.report(.info, "Sandbox: {s}", .{session.tools.sandboxStatus()});
             var text: @import("bill.zig").Text = .{};
             var credential_arena: std.heap.ArenaAllocator = .init(gpa);

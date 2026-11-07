@@ -436,6 +436,13 @@ pub const Transcript = struct {
     }
 
     /// Takes ownership of `changes`.
+    pub fn hookNotice(t: *Transcript, gpa: std.mem.Allocator, message: []const u8) !void {
+        const e = t.lastRunning() orelse return;
+        try e.hook_notice.appendSlice(gpa, message);
+        e.cached = null;
+        t.revision +%= 1;
+    }
+
     pub fn endRun(t: *Transcript, gpa: std.mem.Allocator, ok: bool, output: []const u8, elapsed_ms: u64, changes: ChangeText) !void {
         try t.endRunWithSummary(gpa, ok, output, elapsed_ms, changes, null);
     }
@@ -461,6 +468,13 @@ pub const Transcript = struct {
     fn backgroundRunEntry(t: *Transcript, id: []const u8) ?*Entry {
         for (t.entries.items) |*entry| if (entry.kind == .run and std.mem.eql(u8, entry.task_id orelse "", id)) return entry;
         return null;
+    }
+
+    pub fn backgroundHookNotice(t: *Transcript, gpa: std.mem.Allocator, id: []const u8, notice: []const u8) !void {
+        const e = t.backgroundRunEntry(id) orelse return;
+        try e.hook_notice.appendSlice(gpa, notice);
+        e.cached = null;
+        t.revision +%= 1;
     }
 
     pub fn updateBackgroundRun(t: *Transcript, gpa: std.mem.Allocator, id: []const u8, output: []const u8, changes: ChangeText, summary: ToolSummary) !void {

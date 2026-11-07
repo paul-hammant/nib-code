@@ -45,6 +45,15 @@ const Entry = struct {
 };
 
 pub fn format(gpa: std.mem.Allocator, o: sandbox.Outcome, limit: usize) ![]u8 {
+    if (o.hook.len > 0) {
+        var original = o;
+        original.hook = "";
+        const body = try format(gpa, original, limit / 2);
+        defer gpa.free(body);
+        const payload = try renderLimit(gpa, .{ .ok = true, .text = @constCast(o.hook), .logs = @constCast("") }, limit - body.len - 1);
+        defer gpa.free(payload);
+        return std.fmt.allocPrint(gpa, "{s}\n{s}", .{ body, payload });
+    }
     const suffix = if (o.stopped.len > 0) o.stopped else if (!o.ok) "[Run script failed. Correct the script and continue the task; this error is not a reason to end the Turn.]" else return renderLimit(gpa, o, limit);
     const body = try renderLimit(gpa, o, limit - suffix.len - 1);
     defer gpa.free(body);

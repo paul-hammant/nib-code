@@ -86,6 +86,7 @@ pub const TurnSummary = struct {
 pub const ModelActivity = enum { started, data, script, waiting, finished };
 
 pub const RunCompletion = struct {
+    hook_notice: ?[]const u8 = null,
     execution: ?@import("../sandbox/timing.zig").Execution = null,
     step: usize,
     run_index: usize,

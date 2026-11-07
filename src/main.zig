@@ -188,7 +188,13 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
         session.interrupt_signal = &ask_signal;
         std.posix.sigaction(.TERM, &action, null);
         std.posix.sigaction(.INT, &action, null);
+        var hook_status: []const u8 = "failed";
+        defer @import("session/hooks.zig").TurnJob.start(&session, hook_status, null) catch {};
+        errdefer if (ask_cancel.load(.acquire)) {
+            hook_status = "cancelled";
+        };
         try session.turn(prompt.?, .{ .ctx = &p, .emit = Print.emit }, &ask_cancel, detail);
+        hook_status = "completed";
         if (json) {
             try JsonEvent.write(.{ .end = .{
                 .text = session.history.items[session.history.items.len - 1].content orelse "",

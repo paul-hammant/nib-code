@@ -78,7 +78,7 @@ api_key_env = "MYSITE_API_KEY"
 
 openai uses `OPENAI_API_KEY`; mysite uses MYSITE_API_KEY. Never write key contents to files. Custom protocol/base_url/model/context_window are required; omit api_key_env for unauthenticated local services. Optional `vision = true|false` declares image input support ([providers.md](providers.md)). `NIB_PROVIDER`=mysite overrides the top-level choice.
 
-Dependency-free TOML subset: blank lines, # comments, single-line double-quoted strings (escapes `\"`, `\\`, `\n`), signed decimal integers with underscore grouping, true/false. Only [skills] name keys and a custom provider's `vision` accept booleans; other keys use strings/positive integers and reject booleans by type. Accept only top-level provider/effort; model/base_url/context_window in built-in same-name sections; [codex] additionally transport = "sse"|"websocket", reasoning_summary = "off"|"auto", run_tool = "custom"|"function"; the [limits] keys below; [skills] switches; [sandbox] `mode`/`writable`; and `[providers.<id>]` protocol/base_url/model/context_window/api_key_env/vision (boolean). Arrays only as single-line lists of strings, for `[sandbox].writable`. No general nested tables, multiline strings, or full TOML. Unknown/duplicate keys/sections and malformed syntax report path/line rather than silently ignoring.
+Dependency-free TOML subset: blank lines, # comments, single-line double-quoted strings (escapes `\"`, `\\`, `\n`), signed decimal integers with underscore grouping, true/false. Only [skills] name keys and a custom provider's `vision` accept booleans; other keys use strings/positive integers and reject booleans by type. Accept only top-level provider/effort; model/base_url/context_window in built-in same-name sections; [codex] additionally transport = "sse"|"websocket", reasoning_summary = "off"|"auto", run_tool = "custom"|"function"; the [limits] keys below; [skills] switches; [sandbox] `mode`/`writable`; [hooks] `after_edit`/`turn_end`; and `[providers.<id>]` protocol/base_url/model/context_window/api_key_env/vision (boolean). Arrays only as single-line lists of strings, for `[sandbox].writable` and hook commands. No general nested tables, multiline strings, or full TOML. Unknown/duplicate keys/sections and malformed syntax report path/line rather than silently ignoring.
 
 ## [skills]
 
@@ -205,3 +205,21 @@ TUI Run summaries show actual effort of the **request producing them**, not next
 Children inherit effective configuration; summaries use independent minimum reasoning. Resume uses current launch settings within provider/Codex-model boundaries; [codex.md](codex.md).
 
 Read/validate current files before writeback, replacing only effort value byte ranges (preserve same-line comments on deletion); if absent insert at top-level end before first section. Write full contents to same-directory temporary file, sync, rename; failures clean up temporary files, never partially overwrite originals. Save failures show in transcript without reverting current effort. No cross-process lock: simultaneous nib/editor saves may overwrite earlier saves. File cap 1 MiB; no automatic migration/project config.
+
+## [hooks]
+
+Hooks are off unless configured. Values are single-line arrays of shell commands:
+
+```toml
+[hooks]
+after_edit = ["zig fmt {files}"]
+turn_end = ["notify-send nib 'Turn finished'"]
+```
+
+Commands run sequentially through `/bin/sh -c` in the project directory, using bash's OS write sandbox, writable roots, and API-key filtering. Each command has a fixed 30-second timeout; execution stops at the first failure. Success is silent.
+
+`after_edit` runs once after each Run settles if edit/write changed files. `{files}` expands to shell-quoted paths relative to the project directory; `NIB_FILES` contains those paths separated by newlines, and `NIB_EVENT=after_edit`. A failure adds a `hook` payload to that Run's model output and a warning line in its TUI block. Child Sessions run and report their own after-edit hooks, including background Runs. Hook writes are not captured for `/undo`; reread formatted files as needed.
+
+`turn_end` runs only for root Sessions in the TUI and `nib ask`, after completion, failure, or cancellation. It receives `NIB_EVENT=turn_end` and `NIB_TURN_STATUS=completed|failed|cancelled`. A background thread discards output and never sends failures to the model; the TUI shows `hook turn_end · exit N`. The whole turn-end sequence shares a 30-second deadline, so ask waits at most that deadline before exiting. Session shutdown joins outstanding hook threads. Offline replay never executes hooks.
+
+Session logs record the event, expanded command, exit code (124 for timeout), and duration in milliseconds, without command output. `/status` shows configured hook counts only when nonempty.

@@ -60,9 +60,20 @@ pub const Turn = struct {
         return t;
     }
 
+    fn hookNotice(ctx: *anyopaque, gpa: std.mem.Allocator, message: []const u8) void {
+        const loop: *vaxis.Loop(Event) = @ptrCast(@alignCast(ctx));
+        const copy = gpa.dupe(u8, message) catch return;
+        const posted = loop.tryPostEvent(.{ .notice = copy }) catch false;
+        if (!posted) gpa.free(copy);
+    }
+
     pub fn work(t: *Turn, compact: bool) void {
+        var status: []const u8 = "completed";
+        defer if (!compact) @import("../session/hooks.zig").TurnJob.start(t.session, status, .{ .ctx = t.loop, .emit = hookNotice }) catch {};
+
         var detail: ?[]u8 = null;
         t.execute(compact, &detail) catch |err| {
+            status = if (t.cancel.load(.acquire)) "cancelled" else "failed";
             const msg = detail orelse (t.gpa.dupe(u8, @errorName(err)) catch return);
             t.loop.postEvent(.{ .failed = .{ .message = msg, .reason = @import("../tools/changes.zig").Recovery.classify(err, t.cancel.load(.acquire), t.failure_stage) } }) catch t.gpa.free(msg);
             return;
@@ -140,7 +151,9 @@ pub const Turn = struct {
                 errdefer changes.deinit(gpa);
                 const summary: ?@import("../session/tool_summary.zig").Summary = if (b.completion) |value| try .init(gpa, value.calls, value.run_index, value.calls_omitted) else null;
                 errdefer if (summary) |value| value.deinit(gpa);
-                break :blk .{ .background = .{ .id = id, .kind = b.kind, .state = b.state, .ok = b.ok, .result = if (b.completion) |value| try gpa.dupe(u8, value.output) else if (b.result) |result| try gpa.dupe(u8, result) else null, .changes = changes, .tool_summary = summary } };
+                const hook_notice = if (b.completion) |value| (if (value.hook_notice) |notice| try gpa.dupe(u8, notice) else null) else null;
+                errdefer if (hook_notice) |notice| gpa.free(notice);
+                break :blk .{ .background = .{ .hook_notice = hook_notice, .id = id, .kind = b.kind, .state = b.state, .ok = b.ok, .result = if (b.completion) |value| try gpa.dupe(u8, value.output) else if (b.result) |result| try gpa.dupe(u8, result) else null, .changes = changes, .tool_summary = summary } };
             },
             .turn_end => |summary| .{ .turn_end = summary },
         };

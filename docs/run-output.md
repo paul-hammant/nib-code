@@ -121,3 +121,7 @@ Runs share cwd/files, possibly concurrently. file_state mutex protects tables; p
 Exit never restores JS heaps/restarts commands; undelivered tasks resume as lost, committed results never redeliver. Replay does not reproduce wall-time transitions: locate original Step/Run, execute full scripts, compare final output, never early notices before final commit.
 
 TUI original Runs show neutral → run background → rN for registration; final entries show source Run → rN, including resume. Superseded bash shows b1 superseded by b2 with neutral arrows/tree replacement ids, not failure.
+
+## After-edit hooks
+
+A failed configured `after_edit` hook adds `{"hook":{"command":"...","exit_code":1,"output":"..."}}` to its Run result. Exit code 124 denotes timeout. Complete captured output remains available until model-side rendering applies the normal Run display budget. Successful hooks add no result data. Commands run once per settled Run containing edit/write changes; child Sessions report their own hooks. Replay does not run hooks.

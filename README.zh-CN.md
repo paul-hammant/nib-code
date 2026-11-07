@@ -46,6 +46,8 @@ curl -fsSL https://raw.githubusercontent.com/yyydddkkk/nib-code/main/install.sh 
 
 ## 使用
 
+可选的沙箱内 `after_edit` 和 `turn_end` 命令：[hooks 配置](docs/config.md#hooks)。
+
 ```sh
 cd your-project
 nib                          # 交互界面

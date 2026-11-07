@@ -68,6 +68,8 @@ pub const LogEntry = console.Entry;
 pub const max_log_entries = console.max_entries;
 
 pub const Outcome = struct {
+    hook: []const u8 = "",
+    hook_notice: []const u8 = "",
     ok: bool,
     /// Completion value as JSON when `ok`, otherwise error message and stack.
     text: []u8,
@@ -81,6 +83,8 @@ pub const Outcome = struct {
     stopped: []const u8 = "",
 
     pub fn deinit(o: Outcome, gpa: std.mem.Allocator) void {
+        gpa.free(o.hook);
+        gpa.free(o.hook_notice);
         gpa.free(o.text);
         gpa.free(o.logs);
         gpa.free(o.log_entries);

@@ -34,6 +34,7 @@ pub const ForkedFrom = struct {
 pub const TaskStop = struct { id: []const u8, reason: []const u8, stopped: bool };
 
 pub const Record = struct {
+    hook: ?struct { event: []const u8, command: []const u8, exit_code: i32, duration_ms: u64 } = null,
     skills: ?@import("skills.zig").Summary = null,
     task_stop: ?TaskStop = null,
     sandbox_unavailable: ?[]const u8 = null,
@@ -160,6 +161,12 @@ pub const Log = struct {
         log.mutex.lockUncancelable(io);
         defer log.mutex.unlock(io);
         try log.append(io, a, .{ .bash = event });
+    }
+
+    pub fn hook(log: *Log, io: std.Io, a: std.mem.Allocator, event: []const u8, command: []const u8, exit_code: i32, duration_ms: u64) !void {
+        log.mutex.lockUncancelable(io);
+        defer log.mutex.unlock(io);
+        try log.append(io, a, .{ .hook = .{ .event = event, .command = command, .exit_code = exit_code, .duration_ms = duration_ms } });
     }
 
     pub fn sandboxUnavailable(log: *Log, io: std.Io, a: std.mem.Allocator, reason: []const u8) !void {
@@ -320,6 +327,7 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
             torn = true;
             continue;
         };
+        if (r.hook != null) continue;
         if (history.items.len == 0 or (steps == 0 and r.from == 0 and r.provider != null)) {
             parent_session_id = r.parent_session_id;
             skills = r.skills orelse .{};

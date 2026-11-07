@@ -31,6 +31,7 @@ pub const Entry = struct {
     text: std.ArrayList(u8) = .empty,
     /// For `.run`: the complete result delivered by Session.
     output: std.ArrayList(u8) = .empty,
+    hook_notice: std.ArrayList(u8) = .empty,
     /// For `.run`: see `ChangeText`.
     changes: ChangeText = .{},
     agents: std.ArrayList(Progress) = .empty,
@@ -69,6 +70,7 @@ pub const Entry = struct {
         if (e.tool_summary) |summary| summary.deinit(gpa);
         e.text.deinit(gpa);
         e.output.deinit(gpa);
+        e.hook_notice.deinit(gpa);
         e.label.deinit(gpa);
         e.files.deinit(gpa);
         e.changes.deinit(gpa);
@@ -120,6 +122,7 @@ pub const Entry = struct {
     }
 
     pub fn hasWarning(e: *const Entry) bool {
+        if (e.hook_notice.items.len > 0) return true;
         for (e.agents.items) |p| if (p.superseded_by == null and (p.state == .failed or p.state == .timed_out or p.state == .canceled)) return true;
         return false;
     }
@@ -169,6 +172,10 @@ pub const Entry = struct {
             if (e.files.items.len > 0) {
                 const r = win.child(.{ .x_off = 2, .y_off = rows }).printSegment(.{ .text = e.files.items, .style = .{ .dim = true } }, .{ .wrap = .word, .commit = commit });
                 rows +|= @max(1, r.row +| @intFromBool(r.col > 0));
+            }
+            if (e.hook_notice.items.len > 0) {
+                _ = win.child(.{ .x_off = 2, .y_off = rows }).printSegment(.{ .text = e.hook_notice.items, .style = .{ .fg = .{ .index = 3 } } }, .{ .wrap = .none, .commit = commit });
+                rows +|= 1;
             }
             rows +|= e.agent_tree.print(win.child(.{ .y_off = rows }), commit);
             if (!e.open) return rows;
