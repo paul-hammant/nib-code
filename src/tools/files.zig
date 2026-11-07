@@ -44,6 +44,13 @@ pub fn read(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
     return .{ .ok = result };
 }
 
+fn writeBlocked(t: *Tools, gpa: std.mem.Allocator, path: []const u8) !?[]const u8 {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const why = (try t.checkWritable(arena.allocator(), path)) orelse return null;
+    return why;
+}
+
 pub fn edit(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolResult {
     const A = struct { path: []const u8, old_text: []const u8, new_text: []const u8, all: bool = false };
     const a = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch
@@ -53,6 +60,7 @@ pub fn edit(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
     const path = try tools.normalizedPath(t.io, gpa, v.path);
     defer gpa.free(path);
     try t.checkCredentialPath(gpa, path);
+    if (try writeBlocked(t, gpa, path)) |why| return fail(gpa, "{s}: {s}", .{ v.path, why });
     const lock = try file_state.lock(t, gpa, path);
     defer lock.close(t.io);
     if (t.cancelFlag().load(.acquire)) return error.Canceled;
@@ -90,6 +98,7 @@ pub fn write(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolR
     const path = try tools.normalizedPath(t.io, gpa, v.path);
     defer gpa.free(path);
     try t.checkCredentialPath(gpa, path);
+    if (try writeBlocked(t, gpa, path)) |why| return fail(gpa, "{s}: {s}", .{ v.path, why });
     const lock = try file_state.lock(t, gpa, path);
     defer lock.close(t.io);
     if (t.cancelFlag().load(.acquire)) return error.Canceled;
@@ -209,6 +218,38 @@ test "parallel edits lock the normalized path through read and write" {
     const data = try tmp.dir.readFileAlloc(testing.io, "f", testing.allocator, .limited(100));
     defer testing.allocator.free(data);
     try testing.expectEqualStrings("ABCDEFGHIJKLMNOP", data);
+}
+
+test "edit and write refuse paths outside the writable roots as data" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "inside.txt", .data = "old" });
+    try tmp.dir.symLink(testing.io, "/usr/share", "escape", .{});
+    const root = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer testing.allocator.free(root);
+    var t: Tools = .{ .io = testing.io, .home = root, .cfg = .{ .base_url = "", .api_key = "", .model = "m" } };
+    defer t.file_state.deinit(testing.allocator);
+    const outside = [_][]const u8{ "/usr/share/nib-sandbox-test", "escape/nib-sandbox-test", "../../../../../../../usr/share/nib-sandbox-test" };
+    for (outside) |relative| {
+        const path = if (std.mem.startsWith(u8, relative, "escape")) try std.fs.path.join(testing.allocator, &.{ root, relative }) else try testing.allocator.dupe(u8, relative);
+        defer testing.allocator.free(path);
+        const args = try std.json.Stringify.valueAlloc(testing.allocator, .{ .path = path, .old_text = "a", .new_text = "b", .content = "x" }, .{});
+        defer testing.allocator.free(args);
+        for ([_][]const u8{ "edit", "write" }) |name| {
+            const result = Tools.call(&t, testing.allocator, name, args);
+            defer freeResult(result);
+            try testing.expect(std.mem.indexOf(u8, result.err, "sandbox only allows writes inside the project") != null);
+        }
+    }
+    const inside = try std.fmt.allocPrint(testing.allocator, "{{\"path\":\"{s}/inside.txt\",\"old_text\":\"old\",\"new_text\":\"new\"}}", .{root});
+    defer testing.allocator.free(inside);
+    const ok = Tools.call(&t, testing.allocator, "edit", inside);
+    defer freeResult(ok);
+    try testing.expectEqualStrings("{\"replaced\":1}", ok.ok);
+    t.cfg.?.sandbox.mode = .off;
+    const off = Tools.call(&t, testing.allocator, "write", "{\"path\":\"/nonexistent-nib-dir/x\",\"content\":\"x\"}");
+    defer freeResult(off);
+    try testing.expect(std.mem.indexOf(u8, off.err, "sandbox") == null);
 }
 
 test "credential file tools deny default custom and symlink paths" {

@@ -68,7 +68,14 @@ pub const Limits = struct {
     run_output_bytes: usize = 16 * 1024,
 };
 
+pub const Sandbox = struct {
+    mode: enum { workspace, off } = .workspace,
+    /// Absolute extra writable roots.
+    writable: []const []const u8 = &.{},
+};
+
 pub const Config = struct {
+    sandbox: Sandbox = .{},
     enabled_skills: []const []const u8 = &.{},
     limits: Limits = .{},
     provider: Id = .chat_completions,

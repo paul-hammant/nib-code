@@ -9,6 +9,7 @@ const diff = @import("tools/diff.zig");
 const subagent = @import("tools/agent.zig");
 const model_function = @import("tools/llm.zig");
 const image = @import("image.zig");
+const jail = @import("tools/bash/jail.zig");
 
 const Tool = struct {
     root_only: bool = false,
@@ -235,6 +236,8 @@ pub const Tools = struct {
     images_mutex: std.Io.Mutex = .init,
     /// Images viewed outside any RunScope (`nib js`).
     images: std.ArrayList(image.Image) = .empty,
+    jail_unavailable: std.atomic.Value(u8) = .init(0),
+    jail_noticed: bool = false,
 
     fn scope(t: *Tools) ?*RunScope {
         const value = current_scope orelse return null;
@@ -362,6 +365,12 @@ pub const Tools = struct {
             defer gpa.free(notice);
             try sink.emit(sink.ctx, notice);
         };
+        if (t.notice_sink) |sink| if (t.takeJailNotice()) |reason| {
+            const notice = try std.fmt.allocPrint(sink.gpa, "Sandbox unavailable · {s} · bash runs without it", .{reason.text()});
+            defer sink.gpa.free(notice);
+            try sink.emit(sink.ctx, notice);
+            if (t.background.log) |log| log.sandboxUnavailable(t.io, sink.gpa, reason.text()) catch {};
+        };
         if (t.background_sink) |sink| try t.background.poll(t.io, sink.ctx, sink.emit);
         try t.progress.drain(t.io);
     }
@@ -381,6 +390,48 @@ pub const Tools = struct {
             break if (tool.run) |run_tool| run_tool(t, gpa, args) else error.SandboxOnlyTool;
         } else fail(gpa, "unknown tool", .{});
         return r catch |err| fail(gpa, "{s}", .{@errorName(err)}) catch .{ .err = &.{} };
+    }
+
+    pub fn sandboxEnabled(t: *const Tools) bool {
+        const cfg = t.cfg orelse return false;
+        return cfg.sandbox.mode == .workspace;
+    }
+
+    /// Canonical writable roots, or null when the sandbox is off. Memory comes from `a`.
+    pub fn writableRoots(t: *Tools, a: std.mem.Allocator) !?[]const []const u8 {
+        if (!t.sandboxEnabled()) return null;
+        const cwd = try std.process.currentPathAlloc(t.io, a);
+        return try jail.roots(t.io, a, .{ .cwd = cwd, .home = t.home, .environ = t.environ, .extra = t.cfg.?.sandbox.writable });
+    }
+
+    /// Command argv, wrapped by the OS sandbox when it is on and available.
+    pub fn sandboxedArgv(t: *Tools, a: std.mem.Allocator, inner: []const []const u8) ![]const []const u8 {
+        const roots = (try t.writableRoots(a)) orelse return inner;
+        if (jail.unavailable(t.io)) |reason| {
+            if (t.jail_unavailable.load(.acquire) == 0) t.jail_unavailable.store(@as(u8, @intFromEnum(reason)) + 1, .release);
+            return inner;
+        }
+        return jail.wrap(a, t.io, roots, inner);
+    }
+
+    fn takeJailNotice(t: *Tools) ?jail.Unavailable {
+        if (t.jail_noticed) return null;
+        const value = t.jail_unavailable.load(.acquire);
+        if (value == 0) return null;
+        t.jail_noticed = true;
+        return @enumFromInt(value - 1);
+    }
+
+    pub fn sandboxStatus(t: *const Tools) []const u8 {
+        if (!t.sandboxEnabled()) return "off";
+        return if (jail.unavailable(t.io) == null) "workspace" else "workspace · bash unavailable";
+    }
+
+    /// Error text when the sandbox forbids writing `path` (canonical), else null.
+    pub fn checkWritable(t: *Tools, a: std.mem.Allocator, path: []const u8) !?[]const u8 {
+        const roots = (try t.writableRoots(a)) orelse return null;
+        if (jail.allows(roots, path)) return null;
+        return "outside the project; the sandbox only allows writes inside the project and its writable roots";
     }
 
     pub fn codexHome(t: *const Tools) ?[]const u8 {

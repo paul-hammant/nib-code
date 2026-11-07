@@ -42,7 +42,7 @@ Tool descriptions and system prompts state facts and costs for models to weigh, 
   - [0001 Zig, from scratch](adr/0001-zig-from-scratch.md)
   - [0002 Expose only run(code): JS in QuickJS](adr/0002-run-code-only.md)
   - [0003 Fresh sandbox per Run](adr/0003-stateless-runs.md)
-  - [0004 Two isolation layers](adr/0004-two-layer-isolation.md) (deferred: no system sandbox; language isolation implemented)
+  - [0004 Two isolation layers](adr/0004-two-layer-isolation.md) (language isolation plus an OS write sandbox: Landlock / sandbox-exec)
   - [0005 One process per Session](adr/0005-process-per-session.md)
   - [0006 No approvals; host rejection of dangerous commands](adr/0006-deny-dangerous-commands.md)
   - [0007 Stable system; complete-Step compaction](adr/0007-context-compaction.md)
@@ -104,7 +104,7 @@ Second-phase input plans:
 - **Cross-process input history `~/.nib/history.jsonl` and ctrl+r search.** Current scope is in-process drafts and Session-log resume. Persistent history needs sensitive-input handling, retention, and multiprocess appends; search needs separate interaction state, designed together in phase two.
 - **ctrl+g edits drafts through $EDITOR.** Needs terminal suspension/restoration, temporary cleanup, and reimport after paste expansion; integrate once the draft model stabilizes in phase two.
 
-Run tool concurrency, nib ask --json, and `tools.agent` are implemented; see ADR 0009–0010, [ask-json.md](ask-json.md), and [tool-delegation.md](tool-delegation.md). After zig build, `python3 tests/test_session.py` checks resume, machine events, subagent concurrency/depth/usage/cancellation, and startup overhead, entirely with local mocks and no real keys. Other deferred alternatives live in their ADRs: system sandbox ([0004](adr/0004-two-layer-isolation.md)), daemon ([0005](adr/0005-process-per-session.md)), cross-Run variables ([0003](adr/0003-stateless-runs.md)), hybrid native calls and Python runtime ([0002](adr/0002-run-code-only.md)).
+Run tool concurrency, nib ask --json, and `tools.agent` are implemented; see ADR 0009–0010, [ask-json.md](ask-json.md), and [tool-delegation.md](tool-delegation.md). After zig build, `python3 tests/test_session.py` checks resume, machine events, subagent concurrency/depth/usage/cancellation, and startup overhead, entirely with local mocks and no real keys. Other deferred alternatives live in their ADRs: daemon ([0005](adr/0005-process-per-session.md)), cross-Run variables ([0003](adr/0003-stateless-runs.md)), hybrid native calls and Python runtime ([0002](adr/0002-run-code-only.md)).
 
 ## Measurements
 

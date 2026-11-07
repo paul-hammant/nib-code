@@ -60,6 +60,7 @@ const File = struct {
     skills_end: ?usize = null,
     top_end: usize = 0,
     limits: provider.Limits = .{},
+    sandbox: provider.Sandbox = .{},
     provider_id: ?provider.Id = null,
     effort: ?[]const u8 = null,
     codex_settings: Settings = .{},
@@ -138,6 +139,24 @@ const Parser = struct {
         const number = std.fmt.parseInt(i128, clean.items, 10) catch return p.bad("integer out of range", .{});
         return if (negative) -number else number;
     }
+    fn stringArray(p: Parser, input: []const u8, consumed: *usize) ![]const []const u8 {
+        if (input.len == 0 or input[0] != '[') return p.bad("expected an array of strings on one line", .{});
+        var items: std.ArrayList([]const u8) = .empty;
+        var i: usize = 1;
+        while (true) {
+            while (i < input.len and (input[i] == ' ' or input[i] == '\t')) i += 1;
+            if (i == input.len) return p.bad("unterminated array; arrays must fit on one line", .{});
+            if (input[i] == ']') break;
+            var used: usize = 0;
+            try items.append(p.a, try p.string(input[i..], &used));
+            i += used;
+            while (i < input.len and (input[i] == ' ' or input[i] == '\t')) i += 1;
+            if (i < input.len and input[i] == ',') i += 1 else if (i == input.len or input[i] != ']') return p.bad("expected , or ] in array", .{});
+        }
+        consumed.* = i + 1;
+        return items.items;
+    }
+
     const Value = union(enum) { string: []const u8, integer: i128, boolean: bool };
 
     fn value(p: Parser, input: []const u8, consumed: *usize) !Value {
@@ -166,10 +185,11 @@ fn secretKey(key: []const u8) bool {
 fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u8, detail: *?[]u8) !File {
     var p: Parser = .{ .a = a, .diagnostics = diagnostics, .path = path, .detail = detail };
     var file: File = .{};
-    const Section = enum { chat_completions, codex, limits, skills, provider_dynamic };
+    const Section = enum { chat_completions, codex, limits, skills, sandbox, provider_dynamic };
     var section: ?Section = null;
-    var seen_sections: [5]bool = @splat(false);
-    var seen: [6][10]bool = @splat(@splat(false));
+    var seen_sections: [6]bool = @splat(false);
+    var sandbox_seen: [2]bool = @splat(false);
+    var seen: [7][10]bool = @splat(@splat(false));
     var current_provider: usize = 0;
     var offset: usize = 0;
     while (offset < text.len) : (p.line += 1) {
@@ -226,6 +246,25 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
             if (tail.len > 0 and tail[0] != '#') return p.bad("unexpected text after value", .{});
             const value_start = start + @intFromPtr(value.ptr) - @intFromPtr(raw.ptr);
             try file.skills.append(a, .{ .name = try a.dupe(u8, key), .enabled = parsed.boolean, .span = .{ .start = value_start, .end = value_start + consumed } });
+            continue;
+        }
+        if (section == .sandbox) {
+            const which: usize = if (std.mem.eql(u8, key, "mode")) 0 else if (std.mem.eql(u8, key, "writable")) 1 else return p.bad("unknown sandbox key '{s}'", .{key});
+            if (sandbox_seen[which]) return p.bad("duplicate key '{s}'", .{key});
+            sandbox_seen[which] = true;
+            const value = std.mem.trimStart(u8, line[eq + 1 ..], " \t");
+            var consumed: usize = 0;
+            if (which == 0) {
+                const parsed = try p.value(value, &consumed);
+                if (parsed != .string) return p.bad("mode must be a string", .{});
+                file.sandbox.mode = std.meta.stringToEnum(@FieldType(provider.Sandbox, "mode"), parsed.string) orelse return p.bad("mode must be workspace or off", .{});
+            } else {
+                const paths = try p.stringArray(value, &consumed);
+                for (paths) |entry| if (!std.fs.path.isAbsolute(entry) and !std.mem.eql(u8, entry, "~") and !std.mem.startsWith(u8, entry, "~/")) return p.bad("writable paths must be absolute or start with ~/", .{});
+                file.sandbox.writable = paths;
+            }
+            const tail = std.mem.trimStart(u8, value[consumed..], " \t");
+            if (tail.len > 0 and tail[0] != '#') return p.bad("unexpected text after value", .{});
             continue;
         }
         const index: usize = if (section == null)
@@ -418,6 +457,13 @@ pub fn resolve(a: Allocator, env: *const Env, text: []const u8, path: []const u8
     errdefer a.free(cfg.api_key);
     cfg.codex_home = if (env.get("CODEX_HOME")) |v| try a.dupe(u8, v) else try std.fs.path.join(a, &.{ env.get("HOME") orelse "", ".codex" });
     cfg.enabled_skills = try enabledSkills(a, file.skills.items);
+    cfg.sandbox.mode = if (env.get("NIB_SANDBOX")) |v| std.meta.stringToEnum(@FieldType(provider.Sandbox, "mode"), v) orelse {
+        detail.* = try a.dupe(u8, "NIB_SANDBOX: expected workspace or off");
+        return error.InvalidConfig;
+    } else file.sandbox.mode;
+    const roots = try a.alloc([]const u8, file.sandbox.writable.len);
+    for (file.sandbox.writable, roots) |configured, *root| root.* = try @import("tools/bash/jail.zig").expandHome(a, env.get("HOME") orelse "", configured);
+    cfg.sandbox.writable = roots;
     return cfg;
 }
 
@@ -893,6 +939,35 @@ test "limits defaults, bounds and diagnostics" {
     }
     for ([_][]const u8{ "[limits]\nunknown = 1", "[limits]\nmax_steps = 1\nmax_steps = 2", "[limits]\n[limits]" }) |text| {
         try t.expectError(error.InvalidConfig, resolve(a, &env, text, "config.toml", &detail));
+        try t.expect(std.mem.startsWith(u8, detail.?, "config.toml:"));
+    }
+}
+
+test "sandbox defaults, file settings and NIB_SANDBOX override" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: Env = .init(a);
+    try env.put("HOME", "/home/u");
+    var detail: ?[]u8 = null;
+    const defaults = try resolve(a, &env, "", "config.toml", &detail);
+    try t.expectEqual(.workspace, defaults.sandbox.mode);
+    try t.expectEqual(@as(usize, 0), defaults.sandbox.writable.len);
+    const text = "[sandbox]\nmode = \"off\" # trusted machine\nwritable = [\"~/extra\", \"/data/shared\",]\n";
+    const file = try resolve(a, &env, text, "config.toml", &detail);
+    try t.expectEqual(.off, file.sandbox.mode);
+    try t.expectEqual(@as(usize, 2), file.sandbox.writable.len);
+    try t.expectEqualStrings("/home/u/extra", file.sandbox.writable[0]);
+    try t.expectEqualStrings("/data/shared", file.sandbox.writable[1]);
+    try env.put("NIB_SANDBOX", "workspace");
+    try t.expectEqual(.workspace, (try resolve(a, &env, text, "config.toml", &detail)).sandbox.mode);
+    try env.put("NIB_SANDBOX", "maybe");
+    try t.expectError(error.InvalidConfig, resolve(a, &env, text, "config.toml", &detail));
+    try t.expect(std.mem.startsWith(u8, detail.?, "NIB_SANDBOX:"));
+    for ([_][]const u8{ "[sandbox]\nmode = \"on\"", "[sandbox]\nmode = 1", "[sandbox]\nunknown = 1", "[sandbox]\nmode = \"off\"\nmode = \"off\"", "[sandbox]\nwritable = [\"relative\"]", "[sandbox]\nwritable = [\"/a\"", "[sandbox]\nwritable = \"/a\"", "[sandbox]\nwritable = [\"/a\" \"/b\"]", "[sandbox]\n[sandbox]" }) |bad| {
+        var clean: Env = .init(a);
+        try t.expectError(error.InvalidConfig, resolve(a, &clean, bad, "config.toml", &detail));
         try t.expect(std.mem.startsWith(u8, detail.?, "config.toml:"));
     }
 }

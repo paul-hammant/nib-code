@@ -200,6 +200,7 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
             if (skills.skipped.len > 0) try suffix.print(gpa, " · {d} invalid/skipped", .{skills.skipped.len});
             if (skills.missing > 0) try suffix.print(gpa, " · {d} missing", .{skills.missing});
             try app.report(.info, "Skills: {d} on · {d} found{s}", .{ skills.count, skills.found, suffix.items });
+            try app.report(.info, "Sandbox: {s}", .{session.tools.sandboxStatus()});
             var text: @import("bill.zig").Text = .{};
             try app.report(.info, "Provider {s} · {s} · effort {s} · context {d}%\n{s}", .{ app.cfg.name(), app.cfg.model, app.cfg.effectiveEffort(), app.context * 100 / @max(app.cfg.context_window, 1), if (app.last_summary) |summary| text.details(summary) else "No completed turn yet." });
         },

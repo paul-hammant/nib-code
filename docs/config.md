@@ -73,13 +73,34 @@ api_key_env = "MYSITE_API_KEY"
 
 openai uses `OPENAI_API_KEY`; mysite uses MYSITE_API_KEY. Never write key contents to files. Custom protocol/base_url/model/context_window are required; omit api_key_env for unauthenticated local services. Optional `vision = true|false` declares image input support ([providers.md](providers.md)). `NIB_PROVIDER`=mysite overrides the top-level choice.
 
-Dependency-free TOML subset: blank lines, # comments, single-line double-quoted strings (escapes `\"`, `\\`, `\n`), signed decimal integers with underscore grouping, true/false. Only [skills] name keys and a custom provider's `vision` accept booleans; other keys use strings/positive integers and reject booleans by type. Accept only top-level provider/effort; model/base_url/context_window in built-in same-name sections; [codex] additionally transport = "sse"|"websocket", reasoning_summary = "off"|"auto", run_tool = "custom"|"function"; the [limits] keys below; [skills] switches; and `[providers.<id>]` protocol/base_url/model/context_window/api_key_env/vision (boolean). No arrays, general nested tables, multiline strings, or full TOML. Unknown/duplicate keys/sections and malformed syntax report path/line rather than silently ignoring.
+Dependency-free TOML subset: blank lines, # comments, single-line double-quoted strings (escapes `\"`, `\\`, `\n`), signed decimal integers with underscore grouping, true/false. Only [skills] name keys and a custom provider's `vision` accept booleans; other keys use strings/positive integers and reject booleans by type. Accept only top-level provider/effort; model/base_url/context_window in built-in same-name sections; [codex] additionally transport = "sse"|"websocket", reasoning_summary = "off"|"auto", run_tool = "custom"|"function"; the [limits] keys below; [skills] switches; [sandbox] `mode`/`writable`; and `[providers.<id>]` protocol/base_url/model/context_window/api_key_env/vision (boolean). Arrays only as single-line lists of strings, for `[sandbox].writable`. No general nested tables, multiline strings, or full TOML. Unknown/duplicate keys/sections and malformed syntax report path/line rather than silently ignoring.
 
 ## [skills]
 
 Skills default off. Keys are names; only true enables, false/absence disables. Enabled missing files stay outside the prompt index; `/status` shows missing. No environment/project switches.
 
 TUI `/skills` lists discoveries/switches; `/skills on <name>` and `/skills off <name>` save atomically, preserving other lines. New Sessions only; current/resumed Sessions retain original system. Format/directories/precedence: [skills.md](skills.md).
+
+## [sandbox]
+
+```toml
+[sandbox]
+mode = "workspace"          # or "off"; default workspace
+writable = ["~/data/shared"] # extra writable roots; absolute or ~/...
+```
+
+Writes are restricted by default; reads and network are not. bash (foreground and background), and every subagent Session, can write only to:
+
+- the project directory (first cwd ancestor containing `.git`, else cwd); for a linked git worktree also its gitdir and common dir;
+- `/tmp`, `/var/tmp`, `$TMPDIR`, `/dev/shm`, and `/dev/null`, `/dev/zero`, `/dev/full`, tty/pty devices (macOS: `/private/tmp`, `/private/var/tmp`, `/private/var/folders`, `/dev/fd`);
+- per-user build and package caches, when they exist: `~/.cache`, `~/.npm`, `~/.cargo`, `~/.rustup`, `~/go/pkg`, `~/.gradle`, `~/.m2`, `~/.bun`, `~/.yarn`, `~/.pnpm-store`, `~/.local/share/pnpm`, `~/.local/share/uv` (macOS also `~/Library/Caches`, `~/Library/Developer`), plus `$XDG_CACHE_HOME`, `$ZIG_GLOBAL_CACHE_DIR`, `$CARGO_HOME`, `$RUSTUP_HOME`, `$GOPATH/pkg`, `$GOCACHE`, `$GOMODCACHE`, `$GRADLE_USER_HOME`, `$npm_config_cache`, `$PIP_CACHE_DIR`, `$UV_CACHE_DIR`;
+- `writable` entries. Missing paths are skipped.
+
+`$NIB_HOME` is not in the list: nib itself writes it, commands cannot. Denied writes fail as ordinary `EACCES`/`EPERM`; nothing is added to tool results. The in-process edit/write tools apply the same roots by canonical path (symlinks and `..` resolved) and return an error.
+
+Linux uses Landlock (kernel 5.19+ with Landlock enabled, ABI 2+), applied in the bash child only. macOS uses `sandbox-exec` with a generated profile. If neither works, commands run unsandboxed, one dim notice appears per Session, the Session log records `sandbox_unavailable`, and `/status` shows `Sandbox: workspace · bash unavailable`. Edit/write checks still apply. Rationale: [ADR 0004](adr/0004-two-layer-isolation.md).
+
+`NIB_SANDBOX=off|workspace` overrides `mode`. Children inherit the effective mode and roots through stdin.
 
 ## [limits]
 
@@ -115,7 +136,7 @@ Configuration stores no secrets and accepts no API-key/token/password/credential
 Highest first:
 
 1. CLI `--effort <level>` (TUI startup and ask).
-2. Environment: `NIB_PROVIDER`, `NIB_MODEL`, `NIB_BASE_URL`, `NIB_CONTEXT_WINDOW`, `NIB_THINKING`, `NIB_REASONING_EFFORT`, `NIB_CODEX_TRANSPORT`, `NIB_CODEX_RUN_TOOL`, `NIB_REASONING_SUMMARY`, NIB_RUN_OUTPUT_BYTES.
+2. Environment: `NIB_PROVIDER`, `NIB_MODEL`, `NIB_BASE_URL`, `NIB_CONTEXT_WINDOW`, `NIB_THINKING`, `NIB_REASONING_EFFORT`, `NIB_CODEX_TRANSPORT`, `NIB_CODEX_RUN_TOOL`, `NIB_REASONING_SUMMARY`, NIB_RUN_OUTPUT_BYTES, `NIB_SANDBOX`.
 3. `$NIB_HOME/config.toml`。
 4. Built-in defaults.
 
@@ -134,6 +155,7 @@ Children inherit effective provider/model/limits through anonymous stdin, skippi
 | `NIB_CODEX_TRANSPORT` | websocket (default) or sse; overrides [codex].transport; Session SSE fallback after handshake/protocol failure; [transport](codex.md#responses-websocket-transport) |
 | `NIB_CODEX_RUN_TOOL` | custom (default, direct JS) or function (JSON code/effort); overrides `[codex].run_tool`, preserving history types; Chat Completions always function |
 | `NIB_REASONING_SUMMARY` | off (default, omit summary) or auto; overrides `[codex].reasoning_summary`, preserving effort/encrypted continuation |
+| `NIB_SANDBOX` | workspace (default) or off; overrides `[sandbox].mode`; [details](#sandbox) |
 | `NIB_RUN_OUTPUT_BYTES` | Model display bytes, 16384–16777216; overrides `[limits].run_output_bytes`, default 16384; JS data/console capture unchanged |
 | `NIB_MODEL` | Current provider model |
 | `NIB_CONTEXT_WINDOW` | Context tokens; DeepSeek default 1000000 |

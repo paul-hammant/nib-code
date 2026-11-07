@@ -85,8 +85,11 @@ fn execute(t: *Tools, gpa: std.mem.Allocator, command: []const u8, timeout_ms: i
     defer gpa.free(script);
 
     t.recovery.noteBash(t.io);
+    var launch: std.heap.ArenaAllocator = .init(gpa);
+    defer launch.deinit();
+    const argv = try t.sandboxedArgv(launch.allocator(), &.{ "bash", "-c", script });
     const executed = process.run(gpa, t.io, .{ .spawn = .{
-        .argv = &.{ "bash", "-c", script },
+        .argv = argv,
         .environ_map = t.environ,
         .stdin = .ignore,
         .stdout = .pipe,

@@ -36,6 +36,7 @@ pub const TaskStop = struct { id: []const u8, reason: []const u8, stopped: bool 
 pub const Record = struct {
     skills: ?@import("skills.zig").Summary = null,
     task_stop: ?TaskStop = null,
+    sandbox_unavailable: ?[]const u8 = null,
     at: ?i64 = null,
     diagnostic: ?Diagnostic = null,
     agent_session: ?AgentSession = null,
@@ -159,6 +160,12 @@ pub const Log = struct {
         log.mutex.lockUncancelable(io);
         defer log.mutex.unlock(io);
         try log.append(io, a, .{ .bash = event });
+    }
+
+    pub fn sandboxUnavailable(log: *Log, io: std.Io, a: std.mem.Allocator, reason: []const u8) !void {
+        log.mutex.lockUncancelable(io);
+        defer log.mutex.unlock(io);
+        try log.append(io, a, .{ .sandbox_unavailable = reason });
     }
 
     pub fn taskStop(log: *Log, io: std.Io, a: std.mem.Allocator, event: TaskStop) !void {
@@ -371,7 +378,7 @@ pub fn replay(gpa: std.mem.Allocator, a: std.mem.Allocator, data: []const u8, hi
             try restoreId(event.id, &next_agent_id, &next_bash_id, &next_run_id);
             continue;
         }
-        if (r.task_stop != null) continue;
+        if (r.task_stop != null or r.sandbox_unavailable != null) continue;
         if (r.diagnostic != null or (r.transport_fallback != null and r.messages.len == 0)) continue;
         if (r.from > history.items.len) return error.InvalidSessionLog;
         try history.ensureTotalCapacity(gpa, r.from + r.messages.len);

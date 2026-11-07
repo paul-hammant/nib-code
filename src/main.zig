@@ -33,6 +33,13 @@ pub fn main(init: std.process.Init) void {
 
 fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer, json: bool, detail: *?[]u8, failure: *JsonEvent.Failure) !void {
     const gpa = init.gpa;
+    if (args.len > 1 and std.mem.eql(u8, args[1], @import("tools/bash/jail.zig").helper_command)) {
+        @import("tools/bash/jail.zig").helper(init.io, args[2..]) catch |err| {
+            std.debug.print("nib: sandbox: {s}\n", .{@errorName(err)});
+            std.process.exit(126);
+        };
+        std.process.exit(126);
+    }
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try stdout.writeAll(help);

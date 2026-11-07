@@ -131,6 +131,7 @@ fn loadMain(a: Allocator, data: []const u8) ![]Run {
         if (record.object.get("background")) |b| if (b != .null) continue;
         if (record.object.get("bash")) |b| if (b != .null) continue;
         if (record.object.get("task_stop")) |stop| if (stop != .null) continue;
+        if (record.object.get("sandbox_unavailable")) |reason| if (reason != .null) continue;
         const messages: []const Value = if (record.object.get("messages")) |v| try array(v) else &.{};
         if (messages.len == 0 and (try optionalString(record, "transport_fallback")) != null) continue;
         const from = if (record.object.get("from")) |v| try natural(v) else 0;

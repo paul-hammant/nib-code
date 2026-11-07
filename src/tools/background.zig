@@ -563,7 +563,7 @@ test "background starts share per-kind foreground counters and leave terminal pr
     defer log.close(testing.io);
     var inbox: Inbox = .{};
     defer inbox.batch.deinit(testing.allocator);
-    var t: Tools = .{ .io = testing.io, .home = "/home/nobody", .cfg = .{ .model = "m", .base_url = "", .api_key = "" } };
+    var t: Tools = .{ .io = testing.io, .home = "/home/nobody", .cfg = .{ .model = "m", .base_url = "", .api_key = "", .sandbox = .{ .mode = .off } } };
     defer t.progress.deinit(testing.allocator);
     defer t.agent_sessions.deinit(testing.allocator);
     defer t.background.stop(testing.allocator);
