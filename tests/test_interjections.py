@@ -200,6 +200,14 @@ def fixture(tmp, replies, config=None, provider="chat_completions", environment=
             thread.join()
 
 
+def wait_queued(terminal, *texts):
+    # Interjections typed in one write reach the TUI one Enter at a time; release only after all are queued.
+    def all_queued():
+        lines = screen(terminal.read(), 120, 32)
+        return all(any(line.rstrip().endswith(f"{text} · queued") for line in lines) for text in texts)
+    wait_for(all_queued, "queued: " + ", ".join(texts))
+
+
 def run_code(tmp):
     started, release = tmp / "run-started", tmp / "run-release"
     command = f"touch {shlex.quote(str(started))}; while [ ! -f {shlex.quote(str(release))} ]; do sleep 0.02; done; echo run-result"
@@ -217,8 +225,7 @@ def test_during_run_and_resume(tmp):
         terminal.send("initial\r")
         wait_for(started.exists, "Run started")
         terminal.send("interjection one\rinterjection two\r")
-        wait_for(lambda: any("interjection two" in row and "queued" in row
-                             for row in screen(terminal.read(), 120, 32)), "both interjections queued")
+        wait_queued(terminal, "interjection one", "interjection two")
         assert not second.received.is_set(), "must not interrupt the Run"
         release.touch()
         assert second.received.wait(5)
@@ -265,7 +272,7 @@ def test_after_final_step(tmp):
         terminal.send("initial\r")
         assert first.received.wait(5)
         terminal.send("next one\rnext two\r")
-        terminal.until(b"queued")
+        wait_queued(terminal, "next one", "next two")
         assert not second.received.is_set(), "must not interrupt the model request"
         first.release.set()
         assert second.received.wait(5)
@@ -282,7 +289,7 @@ def test_escape_restores_draft(tmp):
         terminal.send("initial\r")
         wait_for(started.exists, "Run started")
         terminal.send("queued one\rqueued two\runsubmitted draft")
-        terminal.until(b"queued")
+        wait_queued(terminal, "queued one", "queued two")
         terminal.send("\x1b")
         terminal.until(b"Canceled")
         assert not second.received.is_set(), "Esc must not automatically resend"
