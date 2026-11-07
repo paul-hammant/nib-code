@@ -20,7 +20,7 @@
     ]
   },
   "footprint": [
-    {"name": "nib", "version": "0.5.0 (release, static)", "install": "5 MB", "idle_rss_mb": 3.8, "ten_rss_mb": 38, "prompt_tokens_approx": "2.2k", "prompt_tokens": 2190},
+    {"name": "nib", "version": "0.9.0 (release, static)", "install": "6 MB", "idle_rss_mb": 4.8, "ten_rss_mb": 47, "prompt_tokens_approx": "2.3k", "prompt_tokens": 2264},
     {"name": "pi (clean)", "short": "pi", "version": "1.4.0", "install": "108 MB + Node (121 MB)", "idle_rss_mb": 124, "ten_rss_mb": 1134, "prompt_tokens_approx": "1.3k", "prompt_tokens": 1282},
     {"name": "pi (everyday extensions)", "short": "pi + extensions", "version": "1.4.0", "install": "620 MB + Node", "idle_rss_mb": 358, "ten_rss_mb": 1984, "prompt_tokens_approx": "2.4k", "prompt_tokens": 2417},
     {"name": "Codex CLI", "short": "Codex", "version": "0.166.0", "install": "305 MB", "idle_rss_mb": 275, "ten_rss_mb": 1164, "prompt_tokens_approx": "10.3k", "prompt_tokens": 10260},

@@ -4,7 +4,7 @@
 
 | Agent | Version | Installed size | Idle RSS | Total RSS of 10 idle instances | Fixed prompt per request, ≈tokens |
 | --- | --- | ---: | ---: | ---: | ---: |
-| nib | 0.5.0 (release, static) | 5 MB | 3.8 MB | 38 MB | 2.2k |
+| nib | 0.9.0 (release, static) | 6 MB | 4.8 MB | 47 MB | 2.3k |
 | pi (clean) | 1.4.0 | 108 MB + Node (121 MB) | 124 MB | 1,134 MB | 1.3k |
 | pi (everyday extensions) | 1.4.0 | 620 MB + Node | 358 MB | 1,984 MB | 2.4k |
 | Codex CLI | 0.166.0 | 305 MB | 275 MB | 1,164 MB | 10.3k |
@@ -12,13 +12,13 @@
 | prime-agent | 0.10.2 | 63 MB + Python worker | 335 MB | 1,460 MB | 8.9k |
 | dsh | dst TUI 0.16.1 | 141 MB + Node | 544 MB | 5,459 MB | 6.2k |
 
-*Measured locally in November 2026, idle TUI, no model requests; fixed prompts include system and tool definitions.*
+*Measured locally in November 2026, idle TUI in a 140×40 terminal, no model requests; fixed prompts include system and tool definitions. nib re-measured at 0.9.0 under the same conditions (0.5.0 reproduces 3.8 MB / 38 MB there).*
 
 ### Fixed prompt per request
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/bench-prompt-dark.svg">
-  <img src="assets/bench-prompt-light.svg" alt="Fixed prompt tokens per request, ascending: pi clean 1,282; nib 2,190; pi with everyday extensions 2,417; dsh 6,236; prime-agent 8,891; Codex CLI 10,260; Claude Code 11,275." width="880">
+  <img src="assets/bench-prompt-light.svg" alt="Fixed prompt tokens per request, ascending: pi clean 1,282; nib 2,264; pi with everyday extensions 2,417; dsh 6,236; prime-agent 8,891; Codex CLI 10,260; Claude Code 11,275." width="880">
 </picture>
 
 *November 2026, system + tool definitions, in tokens.*

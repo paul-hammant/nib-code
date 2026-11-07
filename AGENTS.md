@@ -18,7 +18,7 @@ A coding agent written in Zig 0.17, with command name `nib`.
 
 - Test only the code you change locally: matching unit tests through `zig build test` (use filters if supported) and 1–3 related e2e scripts. GitHub Actions runs unit tests on Linux/macOS and the full e2e suite on Linux (portable scripts also on macOS) on every push, pull request, or manual dispatch: push a feature branch (`feat/…`, `fix/…`, `docs/…`, `ci/…`), wait for CI to pass before merging to main, and delete the remote branch after merging. Use the parallel local runner only when CI is unavailable.
 - Pushing feature branches is allowed. Pushing or merging to main, tags/releases, editing GitHub releases, and closing or merging PRs require the maintainer's explicit approval.
-- Everything published on GitHub is English: docs, ADRs, release notes, comments, and prompts. `README.zh-CN.md` is the only Chinese file.
+- Everything published on GitHub is English: docs, ADRs, comments, and prompts. Two exceptions: `README.zh-CN.md`, and release notes (`docs/releases/<version>.md`, from 0.9.0), which carry English first, then `---` and the same notes in Chinese.
 - Never tune nib for benchmark tasks. Judge speed against other agents using the same model, effort, and service tier.
 
 ## References as needed
