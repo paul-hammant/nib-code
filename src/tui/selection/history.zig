@@ -74,7 +74,7 @@ pub const History = struct {
                     wrote_row = true;
                     const first = if (i == range.first.entry and row + r == range.first.row) range.first.col else 0;
                     const last = if (i == range.last.entry and row + r == range.last.row) range.last.col else screen.width -| 1;
-                    try appendRow(&out, gpa, &screen, @intCast(r), if (entry.simple) @max(first, @as(u16, @intCast(body.x_off))) else first, if (entry.simple) @min(last, @as(u16, @intCast(body.x_off)) + body.width -| 1) else last);
+                    try appendRow(&out, gpa, &screen, @intCast(r), first, last);
                 }
                 row += count;
             }

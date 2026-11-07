@@ -25,8 +25,10 @@ Hooks: successful commands are silent. After-edit failure adds one warning-color
 
 `/simple` or Ctrl+S toggles a persisted reading mode without a notice, including during a Turn. Normal mode is the default. Kitty binds Ctrl+Shift+S to paste-from-selection by default; use Ctrl+S there. Ctrl+Shift+S also toggles Simple mode when delivered distinctly by the terminal. Raw mode disables IXON so Ctrl+S does not freeze output. `/help` lists `Ctrl+S simple mode`.
 
-Simple mode hides Turn footers and bottom-border metadata; `/status` retains all details. A dim full-width `─` separator replaces the input box, with `›` before the input, no placeholder, and exactly one blank row below. At 80% context usage, a single dim `context N%` appears right-aligned on the separator. The signed-out hint, activity, menus, provider flows, notices, errors and warnings remain available.
+Simple mode hides Turn footers; `/status` retains all details. Width, margins, turn spacing and the bordered input box match Normal mode, including exactly one blank row below the box. The input has no placeholder. Its bottom border is plain, except at 80% context usage or above: a dim ` context N% ` is right-aligned inside the corners.
 
-Above 110 columns, the reading column is 100 columns wide and centered; narrower terminals use full width. An extra blank row separates turns. Collapsed Runs use one title line: successful Runs carry no mark (success is silent); failures and warnings keep their red ✗ / yellow ! marks; running Runs keep their live text. Running agent trees remain visible to preserve progress. Opening retains normal summaries and details. User shading and Markdown are unchanged.
+The signed-out hint, activity, menus, provider flows, notices, errors and warnings remain available.
+
+Collapsed Runs use one title line: successful Runs carry no mark (success is silent); failures and warnings keep their red ✗ / yellow ! marks; running Runs keep their live text. Running agent trees remain visible to preserve progress. Opening retains normal summaries and details. User shading and Markdown are unchanged.
 
 Hover shifts each reported background RGB channel by +18 on dark backgrounds or −18 on light backgrounds (saturated). Without a background report, a reported dark scheme uses RGB 18/18/18 and light uses 237/237/237. Without either report, hover adds no background. This neutral shade stays restrained beside the blue user-message tint.

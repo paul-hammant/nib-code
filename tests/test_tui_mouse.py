@@ -1,6 +1,10 @@
 """Mouse selection, scrolling and user cards through a PTY. Run after zig build."""
 import base64
 import contextlib
+import fcntl
+import signal
+import struct
+import termios
 import os
 from pathlib import Path
 import re
@@ -98,33 +102,44 @@ def test_click_and_ctrl_o_open_single_runs(tmp):
 
 
 def test_simple_mode(tmp):
-    replies = [Reply("working", code="/* simple-script */ await tools.bash({command: 'echo done'}); 'done'"), Reply("simple-done")]
+    replies = [Reply("working", code="/* simple-script */ await tools.bash({command: 'echo done'}); 'done'"), Reply("simple-done"), Reply("second-done")]
     with fixture(tmp, replies) as (terminal, home, env):
         terminal.send("check\r")
         terminal.wait_turn("simple-done")
 
-        def view():
-            return "\n".join(screen(terminal.read(), 120, 32))
+        terminal.send("again\r")
+        terminal.wait_turn("second-done")
+        fcntl.ioctl(terminal.master, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 160, 0, 0))
+        os.kill(terminal.child.pid, signal.SIGWINCH)
 
+        def view():
+            return "\n".join(screen(terminal.read(), 160, 40))
+
+        wait_for(lambda: "╭" + "─" * 158 + "╮" in view(), "resized normal frame")
         wait_for(lambda: "tokens" in view(), "normal Turn footer")
         terminal.send("\x13")
         wait_for(lambda: (home / "config.toml").exists() and 'ui = "simple"' in (home / "config.toml").read_text(), "Ctrl+S persistence")
-        wait_for(lambda: "╭" not in view(), "Simple input rule")
+        wait_for(lambda: "Ask about" not in view() and "tokens" not in view(), "Simple framed input")
+        lines = view().split("\n")
+        assert lines[36] == "╭" + "─" * 158 + "╮", view()
+        assert lines[37] == "│" + " " * 158 + "│", view()
+        assert lines[38] == "╰" + "─" * 158 + "╯" and lines[39] == "", view()
+        assert lines[0] == " ▎ › check", view()
         assert "tokens" not in view() and "mock" not in view(), view()
         row = next(i for i, line in enumerate(view().split("\n")) if "Run" in line)
         terminal.send(mouse(0, 15, row) + mouse(0, 15, row, release=True))
-        wait_for(lambda: "simple-script" in view(), "centered Run opens by click")
+        wait_for(lambda: "simple-script" in view(), "Run opens by click")
         terminal.send("/simple\r")
-        wait_for(lambda: "╭" in view(), "command returns to normal")
+        wait_for(lambda: "Ask about" in view(), "command returns to normal")
         terminal.send("\x13")
-        wait_for(lambda: "╭" not in view(), "key returns to Simple")
+        wait_for(lambda: "Ask about" not in view(), "key returns to Simple")
         terminal.close()
         with patch.object(Terminal, "until", lambda *args, **kwargs: None):
             restarted = Terminal(tmp, env)
         try:
-            restarted.until("─".encode())
+            restarted.until("╭".encode())
             restored = "\n".join(screen(restarted.read(), 120, 32))
-            assert "╭" not in restored and "Ask about" not in restored, restored
+            assert "╭" in restored and "Ask about" not in restored, restored
         finally:
             restarted.close()
 

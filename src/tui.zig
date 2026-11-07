@@ -133,6 +133,8 @@ pub fn run(init: std.process.Init, session: *Session) !void {
     defer vx.deinit(gpa, w);
 
     var loop: vaxis.Loop(Event) = .init(io, &tty, &vx);
+    try loop.installResizeHandler();
+    defer loop.uninstallResizeHandler();
     try loop.start();
     defer loop.stop();
     defer session.finishHooks();
