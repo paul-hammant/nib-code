@@ -49,8 +49,8 @@ fn execute(t: *tools.Tools, gpa: std.mem.Allocator, args: []const u8, schema: bo
 
 fn mapContent(t: *tools.Tools, gpa: std.mem.Allocator, a: std.mem.Allocator, out: *std.ArrayList(u8), content: V) !void {
     if (content != .array) return;
-    for (content.array.items) |item| {
-        if (out.items.len > 0) try out.append(a, '\n');
+    for (content.array.items, 0..) |item, i| {
+        if (i > 0) try out.append(a, '\n');
         const kind = string(field(item, "type")) orelse "unknown";
         if (std.mem.eql(u8, kind, "text")) {
             try out.appendSlice(a, string(field(item, "text")) orelse "");
@@ -94,4 +94,8 @@ test "MCP content text and nonvision images keep full text" {
     var out: std.ArrayList(u8) = .empty;
     try mapContent(&t, std.testing.allocator, a, &out, content);
     try std.testing.expectEqualStrings("hello\n[image omitted]\n[audio omitted]", out.items);
+    const empty = try std.json.parseFromSliceLeaky(V, a, "[{\"type\":\"text\",\"text\":\"\"},{\"type\":\"text\",\"text\":\"next\"},{\"type\":\"text\",\"text\":\"\"}]", .{});
+    out = .empty;
+    try mapContent(&t, std.testing.allocator, a, &out, empty);
+    try std.testing.expectEqualStrings("\nnext\n", out.items);
 }

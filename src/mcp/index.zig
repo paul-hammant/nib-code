@@ -70,7 +70,7 @@ pub fn append(a: A, out: *std.ArrayList(u8), id: []const u8, tools: []const V) !
         const end = for (description, 0..) |c, i| {
             if (std.mem.indexOfScalar(u8, ".!?", c) != null and (i + 1 == description.len or std.ascii.isWhitespace(description[i + 1]))) break i + 1;
         } else description.len;
-        try out.print(a, "{s}.{s}({s}) — {s}\n", .{ id, try compact(a, name, 80), try signature(a, field(tool, "inputSchema")), try compact(a, description[0..end], max_description) });
+        try out.print(a, "{s}.{s}({s}) — {s}\n", .{ id, try compact(a, name, name.len), try signature(a, field(tool, "inputSchema")), try compact(a, description[0..end], max_description) });
     }
     if (tools.len > max_tools) try out.print(a, "{s}: {d} tools omitted; use tools.mcp_schema(\"server.tool\") for full schemas.\n", .{ id, tools.len - max_tools });
 }
@@ -96,4 +96,9 @@ test "index caps tools and descriptions" {
     try append(a, &out, "docs", tools);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "3 tools omitted") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "Second sentence") == null);
+    const long_name = "search_search_search_search_search_search_search_search_search_search_search_search_search_search_search_search_";
+    const named = try @import("../mcp.zig").value(a, .{ .name = long_name, .inputSchema = V{ .object = .empty } });
+    out = .empty;
+    try append(a, &out, "docs", &.{named});
+    try std.testing.expect(std.mem.indexOf(u8, out.items, long_name) != null);
 }
