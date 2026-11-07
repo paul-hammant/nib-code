@@ -59,7 +59,7 @@ pub fn fetch(a: std.mem.Allocator, client: *std.http.Client, base_url: []const u
         .extra_headers = if (anthropic) (if (key.len > 0) headers[0..] else headers[0..1]) else headers[0..1],
         .response_writer = &response.writer,
     });
-    const status = @intFromEnum(result.status);
+    const status = @backingInt(result.status);
     if (status < 200 or status >= 300) return error.ModelListRejected;
     return parse(a, response.written());
 }

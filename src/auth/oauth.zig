@@ -176,7 +176,7 @@ pub fn post(a: std.mem.Allocator, client: *std.http.Client, url: []const u8, con
         .extra_headers = &.{.{ .name = "accept", .value = "application/json" }},
         .response_writer = &response.writer,
     });
-    return .{ .status = @intFromEnum(result.status), .body = response.written() };
+    return .{ .status = @backingInt(result.status), .body = response.written() };
 }
 
 fn tokenUrl(a: std.mem.Allocator, issuer: []const u8) ![]u8 {

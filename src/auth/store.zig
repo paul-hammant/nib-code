@@ -176,12 +176,12 @@ test "store round trip keeps unknown fields, mode 0600 and removes cleanly" {
     try testing.expect(!again.removeKey("anthropic"));
     try again.save(testing.io, testing.allocator, p);
     const stat = try std.Io.Dir.cwd().statFile(testing.io, p, .{});
-    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(@intFromEnum(stat.permissions) & 0o777)));
+    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(@backingInt(stat.permissions) & 0o777)));
     try tmp.dir.setFilePermissions(testing.io, "nib/auth.json", .fromMode(0o644), .{});
     try again.save(testing.io, testing.allocator, p);
-    try testing.expectEqual(@as(u32, 0o644), @as(u32, @intCast(@intFromEnum((try std.Io.Dir.cwd().statFile(testing.io, p, .{})).permissions) & 0o777)));
+    try testing.expectEqual(@as(u32, 0o644), @as(u32, @intCast(@backingInt((try std.Io.Dir.cwd().statFile(testing.io, p, .{})).permissions) & 0o777)));
     try again.saveSecret(testing.io, testing.allocator, p);
-    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(@intFromEnum((try std.Io.Dir.cwd().statFile(testing.io, p, .{})).permissions) & 0o777)));
+    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(@backingInt((try std.Io.Dir.cwd().statFile(testing.io, p, .{})).permissions) & 0o777)));
     var third: Doc = try .load(testing.allocator, testing.io, p);
     defer third.deinit();
     try testing.expectEqualStrings("acc", third.tokens().?.account_id);

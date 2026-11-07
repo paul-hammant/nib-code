@@ -115,6 +115,23 @@ def test_key_entry_and_model_list(tmp):
         mock.close()
 
 
+def test_child_agent_uses_stored_key(tmp):
+    tmp.mkdir()
+    home = tmp / "home"
+    (home / "nib").mkdir(parents=True)
+    mock = Mock("responses", custom_run=True)
+    (home / "nib" / "config.toml").write_text(f'provider = "openai"\n[openai]\nbase_url = "{mock.url}"\n')
+    (home / "nib" / "auth.json").write_text(json.dumps({"keys": {"openai": mock.key}}))
+    try:
+        result = subprocess.run([str(BIN), "ask", "delegate"], cwd=tmp, env=base_env(home), capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result
+        assert "child answer" in result.stdout + result.stderr or any("child" in json.dumps(r[2]) for r in mock.requests), result
+        assert len(mock.requests) >= 3 and not mock.errors, mock.errors
+        assert mock.key not in result.stdout + result.stderr
+    finally:
+        mock.close()
+
+
 def test_add_endpoint(tmp):
     tmp.mkdir()
     home = tmp / "home"

@@ -118,11 +118,11 @@ pub fn addEndpoint(a: Allocator, io: std.Io, home_path: []const u8, endpoint: En
     if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') try out.appendSlice(a, newline);
     if (out.items.len > 0) try out.appendSlice(a, newline);
     try out.print(a, "[providers.{s}]{s}protocol = \"{s}\"{s}base_url = {f}{s}model = {f}{s}context_window = {d}{s}", .{
-        endpoint.id,                             newline,
-        @tagName(endpoint.protocol),             newline,
-        std.json.fmt(endpoint.base_url, .{}),    newline,
-        std.json.fmt(endpoint.model, .{}),       newline,
-        endpoint.context_window,                 newline,
+        endpoint.id,                          newline,
+        @tagName(endpoint.protocol),          newline,
+        std.json.fmt(endpoint.base_url, .{}), newline,
+        std.json.fmt(endpoint.model, .{}),    newline,
+        endpoint.context_window,              newline,
     });
     var detail: ?[]u8 = null;
     _ = try parse(a, a, out.items, path, &detail);

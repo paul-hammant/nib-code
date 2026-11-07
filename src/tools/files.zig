@@ -284,6 +284,37 @@ test "credential file tools deny default custom and symlink paths" {
     try testing.expectEqualStrings("fictional-custom", data);
 }
 
+test "file tools refuse nib's own credential store" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "nibhome");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "nibhome/auth.json", .data = "{\"keys\":{\"x\":\"fictional-stored\"}}" });
+    try tmp.dir.symLink(testing.io, "nibhome/auth.json", "alias", .{});
+    const root = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer testing.allocator.free(root);
+    const data_home = try std.fs.path.join(testing.allocator, &.{ root, "nibhome" });
+    defer testing.allocator.free(data_home);
+    var t: Tools = .{ .io = testing.io, .home = root, .data_home = data_home };
+    for ([_][]const u8{ "nibhome/auth.json", "alias" }) |relative| {
+        const path = try std.fs.path.join(testing.allocator, &.{ root, relative });
+        defer testing.allocator.free(path);
+        const args = try std.json.Stringify.valueAlloc(testing.allocator, .{ .path = path, .old_text = "fictional", .new_text = "changed", .content = "changed" }, .{});
+        defer testing.allocator.free(args);
+        for ([_][]const u8{ "read", "edit", "write" }) |name| {
+            const result = Tools.call(&t, testing.allocator, name, args);
+            defer freeResult(result);
+            try testing.expectEqualStrings("CredentialAccessDenied", result.err);
+        }
+    }
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var found = false;
+    for (try t.credentialPaths(arena.allocator())) |path| {
+        if (std.mem.endsWith(u8, path, "nibhome/auth.json")) found = true;
+    }
+    try testing.expect(found);
+}
+
 test "read and write round trip more than 16 KiB inside JS" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
