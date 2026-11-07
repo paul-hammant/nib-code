@@ -28,25 +28,26 @@ pub fn drawFrame(outer: vaxis.Window, entries: []Entry, input: *Editor, scroll: 
     if (win.height == 0 or win.width == 0) return null;
 
     const framed = win.height >= 6 and win.width >= 8;
-    const bottom_space: u16 = @intFromBool(framed and win.height >= 8);
+    const status_fixed = framed and win.height >= 8;
     const borders: u16 = if (framed) 2 else 0;
     const x: u16 = if (framed) 2 else @min(3, win.width - 1);
     const input_w = win.width - x - @as(u16, if (framed) 2 else 0);
     const input_h = @min(input.rows(win.child(.{ .width = input_w })), @max(1, win.height / 3));
     const saved_scroll = scroll.*;
-    var activity_h = activityHeight(s.busy != null or s.background_count > 0 or s.notice != null or s.hint.len > 0 or scroll.top != null or scroll.pending < 0, win.height - input_h - borders - bottom_space, win.height);
-    const menu_layout = menuLayout(menu, menu_sel, @min(max_menu_rows, (win.height - input_h - borders - bottom_space - activity_h) / 2));
+    const above_input = win.height - input_h - borders;
+    var activity_h = statusHeight(status_fixed, s.busy != null or s.background_count > 0 or s.notice != null or s.hint.len > 0 or scroll.top != null or scroll.pending < 0, above_input);
+    const menu_layout = menuLayout(menu, menu_sel, @min(max_menu_rows, (above_input - activity_h) / 2));
     const menu_h = menu_layout.rows;
-    var body_h = win.height - input_h - borders - bottom_space - menu_h - activity_h;
+    var body_h = above_input - menu_h - activity_h;
     var body = win.child(.{ .x_off = @min(1, win.width - 1), .width = @max(1, win.width -| 2), .height = body_h });
     var top = scroll.layout(entries, body);
     scroll.observe(s.revision, saved_scroll.top != null);
     var activity_status = s;
     activity_status.new_output = scroll.new_output;
-    const actual_h = activityHeight(text.formatWidth(activity_status, scroll.top != null, win.width -| 2).len > 0, win.height - input_h - borders - bottom_space - menu_h, win.height);
+    const actual_h = statusHeight(status_fixed, text.formatWidth(activity_status, scroll.top != null, win.width -| 2).len > 0, above_input - menu_h);
     if (actual_h != activity_h) {
         activity_h = actual_h;
-        body_h = win.height - input_h - borders - bottom_space - menu_h - activity_h;
+        body_h = above_input - menu_h - activity_h;
         body.height = body_h;
         scroll.* = saved_scroll;
         top = scroll.layout(entries, body);
@@ -78,7 +79,7 @@ pub fn drawFrame(outer: vaxis.Window, entries: []Entry, input: *Editor, scroll: 
     }
 
     if (activity_h > 0) {
-        _ = win.child(.{ .x_off = 1, .y_off = body_h + activity_h - 1, .height = 1 }).printSegment(.{ .text = text.formatWidth(activity_status, scroll.top != null, win.width -| 2), .style = s.activityStyle() }, .{ .wrap = .none });
+        _ = win.child(.{ .x_off = 1, .y_off = body_h, .height = 1 }).printSegment(.{ .text = text.formatWidth(activity_status, scroll.top != null, win.width -| 2), .style = s.activityStyle() }, .{ .wrap = .none });
     }
     var menu_y = body_h + activity_h;
     for (menu_layout.first..menu_layout.end) |i| {
@@ -108,11 +109,16 @@ pub fn drawFrame(outer: vaxis.Window, entries: []Entry, input: *Editor, scroll: 
             if (percent >= 80) {
                 const label = std.fmt.bufPrint(&text.status, " context {d}% ", .{percent}) catch "";
                 const w = win.gwidth(label);
-                if (w <= win.width - 2) _ = win.child(.{ .x_off = win.width - 1 - w, .y_off = input_y + input_h + 1, .height = 1, .width = w }).printSegment(.{ .text = label, .style = .{ .dim = true } }, .{ .wrap = .none });
+                if (w <= win.width - 2) _ = win.child(.{ .x_off = win.width - 1 - w, .y_off = input_y, .height = 1, .width = w }).printSegment(.{ .text = label, .style = .{ .dim = true } }, .{ .wrap = .none });
             }
         } else {
-            put(win, 2, input_y + input_h + 1, " ");
-            _ = win.child(.{ .x_off = 3, .y_off = input_y + input_h + 1, .width = win.width - 6, .height = 1 }).printSegment(.{ .text = text.footer(s, win.width - 6), .style = .{ .dim = true } }, .{ .wrap = .none });
+            const meta = text.footer(s, win.width - 7);
+            if (meta.len > 0) {
+                const meta_w = win.gwidth(meta);
+                put(win, 2, input_y + input_h + 1, " ");
+                _ = win.child(.{ .x_off = 3, .y_off = input_y + input_h + 1, .width = meta_w, .height = 1 }).printSegment(.{ .text = meta, .style = .{ .dim = true } }, .{ .wrap = .none });
+                put(win, 3 + meta_w, input_y + input_h + 1, " ");
+            }
         }
     } else if (win.width >= 3) {
         _ = win.child(.{ .x_off = 1, .y_off = input_y, .height = 1 }).printSegment(.{ .text = "› ", .style = .{ .fg = .{ .index = 4 } } }, .{ .wrap = .none });
@@ -124,9 +130,10 @@ pub fn drawFrame(outer: vaxis.Window, entries: []Entry, input: *Editor, scroll: 
     return .{ .top = top, .window = body };
 }
 
-fn activityHeight(visible: bool, available: u16, terminal_height: u16) u16 {
-    if (!visible or available == 0) return 0;
-    return if (terminal_height >= 10 and available >= 4) 2 else 1;
+/// Framed terminals of 8+ rows always reserve one status row so the input never moves; smaller ones reserve it only while it has text.
+fn statusHeight(fixed: bool, visible: bool, available: u16) u16 {
+    if (available == 0) return 0;
+    return @intFromBool(fixed or visible);
 }
 
 const MenuLayout = struct { first: usize = 0, end: usize = 0, rows: u16 = 0 };
@@ -231,9 +238,9 @@ test "draw keeps scrolled body fixed while output arrives and caps input height"
     input.cursor = input.buf.items.len;
     draw(win, t.entries.items, &input, &view, &.{}, 0, busy, &text);
     try testing.expectEqual(@as(u16, 9), input.top_row);
-    try testing.expectEqual(@as(u16, 21), screen.cursor.row);
+    try testing.expectEqual(@as(u16, 22), screen.cursor.row);
     try testing.expect(screen.cursor_vis);
-    try testing.expectEqualStrings("i", screen.readCell(2, 14).?.char.grapheme);
+    try testing.expectEqualStrings("i", screen.readCell(2, 15).?.char.grapheme);
 }
 
 fn snapshot(gpa: std.mem.Allocator, screen: *const vaxis.Screen) ![]u8 {
@@ -285,17 +292,14 @@ test "layout snapshots: normal, short, tiny, narrow, menu, busy and history" {
         const candidates = [_]commands.Candidate{.{ .command = .help, .label = "/help", .detail = "show help" }};
         draw(win, t.entries.items, &input, &viewport, if (c.menu) &candidates else &.{}, 0, .{ .cfg = mock_cfg, .busy = if (c.busy) .{ .phase = .thinking, .ms = 1200 } else null, .notice = if (c.notice) "copied 3 chars" else null }, &text);
         try testing.expect(screen.cursor_vis);
-        try testing.expectEqual(@as(u16, if (c.h >= 8) c.h - 3 else if (c.h >= 6) c.h - 2 else c.h - 1), screen.cursor.row);
+        try testing.expectEqual(@as(u16, if (c.h >= 6) c.h - 2 else c.h - 1), screen.cursor.row);
         const image = try snapshot(gpa, &screen);
         defer gpa.free(image);
         try images.print(gpa, "--- {s} {d}x{d} ---\n{s}", .{ c.name, c.w, c.h, image });
         if (testing.environ.getPosix("NIB_TUI_SNAPSHOTS") != null) std.debug.print("\n--- {s} {d}x{d} ---\n{s}", .{ c.name, c.w, c.h, image });
-        if (c.h >= 8) for (0..c.w) |col| {
-            try testing.expectEqualStrings(" ", screen.readCell(@intCast(col), c.h - 1).?.char.grapheme);
-        };
         if (c.h >= 6) {
-            try testing.expectEqualStrings("╰", screen.readCell(0, if (c.h >= 8) c.h - 2 else c.h - 1).?.char.grapheme);
-            try testing.expectEqualStrings("╯", screen.readCell(c.w - 1, if (c.h >= 8) c.h - 2 else c.h - 1).?.char.grapheme);
+            try testing.expectEqualStrings("╰", screen.readCell(0, c.h - 1).?.char.grapheme);
+            try testing.expectEqualStrings("╯", screen.readCell(c.w - 1, c.h - 1).?.char.grapheme);
         } else try testing.expect(std.mem.indexOf(u8, image, "› Ask about this project · / for commands") != null);
         if (c.busy) try testing.expect(std.mem.indexOf(u8, image, "Waiting for model · turn <1s") != null);
 
@@ -305,9 +309,9 @@ test "layout snapshots: normal, short, tiny, narrow, menu, busy and history" {
     try testing.expectEqualStrings(@embedFile("layout_snapshots.txt"), images.items);
 }
 
-test "activity has breathing room at 60, 120 and 160 columns without wasting short terminals" {
+test "status row is reserved so the input box never moves" {
     const gpa = testing.allocator;
-    for ([_]u16{ 60, 120, 160 }) |width| for ([_]u16{ 7, 9, 12, 32 }) |height| {
+    for ([_]u16{ 40, 60, 80, 120, 160 }) |width| for ([_]u16{ 6, 7, 8, 9, 10, 16, 24, 40 }) |height| {
         var screen = try vaxis.Screen.init(gpa, .{ .cols = width, .rows = height, .x_pixel = 0, .y_pixel = 0 });
         defer screen.deinit(gpa);
         const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = width, .height = height, .screen = &screen };
@@ -319,6 +323,7 @@ test "activity has breathing room at 60, 120 and 160 columns without wasting sho
         defer lines.deinit(gpa);
         for (0..40) |i| try lines.print(gpa, "line-{d}\n", .{i});
         try transcript.add(gpa, .assistant, lines.items);
+        const status_y = height - 4;
         const states = [_]status.Status{
             .{ .cfg = mock_cfg, .busy = .{ .phase = .scripting, .ms = 0 } },
             .{ .cfg = mock_cfg, .background_count = 1 },
@@ -328,19 +333,58 @@ test "activity has breathing room at 60, 120 and 160 columns without wasting sho
             var viewport: Viewport = .{ .pending = 0 };
             var text: status.Text = .{};
             const frame = drawFrame(win, transcript.entries.items, &input, &viewport, &.{}, 0, s, &text).?;
-            const status_y = height - @as(u16, if (height >= 8) 5 else 4);
-            try testing.expectEqual(status_y - @as(u16, @intFromBool(height >= 10)), frame.window.height);
-            if (height >= 10) for (0..width) |col| {
-                try testing.expectEqualStrings(" ", screen.readCell(@intCast(col), status_y - 1).?.char.grapheme);
-            };
+            try testing.expectEqual(status_y, frame.window.height);
+            try testing.expectEqualStrings("╭", screen.readCell(0, status_y + 1).?.char.grapheme);
+            try testing.expectEqualStrings("╰", screen.readCell(0, height - 1).?.char.grapheme);
             try testing.expect(!std.mem.eql(u8, " ", screen.readCell(1, status_y).?.char.grapheme));
             try testing.expect(screen.cursor_vis);
-            try testing.expectEqual(height - @as(u16, if (height >= 8) 3 else 2), screen.cursor.row);
+            try testing.expectEqual(height - 2, screen.cursor.row);
         }
         var viewport: Viewport = .{};
         var text: status.Text = .{};
         const frame = drawFrame(win, transcript.entries.items, &input, &viewport, &.{}, 0, .{ .cfg = mock_cfg }, &text).?;
-        try testing.expectEqual(height - @as(u16, if (height >= 8) 4 else 3), frame.window.height);
+        try testing.expectEqual(if (height >= 8) status_y else status_y + 1, frame.window.height);
+        try testing.expectEqualStrings("╭", screen.readCell(0, height - 3).?.char.grapheme);
+        if (height >= 8) for (0..width) |col| {
+            try testing.expectEqualStrings(" ", screen.readCell(@intCast(col), status_y).?.char.grapheme);
+        };
+        try testing.expectEqual(height - 2, screen.cursor.row);
+    };
+}
+
+test "Simple context label sits on the top border and Normal metadata is spaced" {
+    const gpa = testing.allocator;
+    for ([_]bool{ false, true }) |simple| for ([_]u64{ 0, 79, 80 }) |context| {
+        var screen = try vaxis.Screen.init(gpa, .{ .cols = 60, .rows = 12, .x_pixel = 0, .y_pixel = 0 });
+        defer screen.deinit(gpa);
+        const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 60, .height = 12, .screen = &screen };
+        var input: Editor = .{};
+        defer input.deinit(gpa);
+        var viewport: Viewport = .{};
+        var text: status.Text = .{};
+        var cfg = mock_cfg;
+        cfg.simple = simple;
+        cfg.context_window = 100;
+        draw(win, &.{}, &input, &viewport, &.{}, 0, .{ .cfg = cfg, .context = context }, &text);
+        const image = try snapshot(gpa, &screen);
+        defer gpa.free(image);
+        var rows = std.mem.splitScalar(u8, image, '\n');
+        var top_row: []const u8 = "";
+        var bottom_row: []const u8 = "";
+        var n: usize = 0;
+        while (rows.next()) |row| : (n += 1) {
+            if (n == 9) top_row = row;
+            if (n == 11) bottom_row = row;
+        }
+        if (simple) {
+            try testing.expectEqual(context >= 80, std.mem.endsWith(u8, top_row, " context 80% ╮"));
+            try testing.expect(std.mem.indexOf(u8, bottom_row, "context") == null);
+            try testing.expect(std.mem.indexOf(u8, bottom_row, "mock") == null);
+        } else {
+            try testing.expect(std.mem.indexOf(u8, top_row, "context") == null);
+            try testing.expect(std.mem.startsWith(u8, bottom_row, if (context == 0) "╰─ mock ─" else "╰─ mock · context "));
+            try testing.expect(std.mem.indexOf(u8, bottom_row, "% ─") != null or context == 0);
+        }
     };
 }
 
@@ -358,17 +402,17 @@ test "selection copies displayed blocks at the framed input coordinates" {
     var text: status.Text = .{};
     draw(win, &.{}, &input, &viewport, &.{}, 0, .{ .cfg = mock_cfg }, &text);
     try testing.expectEqual(@as(u16, 29), screen.cursor.col);
-    try testing.expectEqual(@as(u16, 9), screen.cursor.row);
+    try testing.expectEqual(@as(u16, 10), screen.cursor.row);
     var selection: Selection = .{};
-    _ = selection.mouse(.{ .col = 28, .row = 9, .type = .press, .button = .left, .mods = .{} }, &screen);
-    _ = selection.mouse(.{ .col = 2, .row = 9, .type = .drag, .button = .left, .mods = .{} }, &screen);
-    try testing.expect(selection.mouse(.{ .col = 2, .row = 9, .type = .release, .button = .left, .mods = .{} }, &screen));
+    _ = selection.mouse(.{ .col = 28, .row = 10, .type = .press, .button = .left, .mods = .{} }, &screen);
+    _ = selection.mouse(.{ .col = 2, .row = 10, .type = .drag, .button = .left, .mods = .{} }, &screen);
+    try testing.expect(selection.mouse(.{ .col = 2, .row = 10, .type = .release, .button = .left, .mods = .{} }, &screen));
     const copied = try selection.text(gpa, &screen);
     defer gpa.free(copied);
     try testing.expectEqualStrings("你[Pasted #1 · 6 lines · 1]", copied);
     selection.highlight(&screen);
-    try testing.expect(screen.readCell(2, 9).?.style.reverse);
-    try testing.expect(!screen.readCell(0, 9).?.style.reverse);
+    try testing.expect(screen.readCell(2, 10).?.style.reverse);
+    try testing.expect(!screen.readCell(0, 10).?.style.reverse);
 }
 
 test "minimal terminal dimensions retain an input cursor" {
@@ -539,7 +583,7 @@ test "Simple layout snapshots and full-width hit testing" {
                 const p = @import("selection/history.zig").position(frame, t.entries.items, @intCast(frame.window.x_off + 4), 0).?;
                 try testing.expect(p.entry < t.entries.items.len);
             }
-            for (0..size.w) |col| try testing.expectEqualStrings(" ", screen.readCell(@intCast(col), size.h - 1).?.char.grapheme);
+            try testing.expectEqualStrings("╰", screen.readCell(0, size.h - 1).?.char.grapheme);
         };
     }
     if (testing.environ.getPosix("NIB_TUI_SNAPSHOTS") != null) std.debug.print("\nSIMPLE_SNAPSHOTS_BEGIN\n{s}SIMPLE_SNAPSHOTS_END\n", .{images.items});

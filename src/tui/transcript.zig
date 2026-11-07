@@ -888,12 +888,12 @@ test "user cards tint wrapped rows, retain terminal foreground and leave gaps un
     for (0..height) |row| {
         try testing.expectEqualStrings("▎", screen.readCell(0, @intCast(row)).?.char.grapheme);
         try testing.expectEqualDeep(entry.user_bg, screen.readCell(17, @intCast(row)).?.style.bg);
-        const body = screen.readCell(if (row == 0) 4 else 2, @intCast(row)).?;
+        const body = screen.readCell(2, @intCast(row)).?;
         try testing.expect(body.style.fg == .default);
         try testing.expect(!body.style.bold);
     }
-    try testing.expectEqualStrings("›", screen.readCell(2, 0).?.char.grapheme);
-    try testing.expectEqual(@as(u8, 4), screen.readCell(2, 0).?.style.fg.index);
+    try testing.expectEqualStrings("h", screen.readCell(2, 0).?.char.grapheme);
+    try testing.expectEqualStrings(" ", screen.readCell(1, 0).?.char.grapheme);
     try testing.expect(screen.readCell(0, height).?.style.bg == .default);
     win.clear();
     _ = entry.print(win.child(.{ .y_off = -1, .height = height }), true);

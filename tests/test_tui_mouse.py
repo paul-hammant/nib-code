@@ -80,7 +80,7 @@ def test_background_report_and_user_card(tmp):
             wait_for(lambda: len(terminal.read()) > start, "theme redraw")
             assert terminal.child.poll() is None
         start = len(terminal.read())
-        terminal.send(mouse(0, 5, 0) + mouse(32, 14, 0) + mouse(0, 14, 0, release=True))
+        terminal.send(mouse(0, 3, 0) + mouse(32, 12, 0) + mouse(0, 12, 0, release=True))
         copied = clipboard(terminal, start)
         assert copied == "mouse test", repr(copied)
 
@@ -132,10 +132,10 @@ def test_simple_mode(tmp):
         wait_for(lambda: (home / "config.toml").exists() and 'ui = "simple"' in (home / "config.toml").read_text(), "Ctrl+S persistence")
         wait_for(lambda: "Ask about" not in view() and "tokens" not in view(), "Simple framed input")
         lines = view().split("\n")
-        assert lines[36] == "╭" + "─" * 158 + "╮", view()
-        assert lines[37] == "│" + " " * 158 + "│", view()
-        assert lines[38] == "╰" + "─" * 158 + "╯" and lines[39] == "", view()
-        assert lines[0] == " ▎ › check", view()
+        assert lines[37] == "╭" + "─" * 158 + "╮", view()
+        assert lines[38] == "│" + " " * 158 + "│", view()
+        assert lines[39] == "╰" + "─" * 158 + "╯", view()
+        assert lines[0] == " ▎ check", view()
         assert "tokens" not in view() and "mock" not in view(), view()
         row = next(i for i, line in enumerate(view().split("\n")) if "Run" in line)
         terminal.send(mouse(0, 15, row) + mouse(0, 15, row, release=True))

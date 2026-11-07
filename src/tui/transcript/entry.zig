@@ -193,7 +193,7 @@ pub const Entry = struct {
         }
         if (folded and e.kind == .user) {
             const suffix_width = vaxis.gwidth.gwidth(e.label.items, win.screen.width_method) + @as(u16, if (e.queued != null) 9 else 0);
-            const available = win.width -| (suffix_width +| 2);
+            const available = win.width -| suffix_width;
             var end: usize = 0;
             while (end < segs[1].text.len) {
                 const n = end + (std.unicode.utf8ByteSequenceLength(segs[1].text[end]) catch 1);
@@ -213,7 +213,7 @@ pub const Entry = struct {
         const folded = e.collapsible() and !e.open;
         if (folded) {
             const suffix_width = body.gwidth(e.label.items) + @as(u16, if (e.queued != null) 9 else 0);
-            const available = body.width -| (suffix_width +| 2);
+            const available = body.width -| suffix_width;
             var end: usize = 0;
             while (end < segs[1].text.len) {
                 const next = end + (std.unicode.utf8ByteSequenceLength(segs[1].text[end]) catch 1);
@@ -260,7 +260,7 @@ pub const Entry = struct {
         const dim: vaxis.Style = .{ .dim = true };
         switch (e.kind) {
             .user => {
-                segs[0] = .{ .text = "› ", .style = .{ .fg = .{ .index = 4 } } };
+                segs[0] = .{ .text = "" };
                 const folded = e.collapsible() and !e.open;
                 segs[1] = .{ .text = if (folded) e.text.items[0 .. std.mem.indexOfScalar(u8, e.text.items, '\n') orelse e.text.items.len] else e.text.items };
                 var n: usize = 2;
