@@ -160,7 +160,7 @@ def history(home):
     if not paths:
         return []
     messages = []
-    for line in paths[0].read_text().splitlines():
+    for line in paths[0].read_bytes().split(b"\n")[:-1]:
         record = json.loads(line)
         if record.get("messages"):
             messages[record["from"]:] = record["messages"]

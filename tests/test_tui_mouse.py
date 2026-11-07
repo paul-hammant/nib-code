@@ -11,7 +11,7 @@ import re
 import tempfile
 from unittest.mock import patch
 
-from test_interjections import Terminal, Reply, fixture, finished, screen, wait_for
+from test_interjections import Terminal, Reply, fixture, finished, history, screen, wait_for
 
 
 def mouse(button, col, row, release=False):
@@ -36,6 +36,17 @@ def terminal_fixture(tmp, reply):
             wait_for(lambda: finished(home, reply.text), "committed reply")
             terminal.until(b"line-079")
             yield terminal
+
+
+def test_history_ignores_incomplete_record(tmp):
+    sessions = tmp / "sessions"
+    sessions.mkdir(parents=True)
+    path = sessions / ("a" * 32 + ".jsonl")
+    complete = b'{"from":0,"messages":[{"content":"done"}]}\n'
+    path.write_bytes(complete + b'{"from":1,"messages":[{"content":"partial')
+    assert history(tmp) == [{"content": "done"}]
+    path.write_bytes(complete + b'{"from":1,"messages":[{"content":"next"}]}\n')
+    assert history(tmp) == [{"content": "done"}, {"content": "next"}]
 
 
 def test_cross_screen_selection(tmp):
@@ -146,6 +157,6 @@ def test_simple_mode(tmp):
 
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="nib-tui-mouse-") as directory:
-        for test in (test_cross_screen_selection, test_background_report_and_user_card, test_click_and_ctrl_o_open_single_runs, test_simple_mode):
+        for test in (test_history_ignores_incomplete_record, test_cross_screen_selection, test_background_report_and_user_card, test_click_and_ctrl_o_open_single_runs, test_simple_mode):
             test(Path(directory) / test.__name__)
             print(test.__name__ + ": ok")
