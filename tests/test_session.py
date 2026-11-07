@@ -237,6 +237,7 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         assert all(not any(key in record for key in ("nib_version", "system_sha", "patches_off"))
                    for record in initial_records[1:])
         assert system.index("You are nib") < system.index("GLOBAL_MARKER") < system.index("PROJECT_MARKER")
+        assert "async mcp(" not in system and "<mcp_tools>" not in system
         assert "IGNORED_XDG_MARKER" not in system
         global_agents.write_text("CHANGED_GLOBAL")
         ask("--continue", "second")

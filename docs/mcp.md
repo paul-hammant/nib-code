@@ -39,7 +39,7 @@ github.search_issues(query: string, state?: "open"|"closed") — Search issues.
 
 The index includes at most 40 tools per server, reports the omitted count, collapses
 nested objects to `{…}`, and limits signatures and first-sentence descriptions.
-Full schemas stay outside the prompt. No MCP index is added when all servers are
+Full schemas stay outside the prompt. MCP API descriptions and the index are absent when all servers are
 off. Server errors appear as short failure lines; other servers remain usable.
 
 Switches apply to new Sessions. Current and resumed Sessions retain their original

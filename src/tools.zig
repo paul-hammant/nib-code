@@ -155,11 +155,12 @@ fn enabled(tool: Tool, depth: u32) bool {
     return !tool.root_only or depth == 0;
 }
 
-fn makeApi(comptime depth: u32) Api {
+fn makeApi(comptime depth: u32, comptime mcp_enabled: bool) Api {
     var n: []const []const u8 = &.{};
     var d: []const u8 = "const tools = {\n";
     for (all) |tool| {
         if (!enabled(tool, depth)) continue;
+        if (!mcp_enabled and (std.mem.eql(u8, tool.name, "mcp") or std.mem.eql(u8, tool.name, "mcp_schema"))) continue;
         n = n ++ .{tool.name};
         d = d ++ tool.doc ++ "\n";
     }
@@ -171,8 +172,10 @@ fn makeApi(comptime depth: u32) Api {
     };
 }
 
-const root_api = makeApi(0);
-const child_api = makeApi(1);
+const root_api = makeApi(0, true);
+const child_api = makeApi(1, true);
+const inactive_root_api = makeApi(0, false);
+const inactive_child_api = makeApi(1, false);
 pub const names = root_api.names;
 pub const docs = root_api.docs;
 
@@ -333,7 +336,11 @@ pub const Tools = struct {
         defer a.free(options);
         const limits = try std.fmt.allocPrint(a, "{d} concurrent/process, {d}/Run, {d} KiB", .{ cfg.limits.llm_concurrency, cfg.limits.llm_calls_per_run, cfg.limits.llm_input_kib });
         defer a.free(limits);
-        const limited_docs = try std.mem.replaceOwned(u8, a, t.api().docs, "{{llm_limits}}", limits);
+        const mcp_enabled = for (cfg.mcp_servers) |server| {
+            if (server.enabled) break true;
+        } else false;
+        const api_docs = if (mcp_enabled) t.api().docs else if (t.depth == 0 or t.forked) inactive_root_api.docs else inactive_child_api.docs;
+        const limited_docs = try std.mem.replaceOwned(u8, a, api_docs, "{{llm_limits}}", limits);
         defer a.free(limited_docs);
         return std.mem.replaceOwned(u8, a, limited_docs, "{{llm_options}}", options);
     }

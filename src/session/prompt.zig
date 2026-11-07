@@ -140,10 +140,24 @@ test "system prompt documents every tool in JavaScript" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "1800000 (30 min)") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "resume:a1 after completion; busy:wait, don't retry/replace") != null);
     for (tools.names) |name| {
+        if (std.mem.startsWith(u8, name, "mcp")) continue;
         const call = try std.fmt.allocPrint(gpa, "async {s}(", .{name});
         defer gpa.free(call);
         try std.testing.expect(std.mem.indexOf(u8, prompt, call) != null);
     }
+}
+
+test "MCP API descriptions enter context only with enabled servers" {
+    const t = std.testing;
+    var host: tools.Tools = .{ .io = t.io, .home = "/unused", .cfg = .{ .base_url = "", .api_key = "", .model = "m" } };
+    const off = try renderSystem(t.allocator, "/work", &host, null);
+    defer t.allocator.free(off);
+    try t.expect(std.mem.indexOf(u8, off, "async mcp(") == null);
+    host.cfg.?.mcp_servers = &.{.{ .id = "test", .command = "server", .enabled = true }};
+    const on = try renderSystem(t.allocator, "/work", &host, null);
+    defer t.allocator.free(on);
+    try t.expect(std.mem.indexOf(u8, on, "async mcp(") != null);
+    try t.expect(std.mem.indexOf(u8, on, "async mcp_schema(") != null);
 }
 
 test "system prompt renders configured Run display budget" {

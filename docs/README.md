@@ -61,11 +61,13 @@ Tool descriptions and system prompts state facts and costs for models to weigh, 
   - [0020 Providers are data; at most three wire protocols](adr/0020-providers.md)
   - [0021 Images: attach by path or clipboard, store by reference, view separate from read](adr/0021-images.md)
   - [0022 Provider sign-in: /provider, credential store, nib-owned Codex OAuth](adr/0022-provider-sign-in.md)
+  - [0024 Opt-in MCP tools](adr/0024-mcp-tools.md)
 - [ask-json.md](ask-json.md): ask --json NDJSON events, progress, usage
 - [session-log.md](session-log.md): logs, resume/cancellation, timing, measurement definitions
 - [undo.md](undo.md): per-Turn TUI edit/write undo, conflict rejection, quotas, recovery boundaries
 - [replay.md](replay.md): recording, offline Run replay, diagnostic scripts, privacy boundaries
 - [reflect.md](reflect.md): read-only reflection, saved answers, automatic issue publication
+- [mcp.md](mcp.md): opt-in servers, context index, transports, protocol detection, lifecycle, sandbox, and limits
 - [config.md](config.md): `NIB_HOME`, files, environment, precedence, effort persistence
 - [codex.md](codex.md): local Codex login, configuration, credential boundaries
 - [run-output.md](run-output.md): data integrity, explicit limits, Run display budgets, execution timeouts
@@ -130,6 +132,3 @@ Tool/bash statistics estimate JS/static-shell call sites, not actual loop/dynami
 | One HTTPS request peak RSS (including TLS) | 7.6 MB (2026-11-01, ReleaseFast) | — | `/usr/bin/time -f %M nib ask hi` (invalid key, 401) |
 
 See [tui-ux.md](tui-ux.md) for background-task management, waiting phases, and recovery notices.
-
-- [MCP tools](mcp.md): opt-in servers, context index, transports, protocol detection, lifecycle, sandbox, and limits.
-- [0024: Opt-in MCP tools](adr/0024-mcp-tools.md)
