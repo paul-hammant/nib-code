@@ -277,7 +277,7 @@ pub const Entry = struct {
             .assistant => segs[0] = .{ .text = e.text.items },
             .run => {
                 segs[0] = if (e.run == .failed) .{ .text = "✗ ", .style = .{ .fg = .{ .index = 1 } } } else if (e.run == .warning or e.run == .lost or e.run == .timed_out or e.run == .canceled or e.hasWarning()) .{ .text = "! ", .style = .{ .fg = .{ .index = 3 } } } else .{ .text = "  ", .style = dim };
-                segs[1] = .{ .text = if (e.simple and e.run == .ok and !e.hasWarning()) "✓ " else "", .style = dim };
+                segs[1] = .{ .text = "", .style = dim };
                 segs[2] = .{ .text = e.label.items, .style = dim };
                 if (!e.open) return segs[0..3];
                 segs[3] = .{ .text = "\n" };

@@ -102,7 +102,7 @@ pub fn drawFrame(outer: vaxis.Window, entries: []Entry, input: *Editor, scroll: 
         for (0..win.width) |col| put(win, @intCast(col), input_y, "─");
         const percent = s.context * 100 / @max(s.cfg.context_window, 1);
         if (percent >= 80) {
-            const label = std.fmt.bufPrint(&text.status, "context {d}%", .{percent}) catch "";
+            const label = std.fmt.bufPrint(&text.status, " context {d}%", .{percent}) catch "";
             const w = win.gwidth(label);
             if (w <= win.width) _ = win.child(.{ .x_off = win.width - w, .y_off = input_y, .height = 1 }).printSegment(.{ .text = label, .style = .{ .dim = true } }, .{ .wrap = .none });
         }
@@ -572,7 +572,7 @@ test "Simple Run marks and centered selection preserve details" {
         const image = try snapshot(gpa, &screen);
         defer gpa.free(image);
         try testing.expect(std.mem.indexOf(u8, image, switch (state) {
-            .ok => "✓ Run",
+            .ok => "  Run",
             .failed => "✗ Run",
             .running => "Run · running",
             else => "! Run",
