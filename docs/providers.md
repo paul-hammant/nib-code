@@ -6,7 +6,7 @@ Service identity is separate from wire protocol: codex, openai, anthropic, deeps
 
 | id | Protocol | Default `base_url` | Credentials | Default model / window |
 | --- | --- | --- | --- | --- |
-| codex | responses, Codex login/WS extensions | `https://chatgpt.com/backend-api` | `CODEX_HOME/auth.json` | `gpt-6.1-sol` / 500000 |
+| codex | responses, Codex login/WS extensions | `https://chatgpt.com/backend-api` | ChatGPT sign-in (`/provider`, `nib login codex`) or `CODEX_HOME/auth.json` | `gpt-6.1-sol` / 500000 |
 | openai | responses, SSE | `https://api.openai.com/v1` | `OPENAI_API_KEY` | `gpt-6.1-sol` / 1050000 |
 | anthropic | `anthropic_messages`, SSE | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` | `claude-sonnet-5-5` / 1000000 |
 | deepseek | `chat_completions`, SSE | `https://api.deepseek.com` | `DEEPSEEK_API_KEY` | `deepseek-flash` / 1000000 |
@@ -14,7 +14,19 @@ Service identity is separate from wire protocol: codex, openai, anthropic, deeps
 
 Snapshot: user-provided models.dev `api.json`, fetched **2026-11-06**. OpenAI lists gpt-6.1-sol/terra, both window 1050000/output 128000. Anthropic lists claude-opus-5-5, `claude-sonnet-5-5`, claude-haiku-5-5, claude-fable-5-1, all window 1000000/output 128000. xAI lists grok-4.7/4.6, both window 500000. DeepSeek retains deepseek-flash/deepseek-v4-pro, both window 1000000. Codex retains its list/windows/defaults; see [codex.md](codex.md). This short catalog neither guarantees account access nor calls discovery endpoints.
 
-Prefer TUI `/model`: menus list currently credentialed built-in models and config.toml custom services; typing filters, current models show current. `/model openai` selects configured/default model; `/model openai gpt-6.1-terra` or `/model openai/gpt-6.1-terra` selects exactly. Unknown models require configured `context_window` or NIB_CONTEXT_WINDOW. Selection saves atomically to `$NIB_HOME/config.toml`, preserving other settings/comments and current effort with model mappings. Committed Steps trigger a new Session; old Sessions retain their service and remain resumable. Empty Sessions switch in place; active Turns cannot switch. NIB_PROVIDER/NIB_MODEL still override on next launch, noted in confirmation. Define custom services once in config.toml before menu selection. Direct file/environment edits remain alternatives.
+## Signing in and choosing
+
+Run `nib`, then `/provider`. The menu lists every built-in service and each custom `[providers.<id>]` with where its credential comes from (`signed in · ChatGPT`, an environment variable name, `key stored`, a host, or `—`); the current one is marked `current`.
+
+- A service without credentials asks for its key in the input area (shown as dots, `Esc` cancels, `Enter` saves to `$NIB_HOME/auth.json`) and then switches to it with its default model. Codex opens the ChatGPT sign-in ([codex.md](codex.md#signing-in)).
+- A credentialed service switches directly. `/provider <id>` types the same choice.
+- `Add endpoint…` (or `/provider +`) asks for a name, base URL, API key (may be empty for local servers) and protocol (Enter for OpenAI-compatible Chat Completions, `2` Responses, `3` Anthropic Messages), then lists `GET <base>/models` (Anthropic: `/v1/models`) with that key to pick a model. If listing fails it asks for the model id; the context window comes from the listing when present, else asks (Enter for 128000). It appends a `[providers.<id>]` section to `config.toml` and keeps the key in the store. `Esc` at any step writes nothing.
+- `/provider logout <id>` removes nib's stored key or ChatGPT login. Environment keys and a Codex CLI login are reported, not deleted. Typing `/provider lo` lists what can be signed out.
+- Terminal equivalents: `nib login [service] [--device]` and `nib logout <service>`.
+
+`/model` lists only the current service's models (its catalog, or a custom service's configured model); `/model <model>` selects one. `/model <service>/<model>` and `/model <service> <model>` still work. Unknown models require configured `context_window` or NIB_CONTEXT_WINDOW. Selection saves atomically to `$NIB_HOME/config.toml`, preserving other settings/comments and current effort. Committed Steps trigger a new Session; old Sessions retain their service and remain resumable. Empty Sessions switch in place; active Turns cannot switch. NIB_PROVIDER/NIB_MODEL still override on next launch, noted in confirmation. Direct file/environment edits remain alternatives.
+
+Without a configured service that has credentials, startup silently uses the first credentialed one: Codex login, then keys for anthropic, openai, deepseek, xai, then custom services. It is not saved until you choose with `/provider` or `/model`. With none, the bottom bar shows `Not signed in`, the welcome line says `No provider · /provider to sign in`, and sending a message opens the `/provider` menu with the draft kept; `nib ask` exits with `No provider · run nib login`.
 
 Alternatively switch in `$NIB_HOME/config.toml`:
 
@@ -26,7 +38,7 @@ effort = "high"
 model = "claude-sonnet-5-5"
 ```
 
-Set `ANTHROPIC_API_KEY` in the environment. Environment-only selection also works: `NIB_PROVIDER=openai` with OPENAI_API_KEY. Overrides do not persist. Unknown models need context_window/NIB_CONTEXT_WINDOW; legacy `chat_completions` unknown models retain the 1000000 default.
+Set `ANTHROPIC_API_KEY` in the environment (or sign in with `/provider`). Environment-only selection also works: `NIB_PROVIDER=openai` with OPENAI_API_KEY. Overrides do not persist. Unknown models need context_window/NIB_CONTEXT_WINDOW; legacy `chat_completions` unknown models retain the 1000000 default.
 
 ## OpenAI-compatible endpoints and self-hosting
 
@@ -41,7 +53,7 @@ context_window = 128000
 api_key_env = "MYSITE_API_KEY"
 ```
 
-Put the key in environment `MYSITE_API_KEY`; configuration stores its name only. protocol/base_url/model/context_window are required; unauthenticated local services omit api_key_env. It is an environment name, not a key. Ids use ASCII letters/digits/underscore/hyphen; collisions with built-ins or custom error.
+Put the key in environment `MYSITE_API_KEY`; configuration stores its name only. protocol/base_url/model/context_window are required; unauthenticated local services omit api_key_env. It is an environment name, not a key. Endpoints added with `/provider` omit api_key_env and keep the key in `auth.json` under the endpoint id; an environment variable named by api_key_env still wins. Ids use ASCII letters/digits/underscore/hyphen; collisions with built-ins or custom error.
 
 `vision = true|false` (custom services only) declares whether the model accepts image input. Omitted, it follows the protocol: true for `responses` and `anthropic_messages`, false for `chat_completions`, where endpoints differ. Built-in rows carry it in the provider/model table: false for `chat_completions` and DeepSeek, true elsewhere. Without vision, attaching an image in the TUI is refused with a notice and `tools.view` returns `{ ok: false, error }`; images already in a resumed Session history become text placeholders.
 
@@ -77,10 +89,10 @@ Anthropic places ephemeral cache_control breakpoints on system, last user/tool_r
 
 ## Credentials, resume, and errors
 
-Children inherit effective configuration through anonymous stdin, skipping files. Pass variable names; each process reads the selected environment key independently. Only selected keys enter nib children; bash removes built-in/current custom keys. No secrets in argv/logs/config. Codex independently reads login files; other services have no subscription OAuth.
+Children inherit effective configuration through anonymous stdin, skipping files. Pass variable names; each process reads the selected environment key or the key in `auth.json` independently, so stored keys never travel through stdin. Only selected keys enter nib children; bash removes built-in/current custom keys, and read/edit/write/bash refuse `$NIB_HOME/auth.json` like Codex credential files. No secrets in argv/logs/config. Key precedence: environment variable, then `auth.json`, then (Codex only) `CODEX_HOME/auth.json`. Codex independently reads login files; only Codex has a subscription sign-in, and Claude subscriptions are not supported (API keys only).
 
 Legacy provider = "chat_completions", `[chat_completions]`, and `NIB_API_KEY` over `DEEPSEEK_API_KEY` remain compatible; deepseek has its own identity/key. Old Session identities do not convert automatically. Cross-service resume rejects even for matching protocols. Custom logs use `provider:"custom"` plus `custom_provider:"mysite"`, both compared on resume/fork. Responses/Messages also require matching models to protect encrypted/signed continuation.
 
-401 asks users to check the current service's key environment variable without exposing authentication response bodies; only Codex rereads login once. 429/5xx, network, cancellation, and three timeouts reuse existing policies. Ordinary services do not automatically replay after visible deltas; buffered llm/summaries can retry. See [codex.md](codex.md#stream-failures-and-retries).
+401 asks users to check the current service's key (its environment variable, or `the key stored by nib`) without exposing authentication response bodies; only Codex rereads or refreshes login once. 429/5xx, network, cancellation, and three timeouts reuse existing policies. Ordinary services do not automatically replay after visible deltas; buffered llm/summaries can retry. See [codex.md](codex.md#stream-failures-and-retries).
 
-nib --help and `/status` show effective service id; `/status` also shows cache-write tokens. No per-service UI, model marketplace, discovery, or non-Codex OAuth.
+nib --help and `/status` show effective service id; `/status` also shows the credential source (`key from ANTHROPIC_API_KEY`, `key stored by nib`, `ChatGPT login stored by nib`, never a key) and cache-write tokens. No model marketplace, background discovery (one `/models` request only while adding an endpoint), or non-Codex OAuth. Design record: [ADR 0022](adr/0022-provider-sign-in.md).

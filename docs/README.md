@@ -60,6 +60,7 @@ Tool descriptions and system prompts state facts and costs for models to weigh, 
   - [0019 Skills: index in system, read on demand](adr/0019-skills.md)
   - [0020 Providers are data; at most three wire protocols](adr/0020-providers.md)
   - [0021 Images: attach by path or clipboard, store by reference, view separate from read](adr/0021-images.md)
+  - [0022 Provider sign-in: /provider, credential store, nib-owned Codex OAuth](adr/0022-provider-sign-in.md)
 - [ask-json.md](ask-json.md): ask --json NDJSON events, progress, usage
 - [session-log.md](session-log.md): logs, resume/cancellation, timing, measurement definitions
 - [undo.md](undo.md): per-Turn TUI edit/write undo, conflict rejection, quotas, recovery boundaries

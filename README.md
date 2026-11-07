@@ -53,9 +53,9 @@ nib ask 'explain the entry points'
 nib -c                       # continue the last session here
 ```
 
-Uses your Codex login by default; `/model` switches to Claude, OpenAI, DeepSeek, Grok or [your own endpoint](docs/providers.md).
+Run `nib`, then `/provider` to sign in; `/model` picks a model. Codex, Claude, OpenAI, DeepSeek, Grok or [your own endpoint](docs/providers.md).
 
-Enter sends, Shift+Enter adds a line, Esc cancels. Type `/` for commands: `/model`, `/effort`, `/undo`, `/tasks`, `/skills`, `/status`. `@` completes file paths.
+Enter sends, Shift+Enter adds a line, Esc cancels. Type `/` for commands: `/provider`, `/model`, `/effort`, `/undo`, `/tasks`, `/skills`, `/status`. `@` completes file paths.
 
 Project conventions go in `AGENTS.md`; personal ones in `~/.nib/AGENTS.md`.
 

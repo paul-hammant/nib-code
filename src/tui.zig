@@ -821,6 +821,40 @@ test "wheel scrolls during history selection and ignores non-press wheel events"
     }
 }
 
+test "key entry stays out of the editor, its history and drafts" {
+    const gpa = std.testing.allocator;
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.flow = .{ .gpa = gpa };
+    defer app.flow.deinit();
+    app.input = .{};
+    defer app.input.deinit(gpa);
+    app.menu = .init(gpa);
+    defer app.menu.deinit();
+    app.paste_buf = .empty;
+    defer app.paste_buf.deinit(gpa);
+    app.selection = .{};
+    app.notice = null;
+    app.pasting = false;
+    app.turn = null;
+    try app.input.insert(gpa, "draft message");
+    try app.flow.startKey("openai", "OpenAI");
+    const secret = "sk-secret";
+    for (0..secret.len) |i| _ = try app.onKey(.{ .codepoint = secret[i], .text = secret[i .. i + 1] });
+    try std.testing.expectEqualStrings(secret, app.flow.text.items);
+    _ = try app.handle(.paste_start);
+    _ = try app.onKey(.{ .codepoint = 'Z', .text = "Z" });
+    _ = try app.handle(.paste_end);
+    try std.testing.expectEqualStrings(secret ++ "Z", app.flow.text.items);
+    try std.testing.expectEqualStrings("draft message", app.input.text());
+    try std.testing.expectEqual(@as(usize, 0), app.input.history.items.len);
+    try std.testing.expect(app.input.draft == null and app.input.blocks.items.len == 0);
+    _ = try app.onKey(.{ .codepoint = vaxis.Key.escape });
+    try std.testing.expect(!app.flow.active());
+    try std.testing.expectEqual(@as(usize, 0), app.flow.text.items.len);
+    try std.testing.expectEqualStrings("draft message", app.input.text());
+}
+
 test "bracketed paste buffers newline and slash keys without executing them" {
     const gpa = std.testing.allocator;
     var app: App = undefined;

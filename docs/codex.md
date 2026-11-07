@@ -1,8 +1,12 @@
-# Run nib with local Codex login
+# Run nib with a ChatGPT login
 
 Other API-key/custom services: [providers.md](providers.md). Codex adds ChatGPT login/WS extensions to shared Responses; defaults unchanged.
 
-Log into ChatGPT through codex, then run:
+## Signing in
+
+Run `nib`, then `/provider` and choose Codex; or `nib login codex`. nib opens the browser (`open` on macOS, `xdg-open` on Linux) and waits on `127.0.0.1:1455` for the callback (`Waiting for ChatGPT sign-in · Esc cancels`). Without a display, over SSH, or when the browser or port is unavailable it uses device-code login instead: the TUI prints `Open <url> and enter code <code>`; `nib login codex --device` forces it. Success prints `Codex · signed in · <plan>`.
+
+The flow is the Codex CLI's (public client id, PKCE, `https://auth.openai.com`; [ADR 0022](adr/0022-provider-sign-in.md)). Tokens go to `$NIB_HOME/auth.json` (mode 0600). If you already use the Codex CLI, nib reads `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`) in place without copying it, and nib's own login takes precedence when both exist. `/provider logout codex` removes only nib's tokens. No telemetry; the only calls are the sign-in, refresh and model requests.
 
 ```sh
 nib
@@ -11,7 +15,7 @@ nib ask --json 'Hello'
 nib --continue
 ```
 
-Read `~/.codex/auth.json` by default; `CODEX_HOME=/path/to/codex` changes directory. No NIB_API_KEY needed. Nonsecret settings go in `$NIB_HOME/config.toml` (default `~/.nib/config.toml`) [codex]; [configuration](config.md). NIB_BASE_URL/NIB_MODEL/NIB_CONTEXT_WINDOW override files; clear obsolete overrides when switching services.
+No NIB_API_KEY needed. Nonsecret settings go in `$NIB_HOME/config.toml` (default `~/.nib/config.toml`) [codex]; [configuration](config.md). NIB_BASE_URL/NIB_MODEL/NIB_CONTEXT_WINDOW override files; clear obsolete overrides when switching services.
 
 Default `gpt-6.1-sol`, window 500,000 tokens. Explicit model:
 
@@ -95,7 +99,7 @@ Use current models/prefixes/encrypted reasoning for summaries, preserving cache 
 
 Sessions record provider/model. Cross-provider resume rejects: use originals or new Sessions. Codex model must match for encrypted reasoning; Chat Completions retains current-model resume behavior. Default Codex since 2026-11-02 (previously DeepSeek); `NIB_PROVIDER=chat_completions` selects that protocol, default DeepSeek.
 
-Missing/malformed credentials or 401 prompt login. Reread/retry 401 once for CLI-refreshed credentials, then ask users to run codex login. No refresh_token use or credentials in logs/argv/child environments. Agents receive effective config via stdin, skip files, read auth.json independently; bash removes common secret variables. read/edit/write reject credential files; bash rejects credential-directory references. Mistake protection, not system sandboxing: [ADR 0006](adr/0006-deny-dangerous-commands.md).
+Missing/malformed credentials prompt `nib login codex`. Access tokens that are JWTs are refreshed with the refresh token when expired or within 60s of expiry, and once after a 401 (a different token already on disk is used as is); the new tokens are written back to the file they came from, preserving its other fields and mode. Opaque tokens are never refreshed on their own. A repeated 401 asks users to run `nib login codex`. There is no cross-process lock: two processes refreshing at once may race on a rotating refresh token. No credentials in logs/argv/child environments. Agents receive effective config via stdin, skip files, read auth.json independently; bash removes common secret variables. read/edit/write reject credential files; bash rejects credential-directory references. Mistake protection, not system sandboxing: [ADR 0006](adr/0006-deny-dangerous-commands.md).
 
 ## Stream activity
 

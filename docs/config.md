@@ -6,17 +6,22 @@
 ~/.nib/
   AGENTS.md       Global instructions
   config.toml     Optional nonsecret runtime configuration
+  auth.json       Credentials stored by /provider and nib login (mode 0600)
   sessions/       <32-character-lowercase-hex-ID>.jsonl main logs and matching .calls.jsonl recordings
   reflections.md  Completed /reflect answers and issue publication results
 ```
 
-No XDG configuration/data reads, old-file searches, or automatic migration. Users move retained instructions/Sessions themselves. `NIB_HOME` does not change Codex credentials: `$CODEX_HOME/auth.json`, default ~/.codex/auth.json.
+No XDG configuration/data reads, old-file searches, or automatic migration. Users move retained instructions/Sessions themselves. `NIB_HOME` does not change the Codex CLI login nib may import: `$CODEX_HOME/auth.json`, default ~/.codex/auth.json.
+
+## `auth.json`
+
+Written by `/provider`, `nib login` and the ChatGPT refresh; mode 0600, replaced atomically (temporary file + rename). Never edit it while nib runs. Shape: `{"keys": {"<service id>": "<key>"}, "tokens": {id_token, access_token, refresh_token, account_id}, "last_refresh": "<RFC 3339>"}`; unknown fields are kept. Key precedence, highest first: the service's environment variable, then `auth.json`, then (Codex only) `$CODEX_HOME/auth.json`, used in place and never copied; nib's own Codex `tokens` outrank the CLI file. Keys are never printed in the TUI, logs, errors, or `/status` (which names only the source), never written to config.toml, and `read`/`edit`/`write` and bash refuse this file. Sign out with `/provider logout <service>` or `nib logout <service>`; it removes only nib's own entry.
 
 New Sessions assemble system from base instructions, `$NIB_HOME/AGENTS.md`, then project AGENTS.md. Project root is the first cwd ancestor containing .git, or cwd if absent. Resume retains logged system. No project `config.toml` yet; project conventions remain in AGENTS.md.
 
 ## `config.toml`
 
-Prefer TUI `/model` for services/models, atomically saving to `config.toml` and starting new Sessions when Steps exist. Define custom services before menu use. Direct file/environment edits remain alternatives; NIB_PROVIDER/NIB_MODEL override saved values at startup. Syntax, credential filtering, Session semantics: [providers.md](providers.md).
+Prefer TUI `/provider` for services (including `Add endpoint…`, which appends a `[providers.<id>]` section) and `/model` for models, atomically saving to `config.toml` and starting new Sessions when Steps exist. Direct file/environment edits remain alternatives; NIB_PROVIDER/NIB_MODEL override saved values at startup. Syntax, credential filtering, Session semantics: [providers.md](providers.md).
 
 ```toml
 # Optional top-level keys
@@ -52,7 +57,7 @@ run_output_bytes = 16384
 hallmark = true # All disabled by default; enable individually by name
 ```
 
-Only the selected provider section applies; switching need not rewrite others. Without environment/file settings, default codex uses `gpt-6.1-sol`, window 500000 tokens, local Codex login, no API key. Codex windows depend on model; unknown models require `context_window` or NIB_CONTEXT_WINDOW. Models/resume/credentials: [codex.md](codex.md), [ADR 0011](adr/0011-provider-wire-protocols.md).
+Only the selected provider section applies; switching need not rewrite others. Without environment/file settings the service is codex (`gpt-6.1-sol`, window 500000 tokens) when signed in; otherwise startup uses the first credentialed service without saving it ([providers.md](providers.md#signing-in-and-choosing)). Codex windows depend on model; unknown models require `context_window` or NIB_CONTEXT_WINDOW. Models/resume/credentials: [codex.md](codex.md), [ADR 0011](adr/0011-provider-wire-protocols.md).
 
 Built-ins: codex (default), openai, anthropic, deepseek, xai. Legacy chat_completions is a DeepSeek-compatible entry retaining independent Session identity. Tables/windows/authentication/effort/custom examples: [providers.md](providers.md).
 
@@ -129,7 +134,7 @@ Bytes cannot distinguish progress from heartbeats; continuous summaries cannot g
 
 Explicit `max_steps` enters new-Session system prompts per Turn. With at most 3 Steps left, append remaining counts to each Run output outside display budgets. Exhaustion stops model requests; active background agent/bash finish first, results enter history/logs for next Turn. Still end with TooManySteps / stopped after N steps, listing waited task types/IDs if any. Esc immediately cancels Turn/tasks during waits. Without limits, no hints or Step cap. Resume retains original system; if current limits differ, prepend current budget facts to each Turn input to avoid stale limits.
 
-Configuration stores no secrets and accepts no API-key/token/password/credential fields. Chat Completions uses `NIB_API_KEY` / `DEEPSEEK_API_KEY`; Codex uses login files. Keep secrets out of URLs.
+Configuration stores no secrets and accepts no API-key/token/password/credential fields. Keys live in the environment or `auth.json`: Chat Completions uses `NIB_API_KEY` / `DEEPSEEK_API_KEY`; Codex uses its sign-in. Keep secrets out of URLs.
 
 ## Override precedence
 
@@ -149,7 +154,8 @@ Children inherit effective provider/model/limits through anonymous stdin, skippi
 | Variable | Meaning |
 |---|---|
 | `NIB_RECORD` | Recording defaults on; only off disables, without deleting calls files; [replay.md](replay.md) |
-| `NIB_HOME` | User directory, default ~/.nib; Codex credentials unchanged |
+| `NIB_HOME` | User directory, default ~/.nib (holds `auth.json`); the Codex CLI login location is unchanged |
+| `NIB_AUTH_ISSUER` / `NIB_AUTH_PORT` / `NIB_AUTH_NO_BROWSER` | Tests only: OAuth issuer URL (default `https://auth.openai.com`), callback port (default 1455), and skip the browser to force the device-code flow |
 | `NIB_PROVIDER` | codex / openai / anthropic / deepseek / xai / chat_completions or configured custom id |
 | `NIB_BASE_URL` | Current provider endpoint |
 | `NIB_CODEX_TRANSPORT` | websocket (default) or sse; overrides [codex].transport; Session SSE fallback after handshake/protocol failure; [transport](codex.md#responses-websocket-transport) |
@@ -161,9 +167,9 @@ Children inherit effective provider/model/limits through anonymous stdin, skippi
 | `NIB_CONTEXT_WINDOW` | Context tokens; DeepSeek default 1000000 |
 | `NIB_THINKING` | on / off; unset uses server defaults absent other reasoning settings |
 | `NIB_REASONING_EFFORT` | Reasoning level, e.g. low / high / max |
-| `CODEX_HOME` | Codex login directory containing `auth.json`; default `~/.codex/auth.json` |
-| `NIB_API_KEY` / `DEEPSEEK_API_KEY` | Legacy chat_completions prefers `NIB_API_KEY`; deepseek uses `DEEPSEEK_API_KEY`; environment only |
-| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `XAI_API_KEY` | Corresponding built-in keys; environment only |
+| `CODEX_HOME` | Codex CLI login directory containing `auth.json`, read as a fallback; default `~/.codex/auth.json` |
+| `NIB_API_KEY` / `DEEPSEEK_API_KEY` | Legacy chat_completions prefers `NIB_API_KEY`; deepseek uses `DEEPSEEK_API_KEY` or a stored key |
+| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `XAI_API_KEY` | Corresponding built-in keys; outrank `auth.json` |
 | `NIB_PATCHES_OFF` | Disable prompt patches: all or comma-separated ids; [compromises.md](compromises.md) |
 | `NIB_ISSUE_REPO` | `/reflect` publication repository or off; [reflect.md](reflect.md) |
 

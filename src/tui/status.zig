@@ -282,3 +282,12 @@ test "reasoning and text phases and attention colors describe known facts" {
         }
     }
 }
+
+test "signed-out footer names no model and a provider step hint joins the activity line" {
+    const t = std.testing;
+    const cfg: provider.Config = .{ .base_url = "", .api_key = "", .model = "gpt-6.1-sol" };
+    var text: Text = .{};
+    try t.expectEqualStrings("Not signed in", text.footer(.{ .cfg = cfg, .signed_out = true, .context = 10 }, 40));
+    try t.expectEqualStrings("gpt-6.1-sol", text.footer(.{ .cfg = cfg }, 40));
+    try t.expectEqualStrings("Waiting for ChatGPT sign-in · Esc cancels", text.format(.{ .cfg = cfg, .hint = "Waiting for ChatGPT sign-in · Esc cancels" }, false));
+}

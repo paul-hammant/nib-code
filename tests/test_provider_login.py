@@ -193,7 +193,7 @@ def test_add_endpoint(tmp):
 
 def opener(directory, log, silent=False):
     directory.mkdir()
-    script = directory / "xdg-open"
+    script = directory / ("open" if sys.platform == "darwin" else "xdg-open")
     if silent:
         script.write_text(f'#!/bin/sh\necho "$1" >> "{log}"\nexit 0\n')
     else:
