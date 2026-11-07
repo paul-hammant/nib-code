@@ -67,8 +67,17 @@ console.log(await tools.mcp("local.change", {text:"change"}));
 console.log(await tools.mcp_schema("local.added"));
 console.log((await tools.mcp("local.large", {text:"large"})).content.length);
 console.log(await tools.mcp("local.env", {}));'''
-                root, data, mock, ask = self.setup_case(self.stdio_config(legacy), code)
+                records = tempfile.TemporaryDirectory(prefix="nib-mcp-record-")
+                self.addCleanup(records.cleanup)
+                record = Path(records.name) / "requests.jsonl"
+                root, data, mock, ask = self.setup_case(self.stdio_config(legacy, record=record), code)
                 ask()
+                requests = [json.loads(line) for line in record.read_text().splitlines()]
+                run_pid = next(r["pid"] for r in requests if r["request"].get("method") == "tools/call")
+                methods = [(r["request"].get("method"), (r["request"].get("params") or {}).get("name")) for r in requests if r["pid"] == run_pid]
+                before_change = methods[:methods.index(("tools/call", "change"))]
+                self.assertNotIn(("tools/list", None), before_change, "calls reuse the discovered catalog")
+                self.assertIn(("tools/list", None), methods, "list_changed refreshes the catalog")
                 system = mock.requests[0][2]["messages"][0]["content"]
                 self.assertIn("local.echo(text: string) — Echo the input.", system)
                 self.assertIn("local.second()", system)

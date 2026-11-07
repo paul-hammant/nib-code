@@ -97,9 +97,10 @@ Detection is cached for each live connection and repeated after reconnection.
 The prompt index requires discovery before the model's first request. Discovery
 uses short-lived connections. Persistent stdio processes start lazily on the first
 Run call, are shared across Runs, and stop on Session exit. The server's state
-folder survives. Catalogs are paginated and refreshed before each schema lookup or
-call, so `notifications/tools/list_changed` and HTTP catalog changes take effect on
-the next use. There is no background notification stream or polling loop.
+folder survives. Catalogs are paginated and cached per server: a call lists tools
+again only after `notifications/tools/list_changed` arrives on that connection, or
+once when the named tool is missing from the cached list (servers that add tools
+without notifying). There is no background notification stream or polling loop.
 
 ## Stdio environment and sandbox
 

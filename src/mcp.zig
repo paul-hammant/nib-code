@@ -101,6 +101,10 @@ pub const Client = struct {
         const s = c.state(parts.server) orelse return error.UnknownServer;
         if (!s.config.enabled) return error.DisabledServer;
         try s.transport.ensure(a, cancel);
+        const cached = s.listed and !s.transport.dirty;
+        if (!cached) try c.refresh(s, cancel);
+        for (s.tools) |tool| if (std.mem.eql(u8, string(field(tool, "name")).?, parts.tool)) return field(tool, "inputSchema");
+        if (!cached) return error.UnknownTool;
         try c.refresh(s, cancel);
         for (s.tools) |tool| if (std.mem.eql(u8, string(field(tool, "name")).?, parts.tool)) return field(tool, "inputSchema");
         return error.UnknownTool;
