@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from mock_agent import USAGE
 from test_llm import records, wait_for
@@ -24,8 +25,23 @@ def alive(pid):
     status = Path(f"/proc/{pid}/stat")
     try:
         return status.read_text().split()[2] != "Z"
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return False
+
+
+class ProcessLivenessTests(unittest.TestCase):
+    def test_exit_between_stat_open_and_read(self):
+        child = subprocess.Popen(["sleep", "300"])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        self.assertTrue(alive(child.pid))
+        with Path(f"/proc/{child.pid}/stat").open() as status:
+            child.terminate()
+            child.wait()
+            # Keep the proc file open across reaping to reproduce Linux ESRCH on read.
+            with patch.object(Path, "open", return_value=status):
+                self.assertFalse(alive(child.pid))
+        self.assertFalse(alive(child.pid))
 
 
 class AgentTests:
