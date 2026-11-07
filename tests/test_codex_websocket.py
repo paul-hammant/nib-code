@@ -355,7 +355,7 @@ def test_tui_cancel(tmp):
         assert time.monotonic() - started < 2
         server.mode = "normal"
         terminal.send("resumed\r")
-        wait_for(lambda: finished(home, "finished🙂"), "Turn after Esc")
+        terminal.wait_turn("finished🙂")
         assert server.connections == 2 and len(server.requests) == 2
         assert "previous_response_id" not in server.requests[-1]["body"]
         # Same Session keeps the completed socket, but starts a fresh turn-state token.
@@ -368,9 +368,11 @@ def test_tui_cancel(tmp):
         session = next((home / "sessions").glob("[0-9a-f]" * 32 + ".jsonl")).stem
         wait_for(lambda: len([r for r in read_log(home, session) if r.get("model_ms") is not None]) == 2,
                  "second completed Turn")
+        terminal.wait_turn("finished🙂")
         terminal.send("/compact\r")
         wait_for(lambda: any(m.get("content", "").startswith("Earlier session summary:")
                              for r in read_log(home, session) for m in r.get("messages", [])), "manual compaction")
+        terminal.until(b"compacted context:")
         assert len(server.requests) == 4 and "previous_response_id" not in server.requests[-1]["body"]
         assert not server.requests[-1]["body"].get("tools")
         terminal.send("resumed\r")

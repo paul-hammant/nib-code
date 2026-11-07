@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 import tempfile
 import threading
-import time
 
 from test_files import js_call
 from test_interjections import Reply, Terminal, fixture, wait_for
@@ -33,8 +32,7 @@ def history(home, session=None):
 
 def done(terminal, home, text):
     wait_for(lambda: history(home)[-1].get("content") == text, text)
-    terminal.until(text.encode())
-    time.sleep(.15)
+    terminal.wait_turn(text)
 
 
 def undo(terminal, home, expected, session=None):

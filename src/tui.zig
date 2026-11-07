@@ -444,7 +444,7 @@ pub const App = struct {
             const line = try selected.?.line(gpa);
             defer gpa.free(line);
             try input.replace(gpa, line);
-            if (app.turn == null or commands.allowedWhileBusy(line)) submitted = try input.take(gpa);
+            if (app.turn == null or commands.allowedWhileBusy(line)) submitted = try input.take(gpa) else app.notice = "Turn running · retry command when it ends";
         } else if (k.matches(vaxis.Key.escape, .{})) {
             if (app.turn) |t| t.cancel.store(true, .release);
         } else if (k.matches(vaxis.Key.page_up, .{})) {
@@ -460,7 +460,7 @@ pub const App = struct {
         } else if (isNewline(k, app.pasting)) {
             try input.insert(gpa, "\n");
         } else if (k.matches(vaxis.Key.enter, .{})) {
-            if (app.turn == null or commands.parse(input.text()) == null or commands.allowedWhileBusy(input.text())) submitted = try input.take(gpa);
+            if (app.turn == null or commands.parse(input.text()) == null or commands.allowedWhileBusy(input.text())) submitted = try input.take(gpa) else app.notice = "Turn running · retry command when it ends";
         } else {
             _ = try input.key(gpa, k);
         }

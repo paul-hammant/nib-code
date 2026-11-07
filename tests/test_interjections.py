@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import pty
 import queue
+import re
 import select
 import shlex
 import signal
@@ -21,6 +22,8 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "zig-out/bin/nib"
+sys.path.insert(0, str(ROOT / "scripts"))
+from screen import screen
 
 
 def wait_for(check, description, timeout=10):
@@ -119,6 +122,17 @@ class Terminal:
         with self.output_changed:
             if not self.output_changed.wait_for(lambda: text in self.output, timeout=10):
                 raise AssertionError((text, self.child.poll(), self.output[-4000:]))
+
+    def wait_turn(self, text):
+        # The bill is appended only after the TUI consumes Turn completion.
+        with self.output_changed:
+            def rendered():
+                visible = "\n".join(screen(self.output, 120, 32))
+                start = visible.rfind(text)
+                return (start >= 0 and "Esc to cancel" not in visible and
+                        re.search(r"\d+ steps?.*?tokens", visible[start + len(text):], re.S))
+            if not self.output_changed.wait_for(rendered, timeout=10):
+                raise AssertionError((text, self.child.poll(), screen(self.output, 120, 32)))
 
     def send(self, text):
         os.write(self.master, text.encode())
@@ -272,6 +286,25 @@ def test_escape_restores_draft(tmp):
         wait_for(lambda: finished(home, "resent-final"), "resubmitted restored input")
 
 
+def test_busy_slash_notice(tmp):
+    tmp.mkdir()
+    for name, command in (("model", "/model openai/gpt-6.1-terra"),
+                          ("reflect", "/reflect focus")):
+        gated = Reply("busy-finished", gated=True)
+        with fixture(tmp / name, [gated]) as (terminal, home, _):
+            terminal.send("initial\r")
+            assert gated.received.wait(5)
+            terminal.send(command)
+            terminal.send("\r")
+            terminal.until("Turn running · retry command when it ends".encode())
+            assert command in "\n".join(screen(terminal.read(), 120, 32))
+            assert not gated.release.is_set()
+            gated.release.set()
+            terminal.wait_turn("busy-finished")
+            terminal.send("\x15/help\r")
+            terminal.until(b"/help")
+
+
 def test_tool_bytes_bill(tmp):
     code = "await Promise.all([tools.read({path:'a.txt'}), tools.read({path:'b.txt'})]); 'ok'"
     with fixture(tmp, [Reply("reading", code=code), Reply("bytes-final")]) as (terminal, home, _):
@@ -289,6 +322,6 @@ def test_tool_bytes_bill(tmp):
 
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="nib-interjections-") as directory:
-        for test in (test_during_run_and_resume, test_after_final_step, test_escape_restores_draft, test_tool_bytes_bill):
+        for test in (test_busy_slash_notice, test_during_run_and_resume, test_after_final_step, test_escape_restores_draft, test_tool_bytes_bill):
             test(Path(directory) / test.__name__)
             print(test.__name__ + ": ok")

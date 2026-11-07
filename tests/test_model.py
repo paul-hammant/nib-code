@@ -35,12 +35,14 @@ def test_model(tmp):
         assert [p.stem for p in logs()] == [original]
         terminal.send("again first\r")
         wait_for(lambda: completed(1), "first committed step")
+        terminal.wait_turn("mock answer")
         assert first.requests[-1][2]["model"] == "gpt-6.1-terra"
         terminal.send("/model anthropic/claude-sonnet-5-5\r")
         terminal.until(b"new session")
         wait_for(lambda: len(logs()) == 2, "new session")
         terminal.send("again second\r")
         wait_for(lambda: completed(2), "second committed step")
+        terminal.wait_turn("mock answer")
         assert second.requests[-1][2]["model"] == "claude-sonnet-5-5"
         assert len(first.requests) == 1
         messages = second.requests[-1][2]["messages"]
