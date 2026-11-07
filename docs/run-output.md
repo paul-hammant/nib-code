@@ -42,6 +42,10 @@ read returns { text, next_offset }, preserving requested offset/limit lines (def
 
 Search fields/UTF-8 columns: [ADR 0012](adr/0012-search-and-fetch-tools.md).
 
+## Images (`tools.view`)
+
+`view({ path })` returns only `{ ok, path, width, height, bytes }` to JS, or `{ ok: false, error }` as data for a missing file, unsupported format, file over 5 MB, a model without image input, or a Run that already viewed 4 images (`src/image.zig` `max_per_run`). Formats are png, jpeg, gif and webp; dimensions come from the file header and pixels are never decoded or resized. The image is stored in the Session and attached to the Run's tool result, so it reaches the next request as an image (encodings: [providers.md](providers.md#images)). Images do not count against the display budget; their request cost is estimated at 1500 tokens each. A Run that moves to the background keeps its text result; images viewed by it are not attached. The Run block lists `view <path> · <width>×<height>` beside read lines. `read` is unchanged and still rejects binary data.
+
 ## File replacement, Session versions, and cross-process coordination
 
 edit/write write complete contents to random same-directory `.nib-*` files, then atomic same-directory rename, cleaning up on failure. Preserve existing permission bits; follow symlinks to real targets without replacing links. New inodes break hard-link sharing; other links keep old contents. File tools do not fsync: atomic visibility is not power-loss durability. Configuration writes retain fsync.

@@ -21,6 +21,8 @@ from mock_llm_tool import codex_run
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "zig-out/bin/nib"
+PNG = b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(">II", 640, 480) + b"\x08\x06\x00\x00\x00"
+VIEW = {}
 
 
 def frame(payload, opcode=1, fin=True):
@@ -222,6 +224,8 @@ def response(inputs, response_id, mode, body):
             args["code"] = "await tools.sleep(300); console.log('idle result')"
         if mode == "idle-alive":
             args["code"] = "await tools.sleep(51000); console.log('idle result')"
+        if mode == "view":
+            args["code"] = "console.log(await tools.view({path: %s}))" % json.dumps(VIEW["path"])
         if mode == "fork":
             args["code"] = 'console.log(await tools.agent({prompt: "resumed", fork: true}))'
         if mode == "effort":
@@ -399,6 +403,19 @@ def main():
         assert steps[0]["full_reason"] == "first_request"
         assert all(s["transport"] == "websocket" and s["first_data_ms"] <= s["model_ms"] for s in steps)
         assert steps[1]["input_items"] == 1 and steps[1]["input_bytes"] == len(json.dumps(second["input"], ensure_ascii=False, separators=(",", ":")).encode())
+        VIEW["path"] = str(tmp / "shot.png")
+        (tmp / "shot.png").write_bytes(PNG)
+        data_url = "data:image/png;base64," + base64.b64encode(PNG).decode()
+        for transport in ("websocket", "sse"):
+            viewed, _, view_session, view_home = run_case(tmp, "view", home=tmp / f"view-{transport}", extra=dict(NIB_CODEX_TRANSPORT=transport))
+            second = viewed.requests[1]["body"]
+            output = next(i for i in second["input"] if i.get("type") == "custom_tool_call_output")["output"]
+            assert output[0]["type"] == "input_text" and output[1] == dict(type="input_image", image_url=data_url), output
+            if transport == "websocket":
+                assert second["previous_response_id"] == "resp-1-1" and [i["type"] for i in second["input"]] == ["custom_tool_call_output"], second
+            resumed_view, _, _, _ = run_case(tmp, "normal", resume=view_session, home=view_home, extra=dict(NIB_CODEX_TRANSPORT=transport))
+            replayed = next(i for i in resumed_view.requests[0]["body"]["input"] if i.get("type") == "custom_tool_call_output")["output"]
+            assert replayed[1] == dict(type="input_image", image_url=data_url), replayed
         for mode in ("background", "background-prefix", "background-ordered", "background-reconnect"):
             background, bg_steps, _, _ = run_case(tmp, mode)
             assert len(background.requests) == len(bg_steps) == 3, (mode, background.requests, bg_steps)

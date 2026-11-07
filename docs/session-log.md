@@ -34,6 +34,10 @@ Logs: `$NIB_HOME/sessions/<ID>.jsonl`, default ~/.nib/sessions/. Every new recor
 
 Both transports share `src/provider/cancel.zig` `std.Io.Select`: request task writes live sink, another checks cancel every 20 ms. Cancellation interrupts blocked connect/send/read I/O and joins cleanup before `error.Canceled`, without next-data waits. TUI Esc/ask signals share this, no read timeout/retry changes; commitInterrupted retains streamed text.
 
+## Images
+
+Images are stored in `$NIB_HOME/sessions/<ID>.images/` as `<content-hash>.<ext>` (directory 0700, files 0600). A message's optional `images` array holds references only: `{ path, name, media_type, bytes, width, height }`; user messages carry TUI attachments, tool messages carry `tools.view` images. Logs never contain base64. Resume reads the files when building requests; a file that is gone becomes `[image <name> unavailable: file is gone]`. Restored `view` summaries regain their dimensions from the same references. Background Runs do not attach images.
+
 ## Background task results
 
 Before agent/bash background start, synchronously append independent background: {id, kind: "agent"|"bash"|"run", state: "started"}. After result insertion append finished/ok; unfinished resume appends lost. Separate Session a1,a2…/b1,b2… counters share foreground/background per type. Resume scans lifecycles/bash/calls[].id and continues each prefix maximum, including old shared-counter logs without filling gaps. Records carry at/turn_step, changing no history/context_tokens. Results separately commit user source: "background", background_kind/id/ok before main requests. Optional `background_ok` lets TUI restore status despite truncated body JSON. Agent body [background agent a1 finished] newline plus truncated {ok,id,text,changes,error?}, no usage. Bash body `{exit_code,output}`, `{superseded_by}`, or {error}, no ok. Unfinished resume never restarts, inserting lost process-ended messages. Source metadata stays local; bodies reach models. No new Turns. Legacy `background_agent` remains countable.

@@ -1361,3 +1361,23 @@ test "background Run completion restores its superseded bash on the originating 
     try restoreToolSummaries(a, &history, .{ .messages = &.{result} }, &replacements);
     try t.expectEqualStrings("b2", history[0].bash_replacements.?[0].superseded_by.?);
 }
+
+test "replay restores image references and view summaries" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const data =
+        \\{"from":0,"messages":[{"role":"system","content":"s"}],"provider":"codex","model":"m"}
+        \\{"from":1,"messages":[{"role":"user","content":"look [Image #1]","images":[{"path":"/x/a.png","name":"a.png","media_type":"image/png","bytes":3,"width":4,"height":3}]},{"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"run","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c","content":"ok","images":[{"path":"/x/b.png","name":"shot.png","media_type":"image/png","bytes":3,"width":640,"height":480}]}],"calls":[{"name":"view","start_ms":0,"end_ms":1,"ok":true,"run_index":0,"path":"shot.png"}]}
+        \\
+    ;
+    var history: std.ArrayList(provider.Message) = .empty;
+    var tokens: u64 = 0;
+    _ = try replay(a, a, data, &history, &tokens);
+    try t.expectEqualStrings("a.png", history.items[1].images.?[0].name);
+    try t.expectEqual(@as(u32, 640), history.items[3].images.?[0].width);
+    try t.expectEqualStrings("shot.png · 640×480", history.items[3].tool_summary.?.files[0].path);
+    const written = try std.fmt.allocPrint(a, "{f}", .{std.json.fmt(history.items[1], .{ .emit_null_optional_fields = false })});
+    try t.expect(std.mem.indexOf(u8, written, "\"images\":[{\"path\":\"/x/a.png\"") != null);
+}

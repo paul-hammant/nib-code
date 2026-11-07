@@ -43,9 +43,23 @@ api_key_env = "MYSITE_API_KEY"
 
 Put the key in environment `MYSITE_API_KEY`; configuration stores its name only. protocol/base_url/model/context_window are required; unauthenticated local services omit api_key_env. It is an environment name, not a key. Ids use ASCII letters/digits/underscore/hyphen; collisions with built-ins or custom error.
 
+`vision = true|false` (custom services only) declares whether the model accepts image input. Omitted, it follows the protocol: true for `responses` and `anthropic_messages`, false for `chat_completions`, where endpoints differ. Built-in rows carry it in the provider/model table: false for `chat_completions` and DeepSeek, true elsewhere. Without vision, attaching an image in the TUI is refused with a notice and `tools.view` returns `{ ok: false, error }`; images already in a resumed Session history become text placeholders.
+
 Chat Completions appends `/chat/completions` to `base_url`; Responses appends `/responses`; Anthropic Messages appends `/v1/messages`, so use a service-root Messages URL. All accept trailing /. Custom Responses uses function Run for endpoints lacking custom tools.
 
 The existing TOML subset adds `[providers.<id>]`, not general nested tables/arrays. Duplicate sections/keys, unknown keys, wrong types, missing fields report path/line. Built-ins still use same-name sections such as [openai], overriding model/base_url/context_window only; Codex extras remain in its documentation.
+
+## Images
+
+User attachments and `tools.view` images are stored under the Session ([session-log.md](session-log.md#images)) and base64-encoded only when a request is built; a missing file becomes a text placeholder.
+
+| Protocol | User attachment | `tools.view` result |
+| --- | --- | --- |
+| `anthropic_messages` | `image` blocks (base64 source) after the text block | `image` blocks inside the `tool_result` content; the cache breakpoint stays on the last block |
+| `responses` | `input_image` data URLs after the `input_text` item | Codex and OpenAI: `input_image` items in the `function_call_output`/`custom_tool_call_output` `output` array; other Responses services: a user message with the image right after the tool outputs |
+| `chat_completions` | `image_url` data-URL parts after the text part | a user message with the images right after the last tool message of the group (tool messages cannot carry images) |
+
+Compaction summarizes older images: the summary request replaces each with `[image shot.png 1280×720 omitted]`. Context estimates count 1500 tokens per image.
 
 ## Effort and reasoning continuation
 

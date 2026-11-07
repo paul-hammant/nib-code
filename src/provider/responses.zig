@@ -332,7 +332,7 @@ fn requestBody(gpa: std.mem.Allocator, io: std.Io, cfg: p.Config, cache_key: []c
             } else try w.print("{s}{f}", .{ separator, std.json.fmt(.{ .type = kind, .call_id = m.tool_call_id, .output = m.content orelse "" }, .{}) });
             separator = ",";
             if (pending_images.items.len > 0 and !(index + 1 < messages.len and std.mem.eql(u8, messages[index + 1].role, "tool"))) {
-                try w.print(",{f}", .{std.json.fmt(.{ .role = "user", .content = pending_images.items }, .{})});
+                try w.print(",{f}", .{std.json.fmt(.{ .role = "user", .content = pending_images.items }, .{ .emit_null_optional_fields = false })});
                 pending_images.clearRetainingCapacity();
             }
             continue;
@@ -1037,6 +1037,7 @@ test "Responses images use input_image and tool outputs only where the API accep
             const follow = input[3].object.get("content").?.array.items;
             try t.expectEqualStrings("[tool result image: shot.png]", follow[0].object.get("text").?.string);
             try t.expectEqualStrings("input_image", follow[1].object.get("type").?.string);
+            try t.expect(follow[1].object.get("text") == null);
         }
     }
 }

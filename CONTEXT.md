@@ -38,6 +38,10 @@ _Avoid_: background agent (a subagent), detached Run
 After this Session modifies files, a newly started identical bash command supersedes an active execution from an earlier Run. Supersession means only that the old execution stopped, not that validation passed or failed; it does not terminate subsequent code in the original Run.
 _Avoid_: validation passed, validation failed (when describing supersession itself)
 
+**Image**:
+A png, jpeg, gif or webp file attached to a user message in the TUI or to a Run result by `tools.view`. The Session log stores a reference to a copy under the Session, never the pixels; requests encode it on demand.
+_Avoid_: screenshot, attachment (too broad)
+
 **Sandbox**:
 The isolated environment for one Run, with no host capabilities except Tools; destroyed when the Run ends.
 _Avoid_: VM, REPL, kernel (these imply persistent state across Runs)

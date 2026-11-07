@@ -173,17 +173,22 @@ def finished(home, text):
 
 
 @contextlib.contextmanager
-def fixture(tmp, replies):
+def fixture(tmp, replies, config=None, provider="chat_completions", environment=None):
     tmp.mkdir()
     home = tmp / "home"
+    if config:
+        home.mkdir()
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("NIB_", "DEEPSEEK_", "OPENAI_", "CODEX_"))}
     with Mock(replies) as mock:
         thread = threading.Thread(target=mock.serve_forever, daemon=True)
         thread.start()
-        env.update(NIB_PROVIDER="chat_completions", NIB_API_KEY="mock",
-                   NIB_BASE_URL=f"http://127.0.0.1:{mock.server_port}", NIB_HOME=str(home),
-                   HOME=str(tmp), TERM="xterm-256color")
+        url = f"http://127.0.0.1:{mock.server_port}"
+        if config:
+            (home / "config.toml").write_text(config.replace("{url}", url))
+        env.update(NIB_PROVIDER=provider, NIB_API_KEY="mock",
+                   NIB_BASE_URL=url, NIB_HOME=str(home),
+                   HOME=str(tmp), TERM="xterm-256color", **(environment or {}))
         terminal = Terminal(tmp, env)
         try:
             yield terminal, home, env

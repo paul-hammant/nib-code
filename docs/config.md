@@ -71,9 +71,9 @@ context_window = 128000
 api_key_env = "MYSITE_API_KEY"
 ```
 
-openai uses `OPENAI_API_KEY`; mysite uses MYSITE_API_KEY. Never write key contents to files. Custom protocol/base_url/model/context_window are required; omit api_key_env for unauthenticated local services. `NIB_PROVIDER`=mysite overrides the top-level choice.
+openai uses `OPENAI_API_KEY`; mysite uses MYSITE_API_KEY. Never write key contents to files. Custom protocol/base_url/model/context_window are required; omit api_key_env for unauthenticated local services. Optional `vision = true|false` declares image input support ([providers.md](providers.md)). `NIB_PROVIDER`=mysite overrides the top-level choice.
 
-Dependency-free TOML subset: blank lines, # comments, single-line double-quoted strings (escapes `\"`, `\\`, `\n`), signed decimal integers with underscore grouping, true/false. Only [skills] name keys accept booleans; other keys use strings/positive integers and reject booleans by type. Accept only top-level provider/effort; model/base_url/context_window in built-in same-name sections; [codex] additionally transport = "sse"|"websocket", reasoning_summary = "off"|"auto", run_tool = "custom"|"function"; the [limits] keys below; [skills] switches; and `[providers.<id>]` protocol/base_url/model/context_window/api_key_env. No arrays, general nested tables, multiline strings, or full TOML. Unknown/duplicate keys/sections and malformed syntax report path/line rather than silently ignoring.
+Dependency-free TOML subset: blank lines, # comments, single-line double-quoted strings (escapes `\"`, `\\`, `\n`), signed decimal integers with underscore grouping, true/false. Only [skills] name keys and a custom provider's `vision` accept booleans; other keys use strings/positive integers and reject booleans by type. Accept only top-level provider/effort; model/base_url/context_window in built-in same-name sections; [codex] additionally transport = "sse"|"websocket", reasoning_summary = "off"|"auto", run_tool = "custom"|"function"; the [limits] keys below; [skills] switches; and `[providers.<id>]` protocol/base_url/model/context_window/api_key_env/vision (boolean). No arrays, general nested tables, multiline strings, or full TOML. Unknown/duplicate keys/sections and malformed syntax report path/line rather than silently ignoring.
 
 ## [skills]
 

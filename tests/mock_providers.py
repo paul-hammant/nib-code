@@ -6,8 +6,8 @@ import threading
 
 
 class Mock:
-    def __init__(self, protocol, custom_run=False, key="fake-provider-key"):
-        self.protocol, self.custom_run, self.key = protocol, custom_run, key
+    def __init__(self, protocol, custom_run=False, key="fake-provider-key", code=None):
+        self.protocol, self.custom_run, self.key, self.code = protocol, custom_run, key, code
         self.requests = []
         self.errors = []
         owner = self
@@ -62,7 +62,7 @@ class Mock:
         again = "again" in prompt
         tool = not child and not tool_result and not again
         answer = "child answer" if child else "mock answer"
-        code = 'console.log(await tools.agent({prompt:"child"})); console.log(await tools.llm({prompt:"pure"}));' if "delegate" in prompt else 'console.log("roundtrip");'
+        code = 'console.log(await tools.agent({prompt:"child"})); console.log(await tools.llm({prompt:"pure"}));' if "delegate" in prompt else (self.code or 'console.log("roundtrip");')
         if tool_result and not child:
             if self.protocol == "responses":
                 assert any(m.get("type") == "reasoning" and m.get("encrypted_content") == "opaque-response" for m in messages)
