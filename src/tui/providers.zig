@@ -71,14 +71,10 @@ fn logout(app: *App, svc: auth.Service) !void {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const out = auth.signOut(arena.allocator(), app.io, app.environ, app.session.options.home, svc.id) catch |err| return app.report(.err, "could not sign out: {s}", .{@errorName(err)});
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(gpa);
-    try text.print(gpa, "{s} · {s}", .{ svc.name, if (out.removed) "signed out" else "nothing stored by nib" });
-    if (out.env_name) |name| try text.print(gpa, " · key still set in {s}", .{name});
-    if (out.cli_login) try text.appendSlice(gpa, " · Codex CLI login kept");
+    const text = try auth.signOutText(arena.allocator(), svc.name, out);
     if (out.removed and std.mem.eql(u8, svc.id, app.cfg.name()) and out.env_name == null and !out.cli_login) dropKey(app);
     app.refreshCredentials();
-    try app.transcript.add(gpa, .info, text.items);
+    try app.transcript.add(gpa, .info, text);
 }
 
 /// The running Session must stop using a key that was just removed from the store.

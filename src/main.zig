@@ -56,6 +56,10 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
         try stdout.print("nib {s}\n", .{@import("build_options").version});
         return stdout.flush();
     }
+    if (args.len > 1 and (std.mem.eql(u8, args[1], "login") or std.mem.eql(u8, args[1], "logout"))) {
+        const cli = @import("auth/cli.zig");
+        return if (args[1].len == 5) cli.login(init, args[2..], stdout) else cli.logout(init, args[2..], stdout);
+    }
     if (args.len > 1 and std.mem.eql(u8, args[1], "replay")) {
         return @import("replay.zig").run(init, args[2..], stdout);
     }
@@ -130,8 +134,15 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
         return;
     }
     if (effort) |value| try cfg.setEffort(value);
-    if (ask and cfg.missingKey()) {
-        detail.* = try std.fmt.allocPrint(gpa, "{s}: no API key; set {s}.", .{ cfg.name(), cfg.api_key_env orelse "the provider key environment variable" });
+    if (ask and !config.credentialed(init.arena.allocator(), init.io, cfg)) {
+        const explicit = init.environ_map.get("NIB_PROVIDER") != null;
+        if (!explicit) {
+            detail.* = try gpa.dupe(u8, "No provider · run nib login");
+        } else if (cfg.provider == .codex) {
+            detail.* = try gpa.dupe(u8, "codex: not signed in; run nib login codex.");
+        } else {
+            detail.* = try std.fmt.allocPrint(gpa, "{s}: no API key; set {s} or run nib login {s}.", .{ cfg.name(), cfg.api_key_env orelse "the provider key environment variable", cfg.name() });
+        }
         return error.MissingApiKey;
     }
     options.undo_enabled = !ask;
@@ -206,6 +217,8 @@ const help =
     \\  nib [options]                         Open the TUI
     \\  nib ask [options] <prompt|->           Ask once; - reads stdin
     \\  nib js <code>                         Run sandbox JavaScript
+    \\  nib login [service] [--device]        Sign in or store a key; no service lists them
+    \\  nib logout <service>                  Remove nib's stored credential
     \\  nib replay <session-id> --all [--json] Replay recorded Runs offline
     \\
     \\Options:
@@ -218,6 +231,7 @@ const help =
     \\
     \\TUI: Enter sends · Shift+Enter adds a line · Esc cancels · Ctrl+O opens latest details · click a Run
     \\Type / for commands, /help for keys, /status for timing and cache details.
+    \\First run: nib, then /provider to sign in; /model picks a model.
     \\Setup: see README.md and docs/config.md.
     \\
 ;
@@ -242,6 +256,8 @@ fn errorMessage(err: anyerror) []const u8 {
         error.ReplayMetadataNotFound => "No replay recording found for this Run; recording must be enabled when the original Run executes.",
         error.ReplayRunNotFound => "Run not found; step counts assistant messages across the entire session (1-based), run indexes tool_calls (0-based).",
         error.InvalidReasoningEffort, error.MissingReasoningEffort => "Use --effort default|off|none|minimal|low|medium|high|xhigh|max (model support varies).",
+        error.UnknownService => "Unknown service · run nib login to list services",
+        error.EmptyKey => "API key cannot be empty",
         error.SessionProviderMismatch => "Cannot resume this session with a different provider; use its original NIB_PROVIDER or start a new session.",
         error.SessionModelMismatch => "Cannot resume this Codex session with a different model; set NIB_MODEL to its original model or start a new session.",
         error.UnknownCodexModelContextWindow => "Unknown Codex model context window; set NIB_CONTEXT_WINDOW explicitly (see pi model catalog).",
@@ -257,6 +273,7 @@ test {
     _ = @import("auth/codex.zig");
     _ = @import("auth/login.zig");
     _ = @import("auth/models.zig");
+    _ = @import("auth/cli.zig");
     _ = sandbox;
     _ = provider;
     _ = config;

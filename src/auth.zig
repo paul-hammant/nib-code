@@ -121,7 +121,7 @@ pub fn setKey(a: std.mem.Allocator, io: std.Io, home: []const u8, id: []const u8
     var doc: store.Doc = try .load(a, io, file);
     defer doc.deinit();
     try doc.setKey(id, key);
-    try doc.save(io, a, file);
+    try doc.saveSecret(io, a, file);
 }
 
 pub const Signout = struct {
@@ -145,7 +145,7 @@ pub fn signOut(a: std.mem.Allocator, io: std.Io, env: *const Env, home: []const 
     var doc: store.Doc = try .load(a, io, file);
     defer doc.deinit();
     const removed = doc.removeKey(id);
-    if (removed) try doc.save(io, a, file);
+    if (removed) try doc.saveSecret(io, a, file);
     var names: []const []const u8 = &.{};
     for (provider.definitions) |d| if (std.mem.eql(u8, d.id, id)) {
         names = d.api_key_env;
@@ -157,6 +157,15 @@ pub fn signOut(a: std.mem.Allocator, io: std.Io, env: *const Env, home: []const 
         };
     };
     return .{ .removed = removed, .env_name = env_name };
+}
+
+/// The confirmation after signing out; `out` says what is left behind.
+pub fn signOutText(a: std.mem.Allocator, name: []const u8, out: Signout) ![]u8 {
+    var text: std.ArrayList(u8) = .empty;
+    try text.print(a, "{s} · {s}", .{ name, if (out.removed) "signed out" else "nothing stored by nib" });
+    if (out.env_name) |env_name| try text.print(a, " · key still set in {s}", .{env_name});
+    if (out.cli_login) try text.appendSlice(a, " · Codex CLI login kept");
+    return text.toOwnedSlice(a);
 }
 
 pub fn knownService(list: []const Service, id: []const u8) bool {

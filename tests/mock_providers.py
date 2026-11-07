@@ -6,8 +6,10 @@ import threading
 
 
 class Mock:
-    def __init__(self, protocol, custom_run=False, key="fake-provider-key", code=None):
+    def __init__(self, protocol, custom_run=False, key="fake-provider-key", code=None, models=None):
         self.protocol, self.custom_run, self.key, self.code = protocol, custom_run, key, code
+        self.models = models
+        self.gets = []
         self.requests = []
         self.errors = []
         owner = self
@@ -15,6 +17,18 @@ class Mock:
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *_):
                 pass
+
+            def do_GET(self):
+                owner.gets.append((self.path, dict(self.headers)))
+                expected = "/v1/models" if owner.protocol == "anthropic_messages" else "/models"
+                if owner.models is None or self.path.split("?")[0] != expected:
+                    return self.send_error(404)
+                body = json.dumps({"data": owner.models}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
 
             def do_POST(self):
                 try:

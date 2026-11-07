@@ -6,6 +6,8 @@ pub const Options = struct {
     /// Creation permissions for a missing target, subject to umask.
     permissions: Io.File.Permissions = .default_file,
     sync: bool = false,
+    /// Give an existing target the creation permissions instead of keeping its own.
+    force_permissions: bool = false,
 };
 
 /// The caller owns the returned path. Missing suffixes are allowed.
@@ -96,7 +98,7 @@ pub fn replace(io: Io, allocator: Allocator, path: []const u8, data: []const u8,
         if (!renamed) dir.deleteFile(io, name) catch {};
     }
     try file.writeStreamingAll(io, data);
-    if (existing) |stat| try file.setPermissions(io, stat.permissions);
+    if (existing) |stat| if (!options.force_permissions) try file.setPermissions(io, stat.permissions);
     const written = try file.stat(io);
     if (options.sync) try file.sync(io);
     file.close(io);

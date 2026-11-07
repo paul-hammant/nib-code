@@ -131,7 +131,7 @@ fn refresh(gpa: std.mem.Allocator, io: std.Io, client: *std.http.Client, loc: Lo
     defer doc.deinit();
     var stamp: [20]u8 = undefined;
     try doc.setTokens(tokens, store.timestamp(&stamp, now(io)));
-    try doc.save(io, gpa, old.file);
+    if (old.source == .nib) try doc.saveSecret(io, gpa, old.file) else try doc.save(io, gpa, old.file);
     return load(gpa, io, loc);
 }
 
@@ -150,7 +150,7 @@ pub fn save(a: std.mem.Allocator, io: std.Io, nib_home: []const u8, exchanged: o
         .id_token = exchanged.id_token,
         .account_id = account,
     }, store.timestamp(&stamp, now(io)));
-    try doc.save(io, a, file);
+    try doc.saveSecret(io, a, file);
     return if (claim.plan) |plan| try a.dupe(u8, plan) else null;
 }
 
@@ -161,7 +161,7 @@ pub fn remove(gpa: std.mem.Allocator, io: std.Io, nib_home: []const u8) !bool {
     var doc: store.Doc = try .load(gpa, io, file);
     defer doc.deinit();
     if (!doc.removeTokens()) return false;
-    try doc.save(io, gpa, file);
+    try doc.saveSecret(io, gpa, file);
     return true;
 }
 

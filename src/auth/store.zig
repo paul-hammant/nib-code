@@ -44,12 +44,21 @@ pub const Doc = struct {
         return doc;
     }
 
-    /// Atomic replace, mode 0600.
+    /// Atomic replace; a new file is 0600 and an existing file keeps its mode.
     pub fn save(d: *Doc, io: std.Io, gpa: std.mem.Allocator, file_path: []const u8) !void {
+        return d.write(io, gpa, file_path, false);
+    }
+
+    /// Atomic replace that leaves the file 0600 even if it was wider before.
+    pub fn saveSecret(d: *Doc, io: std.Io, gpa: std.mem.Allocator, file_path: []const u8) !void {
+        return d.write(io, gpa, file_path, true);
+    }
+
+    fn write(d: *Doc, io: std.Io, gpa: std.mem.Allocator, file_path: []const u8, force: bool) !void {
         const bytes = try std.json.Stringify.valueAlloc(gpa, d.root, .{ .whitespace = .indent_2 });
         defer gpa.free(bytes);
         if (std.fs.path.dirname(file_path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
-        _ = try atomic_file.replace(io, gpa, file_path, bytes, .{ .permissions = .fromMode(0o600), .sync = true });
+        _ = try atomic_file.replace(io, gpa, file_path, bytes, .{ .permissions = .fromMode(0o600), .sync = true, .force_permissions = force });
     }
 
     fn object(d: *Doc) *std.json.ObjectMap {
@@ -153,7 +162,7 @@ test "store round trip keeps unknown fields, mode 0600 and removes cleanly" {
     try testing.expectEqual(@as(usize, 0), doc.object().count());
     try doc.setKey("anthropic", "fake-key-1");
     try doc.object().put(doc.arena.allocator(), "future", .{ .integer = 7 });
-    try doc.save(testing.io, testing.allocator, p);
+    try doc.saveSecret(testing.io, testing.allocator, p);
     doc.deinit();
 
     var again: Doc = try .load(testing.allocator, testing.io, p);
@@ -168,6 +177,11 @@ test "store round trip keeps unknown fields, mode 0600 and removes cleanly" {
     try again.save(testing.io, testing.allocator, p);
     const stat = try std.Io.Dir.cwd().statFile(testing.io, p, .{});
     try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(@intFromEnum(stat.permissions) & 0o777)));
+    try tmp.dir.setFilePermissions(testing.io, "nib/auth.json", .fromMode(0o644), .{});
+    try again.save(testing.io, testing.allocator, p);
+    try testing.expectEqual(@as(u32, 0o644), @as(u32, @intCast(@intFromEnum((try std.Io.Dir.cwd().statFile(testing.io, p, .{})).permissions) & 0o777)));
+    try again.saveSecret(testing.io, testing.allocator, p);
+    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(@intFromEnum((try std.Io.Dir.cwd().statFile(testing.io, p, .{})).permissions) & 0o777)));
     var third: Doc = try .load(testing.allocator, testing.io, p);
     defer third.deinit();
     try testing.expectEqualStrings("acc", third.tokens().?.account_id);
