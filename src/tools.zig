@@ -452,6 +452,13 @@ pub const Tools = struct {
             defer gpa.free(canonical_custom);
             if (std.mem.eql(u8, path, canonical_custom)) return error.CredentialAccessDenied;
         }
+        if (t.data_home) |dir| {
+            const store_path = try std.fs.path.join(gpa, &.{ dir, "auth.json" });
+            defer gpa.free(store_path);
+            const canonical_store = try normalizedPath(t.io, gpa, store_path);
+            defer gpa.free(canonical_store);
+            if (std.mem.eql(u8, path, canonical_store)) return error.CredentialAccessDenied;
+        }
     }
 
     /// Canonical credential file paths for walks, which never follow symlinks.
@@ -459,6 +466,7 @@ pub const Tools = struct {
         var out: std.ArrayList([]const u8) = .empty;
         try out.append(a, try normalizedPath(t.io, a, try std.fs.path.join(a, &.{ t.home, ".codex", "auth.json" })));
         if (t.codexHome()) |home| try out.append(a, try normalizedPath(t.io, a, try std.fs.path.join(a, &.{ home, "auth.json" })));
+        if (t.data_home) |dir| try out.append(a, try normalizedPath(t.io, a, try std.fs.path.join(a, &.{ dir, "auth.json" })));
         return out.items;
     }
 };

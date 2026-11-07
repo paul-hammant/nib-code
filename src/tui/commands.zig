@@ -5,10 +5,12 @@ const reflect = @import("reflect.zig");
 const config = @import("../config.zig");
 const ChangeText = @import("transcript.zig").ChangeText;
 const provider = @import("../provider.zig");
+const auth = @import("../auth.zig");
+const providers = @import("providers.zig");
 
-pub const Command = enum { help, new, @"resume", compact, undo, model, effort, copy, reflect, js, tasks, stop, status, skills };
+pub const Command = enum { help, new, @"resume", compact, undo, provider, model, effort, copy, reflect, js, tasks, stop, status, skills };
 
-pub const Choices = enum { none, models, efforts, sessions, tasks };
+pub const Choices = enum { none, models, efforts, sessions, tasks, services };
 
 pub const Group = enum { send, view, session };
 
@@ -33,7 +35,8 @@ pub const specs = std.enums.EnumArray(Command, Spec).init(.{
     .@"resume" = .{ .args = "<id>", .help = "resume a session", .choices = .sessions, .needs_arg = true },
     .undo = .{ .help = "undo last edited Turn; edit/write only", .while_busy = true },
     .compact = .{ .help = "compact earlier history" },
-    .model = .{ .args = "[provider[/model]]", .help = "switch model", .choices = .models, .needs_arg = true },
+    .provider = .{ .args = "[service]", .help = "sign in and switch service", .choices = .services, .needs_arg = true },
+    .model = .{ .args = "<model>", .help = "switch model of this service", .choices = .models, .needs_arg = true },
     .effort = .{ .group = .send, .args = "[level]", .help = "reasoning effort", .choices = .efforts },
     .copy = .{ .group = .view, .help = "copy last answer", .while_busy = true },
     .reflect = .{ .args = "[focus]", .help = "publish issue drafts: yyydddkkk/nib-code" },
@@ -123,7 +126,7 @@ pub const effort_choices = blk: {
 
 /// Prefix matches for `input`: command names before the first space,
 /// then argument choices for commands that have them.
-pub fn candidates(input: []const u8, sessions: []const Choice, tasks: []const Choice, models: []const Choice, out: []Candidate) []Candidate {
+pub fn candidates(input: []const u8, sessions: []const Choice, tasks: []const Choice, models: []const Choice, services: []const Choice, out: []Candidate) []Candidate {
     if (input.len == 0 or input[0] != '/' or std.mem.indexOfScalar(u8, input, '\n') != null) return out[0..0];
     var n: usize = 0;
     const space = std.mem.indexOfScalar(u8, input, ' ') orelse {
@@ -148,6 +151,7 @@ pub fn candidates(input: []const u8, sessions: []const Choice, tasks: []const Ch
         .sessions => sessions,
         .tasks => tasks,
         .models => models,
+        .services => services,
     };
     for (choices) |choice| {
         if (n == out.len) break;
@@ -189,6 +193,67 @@ pub fn helpText(gpa: std.mem.Allocator, issue_repo: ?[]const u8) ![]u8 {
 
 const testing = std.testing;
 
+/// A bare word is a model of the current service; `service/model` and `service model` still select a service too.
+fn modelSelection(app: *App, arg: []const u8) !config.ModelSelection {
+    var words = std.mem.tokenizeAny(u8, arg, " \t\n");
+    const first = words.next() orelse return error.InvalidModelArgument;
+    const second = words.next();
+    if (second != null) return config.parseModel(arg);
+    if (std.mem.indexOfScalar(u8, first, '/')) |slash| {
+        var arena: std.heap.ArenaAllocator = .init(app.gpa);
+        defer arena.deinit();
+        const list = auth.services(arena.allocator(), app.io, app.environ, app.session.options.home) catch &.{};
+        if (slash > 0 and slash + 1 < first.len and auth.find(list, first[0..slash]) != null) return config.parseModel(arg);
+    }
+    return .{ .provider = app.cfg.name(), .model = first };
+}
+
+/// Saves and applies a service/model choice; a new Session starts when Steps already exist.
+/// `note` replaces the confirmation line's service/model text.
+pub fn select(app: *App, selection: config.ModelSelection, note: ?[]const u8) !void {
+    const gpa = app.gpa;
+    const session = app.session;
+    const a = app.config_allocator orelse gpa;
+    var cfg = config.saveModel(a, app.io, app.environ, session.options.home, selection) catch |err| {
+        return app.report(.err, "could not select model: {s} · check provider and context_window", .{@errorName(err)});
+    };
+    cfg.thinking = app.cfg.thinking;
+    cfg.reasoning_effort = app.cfg.reasoning_effort;
+    const fresh = session.log.steps > 0;
+    const previous = session.cfg;
+    session.cfg = cfg;
+    if (fresh) {
+        session.reopen(null) catch |err| {
+            session.cfg = previous;
+            return app.report(.err, "could not open session: {s}", .{@errorName(err)});
+        };
+        session.tools.recovery.enabled = true;
+        app.transcript.clear(gpa);
+        app.background_count = 0;
+        app.usage = .{};
+        app.steps = 0;
+        app.last_summary = null;
+    } else {
+        session.tools.cfg = cfg;
+        const cwd = try std.process.currentPathAlloc(app.io, a);
+        session.initializeHistory(cwd) catch |err| {
+            session.cfg = previous;
+            session.tools.cfg = previous;
+            return app.report(.err, "model saved, but could not update session: {s}", .{@errorName(err)});
+        };
+        session.log.provider = cfg.provider;
+        session.log.custom_provider = cfg.custom_provider;
+        session.log.model = cfg.model;
+    }
+    app.cfg = session.cfg;
+    app.context = session.context_tokens;
+    app.refreshCredentials();
+    const override = if (app.environ.get("NIB_PROVIDER") != null and app.environ.get("NIB_MODEL") != null) " · NIB_PROVIDER/NIB_MODEL override at startup" else if (app.environ.get("NIB_PROVIDER") != null) " · NIB_PROVIDER overrides at startup" else if (app.environ.get("NIB_MODEL") != null) " · NIB_MODEL overrides at startup" else "";
+    if (note) |text| {
+        try app.report(.info, "{s}{s}{s}", .{ text, if (fresh) " · new session" else "", override });
+    } else try app.report(.info, "{s} · {s}{s}{s}", .{ cfg.name(), cfg.model, if (fresh) " · new session" else "", override });
+}
+
 pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
     const gpa = app.gpa;
     const session = app.session;
@@ -202,7 +267,10 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
             try app.report(.info, "Skills: {d} on · {d} found{s}", .{ skills.count, skills.found, suffix.items });
             try app.report(.info, "Sandbox: {s}", .{session.tools.sandboxStatus()});
             var text: @import("bill.zig").Text = .{};
-            try app.report(.info, "Provider {s} · {s} · effort {s} · context {d}%\n{s}", .{ app.cfg.name(), app.cfg.model, app.cfg.effectiveEffort(), app.context * 100 / @max(app.cfg.context_window, 1), if (app.last_summary) |summary| text.details(summary) else "No completed turn yet." });
+            var credential_arena: std.heap.ArenaAllocator = .init(gpa);
+            defer credential_arena.deinit();
+            const arena_a = credential_arena.allocator();
+            try app.report(.info, "Provider {s} · {s} · {s} · effort {s} · context {d}%\n{s}", .{ app.cfg.name(), app.cfg.model, auth.describe(arena_a, app.io, app.cfg), app.cfg.effectiveEffort(), app.context * 100 / @max(app.cfg.context_window, 1), if (app.last_summary) |summary| text.details(summary) else "No completed turn yet." });
         },
         .skills => {
             var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -308,43 +376,11 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
             try app.vx.copyToSystemClipboard(app.w, answer, gpa);
             try app.report(.info, "copied {d} bytes (needs a terminal with OSC 52 clipboard support)", .{answer.len});
         },
+        .provider => try providers.command(app, arg),
         .model => {
-            const selection = config.parseModel(arg) catch return app.transcript.add(gpa, .err, "usage: /model <provider> [model]");
-            const a = app.config_allocator orelse gpa;
-            var cfg = config.saveModel(a, app.io, app.environ, session.options.home, selection) catch |err| {
-                return app.report(.err, "could not select model: {s} · check provider and context_window", .{@errorName(err)});
-            };
-            cfg.thinking = app.cfg.thinking;
-            cfg.reasoning_effort = app.cfg.reasoning_effort;
-            const fresh = session.log.steps > 0;
-            const previous = session.cfg;
-            session.cfg = cfg;
-            if (fresh) {
-                session.reopen(null) catch |err| {
-                    session.cfg = previous;
-                    return app.report(.err, "could not open session: {s}", .{@errorName(err)});
-                };
-                session.tools.recovery.enabled = true;
-                app.transcript.clear(gpa);
-                app.background_count = 0;
-                app.usage = .{};
-                app.steps = 0;
-                app.last_summary = null;
-            } else {
-                session.tools.cfg = cfg;
-                const cwd = try std.process.currentPathAlloc(app.io, a);
-                session.initializeHistory(cwd) catch |err| {
-                    session.cfg = previous;
-                    session.tools.cfg = previous;
-                    return app.report(.err, "model saved, but could not update session: {s}", .{@errorName(err)});
-                };
-                session.log.provider = cfg.provider;
-                session.log.custom_provider = cfg.custom_provider;
-                session.log.model = cfg.model;
-            }
-            app.cfg = session.cfg;
-            app.context = session.context_tokens;
-            try app.report(.info, "{s} · {s}{s}{s}", .{ cfg.name(), cfg.model, if (fresh) " · new session" else "", if (app.environ.get("NIB_PROVIDER") != null and app.environ.get("NIB_MODEL") != null) " · NIB_PROVIDER/NIB_MODEL override at startup" else if (app.environ.get("NIB_PROVIDER") != null) " · NIB_PROVIDER overrides at startup" else if (app.environ.get("NIB_MODEL") != null) " · NIB_MODEL overrides at startup" else "" });
+            if (arg.len == 0) return app.transcript.add(gpa, .err, "usage: /model <model> · type /model and a space to pick one");
+            const selection = modelSelection(app, arg) catch return app.transcript.add(gpa, .err, "usage: /model <model>");
+            try select(app, selection, null);
         },
         .effort => {
             if (arg.len > 0) {
@@ -386,7 +422,7 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
             app.activity = .start(app.io, .compacting);
         },
         .reflect => {
-            if (app.cfg.missingKey()) return app.transcript.add(gpa, .err, "no API key");
+            if (!app.credentialed()) return app.transcript.add(gpa, .err, "No provider · /provider to sign in");
             const log_path = try std.fmt.allocPrint(gpa, "{s}/sessions/{s}.jsonl", .{ session.options.home, session.id });
             defer gpa.free(log_path);
             const text = try reflect.prompt(gpa, session.id, log_path, reflect.issueRepo(app) orelse reflect.Issues.default_repo, arg);
@@ -415,15 +451,15 @@ test "parse tells commands from paths and messages" {
 
 test "candidates complete command names, then argument choices" {
     var buf: [16]Candidate = undefined;
-    try testing.expectEqual(@as(usize, std.enums.values(Command).len), candidates("/", &.{}, &.{}, &.{}, &buf).len);
-    const co = candidates("/co", &.{}, &.{}, &.{}, &buf);
+    try testing.expectEqual(@as(usize, std.enums.values(Command).len), candidates("/", &.{}, &.{}, &.{}, &.{}, &buf).len);
+    const co = candidates("/co", &.{}, &.{}, &.{}, &.{}, &buf);
     try testing.expectEqual(@as(usize, 2), co.len);
     try testing.expectEqualStrings("/copy", co[0].label);
     try testing.expectEqualStrings("/compact", co[1].label);
-    try testing.expectEqual(@as(usize, 0), candidates("/js 1 + 1", &.{}, &.{}, &.{}, &buf).len);
-    try testing.expectEqual(@as(usize, 0), candidates("hi /co", &.{}, &.{}, &.{}, &buf).len);
+    try testing.expectEqual(@as(usize, 0), candidates("/js 1 + 1", &.{}, &.{}, &.{}, &.{}, &buf).len);
+    try testing.expectEqual(@as(usize, 0), candidates("hi /co", &.{}, &.{}, &.{}, &.{}, &buf).len);
 
-    const efforts = candidates("/effort h", &.{}, &.{}, &.{}, &buf);
+    const efforts = candidates("/effort h", &.{}, &.{}, &.{}, &.{}, &buf);
     try testing.expectEqual(@as(usize, 1), efforts.len);
     try testing.expectEqualStrings("high", efforts[0].value.?);
     const line = try efforts[0].line(testing.allocator);
@@ -431,19 +467,19 @@ test "candidates complete command names, then argument choices" {
     try testing.expectEqualStrings("/effort high", line);
 
     const sessions = [_]Choice{ .{ .value = "abc123", .label = "abc1", .detail = "now" }, .{ .value = "def456", .label = "def4", .detail = "1h" } };
-    const picked = candidates("/resume d", &sessions, &.{}, &.{}, &buf);
+    const picked = candidates("/resume d", &sessions, &.{}, &.{}, &.{}, &buf);
     try testing.expectEqual(@as(usize, 1), picked.len);
     try testing.expectEqualStrings("def456", picked[0].value.?);
 }
 
 test "accepting a command waits for required arguments only" {
     var buf: [8]Candidate = undefined;
-    const js = candidates("/j", &.{}, &.{}, &.{}, &buf)[0];
+    const js = candidates("/j", &.{}, &.{}, &.{}, &.{}, &buf)[0];
     try testing.expect(!js.runs());
     const tab = try js.completion(testing.allocator);
     defer testing.allocator.free(tab);
     try testing.expectEqualStrings("/js ", tab);
-    const effort = candidates("/ef", &.{}, &.{}, &.{}, &buf)[0];
+    const effort = candidates("/ef", &.{}, &.{}, &.{}, &.{}, &buf)[0];
     try testing.expect(effort.runs());
     const help = try helpText(testing.allocator, reflect.Issues.default_repo);
     defer testing.allocator.free(help);
@@ -455,11 +491,11 @@ test "task commands run while busy and stop completes current task ids" {
     try testing.expect(allowedWhileBusy("/stop r3"));
     var buf: [16]Candidate = undefined;
     const tasks = [_]Choice{.{ .value = "r3", .label = "r3", .detail = "Run" }};
-    const selected = candidates("/stop r", &.{}, &tasks, &.{}, &buf);
+    const selected = candidates("/stop r", &.{}, &tasks, &.{}, &.{}, &buf);
     try testing.expectEqual(@as(usize, 1), selected.len);
     try testing.expectEqualStrings("r3", selected[0].value.?);
     try testing.expect(selected[0].runs());
-    try testing.expect(!candidates("/stop", &.{}, &tasks, &.{}, &buf)[0].runs());
+    try testing.expect(!candidates("/stop", &.{}, &tasks, &.{}, &.{}, &buf)[0].runs());
 }
 
 test "help groups commands and states the real issue destination or disabled state" {
@@ -476,13 +512,27 @@ test "help groups commands and states the real issue destination or disabled sta
 
 test "model choices filter and complete without running the bare command" {
     var buf: [16]Candidate = undefined;
-    const models = [_]Choice{ .{ .value = "openai/gpt-6.1-sol", .label = "openai · gpt-6.1-sol", .detail = "current" }, .{ .value = "anthropic/claude-sonnet-5-5", .label = "anthropic · claude-sonnet-5-5", .detail = "" } };
-    try testing.expect(!allowedWhileBusy("/model openai"));
-    try testing.expect(!candidates("/model", &.{}, &.{}, &models, &buf)[0].runs());
-    const selected = candidates("/model openai", &.{}, &.{}, &models, &buf);
+    const models = [_]Choice{ .{ .value = "gpt-6.1-sol", .label = "gpt-6.1-sol", .detail = "current" }, .{ .value = "gpt-6.1-terra", .label = "gpt-6.1-terra", .detail = "" } };
+    try testing.expect(!allowedWhileBusy("/model gpt-6.1-sol"));
+    try testing.expect(!candidates("/model", &.{}, &.{}, &models, &.{}, &buf)[0].runs());
+    const selected = candidates("/model gpt-6.1-s", &.{}, &.{}, &models, &.{}, &buf);
     try testing.expectEqual(@as(usize, 1), selected.len);
     try testing.expectEqualStrings("current", selected[0].detail);
     const line = try selected[0].line(testing.allocator);
     defer testing.allocator.free(line);
-    try testing.expectEqualStrings("/model openai/gpt-6.1-sol", line);
+    try testing.expectEqualStrings("/model gpt-6.1-sol", line);
+}
+
+test "service choices complete /provider and run on Enter" {
+    var buf: [16]Candidate = undefined;
+    const services = [_]Choice{ .{ .value = "codex", .label = "Codex", .detail = "signed in · ChatGPT" }, .{ .value = "anthropic", .label = "Anthropic", .detail = "—" } };
+    try testing.expect(!allowedWhileBusy("/provider anthropic"));
+    try testing.expect(!candidates("/provider", &.{}, &.{}, &.{}, &services, &buf)[0].runs());
+    const all = candidates("/provider ", &.{}, &.{}, &.{}, &services, &buf);
+    try testing.expectEqual(@as(usize, 2), all.len);
+    const one = candidates("/provider an", &.{}, &.{}, &.{}, &services, &buf);
+    try testing.expect(one[0].runs());
+    const line = try one[0].line(testing.allocator);
+    defer testing.allocator.free(line);
+    try testing.expectEqualStrings("/provider anthropic", line);
 }

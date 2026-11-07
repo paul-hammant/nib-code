@@ -27,14 +27,19 @@ const protected_paths = [_][]const u8{
 };
 
 pub fn check(command: []const u8, home: []const u8) Verdict {
-    switch (checkCredentials(command, null)) {
+    switch (checkCredentials(command, null, null)) {
         .allow => {},
         .deny => |why| return .{ .deny = why },
     }
     return checkDepth(command, home, 0);
 }
 
-pub fn checkCredentials(command: []const u8, codex_home: ?[]const u8) Verdict {
+pub fn checkCredentials(command: []const u8, codex_home: ?[]const u8, nib_home: ?[]const u8) Verdict {
+    if (std.mem.indexOf(u8, command, "auth.json") != null) {
+        const named = std.mem.indexOf(u8, command, ".nib") != null or std.mem.indexOf(u8, command, "NIB_HOME") != null;
+        const located = if (nib_home) |dir| dir.len > 0 and std.mem.indexOf(u8, command, dir) != null else false;
+        if (named or located) return .{ .deny = "access to nib credentials" };
+    }
     if (std.mem.indexOf(u8, command, ".codex") != null or
         std.mem.indexOf(u8, command, "$CODEX_HOME") != null or
         std.mem.indexOf(u8, command, "${CODEX_HOME}") != null)
@@ -551,14 +556,22 @@ test "Codex credential commands are denied for default and custom homes" {
         "cat ~/.codex/auth.json",                                        "jq . /home/u/.codex/auth.json",
         "cat \"$CODEX_HOME/auth.json\"",                                 "cat ${CODEX_HOME}/auth.json",
         "python -c 'print(open(\"/tmp/codex-home/auth.json\").read())'",
-    }) |command| try testing.expect(checkCredentials(command, "/tmp/codex-home") == .deny);
-    try testing.expect(checkCredentials("cat project/auth.json", "/tmp/codex-home") == .allow);
+    }) |command| try testing.expect(checkCredentials(command, "/tmp/codex-home", null) == .deny);
+    try testing.expect(checkCredentials("cat project/auth.json", "/tmp/codex-home", null) == .allow);
+}
+
+test "nib credential store references are denied for default and custom homes" {
+    for ([_][]const u8{ "cat ~/.nib/auth.json", "jq . $NIB_HOME/auth.json", "cat \"${NIB_HOME}/auth.json\"", "python3 -c 'open(\"/srv/nibdata/auth.json\")'" }) |command| {
+        try testing.expect(checkCredentials(command, null, "/srv/nibdata") == .deny);
+    }
+    try testing.expect(checkCredentials("cat ~/.nib/config.toml", null, "/srv/nibdata") == .allow);
+    try testing.expect(checkCredentials("cat project/auth.json", null, "/srv/nibdata") == .allow);
 }
 
 test "credential directory globs and recursive searches are denied" {
-    try testing.expect(checkCredentials("cat ~/.codex/*", null) == .deny);
-    try testing.expect(checkCredentials("rg . \"$CODEX_HOME\"", null) == .deny);
-    try testing.expect(checkCredentials("rg . /tmp/custom-codex", "/tmp/custom-codex") == .deny);
+    try testing.expect(checkCredentials("cat ~/.codex/*", null, null) == .deny);
+    try testing.expect(checkCredentials("rg . \"$CODEX_HOME\"", null, null) == .deny);
+    try testing.expect(checkCredentials("rg . /tmp/custom-codex", "/tmp/custom-codex", null) == .deny);
 }
 
 fn repeat(comptime text: []const u8, comptime count: usize) [text.len * count]u8 {
@@ -656,7 +669,7 @@ test "heredocs do not relax command word or credential checks" {
     try expectTooLong("cat <<'EOF'\ndata\nEOF\necho " ++ repeat("x ", 256));
     try testing.expectEqualStrings("command portion has more than 256 shell words; write long scripts to a file with tools.write and run that file", too_long);
     try expectDenied("cat <<'EOF'\n.codex/auth.json\nEOF\n");
-    try testing.expect(checkCredentials("cat <<'EOF'\n/tmp/private-codex/auth.json\nEOF\n", "/tmp/private-codex") == .deny);
+    try testing.expect(checkCredentials("cat <<'EOF'\n/tmp/private-codex/auth.json\nEOF\n", "/tmp/private-codex", null) == .deny);
 }
 
 test "arithmetic shifts are not heredoc declarations" {

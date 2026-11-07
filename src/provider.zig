@@ -74,6 +74,8 @@ pub const Sandbox = struct {
     writable: []const []const u8 = &.{},
 };
 
+pub const KeySource = enum { none, env, store };
+
 pub const Config = struct {
     sandbox: Sandbox = .{},
     enabled_skills: []const []const u8 = &.{},
@@ -83,6 +85,11 @@ pub const Config = struct {
     custom_protocol: Protocol = .chat_completions,
     custom_vision: ?bool = null,
     api_key_env: ?[]const u8 = null,
+    key_source: KeySource = .none,
+    /// Where nib's own `auth.json` lives; null in tests that never sign in.
+    nib_home: ?[]const u8 = null,
+    /// Test hook for the ChatGPT OAuth issuer (NIB_AUTH_ISSUER).
+    auth_issuer: ?[]const u8 = null,
     codex_transport: Transport = .websocket,
     codex_run_tool: enum { custom, function } = .custom,
     reasoning_summary: enum { off, auto } = .off,
@@ -142,6 +149,11 @@ pub const Config = struct {
         if (cfg.protocol() == .anthropic_messages) return @import("provider/anthropic.zig").effort(cfg) orelse "server default";
         if (cfg.thinking == false) return "off";
         return cfg.reasoning_effort orelse if (cfg.thinking == true) "on (server default effort)" else "server default";
+    }
+
+    /// What a 401 asks the user to check, without revealing any key.
+    pub fn keyHint(cfg: Config) []const u8 {
+        return if (cfg.key_source == .store) "the key stored by nib (run nib login)" else cfg.api_key_env orelse "API key";
     }
 
     pub fn missingKey(cfg: Config) bool {

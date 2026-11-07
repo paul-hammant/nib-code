@@ -96,7 +96,7 @@ pub fn stream(
     if (response.head.status.class() != .success) {
         const status = @backingInt(response.head.status);
         if (status == 401) {
-            detail.* = try std.fmt.allocPrint(gpa, "{s}: HTTP 401; check {s}.", .{ cfg.name(), cfg.api_key_env orelse "API key" });
+            detail.* = try std.fmt.allocPrint(gpa, "{s}: HTTP 401; check {s}.", .{ cfg.name(), cfg.keyHint() });
             return error.HttpStatus;
         }
         const text = response_reader.allocRemaining(gpa, .limited(64 * 1024)) catch "";

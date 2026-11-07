@@ -188,7 +188,7 @@ pub fn stream(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.
     const reader = response.reader(buffer);
     const status = @backingInt(response.head.status);
     if (response.head.status.class() != .success) {
-        detail.* = try std.fmt.allocPrint(gpa, "{s}: HTTP {d}; check {s}.", .{ cfg.name(), status, cfg.api_key_env orelse "API key" });
+        detail.* = try std.fmt.allocPrint(gpa, "{s}: HTTP {d}; check {s}.", .{ cfg.name(), status, cfg.keyHint() });
         return if (status == 429 or status >= 500) error.HttpTransient else error.HttpStatus;
     }
     var observed = try body_reader.Reader.init(gpa, reader, monitor, sink);

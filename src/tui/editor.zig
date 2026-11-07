@@ -51,6 +51,7 @@ pub const Editor = struct {
     draft: ?Snapshot = null,
     draft_cursor: usize = 0,
     top_row: u16 = 0,
+    placeholder: []const u8 = "Ask about this project · / for commands",
 
     pub fn deinit(e: *Editor, gpa: std.mem.Allocator) void {
         e.buf.deinit(gpa);
@@ -308,7 +309,7 @@ pub const Editor = struct {
         if (at.row < e.top_row) e.top_row = at.row;
         if (at.row >= @as(u32, e.top_row) + win.height) e.top_row = at.row - win.height + 1;
         if (e.buf.items.len == 0) {
-            _ = win.printSegment(.{ .text = "Ask about this project · / for commands", .style = .{ .dim = true } }, .{ .wrap = .none });
+            _ = win.printSegment(.{ .text = e.placeholder, .style = .{ .dim = true } }, .{ .wrap = .none });
         } else {
             _ = win.child(.{ .y_off = -@as(i17, @intCast(e.top_row)) }).print(&.{.{ .text = e.buf.items }}, .{ .wrap = .grapheme });
         }

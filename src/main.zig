@@ -110,6 +110,7 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
         const envelope = try std.json.parseFromSliceLeaky(@import("tools/agent/input.zig").Input, init.arena.allocator(), data, .{});
         cfg = envelope.config;
         if (cfg.api_key_env) |key_env| cfg.api_key = init.environ_map.get(key_env) orelse "";
+        try config.applyStore(init.arena.allocator(), init.io, options.home, &cfg);
         prompt = envelope.prompt;
         options.fork = envelope.fork;
         options.undo_dir = envelope.undo_dir;
@@ -250,6 +251,12 @@ fn errorMessage(err: anyerror) []const u8 {
 
 test {
     _ = @import("replay.zig");
+    _ = @import("auth.zig");
+    _ = @import("auth/store.zig");
+    _ = @import("auth/oauth.zig");
+    _ = @import("auth/codex.zig");
+    _ = @import("auth/login.zig");
+    _ = @import("auth/models.zig");
     _ = sandbox;
     _ = provider;
     _ = config;
@@ -268,6 +275,8 @@ test {
     _ = @import("tui/transcript.zig");
     _ = @import("tui/viewport.zig");
     _ = @import("tui/menu.zig");
+    _ = @import("tui/provider_flow.zig");
+    _ = @import("tui/providers.zig");
     _ = @import("tui/status.zig");
     _ = @import("tui/view.zig");
     _ = @import("tui/selection.zig");

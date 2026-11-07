@@ -17,6 +17,10 @@ pub const Menu = struct {
     sessions_loaded: bool = false,
     tasks: []const commands.Choice = &.{},
     models: []const commands.Choice = &.{},
+    services: []const commands.Choice = &.{},
+    /// A fixed list that replaces the `/` candidates until unpinned; owns its strings.
+    pinned: []commands.Candidate = &.{},
+    pin_arena: std.heap.ArenaAllocator,
     gpa: std.mem.Allocator,
     /// `@` completions: set while the cursor ends an `@` mention.
     mentioning: bool = false,
@@ -32,7 +36,7 @@ pub const Menu = struct {
     file_fresh: bool = false,
 
     pub fn init(gpa: std.mem.Allocator) Menu {
-        return .{ .arena = .init(gpa), .gpa = gpa, .file_arena = .init(gpa) };
+        return .{ .arena = .init(gpa), .gpa = gpa, .file_arena = .init(gpa), .pin_arena = .init(gpa) };
     }
 
     pub fn deinit(m: *Menu) void {
@@ -41,12 +45,38 @@ pub const Menu = struct {
             m.gpa.destroy(ix);
         }
         m.file_arena.deinit();
+        m.pin_arena.deinit();
         m.arena.deinit();
     }
 
+    pub fn isPinned(m: Menu) bool {
+        return m.pinned.len > 0;
+    }
+
+    pub fn pin(m: *Menu, rows: []const commands.Candidate) !void {
+        m.unpin();
+        const a = m.pin_arena.allocator();
+        const copy = try a.alloc(commands.Candidate, rows.len);
+        for (rows, copy) |row, *out| {
+            out.* = row;
+            out.label = try a.dupe(u8, row.label);
+            out.detail = try a.dupe(u8, row.detail);
+            if (row.value) |value| out.value = try a.dupe(u8, value);
+        }
+        m.pinned = copy;
+        m.sel = 0;
+    }
+
+    pub fn unpin(m: *Menu) void {
+        m.pinned = &.{};
+        _ = m.pin_arena.reset(.retain_capacity);
+        m.sel = 0;
+    }
+
     pub fn items(m: *Menu, input: []const u8) []commands.Candidate {
+        if (m.pinned.len > 0) return m.pinned;
         if (m.closed) return m.buf[0..0];
-        const slash = commands.candidates(input, m.sessions, m.tasks, m.models, &m.buf);
+        const slash = commands.candidates(input, m.sessions, m.tasks, m.models, m.services, &m.buf);
         if (slash.len > 0 or !m.mentioning) return slash;
         return m.file_buf[0..m.file_len];
     }
@@ -130,14 +160,19 @@ pub const Menu = struct {
         if (std.mem.startsWith(u8, input, "/model ")) {
             _ = m.arena.reset(.retain_capacity);
             const a = m.arena.allocator();
-            const env = session.options.environ orelse return;
-            const entries = try @import("../config.zig").modelEntries(a, io, env, session.options.home);
+            const entries = try @import("../config.zig").modelEntries(a, io, session.options.home, session.cfg);
             const choices = try a.alloc(commands.Choice, entries.len);
             for (entries, choices) |entry, *choice| {
-                const active = std.mem.eql(u8, entry.provider, session.cfg.name()) and std.mem.eql(u8, entry.model, session.cfg.model);
-                choice.* = .{ .value = try std.fmt.allocPrint(a, "{s}/{s}", .{ entry.provider, entry.model }), .label = try std.fmt.allocPrint(a, "{s} · {s}", .{ entry.provider, entry.model }), .detail = if (active) "current" else "" };
+                const active = std.mem.eql(u8, entry.model, session.cfg.model);
+                choice.* = .{ .value = entry.model, .label = entry.model, .detail = if (active) "current" else "" };
             }
             m.models = choices;
+            return;
+        }
+        if (std.mem.startsWith(u8, input, "/provider ")) {
+            _ = m.arena.reset(.retain_capacity);
+            const env = session.options.environ orelse return;
+            m.services = try @import("providers.zig").serviceChoices(m.arena.allocator(), io, env, session.options.home, session.cfg.name(), input["/provider ".len..]);
             return;
         }
         if (std.mem.startsWith(u8, input, "/stop ")) {

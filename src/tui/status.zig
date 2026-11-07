@@ -68,6 +68,10 @@ pub const Status = struct {
     /// A transient message, such as a copy confirmation.
     notice: ?[]const u8 = null,
     detail: []const u8 = "",
+    /// What an open /provider step asks for; replaces nothing, it is appended to the activity line.
+    hint: []const u8 = "",
+    /// No usable credentials: the footer says so instead of naming a model.
+    signed_out: bool = false,
     revision: usize = 0,
     new_output: bool = false,
 
@@ -112,6 +116,10 @@ pub const Text = struct {
         if (scrolled) {
             if (w.end > 0) w.writeAll(" · ") catch {};
             w.writeAll(if (s.new_output) "New output below · PgDn to return" else "↑ history · PgDn to return") catch {};
+        }
+        if (s.hint.len > 0) {
+            if (w.end > 0) w.writeAll(" · ") catch {};
+            w.writeAll(s.hint) catch {};
         }
         if (s.notice) |notice| {
             if (w.end > 0) w.writeAll(" · ") catch {};
@@ -162,6 +170,7 @@ pub const Text = struct {
     }
 
     pub fn footer(text: *Text, s: Status, width: u16) []const u8 {
+        if (s.signed_out) return if (width >= 14) "Not signed in" else "";
         var line = if (s.context > 0) std.fmt.bufPrint(&text.status, "{s} · context {d}%", .{ s.cfg.model, s.context * 100 / @max(s.cfg.context_window, 1) }) catch "" else s.cfg.model;
         while (@import("vaxis").gwidth.gwidth(line, .unicode) > width) {
             const separator = std.mem.lastIndexOf(u8, line, " · ") orelse return "";

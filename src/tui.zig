@@ -17,6 +17,9 @@ const selection = @import("tui/selection.zig");
 const reflect = @import("tui/reflect.zig");
 const image = @import("image.zig");
 const clipboard = @import("tui/clipboard.zig");
+const providers = @import("tui/providers.zig");
+const provider_flow = @import("tui/provider_flow.zig");
+const config = @import("config.zig");
 const Turn = @import("tui/turn.zig").Turn;
 const Ticker = @import("tui/turn.zig").Ticker;
 const Frames = @import("tui/frames.zig").Frames;
@@ -61,6 +64,8 @@ pub const Event = union(enum) {
     issue: []u8,
     issues_done,
     paths_ready,
+    /// A sign-in or model-listing job finished; freed with the event.
+    flow: *provider_flow.Result,
 
     pub fn flushesVisible(event: Event) bool {
         return switch (event) {
@@ -72,7 +77,7 @@ pub const Event = union(enum) {
     pub fn refresh(event: Event) Frames.Refresh {
         return switch (event) {
             .tick => .animation,
-            .key_press, .paste_end, .mouse, .winsize, .color_report, .color_scheme, .done, .failed, .issues_done => .immediate,
+            .key_press, .paste_end, .mouse, .winsize, .color_report, .color_scheme, .done, .failed, .issues_done, .flow => .immediate,
             else => .content,
         };
     }
@@ -101,6 +106,10 @@ pub const Event = union(enum) {
                 var changes = b.changes;
                 changes.deinit(gpa);
                 if (b.tool_summary) |summary| summary.deinit(gpa);
+            },
+            .flow => |r| {
+                r.deinit(gpa);
+                gpa.destroy(r);
             },
             .key_press, .winsize, .paste_start, .paste_end, .mouse, .color_report, .color_scheme, .tick, .tool_activity, .model_activity, .user_inserted, .done, .turn_end, .usage, .issues_done, .paths_ready => {},
         }
@@ -155,15 +164,16 @@ pub fn run(init: std.process.Init, session: *Session) !void {
         .menu = .init(gpa),
         .activity = .start(io, .thinking),
         .context = session.context_tokens,
+        .flow = .{ .gpa = gpa },
     };
     defer app.deinit();
+    app.refreshCredentials();
     app.menu.wake = .{ .ctx = &app, .call = pathsReady };
 
     try app.transcript.addHistory(gpa, session.history.items);
     for (session.history.items) |m| {
         if (m.source != .undo and std.mem.eql(u8, m.role, "user")) try app.input.remember(gpa, m.content orelse "");
     }
-    if (app.cfg.missingKey()) try app.transcript.add(gpa, .err, "No API key: set the active provider key environment variable. /js <code> still works.");
 
     var frames: Frames = .{};
     while (true) {
@@ -228,6 +238,12 @@ pub const App = struct {
     pending_bill: ?TurnSummary = null,
     last_summary: ?TurnSummary = null,
     turn_runs: usize = 0,
+    flow: provider_flow.Flow = .{ .gpa = undefined },
+    /// No usable credentials for the current service; see refreshCredentials.
+    signed_out: bool = false,
+    prompt_view: Editor = .{ .placeholder = "" },
+    prompt_text: std.ArrayList(u8) = .empty,
+    flow_hint: [256]u8 = undefined,
 
     const command = commands.execute;
     const saveReflection = reflect.saveReflection;
@@ -240,6 +256,7 @@ pub const App = struct {
             t.cancel.store(true, .release);
             t.finish();
         }
+        app.flow.deinit();
         app.stopReflecting();
         app.clearStepEffort();
         if (app.issues) |job| job.finish();
@@ -249,7 +266,20 @@ pub const App = struct {
         app.menu.deinit();
         app.transcript.deinit(app.gpa);
         app.input.deinit(app.gpa);
+        app.prompt_view.deinit(app.gpa);
+        app.prompt_text.deinit(app.gpa);
         app.paste_buf.deinit(app.gpa);
+    }
+
+    pub fn refreshCredentials(app: *App) void {
+        var arena: std.heap.ArenaAllocator = .init(app.gpa);
+        defer arena.deinit();
+        app.signed_out = !config.credentialed(arena.allocator(), app.io, app.cfg);
+    }
+
+    pub fn credentialed(app: *App) bool {
+        app.refreshCredentials();
+        return !app.signed_out;
     }
 
     fn idleProgress(ctx: *anyopaque, progress: @import("session/events.zig").Progress) !void {
@@ -270,9 +300,13 @@ pub const App = struct {
             },
             .paste_end => {
                 app.pasting = false;
-                if (!try app.attachPastedFile(app.paste_buf.items)) try app.input.paste(gpa, app.paste_buf.items);
-                app.menu.inputChanged(app.input.text());
-                app.menu.closed = true;
+                if (app.flow.takesText()) {
+                    try providers.pasted(app, app.paste_buf.items);
+                } else {
+                    if (!try app.attachPastedFile(app.paste_buf.items)) try app.input.paste(gpa, app.paste_buf.items);
+                    app.menu.inputChanged(app.input.text());
+                    app.menu.closed = true;
+                }
                 app.paste_buf.clearRetainingCapacity();
             },
             .mouse => |m| {
@@ -298,6 +332,7 @@ pub const App = struct {
                 }
             },
             .paths_ready => {},
+            .flow => |r| try providers.result(app, r),
             .tick => if (app.turn == null) {
                 app.session.tools.progress.sink = .{ .ctx = app, .emit = idleProgress };
                 defer app.session.tools.progress.sink = null;
@@ -441,6 +476,10 @@ pub const App = struct {
         const input = &app.input;
         if (k.matches('c', .{ .ctrl = true })) return false;
         if (k.matches('d', .{ .ctrl = true }) and input.text().len == 0) return false;
+        if (app.flow.active() or app.menu.isPinned()) {
+            try providers.key(app, k);
+            return true;
+        }
         app.menu.sync(app.io, input, app.session);
         const selected = app.menu.selected(input.text());
         const before = std.hash.Wyhash.hash(0, input.text());
@@ -480,7 +519,9 @@ pub const App = struct {
         } else if (isNewline(k, app.pasting)) {
             try input.insert(gpa, "\n");
         } else if (k.matches(vaxis.Key.enter, .{})) {
-            if (input.imageCount() > 0 and !app.cfg.vision()) {
+            if (input.text().len > 0 and commands.parse(input.text()) == null and !app.credentialed()) {
+                try providers.openMenu(app);
+            } else if (input.imageCount() > 0 and !app.cfg.vision()) {
                 app.notice = std.fmt.bufPrint(&app.notice_buf, "{s} has no image input · remove the [Image] blocks", .{app.cfg.model}) catch null;
             } else if (input.imageCount() > 0 and app.turn != null) {
                 app.notice = "Turn running · images send with the next message";
@@ -553,9 +594,9 @@ pub const App = struct {
                 .known => |c| app.command(c.command, c.arg, line),
             };
         }
-        if (app.cfg.missingKey()) {
+        if (!app.credentialed()) {
             gpa.free(line);
-            return app.transcript.add(gpa, .err, "no API key");
+            return app.transcript.add(gpa, .err, "No provider · /provider to sign in");
         }
         if (app.turn != null) {
             defer gpa.free(line);
@@ -677,12 +718,18 @@ pub const App = struct {
     fn render(app: *App) !void {
         try app.menu.load(app.io, app.input.text(), app.session);
         app.menu.sync(app.io, &app.input, app.session);
+        var visible_input: *Editor = &app.input;
+        if (app.flow.takesText()) {
+            try app.flow.display(&app.prompt_text, app.gpa);
+            try app.prompt_view.replace(app.gpa, app.prompt_text.items);
+            visible_input = &app.prompt_view;
+        }
         const menu = app.menu.items(app.input.text());
         for (menu) |*candidate| if (candidate.command == .reflect and candidate.value == null) {
             candidate.detail = commands.reflectHelp(&app.reflect_help, reflect.issueRepo(app));
         };
         if (app.scroll.pending != 0 and (!app.selection.active or app.selection.history == null)) app.selection.clear();
-        app.body = view.drawFrame(app.vx.window(), app.transcript.entries.items, &app.input, &app.scroll, menu, @min(app.menu.sel, menu.len -| 1), .{
+        app.body = view.drawFrame(app.vx.window(), app.transcript.entries.items, visible_input, &app.scroll, menu, @min(app.menu.sel, menu.len -| 1), .{
             .cfg = app.cfg,
             .user_bg = app.user_bg,
             .usage = app.usage,
@@ -692,6 +739,8 @@ pub const App = struct {
             .busy = if (app.turn != null) app.activity.label(app.io) else null,
             .notice = app.notice,
             .detail = app.activityDetail(),
+            .hint = if (app.flow.active()) app.flow.hint(&app.flow_hint) else if (app.menu.isPinned()) "Choose a service · Enter selects · Esc cancels" else "",
+            .signed_out = app.signed_out,
             .revision = app.transcript.revision,
         }, &app.status_text);
         if (app.selection.active and app.selection.history != null) {
@@ -742,6 +791,8 @@ test "wheel scrolls during history selection and ignores non-press wheel events"
     vx.screen = try vaxis.Screen.init(gpa, .{ .cols = 8, .rows = 3, .x_pixel = 0, .y_pixel = 0 });
     defer vx.screen.deinit(gpa);
     var app: App = undefined;
+    app.flow = .{ .gpa = std.testing.allocator };
+    app.signed_out = false;
     app.gpa = gpa;
     app.vx = &vx;
     app.selection = .{};
@@ -773,6 +824,8 @@ test "wheel scrolls during history selection and ignores non-press wheel events"
 test "bracketed paste buffers newline and slash keys without executing them" {
     const gpa = std.testing.allocator;
     var app: App = undefined;
+    app.flow = .{ .gpa = std.testing.allocator };
+    app.signed_out = false;
     app.gpa = gpa;
     app.input = .{};
     defer app.input.deinit(gpa);
@@ -798,6 +851,8 @@ test "bracketed paste buffers newline and slash keys without executing them" {
 test "usage snapshots refresh the footer without reading the running Session" {
     const t = std.testing;
     var app: App = undefined;
+    app.flow = .{ .gpa = std.testing.allocator };
+    app.signed_out = false;
     app.gpa = t.allocator;
     app.usage = .{ .prompt_tokens = 99999, .completion_tokens = 999 };
     app.context = 800;
@@ -869,6 +924,8 @@ test "turn_end forwards by value and defers bills until terminal content" {
     turn.gpa = t.allocator;
     turn.loop = &loop;
     var app: App = undefined;
+    app.flow = .{ .gpa = std.testing.allocator };
+    app.signed_out = false;
     app.gpa = t.allocator;
     app.transcript = .{};
     defer app.transcript.deinit(t.allocator);
@@ -902,6 +959,8 @@ test "insertion notifications reach the queued user entry" {
     var turn: Turn = undefined;
     turn.loop = &loop;
     var app: App = undefined;
+    app.flow = .{ .gpa = std.testing.allocator };
+    app.signed_out = false;
     app.gpa = t.allocator;
     app.transcript = .{};
     defer app.transcript.deinit(t.allocator);
@@ -919,6 +978,8 @@ test "background events own their payload and maintain running count" {
     turn.gpa = t.allocator;
     turn.loop = &loop;
     var app: App = undefined;
+    app.flow = .{ .gpa = std.testing.allocator };
+    app.signed_out = false;
     app.gpa = t.allocator;
     app.transcript = .{};
     app.background_count = 0;
@@ -1033,6 +1094,8 @@ test "shutdown closes a full queue before joining the canceled Turn" {
 test "Step events own effort and Runs keep their generating Step metadata" {
     const t = std.testing;
     var app: App = undefined;
+    app.flow = .{ .gpa = std.testing.allocator };
+    app.signed_out = false;
     app.gpa = t.allocator;
     app.io = t.io;
     app.transcript = .{};
@@ -1061,6 +1124,8 @@ test "Step events own effort and Runs keep their generating Step metadata" {
 test "Run summary survives event queue and original summary destruction" {
     const t = std.testing;
     var app: App = undefined;
+    app.flow = .{ .gpa = std.testing.allocator };
+    app.signed_out = false;
     app.gpa = t.allocator;
     app.io = t.io;
     app.transcript = .{};
@@ -1094,6 +1159,8 @@ test "cancel returns queued messages alongside an existing draft" {
         remaining.deinit(a);
     }
     var app: App = undefined;
+    app.flow = .{ .gpa = std.testing.allocator };
+    app.signed_out = false;
     app.gpa = a;
     app.session = &session;
     app.transcript = .{};
@@ -1114,6 +1181,8 @@ test "cancel returns queued messages alongside an existing draft" {
 test "stream events distinguish reasoning text and Run arguments through retry" {
     const t = std.testing;
     var app: App = undefined;
+    app.flow = .{ .gpa = std.testing.allocator };
+    app.signed_out = false;
     app.gpa = t.allocator;
     app.io = t.io;
     app.transcript = .{};
@@ -1161,6 +1230,8 @@ test "@ completion: Enter and Tab accept instead of sending, directories keep co
     const gpa = std.testing.allocator;
     var session: Session = undefined;
     var app: App = undefined;
+    app.flow = .{ .gpa = std.testing.allocator };
+    app.signed_out = false;
     app.gpa = gpa;
     app.io = std.testing.io;
     app.session = &session;
@@ -1209,6 +1280,8 @@ test "@ completion ignores emails and pasted mentions" {
     const gpa = std.testing.allocator;
     var session: Session = undefined;
     var app: App = undefined;
+    app.flow = .{ .gpa = std.testing.allocator };
+    app.signed_out = false;
     app.gpa = gpa;
     app.io = std.testing.io;
     app.session = &session;
@@ -1262,6 +1335,8 @@ test "click toggles only the Run title row under the pointer across wrapped line
     vx.screen = try vaxis.Screen.init(gpa, .{ .cols = 8, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
     defer vx.screen.deinit(gpa);
     var app: App = undefined;
+    app.flow = .{ .gpa = std.testing.allocator };
+    app.signed_out = false;
     app.gpa = gpa;
     clickApp(&app, &vx, .{}, .{});
     defer app.transcript.deinit(gpa);
@@ -1300,6 +1375,8 @@ test "a drag across a Run title selects instead of toggling" {
     vx.screen = try vaxis.Screen.init(gpa, .{ .cols = 8, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
     defer vx.screen.deinit(gpa);
     var app: App = undefined;
+    app.flow = .{ .gpa = std.testing.allocator };
+    app.signed_out = false;
     app.gpa = gpa;
     app.io = std.testing.io;
     clickApp(&app, &vx, .{}, .{});
@@ -1319,6 +1396,8 @@ test "toggling pins the view unless following the latest details entry" {
     vx.screen = try vaxis.Screen.init(gpa, .{ .cols = 8, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
     defer vx.screen.deinit(gpa);
     var app: App = undefined;
+    app.flow = .{ .gpa = std.testing.allocator };
+    app.signed_out = false;
     clickApp(&app, &vx, .{ .entry = 1, .row = 2 }, null);
     defer app.transcript.deinit(gpa);
     try app.transcript.startRun(gpa, "a");

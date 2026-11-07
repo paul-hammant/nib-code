@@ -2,6 +2,8 @@ const std = @import("std");
 const atomic_file = @import("tools/atomic_file.zig");
 const provider = @import("provider.zig");
 const codex = @import("provider/responses.zig");
+const auth_store = @import("auth/store.zig");
+const auth_codex = @import("auth/codex.zig");
 const Allocator = std.mem.Allocator;
 const Env = std.process.Environ.Map;
 
@@ -19,7 +21,113 @@ pub fn load(a: Allocator, io: std.Io, env: *const Env, home_path: []const u8, de
         return err;
     };
     defer a.free(text);
-    return resolve(a, env, text, path, detail);
+    var cfg = try resolve(a, env, text, path, detail);
+    try applyStore(a, io, home_path, &cfg);
+    if (env.get("NIB_PROVIDER") == null and !credentialed(a, io, cfg)) {
+        if (try pickCredentialed(a, io, env, home_path, text, path)) |picked| cfg = picked;
+    }
+    return cfg;
+}
+
+/// Fills a missing key from nib's own store; environment keys win.
+pub fn applyStore(a: Allocator, io: std.Io, home_path: []const u8, cfg: *provider.Config) !void {
+    if (cfg.provider == .codex or cfg.api_key.len > 0) return;
+    const file = try auth_store.path(a, home_path);
+    defer a.free(file);
+    var doc = auth_store.Doc.load(a, io, file) catch return;
+    defer doc.deinit();
+    const key = doc.key(cfg.name()) orelse return;
+    cfg.api_key = try a.dupe(u8, key);
+    cfg.key_source = .store;
+}
+
+/// Whether requests can be sent: a Codex login, a key, or a service that needs none.
+pub fn credentialed(a: Allocator, io: std.Io, cfg: provider.Config) bool {
+    if (cfg.provider != .codex) return !cfg.missingKey();
+    var login = auth_codex.load(a, io, .{ .nib_home = cfg.nib_home, .codex_home = cfg.codex_home, .issuer = cfg.auth_issuer }) catch return false;
+    login.deinit();
+    return true;
+}
+
+pub const startup_order = [_][]const u8{ "codex", "anthropic", "openai", "deepseek", "xai" };
+
+/// First credentialed service: Codex login, built-in keys, then custom services. Not persisted.
+fn pickCredentialed(a: Allocator, io: std.Io, env: *const Env, home_path: []const u8, text: []const u8, path: []const u8) !?provider.Config {
+    var scratch: std.heap.ArenaAllocator = .init(a);
+    defer scratch.deinit();
+    var detail: ?[]u8 = null;
+    const file = try parse(scratch.allocator(), a, text, path, &detail);
+    var names: std.ArrayList([]const u8) = .empty;
+    try names.appendSlice(scratch.allocator(), &startup_order);
+    for (file.providers.items) |item| if (item.custom) try names.append(scratch.allocator(), item.name);
+    var picked_env = try env.clone(scratch.allocator());
+    for ([_][]const u8{ "NIB_MODEL", "NIB_BASE_URL", "NIB_CONTEXT_WINDOW" }) |name| _ = picked_env.swapRemove(name);
+    for (names.items) |name| {
+        try picked_env.put("NIB_PROVIDER", name);
+        var d: ?[]u8 = null;
+        var cfg = resolve(a, &picked_env, text, path, &d) catch continue;
+        try applyStore(a, io, home_path, &cfg);
+        if (credentialed(a, io, cfg)) return cfg;
+    }
+    return null;
+}
+
+pub const Custom = struct { id: []const u8, protocol: provider.Protocol, base_url: []const u8, model: []const u8, context_window: u64, api_key_env: ?[]const u8 };
+
+/// Custom `[providers.<id>]` services in file order, allocated with `a`.
+pub fn customProviders(a: Allocator, io: std.Io, home_path: []const u8) ![]const Custom {
+    const path = try std.fs.path.join(a, &.{ home_path, "config.toml" });
+    const text = try read(a, io, path);
+    var scratch: std.heap.ArenaAllocator = .init(a);
+    defer scratch.deinit();
+    var detail: ?[]u8 = null;
+    const file = try parse(scratch.allocator(), a, text, path, &detail);
+    var out: std.ArrayList(Custom) = .empty;
+    for (file.providers.items) |item| {
+        if (!item.custom) continue;
+        const st = item.settings;
+        try out.append(a, .{
+            .id = try a.dupe(u8, item.name),
+            .protocol = st.protocol.?,
+            .base_url = try a.dupe(u8, st.base_url.?),
+            .model = try a.dupe(u8, st.model.?),
+            .context_window = st.context_window.?,
+            .api_key_env = if (st.api_key_env) |env_name| try a.dupe(u8, env_name) else null,
+        });
+    }
+    return out.toOwnedSlice(a);
+}
+
+pub fn endpointIdProblem(id: []const u8, existing: []const []const u8) ?[]const u8 {
+    if (id.len == 0) return "Name cannot be empty";
+    for (id) |c| if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return "Use letters, digits, _ and - only";
+    if (std.meta.stringToEnum(provider.Id, id) != null) return "Name is taken by a built-in service";
+    for (existing) |name| if (std.mem.eql(u8, name, id)) return "Name is already used";
+    return null;
+}
+
+pub const Endpoint = struct { id: []const u8, protocol: provider.Protocol, base_url: []const u8, model: []const u8, context_window: u64 };
+
+/// Appends a `[providers.<id>]` section; the key is never written here.
+pub fn addEndpoint(a: Allocator, io: std.Io, home_path: []const u8, endpoint: Endpoint) !void {
+    const path = try std.fs.path.join(a, &.{ home_path, "config.toml" });
+    const text = try read(a, io, path);
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, text);
+    const newline = if (std.mem.indexOf(u8, text, "\r\n") != null) "\r\n" else "\n";
+    if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') try out.appendSlice(a, newline);
+    if (out.items.len > 0) try out.appendSlice(a, newline);
+    try out.print(a, "[providers.{s}]{s}protocol = \"{s}\"{s}base_url = {f}{s}model = {f}{s}context_window = {d}{s}", .{
+        endpoint.id,                             newline,
+        @tagName(endpoint.protocol),             newline,
+        std.json.fmt(endpoint.base_url, .{}),    newline,
+        std.json.fmt(endpoint.model, .{}),       newline,
+        endpoint.context_window,                 newline,
+    });
+    var detail: ?[]u8 = null;
+    _ = try parse(a, a, out.items, path, &detail);
+    try std.Io.Dir.cwd().createDirPath(io, home_path);
+    _ = try atomic_file.replace(io, a, path, out.items, .{ .permissions = .fromMode(0o600), .sync = true });
 }
 
 fn read(a: Allocator, io: std.Io, path: []const u8) ![]u8 {
@@ -455,6 +563,9 @@ pub fn resolve(a: Allocator, env: *const Env, text: []const u8, path: []const u8
     } else "";
     cfg.api_key = try a.dupe(u8, key);
     errdefer a.free(cfg.api_key);
+    cfg.key_source = if (key.len > 0) .env else .none;
+    cfg.nib_home = home(a, env) catch null;
+    cfg.auth_issuer = if (env.get("NIB_AUTH_ISSUER")) |v| try a.dupe(u8, v) else null;
     cfg.codex_home = if (env.get("CODEX_HOME")) |v| try a.dupe(u8, v) else try std.fs.path.join(a, &.{ env.get("HOME") orelse "", ".codex" });
     cfg.enabled_skills = try enabledSkills(a, file.skills.items);
     cfg.sandbox.mode = if (env.get("NIB_SANDBOX")) |v| std.meta.stringToEnum(@FieldType(provider.Sandbox, "mode"), v) orelse {
@@ -550,7 +661,8 @@ pub fn saveModel(a: Allocator, io: std.Io, env: *const Env, home_path: []const u
     try selected_env.put("NIB_PROVIDER", selection.provider);
     if (selection.model) |model| try selected_env.put("NIB_MODEL", model);
     var detail: ?[]u8 = null;
-    const cfg = try resolve(a, &selected_env, text, path, &detail);
+    var cfg = try resolve(a, &selected_env, text, path, &detail);
+    try applyStore(a, io, home_path, &cfg);
     if (cfg.provider == .chat_completions and !std.mem.eql(u8, cfg.model, provider.definition(.chat_completions).default_model) and env.get("NIB_CONTEXT_WINDOW") == null) {
         const file = try parse(a, a, text, path, &detail);
         if (file.chat_settings.context_window == null) return error.UnknownModelContextWindow;
@@ -563,37 +675,21 @@ pub fn saveModel(a: Allocator, io: std.Io, env: *const Env, home_path: []const u
 
 pub const ModelEntry = struct { provider: []const u8, model: []const u8 };
 
-pub fn modelEntries(a: Allocator, io: std.Io, env: *const Env, home_path: []const u8) ![]const ModelEntry {
-    const path = try std.fs.path.join(a, &.{ home_path, "config.toml" });
-    const text = try read(a, io, path);
-    var detail: ?[]u8 = null;
-    const file = try parse(a, a, text, path, &detail);
+/// Models of the service `cfg` selects: its catalog, or a custom service's configured model.
+pub fn modelEntries(a: Allocator, io: std.Io, home_path: []const u8, cfg: provider.Config) ![]const ModelEntry {
     var entries: std.ArrayList(ModelEntry) = .empty;
-    for (provider.definitions) |entry| {
-        var usable = false;
-        if (std.mem.eql(u8, entry.id, "codex")) {
-            const dir = env.get("CODEX_HOME") orelse try std.fs.path.join(a, &.{ env.get("HOME") orelse "", ".codex" });
-            const auth = try std.fs.path.join(a, &.{ dir, "auth.json" });
-            if (std.Io.Dir.cwd().access(io, auth, .{})) |_| {
-                usable = true;
-            } else |_| {}
-        } else for (entry.api_key_env) |key| {
-            if (env.get(key)) |value| if (value.len > 0) {
-                usable = true;
-            };
+    if (cfg.provider == .custom) {
+        const name = cfg.name();
+        for (try customProviders(a, io, home_path)) |item| {
+            if (std.mem.eql(u8, item.id, name)) try entries.append(a, .{ .provider = name, .model = item.model });
         }
-        if (!usable) continue;
+    } else {
+        const entry = provider.definition(cfg.provider);
         if (entry.models.len == 0) try entries.append(a, .{ .provider = entry.id, .model = entry.default_model });
         for (entry.models) |model| try entries.append(a, .{ .provider = entry.id, .model = model.id });
     }
-    for (file.providers.items) |item| {
-        if (!item.custom) continue;
-        if (item.settings.api_key_env) |key| {
-            const value: []const u8 = env.get(key) orelse continue;
-            if (value.len == 0) continue;
-        }
-        try entries.append(a, .{ .provider = item.name, .model = item.settings.model.? });
-    }
+    for (entries.items) |item| if (std.mem.eql(u8, item.model, cfg.model)) return entries.toOwnedSlice(a);
+    try entries.append(a, .{ .provider = cfg.name(), .model = cfg.model });
     return entries.toOwnedSlice(a);
 }
 
@@ -1214,7 +1310,7 @@ test "model arguments and configuration preserve comments and sections" {
     try t.expect(std.mem.indexOf(u8, changed, "[providers.local]") != null);
 }
 
-test "model entries filter keys auth and custom providers and save atomically" {
+test "model entries list only the current service and saving is atomic" {
     const t = std.testing;
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
@@ -1227,23 +1323,127 @@ test "model entries filter keys auth and custom providers and save atomically" {
     try env.put("CODEX_HOME", root);
     const custom = "[providers.local]\nprotocol = \"responses\"\nbase_url = \"http://localhost\"\nmodel = \"old\"\ncontext_window = 1000\n[providers.locked]\nprotocol = \"responses\"\nbase_url = \"http://localhost\"\nmodel = \"old\"\ncontext_window = 1000\napi_key_env = \"SITE_KEY\"\n";
     try tmp.dir.writeFile(t.io, .{ .sub_path = "config.toml", .data = custom });
-    const initial = try modelEntries(a, t.io, &env, root);
-    try t.expectEqual(@as(usize, 1), initial.len);
-    try t.expectEqualStrings("local", initial[0].provider);
-    try tmp.dir.writeFile(t.io, .{ .sub_path = "auth.json", .data = "{}" });
-    try env.put("OPENAI_API_KEY", "fake");
-    try env.put("SITE_KEY", "fake");
-    const entries = try modelEntries(a, t.io, &env, root);
-    try t.expect(entries.len > 4);
-    try t.expectEqualStrings("codex", entries[0].provider);
+    var detail: ?[]u8 = null;
+    var anthropic_env = try env.clone(a);
+    try anthropic_env.put("NIB_PROVIDER", "anthropic");
+    const anthropic = try resolve(a, &anthropic_env, custom, "config.toml", &detail);
+    const own = try modelEntries(a, t.io, root, anthropic);
+    try t.expectEqual(@as(usize, 4), own.len);
+    for (own) |entry| try t.expectEqualStrings("anthropic", entry.provider);
+    var local_env = try env.clone(a);
+    try local_env.put("NIB_PROVIDER", "local");
+    const local = try resolve(a, &local_env, custom, "config.toml", &detail);
+    const listed = try modelEntries(a, t.io, root, local);
+    try t.expectEqual(@as(usize, 1), listed.len);
+    try t.expectEqualStrings("old", listed[0].model);
     _ = try saveModel(a, t.io, &env, root, .{ .provider = "local", .model = "new" });
     const saved = try tmp.dir.readFileAlloc(t.io, "config.toml", a, .unlimited);
     try t.expect(std.mem.startsWith(u8, saved, "provider = \"local\"\n"));
     try t.expect(std.mem.indexOf(u8, saved, "model = \"new\"") != null);
     try t.expect(std.mem.indexOf(u8, saved, "[providers.locked]") != null);
+    try env.put("OPENAI_API_KEY", "fake");
     try t.expectError(error.InvalidConfig, saveModel(a, t.io, &env, root, .{ .provider = "openai", .model = "unknown" }));
     try t.expectEqualStrings(saved, try tmp.dir.readFileAlloc(t.io, "config.toml", a, .unlimited));
     const new_home = try std.fs.path.join(a, &.{ root, "new" });
     _ = try saveModel(a, t.io, &env, new_home, .{ .provider = "openai", .model = null });
     try t.expectEqualStrings("provider = \"openai\"\n[openai]\nmodel = \"gpt-6.1-sol\"\n", try tmp.dir.readFileAlloc(t.io, "new/config.toml", a, .unlimited));
+}
+
+fn envWithHome(a: Allocator, root: []const u8) !Env {
+    var env: Env = .init(a);
+    try env.put("HOME", root);
+    try env.put("NIB_HOME", root);
+    try env.put("CODEX_HOME", try std.fs.path.join(a, &.{ root, "codex" }));
+    return env;
+}
+
+test "startup picks the first credentialed service without persisting" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var env = try envWithHome(a, root);
+    var detail: ?[]u8 = null;
+    // Nothing credentialed: the configured (default Codex) service stays, flagged as not credentialed.
+    var cfg = try load(a, t.io, &env, root, &detail);
+    try t.expectEqual(provider.Id.codex, cfg.provider);
+    try t.expect(!credentialed(a, t.io, cfg));
+    // A stored key for xAI and an env key for OpenAI: built-in order puts OpenAI first.
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "auth.json", .data = "{\"keys\":{\"xai\":\"stored-fake\"}}" });
+    cfg = try load(a, t.io, &env, root, &detail);
+    try t.expectEqual(provider.Id.xai, cfg.provider);
+    try t.expectEqual(provider.KeySource.store, cfg.key_source);
+    try t.expectEqualStrings("stored-fake", cfg.api_key);
+    try env.put("OPENAI_API_KEY", "env-fake");
+    cfg = try load(a, t.io, &env, root, &detail);
+    try t.expectEqual(provider.Id.openai, cfg.provider);
+    try t.expectEqual(provider.KeySource.env, cfg.key_source);
+    try env.put("ANTHROPIC_API_KEY", "env-fake");
+    try t.expectEqual(provider.Id.anthropic, (try load(a, t.io, &env, root, &detail)).provider);
+    // A Codex login outranks every key.
+    try tmp.dir.createDirPath(t.io, "codex");
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "codex/auth.json", .data = "{\"tokens\":{\"access_token\":\"a\",\"account_id\":\"b\"}}" });
+    try t.expectEqual(provider.Id.codex, (try load(a, t.io, &env, root, &detail)).provider);
+    // A configured credentialed service wins over the order; an explicit NIB_PROVIDER is never replaced.
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "config.toml", .data = "provider = \"deepseek\"\n" });
+    try t.expectEqual(provider.Id.codex, (try load(a, t.io, &env, root, &detail)).provider);
+    try env.put("DEEPSEEK_API_KEY", "env-fake");
+    try t.expectEqual(provider.Id.deepseek, (try load(a, t.io, &env, root, &detail)).provider);
+    try env.put("NIB_PROVIDER", "xai");
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "auth.json", .data = "{}" });
+    const explicit = try load(a, t.io, &env, root, &detail);
+    try t.expectEqual(provider.Id.xai, explicit.provider);
+    try t.expect(!credentialed(a, t.io, explicit));
+    const config_text = try tmp.dir.readFileAlloc(t.io, "config.toml", a, .unlimited);
+    try t.expectEqualStrings("provider = \"deepseek\"\n", config_text);
+}
+
+test "custom services come last and a stored key serves a keyless config" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var env = try envWithHome(a, root);
+    var detail: ?[]u8 = null;
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "config.toml", .data = "[providers.site]\nprotocol = \"chat_completions\"\nbase_url = \"http://h\"\nmodel = \"m\"\ncontext_window = 9\napi_key_env = \"SITE_KEY\"\n" });
+    try t.expectEqual(provider.Id.codex, (try load(a, t.io, &env, root, &detail)).provider);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "auth.json", .data = "{\"keys\":{\"site\":\"stored-fake\"}}" });
+    const cfg = try load(a, t.io, &env, root, &detail);
+    try t.expectEqual(provider.Id.custom, cfg.provider);
+    try t.expectEqualStrings("site", cfg.name());
+    try t.expectEqualStrings("stored-fake", cfg.api_key);
+    try t.expectEqualStrings("the key stored by nib (run nib login)", cfg.keyHint());
+    try env.put("SITE_KEY", "env-fake");
+    try t.expectEqualStrings("env-fake", (try load(a, t.io, &env, root, &detail)).api_key);
+}
+
+test "adding an endpoint appends one section and validates ids" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "config.toml", .data = "# keep\neffort = \"high\"" });
+    try addEndpoint(a, t.io, root, .{ .id = "my-site", .protocol = .chat_completions, .base_url = "https://x.example/v1", .model = "m\"1", .context_window = 128000 });
+    const text = try tmp.dir.readFileAlloc(t.io, "config.toml", a, .unlimited);
+    try t.expect(std.mem.startsWith(u8, text, "# keep\neffort = \"high\"\n\n[providers.my-site]\nprotocol = \"chat_completions\"\n"));
+    const found = try customProviders(a, t.io, root);
+    try t.expectEqual(@as(usize, 1), found.len);
+    try t.expectEqualStrings("m\"1", found[0].model);
+    try t.expectError(error.InvalidConfig, addEndpoint(a, t.io, root, .{ .id = "my-site", .protocol = .responses, .base_url = "http://h", .model = "m", .context_window = 1 }));
+    try t.expectEqualStrings(text, try tmp.dir.readFileAlloc(t.io, "config.toml", a, .unlimited));
+    try t.expect(endpointIdProblem("", &.{}) != null);
+    try t.expect(endpointIdProblem("a b", &.{}) != null);
+    try t.expect(endpointIdProblem("openai", &.{}) != null);
+    try t.expect(endpointIdProblem("custom", &.{}) != null);
+    try t.expect(endpointIdProblem("my-site", &.{"my-site"}) != null);
+    try t.expect(endpointIdProblem("ok_1", &.{"other"}) == null);
 }

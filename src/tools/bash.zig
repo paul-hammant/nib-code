@@ -32,7 +32,7 @@ pub fn bash(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
     defer a.deinit();
     if (a.value.validationError()) |message| return fail(gpa, "{s}", .{message});
 
-    switch (policy.checkCredentials(a.value.command, t.codexHome())) {
+    switch (policy.checkCredentials(a.value.command, t.codexHome(), t.data_home)) {
         .allow => {},
         .deny => |why| return fail(gpa, "refused by nib: {s}", .{why}),
     }

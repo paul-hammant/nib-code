@@ -28,7 +28,7 @@ pub fn drawFrame(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *V
     const input_w = win.width - x - @as(u16, if (framed) 2 else 0);
     const input_h = @min(input.rows(win.child(.{ .width = input_w })), @max(1, win.height / 3));
     const saved_scroll = scroll.*;
-    var activity_h = activityHeight(s.busy != null or s.background_count > 0 or s.notice != null or scroll.top != null or scroll.pending < 0, win.height - input_h - borders - hints, win.height);
+    var activity_h = activityHeight(s.busy != null or s.background_count > 0 or s.notice != null or s.hint.len > 0 or scroll.top != null or scroll.pending < 0, win.height - input_h - borders - hints, win.height);
     const menu_layout = menuLayout(menu, menu_sel, @min(max_menu_rows, (win.height - input_h - borders - hints - activity_h) / 2));
     const menu_h = menu_layout.rows;
     var body_h = win.height - input_h - borders - hints - menu_h - activity_h;
@@ -51,6 +51,10 @@ pub fn drawFrame(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *V
         y += @as(i32, h) + 1;
     }
 
+    if (s.signed_out and entries.len == 0 and body_h > 0) {
+        _ = body.printSegment(.{ .text = "No provider · /provider to sign in", .style = .{ .dim = true } }, .{ .wrap = .none });
+    }
+
     scroll.observe(s.revision, saved_scroll.top != null);
     var activity_status = s;
     activity_status.new_output = scroll.new_output;
@@ -66,7 +70,7 @@ pub fn drawFrame(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *V
         }
         const chosen = i == menu_sel;
         const row = win.child(.{ .x_off = 2, .y_off = menu_y, .height = 1 });
-        const label_width = if (c.is_path) row.width else if (c.command == .model and c.value != null) row.width -| 10 else @min(row.width, 12);
+        const label_width = if (c.is_path) row.width else if (c.command == .model and c.value != null) row.width -| 10 else if (c.command == .provider and c.value != null) @min(row.width, 14) else @min(row.width, 12);
         printFitted(row.child(.{ .width = label_width }), c.label, if (chosen) .{ .reverse = true, .bold = true } else .{ .bold = true });
         if (row.width > label_width + 2) printFitted(row.child(.{ .x_off = label_width + 2 }), c.detail, .{ .dim = true });
         menu_y += 1;
@@ -349,7 +353,7 @@ test "minimal terminal dimensions retain an input cursor" {
 
 test "grouped menus keep the selected command visible within their row budget" {
     var buf: [16]commands.Candidate = undefined;
-    const menu = commands.candidates("/", &.{}, &.{}, &.{}, &buf);
+    const menu = commands.candidates("/", &.{}, &.{}, &.{}, &.{}, &buf);
     for (2..12) |limit| for (0..menu.len) |selected| {
         const layout = menuLayout(menu, selected, @intCast(limit));
         try testing.expect(layout.rows <= limit);

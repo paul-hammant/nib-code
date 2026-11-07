@@ -38,29 +38,18 @@ pub fn reasoningEffort(cfg: p.Config) ?[]const u8 {
     return cfg.reasoning_effort orelse if (cfg.thinking == true) @as(?[]const u8, "medium") else null;
 }
 
-const Credentials = struct {
-    tokens: struct { access_token: []const u8, account_id: []const u8 },
-};
+const login = @import("../auth/codex.zig");
 
-fn credentials(gpa: std.mem.Allocator, io: std.Io, cfg: p.Config, detail: *?[]u8) !std.json.Parsed(Credentials) {
-    const path = try std.fs.path.join(gpa, &.{ cfg.codex_home orelse return authError(gpa, detail, "Codex credentials unavailable; run codex to log in."), "auth.json" });
-    defer gpa.free(path);
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1024 * 1024)) catch
-        return authError(gpa, detail, "Cannot read Codex auth.json; run codex to log in (or check CODEX_HOME).");
-    defer gpa.free(bytes);
-    const parsed = std.json.parseFromSlice(Credentials, gpa, bytes, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch
-        return authError(gpa, detail, "Invalid Codex auth.json; run codex to log in again.");
-    if (parsed.value.tokens.access_token.len == 0 or parsed.value.tokens.account_id.len == 0 or
-        std.mem.indexOfAny(u8, parsed.value.tokens.access_token, "\r\n") != null or
-        std.mem.indexOfAny(u8, parsed.value.tokens.account_id, "\r\n") != null)
-    {
-        parsed.deinit();
-        return authError(gpa, detail, "Incomplete Codex credentials; run codex to log in again.");
-    }
-    return parsed;
+fn credentials(gpa: std.mem.Allocator, client: *std.http.Client, cfg: p.Config, detail: *?[]u8, rejected: ?[]const u8) !login.Login {
+    return login.current(gpa, client.io, client, .{ .nib_home = cfg.nib_home, .codex_home = cfg.codex_home, .issuer = cfg.auth_issuer }, rejected) catch |err| switch (err) {
+        error.NotSignedIn => authError(gpa, detail, "Codex credentials unavailable; run nib login codex to log in."),
+        error.InvalidCredentials => authError(gpa, detail, "Invalid or incomplete Codex credentials; run nib login codex to log in again."),
+        error.RefreshFailed => authError(gpa, detail, "Codex login expired and could not be refreshed; run nib login codex to log in again."),
+        else => return err,
+    };
 }
 
-fn authError(gpa: std.mem.Allocator, detail: *?[]u8, message: []const u8) !std.json.Parsed(Credentials) {
+fn authError(gpa: std.mem.Allocator, detail: *?[]u8, message: []const u8) error{ OutOfMemory, InvalidCredentials } {
     detail.* = try gpa.dupe(u8, message);
     return error.InvalidCredentials;
 }
@@ -146,12 +135,12 @@ fn streamWebSocket(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.
     errdefer state.reset(gpa);
     const body = try requestBody(gpa, client.io, cfg, cache_key, messages, tools_json, max_tokens);
     defer gpa.free(body);
-    const auth = try credentials(gpa, client.io, cfg, detail);
+    var auth = try credentials(gpa, client, cfg, detail, null);
     defer auth.deinit();
-    const bearer = try std.fmt.allocPrint(gpa, "Bearer {s}", .{auth.value.tokens.access_token});
+    const bearer = try std.fmt.allocPrint(gpa, "Bearer {s}", .{auth.access_token});
     defer gpa.free(bearer);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    for ([_][]const u8{ cfg.base_url, cfg.model, cache_key, bearer, auth.value.tokens.account_id }) |part| {
+    for ([_][]const u8{ cfg.base_url, cfg.model, cache_key, bearer, auth.account_id }) |part| {
         hash.update(part);
         hash.update(&.{0});
     }
@@ -176,7 +165,7 @@ fn streamWebSocket(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.
         defer gpa.free(routing);
         state.socket = try websocket.Connection.open(gpa, client, url, &.{
             .{ .name = "authorization", .value = bearer },
-            .{ .name = "chatgpt-account-id", .value = auth.value.tokens.account_id },
+            .{ .name = "chatgpt-account-id", .value = auth.account_id },
             .{ .name = "OpenAI-Beta", .value = "responses_websockets=2026-02-06" },
             .{ .name = "originator", .value = "nib" },
             .{ .name = "session-id", .value = cache_key },
@@ -217,17 +206,19 @@ fn streamSse(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.C
     defer gpa.free(body);
     const url = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ std.mem.trimEnd(u8, cfg.base_url, "/"), if (cfg.provider == .codex) "codex/responses" else "responses" });
     defer gpa.free(url);
+    var rejected: ?[]u8 = null;
+    defer if (rejected) |token| gpa.free(token);
     for (0..2) |attempt| {
-        const auth = if (cfg.provider == .codex) try credentials(gpa, client.io, cfg, detail) else null;
-        defer if (auth) |value| value.deinit();
-        const bearer = try std.fmt.allocPrint(gpa, "Bearer {s}", .{if (auth) |value| value.value.tokens.access_token else cfg.api_key});
+        var auth: ?login.Login = if (cfg.provider == .codex) try credentials(gpa, client, cfg, detail, rejected) else null;
+        defer if (auth) |*value| value.deinit();
+        const bearer = try std.fmt.allocPrint(gpa, "Bearer {s}", .{if (auth) |value| value.access_token else cfg.api_key});
         defer gpa.free(bearer);
         var req = try client.request(.POST, try std.Uri.parse(url), .{
             .redirect_behavior = .not_allowed,
             .headers = .{ .authorization = if (auth != null or cfg.api_key.len > 0) .{ .override = bearer } else .omit, .content_type = .{ .override = "application/json" }, .accept_encoding = .omit },
             .extra_headers = if (auth != null) &.{
                 .{ .name = "accept", .value = "text/event-stream" },
-                .{ .name = "chatgpt-account-id", .value = auth.?.value.tokens.account_id },
+                .{ .name = "chatgpt-account-id", .value = auth.?.account_id },
                 .{ .name = "OpenAI-Beta", .value = "responses=experimental" },
                 .{ .name = "originator", .value = "nib" },
                 .{ .name = "session-id", .value = cache_key },
@@ -252,8 +243,11 @@ fn streamSse(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.C
                 detail.* = try std.fmt.allocPrint(gpa, "{s}: HTTP 401; check {s}.", .{ cfg.name(), cfg.api_key_env orelse "API key" });
                 return error.HttpStatus;
             }
-            if (attempt == 0) continue;
-            detail.* = try gpa.dupe(u8, "Codex authentication expired or was revoked (HTTP 401); run codex to log in again.");
+            if (attempt == 0) {
+                rejected = try gpa.dupe(u8, auth.?.access_token);
+                continue;
+            }
+            detail.* = try gpa.dupe(u8, "Codex authentication expired or was revoked (HTTP 401); run nib login codex to log in again.");
             return error.HttpStatus;
         }
         if (response.head.status.class() != .success) {
