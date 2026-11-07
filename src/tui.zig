@@ -534,9 +534,9 @@ pub const App = struct {
                 defer app.gpa.free(data);
                 try app.attachBytes("clipboard.png", data);
             },
-            .no_tool => app.notice = "no clipboard image tool · install wl-paste or xclip",
-            .no_image => app.notice = "no image in clipboard",
-            .too_large => app.notice = "clipboard image is larger than 5 MB",
+            .no_tool => app.notice = "No clipboard image tool · install wl-paste or xclip",
+            .no_image => app.notice = "No image in clipboard",
+            .too_large => app.notice = "Clipboard image is larger than 5 MB",
         }
     }
 
