@@ -78,4 +78,4 @@ nib 以你的权限运行模型写的代码。bash 会拒绝明显危险的命�
 
 ## 更多
 
-[文档](docs/README.md) · [Provider](docs/providers.md) · [配置](docs/config.md) · [版本说明](docs/releases/) · [MIT](LICENSE)
+[原则](docs/principles.md) · [文档](docs/README.md) · [Provider](docs/providers.md) · [配置](docs/config.md) · [版本说明](docs/releases/) · [MIT](LICENSE)

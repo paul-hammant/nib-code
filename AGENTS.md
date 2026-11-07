@@ -23,6 +23,7 @@ A coding agent written in Zig 0.17, with command name `nib`.
 
 ## References as needed
 
+- Before adding a feature or changing user-facing behavior, read [docs/principles.md](docs/principles.md).
 - Skill discovery, format, precedence, and resume behavior: [docs/skills.md](docs/skills.md).
 
 - Before changing the TUI, CLI help, or fixed text, read [docs/ui-style.md](docs/ui-style.md).

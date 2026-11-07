@@ -36,6 +36,7 @@ Tool descriptions and system prompts state facts and costs for models to weigh, 
 
 ## Index
 
+- [principles.md](principles.md): product principles — focused, small and refined, quiet, together
 - [CONTEXT.md](../CONTEXT.md): shared terminology
 - [adr/](adr/): architecture decision records
   - [0001 Zig, from scratch](adr/0001-zig-from-scratch.md)
@@ -56,6 +57,8 @@ Tool descriptions and system prompts state facts and costs for models to weigh, 
   - [0016 New identical commands supersede stale bash](adr/0016-superseded-bash.md)
   - [0017 Codex WebSocket default, disposable continuation](adr/0017-codex-websocket.md)
   - [0018 Codex custom Run reuses execution/history](adr/0018-custom-run.md)
+  - [0019 Skills: index in system, read on demand](adr/0019-skills.md)
+  - [0020 Providers are data; at most three wire protocols](adr/0020-providers.md)
 - [ask-json.md](ask-json.md): ask --json NDJSON events, progress, usage
 - [session-log.md](session-log.md): logs, resume/cancellation, timing, measurement definitions
 - [undo.md](undo.md): per-Turn TUI edit/write undo, conflict rejection, quotas, recovery boundaries
