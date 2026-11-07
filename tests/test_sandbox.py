@@ -18,6 +18,7 @@ from mock_http import ThreadingHTTPServer
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "zig-out/bin/nib"
+DENIED = "ermission denied|not permitted"
 
 
 class MockHandler(BaseHTTPRequestHandler):
@@ -105,7 +106,7 @@ class SandboxTests(unittest.TestCase):
         self.assertEqual(result, {"exit_code": 0, "output": "hi\n"})
         result = self.recorded(f"touch {self.outside}")
         self.assertNotEqual(result["exit_code"], 0, result)
-        self.assertIn("ermission denied", result["output"])
+        self.assertRegex(result["output"], DENIED)
         self.assertFalse(self.outside.exists())
 
     def test_temp_dirs_and_devices_stay_writable(self):
@@ -169,7 +170,7 @@ class SandboxTests(unittest.TestCase):
         self.run_js("await " + bash(command, background=True))
         self.assertTrue((self.project / "rc.txt").exists())
         self.assertNotEqual((self.project / "rc.txt").read_text().strip(), "0")
-        self.assertIn("ermission denied", (self.project / "err.txt").read_text())
+        self.assertRegex((self.project / "err.txt").read_text(), DENIED)
         self.assertFalse(self.outside.exists())
 
     def test_subagent_inherits_the_sandbox(self):
