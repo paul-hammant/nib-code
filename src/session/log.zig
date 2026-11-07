@@ -275,6 +275,7 @@ fn restoreToolSummaries(a: std.mem.Allocator, history: []provider.Message, recor
                     }
                     if (replaced.items.len > 0) message.bash_replacements = try replaced.toOwnedSlice(a);
                     message.tool_summary = try @import("tool_summary.zig").Summary.init(a, calls, run_index, omitted);
+                    if (message.images) |images| try message.tool_summary.?.annotateViews(a, images);
                     break;
                 }
             }

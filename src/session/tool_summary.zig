@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const timing = @import("../sandbox/timing.zig");
+const Image = @import("../image.zig").Image;
 
 pub const File = struct { tool: []const u8, path: []const u8 };
 
@@ -60,6 +61,20 @@ pub const Summary = struct {
             gpa.free(owned_files);
         }
         return .{ .counts = try counts.toOwnedSlice(gpa), .omitted = omitted, .files = owned_files };
+    }
+
+    /// Appends the dimensions of each viewed image to its `view` file entry.
+    pub fn annotateViews(s: Summary, gpa: Allocator, images: []const Image) !void {
+        for (@constCast(s.files)) |*file| {
+            if (!std.mem.eql(u8, file.tool, "view")) continue;
+            for (images) |item| {
+                if (!std.mem.eql(u8, item.name, file.path)) continue;
+                const labeled = try std.fmt.allocPrint(gpa, "{s} · {d}×{d}", .{ file.path, item.width, item.height });
+                gpa.free(file.path);
+                file.path = labeled;
+                break;
+            }
+        }
     }
 
     pub fn clone(s: Summary, gpa: Allocator) !Summary {
@@ -196,4 +211,20 @@ test "summary owns unique dispatched file facts" {
     defer copy.deinit(a);
     try std.testing.expectEqualDeep(&[_]File{ .{ .tool = "read", .path = "a.zig" }, .{ .tool = "grep", .path = "." } }, copy.files);
     try std.testing.expect(summary.files[0].path.ptr != copy.files[0].path.ptr);
+}
+
+test "annotateViews labels viewed images with their dimensions" {
+    const t = std.testing;
+    var r: timing.Run = .init(t.io, .now(t.io, .awake));
+    r.detail_allocator = t.allocator;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    r.detail_allocator = arena.allocator();
+    try r.describe(r.reserve("view"), "view", "{\"path\":\"shot.png\"}");
+    try r.describe(r.reserve("view"), "view", "{\"path\":\"gone.png\"}");
+    const summary = try Summary.init(t.allocator, r.entries[0..r.count], 0, 0);
+    defer summary.deinit(t.allocator);
+    try summary.annotateViews(t.allocator, &.{.{ .path = "p", .name = "shot.png", .media_type = "image/png", .bytes = 1, .width = 1280, .height = 720 }});
+    try t.expectEqualStrings("shot.png · 1280×720", summary.files[0].path);
+    try t.expectEqualStrings("gone.png", summary.files[1].path);
 }

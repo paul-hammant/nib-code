@@ -27,7 +27,7 @@ pub const Id = blk: {
     break :blk @Enum(u8, .exhaustive, &names, &values);
 };
 
-pub const Model = struct { id: []const u8, context_window: u64, max_output: u32 = 128000, can_disable_reasoning: bool = true };
+pub const Model = struct { id: []const u8, context_window: u64, max_output: u32 = 128000, can_disable_reasoning: bool = true, vision: ?bool = null };
 
 pub const Definition = struct {
     id: []const u8,
@@ -38,14 +38,15 @@ pub const Definition = struct {
     default_model: []const u8,
     models: []const Model = &.{},
     custom_run: bool = false,
+    vision: bool = true,
 };
 
 pub const definitions = [_]Definition{
     .{ .id = "codex", .models = &codex.models, .name = "Codex", .protocol = .responses, .base_url = "https://chatgpt.com/backend-api", .api_key_env = &.{}, .default_model = codex.default_model },
-    .{ .id = "chat_completions", .name = "Chat Completions", .protocol = .chat_completions, .base_url = "https://api.deepseek.com", .api_key_env = &.{ "NIB_API_KEY", "DEEPSEEK_API_KEY" }, .default_model = chat.default_model },
+    .{ .id = "chat_completions", .vision = false, .name = "Chat Completions", .protocol = .chat_completions, .base_url = "https://api.deepseek.com", .api_key_env = &.{ "NIB_API_KEY", "DEEPSEEK_API_KEY" }, .default_model = chat.default_model },
     .{ .id = "openai", .custom_run = true, .name = "OpenAI", .protocol = .responses, .base_url = "https://api.openai.com/v1", .api_key_env = &.{"OPENAI_API_KEY"}, .default_model = "gpt-6.1-sol", .models = &.{ .{ .id = "gpt-6.1-sol", .context_window = 1050000 }, .{ .id = "gpt-6.1-terra", .context_window = 1050000 } } },
     .{ .id = "anthropic", .name = "Anthropic", .protocol = .anthropic_messages, .base_url = "https://api.anthropic.com", .api_key_env = &.{"ANTHROPIC_API_KEY"}, .default_model = "claude-sonnet-5-5", .models = &.{ .{ .id = "claude-opus-5-5", .context_window = 1000000 }, .{ .id = "claude-sonnet-5-5", .context_window = 1000000 }, .{ .id = "claude-haiku-5-5", .context_window = 1000000 }, .{ .id = "claude-fable-5-1", .context_window = 1000000 } } },
-    .{ .id = "deepseek", .name = "DeepSeek", .protocol = .chat_completions, .base_url = "https://api.deepseek.com", .api_key_env = &.{"DEEPSEEK_API_KEY"}, .default_model = "deepseek-flash", .models = &.{ .{ .id = "deepseek-flash", .context_window = 1000000 }, .{ .id = "deepseek-v4-pro", .context_window = 1000000 } } },
+    .{ .id = "deepseek", .vision = false, .name = "DeepSeek", .protocol = .chat_completions, .base_url = "https://api.deepseek.com", .api_key_env = &.{"DEEPSEEK_API_KEY"}, .default_model = "deepseek-flash", .models = &.{ .{ .id = "deepseek-flash", .context_window = 1000000 }, .{ .id = "deepseek-v4-pro", .context_window = 1000000 } } },
     .{ .id = "xai", .name = "xAI", .protocol = .responses, .base_url = "https://api.x.ai/v1", .api_key_env = &.{"XAI_API_KEY"}, .default_model = "grok-4.7", .models = &.{ .{ .id = "grok-4.7", .context_window = 500000 }, .{ .id = "grok-4.6", .context_window = 500000 } } },
 };
 
@@ -73,6 +74,7 @@ pub const Config = struct {
     provider: Id = .chat_completions,
     custom_provider: ?[]const u8 = null,
     custom_protocol: Protocol = .chat_completions,
+    custom_vision: ?bool = null,
     api_key_env: ?[]const u8 = null,
     codex_transport: Transport = .websocket,
     codex_run_tool: enum { custom, function } = .custom,
@@ -96,6 +98,16 @@ pub const Config = struct {
 
     pub fn protocol(cfg: Config) Protocol {
         return if (cfg.provider == .custom) cfg.custom_protocol else definition(cfg.provider).protocol;
+    }
+
+    /// Whether the model accepts image input; custom providers declare it, defaulting to the protocol.
+    pub fn vision(cfg: Config) bool {
+        if (cfg.provider == .custom) return cfg.custom_vision orelse (cfg.custom_protocol != .chat_completions);
+        const entry = definition(cfg.provider);
+        for (entry.models) |model| if (std.mem.eql(u8, model.id, cfg.model)) {
+            if (model.vision) |value| return value;
+        };
+        return entry.vision;
     }
 
     pub fn customRun(cfg: Config) bool {
@@ -165,6 +177,7 @@ pub const Message = struct {
     tool_calls: ?[]const ToolCall = null,
     tool_call_id: ?[]const u8 = null,
     reasoning: ?Reasoning = null,
+    images: ?[]const @import("image.zig").Image = null,
     phase: ?[]const u8 = null,
     waiting: ?bool = null,
     step_effort: ?StepEffort = null,
@@ -314,4 +327,21 @@ test "provider definitions cover every identity exactly once" {
         try std.testing.expect(definition(id).base_url.len > 0);
         try std.testing.expect(definition(id).default_model.len > 0);
     }
+}
+
+test "vision follows provider tables and custom declarations" {
+    const t = std.testing;
+    try t.expect((Config{ .provider = .codex, .base_url = "", .api_key = "", .model = "gpt-6.1-sol" }).vision());
+    try t.expect((Config{ .provider = .anthropic, .base_url = "", .api_key = "", .model = "claude-sonnet-5-5" }).vision());
+    try t.expect(!(Config{ .provider = .deepseek, .base_url = "", .api_key = "", .model = "deepseek-flash" }).vision());
+    try t.expect(!(Config{ .provider = .chat_completions, .base_url = "", .api_key = "", .model = "deepseek-flash" }).vision());
+    var custom: Config = .{ .provider = .custom, .custom_provider = "site", .base_url = "", .api_key = "", .model = "m" };
+    try t.expect(!custom.vision());
+    custom.custom_vision = true;
+    try t.expect(custom.vision());
+    custom.custom_protocol = .anthropic_messages;
+    custom.custom_vision = null;
+    try t.expect(custom.vision());
+    custom.custom_vision = false;
+    try t.expect(!custom.vision());
 }

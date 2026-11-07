@@ -3,6 +3,7 @@ pub const default_model = "deepseek-flash";
 const sse = @import("sse.zig");
 const idle = @import("idle.zig");
 const body_reader = @import("body.zig");
+const image = @import("../image.zig");
 
 const Config = @import("../provider.zig").Config;
 const Message = @import("../provider.zig").Message;
@@ -64,7 +65,7 @@ pub fn stream(
     defer gpa.free(url);
     const auth = try std.fmt.allocPrint(gpa, "Bearer {s}", .{cfg.api_key});
     defer gpa.free(auth);
-    const body = try requestBody(gpa, cfg, messages, tools_json, max_tokens);
+    const body = try requestBody(gpa, client.io, cfg, messages, tools_json, max_tokens);
     defer gpa.free(body);
 
     var req = try client.request(.POST, try std.Uri.parse(url), .{
@@ -195,23 +196,67 @@ fn observeTiming(timing: *@import("../provider.zig").ModelTiming, chunk: Chunk) 
     }
 }
 
-fn requestBody(gpa: std.mem.Allocator, cfg: Config, messages: []const Message, tools_json: []const u8, max_tokens: ?u32) ![]u8 {
-    const WireMessage = struct {
-        role: []const u8,
-        content: ?[]const u8,
-        tool_calls: ?[]const ToolCall,
-        tool_call_id: ?[]const u8,
-        reasoning_content: ?[]const u8,
+const WirePart = struct { type: []const u8, text: ?[]const u8 = null, image_url: ?struct { url: []const u8 } = null };
+
+const WireContent = union(enum) {
+    text: []const u8,
+    parts: []const WirePart,
+
+    pub fn jsonStringify(c: WireContent, jw: anytype) !void {
+        switch (c) {
+            inline else => |value| try jw.write(value),
+        }
+    }
+};
+
+const WireMessage = struct {
+    role: []const u8,
+    content: ?WireContent,
+    tool_calls: ?[]const ToolCall,
+    tool_call_id: ?[]const u8,
+    reasoning_content: ?[]const u8,
+};
+
+fn imageParts(a: std.mem.Allocator, list: *std.ArrayList(WirePart), parts: []const image.Part) !void {
+    for (parts) |part| switch (part) {
+        .text => |text| try list.append(a, .{ .type = "text", .text = text }),
+        .data => try list.append(a, .{ .type = "image_url", .image_url = .{ .url = try part.dataUrl(a) } }),
     };
-    const wire = try gpa.alloc(WireMessage, messages.len);
-    defer gpa.free(wire);
-    for (messages, wire) |m, *w| w.* = .{
-        .role = m.role,
-        .content = m.content,
-        .tool_calls = m.tool_calls,
-        .tool_call_id = m.tool_call_id,
-        .reasoning_content = if (m.reasoning) |r| if (r.provider == cfg.provider) r.data else null else null,
-    };
+}
+
+fn requestBody(gpa: std.mem.Allocator, io: std.Io, cfg: Config, messages: []const Message, tools_json: []const u8, max_tokens: ?u32) ![]u8 {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var wire: std.ArrayList(WireMessage) = .empty;
+    // A tool message cannot carry images; they follow the last tool message of its group.
+    var tool_images: std.ArrayList(WirePart) = .empty;
+    for (messages, 0..) |m, index| {
+        var content: ?WireContent = if (m.content) |text| .{ .text = text } else null;
+        if (m.images) |images| if (std.mem.eql(u8, m.role, "tool")) {
+            const parts = try image.parts(a, io, images, cfg.vision());
+            for (images, parts) |source, part| {
+                try tool_images.append(a, .{ .type = "text", .text = try std.fmt.allocPrint(a, "[tool result image: {s}]", .{source.name}) });
+                try imageParts(a, &tool_images, &.{part});
+            }
+        } else {
+            var list: std.ArrayList(WirePart) = .empty;
+            try list.append(a, .{ .type = "text", .text = m.content orelse "" });
+            try imageParts(a, &list, try image.parts(a, io, images, cfg.vision()));
+            content = .{ .parts = list.items };
+        };
+        try wire.append(a, .{
+            .role = m.role,
+            .content = content,
+            .tool_calls = m.tool_calls,
+            .tool_call_id = m.tool_call_id,
+            .reasoning_content = if (m.reasoning) |r| if (r.provider == cfg.provider) r.data else null else null,
+        });
+        const next_is_tool = index + 1 < messages.len and std.mem.eql(u8, messages[index + 1].role, "tool");
+        if (tool_images.items.len > 0 and !next_is_tool) {
+            try wire.append(a, .{ .role = "user", .content = .{ .parts = try tool_images.toOwnedSlice(a) }, .tool_calls = null, .tool_call_id = null, .reasoning_content = null });
+        }
+    }
     const opts: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
     const limit = if (max_tokens) |n| try std.fmt.allocPrint(gpa, ",\"max_tokens\":{d}", .{n}) else try gpa.dupe(u8, "");
     defer gpa.free(limit);
@@ -234,7 +279,7 @@ fn requestBody(gpa: std.mem.Allocator, cfg: Config, messages: []const Message, t
     defer gpa.free(cache);
     return std.fmt.allocPrint(gpa,
         \\{{"model":{f},"messages":{f}{s}{s}{s}{s}{s}{s},"stream":true,"stream_options":{{"include_usage":true}}}}
-    , .{ std.json.fmt(cfg.model, opts), std.json.fmt(wire, opts), tool_field, limit, thinking, effort, format, cache });
+    , .{ std.json.fmt(cfg.model, opts), std.json.fmt(wire.items, opts), tool_field, limit, thinking, effort, format, cache });
 }
 
 test "chunk decodes deepseek deltas, tool call fragments and usage" {
@@ -257,7 +302,7 @@ test "request body omits null fields and absent tools" {
         .{ .role = "assistant", .content = "", .tool_calls = &.{.{ .id = "c1", .function = .{ .name = "run", .arguments = "{}" } }} },
         .{ .role = "tool", .content = "ok", .tool_call_id = "c1" },
     };
-    const body = try requestBody(gpa, .{ .base_url = "", .api_key = "", .model = "m" }, &msgs, "[]", null);
+    const body = try requestBody(gpa, std.testing.io, .{ .base_url = "", .api_key = "", .model = "m" }, &msgs, "[]", null);
     defer gpa.free(body);
     try std.testing.expectEqualStrings(
         \\{"model":"m","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"run","arguments":"{}"}}]},{"role":"tool","content":"ok","tool_call_id":"c1"}],"stream":true,"stream_options":{"include_usage":true}}
@@ -267,12 +312,12 @@ test "request body omits null fields and absent tools" {
 test "request body passes reasoning back and sends thinking only when configured" {
     const gpa = std.testing.allocator;
     const msgs = [_]Message{.{ .role = "assistant", .content = "a", .reasoning = .{ .provider = .chat_completions, .data = "r" } }};
-    const on = try requestBody(gpa, .{ .base_url = "", .api_key = "", .model = "m", .thinking = true, .reasoning_effort = "max" }, &msgs, "[]", null);
+    const on = try requestBody(gpa, std.testing.io, .{ .base_url = "", .api_key = "", .model = "m", .thinking = true, .reasoning_effort = "max" }, &msgs, "[]", null);
     defer gpa.free(on);
     try std.testing.expectEqualStrings(
         \\{"model":"m","messages":[{"role":"assistant","content":"a","reasoning_content":"r"}],"thinking":{"type":"enabled"},"reasoning_effort":"max","stream":true,"stream_options":{"include_usage":true}}
     , on);
-    const off = try requestBody(gpa, .{ .base_url = "", .api_key = "", .model = "m", .thinking = false, .reasoning_effort = "max" }, &msgs, "[]", null);
+    const off = try requestBody(gpa, std.testing.io, .{ .base_url = "", .api_key = "", .model = "m", .thinking = false, .reasoning_effort = "max" }, &msgs, "[]", null);
     defer gpa.free(off);
     try std.testing.expect(std.mem.indexOf(u8, off, "\"thinking\":{\"type\":\"disabled\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, off, "reasoning_effort") == null);
@@ -280,7 +325,7 @@ test "request body passes reasoning back and sends thinking only when configured
 
 test "summary request limits output and omits tools" {
     const t = std.testing;
-    const body = try requestBody(t.allocator, .{ .base_url = "", .api_key = "", .model = "m" }, &.{.{ .role = "user", .content = "summary" }}, "[]", 512);
+    const body = try requestBody(t.allocator, t.io, .{ .base_url = "", .api_key = "", .model = "m" }, &.{.{ .role = "user", .content = "summary" }}, "[]", 512);
     defer t.allocator.free(body);
     const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, body, .{});
     defer parsed.deinit();
@@ -322,7 +367,7 @@ test "tool-free JSON requests retain system and use json_object without leaking 
         .{ .role = "user", .content = "question" },
     };
     for ([_]?std.json.Value{ null, schema.value }) |output_schema| {
-        const body = try requestBody(t.allocator, .{ .base_url = "", .api_key = "", .model = "m", .output_schema = output_schema }, &messages, "[]", null);
+        const body = try requestBody(t.allocator, t.io, .{ .base_url = "", .api_key = "", .model = "m", .output_schema = output_schema }, &messages, "[]", null);
         defer t.allocator.free(body);
         const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, body, .{});
         defer parsed.deinit();
@@ -346,8 +391,38 @@ test "custom Chat Completions effort avoids DeepSeek-only thinking fields" {
     const t = std.testing;
     var cfg: Config = .{ .provider = .custom, .custom_provider = "site", .base_url = "", .api_key = "", .model = "local" };
     try cfg.setEffort("high");
-    const body = try requestBody(t.allocator, cfg, &.{.{ .role = "user", .content = "hi" }}, "[]", null);
+    const body = try requestBody(t.allocator, t.io, cfg, &.{.{ .role = "user", .content = "hi" }}, "[]", null);
     defer t.allocator.free(body);
     try t.expect(std.mem.indexOf(u8, body, "\"thinking\"") == null);
     try t.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
+}
+
+test "Chat Completions images use image_url parts and follow tool results in a user message" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/images", .{tmp.sub_path});
+    const shot = try image.store(t.io, a, directory, "shot.png", image.sample_png);
+    const calls = [_]ToolCall{ .{ .id = "one", .function = .{ .name = "run", .arguments = "{}" } }, .{ .id = "two", .function = .{ .name = "run", .arguments = "{}" } } };
+    const messages = [_]Message{
+        .{ .role = "user", .content = "look", .images = &.{shot} },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls },
+        .{ .role = "tool", .content = "viewed", .tool_call_id = "one", .images = &.{shot} },
+        .{ .role = "tool", .content = "plain", .tool_call_id = "two" },
+    };
+    const body = try requestBody(a, t.io, .{ .provider = .custom, .custom_provider = "site", .custom_vision = true, .base_url = "", .api_key = "", .model = "m" }, &messages, "[]", null);
+    const wire = (try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{})).object.get("messages").?.array.items;
+    try t.expectEqual(@as(usize, 5), wire.len);
+    const parts = wire[0].object.get("content").?.array.items;
+    try t.expectEqualStrings("look", parts[0].object.get("text").?.string);
+    try t.expect(std.mem.startsWith(u8, parts[1].object.get("image_url").?.object.get("url").?.string, "data:image/png;base64,iVBOR"));
+    try t.expectEqualStrings("viewed", wire[2].object.get("content").?.string);
+    try t.expectEqualStrings("tool", wire[3].object.get("role").?.string);
+    try t.expectEqualStrings("user", wire[4].object.get("role").?.string);
+    const follow = wire[4].object.get("content").?.array.items;
+    try t.expectEqualStrings("[tool result image: shot.png]", follow[0].object.get("text").?.string);
+    try t.expectEqualStrings("image_url", follow[1].object.get("type").?.string);
 }

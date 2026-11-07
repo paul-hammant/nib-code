@@ -3,6 +3,7 @@ const p = @import("../provider.zig");
 const idle = @import("idle.zig");
 const sse = @import("sse.zig");
 const body_reader = @import("body.zig");
+const image = @import("../image.zig");
 
 fn family(model: []const u8, name: []const u8) bool {
     if (!std.mem.startsWith(u8, model, name)) return false;
@@ -44,7 +45,17 @@ pub fn effort(cfg: p.Config) ?[]const u8 {
     return value;
 }
 
-pub fn requestBody(gpa: std.mem.Allocator, cfg: p.Config, messages: []const p.Message, tools_json: []const u8, max_tokens: ?u32) ![]u8 {
+const ephemeral = ",\"cache_control\":{\"type\":\"ephemeral\"}";
+
+fn writeImageBlock(w: *std.Io.Writer, part: image.Part, cache: bool) !void {
+    const control: []const u8 = if (cache) ephemeral else "";
+    switch (part) {
+        .text => |text| try w.print("{{\"type\":\"text\",\"text\":{f}{s}}}", .{ std.json.fmt(text, .{}), control }),
+        .data => |data| try w.print("{{\"type\":\"image\",\"source\":{{\"type\":\"base64\",\"media_type\":{f},\"data\":\"{s}\"}}{s}}}", .{ std.json.fmt(data.media_type, .{}), data.base64, control }),
+    }
+}
+
+pub fn requestBody(gpa: std.mem.Allocator, io: std.Io, cfg: p.Config, messages: []const p.Message, tools_json: []const u8, max_tokens: ?u32) ![]u8 {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -104,12 +115,29 @@ pub fn requestBody(gpa: std.mem.Allocator, cfg: p.Config, messages: []const p.Me
                 var block_sep: []const u8 = "";
                 while (true) {
                     const result = messages[i];
-                    try w.print("{s}{{\"type\":\"tool_result\",\"tool_use_id\":{f},\"content\":{f}{s}}}", .{ block_sep, std.json.fmt(result.tool_call_id orelse return error.InvalidResponse, .{}), std.json.fmt(result.content orelse "", .{}), if (last_user == i) ",\"cache_control\":{\"type\":\"ephemeral\"}" else "" });
+                    try w.print("{s}{{\"type\":\"tool_result\",\"tool_use_id\":{f},\"content\":", .{ block_sep, std.json.fmt(result.tool_call_id orelse return error.InvalidResponse, .{}) });
+                    if (result.images) |images| {
+                        try w.print("[{f}", .{std.json.fmt(.{ .type = "text", .text = result.content orelse "" }, .{})});
+                        for (try image.parts(a, io, images, cfg.vision())) |part| {
+                            try w.writeByte(',');
+                            try writeImageBlock(w, part, false);
+                        }
+                        try w.writeByte(']');
+                    } else try w.print("{f}", .{std.json.fmt(result.content orelse "", .{})});
+                    try w.print("{s}}}", .{if (last_user == i) ephemeral else ""});
                     if (i + 1 == messages.len or !std.mem.eql(u8, messages[i + 1].role, "tool")) break;
                     i += 1;
                     block_sep = ",";
                 }
-            } else try w.print("{{\"type\":\"text\",\"text\":{f}{s}}}", .{ std.json.fmt(m.content orelse "", .{}), if (last_user == i) ",\"cache_control\":{\"type\":\"ephemeral\"}" else "" });
+            } else {
+                const parts = if (m.images) |images| try image.parts(a, io, images, cfg.vision()) else &.{};
+                const cache = last_user == i;
+                try w.print("{{\"type\":\"text\",\"text\":{f}{s}}}", .{ std.json.fmt(m.content orelse "", .{}), if (cache and parts.len == 0) ephemeral else "" });
+                for (parts, 0..) |part, index| {
+                    try w.writeByte(',');
+                    try writeImageBlock(w, part, cache and index + 1 == parts.len);
+                }
+            }
             try w.writeAll("]}");
         }
         sep = ",";
@@ -136,7 +164,7 @@ pub fn requestBody(gpa: std.mem.Allocator, cfg: p.Config, messages: []const p.Me
 }
 
 pub fn stream(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.Client, cfg: p.Config, messages: []const p.Message, tools_json: []const u8, max_tokens: ?u32, sink: p.Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, monitor: *idle.Monitor) !p.Reply {
-    const body = try requestBody(gpa, cfg, messages, tools_json, max_tokens);
+    const body = try requestBody(gpa, client.io, cfg, messages, tools_json, max_tokens);
     defer gpa.free(body);
     const url = try std.fmt.allocPrint(gpa, "{s}/v1/messages", .{std.mem.trimEnd(u8, cfg.base_url, "/")});
     defer gpa.free(url);
@@ -286,7 +314,7 @@ test "Anthropic request caching paired results adaptive effort and signed contin
     try cfg.setEffort("off");
     try t.expectEqualStrings("low", effort(cfg).?);
     const blocks = "[{\"type\":\"thinking\",\"thinking\":\"private\",\"signature\":\"opaque-signature\"},{\"type\":\"tool_use\",\"id\":\"call\",\"name\":\"run\",\"input\":{\"code\":\"1\"}}]";
-    const body = try requestBody(a, cfg, &.{ .{ .role = "system", .content = "instructions" }, .{ .role = "user", .content = "task" }, .{ .role = "assistant", .reasoning = .{ .provider = .anthropic, .data = blocks, .includes_output = true } }, .{ .role = "tool", .tool_call_id = "call", .content = "result" } }, "[]", null);
+    const body = try requestBody(a, t.io, cfg, &.{ .{ .role = "system", .content = "instructions" }, .{ .role = "user", .content = "task" }, .{ .role = "assistant", .reasoning = .{ .provider = .anthropic, .data = blocks, .includes_output = true } }, .{ .role = "tool", .tool_call_id = "call", .content = "result" } }, "[]", null);
     const value = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
     try t.expectEqualStrings("adaptive", value.object.get("thinking").?.object.get("type").?.string);
     try t.expectEqualStrings("opaque-signature", value.object.get("messages").?.array.items[2].object.get("content").?.array.items[0].object.get("signature").?.string);
@@ -296,11 +324,11 @@ test "Anthropic request caching paired results adaptive effort and signed contin
     try t.expectEqualStrings("off", effort(cfg).?);
     cfg.model = "claude-3-7-sonnet";
     try cfg.setEffort("medium");
-    const legacy = try requestBody(a, cfg, &.{.{ .role = "user", .content = "task" }}, "[]", 32);
+    const legacy = try requestBody(a, t.io, cfg, &.{.{ .role = "user", .content = "task" }}, "[]", 32);
     try t.expect(std.mem.indexOf(u8, legacy, "\"budget_tokens\":8192") != null);
     try t.expect(std.mem.indexOf(u8, legacy, "\"max_tokens\":9216") != null);
     try cfg.setEffort("minimal");
-    const minimal = try requestBody(a, cfg, &.{.{ .role = "user", .content = "task" }}, "[]", 32);
+    const minimal = try requestBody(a, t.io, cfg, &.{.{ .role = "user", .content = "task" }}, "[]", 32);
     try t.expect(std.mem.indexOf(u8, minimal, "\"budget_tokens\":1024") != null);
     try t.expect(adaptive("claude-fable-5-1"));
     try t.expect(adaptive("claude-opus-5-5-20261106"));
@@ -366,4 +394,51 @@ test "Anthropic incomplete tool input is never returned for execution" {
     try t.expectError(error.IncompleteResponse, readStream(a, a, &unfinished, cfg, .{ .ctx = &cancel, .onDelta = Quiet.delta }, &cancel, &detail));
     var limited: std.Io.Reader = .fixed(prefix ++ "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n");
     try t.expectError(error.ProviderFailed, readStream(a, a, &limited, cfg, .{ .ctx = &cancel, .onDelta = Quiet.delta }, &cancel, &detail));
+}
+
+test "Anthropic images ride in user blocks and tool results with the cache breakpoint last" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/images", .{tmp.sub_path});
+    const shot = try image.store(t.io, a, directory, "shot.png", image.sample_png);
+    var cfg: p.Config = .{ .provider = .anthropic, .base_url = "", .api_key = "", .model = "claude-sonnet-5-5" };
+    const calls = [_]p.ToolCall{.{ .id = "call", .function = .{ .name = "run", .arguments = "{\"code\":\"1\"}" } }};
+    const messages = [_]p.Message{
+        .{ .role = "system", .content = "instructions" },
+        .{ .role = "user", .content = "look [Image #1]", .images = &.{shot} },
+        .{ .role = "assistant", .tool_calls = &calls },
+        .{ .role = "tool", .tool_call_id = "call", .content = "viewed", .images = &.{shot} },
+    };
+    const body = try requestBody(a, t.io, cfg, &messages, "[]", null);
+    const wire = (try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{})).object.get("messages").?.array.items;
+    const user = wire[0].object.get("content").?.array.items;
+    try t.expectEqualStrings("text", user[0].object.get("type").?.string);
+    try t.expect(user[0].object.get("cache_control") == null);
+    try t.expectEqualStrings("image", user[1].object.get("type").?.string);
+    try t.expect(user[1].object.get("cache_control") == null);
+    const source = user[1].object.get("source").?.object;
+    try t.expectEqualStrings("base64", source.get("type").?.string);
+    try t.expectEqualStrings("image/png", source.get("media_type").?.string);
+    try t.expectEqualStrings("iVBORw0KGgo", source.get("data").?.string[0..11]);
+    const result = wire[2].object.get("content").?.array.items[0].object;
+    try t.expectEqualStrings("tool_result", result.get("type").?.string);
+    try t.expect(result.get("cache_control") != null);
+    const inner = result.get("content").?.array.items;
+    try t.expectEqualStrings("viewed", inner[0].object.get("text").?.string);
+    try t.expectEqualStrings("image", inner[1].object.get("type").?.string);
+    const last = try requestBody(a, t.io, cfg, messages[0..2], "[]", null);
+    const final_user = (try std.json.parseFromSliceLeaky(std.json.Value, a, last, .{})).object.get("messages").?.array.items[0].object.get("content").?.array.items;
+    try t.expect(final_user[0].object.get("cache_control") == null);
+    try t.expect(final_user[1].object.get("cache_control") != null);
+    cfg.provider = .custom;
+    cfg.custom_provider = "site";
+    cfg.custom_protocol = .anthropic_messages;
+    cfg.custom_vision = false;
+    const text_only = try requestBody(a, t.io, cfg, messages[0..2], "[]", null);
+    try t.expect(std.mem.indexOf(u8, text_only, "[image shot.png 640×480 omitted]") != null);
+    try t.expect(std.mem.indexOf(u8, text_only, "base64") == null);
 }

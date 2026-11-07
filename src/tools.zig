@@ -8,6 +8,7 @@ const bash = @import("tools/bash.zig");
 const diff = @import("tools/diff.zig");
 const subagent = @import("tools/agent.zig");
 const model_function = @import("tools/llm.zig");
+const image = @import("image.zig");
 
 const Tool = struct {
     root_only: bool = false,
@@ -32,6 +33,14 @@ const all = [_]Tool{
         \\  // Locate with grep first, then read needed line ranges; batch large multi-file output or print snippets to stay within the Run display budget.
         \\  // Read requested lines of a UTF-8 file (max 16 MiB) verbatim. offset is 1-based; next_offset is null at EOF.
         \\  async read({ path, offset = 1, limit = 2000 }) {}, // → { text, next_offset }
+        ,
+    },
+    .{
+        .name = "view",
+        .run = @import("tools/view.zig").view,
+        .doc =
+        \\  // Look at an image file (png, jpeg, gif, webp; max 5 MB): it is attached to this Run's result for you to see; JS gets only metadata. Max 4 per Run. Fails with ok:false when the model has no image input.
+        \\  async view({ path }) {}, // → { ok, path, width, height, bytes } or { ok: false, error }
         ,
     },
     .{
@@ -157,6 +166,7 @@ pub const RunScope = struct {
     llm_calls: std.atomic.Value(usize) = .init(0),
     active_tools: [all.len]std.atomic.Value(u32) = @splat(.init(0)),
     changes: @import("tools/changes.zig").Tracker = .{},
+    images: std.ArrayList(image.Image) = .empty,
     fork: ?@import("tools/agent/input.zig").Fork = null,
 
     pub fn activeTool(scope: *RunScope) []const u8 {
@@ -222,6 +232,9 @@ pub const Tools = struct {
     track_changes: bool = false,
     changes_mutex: std.Io.Mutex = .init,
     changes: @import("tools/changes.zig").Tracker = .{},
+    images_mutex: std.Io.Mutex = .init,
+    /// Images viewed outside any RunScope (`nib js`).
+    images: std.ArrayList(image.Image) = .empty,
 
     fn scope(t: *Tools) ?*RunScope {
         const value = current_scope orelse return null;
@@ -238,6 +251,22 @@ pub const Tools = struct {
 
     pub fn forkSnapshot(t: *Tools) ?@import("tools/agent/input.zig").Fork {
         return if (t.scope()) |value| value.fork else t.fork_snapshot;
+    }
+
+    /// Stores an image for the current Run's result; false once the Run holds `image.max_per_run`.
+    pub fn attachImage(t: *Tools, gpa: std.mem.Allocator, attached: image.Image) !bool {
+        t.images_mutex.lockUncancelable(t.io);
+        defer t.images_mutex.unlock(t.io);
+        const list = if (t.scope()) |value| &value.images else &t.images;
+        if (list.items.len >= image.max_per_run) return false;
+        try list.append(gpa, attached);
+        return true;
+    }
+
+    pub fn viewedImages(t: *Tools) usize {
+        t.images_mutex.lockUncancelable(t.io);
+        defer t.images_mutex.unlock(t.io);
+        return (if (t.scope()) |value| &value.images else &t.images).items.len;
     }
 
     pub fn noteChange(t: *Tools, gpa: std.mem.Allocator, path: []const u8, before: ?[]const u8, after: []const u8) !void {
@@ -383,6 +412,19 @@ pub const Tools = struct {
     }
 };
 
+/// Moves `list` into `a` and frees the originals.
+pub fn takeImages(list: *std.ArrayList(image.Image), gpa: std.mem.Allocator, a: std.mem.Allocator) ![]const image.Image {
+    defer clearImages(list, gpa);
+    const copies = try a.alloc(image.Image, list.items.len);
+    for (list.items, copies) |item, *copy| copy.* = try item.clone(a);
+    return copies;
+}
+
+pub fn clearImages(list: *std.ArrayList(image.Image), gpa: std.mem.Allocator) void {
+    for (list.items) |item| item.deinit(gpa);
+    list.clearAndFree(gpa);
+}
+
 pub fn normalizedPath(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
     return @import("tools/atomic_file.zig").canonicalPath(io, gpa, path);
 }
@@ -485,7 +527,7 @@ test "child API filters agent from both docs and sandbox" {
     try testing.expect(std.mem.indexOf(u8, t.api().docs, "async agent({") == null);
     const result = try sandbox.eval(testing.allocator, testing.io, "[typeof tools.agent, Object.keys(tools)]", .{}, t.host(), null);
     defer result.deinit(testing.allocator);
-    try testing.expectEqualStrings("[\"undefined\",[\"sleep\",\"read\",\"edit\",\"write\",\"grep\",\"glob\",\"fetch\",\"bash\",\"stop\",\"llm\"]]", result.text);
+    try testing.expectEqualStrings("[\"undefined\",[\"sleep\",\"read\",\"view\",\"edit\",\"write\",\"grep\",\"glob\",\"fetch\",\"bash\",\"stop\",\"llm\"]]", result.text);
 }
 
 test "Run excludes tool waits without resetting the JS budget" {

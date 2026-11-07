@@ -28,6 +28,8 @@ pub const Turn = struct {
     gpa: std.mem.Allocator,
     session: *Session,
     text: []const u8,
+    /// Owned copies; empty for compaction and queued text.
+    images: []const @import("../image.zig").Image = &.{},
     loop: *vaxis.Loop(Event),
     cancel: std.atomic.Value(bool) = .init(false),
     thread: std.Thread = undefined,
@@ -36,9 +38,24 @@ pub const Turn = struct {
     last_model_activity: ?std.Io.Clock.Timestamp = null,
 
     pub fn spawn(gpa: std.mem.Allocator, session: *Session, loop: *vaxis.Loop(Event), text: []const u8, compact: bool) !*Turn {
+        return spawnWithImages(gpa, session, loop, text, &.{}, compact);
+    }
+
+    /// Copies `images`; the caller keeps ownership of its slice.
+    pub fn spawnWithImages(gpa: std.mem.Allocator, session: *Session, loop: *vaxis.Loop(Event), text: []const u8, images: []const @import("../image.zig").Image, compact: bool) !*Turn {
         const t = try gpa.create(Turn);
         errdefer gpa.destroy(t);
-        t.* = .{ .gpa = gpa, .session = session, .text = text, .loop = loop };
+        const copies = try gpa.alloc(@import("../image.zig").Image, images.len);
+        var copied: usize = 0;
+        errdefer {
+            for (copies[0..copied]) |item| item.deinit(gpa);
+            gpa.free(copies);
+        }
+        for (images, copies) |item, *copy| {
+            copy.* = try item.clone(gpa);
+            copied += 1;
+        }
+        t.* = .{ .gpa = gpa, .session = session, .text = text, .images = copies, .loop = loop };
         t.thread = try std.Thread.spawn(.{}, work, .{ t, compact });
         return t;
     }
@@ -59,7 +76,7 @@ pub const Turn = struct {
         if (compact) {
             errdefer t.session.tools.background.stop(t.gpa);
             _ = try t.session.compact(sink, &t.cancel, detail);
-        } else try t.session.turn(t.text, sink, &t.cancel, detail);
+        } else try t.session.turnWithImages(t.text, t.images, sink, &t.cancel, detail);
     }
 
     pub fn userInserted(ctx: *anyopaque, id: u64) !void {
@@ -133,6 +150,8 @@ pub const Turn = struct {
 
     pub fn finish(t: *Turn) void {
         t.thread.join();
+        for (t.images) |item| item.deinit(t.gpa);
+        t.gpa.free(t.images);
         t.gpa.free(t.text);
         t.gpa.destroy(t);
     }

@@ -231,6 +231,7 @@ pub const Session = struct {
         s.inbox.batch.deinit(s.gpa);
         s.tools.recovery.clear(s.gpa, s.io);
         s.tools.discardChanges(s.gpa);
+        tools.clearImages(&s.tools.images, s.gpa);
         s.tools.file_state.deinit(s.gpa);
         if (s.recorder) |*recorder| recorder.deinit();
         s.log.close(s.io);
@@ -260,6 +261,15 @@ pub const Session = struct {
     }
 
     pub fn turn(s: *Session, user_text: []const u8, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
+        return s.turnWithImages(user_text, &.{}, sink, cancel, detail);
+    }
+
+    /// Directory holding this Session's stored images.
+    pub fn imageDirectory(s: *Session, a: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(a, "{s}/sessions/{s}.images", .{ s.options.home, s.id });
+    }
+
+    pub fn turnWithImages(s: *Session, user_text: []const u8, images: []const @import("image.zig").Image, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
         try s.undo_history.begin(&s.tools, s.gpa);
         defer {
             s.undo_history.finish(&s.tools, s.gpa);
@@ -302,7 +312,9 @@ pub const Session = struct {
         defer pending.deinit(s.gpa);
         var partial: Partial = .{};
         defer partial.deinit(s.gpa);
-        try pending.append(s.gpa, .{ .role = "user", .content = try prompt.turnBudgetText(s.arena.allocator(), s.history.items[0].content orelse "", s.cfg.limits.max_steps, user_text) });
+        const attached = try s.arena.allocator().alloc(@import("image.zig").Image, images.len);
+        for (images, attached) |item, *copy| copy.* = try item.clone(s.arena.allocator());
+        try pending.append(s.gpa, .{ .role = "user", .content = try prompt.turnBudgetText(s.arena.allocator(), s.history.items[0].content orelse "", s.cfg.limits.max_steps, user_text), .images = if (images.len > 0) attached else null });
         s.usage = .{};
         s.steps = 0;
         try sink.emit(sink.ctx, .{ .usage = s.usage });
@@ -499,7 +511,7 @@ pub const Session = struct {
                 effort.Pending.record(&next_effort, result.effort, result.ok);
                 run_ms += result.run_ms orelse 0;
                 try sink.emit(sink.ctx, .{ .usage = s.usage });
-                try pending.append(s.gpa, .{ .role = "tool", .content = result.output, .tool_call_id = call.id, .background_id = result.background_id, .run_ok = if (result.background_id == null) result.ok else null, .tool_summary = result.tool_summary });
+                try pending.append(s.gpa, .{ .role = "tool", .content = result.output, .tool_call_id = call.id, .background_id = result.background_id, .run_ok = if (result.background_id == null) result.ok else null, .tool_summary = result.tool_summary, .images = if (result.images.len > 0) result.images else null });
                 try run_results.append(s.gpa, .{
                     .tool_call_id = call.id,
                     .background_id = result.background_id,
@@ -510,7 +522,7 @@ pub const Session = struct {
                     .output_bytes = result.output.len,
                     .remaining_steps = result.remaining_steps,
                 });
-                output_tokens += result.output.len / 3 + 1;
+                output_tokens += result.output.len / 3 + 1 + result.images.len * @import("image.zig").estimated_tokens;
             }
             if (empty_runs and s.tools.background.pending(s.io)) {
                 waiting = true;

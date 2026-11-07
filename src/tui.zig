@@ -15,6 +15,8 @@ const status = @import("tui/status.zig");
 const view = @import("tui/view.zig");
 const selection = @import("tui/selection.zig");
 const reflect = @import("tui/reflect.zig");
+const image = @import("image.zig");
+const clipboard = @import("tui/clipboard.zig");
 const Turn = @import("tui/turn.zig").Turn;
 const Ticker = @import("tui/turn.zig").Ticker;
 const Frames = @import("tui/frames.zig").Frames;
@@ -268,7 +270,7 @@ pub const App = struct {
             },
             .paste_end => {
                 app.pasting = false;
-                try app.input.paste(gpa, app.paste_buf.items);
+                if (!try app.attachPastedFile(app.paste_buf.items)) try app.input.paste(gpa, app.paste_buf.items);
                 app.menu.inputChanged(app.input.text());
                 app.menu.closed = true;
                 app.paste_buf.clearRetainingCapacity();
@@ -469,6 +471,8 @@ pub const App = struct {
             app.scroll.pending = if (app.scroll.top != null) std.math.maxInt(i32) else app.page();
         } else if (k.matches('o', .{ .ctrl = true })) {
             if (app.transcript.latestDetails()) |i| app.toggleEntry(i);
+        } else if (k.matches('v', .{ .ctrl = true })) {
+            try app.attachClipboardImage();
         } else if (k.matches(vaxis.Key.up, .{ .shift = true })) {
             app.scroll.pending -= 3;
         } else if (k.matches(vaxis.Key.down, .{ .shift = true })) {
@@ -476,13 +480,64 @@ pub const App = struct {
         } else if (isNewline(k, app.pasting)) {
             try input.insert(gpa, "\n");
         } else if (k.matches(vaxis.Key.enter, .{})) {
-            if (app.turn == null or commands.parse(input.text()) == null or commands.allowedWhileBusy(input.text())) submitted = try input.take(gpa) else app.notice = "Turn running · retry command when it ends";
+            if (input.imageCount() > 0 and !app.cfg.vision()) {
+                app.notice = std.fmt.bufPrint(&app.notice_buf, "{s} has no image input · remove the [Image] blocks", .{app.cfg.model}) catch null;
+            } else if (input.imageCount() > 0 and app.turn != null) {
+                app.notice = "Turn running · images send with the next message";
+            } else if (app.turn == null or commands.parse(input.text()) == null or commands.allowedWhileBusy(input.text())) submitted = try input.take(gpa) else app.notice = "Turn running · retry command when it ends";
         } else {
             _ = try input.key(gpa, k);
         }
         if (std.hash.Wyhash.hash(0, input.text()) != before) app.menu.inputChanged(input.text());
         if (submitted) |line| try app.submit(line);
         return true;
+    }
+
+    fn showImageNotice(app: *App, comptime fmt: []const u8, args: anytype) void {
+        app.notice = std.fmt.bufPrint(&app.notice_buf, fmt, args) catch null;
+    }
+
+    fn attachBytes(app: *App, name: []const u8, data: []const u8) !void {
+        if (!app.cfg.vision()) return app.showImageNotice("{s} has no image input", .{app.cfg.model});
+        const directory = try app.session.imageDirectory(app.gpa);
+        defer app.gpa.free(directory);
+        const stored = image.store(app.io, app.gpa, directory, name, data) catch |err| switch (err) {
+            error.UnsupportedImage, error.ImageTooLarge => return app.showImageNotice("{s}: {s}", .{ name, image.rejection(err) }),
+            else => return err,
+        };
+        defer stored.deinit(app.gpa);
+        try app.input.attach(app.gpa, stored);
+        app.menu.inputChanged(app.input.text());
+    }
+
+    /// True when pasted text names an existing image file and was handled.
+    fn attachPastedFile(app: *App, pasted: []const u8) !bool {
+        const path = try image.pastedPath(app.gpa, pasted) orelse return false;
+        defer app.gpa.free(path);
+        const stat = std.Io.Dir.cwd().statFile(app.io, path, .{}) catch return false;
+        if (stat.kind != .file) return false;
+        const name = std.fs.path.basename(path);
+        if (stat.size > image.max_bytes) {
+            app.showImageNotice("{s}: {s}", .{ name, image.rejection(error.ImageTooLarge) });
+            return true;
+        }
+        const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, app.gpa, .limited(image.max_bytes)) catch return false;
+        defer app.gpa.free(data);
+        try app.attachBytes(name, data);
+        return true;
+    }
+
+    fn attachClipboardImage(app: *App) !void {
+        if (!app.cfg.vision()) return app.showImageNotice("{s} has no image input", .{app.cfg.model});
+        switch (try clipboard.readImage(app.gpa, app.io, app.environ)) {
+            .png => |data| {
+                defer app.gpa.free(data);
+                try app.attachBytes("clipboard.png", data);
+            },
+            .no_tool => app.notice = "no clipboard image tool · install wl-paste or xclip",
+            .no_image => app.notice = "no image in clipboard",
+            .too_large => app.notice = "clipboard image is larger than 5 MB",
+        }
     }
 
     /// Takes ownership of `line`.
@@ -509,14 +564,18 @@ pub const App = struct {
             app.transcript.entries.items[app.transcript.entries.items.len - 1].queued = id;
             return;
         }
-        try app.startTurn(line);
+        try app.startTurnWithImages(line, app.input.sent_images.items);
     }
 
     /// Takes ownership of text without interpreting slash commands.
     fn startTurn(app: *App, text: []u8) !void {
+        return app.startTurnWithImages(text, &.{});
+    }
+
+    fn startTurnWithImages(app: *App, text: []u8, images: []const @import("image.zig").Image) !void {
         errdefer app.gpa.free(text);
         try app.transcript.add(app.gpa, .user, text);
-        app.turn = try Turn.spawn(app.gpa, app.session, app.loop, text, false);
+        app.turn = try Turn.spawnWithImages(app.gpa, app.session, app.loop, text, images, false);
         app.live_steps = 0;
         app.turn_runs = 0;
         app.activity = .start(app.io, .thinking);

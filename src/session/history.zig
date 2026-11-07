@@ -49,6 +49,11 @@ fn clone(a: std.mem.Allocator, message: provider.Message) !provider.Message {
     if (message.reasoning) |reasoning| copy.reasoning = .{ .provider = reasoning.provider, .data = try a.dupe(u8, reasoning.data), .includes_output = reasoning.includes_output };
     if (message.step_effort) |effort| copy.step_effort = .{ .effort = try a.dupe(u8, effort.effort), .source = effort.source };
     if (message.tool_summary) |summary| copy.tool_summary = try summary.clone(a);
+    if (message.images) |images| {
+        const copies = try a.alloc(@import("../image.zig").Image, images.len);
+        for (images, copies) |image, *copied| copied.* = try image.clone(a);
+        copy.images = copies;
+    }
     if (message.tool_calls) |calls| {
         const copies = try a.alloc(provider.ToolCall, calls.len);
         for (calls, copies) |call, *copied| copied.* = .{

@@ -2,6 +2,7 @@ const std = @import("std");
 const sandbox = @import("../sandbox.zig");
 const provider = @import("../provider.zig");
 const Change = @import("../tools/diff.zig").Change;
+const Image = @import("../image.zig").Image;
 const output_format = @import("output.zig");
 const effort = @import("effort.zig");
 const ToolSummary = @import("tool_summary.zig").Summary;
@@ -13,6 +14,7 @@ pub const Ran = struct {
     outcome: sandbox.Outcome,
     /// Session-arena-owned.
     changes: []const Change,
+    images: []const Image = &.{},
 };
 
 pub fn run(s: *Session, code: []const u8, cancel: ?*const std.atomic.Value(bool)) !Ran {
@@ -33,6 +35,7 @@ fn runTimed(s: *Session, code: []const u8, cancel: ?*const std.atomic.Value(bool
     if (!s.tools.background.anyPending(s.io)) s.tools.progress.clear(s.gpa);
     s.tools.run_id += 1;
     s.tools.discardChanges(s.gpa);
+    @import("../tools.zig").clearImages(&s.tools.images, s.gpa);
     var host = s.tools.host();
     host.timing = timing;
     if (timing) |t| t.started = .now(s.io, .awake);
@@ -75,7 +78,7 @@ pub const PollTarget = struct {
     }
 };
 
-pub const Executed = struct { output: []const u8, ok: bool, empty: bool = false, run_ms: ?u64 = null, effort: ?effort.Declaration = null, remaining_steps: ?usize = null, tool_summary: ?ToolSummary = null, background_id: ?[]const u8 = null };
+pub const Executed = struct { images: []const Image = &.{}, output: []const u8, ok: bool, empty: bool = false, run_ms: ?u64 = null, effort: ?effort.Declaration = null, remaining_steps: ?usize = null, tool_summary: ?ToolSummary = null, background_id: ?[]const u8 = null };
 
 /// Output is arena-owned.
 pub fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const std.atomic.Value(bool), timing: *sandbox.RunTiming) !Executed {
@@ -110,8 +113,9 @@ pub fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const 
     const output = try output_format.stepLimitOutput(a, try output_format.format(a, o, s.cfg.limits.run_output_bytes), remaining_steps);
     const run_ms = timing.elapsed();
     const tool_summary = try ToolSummary.init(a, timing.entries[0..timing.count], timing.run_index, timing.omitted - before_omitted);
+    try tool_summary.annotateViews(a, ran.?.images);
     try sink.emit(sink.ctx, .{ .run_end = .{ .ok = o.ok, .output = output, .changes = ran.?.changes, .tool_summary = tool_summary } });
-    return .{ .output = output, .ok = o.ok, .empty = std.mem.eql(u8, o.text, "undefined") and std.mem.trim(u8, o.logs, " \t\r\n").len == 0, .run_ms = run_ms, .effort = declaration, .remaining_steps = remaining_steps, .tool_summary = tool_summary };
+    return .{ .output = output, .ok = o.ok, .empty = std.mem.eql(u8, o.text, "undefined") and std.mem.trim(u8, o.logs, " \t\r\n").len == 0, .run_ms = run_ms, .effort = declaration, .remaining_steps = remaining_steps, .tool_summary = tool_summary, .images = ran.?.images };
 }
 
 fn executeTimed(s: *Session, code: []const u8, cancel: *const std.atomic.Value(bool), timing: *sandbox.RunTiming, sink: Sink) !?Ran {
@@ -162,7 +166,7 @@ fn executeTimed(s: *Session, code: []const u8, cancel: *const std.atomic.Value(b
     const changes = try job.scope.changes.take(s.gpa, s.arena.allocator(), cwd);
     const outcome = job.outcome.?;
     job.outcome = null;
-    return .{ .outcome = outcome, .changes = changes };
+    return .{ .outcome = outcome, .changes = changes, .images = try @import("../tools.zig").takeImages(&job.scope.images, s.gpa, s.arena.allocator()) };
 }
 
 test "execute emits per-Run actual tool summaries including empty and overflow" {

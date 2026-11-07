@@ -36,6 +36,7 @@ const Settings = struct {
     model_line: usize = 1,
     protocol: ?provider.Protocol = null,
     api_key_env: ?[]const u8 = null,
+    vision: ?bool = null,
     transport: provider.Transport = .websocket,
     run_tool: @FieldType(provider.Config, "codex_run_tool") = .custom,
     reasoning_summary: @FieldType(provider.Config, "reasoning_summary") = .off,
@@ -235,7 +236,7 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
                 if (std.mem.eql(u8, key, name)) break :blk i;
             }
             return p.bad("unknown limits key '{s}'", .{key});
-        } else if (std.mem.eql(u8, key, "model")) 0 else if (std.mem.eql(u8, key, "base_url")) 1 else if (std.mem.eql(u8, key, "context_window")) 2 else if (section == .codex and std.mem.eql(u8, key, "transport")) 3 else if (section == .codex and std.mem.eql(u8, key, "reasoning_summary")) 4 else if (section == .codex and std.mem.eql(u8, key, "run_tool")) 5 else if (section == .provider_dynamic and file.providers.items[current_provider].custom and std.mem.eql(u8, key, "protocol")) 6 else if (section == .provider_dynamic and file.providers.items[current_provider].custom and std.mem.eql(u8, key, "api_key_env")) 7 else return p.bad("unknown provider key '{s}'", .{key});
+        } else if (std.mem.eql(u8, key, "model")) 0 else if (std.mem.eql(u8, key, "base_url")) 1 else if (std.mem.eql(u8, key, "context_window")) 2 else if (section == .codex and std.mem.eql(u8, key, "transport")) 3 else if (section == .codex and std.mem.eql(u8, key, "reasoning_summary")) 4 else if (section == .codex and std.mem.eql(u8, key, "run_tool")) 5 else if (section == .provider_dynamic and file.providers.items[current_provider].custom and std.mem.eql(u8, key, "protocol")) 6 else if (section == .provider_dynamic and file.providers.items[current_provider].custom and std.mem.eql(u8, key, "api_key_env")) 7 else if (section == .provider_dynamic and file.providers.items[current_provider].custom and std.mem.eql(u8, key, "vision")) 8 else return p.bad("unknown provider key '{s}'", .{key});
         const group: usize = if (section) |id| @as(usize, @backingInt(id)) + 1 else 0;
         const keys = if (section == .provider_dynamic) &file.providers.items[current_provider].seen else &seen[group];
         if (keys[index]) return p.bad("duplicate key '{s}'", .{key});
@@ -263,6 +264,9 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
                 9 => file.limits.run_output_bytes = n,
                 else => unreachable,
             }
+        } else if (section != null and index == 8) {
+            if (parsed != .boolean) return p.bad("vision must be true or false", .{});
+            settings.vision = parsed.boolean;
         } else if (section != null and index == 2) {
             if (parsed != .integer) return p.bad("context_window must be an integer", .{});
             if (parsed.integer <= 0 or parsed.integer > std.math.maxInt(u64)) return p.bad("context_window must be a positive u64 integer", .{});
@@ -361,6 +365,7 @@ pub fn resolve(a: Allocator, env: *const Env, text: []const u8, path: []const u8
     if (id == .custom) {
         cfg.custom_provider = try a.dupe(u8, name);
         cfg.custom_protocol = settings.protocol.?;
+        cfg.custom_vision = settings.vision;
     }
     cfg.api_key_env = if (settings.api_key_env) |value| try a.dupe(u8, value) else if (entry.api_key_env.len > 0) try a.dupe(u8, entry.api_key_env[0]) else null;
     cfg.codex_transport = if (env.get("NIB_CODEX_TRANSPORT")) |v| std.meta.stringToEnum(provider.Transport, v) orelse {

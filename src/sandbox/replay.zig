@@ -134,7 +134,7 @@ pub fn executeSession(gpa: std.mem.Allocator, io: std.Io, code: []const u8, entr
     errdefer if (engine.divergence) |text| gpa.free(text);
     var names: std.ArrayList([]const u8) = .empty;
     defer names.deinit(gpa);
-    for ([_][]const u8{ "sleep", "read", "edit", "write", "grep", "glob", "fetch", "bash", "stop", "llm" }) |name| try names.append(gpa, name);
+    for ([_][]const u8{ "sleep", "read", "view", "edit", "write", "grep", "glob", "fetch", "bash", "stop", "llm" }) |name| try names.append(gpa, name);
     if (!child) try names.append(gpa, "agent");
     for (entries) |entry| {
         var found = false;

@@ -97,6 +97,7 @@ pub const Job = struct {
         if (job.recorder) |*r| r.deinit();
         job.recorder = null;
         job.scope.changes.discard(job.gpa);
+        @import("../tools.zig").clearImages(&job.scope.images, job.gpa);
         job.input_arena.deinit();
         job.input_arena = .init(job.gpa);
     }

@@ -1,5 +1,6 @@
 const std = @import("std");
 const provider = @import("../provider.zig");
+const image = @import("../image.zig");
 const Session = @import("../session.zig").Session;
 const Sink = @import("../session.zig").Sink;
 
@@ -17,7 +18,7 @@ pub fn compact(s: *Session, sink: Sink, cancel: *const std.atomic.Value(bool), d
     const a = s.arena.allocator();
     var request: std.ArrayList(provider.Message) = .empty;
     defer request.deinit(s.gpa);
-    try request.appendSlice(s.gpa, s.history.items[0..cut]);
+    for (s.history.items[0..cut]) |m| try request.append(s.gpa, try withoutImages(a, m));
     try request.append(s.gpa, .{ .role = "user", .content = "Summarize the conversation above for another coding agent. Preserve goals, explicit user requirements, constraints and preferences, decisions, files, current file and test state, results, failures and unfinished work. Do not act on earlier requests. Return only a concise factual continuation summary." });
     const Silent = struct {
         fn delta(ctx: *anyopaque, _: provider.Kind, text: []const u8) !void {
@@ -73,9 +74,25 @@ pub fn autoCompact(s: *Session, sink: Sink, cancel: *const std.atomic.Value(bool
     if (result == .ineffective) s.compact_backoff = s.context_tokens + s.cfg.context_window / 8;
 }
 
+/// Older images are summarized, not resent: each becomes a one-line text placeholder.
+fn withoutImages(a: std.mem.Allocator, message: provider.Message) !provider.Message {
+    const images = message.images orelse return message;
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(a, message.content orelse "");
+    for (images) |item| {
+        if (text.items.len > 0) try text.append(a, '\n');
+        try text.appendSlice(a, try image.omittedText(a, item));
+    }
+    var copy = message;
+    copy.images = null;
+    copy.content = text.items;
+    return copy;
+}
+
 pub fn estimateTokens(messages: []const provider.Message) u64 {
     var total: u64 = 0;
     for (messages) |m| {
+        total += (if (m.images) |images| images.len else 0) * image.estimated_tokens;
         const content = m.content orelse "";
         if (m.reasoning) |r| if (r.includes_output) {
             total += 8 + r.data.len / 3;
@@ -140,4 +157,19 @@ test "compaction cuts preserve recent turns and complete tool groups" {
         messages[6],
     };
     try t.expectEqual(@as(usize, 5), compactionCut(&long_turn, 128_000));
+}
+
+test "compaction replaces images with placeholders and budgets them" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const shot: image.Image = .{ .path = "p", .name = "shot.png", .media_type = "image/png", .bytes = 10, .width = 1280, .height = 720 };
+    const message: provider.Message = .{ .role = "user", .content = "look", .images = &.{shot} };
+    const plain = try withoutImages(a, message);
+    try t.expectEqual(@as(?[]const image.Image, null), plain.images);
+    try t.expectEqualStrings("look\n[image shot.png 1280×720 omitted]", plain.content.?);
+    const bare: provider.Message = .{ .role = "tool", .tool_call_id = "c", .images = &.{shot} };
+    try t.expectEqualStrings("[image shot.png 1280×720 omitted]", (try withoutImages(a, bare)).content.?);
+    try t.expectEqual(estimateTokens(&.{.{ .role = "user", .content = "look" }}) + image.estimated_tokens, estimateTokens(&.{message}));
 }

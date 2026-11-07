@@ -71,10 +71,10 @@ pub const Run = struct {
     pub fn describe(r: *Run, index: ?usize, name: []const u8, args: []const u8) !void {
         const a = r.detail_allocator orelse return;
         const i = index orelse return;
-        if (!std.mem.eql(u8, name, "read") and !std.mem.eql(u8, name, "grep") and !std.mem.eql(u8, name, "glob")) return;
+        if (!std.mem.eql(u8, name, "read") and !std.mem.eql(u8, name, "view") and !std.mem.eql(u8, name, "grep") and !std.mem.eql(u8, name, "glob")) return;
         const parsed = std.json.parseFromSlice(struct { path: ?[]const u8 = null }, a, args, .{ .ignore_unknown_fields = true }) catch return;
         defer parsed.deinit();
-        const path = parsed.value.path orelse if (std.mem.eql(u8, name, "read")) return else ".";
+        const path = parsed.value.path orelse if (std.mem.eql(u8, name, "read") or std.mem.eql(u8, name, "view")) return else ".";
         r.entries[i].path = try a.dupe(u8, path);
     }
 
@@ -103,7 +103,7 @@ pub const Run = struct {
 };
 
 fn stableName(name: []const u8) []const u8 {
-    inline for (.{ "read", "write", "edit", "grep", "glob", "bash", "stop", "fetch", "agent", "llm", "sleep" }) |known| {
+    inline for (.{ "read", "view", "write", "edit", "grep", "glob", "bash", "stop", "fetch", "agent", "llm", "sleep" }) |known| {
         if (std.mem.eql(u8, name, known)) return known;
     }
     return "unknown";

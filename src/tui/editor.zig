@@ -3,8 +3,27 @@ const vaxis = @import("vaxis");
 const Key = vaxis.Key;
 const long_text = @import("long_text.zig");
 const paths = @import("paths.zig");
+const image = @import("../image.zig");
 
-const Block = struct { start: usize, end: usize, original: []const u8 };
+const Block = struct {
+    start: usize,
+    end: usize,
+    original: []const u8,
+    /// Set for `[Image #N]` blocks; `original` is then the label itself.
+    image: ?image.Image = null,
+    number: usize = 0,
+
+    fn clone(b: Block, gpa: std.mem.Allocator) !Block {
+        const original = try gpa.dupe(u8, b.original);
+        errdefer gpa.free(original);
+        return .{ .start = b.start, .end = b.end, .original = original, .image = if (b.image) |attached| try attached.clone(gpa) else null, .number = b.number };
+    }
+
+    fn deinit(b: Block, gpa: std.mem.Allocator) void {
+        gpa.free(b.original);
+        if (b.image) |attached| attached.deinit(gpa);
+    }
+};
 
 const Snapshot = struct {
     text: []const u8,
@@ -13,7 +32,7 @@ const Snapshot = struct {
 
     fn deinit(s: Snapshot, gpa: std.mem.Allocator) void {
         gpa.free(s.text);
-        for (s.blocks) |b| gpa.free(b.original);
+        for (s.blocks) |b| b.deinit(gpa);
         gpa.free(s.blocks);
     }
 };
@@ -24,6 +43,8 @@ pub const Editor = struct {
     cursor: usize = 0,
 
     blocks: std.ArrayList(Block) = .empty,
+    /// Images of the most recent `take`, until the next one.
+    sent_images: std.ArrayList(image.Image) = .empty,
     number: usize = 1,
     history: std.ArrayList(Snapshot) = .empty,
     history_index: ?usize = null,
@@ -36,6 +57,8 @@ pub const Editor = struct {
         for (e.history.items) |item| item.deinit(gpa);
         e.clearBlocks(gpa);
         e.blocks.deinit(gpa);
+        e.clearSent(gpa);
+        e.sent_images.deinit(gpa);
         e.history.deinit(gpa);
         if (e.draft) |d| d.deinit(gpa);
     }
@@ -45,8 +68,19 @@ pub const Editor = struct {
     }
 
     fn clearBlocks(e: *Editor, gpa: std.mem.Allocator) void {
-        for (e.blocks.items) |b| gpa.free(b.original);
+        for (e.blocks.items) |b| b.deinit(gpa);
         e.blocks.clearRetainingCapacity();
+    }
+
+    fn clearSent(e: *Editor, gpa: std.mem.Allocator) void {
+        for (e.sent_images.items) |item| item.deinit(gpa);
+        e.sent_images.clearRetainingCapacity();
+    }
+
+    pub fn imageCount(e: *const Editor) usize {
+        var count: usize = 0;
+        for (e.blocks.items) |b| count += @intFromBool(b.image != null);
+        return count;
     }
 
     fn snapshot(e: *const Editor, gpa: std.mem.Allocator) !Snapshot {
@@ -54,13 +88,13 @@ pub const Editor = struct {
         errdefer gpa.free(text_copy);
         var blocks: std.ArrayList(Block) = .empty;
         errdefer {
-            for (blocks.items) |b| gpa.free(b.original);
+            for (blocks.items) |b| b.deinit(gpa);
             blocks.deinit(gpa);
         }
         for (e.blocks.items) |b| {
-            const original = try gpa.dupe(u8, b.original);
-            errdefer gpa.free(original);
-            try blocks.append(gpa, .{ .start = b.start, .end = b.end, .original = original });
+            const copy = try b.clone(gpa);
+            errdefer copy.deinit(gpa);
+            try blocks.append(gpa, copy);
         }
         return .{ .text = text_copy, .blocks = try blocks.toOwnedSlice(gpa), .number = e.number };
     }
@@ -70,9 +104,9 @@ pub const Editor = struct {
         e.buf.clearRetainingCapacity();
         try e.buf.appendSlice(gpa, s.text);
         for (s.blocks) |b| {
-            const original = try gpa.dupe(u8, b.original);
-            errdefer gpa.free(original);
-            try e.blocks.append(gpa, .{ .start = b.start, .end = b.end, .original = original });
+            const copy = try b.clone(gpa);
+            errdefer copy.deinit(gpa);
+            try e.blocks.append(gpa, copy);
         }
         e.number = s.number;
         e.top_row = 0;
@@ -98,6 +132,14 @@ pub const Editor = struct {
     pub fn take(e: *Editor, gpa: std.mem.Allocator) ![]u8 {
         const out = try e.expanded(gpa);
         errdefer gpa.free(out);
+        e.clearSent(gpa);
+        const Order = struct {
+            fn before(_: void, l: Block, r: Block) bool {
+                return l.number < r.number;
+            }
+        };
+        std.mem.sort(Block, e.blocks.items, {}, Order.before);
+        for (e.blocks.items) |b| if (b.image) |attached| try e.sent_images.append(gpa, try attached.clone(gpa));
         if (e.buf.items.len > 0) {
             const saved = try e.snapshot(gpa);
             errdefer saved.deinit(gpa);
@@ -185,7 +227,22 @@ pub const Editor = struct {
         try e.blocks.ensureUnusedCapacity(gpa, 1);
         const start = e.cursor;
         try e.insert(gpa, shown);
-        e.blocks.appendAssumeCapacity(.{ .start = start, .end = e.cursor, .original = original });
+        e.blocks.appendAssumeCapacity(.{ .start = start, .end = e.cursor, .original = original, .number = e.number });
+        e.number += 1;
+    }
+
+    /// Inserts an atomic `[Image #N]` block at the cursor, taking a copy of `attached`.
+    pub fn attach(e: *Editor, gpa: std.mem.Allocator, attached: image.Image) !void {
+        var label: [32]u8 = undefined;
+        const shown = try std.fmt.bufPrint(&label, "[Image #{d}]", .{e.number});
+        const original = try gpa.dupe(u8, shown);
+        errdefer gpa.free(original);
+        const copy = try attached.clone(gpa);
+        errdefer copy.deinit(gpa);
+        try e.blocks.ensureUnusedCapacity(gpa, 1);
+        const start = e.cursor;
+        try e.insert(gpa, shown);
+        e.blocks.appendAssumeCapacity(.{ .start = start, .end = e.cursor, .original = original, .image = copy, .number = e.number });
         e.number += 1;
     }
 
@@ -264,7 +321,7 @@ pub const Editor = struct {
         while (i < e.blocks.items.len) {
             const b = &e.blocks.items[i];
             if (b.start >= from and b.end <= to) {
-                gpa.free(b.original);
+                b.deinit(gpa);
                 _ = e.blocks.swapRemove(i);
             } else {
                 if (b.start >= to) {
@@ -539,4 +596,52 @@ test "block columns use label width and drawing wraps labels not payload" {
     e.draw(win);
     try testing.expectEqual(@as(u16, 3), screen.cursor.col);
     try testing.expectEqual(@as(u16, 2), screen.cursor.row);
+}
+
+const shot: image.Image = .{ .path = "/tmp/a.png", .name = "a.png", .media_type = "image/png", .bytes = 1, .width = 4, .height = 3 };
+
+test "image blocks are atomic, numbered with paste blocks and sent in label order" {
+    const gpa = testing.allocator;
+    var e: Editor = .{};
+    defer e.deinit(gpa);
+    try e.insert(gpa, "see ");
+    try e.attach(gpa, shot);
+    try e.insert(gpa, " and ");
+    try e.paste(gpa, "1\n2\n3\n4\n5\n6");
+    var second = shot;
+    second.name = "b.png";
+    try e.attach(gpa, second);
+    try testing.expectEqual(@as(usize, 2), e.imageCount());
+    try testing.expect(std.mem.indexOf(u8, e.text(), "[Image #1]") != null);
+    try testing.expect(std.mem.endsWith(u8, e.text(), "[Image #3]"));
+    try press(&e, Key.left, .{});
+    try testing.expectEqual(e.text().len - "[Image #3]".len, e.cursor);
+    try press(&e, Key.delete, .{});
+    try testing.expectEqual(@as(usize, 1), e.imageCount());
+    try e.attach(gpa, second);
+    try testing.expect(std.mem.endsWith(u8, e.text(), "[Image #4]"));
+    const sent = try e.take(gpa);
+    defer gpa.free(sent);
+    try testing.expect(std.mem.endsWith(u8, sent, "[Image #4]"));
+    try testing.expectEqual(@as(usize, 2), e.sent_images.items.len);
+    try testing.expectEqualStrings("a.png", e.sent_images.items[0].name);
+    try testing.expectEqual(@as(usize, 0), e.imageCount());
+}
+
+test "image blocks survive input history and delete as a whole" {
+    const gpa = testing.allocator;
+    var e: Editor = .{};
+    defer e.deinit(gpa);
+    try e.attach(gpa, shot);
+    const first = try e.take(gpa);
+    defer gpa.free(first);
+    try e.insert(gpa, "draft");
+    try press(&e, Key.up, .{});
+    try testing.expectEqualStrings("[Image #1]", e.text());
+    try testing.expectEqual(@as(usize, 1), e.imageCount());
+    try press(&e, Key.backspace, .{});
+    try testing.expectEqualStrings("", e.text());
+    try testing.expectEqual(@as(usize, 0), e.imageCount());
+    try press(&e, Key.down, .{});
+    try testing.expectEqualStrings("draft", e.text());
 }

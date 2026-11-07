@@ -5,6 +5,7 @@ const idle = @import("idle.zig");
 const body_reader = @import("body.zig");
 const websocket = @import("websocket.zig");
 const ws_state = @import("codex_ws.zig");
+const image = @import("../image.zig");
 
 const Model = p.Model;
 pub const models = [_]Model{
@@ -143,7 +144,7 @@ fn fallbackError(err: anyerror) bool {
 fn streamWebSocket(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.Client, cfg: p.Config, cache_key: []const u8, messages: []const p.Message, tools_json: []const u8, max_tokens: ?u32, forward: *WsForward, cancel: *const std.atomic.Value(bool), detail: *?[]u8, monitor: *idle.Monitor, state: *ws_state.State) anyerror!p.Reply {
     const sink: p.Sink = .{ .ctx = forward, .onDelta = WsForward.delta, .onData = WsForward.data, .onToolArguments = WsForward.arguments, .timing = forward.sink.timing, .codex_state = state, .monitor = monitor };
     errdefer state.reset(gpa);
-    const body = try requestBody(gpa, cfg, cache_key, messages, tools_json, max_tokens);
+    const body = try requestBody(gpa, client.io, cfg, cache_key, messages, tools_json, max_tokens);
     defer gpa.free(body);
     const auth = try credentials(gpa, client.io, cfg, detail);
     defer auth.deinit();
@@ -212,7 +213,7 @@ fn streamWebSocket(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.
 }
 
 fn streamSse(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.Client, cfg: p.Config, cache_key: []const u8, messages: []const p.Message, tools_json: []const u8, max_tokens: ?u32, sink: p.Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, monitor: *idle.Monitor) !p.Reply {
-    const body = try requestBody(gpa, cfg, cache_key, messages, tools_json, max_tokens);
+    const body = try requestBody(gpa, client.io, cfg, cache_key, messages, tools_json, max_tokens);
     defer gpa.free(body);
     const url = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ std.mem.trimEnd(u8, cfg.base_url, "/"), if (cfg.provider == .codex) "codex/responses" else "responses" });
     defer gpa.free(url);
@@ -266,7 +267,21 @@ fn streamSse(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.C
     unreachable;
 }
 
-fn requestBody(gpa: std.mem.Allocator, cfg: p.Config, cache_key: []const u8, messages: []const p.Message, tools_json: []const u8, max_tokens: ?u32) ![]u8 {
+const InputItem = struct { type: []const u8, text: ?[]const u8 = null, image_url: ?[]const u8 = null };
+
+fn appendInputItems(a: std.mem.Allocator, list: *std.ArrayList(InputItem), parts: []const image.Part) !void {
+    for (parts) |part| switch (part) {
+        .text => |text| try list.append(a, .{ .type = "input_text", .text = text }),
+        .data => try list.append(a, .{ .type = "input_image", .image_url = try part.dataUrl(a) }),
+    };
+}
+
+/// Only OpenAI's own Responses accept images inside tool outputs.
+fn toolOutputImages(cfg: p.Config) bool {
+    return cfg.provider == .codex or cfg.provider == .openai;
+}
+
+fn requestBody(gpa: std.mem.Allocator, io: std.Io, cfg: p.Config, cache_key: []const u8, messages: []const p.Message, tools_json: []const u8, max_tokens: ?u32) ![]u8 {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -275,6 +290,7 @@ fn requestBody(gpa: std.mem.Allocator, cfg: p.Config, cache_key: []const u8, mes
     try w.writeByte('[');
     var separator: []const u8 = "";
     var instructions: []const u8 = "You are a helpful assistant.";
+    var pending_images: std.ArrayList(InputItem) = .empty;
     for (messages, 0..) |m, index| {
         if (std.mem.eql(u8, m.role, "system")) {
             instructions = m.content orelse instructions;
@@ -298,11 +314,36 @@ fn requestBody(gpa: std.mem.Allocator, cfg: p.Config, cache_key: []const u8, mes
                 }
                 break :blk false;
             };
-            try w.print("{s}{f}", .{ separator, std.json.fmt(.{ .type = if (custom) @as([]const u8, "custom_tool_call_output") else "function_call_output", .call_id = m.tool_call_id, .output = m.content orelse "" }, .{}) });
+            const kind: []const u8 = if (custom) "custom_tool_call_output" else "function_call_output";
+            if (m.images) |images| {
+                var list: std.ArrayList(InputItem) = .empty;
+                const parts = try image.parts(a, io, images, cfg.vision());
+                if (toolOutputImages(cfg)) {
+                    try list.append(a, .{ .type = "input_text", .text = m.content orelse "" });
+                    try appendInputItems(a, &list, parts);
+                    try w.print("{s}{f}", .{ separator, std.json.fmt(.{ .type = kind, .call_id = m.tool_call_id, .output = list.items }, .{ .emit_null_optional_fields = false }) });
+                } else {
+                    try w.print("{s}{f}", .{ separator, std.json.fmt(.{ .type = kind, .call_id = m.tool_call_id, .output = m.content orelse "" }, .{}) });
+                    for (images, parts) |source, part| {
+                        try pending_images.append(a, .{ .type = "input_text", .text = try std.fmt.allocPrint(a, "[tool result image: {s}]", .{source.name}) });
+                        try appendInputItems(a, &pending_images, &.{part});
+                    }
+                }
+            } else try w.print("{s}{f}", .{ separator, std.json.fmt(.{ .type = kind, .call_id = m.tool_call_id, .output = m.content orelse "" }, .{}) });
             separator = ",";
+            if (pending_images.items.len > 0 and !(index + 1 < messages.len and std.mem.eql(u8, messages[index + 1].role, "tool"))) {
+                try w.print(",{f}", .{std.json.fmt(.{ .role = "user", .content = pending_images.items }, .{})});
+                pending_images.clearRetainingCapacity();
+            }
             continue;
         }
-        if (m.content) |text| if (text.len > 0) {
+        if (m.images) |images| {
+            var list: std.ArrayList(InputItem) = .empty;
+            try list.append(a, .{ .type = "input_text", .text = m.content orelse "" });
+            try appendInputItems(a, &list, try image.parts(a, io, images, cfg.vision()));
+            try w.print("{s}{f}", .{ separator, std.json.fmt(.{ .role = m.role, .content = list.items, .phase = m.phase }, .{ .emit_null_optional_fields = false }) });
+            separator = ",";
+        } else if (m.content) |text| if (text.len > 0) {
             const content = if (max_tokens != null and std.mem.eql(u8, m.role, "user") and index == messages.len - 1)
                 try std.fmt.allocPrint(a, "{s}\nKeep the summary within {d} tokens.", .{ text, max_tokens.? })
             else
@@ -671,7 +712,7 @@ test "Codex request body defaults to no summary and supports opt in" {
             .reasoning_effort = case.effort,
             .reasoning_summary = summary,
         };
-        const body = try requestBody(t.allocator, cfg, "cache-key", &.{}, "[]", null);
+        const body = try requestBody(t.allocator, t.io, cfg, "cache-key", &.{}, "[]", null);
         defer t.allocator.free(body);
         const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, body, .{});
         defer parsed.deinit();
@@ -693,7 +734,7 @@ test "Codex request body carries the session cache key" {
     const t = std.testing;
     const cfg: p.Config = .{ .provider = .codex, .model = default_model, .api_key = "", .base_url = "" };
     const cache_key = "0123456789abcdef0123456789abcdef";
-    const body = try requestBody(t.allocator, cfg, cache_key, &.{.{ .role = "user", .content = "hello" }}, "[]", null);
+    const body = try requestBody(t.allocator, t.io, cfg, cache_key, &.{.{ .role = "user", .content = "hello" }}, "[]", null);
     defer t.allocator.free(body);
     const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, body, .{});
     defer parsed.deinit();
@@ -718,7 +759,7 @@ test "Codex custom and legacy history retain their wire types across tool config
             .{ .role = "tool", .tool_call_id = "new", .content = "result" },
         };
         const cfg: p.Config = .{ .provider = .codex, .model = default_model, .api_key = "", .base_url = "", .codex_run_tool = mode };
-        const body = try requestBody(a, cfg, "key", &messages, @import("../session/prompt.zig").tools_json, null);
+        const body = try requestBody(a, t.io, cfg, "key", &messages, @import("../session/prompt.zig").tools_json, null);
         const root = (try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{})).object;
         const input = root.get("input").?.array.items;
         try t.expectEqual(@as(usize, 4), input.len);
@@ -911,7 +952,7 @@ test "tool-free JSON requests move system to instructions and use strict named s
         .{ .role = "user", .content = "question" },
     };
     for ([_]?std.json.Value{ null, schema.value }) |output_schema| {
-        const body = try requestBody(t.allocator, .{ .base_url = "", .api_key = "", .model = "m", .output_schema = output_schema }, "cache", &messages, "[]", null);
+        const body = try requestBody(t.allocator, t.io, .{ .base_url = "", .api_key = "", .model = "m", .output_schema = output_schema }, "cache", &messages, "[]", null);
         defer t.allocator.free(body);
         const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, body, .{});
         defer parsed.deinit();
@@ -954,10 +995,48 @@ test "Responses API custom Run is a catalog capability and xAI uses function" {
     const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"run\",\"description\":\"execute\",\"parameters\":{\"type\":\"object\",\"properties\":{\"code\":{\"type\":\"string\"}},\"required\":[\"code\"]}}}]";
     for ([_]p.Id{ .openai, .xai }) |id| {
         const cfg: p.Config = .{ .provider = id, .base_url = "", .api_key = "fake", .model = "model" };
-        const body = try requestBody(a, cfg, "cache", &.{.{ .role = "user", .content = "task" }}, tools, null);
+        const body = try requestBody(a, t.io, cfg, "cache", &.{.{ .role = "user", .content = "task" }}, tools, null);
         const value = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
         try t.expectEqualStrings(if (id == .openai) "custom" else "function", value.object.get("tools").?.array.items[0].object.get("type").?.string);
         try t.expect(!value.object.get("store").?.bool);
         try t.expect(std.mem.indexOf(u8, body, "fake") == null);
+    }
+}
+
+test "Responses images use input_image and tool outputs only where the API accepts them" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/images", .{tmp.sub_path});
+    const shot = try image.store(t.io, a, directory, "shot.png", image.sample_png);
+    const calls = [_]p.ToolCall{.{ .id = "call", .type = "custom", .function = .{ .name = "run", .arguments = "{\"code\":\"1\"}" } }};
+    const messages = [_]p.Message{
+        .{ .role = "user", .content = "look", .images = &.{shot} },
+        .{ .role = "assistant", .tool_calls = &calls },
+        .{ .role = "tool", .tool_call_id = "call", .content = "viewed", .images = &.{shot} },
+    };
+    for ([_]p.Id{ .codex, .xai }) |id| {
+        const body = try requestBody(a, t.io, .{ .provider = id, .base_url = "", .api_key = "", .model = "m" }, "key", &messages, "[]", null);
+        const input = (try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{})).object.get("input").?.array.items;
+        const user = input[0].object.get("content").?.array.items;
+        try t.expectEqualStrings("input_text", user[0].object.get("type").?.string);
+        try t.expect(std.mem.startsWith(u8, user[1].object.get("image_url").?.string, "data:image/png;base64,iVBOR"));
+        try t.expectEqualStrings("custom_tool_call_output", input[2].object.get("type").?.string);
+        if (id == .codex) {
+            try t.expectEqual(@as(usize, 3), input.len);
+            const output = input[2].object.get("output").?.array.items;
+            try t.expectEqualStrings("viewed", output[0].object.get("text").?.string);
+            try t.expectEqualStrings("input_image", output[1].object.get("type").?.string);
+        } else {
+            try t.expectEqual(@as(usize, 4), input.len);
+            try t.expectEqualStrings("viewed", input[2].object.get("output").?.string);
+            try t.expectEqualStrings("user", input[3].object.get("role").?.string);
+            const follow = input[3].object.get("content").?.array.items;
+            try t.expectEqualStrings("[tool result image: shot.png]", follow[0].object.get("text").?.string);
+            try t.expectEqualStrings("input_image", follow[1].object.get("type").?.string);
+        }
     }
 }
