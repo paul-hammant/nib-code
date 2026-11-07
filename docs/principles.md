@@ -26,7 +26,7 @@ Ask: **does this make nib bigger, and is what it adds worth it?**
 Success is silent; only deviations stand out.
 
 - No tips, what's-new screens, upsells, emoji, sounds, or decorative animation.
-- No update checks and no telemetry.
+- No background update checks and no telemetry. `nib update` updates only when you run it.
 - State only known facts. A green check confirms the object named next to it.
 - Answers end with the result, not a long summary.
 - Release at our own pace, not the trend's.
@@ -47,4 +47,4 @@ Extension is through skills, command-line tools, MCP servers, and hooks, all off
 
 ## Not planned
 
-Browser or desktop automation, document and slide generation, plugin marketplaces, theme systems, auto-update, telemetry, Windows support, and unattended autonomous orchestration.
+Browser or desktop automation, document and slide generation, plugin marketplaces, theme systems, automatic/background updating, telemetry, Windows support, and unattended autonomous orchestration.

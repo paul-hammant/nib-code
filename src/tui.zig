@@ -169,6 +169,7 @@ pub fn run(init: std.process.Init, session: *Session) !void {
         .context = session.context_tokens,
         .flow = .{ .gpa = gpa },
     };
+    app.menu.reflect_enabled = reflect.issueRepo(&app) != null;
     defer app.deinit();
     app.refreshCredentials();
     app.menu.wake = .{ .ctx = &app, .call = pathsReady };

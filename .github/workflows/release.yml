@@ -76,6 +76,7 @@ jobs:
           test -f "dist/nib-$PLATFORM.tar.gz"
           NIB_DOWNLOAD_BASE="file://$PWD/dist" sh install.sh
           test "$("$NIB_INSTALL_DIR/nib" --version)" = "nib ${GITHUB_REF_NAME#v}"
+          test "$(NIB_DOWNLOAD_BASE="file://$PWD/dist" "$NIB_INSTALL_DIR/nib" update "${GITHUB_REF_NAME#v}")" = "nib ${GITHUB_REF_NAME#v} is installed"
 
   release:
     needs: smoke

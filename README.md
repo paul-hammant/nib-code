@@ -40,7 +40,7 @@ Linux (x86_64, arm64) and macOS (Apple silicon):
 curl -fsSL https://raw.githubusercontent.com/yyydddkkk/nib-code/main/install.sh | sh
 ```
 
-Installs to `~/.local/bin`. Run it again to upgrade. `NIB_VERSION` pins a release, `NIB_INSTALL_DIR` changes the directory.
+Installs to `~/.local/bin`. `nib update` upgrades in place. `NIB_VERSION` pins a release, `NIB_INSTALL_DIR` changes the directory.
 
 From source (Zig 0.17): `zig build -Doptimize=ReleaseFast --prefix ~/.local`
 

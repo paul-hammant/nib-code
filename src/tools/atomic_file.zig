@@ -99,6 +99,7 @@ pub fn replace(io: Io, allocator: Allocator, path: []const u8, data: []const u8,
     }
     try file.writeStreamingAll(io, data);
     if (existing) |stat| if (!options.force_permissions) try file.setPermissions(io, stat.permissions);
+    if (options.force_permissions) try file.setPermissions(io, options.permissions);
     const written = try file.stat(io);
     if (options.sync) try file.sync(io);
     file.close(io);
@@ -136,6 +137,8 @@ test "replacement preserves existing permissions and uses creation permissions" 
         defer t.allocator.free(text);
         try t.expectEqualStrings("replacement", text);
     }
+    _ = try replace(t.io, t.allocator, path, "executable", .{ .permissions = .fromMode(0o755), .force_permissions = true, .sync = true });
+    try t.expectEqual(@as(std.posix.mode_t, 0o755), (try tmp.dir.statFile(t.io, "file", .{})).permissions.toMode() & 0o7777);
     try expectNoTemps(tmp.dir);
 }
 

@@ -40,7 +40,7 @@ nib 以 Run 为工作单位：模型写一段 JavaScript，一步完成读取、
 curl -fsSL https://raw.githubusercontent.com/yyydddkkk/nib-code/main/install.sh | sh
 ```
 
-安装到 `~/.local/bin`，再跑一次即升级。`NIB_VERSION` 指定版本，`NIB_INSTALL_DIR` 更换目录。
+安装到 `~/.local/bin`，`nib update` 原地升级。`NIB_VERSION` 指定版本，`NIB_INSTALL_DIR` 更换目录。
 
 从源码构建（Zig 0.17）：`zig build -Doptimize=ReleaseFast --prefix ~/.local`
 

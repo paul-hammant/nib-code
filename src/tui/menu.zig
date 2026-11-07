@@ -34,6 +34,7 @@ pub const Menu = struct {
     file_query_len: usize = 0,
     file_generation: u64 = 0,
     file_fresh: bool = false,
+    reflect_enabled: bool = false,
 
     pub fn init(gpa: std.mem.Allocator) Menu {
         return .{ .arena = .init(gpa), .gpa = gpa, .file_arena = .init(gpa), .pin_arena = .init(gpa) };
@@ -76,7 +77,16 @@ pub const Menu = struct {
     pub fn items(m: *Menu, input: []const u8) []commands.Candidate {
         if (m.pinned.len > 0) return m.pinned;
         if (m.closed) return m.buf[0..0];
-        const slash = commands.candidates(input, m.sessions, m.tasks, m.models, m.services, &m.buf);
+        var slash = commands.candidates(input, m.sessions, m.tasks, m.models, m.services, &m.buf);
+        if (!m.reflect_enabled) {
+            var n: usize = 0;
+            for (slash) |candidate| {
+                if (candidate.command == .reflect) continue;
+                slash[n] = candidate;
+                n += 1;
+            }
+            slash = slash[0..n];
+        }
         if (slash.len > 0 or !m.mentioning) return slash;
         return m.file_buf[0..m.file_len];
     }
@@ -250,4 +260,12 @@ test "selection wraps, closing hides the list and editing reopens it" {
     try testing.expect(m.selected("/co") == null);
     m.inputChanged("/c");
     try testing.expectEqualStrings("/copy", m.selected("/c").?.label);
+}
+
+test "reflection is hidden unless enabled" {
+    var m: Menu = .init(testing.allocator);
+    defer m.deinit();
+    try testing.expectEqual(@as(usize, 0), m.items("/ref").len);
+    m.reflect_enabled = true;
+    try testing.expectEqualStrings("/reflect", m.items("/ref")[0].label);
 }

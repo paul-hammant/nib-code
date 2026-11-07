@@ -303,7 +303,7 @@ def test_escape_restores_draft(tmp):
 def test_busy_slash_notice(tmp):
     tmp.mkdir()
     for name, command in (("model", "/model openai/gpt-6.1-terra"),
-                          ("reflect", "/reflect focus")):
+                          ("compact", "/compact")):
         gated = Reply("busy-finished", gated=True)
         with fixture(tmp / name, [gated]) as (terminal, home, _):
             terminal.send("initial\r")
@@ -317,6 +317,14 @@ def test_busy_slash_notice(tmp):
             terminal.wait_turn("busy-finished")
             terminal.send("\x15/help\r")
             terminal.until(b"/help")
+
+
+def test_reflect_disabled(tmp):
+    tmp.mkdir()
+    for name, environment in (("unset", {}), ("off", {"NIB_ISSUE_REPO": "off"})):
+        with fixture(tmp / name, [], environment=environment) as (terminal, _, _):
+            terminal.send("/reflect\r")
+            terminal.until(b"unknown command /reflect")
 
 
 def test_tool_bytes_bill(tmp):
@@ -336,6 +344,6 @@ def test_tool_bytes_bill(tmp):
 
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="nib-interjections-") as directory:
-        for test in (test_busy_slash_notice, test_during_run_and_resume, test_after_final_step, test_escape_restores_draft, test_tool_bytes_bill):
+        for test in (test_reflect_disabled, test_busy_slash_notice, test_during_run_and_resume, test_after_final_step, test_escape_restores_draft, test_tool_bytes_bill):
             test(Path(directory) / test.__name__)
             print(test.__name__ + ": ok")

@@ -63,6 +63,7 @@ fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Writer,
     if (args.len > 1 and std.mem.eql(u8, args[1], "replay")) {
         return @import("replay.zig").run(init, args[2..], stdout);
     }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "update")) return @import("update.zig").run(init, args[2..], stdout, detail);
     const js = args.len >= 3 and std.mem.eql(u8, args[1], "js");
 
     var options: Session.Options = .{
@@ -224,6 +225,7 @@ const help =
     \\  nib ask [options] <prompt|->           Ask once; - reads stdin
     \\  nib js <code>                         Run sandbox JavaScript
     \\  nib login [service] [--device]        Sign in or store a key; no service lists them
+    \\  nib update [version]                  Upgrade in place
     \\  nib logout <service>                  Remove nib's stored credential
     \\  nib replay <session-id> --all [--json] Replay recorded Runs offline
     \\
@@ -304,4 +306,5 @@ test {
     _ = @import("tui/view.zig");
     _ = @import("tui/selection.zig");
     _ = @import("session.zig");
+    _ = @import("update.zig");
 }

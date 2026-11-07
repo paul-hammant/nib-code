@@ -157,8 +157,6 @@ const testing = std.testing;
 
 /// Background filing of one reflection's issue drafts; owns copies of everything it needs.
 pub const Issues = struct {
-    pub const default_repo = "yyydddkkk/nib-code";
-
     gpa: std.mem.Allocator,
     io: std.Io,
     loop: *vaxis.Loop(Event),
@@ -229,10 +227,19 @@ pub fn saveReflection(app: *App) !void {
     try fileIssues(app, answer, path);
 }
 
-/// Null when `NIB_ISSUE_REPO=off`.
+/// Null unless explicitly enabled with an owner/name repository.
 pub fn issueRepo(app: *const App) ?[]const u8 {
-    const repo = app.environ.get("NIB_ISSUE_REPO") orelse Issues.default_repo;
-    return if (std.mem.eql(u8, repo, "off")) null else repo;
+    const repo = app.environ.get("NIB_ISSUE_REPO") orelse return null;
+    return repository(repo);
+}
+
+pub fn repository(repo: []const u8) ?[]const u8 {
+    var parts = std.mem.splitScalar(u8, repo, '/');
+    const owner = parts.next() orelse return null;
+    const name = parts.next() orelse return null;
+    if (owner.len == 0 or name.len == 0 or parts.next() != null) return null;
+    for (repo) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != '.' and c != '/') return null;
+    return repo;
 }
 
 /// Publishes the reflection's issue drafts in the background; no confirmation by design.
@@ -373,4 +380,12 @@ test "sanitize replaces private paths and refuses credential-like drafts" {
     try testing.expectEqualStrings("write fails in <project>", clean.title);
     try testing.expectEqualStrings("<project>/app.py and ~/.nib", clean.body);
     try testing.expect(try sanitize(a, .{ .title = "t", .body = "token ghp_abc" }, "/home/u", "/w") == null);
+}
+
+test "reflection requires an explicit repository" {
+    try testing.expect(repository("off") == null);
+    try testing.expect(repository("") == null);
+    try testing.expect(repository("owner") == null);
+    try testing.expect(repository("owner/name/extra") == null);
+    try testing.expectEqualStrings("owner/name", repository("owner/name").?);
 }

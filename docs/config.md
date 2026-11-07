@@ -175,7 +175,7 @@ Children inherit effective provider/model/limits through anonymous stdin, skippi
 | `NIB_API_KEY` / `DEEPSEEK_API_KEY` | Legacy chat_completions prefers `NIB_API_KEY`; deepseek uses `DEEPSEEK_API_KEY` or a stored key |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `XAI_API_KEY` | Corresponding built-in keys; outrank `auth.json` |
 | `NIB_PATCHES_OFF` | Disable prompt patches: all or comma-separated ids; [compromises.md](compromises.md) |
-| `NIB_ISSUE_REPO` | `/reflect` publication repository or off; [reflect.md](reflect.md) |
+| `NIB_ISSUE_REPO` | Enables `/reflect` and issue publication to owner/name; unset or off disables it; [reflect.md](reflect.md) |
 
 ## Tool-result recording
 

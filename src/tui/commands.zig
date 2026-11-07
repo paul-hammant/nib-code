@@ -40,7 +40,7 @@ pub const specs = std.enums.EnumArray(Command, Spec).init(.{
     .model = .{ .args = "<model>", .help = "switch model of this service", .choices = .models, .needs_arg = true },
     .effort = .{ .group = .send, .args = "[level]", .help = "reasoning effort", .choices = .efforts },
     .copy = .{ .group = .view, .help = "copy last answer", .while_busy = true },
-    .reflect = .{ .args = "[focus]", .help = "publish issue drafts: yyydddkkk/nib-code" },
+    .reflect = .{ .args = "[focus]", .help = "publish issue drafts" },
     .js = .{ .group = .send, .args = "<code>", .help = "run JavaScript", .needs_arg = true },
 });
 
@@ -183,7 +183,7 @@ pub fn helpText(gpa: std.mem.Allocator, issue_repo: ?[]const u8) ![]u8 {
         try text.print(gpa, "{s}\n", .{groupName(group)});
         for (std.enums.values(Command)) |c| {
             const spec = specs.get(c);
-            if (spec.group != group) continue;
+            if (spec.group != group or (c == .reflect and issue_repo == null)) continue;
             try text.print(gpa, "  {s}{s}{s} · {s}\n", .{ slashName(c), if (spec.args.len > 0) " " else "", spec.args, if (c == .reflect) reflectHelp(&reflect_buf, issue_repo) else spec.help });
         }
         try text.append(gpa, '\n');
@@ -256,6 +256,7 @@ pub fn select(app: *App, selection: config.ModelSelection, note: ?[]const u8) !v
 }
 
 pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
+    if (c == .reflect and reflect.issueRepo(app) == null) return app.report(.err, "unknown command /reflect · /help lists commands", .{});
     const gpa = app.gpa;
     const session = app.session;
     switch (c) {
@@ -459,7 +460,7 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
             if (!app.credentialed()) return app.transcript.add(gpa, .err, "No provider · /provider to sign in");
             const log_path = try std.fmt.allocPrint(gpa, "{s}/sessions/{s}.jsonl", .{ session.options.home, session.id });
             defer gpa.free(log_path);
-            const text = try reflect.prompt(gpa, session.id, log_path, reflect.issueRepo(app) orelse reflect.Issues.default_repo, arg);
+            const text = try reflect.prompt(gpa, session.id, log_path, reflect.issueRepo(app).?, arg);
             errdefer gpa.free(text);
             const focus = try gpa.dupe(u8, arg);
             errdefer gpa.free(focus);
@@ -515,7 +516,7 @@ test "accepting a command waits for required arguments only" {
     try testing.expectEqualStrings("/js ", tab);
     const effort = candidates("/ef", &.{}, &.{}, &.{}, &.{}, &buf)[0];
     try testing.expect(effort.runs());
-    const help = try helpText(testing.allocator, reflect.Issues.default_repo);
+    const help = try helpText(testing.allocator, "owner/repo");
     defer testing.allocator.free(help);
     try testing.expect(std.mem.indexOf(u8, help, "/resume <id>") != null);
 }
@@ -540,8 +541,8 @@ test "help groups commands and states the real issue destination or disabled sta
     try testing.expect(std.mem.indexOf(u8, on, "publish issue drafts: owner/repo") != null);
     const off = try helpText(a, null);
     defer a.free(off);
-    try testing.expect(std.mem.indexOf(u8, off, "issue publishing off") != null);
-    try testing.expect(std.mem.indexOf(u8, off, reflect.Issues.default_repo) == null);
+    try testing.expect(std.mem.indexOf(u8, off, "/reflect") == null);
+    try testing.expect(std.mem.indexOf(u8, off, "owner/repo") == null);
 }
 
 test "model choices filter and complete without running the bare command" {
