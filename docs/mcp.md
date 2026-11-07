@@ -113,7 +113,7 @@ Only PATH, HOME, LANG, LC_ALL, LC_CTYPE, TMPDIR, TZ, SYSTEMROOT and explicitly n
 `env` variables are passed through. Credential stripping applies before explicit
 allowlisted variables are added, so a deliberately named `GITHUB_TOKEN` reaches
 that server. Unlisted environment values and nib's provider credentials do not.
-Servers use the bash OS write sandbox with the normal project/temp/cache/extra
+In opt-in workspace mode, servers use the bash OS write sandbox with the normal project/temp/cache/extra
 writable roots plus their state directory. If the configured sandbox is unavailable,
-stdio startup fails; `[sandbox] mode = "off"` explicitly disables the write sandbox
+stdio startup fails. The default `[sandbox] mode = "off"` skips the write sandbox
 for both bash and MCP. Network and filesystem reads retain bash's existing policy.

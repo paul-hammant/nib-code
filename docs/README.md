@@ -42,7 +42,7 @@ Tool descriptions and system prompts state facts and costs for models to weigh, 
   - [0001 Zig, from scratch](adr/0001-zig-from-scratch.md)
   - [0002 Expose only run(code): JS in QuickJS](adr/0002-run-code-only.md)
   - [0003 Fresh sandbox per Run](adr/0003-stateless-runs.md)
-  - [0004 Two isolation layers](adr/0004-two-layer-isolation.md) (language isolation plus an OS write sandbox: Landlock / sandbox-exec)
+  - [0004 Two isolation layers](adr/0004-two-layer-isolation.md) (language isolation plus an opt-in OS write sandbox: Landlock / sandbox-exec)
   - [0005 One process per Session](adr/0005-process-per-session.md)
   - [0006 No approvals; host rejection of dangerous commands](adr/0006-deny-dangerous-commands.md)
   - [0007 Stable system; complete-Step compaction](adr/0007-context-compaction.md)

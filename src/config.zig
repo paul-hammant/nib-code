@@ -1129,7 +1129,7 @@ test "sandbox defaults, file settings and NIB_SANDBOX override" {
     try env.put("HOME", "/home/u");
     var detail: ?[]u8 = null;
     const defaults = try resolve(a, &env, "", "config.toml", &detail);
-    try t.expectEqual(.workspace, defaults.sandbox.mode);
+    try t.expectEqual(.off, defaults.sandbox.mode);
     try t.expectEqual(@as(usize, 0), defaults.sandbox.writable.len);
     const text = "[sandbox]\nmode = \"off\" # trusted machine\nwritable = [\"~/extra\", \"/data/shared\",]\n";
     const file = try resolve(a, &env, text, "config.toml", &detail);
@@ -1137,8 +1137,11 @@ test "sandbox defaults, file settings and NIB_SANDBOX override" {
     try t.expectEqual(@as(usize, 2), file.sandbox.writable.len);
     try t.expectEqualStrings("/home/u/extra", file.sandbox.writable[0]);
     try t.expectEqualStrings("/data/shared", file.sandbox.writable[1]);
+    try t.expectEqual(.workspace, (try resolve(a, &env, "[sandbox]\nmode = \"workspace\"", "config.toml", &detail)).sandbox.mode);
     try env.put("NIB_SANDBOX", "workspace");
     try t.expectEqual(.workspace, (try resolve(a, &env, text, "config.toml", &detail)).sandbox.mode);
+    try env.put("NIB_SANDBOX", "off");
+    try t.expectEqual(.off, (try resolve(a, &env, "[sandbox]\nmode = \"workspace\"", "config.toml", &detail)).sandbox.mode);
     try env.put("NIB_SANDBOX", "maybe");
     try t.expectError(error.InvalidConfig, resolve(a, &env, text, "config.toml", &detail));
     try t.expect(std.mem.startsWith(u8, detail.?, "NIB_SANDBOX:"));

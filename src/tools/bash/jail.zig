@@ -8,11 +8,11 @@ const Env = std.process.Environ.Map;
 pub const helper_command = "__jail";
 
 const home_caches = switch (builtin.os.tag) {
-    .macos => [_][]const u8{ ".cache", "Library/Caches", "Library/Developer", ".npm", ".cargo", ".rustup", "go/pkg", ".gradle", ".m2", ".bun", ".yarn", ".pnpm-store", ".local/share/pnpm", ".local/share/uv" },
-    else => [_][]const u8{ ".cache", ".npm", ".cargo", ".rustup", "go/pkg", ".gradle", ".m2", ".bun", ".yarn", ".pnpm-store", ".local/share/pnpm", ".local/share/uv" },
+    .macos => [_][]const u8{ ".cache", "Library/Caches", "Library/Developer", ".npm", ".cargo/registry", ".cargo/git", ".rustup", "go/pkg", ".gradle", ".m2", ".bun/install/cache", ".yarn", ".pnpm-store", ".local/share/pnpm", ".local/share/uv" },
+    else => [_][]const u8{ ".cache", ".npm", ".cargo/registry", ".cargo/git", ".rustup", "go/pkg", ".gradle", ".m2", ".bun/install/cache", ".yarn", ".pnpm-store", ".local/share/pnpm", ".local/share/uv" },
 };
 
-const cache_env = [_][]const u8{ "XDG_CACHE_HOME", "ZIG_GLOBAL_CACHE_DIR", "CARGO_HOME", "RUSTUP_HOME", "GOCACHE", "GOMODCACHE", "GRADLE_USER_HOME", "npm_config_cache", "PIP_CACHE_DIR", "UV_CACHE_DIR" };
+const cache_env = [_][]const u8{ "XDG_CACHE_HOME", "ZIG_GLOBAL_CACHE_DIR", "RUSTUP_HOME", "GOCACHE", "GOMODCACHE", "GRADLE_USER_HOME", "npm_config_cache", "PIP_CACHE_DIR", "UV_CACHE_DIR" };
 
 const system_paths = switch (builtin.os.tag) {
     .macos => [_][]const u8{ "/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp", "/private/var/folders", "/dev/null", "/dev/zero", "/dev/tty", "/dev/ptmx", "/dev/dtracehelper", "/dev/fd" },
@@ -37,6 +37,7 @@ pub fn roots(io: std.Io, a: Allocator, in: Inputs) ![]const []const u8 {
     if (in.home.len > 0) for (home_caches) |rel| try add(io, a, &out, try std.fs.path.join(a, &.{ in.home, rel }));
     if (in.environ) |env| {
         for (cache_env) |name| if (env.get(name)) |path| try add(io, a, &out, path);
+        if (env.get("CARGO_HOME")) |path| for ([_][]const u8{ "registry", "git" }) |rel| try add(io, a, &out, try std.fs.path.join(a, &.{ path, rel }));
         if (env.get("GOPATH")) |path| try add(io, a, &out, try std.fs.path.join(a, &.{ path, "pkg" }));
     }
     for (in.extra) |path| try add(io, a, &out, path);

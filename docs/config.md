@@ -90,16 +90,20 @@ TUI `/skills` lists discoveries/switches; `/skills on <name>` and `/skills off <
 
 ```toml
 [sandbox]
-mode = "workspace"          # or "off"; default workspace
+mode = "workspace"          # opt in; default "off"
 writable = ["~/data/shared"] # extra writable roots; absolute or ~/...
 ```
 
-Writes are restricted by default; reads and network are not. bash (foreground and background), and every subagent Session, can write only to:
+The sandbox defaults off: nib runs with your permissions, without sandbox probing, wrappers, path checks, or unavailable notices/log records. `/status` shows `Sandbox: off`. Opt in with `mode = "workspace"` or `NIB_SANDBOX=workspace`; `/status` then shows `Sandbox: workspace` when available. The destructive-command deny-list and credential protections apply in both modes.
+
+In workspace mode, reads and network remain open. bash (foreground and background), hooks, MCP stdio servers, and every subagent Session can write only to:
 
 - the project directory (first cwd ancestor containing `.git`, else cwd); for a linked git worktree also its gitdir and common dir;
 - `/tmp`, `/var/tmp`, `$TMPDIR`, `/dev/shm`, and `/dev/null`, `/dev/zero`, `/dev/full`, tty/pty devices (macOS: `/private/tmp`, `/private/var/tmp`, `/private/var/folders`, `/dev/fd`);
-- per-user build and package caches, when they exist: `~/.cache`, `~/.npm`, `~/.cargo`, `~/.rustup`, `~/go/pkg`, `~/.gradle`, `~/.m2`, `~/.bun`, `~/.yarn`, `~/.pnpm-store`, `~/.local/share/pnpm`, `~/.local/share/uv` (macOS also `~/Library/Caches`, `~/Library/Developer`), plus `$XDG_CACHE_HOME`, `$ZIG_GLOBAL_CACHE_DIR`, `$CARGO_HOME`, `$RUSTUP_HOME`, `$GOPATH/pkg`, `$GOCACHE`, `$GOMODCACHE`, `$GRADLE_USER_HOME`, `$npm_config_cache`, `$PIP_CACHE_DIR`, `$UV_CACHE_DIR`;
+- per-user build and package caches, when they exist: `~/.cache`, `~/.npm`, `~/.cargo/registry`, `~/.cargo/git`, `~/.rustup`, `~/go/pkg`, `~/.gradle`, `~/.m2`, `~/.bun/install/cache`, `~/.yarn`, `~/.pnpm-store`, `~/.local/share/pnpm`, `~/.local/share/uv` (macOS also `~/Library/Caches`, `~/Library/Developer`), plus `$XDG_CACHE_HOME`, `$ZIG_GLOBAL_CACHE_DIR`, `$CARGO_HOME/registry`, `$CARGO_HOME/git`, `$RUSTUP_HOME`, `$GOPATH/pkg`, `$GOCACHE`, `$GOMODCACHE`, `$GRADLE_USER_HOME`, `$npm_config_cache`, `$PIP_CACHE_DIR`, `$UV_CACHE_DIR`;
 - `writable` entries. Missing paths are skipped.
+
+Executable directories `~/.cargo/bin`, `~/.bun/bin`, `~/go/bin`, and `~/.local/bin` are not cache roots. Explicit writable roots or a project containing them can still grant access.
 
 `$NIB_HOME` is not in the list: nib itself writes it, commands cannot. Denied writes fail as ordinary `EACCES`/`EPERM`; nothing is added to tool results. The in-process edit/write tools apply the same roots by canonical path (symlinks and `..` resolved) and return an error.
 
@@ -161,7 +165,7 @@ Children inherit effective provider/model/limits through anonymous stdin, skippi
 | `NIB_CODEX_TRANSPORT` | websocket (default) or sse; overrides [codex].transport; Session SSE fallback after handshake/protocol failure; [transport](codex.md#responses-websocket-transport) |
 | `NIB_CODEX_RUN_TOOL` | custom (default, direct JS) or function (JSON code/effort); overrides `[codex].run_tool`, preserving history types; Chat Completions always function |
 | `NIB_REASONING_SUMMARY` | off (default, omit summary) or auto; overrides `[codex].reasoning_summary`, preserving effort/encrypted continuation |
-| `NIB_SANDBOX` | workspace (default) or off; overrides `[sandbox].mode`; [details](#sandbox) |
+| `NIB_SANDBOX` | off (default) or workspace; overrides `[sandbox].mode`; [details](#sandbox) |
 | `NIB_RUN_OUTPUT_BYTES` | Model display bytes, 16384–16777216; overrides `[limits].run_output_bytes`, default 16384; JS data/console capture unchanged |
 | `NIB_MODEL` | Current provider model |
 | `NIB_CONTEXT_WINDOW` | Context tokens; DeepSeek default 1000000 |

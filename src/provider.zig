@@ -69,7 +69,7 @@ pub const Limits = struct {
 };
 
 pub const Sandbox = struct {
-    mode: enum { workspace, off } = .workspace,
+    mode: enum { workspace, off } = .off,
     /// Absolute extra writable roots.
     writable: []const []const u8 = &.{},
 };

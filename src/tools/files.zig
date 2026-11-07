@@ -227,7 +227,7 @@ test "edit and write refuse paths outside the writable roots as data" {
     try tmp.dir.symLink(testing.io, "/usr/share", "escape", .{});
     const root = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer testing.allocator.free(root);
-    var t: Tools = .{ .io = testing.io, .home = root, .cfg = .{ .base_url = "", .api_key = "", .model = "m" } };
+    var t: Tools = .{ .io = testing.io, .home = root, .cfg = .{ .base_url = "", .api_key = "", .model = "m", .sandbox = .{ .mode = .workspace } } };
     defer t.file_state.deinit(testing.allocator);
     const outside = [_][]const u8{ "/usr/share/nib-sandbox-test", "escape/nib-sandbox-test", "../../../../../../../usr/share/nib-sandbox-test" };
     for (outside) |relative| {

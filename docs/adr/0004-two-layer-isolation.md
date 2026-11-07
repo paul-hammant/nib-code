@@ -9,7 +9,13 @@ Language-level isolation gives the Sandbox no host capabilities except Tools. Sy
 
 **Why:** With a bash Tool, language-level isolation cannot stop anything; model-written code runs with the user's permissions. Command-text matching prevents mistakes, not deliberate or accidental bypasses (variables, scripts). The OS enforces by effect instead of text.
 
-## Decisions
+## Default changed on 2026-11-07
+
+The OS write sandbox is now opt-in (`mode = "workspace"` or `NIB_SANDBOX=workspace`); the default is `off`. The boundary of dangerous writes cannot be drawn well: editing `~/.zshrc`, writing into `~/.cargo/bin`, or touching `.git/hooks` can be an attack or exactly what the user requested. By default nib runs with the user's permissions, like pi, and the user stays in the loop. Off skips root construction, probing, wrappers, path checks, unavailable notices and log records. The destructive-command deny-list and credential protections remain in both modes.
+
+Workspace mode allows Cargo registry/git and Bun install/cache subdirectories instead of their parents, including custom `$CARGO_HOME`; their bin directories, `~/go/bin` and `~/.local/bin` are not cache roots. Both OS backends share this allowlist.
+
+## Decisions (workspace mode)
 
 - **Write-only restriction.** Reads and network stay open. Reads are needed by every build and search; restricting them breaks normal use and the model cannot exfiltrate anything the user's own tools could not. Blocking writes outside the project stops the damage that matters (clobbering dotfiles, other repositories, system state) while staying nearly invisible.
 - **Writable roots:** the project directory (first cwd ancestor with `.git`, else cwd; linked worktrees add their gitdir and common dir so `git commit` works), temp dirs, a few devices, a cache allowlist, and user-configured extras. The cache list is the minimal set that keeps cargo, npm/pnpm/yarn/bun, go, gradle, maven, pip/uv and zig working; the full list is in [config.md](../config.md#sandbox). `$NIB_HOME` is excluded: nib writes it from its own unrestricted process, commands should not.
@@ -18,7 +24,7 @@ Language-level isolation gives the Sandbox no host capabilities except Tools. Sy
 - **Scope.** Foreground bash, background bash and subagent Sessions. Children inherit the effective mode and roots through the stdin configuration envelope; each child sandboxes its own bash.
 - **In-process tools.** edit/write cannot be restricted through the OS without restricting nib itself, so they check the canonical path (symlinks and `..` resolved) against the same roots and return an error as data.
 - **Fallback.** If Landlock or `sandbox-exec` is unavailable (old kernel, Landlock disabled, nested sandbox), commands run unsandboxed: one dim notice per Session, a `sandbox_unavailable` record in the Session log, and `/status`. A command never fails because of the sandbox being unavailable.
-- **No approvals.** The user decided against approving individual Tool calls (2026-11-01). A denied write returns the ordinary `EACCES`; nothing is injected into results and the bash result shape is unchanged (no `sandbox` field: it would cost tokens on every call, and tests and models rely on `{exit_code, output}`). Users widen the roots with `[sandbox].writable` or turn the sandbox off with `mode = "off"` / `NIB_SANDBOX=off`.
+- **No approvals.** The user decided against approving individual Tool calls (2026-11-01). A denied write returns the ordinary `EACCES`; nothing is injected into results and the bash result shape is unchanged (no `sandbox` field: it would cost tokens on every call, and tests and models rely on `{exit_code, output}`). Users widen the roots with `[sandbox].writable` or use the default off mode with `mode = "off"` / `NIB_SANDBOX=off`.
 
 ## Confidence
 

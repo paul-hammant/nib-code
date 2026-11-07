@@ -134,7 +134,7 @@ console.log(await tools.mcp("local.env", {}));'''
         self.addCleanup(outside.cleanup)
         target = Path(outside.name) / "blocked"
         code = 'console.log(await tools.mcp("local.sandbox", {text:"test", path:' + json.dumps(str(target)) + '}));'
-        _, _, mock, ask = self.setup_case(self.stdio_config(), code)
+        _, _, mock, ask = self.setup_case(self.stdio_config() + '\n[sandbox]\nmode = "workspace"\n', code)
         ask()
         self.assertIn('"content":"denied"', self.results(mock)[0])
         self.assertFalse(target.exists())

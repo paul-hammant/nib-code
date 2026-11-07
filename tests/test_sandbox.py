@@ -79,7 +79,7 @@ class SandboxTests(unittest.TestCase):
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith(("NIB_", "OPENAI_", "DEEPSEEK_", "CODEX_"))}
         self.env.update(
-            NIB_PROVIDER="chat_completions", NIB_API_KEY="mock",
+            NIB_SANDBOX="workspace", NIB_PROVIDER="chat_completions", NIB_API_KEY="mock",
             NIB_BASE_URL=f"http://127.0.0.1:{server.server_port}",
             NIB_CONTEXT_WINDOW="128000", NIB_HOME=str(self.home), HOME=str(self.base),
             XDG_DATA_HOME=str(self.base / "data"), XDG_CONFIG_HOME=str(self.base / "config"),
@@ -114,6 +114,23 @@ class SandboxTests(unittest.TestCase):
         self.addCleanup(lambda: marker.unlink(missing_ok=True))
         result = self.recorded(f"echo ok > {marker} && echo gone > /dev/null && cat {marker}")
         self.assertEqual(result, {"exit_code": 0, "output": "ok\n"})
+
+    def test_default_allows_external_writes_without_notice(self):
+        self.env.pop("NIB_SANDBOX")
+        self.assertEqual(self.recorded(f"touch {self.outside}")["exit_code"], 0)
+        self.run_js("await tools.write({path: '../file-tool', content: 'old'}); await tools.edit({path: '../file-tool', old_text: 'old', new_text: 'new'});")
+        self.assertEqual((self.base / "file-tool").read_text(), "new")
+        for log in (self.home / "sessions").glob("*.jsonl"):
+            self.assertNotIn("sandbox_unavailable", log.read_text())
+
+    def test_executable_directories_are_not_caches(self):
+        for rel in (".cargo/bin", ".cargo/registry", ".cargo/git", ".bun/bin", ".bun/install/cache", "go/bin", ".local/bin"):
+            (self.base / rel).mkdir(parents=True, exist_ok=True)
+        for env in ({}, {"CARGO_HOME": str(self.base / ".cargo")}):
+            for rel in (".cargo/bin", ".bun/bin", "go/bin", ".local/bin"):
+                self.assertNotEqual(self.recorded(f"touch {self.base}/{rel}/x", **env)["exit_code"], 0)
+            for rel in (".cargo/registry", ".cargo/git", ".bun/install/cache"):
+                self.assertEqual(self.recorded(f"touch {self.base}/{rel}/x", **env)["exit_code"], 0)
 
     def test_caches_stay_writable(self):
         (self.base / ".cache").mkdir()
@@ -152,6 +169,7 @@ class SandboxTests(unittest.TestCase):
         self.assertEqual(result["exit_code"], 0, result)
         self.assertTrue(self.outside.exists())
         self.outside.unlink()
+        self.env.pop("NIB_SANDBOX")
         (self.home / "config.toml").write_text('[sandbox]\nmode = "off"\n')
         self.assertEqual(self.recorded(f"touch {self.outside}")["exit_code"], 0)
         self.outside.unlink()

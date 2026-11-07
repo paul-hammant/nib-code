@@ -95,6 +95,8 @@ class Hooks(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="nib-hook-denied-", dir=Path.home()) as directory:
             target = Path(directory) / "denied"
             self.configure(["echo denied > " + shlex.quote(str(target))])
+            with (self.home / "config.toml").open("a") as config:
+                config.write('[sandbox]\nmode = "workspace"\n')
             self.finish(self.start(self.edit()))
             self.assertFalse(target.exists())
             result = next(m["content"] for m in Handler.requests[-1]["messages"] if m["role"] == "tool")
@@ -114,6 +116,7 @@ class Hooks(unittest.TestCase):
             terminal.wait_turn("finished-hooks")
             terminal.send("/status\r")
             terminal.until(b"Hooks: after_edit 1")
+            terminal.until(b"Sandbox: off")
             logs = [json.loads(line) for path in (home / "sessions").glob("*.jsonl") if ".calls." not in path.name for line in path.read_text().splitlines()]
             self.assertEqual([r["hook"]["event"] for r in logs if "hook" in r], ["after_edit", "turn_end"])
 
