@@ -88,6 +88,8 @@ pub const Candidate = struct {
     value: ?[]const u8 = null,
     label: []const u8,
     detail: []const u8,
+    /// An `@` file completion: `value` is the text that replaces the mention.
+    is_path: bool = false,
 
     pub fn group(c: Candidate) ?Group {
         return if (c.value == null) specs.get(c.command).group else null;

@@ -58,6 +58,7 @@ pub const Event = union(enum) {
     /// One outcome line from automatic issue filing, owned by the receiver.
     issue: []u8,
     issues_done,
+    paths_ready,
 
     pub fn flushesVisible(event: Event) bool {
         return switch (event) {
@@ -99,7 +100,7 @@ pub const Event = union(enum) {
                 changes.deinit(gpa);
                 if (b.tool_summary) |summary| summary.deinit(gpa);
             },
-            .key_press, .winsize, .paste_start, .paste_end, .mouse, .color_report, .color_scheme, .tick, .tool_activity, .model_activity, .user_inserted, .done, .turn_end, .usage, .issues_done => {},
+            .key_press, .winsize, .paste_start, .paste_end, .mouse, .color_report, .color_scheme, .tick, .tool_activity, .model_activity, .user_inserted, .done, .turn_end, .usage, .issues_done, .paths_ready => {},
         }
     }
 };
@@ -154,6 +155,7 @@ pub fn run(init: std.process.Init, session: *Session) !void {
         .context = session.context_tokens,
     };
     defer app.deinit();
+    app.menu.wake = .{ .ctx = &app, .call = pathsReady };
 
     try app.transcript.addHistory(gpa, session.history.items);
     for (session.history.items) |m| {
@@ -175,6 +177,11 @@ pub fn run(init: std.process.Init, session: *Session) !void {
         }
         ticker.busy.store(frames.pending or app.transcript.hasBacklog() or app.turn != null or app.session.tools.background.anyPending(io), .release);
     }
+}
+
+fn pathsReady(ctx: *anyopaque) void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    app.loop.postEvent(.paths_ready) catch {};
 }
 
 pub const App = struct {
@@ -263,6 +270,7 @@ pub const App = struct {
                 app.pasting = false;
                 try app.input.paste(gpa, app.paste_buf.items);
                 app.menu.inputChanged(app.input.text());
+                app.menu.closed = true;
                 app.paste_buf.clearRetainingCapacity();
             },
             .mouse => |m| {
@@ -286,6 +294,7 @@ pub const App = struct {
                     if (app.body) |body| app.scroll.top = body.top;
                 }
             },
+            .paths_ready => {},
             .tick => if (app.turn == null) {
                 app.session.tools.progress.sink = .{ .ctx = app, .emit = idleProgress };
                 defer app.session.tools.progress.sink = null;
@@ -408,6 +417,10 @@ pub const App = struct {
         return true;
     }
 
+    fn page(app: *App) i64 {
+        return @max(app.vx.window().height / 2, 1);
+    }
+
     fn onKey(app: *App, k: vaxis.Key) !bool {
         app.notice = null;
         app.selection.clear();
@@ -423,9 +436,9 @@ pub const App = struct {
             return true;
         }
         const input = &app.input;
-        const page = @max(app.vx.window().height / 2, 1);
         if (k.matches('c', .{ .ctrl = true })) return false;
         if (k.matches('d', .{ .ctrl = true }) and input.text().len == 0) return false;
+        app.menu.sync(app.io, input, app.session);
         const selected = app.menu.selected(input.text());
         const before = std.hash.Wyhash.hash(0, input.text());
         var submitted: ?[]u8 = null;
@@ -436,6 +449,8 @@ pub const App = struct {
             app.menu.move(input.text(), false);
         } else if (selected != null and k.matches(vaxis.Key.down, .{})) {
             app.menu.move(input.text(), true);
+        } else if (selected != null and selected.?.is_path and (k.matches(vaxis.Key.tab, .{}) or k.matches(vaxis.Key.enter, .{}))) {
+            if (input.fileMention()) |m| try input.completeMention(gpa, m.start, selected.?.value.?);
         } else if (selected != null and (k.matches(vaxis.Key.tab, .{}) or (k.matches(vaxis.Key.enter, .{}) and !app.pasting and !selected.?.runs()))) {
             const completion = try selected.?.completion(gpa);
             defer gpa.free(completion);
@@ -448,9 +463,9 @@ pub const App = struct {
         } else if (k.matches(vaxis.Key.escape, .{})) {
             if (app.turn) |t| t.cancel.store(true, .release);
         } else if (k.matches(vaxis.Key.page_up, .{})) {
-            app.scroll.pending -= page;
+            app.scroll.pending -= app.page();
         } else if (k.matches(vaxis.Key.page_down, .{})) {
-            app.scroll.pending = if (app.scroll.top != null) std.math.maxInt(i32) else page;
+            app.scroll.pending = if (app.scroll.top != null) std.math.maxInt(i32) else app.page();
         } else if (k.matches('o', .{ .ctrl = true })) {
             app.transcript.toggleExpanded();
         } else if (k.matches(vaxis.Key.up, .{ .shift = true })) {
@@ -591,6 +606,7 @@ pub const App = struct {
 
     fn render(app: *App) !void {
         try app.menu.load(app.io, app.input.text(), app.session);
+        app.menu.sync(app.io, &app.input, app.session);
         const menu = app.menu.items(app.input.text());
         for (menu) |*candidate| if (candidate.command == .reflect and candidate.value == null) {
             candidate.detail = commands.reflectHelp(&app.reflect_help, reflect.issueRepo(app));
@@ -1060,4 +1076,99 @@ test "terminal, interaction and Run boundaries flush visible backlog" {
     for (events) |event| try std.testing.expect(event.flushesVisible());
     try std.testing.expect(!Event.flushesVisible(.tick));
     try std.testing.expect(!Event.flushesVisible(.{ .delta = .{ .kind = .text, .text = @constCast("text"), .step = 1 } }));
+}
+
+fn shown(app: *App) []const @import("tui/commands.zig").Candidate {
+    app.menu.sync(app.io, &app.input, app.session);
+    return app.menu.items(app.input.text());
+}
+
+fn typeText(app: *App, text: []const u8) !void {
+    for (text) |c| _ = try app.onKey(.{ .codepoint = c, .text = &.{c} });
+}
+
+test "@ completion: Enter and Tab accept instead of sending, directories keep completing, Esc only closes" {
+    const gpa = std.testing.allocator;
+    var session: Session = undefined;
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = std.testing.io;
+    app.session = &session;
+    app.input = .{};
+    defer app.input.deinit(gpa);
+    app.menu = .init(gpa);
+    defer app.menu.deinit();
+    app.notice = null;
+    app.pasting = false;
+    app.selection = .{};
+    app.turn = null;
+    const ix = try gpa.create(@import("tui/paths.zig").Index);
+    ix.* = .{ .gpa = gpa, .io = std.testing.io };
+    app.menu.index = ix;
+    try ix.setEntries(&.{ "src/", "src/main.zig", "src/tui.zig", "my dir/", "my dir/a b.txt", "README.md" });
+
+    try typeText(&app, "see @sr");
+    try std.testing.expect(shown(&app).len > 0);
+    _ = try app.onKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expectEqualStrings("see @src/", app.input.text());
+    try std.testing.expectEqualStrings("src/", shown(&app)[0].label);
+    try typeText(&app, "ma");
+    _ = try app.onKey(.{ .codepoint = vaxis.Key.tab });
+    try std.testing.expectEqualStrings("see @src/main.zig ", app.input.text());
+    try std.testing.expectEqual(@as(usize, 0), shown(&app).len);
+
+    try typeText(&app, "@RE");
+    _ = try app.onKey(.{ .codepoint = vaxis.Key.escape });
+    try std.testing.expectEqual(@as(usize, 0), shown(&app).len);
+    try std.testing.expectEqualStrings("see @src/main.zig @RE", app.input.text());
+    try typeText(&app, "A");
+    _ = try app.onKey(.{ .codepoint = vaxis.Key.down });
+    _ = try app.onKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expectEqualStrings("see @src/main.zig @README.md ", app.input.text());
+
+    try app.input.replace(gpa, "");
+    try typeText(&app, "@my");
+    _ = try app.onKey(.{ .codepoint = vaxis.Key.tab });
+    try std.testing.expectEqualStrings("@\"my dir/", app.input.text());
+    try typeText(&app, "a");
+    _ = try app.onKey(.{ .codepoint = vaxis.Key.tab });
+    try std.testing.expectEqualStrings("@\"my dir/a b.txt\" ", app.input.text());
+}
+
+test "@ completion ignores emails and pasted mentions" {
+    const gpa = std.testing.allocator;
+    var session: Session = undefined;
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = std.testing.io;
+    app.session = &session;
+    app.input = .{};
+    defer app.input.deinit(gpa);
+    app.menu = .init(gpa);
+    defer app.menu.deinit();
+    app.paste_buf = .empty;
+    defer app.paste_buf.deinit(gpa);
+    app.notice = null;
+    app.pasting = false;
+    app.selection = .{};
+    app.turn = null;
+    const ix = try gpa.create(@import("tui/paths.zig").Index);
+    ix.* = .{ .gpa = gpa, .io = std.testing.io };
+    app.menu.index = ix;
+    try ix.setEntries(&.{ "src/", "bob.txt" });
+
+    try typeText(&app, "mail a@b");
+    app.menu.sync(app.io, &app.input, app.session);
+    try std.testing.expectEqual(@as(usize, 0), shown(&app).len);
+
+    try app.input.replace(gpa, "");
+    _ = try app.handle(.paste_start);
+    try typeText(&app, "@sr");
+    _ = try app.handle(.paste_end);
+    app.menu.sync(app.io, &app.input, app.session);
+    try std.testing.expectEqualStrings("@sr", app.input.text());
+    try std.testing.expectEqual(@as(usize, 0), shown(&app).len);
+    try typeText(&app, "c");
+    app.menu.sync(app.io, &app.input, app.session);
+    try std.testing.expectEqual(@as(usize, 1), shown(&app).len);
 }

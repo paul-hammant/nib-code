@@ -55,7 +55,7 @@ nib -c                       # 继续本目录上次的会话
 
 默认使用 Codex 登录；`/model` 可切换到 Claude、OpenAI、DeepSeek、Grok 或[自己的站点](docs/providers.md)。
 
-Enter 发送，Shift+Enter 换行，Esc 取消。输入 `/` 查看指令：`/model`、`/effort`、`/undo`、`/tasks`、`/skills`、`/status`。
+Enter 发送，Shift+Enter 换行，Esc 取消。输入 `/` 查看指令：`/model`、`/effort`、`/undo`、`/tasks`、`/skills`、`/status`。`@` 补全文件路径。
 
 项目约定写在 `AGENTS.md`，个人习惯写在 `~/.nib/AGENTS.md`。
 

@@ -2,6 +2,8 @@ const std = @import("std");
 const commands = @import("commands.zig");
 const Session = @import("../session.zig").Session;
 const session_log = @import("../session/log.zig");
+const paths = @import("paths.zig");
+const Editor = @import("editor.zig").Editor;
 
 /// The `/` candidate list above the input: selection, dismissal and session choices.
 pub const Menu = struct {
@@ -15,19 +17,91 @@ pub const Menu = struct {
     sessions_loaded: bool = false,
     tasks: []const commands.Choice = &.{},
     models: []const commands.Choice = &.{},
+    gpa: std.mem.Allocator,
+    /// `@` completions: set while the cursor ends an `@` mention.
+    mentioning: bool = false,
+    index: ?*paths.Index = null,
+    wake: ?paths.Index.Wake = null,
+    /// Owns the strings of `file_buf`; reset when the matches are recomputed.
+    file_arena: std.heap.ArenaAllocator,
+    file_buf: [paths.max_hits]commands.Candidate = undefined,
+    file_len: usize = 0,
+    file_query: [256]u8 = undefined,
+    file_query_len: usize = 0,
+    file_generation: u64 = 0,
+    file_fresh: bool = false,
 
     pub fn init(gpa: std.mem.Allocator) Menu {
-        return .{ .arena = .init(gpa) };
+        return .{ .arena = .init(gpa), .gpa = gpa, .file_arena = .init(gpa) };
     }
 
     pub fn deinit(m: *Menu) void {
+        if (m.index) |ix| {
+            ix.deinit();
+            m.gpa.destroy(ix);
+        }
+        m.file_arena.deinit();
         m.arena.deinit();
     }
 
     pub fn items(m: *Menu, input: []const u8) []commands.Candidate {
         if (m.closed) return m.buf[0..0];
-        return commands.candidates(input, m.sessions, m.tasks, m.models, &m.buf);
+        const slash = commands.candidates(input, m.sessions, m.tasks, m.models, &m.buf);
+        if (slash.len > 0 or !m.mentioning) return slash;
+        return m.file_buf[0..m.file_len];
     }
+
+    /// Follows the editor's `@` mention: starts or refreshes the path listing and ranks it.
+    pub fn sync(m: *Menu, io: std.Io, e: *const Editor, session: *const Session) void {
+        const found = e.fileMention() orelse {
+            m.mentioning = false;
+            m.file_fresh = false;
+            m.file_len = 0;
+            return;
+        };
+        if (m.index == null) {
+            const ix = m.gpa.create(paths.Index) catch return;
+            ix.* = .{ .gpa = m.gpa, .io = io, .wake = m.wake };
+            m.index = ix;
+        }
+        const ix = m.index.?;
+        if (!m.mentioning) {
+            m.mentioning = true;
+            m.file_fresh = false;
+            ix.refresh(@constCast(&session.tools));
+        }
+        const query = found.query[0..@min(found.query.len, m.file_query.len)];
+        const same = m.file_fresh and std.mem.eql(u8, query, m.file_query[0..m.file_query_len]);
+        ix.withEntries(Rank{ .m = m, .query = query, .same = same, .generation = &ix.generation }, Rank.run);
+    }
+
+    const Rank = struct {
+        m: *Menu,
+        query: []const u8,
+        same: bool,
+        generation: *const u64,
+
+        fn run(r: Rank, entries: []const paths.Entry) void {
+            const m = r.m;
+            if (r.same and m.file_generation == r.generation.*) return;
+            m.file_generation = r.generation.*;
+            m.file_fresh = true;
+            @memcpy(m.file_query[0..r.query.len], r.query);
+            m.file_query_len = r.query.len;
+            _ = m.file_arena.reset(.retain_capacity);
+            const a = m.file_arena.allocator();
+            var hits: [paths.max_hits]paths.Hit = undefined;
+            m.file_len = 0;
+            for (paths.top(entries, r.query, &hits)) |h| {
+                const entry = entries[h.index];
+                const value = paths.insertion(a, entry.path, entry.dir) catch break;
+                const label = if (entry.dir) std.fmt.allocPrint(a, "{s}/", .{entry.path}) catch break else entry.path;
+                m.file_buf[m.file_len] = .{ .command = .help, .value = value, .label = label, .detail = "", .is_path = true };
+                m.file_len += 1;
+            }
+            if (m.sel >= m.file_len) m.sel = 0;
+        }
+    };
 
     pub fn selected(m: *Menu, input: []const u8) ?commands.Candidate {
         const list = m.items(input);

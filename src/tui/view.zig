@@ -66,7 +66,7 @@ pub fn drawFrame(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *V
         }
         const chosen = i == menu_sel;
         const row = win.child(.{ .x_off = 2, .y_off = menu_y, .height = 1 });
-        const label_width = if (c.command == .model and c.value != null) row.width -| 10 else @min(row.width, 12);
+        const label_width = if (c.is_path) row.width else if (c.command == .model and c.value != null) row.width -| 10 else @min(row.width, 12);
         printFitted(row.child(.{ .width = label_width }), c.label, if (chosen) .{ .reverse = true, .bold = true } else .{ .bold = true });
         if (row.width > label_width + 2) printFitted(row.child(.{ .x_off = label_width + 2 }), c.detail, .{ .dim = true });
         menu_y += 1;

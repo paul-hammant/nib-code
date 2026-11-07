@@ -195,6 +195,7 @@ pub const File = struct {
     /// `root` joined with the path below it, as the caller would pass it to another tool.
     path: []const u8,
     absolute: []const u8,
+    dir: bool = false,
 };
 
 pub const Options = struct {
@@ -205,6 +206,8 @@ pub const Options = struct {
     filter: ?[]const u8 = null,
     /// Stops after collecting one file more than this.
     max: usize = std.math.maxInt(usize),
+    /// Also lists directories, each before its contents; `filter` still applies to files only.
+    dirs: bool = false,
 };
 
 /// Regular files under `root` in name order, skipping `.git`, symlinks and .gitignore'd entries,
@@ -284,6 +287,10 @@ const Walk = struct {
             if (denied(w.options.deny, entry_abs)) continue;
             const entry_rel = if (rel.len == 0) entry.name else try std.fs.path.join(w.a, &.{ rel, entry.name });
             if (is_dir) {
+                if (w.options.dirs) {
+                    const path = if (std.mem.eql(u8, w.root, ".")) entry_rel else try std.fs.path.join(w.a, &.{ if (w.root.len == 0) "/" else w.root, entry_rel });
+                    try w.out.append(w.a, .{ .path = path, .absolute = entry_abs, .dir = true });
+                }
                 var sub = dir.openDir(w.io, entry.name, .{ .iterate = true, .follow_symlinks = false }) catch continue;
                 defer sub.close(w.io);
                 try w.visit(sub, entry_top, entry_abs, entry_rel);

@@ -2,6 +2,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const Key = vaxis.Key;
 const long_text = @import("long_text.zig");
+const paths = @import("paths.zig");
 
 const Block = struct { start: usize, end: usize, original: []const u8 };
 
@@ -156,6 +157,20 @@ pub const Editor = struct {
             b.end += s.len;
         };
         e.cursor += s.len;
+    }
+
+    /// The `@` mention ending at the cursor, unless it touches an atomic paste block.
+    pub fn fileMention(e: *const Editor) ?paths.Mention {
+        const m = paths.mention(e.buf.items, e.cursor) orelse return null;
+        for (e.blocks.items) |b| if (b.end > m.start and b.start < e.cursor) return null;
+        return m;
+    }
+
+    /// Replaces the text from `start` to the cursor with `s`.
+    pub fn completeMention(e: *Editor, gpa: std.mem.Allocator, start: usize, s: []const u8) !void {
+        try e.buf.ensureUnusedCapacity(gpa, s.len);
+        e.remove(gpa, start, e.cursor);
+        try e.insert(gpa, s);
     }
 
     pub fn paste(e: *Editor, gpa: std.mem.Allocator, s: []const u8) !void {
