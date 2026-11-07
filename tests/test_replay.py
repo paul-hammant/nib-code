@@ -649,6 +649,8 @@ echo https://example.invalid/issues/1
                 return next((p for p in paths if not p.name.endswith(".calls.jsonl")
                              and "baseline complete" in p.read_text()), None)
             log = wait_for(main_log, "baseline committed")
+            # The log commits before the TUI handles done and enables slash commands.
+            terminal.until(b"110 tokens")
             secret_result = json.dumps({"text": marker, "next_offset": None})
             secret_rows = [
                 {"step": 1, "run": 0, "index": 0, "seq": 0, "name": "read",

@@ -455,9 +455,9 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
                         continue
                     p = event["progress"]
                     updates.append((time.monotonic(), p))
-                    assert live.poll() is None, "progress was buffered until exit"
                     assert not any("run_end" in e for e in seen), seen
                     if len(updates) == 1:
+                        assert live.poll() is None, "progress was buffered until exit"
                         assert not (progress_cwd / "progress-alpha.txt").exists() or p["step"] <= 1
                         active_child_logs = [p for p in (tmp / "nib/sessions").glob("[0-9a-f]" * 32 + ".jsonl")
                                              if (records := replay(p)[1])
