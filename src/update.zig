@@ -16,7 +16,11 @@ fn asset(os: std.Target.Os.Tag, arch: std.Target.Cpu.Arch) ![]const u8 {
             .aarch64 => "nib-aarch64-linux.tar.gz",
             else => error.UnsupportedPlatform,
         },
-        .macos => if (arch == .aarch64) "nib-aarch64-macos.tar.gz" else error.IntelMacUnsupported,
+        .macos => switch (arch) {
+            .aarch64 => "nib-aarch64-macos.tar.gz",
+            .x86_64 => error.IntelMacUnsupported,
+            else => error.UnsupportedPlatform,
+        },
         else => error.UnsupportedPlatform,
     };
 }
@@ -66,7 +70,7 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *std.Io.Wri
     if (args.len > 1) return error.InvalidArguments;
     const a = init.arena.allocator();
     const name = asset(builtin.os.tag, builtin.cpu.arch) catch |err| {
-        detail.* = try init.gpa.dupe(u8, if (err == error.IntelMacUnsupported) "Intel Macs are not supported; build from source with Zig 0.17" else "Unsupported platform");
+        detail.* = if (err == error.IntelMacUnsupported) try init.gpa.dupe(u8, "Intel Macs are not supported; build from source with Zig 0.17") else try std.fmt.allocPrint(init.gpa, "Unsupported platform: {s}/{s}", .{ if (builtin.os.tag == .linux) "Linux" else if (builtin.os.tag == .macos) "Darwin" else @tagName(builtin.os.tag), @tagName(builtin.cpu.arch) });
         return err;
     };
     var client: std.http.Client = .{ .allocator = init.gpa, .io = init.io };
