@@ -1111,7 +1111,7 @@ test "@ completion: Enter and Tab accept instead of sending, directories keep co
     try std.testing.expect(shown(&app).len > 0);
     _ = try app.onKey(.{ .codepoint = vaxis.Key.enter });
     try std.testing.expectEqualStrings("see @src/", app.input.text());
-    try std.testing.expectEqualStrings("src/", shown(&app)[0].label);
+    try std.testing.expectEqualStrings("src/tui.zig", shown(&app)[0].label);
     try typeText(&app, "ma");
     _ = try app.onKey(.{ .codepoint = vaxis.Key.tab });
     try std.testing.expectEqualStrings("see @src/main.zig ", app.input.text());
