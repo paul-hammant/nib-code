@@ -320,6 +320,7 @@ pub const App = struct {
             .mouse => |m| {
                 if (m.type == .motion and !app.selection.active) {
                     app.hovered = null;
+                    if (app.selection.dragged) return true;
                     if (app.body) |body| {
                         if (m.col >= body.window.x_off and m.col < body.window.x_off + body.window.width and m.row >= 0 and m.row < body.window.height) {
                             if (@import("tui/selection/history.zig").position(body, app.transcript.entries.items, @intCast(m.col), @intCast(m.row))) |p| {
@@ -1504,6 +1505,10 @@ test "hover changes only between toggleable entries and summary clicks exclude d
     try std.testing.expectEqual(@as(?usize, 0), app.hovered);
     _ = try app.handle(motion);
     try std.testing.expectEqual(@as(?usize, 0), app.hovered);
+    app.selection.dragged = true;
+    _ = try app.handle(motion);
+    try std.testing.expectEqual(@as(?usize, null), app.hovered);
+    app.selection.clear();
     const rows = app.transcript.entries.items[0].toggleRows(app.body.?.window);
     app.clickEntry(0, rows - 1);
     try std.testing.expect(app.transcript.entries.items[0].open);
