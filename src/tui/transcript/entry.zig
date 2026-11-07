@@ -137,6 +137,14 @@ pub const Entry = struct {
         return e.kind == .run or e.kind == .background or e.kind == .failure or (e.kind == .user and long_text.isLong(e.text.items));
     }
 
+    pub fn toggleRows(e: *Entry, win: vaxis.Window) u16 {
+        if (!e.collapsible()) return 0;
+        const open = e.open;
+        e.open = false;
+        defer e.open = open;
+        return e.print(win, false);
+    }
+
     pub fn print(e: *Entry, win: vaxis.Window, commit: bool) u16 {
         if (e.kind == .assistant) {
             if (e.allocator) |a| return e.markdown_cache.draw(a, win, e.displayText(), commit);

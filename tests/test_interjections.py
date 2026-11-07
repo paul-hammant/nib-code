@@ -129,7 +129,7 @@ class Terminal:
             def rendered():
                 visible = "\n".join(screen(self.output, 120, 32))
                 start = visible.rfind(text)
-                return (start >= 0 and "Esc to cancel" not in visible and
+                return (start >= 0 and
                         re.search(r"\d+ steps?.*?tokens", visible[start + len(text):], re.S))
             if not self.output_changed.wait_for(rendered, timeout=10):
                 raise AssertionError((text, self.child.poll(), screen(self.output, 120, 32)))

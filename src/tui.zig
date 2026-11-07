@@ -179,8 +179,11 @@ pub fn run(init: std.process.Init, session: *Session) !void {
     while (true) {
         const event = try loop.nextEvent();
         const refresh = event.refresh();
-        if (event.flushesVisible()) app.transcript.flushVisible();
+        const old_hover = app.hovered;
+        const motion = event == .mouse and event.mouse.type == .motion and !app.selection.active;
+        if (!motion and event.flushesVisible()) app.transcript.flushVisible();
         if (!try app.handle(event)) break;
+        if (motion and old_hover == app.hovered) continue;
         const frame_start = std.Io.Clock.Timestamp.now(io, .awake);
         if (frames.due(frame_start, if (refresh != .immediate and app.transcript.hasBacklog()) .content else refresh)) {
             app.transcript.advanceVisible(frame_start);
@@ -209,6 +212,8 @@ pub const App = struct {
     selection: selection.Selection = .{},
     body: ?view.Frame = null,
     user_bg: vaxis.Color = .default,
+    hover_bg: vaxis.Color = .default,
+    hovered: ?usize = null,
     /// Shown on the status line until the next key or click; not part of the transcript.
     notice: ?[]const u8 = null,
     notice_buf: [256]u8 = undefined,
@@ -293,7 +298,10 @@ pub const App = struct {
         var event = value;
         defer event.deinit(gpa);
         switch (event) {
-            .key_press => |k| return app.onKey(k),
+            .key_press => |k| {
+                app.hovered = null;
+                return app.onKey(k);
+            },
             .paste_start => {
                 app.pasting = true;
                 app.paste_buf.clearRetainingCapacity();
@@ -310,6 +318,18 @@ pub const App = struct {
                 app.paste_buf.clearRetainingCapacity();
             },
             .mouse => |m| {
+                if (m.type == .motion and !app.selection.active) {
+                    app.hovered = null;
+                    if (app.body) |body| {
+                        if (m.col >= body.window.x_off and m.col < body.window.x_off + body.window.width and m.row >= 0 and m.row < body.window.height) {
+                            if (@import("tui/selection/history.zig").position(body, app.transcript.entries.items, @intCast(m.col), @intCast(m.row))) |p| {
+                                if (p.row < app.transcript.entries.items[p.entry].toggleRows(body.window)) app.hovered = p.entry;
+                            }
+                        }
+                    }
+                    return true;
+                }
+                app.hovered = null;
                 if (m.type == .press) app.notice = null;
                 if (m.button == .wheel_up or m.button == .wheel_down) {
                     if (m.type == .press) {
@@ -352,7 +372,10 @@ pub const App = struct {
                 app.activity.modelActivity(activity.state, activity.at);
             },
             .color_report => |color| {
-                if (color.kind == .bg) app.user_bg = userBackground(color.value);
+                if (color.kind == .bg) {
+                    app.user_bg = userBackground(color.value);
+                    app.hover_bg = hoverBackground(color.value);
+                }
             },
             .color_scheme => try app.vx.queryColor(app.w, .bg),
             .winsize => |ws| {
@@ -706,7 +729,8 @@ pub const App = struct {
     }
 
     fn clickEntry(app: *App, entry: usize, row: u16) void {
-        if (row == 0 and entry < app.transcript.entries.items.len and app.transcript.entries.items[entry].collapsible()) app.toggleEntry(entry);
+        const frame = app.body orelse return;
+        if (entry < app.transcript.entries.items.len and row < app.transcript.entries.items[entry].toggleRows(frame.window)) app.toggleEntry(entry);
     }
 
     fn toggleEntry(app: *App, index: usize) void {
@@ -729,9 +753,12 @@ pub const App = struct {
             candidate.detail = commands.reflectHelp(&app.reflect_help, reflect.issueRepo(app));
         };
         if (app.scroll.pending != 0 and (!app.selection.active or app.selection.history == null)) app.selection.clear();
+        if (app.scroll.pending != 0 or app.selection.dragged) app.hovered = null;
         app.body = view.drawFrame(app.vx.window(), app.transcript.entries.items, visible_input, &app.scroll, menu, @min(app.menu.sel, menu.len -| 1), .{
             .cfg = app.cfg,
             .user_bg = app.user_bg,
+            .hovered = app.hovered,
+            .hover_bg = app.hover_bg,
             .usage = app.usage,
             .steps = app.steps,
             .background_count = app.background_count,
@@ -739,7 +766,7 @@ pub const App = struct {
             .busy = if (app.turn != null) app.activity.label(app.io) else null,
             .notice = app.notice,
             .detail = app.activityDetail(),
-            .hint = if (app.flow.active()) app.flow.hint(&app.flow_hint) else if (app.menu.isPinned()) "Choose a service · Enter selects · Esc cancels" else "",
+            .hint = if (app.flow.active()) app.flow.hint(&app.flow_hint) else if (app.menu.isPinned()) "Choose a service" else "",
             .signed_out = app.signed_out,
             .revision = app.transcript.revision,
         }, &app.status_text);
@@ -752,6 +779,13 @@ pub const App = struct {
         try app.w.flush();
     }
 };
+
+fn hoverBackground(bg: [3]u8) vaxis.Color {
+    const light = @as(u32, bg[0]) * 299 + @as(u32, bg[1]) * 587 + @as(u32, bg[2]) * 114 > 128_000;
+    var rgb: [3]u8 = undefined;
+    for (bg, 0..) |base, i| rgb[i] = if (light) base -| 8 else base +| 8;
+    return .{ .rgb = rgb };
+}
 
 fn userBackground(bg: [3]u8) vaxis.Color {
     const light = @as(u32, bg[0]) * 299 + @as(u32, bg[1]) * 587 + @as(u32, bg[2]) * 114 > 128_000;
@@ -1450,4 +1484,31 @@ test "toggling pins the view unless following the latest details entry" {
     app.toggleEntry(1);
     try std.testing.expect(app.scroll.top == null);
     try std.testing.expect(app.transcript.entries.items[1].open);
+}
+
+test "hover changes only between toggleable entries and summary clicks exclude details" {
+    const a = std.testing.allocator;
+    var vx: vaxis.Vaxis = undefined;
+    vx.screen = try vaxis.Screen.init(a, .{ .cols = 8, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
+    defer vx.screen.deinit(a);
+    var app: App = undefined;
+    app.gpa = a;
+    app.flow = .{ .gpa = a };
+    clickApp(&app, &vx, .{}, .{});
+    app.hovered = null;
+    defer app.transcript.deinit(a);
+    try app.transcript.startRun(a, "console.log('details')");
+    try app.transcript.entries.items[0].files.appendSlice(a, "read x");
+    const motion: Event = .{ .mouse = .{ .col = 3, .row = 0, .type = .motion, .button = .none, .mods = .{} } };
+    _ = try app.handle(motion);
+    try std.testing.expectEqual(@as(?usize, 0), app.hovered);
+    _ = try app.handle(motion);
+    try std.testing.expectEqual(@as(?usize, 0), app.hovered);
+    const rows = app.transcript.entries.items[0].toggleRows(app.body.?.window);
+    app.clickEntry(0, rows - 1);
+    try std.testing.expect(app.transcript.entries.items[0].open);
+    app.clickEntry(0, rows);
+    try std.testing.expect(app.transcript.entries.items[0].open);
+    _ = try app.handle(.{ .mouse = .{ .col = 3, .row = 7, .type = .motion, .button = .none, .mods = .{} } });
+    try std.testing.expectEqual(@as(?usize, null), app.hovered);
 }

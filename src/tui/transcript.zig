@@ -325,7 +325,7 @@ pub const Transcript = struct {
             .tool => "The Run failed.",
             else => "The model request failed.",
         };
-        try e.label.print(gpa, "{s} · Details (click)", .{sentence});
+        try e.label.print(gpa, "{s}", .{sentence});
         try t.entries.append(gpa, e);
     }
 
@@ -1610,7 +1610,7 @@ test "retry removes only the failed attempt and preserves interjections and prio
     try t.failure(a, "server detail", .model);
     const e = &t.entries.items[3];
     try testing.expect(e.collapsible());
-    try testing.expectEqualStrings("The model request failed. · Details (click)", e.label.items);
+    try testing.expectEqualStrings("The model request failed.", e.label.items);
     try testing.expectEqualStrings("server detail", e.text.items);
 }
 

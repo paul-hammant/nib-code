@@ -61,12 +61,12 @@ pub const Form = struct {
 
     pub fn hint(f: Form) []const u8 {
         return switch (f.step) {
-            .name => "Add endpoint 1/4 · Name · Esc cancels",
-            .base_url => "Add endpoint 2/4 · Base URL · Esc cancels",
-            .key => "Add endpoint 3/4 · API key, empty for none · Esc cancels",
-            .protocol => "Add endpoint 4/4 · Protocol: Enter OpenAI-compatible · 2 Responses · 3 Anthropic Messages · Esc cancels",
-            .model => "Add endpoint · Model id · Esc cancels",
-            .window => "Add endpoint · Context window, Enter for 128000 · Esc cancels",
+            .name => "Add endpoint 1/4 · Name",
+            .base_url => "Add endpoint 2/4 · Base URL",
+            .key => "Add endpoint 3/4 · API key, empty for none",
+            .protocol => "Add endpoint 4/4 · Protocol",
+            .model => "Add endpoint · Model id",
+            .window => "Add endpoint · Context window · default 128000",
         };
     }
 
@@ -288,7 +288,7 @@ pub fn loginError(err: anyerror) []const u8 {
     };
 }
 
-pub const Kind = enum { none, key, form, pick, waiting };
+pub const Kind = enum { none, key, form, protocol, pick, waiting };
 pub const Waiting = enum { login, listing };
 
 /// What the TUI is doing for `/provider` besides ordinary editing.
@@ -394,10 +394,11 @@ pub const Flow = struct {
     pub fn hint(f: Flow, buf: []u8) []const u8 {
         return switch (f.kind) {
             .none => "",
-            .key => std.fmt.bufPrint(buf, "{s} API key · Enter saves · Esc cancels", .{f.service_name}) catch "API key · Enter saves · Esc cancels",
+            .key => std.fmt.bufPrint(buf, "{s} API key", .{f.service_name}) catch "API key",
             .form => f.form.?.hint(),
-            .pick => "Choose a model · Enter selects · Esc cancels",
-            .waiting => if (f.waiting == .login) "Waiting for ChatGPT sign-in · Esc cancels" else "Listing models · Esc cancels",
+            .protocol => "Add endpoint 4/4 · Protocol",
+            .pick => "Choose a model",
+            .waiting => if (f.waiting == .login) "Waiting for ChatGPT sign-in" else "Listing models",
         };
     }
 };
@@ -473,7 +474,7 @@ test "secret entry is masked, wiped and kept out of the display" {
     try flow.insert("\nignored");
     try testing.expectEqualStrings("sk-", flow.text.items);
     var hint: [128]u8 = undefined;
-    try testing.expectEqualStrings("Anthropic API key · Enter saves · Esc cancels", flow.hint(&hint));
+    try testing.expectEqualStrings("Anthropic API key", flow.hint(&hint));
     flow.wipe();
     try testing.expectEqual(@as(usize, 0), flow.text.items.len);
     flow.reset();

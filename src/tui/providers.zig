@@ -118,6 +118,11 @@ pub fn key(app: *App, k: vaxis.Key) !void {
     if (!k.matches(vaxis.Key.enter, .{})) return;
     const chosen = app.menu.selected("") orelse return;
     const value = chosen.value orelse return;
+    if (f.kind == .protocol) {
+        app.menu.unpin();
+        f.kind = .form;
+        return advance(app, try f.form.?.submit(value));
+    }
     if (f.kind == .pick) {
         const entry = for (f.listed) |item| {
             if (std.mem.eql(u8, item.id, value)) break item;
@@ -170,7 +175,17 @@ fn submit(app: *App) !void {
 fn advance(app: *App, outcome: flow.Outcome) !void {
     const f = &app.flow;
     switch (outcome) {
-        .next, .invalid => {},
+        .next => {
+            if (f.form) |form| if (form.step == .protocol) {
+                try app.menu.pin(&.{
+                    .{ .command = .provider, .value = "1", .label = "OpenAI-compatible", .detail = "" },
+                    .{ .command = .provider, .value = "2", .label = "Responses", .detail = "" },
+                    .{ .command = .provider, .value = "3", .label = "Anthropic Messages", .detail = "" },
+                });
+                f.kind = .protocol;
+            };
+        },
+        .invalid => {},
         .list_models => {
             const form = &f.form.?;
             const job: flow.Worker.Job = .{ .models = .{
