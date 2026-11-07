@@ -217,7 +217,8 @@ def test_during_run_and_resume(tmp):
         terminal.send("initial\r")
         wait_for(started.exists, "Run started")
         terminal.send("interjection one\rinterjection two\r")
-        terminal.until(b"queued")
+        wait_for(lambda: any("interjection two" in row and "queued" in row
+                             for row in screen(terminal.read(), 120, 32)), "both interjections queued")
         assert not second.received.is_set(), "must not interrupt the Run"
         release.touch()
         assert second.received.wait(5)
@@ -226,7 +227,7 @@ def test_during_run_and_resume(tmp):
         assert users(messages) == ["initial", "interjection one", "interjection two"]
         assert "run-result" in messages[-3]["content"]
         wait_for(lambda: finished(home, "run-finished"), "committed final Step")
-        terminal.until(b"run-finished")
+        terminal.wait_turn("run-finished")
         before = history(home)
         assert [m["role"] for m in before] == ["system", "user", "assistant", "tool", "user", "user", "assistant"]
         terminal.close()
@@ -251,7 +252,8 @@ def test_during_run_and_resume(tmp):
             if message["role"] == "tool":
                 message.pop("background_id", None)
             wire.append(message)
-        assert resumed.messages == wire + [{"role": "user", "content": "after resume"}]
+        expected = wire + [{"role": "user", "content": "after resume"}]
+        assert resumed.messages == expected, (resumed.messages, expected)
         events = [json.loads(line) for line in result.stdout.splitlines()]
         assert not any("user_inserted" in event for event in events), events
         assert events[-1]["end"]["text"] == "resumed-finished"
