@@ -7,7 +7,7 @@ import re
 import tempfile
 from unittest.mock import patch
 
-from test_interjections import Reply, fixture, finished, screen, wait_for
+from test_interjections import Terminal, Reply, fixture, finished, screen, wait_for
 
 
 def mouse(button, col, row, release=False):
@@ -97,8 +97,40 @@ def test_click_and_ctrl_o_open_single_runs(tmp):
         assert terminal.child.poll() is None
 
 
+def test_simple_mode(tmp):
+    replies = [Reply("working", code="/* simple-script */ await tools.bash({command: 'echo done'}); 'done'"), Reply("simple-done")]
+    with fixture(tmp, replies) as (terminal, home, env):
+        terminal.send("check\r")
+        terminal.wait_turn("simple-done")
+
+        def view():
+            return "\n".join(screen(terminal.read(), 120, 32))
+
+        wait_for(lambda: "tokens" in view(), "normal Turn footer")
+        terminal.send("\x13")
+        wait_for(lambda: (home / "config.toml").exists() and 'ui = "simple"' in (home / "config.toml").read_text(), "Ctrl+S persistence")
+        wait_for(lambda: "╭" not in view(), "Simple input rule")
+        assert "tokens" not in view() and "mock" not in view(), view()
+        row = next(i for i, line in enumerate(view().split("\n")) if "Run" in line)
+        terminal.send(mouse(0, 15, row) + mouse(0, 15, row, release=True))
+        wait_for(lambda: "simple-script" in view(), "centered Run opens by click")
+        terminal.send("/simple\r")
+        wait_for(lambda: "╭" in view(), "command returns to normal")
+        terminal.send("\x13")
+        wait_for(lambda: "╭" not in view(), "key returns to Simple")
+        terminal.close()
+        with patch.object(Terminal, "until", lambda *args, **kwargs: None):
+            restarted = Terminal(tmp, env)
+        try:
+            restarted.until("─".encode())
+            restored = "\n".join(screen(restarted.read(), 120, 32))
+            assert "╭" not in restored and "Ask about" not in restored, restored
+        finally:
+            restarted.close()
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="nib-tui-mouse-") as directory:
-        for test in (test_cross_screen_selection, test_background_report_and_user_card, test_click_and_ctrl_o_open_single_runs):
+        for test in (test_cross_screen_selection, test_background_report_and_user_card, test_click_and_ctrl_o_open_single_runs, test_simple_mode):
             test(Path(directory) / test.__name__)
             print(test.__name__ + ": ok")

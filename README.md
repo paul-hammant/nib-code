@@ -46,6 +46,8 @@ From source (Zig 0.17): `zig build -Doptimize=ReleaseFast --prefix ~/.local`
 
 ## Use
 
+`/simple` or Ctrl+S hides everything but the conversation.
+
 Optional sandboxed `after_edit` and `turn_end` commands: [hooks](docs/config.md#hooks).
 
 ```sh

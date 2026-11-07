@@ -39,7 +39,7 @@ pub const Viewport = struct {
         var rows: i64 = -1;
         while (i > 0 and rows < win.height) {
             i -= 1;
-            rows += @as(i64, entries[i].height(win)) + 1;
+            rows += @as(i64, entries[i].extent(win));
         }
         return .{ .entry = i, .row = @intCast(@max(rows - win.height, 0)) };
     }
@@ -64,12 +64,12 @@ pub const Viewport = struct {
                 left -= step;
                 if (left == 0 or top.entry == 0) break;
                 top.entry -= 1;
-                top.row = entries[top.entry].height(win) +| 1;
+                top.row = entries[top.entry].extent(win);
             } else {
-                const step = @min(left, @as(u32, entries[top.entry].height(win)) + 1 - top.row);
+                const step = @min(left, @as(u32, entries[top.entry].extent(win)) - top.row);
                 top.row += @intCast(step);
                 left -= step;
-                if (top.row <= entries[top.entry].height(win)) break;
+                if (top.row < entries[top.entry].extent(win)) break;
                 if (top.entry + 1 == entries.len) break;
                 top.entry += 1;
                 top.row = 0;

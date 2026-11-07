@@ -20,6 +20,8 @@ pub const Kind = enum { user, assistant, run, background, info, err, bill, failu
 
 pub const Entry = struct {
     kind: Kind,
+    simple: bool = false,
+    gap: u16 = 1,
     allocator: ?std.mem.Allocator = null,
     markdown_cache: markdown.Cache = .{},
     smooth: ?@import("../smooth.zig").Smooth = null,
@@ -153,6 +155,7 @@ pub const Entry = struct {
     }
 
     pub fn print(e: *Entry, win: vaxis.Window, commit: bool) u16 {
+        if (e.simple and e.kind == .bill) return 0;
         if (e.kind == .assistant) {
             if (e.allocator) |a| return e.markdown_cache.draw(a, win, e.displayText(), commit);
             return markdown.print(win, e.displayText(), commit);
@@ -168,6 +171,8 @@ pub const Entry = struct {
         const shown = segments(e, &segs);
         if (e.kind == .run) {
             _ = win.print(shown[0..3], .{ .wrap = .none, .commit = commit });
+            if (e.simple and !e.open and e.run != .running) return 1;
+            if (e.simple and !e.open) return 1 +| e.agent_tree.print(win.child(.{ .y_off = 1 }), commit);
             var rows: u16 = 1;
             if (e.changes.summary.len > 0) {
                 const r = win.child(.{ .x_off = 2, .y_off = rows }).printSegment(.{ .text = e.changes.summary, .style = .{ .dim = true } }, .{ .wrap = .word, .commit = commit });
@@ -235,9 +240,13 @@ pub const Entry = struct {
         return rows;
     }
 
+    pub fn extent(e: *Entry, win: vaxis.Window) u16 {
+        return e.height(win) +| e.gap;
+    }
+
     pub fn height(e: *Entry, win: vaxis.Window) u16 {
         const len = e.displayText().len + e.output.items.len + e.changes.diff.len;
-        if (e.cached) |c| {
+        if (if (e.simple) null else e.cached) |c| {
             if (c.width == win.width and c.len == len and c.open == e.open) return c.rows;
         }
         var measure = win;
@@ -268,7 +277,7 @@ pub const Entry = struct {
             .assistant => segs[0] = .{ .text = e.text.items },
             .run => {
                 segs[0] = if (e.run == .failed) .{ .text = "✗ ", .style = .{ .fg = .{ .index = 1 } } } else if (e.run == .warning or e.run == .lost or e.run == .timed_out or e.run == .canceled or e.hasWarning()) .{ .text = "! ", .style = .{ .fg = .{ .index = 3 } } } else .{ .text = "  ", .style = dim };
-                segs[1] = .{ .text = "" };
+                segs[1] = .{ .text = if (e.simple and e.run == .ok and !e.hasWarning()) "✓ " else "", .style = dim };
                 segs[2] = .{ .text = e.label.items, .style = dim };
                 if (!e.open) return segs[0..3];
                 segs[3] = .{ .text = "\n" };

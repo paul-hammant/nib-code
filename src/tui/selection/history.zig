@@ -20,9 +20,8 @@ pub fn position(frame: Frame, entries: []Entry, col: u16, row: u16) ?Position {
     if (frame.window.height == 0) return null;
     var remaining: u32 = @as(u32, frame.top.row) + @min(row, frame.window.height - 1);
     for (entries[frame.top.entry..], frame.top.entry..) |*entry, i| {
-        const height = entry.height(frame.window);
-        if (remaining <= height) return .{ .entry = i, .row = @intCast(remaining), .col = col };
-        remaining -= @as(u32, height) + 1;
+        if (remaining < entry.extent(frame.window)) return .{ .entry = i, .row = @intCast(remaining), .col = col };
+        remaining -= entry.extent(frame.window);
     }
     return null;
 }
@@ -75,7 +74,7 @@ pub const History = struct {
                     wrote_row = true;
                     const first = if (i == range.first.entry and row + r == range.first.row) range.first.col else 0;
                     const last = if (i == range.last.entry and row + r == range.last.row) range.last.col else screen.width -| 1;
-                    try appendRow(&out, gpa, &screen, @intCast(r), first, last);
+                    try appendRow(&out, gpa, &screen, @intCast(r), if (entry.simple) @max(first, @as(u16, @intCast(body.x_off))) else first, if (entry.simple) @min(last, @as(u16, @intCast(body.x_off)) + body.width -| 1) else last);
                 }
                 row += count;
             }

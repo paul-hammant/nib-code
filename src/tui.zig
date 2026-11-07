@@ -217,6 +217,7 @@ pub const App = struct {
     body: ?view.Frame = null,
     user_bg: vaxis.Color = .default,
     hover_bg: vaxis.Color = .default,
+    terminal_bg: ?[3]u8 = null,
     hovered: ?usize = null,
     /// Shown on the status line until the next key or click; not part of the transcript.
     notice: ?[]const u8 = null,
@@ -378,11 +379,15 @@ pub const App = struct {
             },
             .color_report => |color| {
                 if (color.kind == .bg) {
+                    app.terminal_bg = color.value;
                     app.user_bg = userBackground(color.value);
                     app.hover_bg = hoverBackground(color.value);
                 }
             },
-            .color_scheme => try app.vx.queryColor(app.w, .bg),
+            .color_scheme => |scheme| {
+                app.hover_bg = if (app.terminal_bg) |bg| hoverBackground(bg) else hoverFallback(scheme);
+                try app.vx.queryColor(app.w, .bg);
+            },
             .winsize => |ws| {
                 app.selection.clear();
                 try app.vx.resize(gpa, app.w, ws);
@@ -505,6 +510,10 @@ pub const App = struct {
             return true;
         }
         const input = &app.input;
+        if ((k.matches(@import("tui/mode.zig").key, .{ .ctrl = true }) or k.matches(@import("tui/mode.zig").key, .{ .ctrl = true, .shift = true }))) {
+            try app.toggleSimple();
+            return true;
+        }
         if (k.matches('c', .{ .ctrl = true })) return false;
         if (k.matches('d', .{ .ctrl = true }) and input.text().len == 0) return false;
         if (app.flow.active() or app.menu.isPinned()) {
@@ -741,6 +750,18 @@ pub const App = struct {
         if (entry < app.transcript.entries.items.len and row < app.transcript.entries.items[entry].toggleRows(frame.window)) app.toggleEntry(entry);
     }
 
+    pub fn toggleSimple(app: *App) !void {
+        const simple = !app.cfg.simple;
+        @import("config.zig").saveSimple(app.gpa, app.io, app.session.options.home, simple) catch |err| {
+            try app.report(.err, "could not save simple mode: {s}", .{@errorName(err)});
+            return;
+        };
+        app.cfg.simple = simple;
+        app.session.cfg.simple = simple;
+        app.selection.clear();
+        app.hovered = null;
+    }
+
     fn toggleEntry(app: *App, index: usize) void {
         app.transcript.toggle(index);
         const frame = app.body orelse return;
@@ -791,8 +812,15 @@ pub const App = struct {
 fn hoverBackground(bg: [3]u8) vaxis.Color {
     const light = @as(u32, bg[0]) * 299 + @as(u32, bg[1]) * 587 + @as(u32, bg[2]) * 114 > 128_000;
     var rgb: [3]u8 = undefined;
-    for (bg, 0..) |base, i| rgb[i] = if (light) base -| 8 else base +| 8;
+    for (bg, 0..) |base, i| rgb[i] = if (light) base -| 18 else base +| 18;
     return .{ .rgb = rgb };
+}
+
+fn hoverFallback(scheme: ?vaxis.Color.Scheme) vaxis.Color {
+    return switch (scheme orelse return .default) {
+        .light => .{ .rgb = .{ 237, 237, 237 } },
+        .dark => .{ .rgb = .{ 18, 18, 18 } },
+    };
 }
 
 fn userBackground(bg: [3]u8) vaxis.Color {
@@ -1523,4 +1551,39 @@ test "hover changes only between toggleable entries and summary clicks exclude d
     try std.testing.expect(app.transcript.entries.items[0].open);
     _ = try app.handle(.{ .mouse = .{ .col = 3, .row = 7, .type = .motion, .button = .none, .mods = .{} } });
     try std.testing.expectEqual(@as(?usize, null), app.hovered);
+}
+
+test "hover uses neutral eighteen-level contrast and scheme fallback" {
+    const t = std.testing;
+    try t.expectEqualDeep(vaxis.Color{ .rgb = .{ 18, 18, 18 } }, hoverBackground(.{ 0, 0, 0 }));
+    try t.expectEqualDeep(vaxis.Color{ .rgb = .{ 237, 237, 237 } }, hoverBackground(.{ 255, 255, 255 }));
+    try t.expectEqualDeep(hoverBackground(.{ 0, 0, 0 }), hoverFallback(.dark));
+    try t.expectEqualDeep(hoverBackground(.{ 255, 255, 255 }), hoverFallback(.light));
+    try t.expectEqualDeep(vaxis.Color.default, hoverFallback(null));
+}
+
+test "Simple key variants and command toggle silently and persist" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var session: Session = undefined;
+    session.options.home = root;
+    session.cfg = .{ .base_url = "", .api_key = "", .model = "mock" };
+    var app: App = undefined;
+    app.gpa = t.allocator;
+    app.io = t.io;
+    app.session = &session;
+    app.cfg = session.cfg;
+    app.selection = .{};
+    app.input = .{};
+    app.pasting = false;
+    for ([_]bool{ false, true }) |shift| {
+        _ = try app.onKey(.{ .codepoint = @import("tui/mode.zig").key, .mods = .{ .ctrl = true, .shift = shift } });
+        try t.expectEqual(!shift, app.cfg.simple);
+        try t.expect(app.notice == null);
+    }
+    try commands.execute(&app, .simple, "", "/simple");
+    try t.expect(app.cfg.simple);
 }

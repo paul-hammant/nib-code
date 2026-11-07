@@ -1,3 +1,4 @@
+const mode = @import("tui/mode.zig");
 const std = @import("std");
 const atomic_file = @import("tools/atomic_file.zig");
 const provider = @import("provider.zig");
@@ -174,6 +175,8 @@ const File = struct {
     sandbox: provider.Sandbox = .{},
     hooks: provider.Hooks = .{},
     provider_id: ?provider.Id = null,
+    simple: bool = false,
+    ui_value: ?Span = null,
     effort: ?[]const u8 = null,
     codex_settings: Settings = .{},
     chat_settings: Settings = .{},
@@ -444,7 +447,7 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
             continue;
         }
         const index: usize = if (section == null)
-            if (std.mem.eql(u8, key, "provider")) 0 else if (std.mem.eql(u8, key, "effort")) 1 else return p.bad("unknown top-level key '{s}'", .{key})
+            if (std.mem.eql(u8, key, "provider")) 0 else if (std.mem.eql(u8, key, "effort")) 1 else if (std.mem.eql(u8, key, "ui")) 2 else return p.bad("unknown top-level key '{s}'", .{key})
         else if (section == .limits) blk: {
             const names = .{ "llm_concurrency", "llm_calls_per_run", "llm_input_kib", "agent_concurrency", "max_steps", "stream_idle_timeout_s", "run_background_after_ms", "stream_content_timeout_s", "request_timeout_s", "run_output_bytes" };
             inline for (names, 0..) |name, i| {
@@ -494,6 +497,11 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
                     file.provider_id = std.meta.stringToEnum(provider.Id, decoded) orelse .custom;
                     file.provider_name = decoded;
                     file.provider_line = p.line;
+                } else if (index == 2) {
+                    if (!std.mem.eql(u8, decoded, mode.value) and !std.mem.eql(u8, decoded, "normal")) return p.bad("ui must be simple or normal", .{});
+                    file.simple = std.mem.eql(u8, decoded, mode.value);
+                    const value_start = start + @intFromPtr(value.ptr) - @intFromPtr(raw.ptr);
+                    file.ui_value = .{ .start = value_start, .end = value_start + consumed };
                 } else {
                     file.effort = knownEffort(decoded) orelse return p.bad("invalid effort; expected default|off|none|minimal|low|medium|high|xhigh|max", .{});
                     const value_start = start + @intFromPtr(value.ptr) - @intFromPtr(raw.ptr);
@@ -594,6 +602,7 @@ pub fn resolve(a: Allocator, env: *const Env, text: []const u8, path: []const u8
         detail.* = try a.dupe(u8, "NIB_CODEX_TRANSPORT: expected websocket or sse");
         return error.InvalidConfig;
     } else file.codex_settings.transport;
+    cfg.simple = file.simple;
     cfg.codex_run_tool = if (env.get("NIB_CODEX_RUN_TOOL")) |v| std.meta.stringToEnum(@FieldType(provider.Config, "codex_run_tool"), v) orelse {
         detail.* = try a.dupe(u8, "NIB_CODEX_RUN_TOOL: expected custom or function");
         return error.InvalidConfig;
@@ -1605,4 +1614,49 @@ test "MCP atomic toggles preserve nested definitions and CRLF comments" {
     try t.expectEqualStrings("[mcp]\r\nx = true # keep\r\n[mcp.x]\r\ncommand = \"server\"\r\n", try tmp.dir.readFileAlloc(t.io, "config.toml", a, .limited(10000)));
     try saveMcp(a, t.io, home_path, "new", false);
     try t.expect((try loadMcp(a, t.io, home_path))[0].enabled);
+}
+
+pub fn saveSimple(a: Allocator, io: std.Io, home_path: []const u8, simple: bool) !void {
+    const path = try std.fs.path.join(a, &.{ home_path, "config.toml" });
+    defer a.free(path);
+    const text = try read(a, io, path);
+    defer a.free(text);
+    var scratch: std.heap.ArenaAllocator = .init(a);
+    defer scratch.deinit();
+    var detail: ?[]u8 = null;
+    defer if (detail) |d| a.free(d);
+    const file = try parse(scratch.allocator(), a, text, path, &detail);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const value = if (simple) mode.value else "normal";
+    if (file.ui_value) |span| {
+        try out.appendSlice(a, text[0..span.start]);
+        try out.print(a, "\"{s}\"", .{value});
+        try out.appendSlice(a, text[span.end..]);
+    } else {
+        try out.print(a, "ui = \"{s}\"\n{s}", .{ value, text });
+    }
+    try std.Io.Dir.cwd().createDirPath(io, home_path);
+    _ = try atomic_file.replace(io, a, path, out.items, .{ .permissions = .fromMode(0o600), .sync = true });
+}
+
+test "simple persistence preserves surrounding configuration and rejects invalid values" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "config.toml", .data = "# keep\n[codex]\n" });
+    var env: Env = .init(a);
+    defer env.deinit();
+    var detail: ?[]u8 = null;
+    for ([_]bool{ true, false, true }) |simple| {
+        try saveSimple(a, t.io, root, simple);
+        const text = try tmp.dir.readFileAlloc(t.io, "config.toml", a, .limited(10000));
+        try t.expect(std.mem.endsWith(u8, text, "# keep\n[codex]\n"));
+        try t.expectEqual(simple, (try resolve(a, &env, text, "test", &detail)).simple);
+    }
+    for ([_][]const u8{ "ui = true", "ui = \"bad\"", "ui = \"normal\"\nui = \"simple\"" }) |text| try t.expectError(error.InvalidConfig, parse(a, a, text, "test", &detail));
 }

@@ -1,3 +1,4 @@
+const mode = @import("mode.zig");
 const std = @import("std");
 const App = @import("../tui.zig").App;
 const Turn = @import("turn.zig").Turn;
@@ -8,7 +9,7 @@ const provider = @import("../provider.zig");
 const auth = @import("../auth.zig");
 const providers = @import("providers.zig");
 
-pub const Command = enum { help, new, @"resume", compact, undo, provider, model, effort, copy, reflect, js, tasks, stop, status, skills, mcp };
+pub const Command = enum { simple, help, new, @"resume", compact, undo, provider, model, effort, copy, reflect, js, tasks, stop, status, skills, mcp };
 
 pub const Choices = enum { none, models, efforts, sessions, tasks, services };
 
@@ -26,6 +27,7 @@ pub const Spec = struct {
 };
 
 pub const specs = std.enums.EnumArray(Command, Spec).init(.{
+    .simple = .{ .group = .view, .help = "toggle " ++ mode.name ++ " mode", .while_busy = true },
     .mcp = .{ .group = .view, .args = "[on|off <id>]", .help = "list or enable MCP servers for new sessions" },
     .skills = .{ .group = .view, .args = "[on|off <name>]", .help = "list or enable skills for new sessions" },
     .status = .{ .group = .view, .help = "timing and cache details", .while_busy = true },
@@ -44,11 +46,11 @@ pub const specs = std.enums.EnumArray(Command, Spec).init(.{
     .js = .{ .group = .send, .args = "<code>", .help = "run JavaScript", .needs_arg = true },
 });
 
-pub const keys = "Enter send · Shift+Enter newline · Esc cancel\nCtrl+O latest details · click a block summary for details\nPgUp/PgDn scroll · ↑ input history · Ctrl+C quit";
+pub const keys = "Enter send · Shift+Enter newline · Esc cancel\n" ++ mode.shortcut ++ " simple mode · Ctrl+O latest details · click a block summary for details\nPgUp/PgDn scroll · ↑ input history · Ctrl+C quit";
 
 const slash_names = blk: {
     var names: [std.enums.values(Command).len][]const u8 = undefined;
-    for (std.enums.values(Command), &names) |c, *n| n.* = "/" ++ @tagName(c);
+    for (std.enums.values(Command), &names) |c, *n| n.* = if (c == .simple) "/" ++ mode.command else "/" ++ @tagName(c);
     const final = names;
     break :blk final;
 };
@@ -68,7 +70,7 @@ pub fn parse(line: []const u8) ?Parsed {
     const end = std.mem.indexOfAny(u8, line, " \t\n") orelse line.len;
     const name = line[1..end];
     if (std.mem.indexOfScalar(u8, name, '/') != null) return null;
-    const command = std.meta.stringToEnum(Command, name) orelse return .{ .unknown = name };
+    const command = (if (std.mem.eql(u8, name, mode.command)) Command.simple else std.meta.stringToEnum(Command, name)) orelse return .{ .unknown = name };
     return .{ .known = .{ .command = command, .arg = std.mem.trim(u8, line[end..], " \t\n") } };
 }
 
@@ -260,6 +262,7 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
     const gpa = app.gpa;
     const session = app.session;
     switch (c) {
+        .simple => try app.toggleSimple(),
         .status => {
             const skills = session.log.skills;
             var suffix: std.ArrayList(u8) = .empty;
@@ -485,7 +488,7 @@ test "parse tells commands from paths and messages" {
 }
 
 test "candidates complete command names, then argument choices" {
-    var buf: [16]Candidate = undefined;
+    var buf: [32]Candidate = undefined;
     try testing.expectEqual(@as(usize, std.enums.values(Command).len), candidates("/", &.{}, &.{}, &.{}, &.{}, &buf).len);
     const co = candidates("/co", &.{}, &.{}, &.{}, &.{}, &buf);
     try testing.expectEqual(@as(usize, 2), co.len);
@@ -524,7 +527,7 @@ test "accepting a command waits for required arguments only" {
 test "task commands run while busy and stop completes current task ids" {
     try testing.expect(allowedWhileBusy("/tasks"));
     try testing.expect(allowedWhileBusy("/stop r3"));
-    var buf: [16]Candidate = undefined;
+    var buf: [32]Candidate = undefined;
     const tasks = [_]Choice{.{ .value = "r3", .label = "r3", .detail = "Run" }};
     const selected = candidates("/stop r", &.{}, &tasks, &.{}, &.{}, &buf);
     try testing.expectEqual(@as(usize, 1), selected.len);
@@ -546,7 +549,7 @@ test "help groups commands and states the real issue destination or disabled sta
 }
 
 test "model choices filter and complete without running the bare command" {
-    var buf: [16]Candidate = undefined;
+    var buf: [32]Candidate = undefined;
     const models = [_]Choice{ .{ .value = "gpt-6.1-sol", .label = "gpt-6.1-sol", .detail = "current" }, .{ .value = "gpt-6.1-terra", .label = "gpt-6.1-terra", .detail = "" } };
     try testing.expect(!allowedWhileBusy("/model gpt-6.1-sol"));
     try testing.expect(!candidates("/model", &.{}, &.{}, &models, &.{}, &buf)[0].runs());
@@ -559,7 +562,7 @@ test "model choices filter and complete without running the bare command" {
 }
 
 test "service choices complete /provider and run on Enter" {
-    var buf: [16]Candidate = undefined;
+    var buf: [32]Candidate = undefined;
     const services = [_]Choice{ .{ .value = "codex", .label = "Codex", .detail = "signed in · ChatGPT" }, .{ .value = "anthropic", .label = "Anthropic", .detail = "—" } };
     try testing.expect(!allowedWhileBusy("/provider anthropic"));
     try testing.expect(!candidates("/provider", &.{}, &.{}, &.{}, &services, &buf)[0].runs());
@@ -570,4 +573,9 @@ test "service choices complete /provider and run on Enter" {
     const line = try one[0].line(testing.allocator);
     defer testing.allocator.free(line);
     try testing.expectEqualStrings("/provider anthropic", line);
+}
+
+test "simple command is a busy-safe view change" {
+    try testing.expectEqual(Command.simple, parse("/" ++ mode.command).?.known.command);
+    try testing.expect(allowedWhileBusy("/" ++ mode.command));
 }

@@ -16,14 +16,22 @@ pub fn draw(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewpo
     _ = drawFrame(win, entries, input, scroll, menu, menu_sel, s, text);
 }
 
-pub fn drawFrame(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewport, menu: []const commands.Candidate, menu_sel: usize, s: status.Status, text: *status.Text) ?Frame {
-    win.clear();
+pub fn drawFrame(outer: vaxis.Window, entries: []Entry, input: *Editor, scroll: *Viewport, menu: []const commands.Candidate, menu_sel: usize, s: status.Status, text: *status.Text) ?Frame {
+    outer.clear();
+    const width: u16 = if (s.cfg.simple and outer.width > 110) 100 else outer.width;
+    const win = outer.child(.{ .x_off = (outer.width - width) / 2, .width = width });
     win.hideCursor();
+    for (entries, 0..) |*e, i| {
+        if (e.simple != s.cfg.simple) e.cached = null;
+        e.simple = s.cfg.simple;
+        e.gap = if (s.cfg.simple and e.kind == .bill) @as(u16, @intFromBool(i + 1 < entries.len and entries[i + 1].kind == .user)) else if (s.cfg.simple and i + 1 < entries.len and entries[i + 1].kind == .user) 2 else 1;
+    }
     if (win.height == 0 or win.width == 0) return null;
 
-    const framed = win.height >= 6 and win.width >= 8;
-    const bottom_space: u16 = @intFromBool(framed and win.height >= 8);
-    const borders: u16 = if (framed) 2 else 0;
+    const separator = s.cfg.simple and win.height >= 2;
+    const framed = !s.cfg.simple and win.height >= 6 and win.width >= 8;
+    const bottom_space: u16 = @intFromBool((framed or s.cfg.simple) and win.height >= 8);
+    const borders: u16 = if (framed) 2 else if (separator) 1 else 0;
     const x: u16 = if (framed) 2 else @min(3, win.width - 1);
     const input_w = win.width - x - @as(u16, if (framed) 2 else 0);
     const input_h = @min(input.rows(win.child(.{ .width = input_w })), @max(1, win.height / 3));
@@ -64,7 +72,7 @@ pub fn drawFrame(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *V
                 }
             }
         }
-        y += @as(i32, h) + 1;
+        y += e.extent(body);
     }
 
     if (s.signed_out and entries.len == 0 and body_h > 0) {
@@ -90,7 +98,16 @@ pub fn drawFrame(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *V
     }
 
     const input_y = body_h + activity_h + menu_h;
-    if (framed) {
+    if (separator) {
+        for (0..win.width) |col| put(win, @intCast(col), input_y, "─");
+        const percent = s.context * 100 / @max(s.cfg.context_window, 1);
+        if (percent >= 80) {
+            const label = std.fmt.bufPrint(&text.status, "context {d}%", .{percent}) catch "";
+            const w = win.gwidth(label);
+            if (w <= win.width) _ = win.child(.{ .x_off = win.width - w, .y_off = input_y, .height = 1 }).printSegment(.{ .text = label, .style = .{ .dim = true } }, .{ .wrap = .none });
+        }
+        _ = win.child(.{ .x_off = 1, .y_off = input_y + 1, .height = 1 }).printSegment(.{ .text = "›", .style = .{ .fg = .{ .index = 4 } } }, .{ .wrap = .none });
+    } else if (framed) {
         horizontal(win, input_y, "╭", "╮");
         horizontal(win, input_y + input_h + 1, "╰", "╯");
         for (0..input_h) |i| {
@@ -102,7 +119,10 @@ pub fn drawFrame(win: vaxis.Window, entries: []Entry, input: *Editor, scroll: *V
     } else if (win.width >= 3) {
         _ = win.child(.{ .x_off = 1, .y_off = input_y, .height = 1 }).printSegment(.{ .text = "› ", .style = .{ .fg = .{ .index = 4 } } }, .{ .wrap = .none });
     }
-    input.draw(win.child(.{ .x_off = x, .y_off = input_y + @as(u16, if (framed) 1 else 0), .width = input_w, .height = input_h }));
+    const placeholder = input.placeholder;
+    if (s.cfg.simple) input.placeholder = "";
+    defer input.placeholder = placeholder;
+    input.draw(win.child(.{ .x_off = x, .y_off = input_y + @as(u16, if (framed or separator) 1 else 0), .width = input_w, .height = input_h }));
     return .{ .top = top, .window = body };
 }
 
@@ -476,4 +496,100 @@ test "hover covers full summary width and leaves expanded details unchanged" {
         try testing.expectEqualDeep(color, screen.readCell(@intCast(col), @intCast(row)).?.style.bg);
     };
     try testing.expect(!std.meta.eql(color, screen.readCell(1, rows).?.style.bg));
+}
+
+test "Simple layout snapshots and centered hit testing" {
+    const gpa = testing.allocator;
+    var images: std.ArrayList(u8) = .empty;
+    defer images.deinit(gpa);
+    for ([_]struct { w: u16, h: u16 }{ .{ .w = 80, .h = 24 }, .{ .w = 120, .h = 40 }, .{ .w = 160, .h = 50 }, .{ .w = 40, .h = 10 } }) |size| {
+        for ([_]bool{ false, true }) |simple| {
+            var screen = try vaxis.Screen.init(gpa, .{ .cols = size.w, .rows = size.h, .x_pixel = 0, .y_pixel = 0 });
+            defer screen.deinit(gpa);
+            const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = size.w, .height = size.h, .screen = &screen };
+            var t: Transcript = .{};
+            defer t.deinit(gpa);
+            try t.add(gpa, .user, "Check the change");
+            try t.add(gpa, .assistant, "I will edit and verify it.");
+            for (0..2) |_| {
+                try t.add(gpa, .run, "await tools.bash({command: 'zig build'});");
+                const e = &t.entries.items[t.entries.items.len - 1];
+                e.run = .ok;
+                try e.refreshLabel(gpa);
+            }
+            try t.add(gpa, .assistant, "Done.");
+            try t.add(gpa, .bill, "2 Runs · 2 steps · 41s · 6.6k tokens");
+            try t.add(gpa, .user, "Thanks");
+            var input: Editor = .{};
+            defer input.deinit(gpa);
+            var scroll: Viewport = .{};
+            var text: status.Text = .{};
+            var cfg = mock_cfg;
+            cfg.simple = simple;
+            cfg.context_window = 100;
+            const frame = drawFrame(win, t.entries.items, &input, &scroll, &.{}, 0, .{ .cfg = cfg, .context = 84 }, &text).?;
+            const image = try snapshot(gpa, &screen);
+            defer gpa.free(image);
+            try images.print(gpa, "--- {s} {d}x{d} ---\n{s}", .{ if (simple) "simple" else "normal", size.w, size.h, image });
+            try testing.expectEqual(@as(u16, if (simple and size.w > 110) (size.w - 100) / 2 + 1 else 1), frame.window.x_off);
+            try testing.expect(std.mem.indexOf(u8, image, "context 84%") != null);
+            if (simple) {
+                try testing.expect(std.mem.indexOf(u8, image, "╭") == null);
+                try testing.expect(std.mem.indexOf(u8, image, "6.6k") == null);
+                try testing.expect(std.mem.indexOf(u8, image, "Ask about") == null);
+                try testing.expectEqual(@as(u16, 1), t.entries.items[2].height(frame.window));
+                const p = @import("selection/history.zig").position(frame, t.entries.items, @intCast(frame.window.x_off + 4), 0).?;
+                try testing.expect(p.entry < t.entries.items.len);
+            }
+            for (0..size.w) |col| try testing.expectEqualStrings(" ", screen.readCell(@intCast(col), size.h - 1).?.char.grapheme);
+        }
+    }
+    if (testing.environ.getPosix("NIB_TUI_SNAPSHOTS") != null) std.debug.print("\nSIMPLE_SNAPSHOTS_BEGIN\n{s}SIMPLE_SNAPSHOTS_END\n", .{images.items});
+    try testing.expectEqualStrings(@embedFile("simple_snapshots.txt"), images.items);
+}
+
+test "Simple Run marks and centered selection preserve details" {
+    const gpa = testing.allocator;
+    var screen = try vaxis.Screen.init(gpa, .{ .cols = 120, .rows = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(gpa);
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 120, .height = 40, .screen = &screen };
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    try t.add(gpa, .run, "script");
+    const e = &t.entries.items[0];
+    try e.output.appendSlice(gpa, "result");
+    var input: Editor = .{};
+    defer input.deinit(gpa);
+    var scroll: Viewport = .{};
+    var text: status.Text = .{};
+    var cfg = mock_cfg;
+    cfg.simple = true;
+    for ([_]@FieldType(Entry, "run"){ .ok, .failed, .running, .warning }) |state| {
+        e.run = state;
+        try e.refreshLabel(gpa);
+        const frame = drawFrame(win, t.entries.items, &input, &scroll, &.{}, 0, .{ .cfg = cfg, .hovered = 0, .hover_bg = .{ .rgb = .{ 18, 18, 18 } } }, &text).?;
+        try testing.expectEqual(@as(u16, 1), e.height(frame.window));
+        const image = try snapshot(gpa, &screen);
+        defer gpa.free(image);
+        try testing.expect(std.mem.indexOf(u8, image, switch (state) {
+            .ok => "✓ Run",
+            .failed => "✗ Run",
+            .running => "Run · running",
+            else => "! Run",
+        }) != null);
+        try testing.expect(std.mem.indexOf(u8, image, "mock") == null);
+        const p = @import("selection/history.zig").position(frame, t.entries.items, 15, 0).?;
+        try testing.expectEqual(@as(usize, 0), p.entry);
+        try testing.expectEqual(@as(u16, 0), p.row);
+        try testing.expectEqualDeep(vaxis.Color{ .rgb = .{ 18, 18, 18 } }, screen.readCell(11, 0).?.style.bg);
+        try testing.expectEqualDeep(vaxis.Color.default, screen.readCell(9, 0).?.style.bg);
+        e.open = true;
+        const expanded = drawFrame(win, t.entries.items, &input, &scroll, &.{}, 0, .{ .cfg = cfg }, &text).?;
+        try testing.expect(e.height(expanded.window) > 1);
+        const history: @import("selection/history.zig").History = .{ .anchor = .{ .entry = 0, .row = 0, .col = 0 }, .end = .{ .entry = 0, .row = 0, .col = 119 } };
+        const copied = try history.text(gpa, expanded, t.entries.items);
+        defer gpa.free(copied);
+        try testing.expect(!std.mem.startsWith(u8, copied, "          "));
+        e.open = false;
+    }
 }

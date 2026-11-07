@@ -27,6 +27,7 @@ Prefer TUI `/provider` for services (including `Add endpoint…`, which appends 
 # Optional top-level keys
 provider = "codex"
 effort = "high"
+ui = "normal" # normal (default) or simple
 
 [codex]
 model = "gpt-6.1-sol"
@@ -231,3 +232,5 @@ Session logs record the event, expanded command, exit code (124 for timeout), an
 ## MCP servers
 
 `[mcp.<id>]` configures a stdio command or Streamable HTTP URL; `[mcp] <id> = true` enables it (default false). `/mcp` lists servers; `/mcp on <id>` and `/mcp off <id>` persist switches for new Sessions. Current/resumed Sessions retain their snapshot. See [MCP tools](mcp.md) for configuration, environment credentials, protocol detection, sandboxing, and limits.
+
+`/simple` and Ctrl+S atomically persist the top-level `ui` choice for the next launch. Invalid values are configuration errors.
