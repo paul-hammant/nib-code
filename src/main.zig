@@ -208,7 +208,7 @@ const help =
     \\  --effort <level>      Set reasoning effort; /effort lists levels
     \\  --json                Stream NDJSON events (ask only)
     \\
-    \\TUI: Enter sends · Shift+Enter adds a line · Esc cancels · Ctrl+O opens details
+    \\TUI: Enter sends · Shift+Enter adds a line · Esc cancels · Ctrl+O opens latest details · click a Run
     \\Type / for commands, /help for keys, /status for timing and cache details.
     \\Setup: see README.md and docs/config.md.
     \\

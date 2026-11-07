@@ -4,6 +4,7 @@ For agents changing the TUI, CLI help, or fixed text.
 
 - Use English for fixed UI text; preserve the language of model output. Derive titles from tool summaries, diffs, exit codes, and task events; do not add model output or prompt requirements for the UI.
 - Run is the stable parent block. The collapsed layer shows factual summaries, file changes, command results, and task status; expand in Changes / Result / Script order. Explicitly label omitted content as a preview and state its scope.
+- Details open per block: click the title row, or Ctrl+O for the latest Run, background result or failure; there is no expand-all. Failure titles end `· Details (click)`, which stays true after later Runs. Keys help reads `Ctrl+O latest details · click a Run for details`. No hover or other decoration marks clickable titles.
 - Status words: queued / running / waiting / completed / failed / canceled / timed out / superseded / lost. Map internal enums to display text; do not treat the JS return value `ok` as task completion status.
 - Use singular/plural counts: 1 step, 2 steps, 1 Run, 2 Runs, 1 file, 2 files. Write shortcuts as Enter, Shift+Enter, Esc, Ctrl+O, Ctrl+C, PgUp, PgDn.
 - Round time down to seconds: <1s, 24s, 1m40s, 1h0m0s. Abbreviate numbers with decimal k/M, at most one decimal place (rounded down, no trailing .0); specify tokens, B, kB, MB. Share `src/tui/format.zig`.

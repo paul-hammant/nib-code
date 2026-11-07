@@ -44,6 +44,13 @@ pub const Viewport = struct {
         return .{ .entry = i, .row = @intCast(@max(rows - win.height, 0)) };
     }
 
+    /// Call after toggling an entry the user is looking at: pins the current
+    /// top so its title keeps its screen row, unless it is the latest details
+    /// entry while following the bottom.
+    pub fn toggled(v: *Viewport, frame: Anchor, follow: bool) void {
+        if (v.top == null and !follow) v.top = frame;
+    }
+
     pub fn layout(v: *Viewport, entries: []Entry, win: vaxis.Window) Anchor {
         const end = bottom(entries, win);
         var top = v.top orelse end;

@@ -290,6 +290,7 @@ pub const App = struct {
                         app.notice = std.fmt.bufPrint(&app.notice_buf, "copied {d} chars", .{std.unicode.utf8CountCodepoints(text) catch text.len}) catch null;
                     }
                 }
+                if (app.selection.takeClick()) |c| app.clickEntry(c.entry, c.row);
                 if (app.selection.active and app.selection.history != null) {
                     if (app.body) |body| app.scroll.top = body.top;
                 }
@@ -467,7 +468,7 @@ pub const App = struct {
         } else if (k.matches(vaxis.Key.page_down, .{})) {
             app.scroll.pending = if (app.scroll.top != null) std.math.maxInt(i32) else app.page();
         } else if (k.matches('o', .{ .ctrl = true })) {
-            app.transcript.toggleExpanded();
+            if (app.transcript.latestDetails()) |i| app.toggleEntry(i);
         } else if (k.matches(vaxis.Key.up, .{ .shift = true })) {
             app.scroll.pending -= 3;
         } else if (k.matches(vaxis.Key.down, .{ .shift = true })) {
@@ -602,6 +603,16 @@ pub const App = struct {
             return std.fmt.bufPrint(&app.activity_detail, "{s} · {s}", .{ task.id, @import("tui/format.zig").duration(&elapsed, task.elapsed_ms) }) catch "";
         }
         return "";
+    }
+
+    fn clickEntry(app: *App, entry: usize, row: u16) void {
+        if (row == 0 and entry < app.transcript.entries.items.len and app.transcript.entries.items[entry].collapsible()) app.toggleEntry(entry);
+    }
+
+    fn toggleEntry(app: *App, index: usize) void {
+        app.transcript.toggle(index);
+        const frame = app.body orelse return;
+        app.scroll.toggled(frame.top, app.transcript.latestDetails() == index);
     }
 
     fn render(app: *App) !void {
@@ -1171,4 +1182,100 @@ test "@ completion ignores emails and pasted mentions" {
     try typeText(&app, "c");
     app.menu.sync(app.io, &app.input, app.session);
     try std.testing.expectEqual(@as(usize, 1), shown(&app).len);
+}
+
+fn clickApp(app: *App, vx: *vaxis.Vaxis, top: @import("tui/viewport.zig").Anchor, scroll_top: ?@import("tui/viewport.zig").Anchor) void {
+    app.vx = vx;
+    app.selection = .{};
+    app.scroll = .{ .top = scroll_top };
+    app.notice = null;
+    app.transcript = .{};
+    app.body = .{ .top = top, .window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 8, .height = 8, .screen = &vx.screen } };
+}
+
+fn mouseEvent(col: i16, row: i16, kind: vaxis.Mouse.Type) Event {
+    return .{ .mouse = .{ .col = col, .row = row, .button = if (kind == .release) .none else .left, .mods = .{}, .type = kind } };
+}
+
+test "click toggles only the Run title row under the pointer across wrapped lines and scroll offsets" {
+    const gpa = std.testing.allocator;
+    var vx: vaxis.Vaxis = undefined;
+    vx.screen = try vaxis.Screen.init(gpa, .{ .cols = 8, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
+    defer vx.screen.deinit(gpa);
+    var app: App = undefined;
+    app.gpa = gpa;
+    clickApp(&app, &vx, .{}, .{});
+    defer app.transcript.deinit(gpa);
+    try app.transcript.add(gpa, .info, "aaaa bbbb cccc");
+    try app.transcript.startRun(gpa, "tools.read({})");
+    try app.transcript.startRun(gpa, "tools.read({})");
+    const items = app.transcript.entries.items;
+    const win = app.body.?.window;
+    const first_run = @as(i16, @intCast(items[0].height(win))) + 1;
+    const second_run = first_run + @as(i16, @intCast(items[1].height(win))) + 1;
+    try std.testing.expect(items[0].height(win) > 1);
+
+    _ = try app.handle(mouseEvent(3, first_run + 1, .press));
+    _ = try app.handle(mouseEvent(3, first_run + 1, .release));
+    try std.testing.expect(!items[1].open and !items[2].open);
+    _ = try app.handle(mouseEvent(3, first_run, .press));
+    _ = try app.handle(mouseEvent(3, first_run, .release));
+    try std.testing.expect(items[1].open and !items[2].open);
+    try std.testing.expectEqual(@as(?@TypeOf(app.scroll.top.?), .{}), app.scroll.top);
+
+    _ = try app.handle(mouseEvent(0, 0, .press));
+    _ = try app.handle(mouseEvent(0, 0, .release));
+    try std.testing.expect(items[1].open and !items[2].open);
+
+    app.transcript.toggle(1);
+    app.body.?.top = .{ .entry = 1 };
+    const shifted = second_run - first_run;
+    _ = try app.handle(mouseEvent(2, shifted, .press));
+    _ = try app.handle(mouseEvent(2, shifted, .release));
+    try std.testing.expect(!items[1].open and items[2].open);
+}
+
+test "a drag across a Run title selects instead of toggling" {
+    const gpa = std.testing.allocator;
+    var vx: vaxis.Vaxis = undefined;
+    vx.screen = try vaxis.Screen.init(gpa, .{ .cols = 8, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
+    defer vx.screen.deinit(gpa);
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = std.testing.io;
+    clickApp(&app, &vx, .{}, .{});
+    defer app.transcript.deinit(gpa);
+    try app.transcript.startRun(gpa, "tools.read({})");
+    _ = try app.handle(mouseEvent(0, 0, .press));
+    _ = try app.handle(mouseEvent(4, 0, .drag));
+    try std.testing.expect(app.selection.dragged);
+    app.selection.active = false;
+    try std.testing.expect(!app.transcript.entries.items[0].open);
+    try std.testing.expectEqual(@as(?@import("tui/selection/history.zig").Position, null), app.selection.takeClick());
+}
+
+test "toggling pins the view unless following the latest details entry" {
+    const gpa = std.testing.allocator;
+    var vx: vaxis.Vaxis = undefined;
+    vx.screen = try vaxis.Screen.init(gpa, .{ .cols = 8, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
+    defer vx.screen.deinit(gpa);
+    var app: App = undefined;
+    clickApp(&app, &vx, .{ .entry = 1, .row = 2 }, null);
+    defer app.transcript.deinit(gpa);
+    try app.transcript.startRun(gpa, "a");
+    try app.transcript.startRun(gpa, "b");
+    try app.transcript.add(gpa, .assistant, "done");
+    app.scroll.top = .{ .entry = 1, .row = 2 };
+    app.toggleEntry(1);
+    try std.testing.expectEqual(@as(?@TypeOf(app.scroll.top.?), .{ .entry = 1, .row = 2 }), app.scroll.top);
+    app.transcript.toggle(1);
+    app.scroll.top = null;
+    app.toggleEntry(0);
+    try std.testing.expectEqualDeep(app.body.?.top, app.scroll.top.?);
+    try std.testing.expect(app.scroll.top != null);
+    app.scroll.top = null;
+    try std.testing.expectEqual(@as(?usize, 1), app.transcript.latestDetails());
+    app.toggleEntry(1);
+    try std.testing.expect(app.scroll.top == null);
+    try std.testing.expect(app.transcript.entries.items[1].open);
 }

@@ -70,7 +70,7 @@ Project conventions go in `AGENTS.md`; personal ones in `~/.nib/AGENTS.md`.
   1 Run · 2 steps · 41s · 6.6k tokens
 ```
 
-One block per script: what changed, what was read, what ran. Ctrl+O shows the diff, result and script.
+One block per script: what changed, what was read, what ran. Click a Run to see its diff, result and script; Ctrl+O opens the latest.
 
 ## Safety
 

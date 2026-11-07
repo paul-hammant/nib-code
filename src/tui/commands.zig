@@ -40,7 +40,7 @@ pub const specs = std.enums.EnumArray(Command, Spec).init(.{
     .js = .{ .group = .send, .args = "<code>", .help = "run JavaScript", .needs_arg = true },
 });
 
-pub const keys = "Enter send · Shift+Enter newline · Esc cancel\nCtrl+O details · PgUp/PgDn scroll · ↑ input history · Ctrl+C quit";
+pub const keys = "Enter send · Shift+Enter newline · Esc cancel\nCtrl+O latest details · click a Run for details\nPgUp/PgDn scroll · ↑ input history · Ctrl+C quit";
 
 const slash_names = blk: {
     var names: [std.enums.values(Command).len][]const u8 = undefined;

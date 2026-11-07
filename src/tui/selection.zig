@@ -11,6 +11,12 @@ pub const Selection = struct {
     active: bool = false,
     dragged: bool = false,
     history: ?history.History = null,
+    click: ?history.Position = null,
+
+    pub fn takeClick(s: *Selection) ?history.Position {
+        defer s.click = null;
+        return s.click;
+    }
 
     pub fn clear(s: *Selection) void {
         s.* = .{};
@@ -47,7 +53,12 @@ pub const Selection = struct {
                 s.updateEnd(f, entries, col, row);
             }
         }
+        const click: ?history.Position = if (s.active and !s.dragged and m.type == .release and (m.button == .left or m.button == .none))
+            (if (s.history) |h| h.anchor else null)
+        else
+            null;
         const copied = s.mouse(m, screen);
+        if (click) |c| s.click = c;
         if (m.type == .press and m.button == .left) {
             if (frame) |f| {
                 if (m.row >= 0 and m.row < f.window.height and s.anchor != null) {

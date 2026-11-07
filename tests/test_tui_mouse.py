@@ -7,7 +7,7 @@ import re
 import tempfile
 from unittest.mock import patch
 
-from test_interjections import Reply, fixture, finished, wait_for
+from test_interjections import Reply, fixture, finished, screen, wait_for
 
 
 def mouse(button, col, row, release=False):
@@ -70,8 +70,35 @@ def test_background_report_and_user_card(tmp):
         assert copied == "mouse test", repr(copied)
 
 
+def test_click_and_ctrl_o_open_single_runs(tmp):
+    replies = [Reply("first", code="/* script-one */ await tools.bash({command: 'echo out-one'}); 'ret-one'"), Reply("first-done"),
+               Reply("second", code="/* script-two */ await tools.bash({command: 'echo out-two'}); 'ret-two'"), Reply("second-done")]
+    with fixture(tmp, replies) as (terminal, home, _):
+        for prompt, text in (("one", "first-done"), ("two", "second-done")):
+            terminal.send(prompt + "\r")
+            terminal.wait_turn(text)
+
+        def view():
+            return "\n".join(screen(terminal.read(), 120, 32))
+
+        def title(index):
+            rows = [i for i, line in enumerate(view().split("\n")) if "Run" in line and "Script" not in line]
+            return rows[index]
+
+        assert "Script" not in view()
+        row = title(0)
+        terminal.send(mouse(0, 10, row) + mouse(0, 10, row, release=True))
+        wait_for(lambda: "script-one" in view(), "first Run opened by click")
+        assert "script-two" not in view(), view()
+        terminal.send("\x0f\x1b[6~")
+        wait_for(lambda: "script-two" in view(), "latest Run opened by Ctrl+O")
+        terminal.send("\x0f")
+        wait_for(lambda: "script-two" not in view(), "latest Run closed by Ctrl+O")
+        assert terminal.child.poll() is None
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="nib-tui-mouse-") as directory:
-        for test in (test_cross_screen_selection, test_background_report_and_user_card):
+        for test in (test_cross_screen_selection, test_background_report_and_user_card, test_click_and_ctrl_o_open_single_runs):
             test(Path(directory) / test.__name__)
             print(test.__name__ + ": ok")

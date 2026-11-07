@@ -20,8 +20,6 @@ const ToolSummary = @import("../session/tool_summary.zig").Summary;
 /// What the conversation area shows, built from Session events or replayed history.
 pub const Transcript = struct {
     entries: std.ArrayList(Entry) = .empty,
-    /// ctrl+o state; streamed collapsible entries start in it.
-    expanded: bool = false,
     attempt: usize = 0,
     revision: usize = 0,
     next_run: usize = 0,
@@ -46,7 +44,7 @@ pub const Transcript = struct {
 
     pub fn add(t: *Transcript, gpa: std.mem.Allocator, kind: Kind, text: []const u8) !void {
         t.revision +%= 1;
-        var e: Entry = .{ .kind = kind, .open = t.expanded, .allocator = gpa };
+        var e: Entry = .{ .kind = kind, .allocator = gpa };
         errdefer e.deinit(gpa);
         try e.text.appendSlice(gpa, text);
         try e.refreshLabel(gpa);
@@ -63,7 +61,7 @@ pub const Transcript = struct {
             entry.cached = null;
             return;
         };
-        var e: Entry = .{ .kind = .background, .run = if (ok) .ok else .failed, .open = t.expanded };
+        var e: Entry = .{ .kind = .background, .run = if (ok) .ok else .failed };
         errdefer e.deinit(gpa);
         e.task_id = try gpa.dupe(u8, id);
         try e.text.appendSlice(gpa, result);
@@ -115,7 +113,7 @@ pub const Transcript = struct {
             entry.cached = null;
             return;
         };
-        var e: Entry = .{ .kind = .background, .run = .warning, .open = t.expanded };
+        var e: Entry = .{ .kind = .background, .run = .warning };
         errdefer e.deinit(gpa);
         e.task_id = try gpa.dupe(u8, id);
         try e.label.print(gpa, "{s} {s} · lost", .{ id, @tagName(kind) });
@@ -201,11 +199,20 @@ pub const Transcript = struct {
         }
     }
 
-    pub fn toggleExpanded(t: *Transcript) void {
-        t.expanded = !t.expanded;
-        for (t.entries.items) |*e| if (e.collapsible()) {
-            e.open = t.expanded;
-        };
+    pub fn toggle(t: *Transcript, index: usize) void {
+        const e = &t.entries.items[index];
+        if (e.collapsible()) e.open = !e.open;
+    }
+
+    /// Latest Run, background or failure entry; Ctrl+O targets it.
+    pub fn latestDetails(t: *const Transcript) ?usize {
+        var i = t.entries.items.len;
+        while (i > 0) {
+            i -= 1;
+            const k = t.entries.items[i].kind;
+            if (k == .run or k == .background or k == .failure) return i;
+        }
+        return null;
     }
 
     pub fn lastAnswer(t: *const Transcript) ?[]const u8 {
@@ -222,7 +229,7 @@ pub const Transcript = struct {
         t.revision +%= 1;
         const entry_kind: Kind = .assistant;
         const items = t.entries.items;
-        if (items.len == 0 or items[items.len - 1].kind != entry_kind or items[items.len - 1].attempt != t.attempt) try t.entries.append(gpa, .{ .kind = entry_kind, .open = t.expanded, .attempt = t.attempt });
+        if (items.len == 0 or items[items.len - 1].kind != entry_kind or items[items.len - 1].attempt != t.attempt) try t.entries.append(gpa, .{ .kind = entry_kind, .attempt = t.attempt });
         const current = &t.entries.items[t.entries.items.len - 1];
         current.allocator = gpa;
         try current.text.appendSlice(gpa, text);
@@ -309,7 +316,7 @@ pub const Transcript = struct {
 
     pub fn failure(t: *Transcript, gpa: std.mem.Allocator, message: []const u8, reason: @import("../tools/changes.zig").Recovery.Reason) !void {
         t.revision +%= 1;
-        var e: Entry = .{ .kind = .failure, .open = t.expanded, .run = if (reason == .timeout) .warning else .failed };
+        var e: Entry = .{ .kind = .failure, .run = if (reason == .timeout) .warning else .failed };
         errdefer e.deinit(gpa);
         try e.text.appendSlice(gpa, message);
         const sentence = switch (reason) {
@@ -318,7 +325,7 @@ pub const Transcript = struct {
             .tool => "The Run failed.",
             else => "The model request failed.",
         };
-        try e.label.print(gpa, "{s} · Details (Ctrl+O)", .{sentence});
+        try e.label.print(gpa, "{s} · Details (click)", .{sentence});
         try t.entries.append(gpa, e);
     }
 
@@ -328,7 +335,7 @@ pub const Transcript = struct {
 
     pub fn startRunWithEffort(t: *Transcript, gpa: std.mem.Allocator, code: []const u8, effort: ?provider.StepEffort) !void {
         t.revision +%= 1;
-        try t.addRun(gpa, code, t.expanded, effort);
+        try t.addRun(gpa, code, false, effort);
         t.next_run += 1;
         t.entries.items[t.entries.items.len - 1].run_number = t.next_run;
     }
@@ -576,6 +583,14 @@ fn settleProgress(p: *Progress, ok: bool) void {
 
 const testing = std.testing;
 
+fn toggleAll(t: *Transcript) void {
+    var any = false;
+    for (t.entries.items) |e| any = any or (e.collapsible() and e.open);
+    for (t.entries.items) |*e| if (e.collapsible()) {
+        e.open = !any;
+    };
+}
+
 test "background results fold to task facts and expand to complete JSON" {
     const gpa = testing.allocator;
     var t: Transcript = .{};
@@ -587,12 +602,12 @@ test "background results fold to task facts and expand to complete JSON" {
     try testing.expect(e.collapsible());
     try testing.expectEqual(@as(usize, 2), e.segments(&segs).len);
     try testing.expectEqualStrings("bg_1 agent · completed", segs[1].text);
-    t.toggleExpanded();
+    toggleAll(&t);
     try testing.expectEqual(@as(usize, 4), e.segments(&segs).len);
     try testing.expectEqualStrings(result, segs[3].text);
     try testing.expect(t.lastAnswer() == null);
     try t.backgroundResult(gpa, .agent, "bg_2", false, "{\"ok\":false,\"text\":\"failed\"}");
-    try testing.expect(t.entries.items[1].open);
+    try testing.expect(!t.entries.items[1].open);
     try testing.expectEqualStrings("✗ ", t.entries.items[1].segments(&segs)[0].text);
 }
 
@@ -664,12 +679,13 @@ test "background bash shows command and elapsed time until its result arrives" {
     try t.progress(gpa, .{ .id = "b1", .run = 1, .kind = .bash, .background = true, .prompt = "sleep 2\necho done", .elapsed_ms = 1200 });
     try t.endRun(gpa, true, "started", 100, .{});
     try testing.expectEqualStrings("Run · b1 running", t.entries.items[0].label.items);
-    t.toggleExpanded();
+    toggleAll(&t);
     var segs: [max_segments]vaxis.Segment = undefined;
     try testing.expectEqualStrings("  └─ b1 bash sleep 2 echo done · 1s · running", t.entries.items[0].agent_tree.rows.items[0].text);
     try t.backgroundResult(gpa, .bash, "b1", true, "{\"exit_code\":0,\"output\":\"done\\n\"}");
     try testing.expectEqualStrings("Run", t.entries.items[0].label.items);
     try testing.expectEqualStrings("b1 bash · completed · exit 0", t.entries.items[1].label.items);
+    t.toggle(1);
     try testing.expectEqualStrings("{\"exit_code\":0,\"output\":\"done\\n\"}", t.entries.items[1].segments(&segs)[3].text);
 }
 
@@ -697,7 +713,7 @@ test "runs fold to one line until expanded" {
     try testing.expectEqual(@as(u16, 1), e.height(win));
     var segs: [max_segments]vaxis.Segment = undefined;
     try testing.expectEqualStrings("Run", e.segments(&segs)[2].text);
-    t.toggleExpanded();
+    toggleAll(&t);
     try testing.expectEqual(@as(u16, 10), e.height(win));
 }
 
@@ -767,7 +783,7 @@ test "a Run shows changed files in its summary and a colored diff when open" {
     const e = &t.entries.items[0];
     try testing.expectEqualStrings("Run", e.label.items);
     try testing.expectEqual(@as(u16, 2), e.height(win));
-    t.toggleExpanded();
+    toggleAll(&t);
     var segs: [max_segments]vaxis.Segment = undefined;
     const shown = e.segments(&segs);
     try testing.expectEqualStrings("-old\n", shown[8].text);
@@ -792,7 +808,7 @@ test "agent tree stays visible folded, expanded and after Run ends" {
     var segs: [max_segments]vaxis.Segment = undefined;
     try testing.expectEqualStrings("Run · running", e.segments(&segs)[2].text);
     try testing.expectEqualStrings("", e.segments(&segs)[1].text);
-    t.toggleExpanded();
+    toggleAll(&t);
     try testing.expectEqualStrings("  └─ a1 fix it · running · step 3 · edit src/x.zig", e.agent_tree.rows.items[0].text);
     try testing.expectEqualStrings(e.text.items, e.segments(&segs)[10].text);
     try t.progress(gpa, .{ .id = "a1", .prompt = "fix it", .state = .done, .step = 3, .tools = &.{"edit"}, .files = &.{"src/x.zig"} });
@@ -816,7 +832,7 @@ test "multiple child progress keeps creation order, is replaced and summed witho
     const e = &t.entries.items[0];
     var segs: [max_segments]vaxis.Segment = undefined;
     try testing.expectEqualStrings("Run · running", e.segments(&segs)[2].text);
-    t.toggleExpanded();
+    toggleAll(&t);
     try testing.expectEqual(@as(usize, 3), e.agent_tree.rows.items.len);
     try testing.expectEqualStrings("  ├─ a3 third · running · step 1", e.agent_tree.rows.items[0].text);
     try testing.expectEqualStrings("  ├─ a1 first · completed · step 2 · read", e.agent_tree.rows.items[1].text);
@@ -885,18 +901,16 @@ test "long user messages fold live and replayed, truncate the first line, and ex
     _ = e.print(win, true);
     try testing.expectEqualStrings("s", screen.readCell(28, 0).?.char.grapheme);
     try testing.expect(screen.readCell(28, 0).?.style.dim);
-    t.toggleExpanded();
+    toggleAll(&t);
     try testing.expect(e.height(win) > 5);
     t.clear(gpa);
-    t.expanded = false;
     try t.addHistory(gpa, &.{.{ .role = "user", .content = raw }});
     e = &t.entries.items[0];
     try testing.expectEqual(@as(u16, 1), e.height(win));
-    t.toggleExpanded();
+    toggleAll(&t);
     try testing.expect(e.height(win) > 5);
     try t.add(gpa, .user, raw);
-    try testing.expect(t.entries.items[1].open);
-    t.toggleExpanded();
+    try testing.expect(!t.entries.items[1].open);
     try testing.expectEqual(@as(u16, 1), t.entries.items[1].height(win));
     const long = try gpa.alloc(u8, 801);
     defer gpa.free(long);
@@ -921,7 +935,7 @@ test "bills stay dim and one row when resized or expanded" {
     for ([_]u16{ 120, 40, 8, 1, 0, 120 }) |width| {
         win.width = width;
         win.clear();
-        transcript.toggleExpanded();
+        toggleAll(&transcript);
         try testing.expectEqual(@as(u16, 1), entry.height(win));
         try testing.expectEqual(@as(u16, 1), entry.print(win, true));
         const expected = bill.fit(full, width);
@@ -1019,7 +1033,7 @@ test "agent rows have stable heights across folding resizing completion and scro
     try testing.expectEqualStrings("├", screen.readCell(2, 1).?.char.grapheme);
     try testing.expectEqualStrings("└", screen.readCell(2, 2).?.char.grapheme);
     try testing.expectEqualStrings(" ", screen.readCell(0, 3).?.char.grapheme);
-    t.toggleExpanded();
+    toggleAll(&t);
     try testing.expectEqual(@as(u16, 9), e.height(win));
     _ = e.print(win, true);
     try testing.expectEqualStrings("C", screen.readCell(0, 3).?.char.grapheme);
@@ -1030,7 +1044,7 @@ test "agent rows have stable heights across folding resizing completion and scro
     _ = e.print(win, true);
     try testing.expectEqualStrings("R", screen.readCell(0, 5).?.char.grapheme);
     try testing.expectEqualStrings("  ├─ a2 second · failed · step 4 · bash", e.agent_tree.rows.items[0].text);
-    t.toggleExpanded();
+    toggleAll(&t);
     try testing.expectEqual(@as(u16, 3), e.height(win));
     win.clear();
     _ = e.print(win.child(.{ .y_off = -1 }), true);
@@ -1242,8 +1256,8 @@ test "live and restored mixed results have identical folded labels and complete 
         try testing.expectEqualStrings(a.segments(&left)[0].text, b.segments(&right)[0].text);
         try testing.expectEqual(@as(usize, 2), b.segments(&right).len);
     }
-    live.toggleExpanded();
-    restored.toggleExpanded();
+    toggleAll(&live);
+    toggleAll(&restored);
     for (live.entries.items, restored.entries.items, [_][]const u8{ bash_result, agent_result, lost }) |*a, *b, full| {
         try testing.expectEqual(@as(usize, 4), b.segments(&right).len);
         try testing.expectEqualStrings(full, a.segments(&left)[3].text);
@@ -1566,7 +1580,7 @@ test "expanded Runs retain all result lines and label bounded diffs as previews"
     try testing.expectEqualStrings(result.items, e.output.items);
     try testing.expectEqualStrings("Diff preview · 60 of 241 lines\n", e.changes.preview);
     try testing.expect(std.mem.indexOf(u8, e.changes.diff, "more lines") == null);
-    t.toggleExpanded();
+    toggleAll(&t);
     var segs: [max_segments]vaxis.Segment = undefined;
     const shown = e.segments(&segs);
     try testing.expectEqualStrings("Changes\n", shown[4].text);
@@ -1596,7 +1610,7 @@ test "retry removes only the failed attempt and preserves interjections and prio
     try t.failure(a, "server detail", .model);
     const e = &t.entries.items[3];
     try testing.expect(e.collapsible());
-    try testing.expectEqualStrings("The model request failed. · Details (Ctrl+O)", e.label.items);
+    try testing.expectEqualStrings("The model request failed. · Details (click)", e.label.items);
     try testing.expectEqualStrings("server detail", e.text.items);
 }
 
@@ -1674,4 +1688,19 @@ test "display smoothing keeps complete answers and resets at a new attempt" {
     t.beginAttempt();
     try t.smoothDelta(a, "next", now);
     try std.testing.expectEqualStrings("next", t.entries.items[1].displayText());
+}
+
+test "latest details entry is the newest Run, background or failure" {
+    const gpa = testing.allocator;
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    try testing.expectEqual(@as(?usize, null), t.latestDetails());
+    try t.add(gpa, .assistant, "hi");
+    try t.startRun(gpa, "a");
+    try t.add(gpa, .assistant, "done");
+    try testing.expectEqual(@as(?usize, 1), t.latestDetails());
+    try t.failure(gpa, "boom", .tool);
+    try testing.expectEqual(@as(?usize, 3), t.latestDetails());
+    t.toggle(t.latestDetails().?);
+    try testing.expect(t.entries.items[3].open and !t.entries.items[1].open);
 }

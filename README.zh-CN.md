@@ -70,7 +70,7 @@ Enter 发送，Shift+Enter 换行，Esc 取消。输入 `/` 查看指令：`/mod
   1 Run · 2 steps · 41s · 6.6k tokens
 ```
 
-每个脚本一个块：改了什么、读了什么、跑了什么。Ctrl+O 查看 diff、结果和脚本。
+每个脚本一个块：改了什么、读了什么、跑了什么。点击某个 Run 查看 diff、结果和脚本；Ctrl+O 打开最近一个。
 
 ## 安全
 
