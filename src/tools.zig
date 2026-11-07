@@ -20,6 +20,22 @@ const Tool = struct {
 
 const all = [_]Tool{
     .{
+        .name = "mcp",
+        .run = @import("tools/mcp.zig").mcp,
+        .doc =
+        \\  // Call an enabled MCP server tool. Server/transport failures are data; argument errors reject. Full results stay in JS; images share the Run image limit.
+        \\  async mcp(name, args = {}) {}, // → { ok, content, structured?, error? }
+        ,
+    },
+    .{
+        .name = "mcp_schema",
+        .run = @import("tools/mcp.zig").mcp_schema,
+        .doc =
+        \\  // Full input JSON Schema for an enabled server.tool, including tools omitted from the compact index.
+        \\  async mcp_schema(name) {}, // → JSON Schema or { ok: false, error }
+        ,
+    },
+    .{
         .name = "sleep",
         .doc =
         \\  // Wait ms (integer 0..2147483647); cancellable, no process/thread or tool slot. Counts Run wall time, not JS budget. Run drains even unawaited sleeps.
@@ -210,6 +226,7 @@ pub const Tools = struct {
     undo_failure: std.atomic.Value(u8) = .init(0),
     environ: ?*const std.process.Environ.Map = null,
     cfg: ?provider.Config = null,
+    mcp_client: ?*@import("mcp.zig").Client = null,
     depth: u32 = 0,
     session_id: ?[]const u8 = null,
     forked: bool = false,
@@ -586,7 +603,7 @@ test "child API filters agent from both docs and sandbox" {
     try testing.expect(std.mem.indexOf(u8, t.api().docs, "async agent({") == null);
     const result = try sandbox.eval(testing.allocator, testing.io, "[typeof tools.agent, Object.keys(tools)]", .{}, t.host(), null);
     defer result.deinit(testing.allocator);
-    try testing.expectEqualStrings("[\"undefined\",[\"sleep\",\"read\",\"view\",\"edit\",\"write\",\"grep\",\"glob\",\"fetch\",\"bash\",\"stop\",\"llm\"]]", result.text);
+    try testing.expectEqualStrings("[\"undefined\",[\"mcp\",\"mcp_schema\",\"sleep\",\"read\",\"view\",\"edit\",\"write\",\"grep\",\"glob\",\"fetch\",\"bash\",\"stop\",\"llm\"]]", result.text);
 }
 
 test "Run excludes tool waits without resetting the JS budget" {

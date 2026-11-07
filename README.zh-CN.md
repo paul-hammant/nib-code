@@ -59,6 +59,8 @@ nib -c                       # 继续本目录上次的会话
 
 Enter 发送，Shift+Enter 换行，Esc 取消。输入 `/` 查看指令：`/provider`、`/model`、`/effort`、`/undo`、`/tasks`、`/skills`、`/status`。`@` 补全文件路径。
 
+`/mcp` 启用 config.toml 中配置的 MCP 服务器。
+
 项目约定写在 `AGENTS.md`，个人习惯写在 `~/.nib/AGENTS.md`。
 
 ## 一个 Run

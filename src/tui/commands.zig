@@ -8,7 +8,7 @@ const provider = @import("../provider.zig");
 const auth = @import("../auth.zig");
 const providers = @import("providers.zig");
 
-pub const Command = enum { help, new, @"resume", compact, undo, provider, model, effort, copy, reflect, js, tasks, stop, status, skills };
+pub const Command = enum { help, new, @"resume", compact, undo, provider, model, effort, copy, reflect, js, tasks, stop, status, skills, mcp };
 
 pub const Choices = enum { none, models, efforts, sessions, tasks, services };
 
@@ -26,6 +26,7 @@ pub const Spec = struct {
 };
 
 pub const specs = std.enums.EnumArray(Command, Spec).init(.{
+    .mcp = .{ .group = .view, .args = "[on|off <id>]", .help = "list or enable MCP servers for new sessions" },
     .skills = .{ .group = .view, .args = "[on|off <name>]", .help = "list or enable skills for new sessions" },
     .status = .{ .group = .view, .help = "timing and cache details", .while_busy = true },
     .tasks = .{ .group = .view, .help = "background tasks", .while_busy = true },
@@ -272,6 +273,38 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
             defer credential_arena.deinit();
             const arena_a = credential_arena.allocator();
             try app.report(.info, "Provider {s} · {s} · {s} · effort {s} · context {d}%\n{s}", .{ app.cfg.name(), app.cfg.model, auth.describe(arena_a, app.io, app.cfg), app.cfg.effectiveEffort(), app.context * 100 / @max(app.cfg.context_window, 1), if (app.last_summary) |summary| text.details(summary) else "No completed turn yet." });
+        },
+        .mcp => {
+            var arena: std.heap.ArenaAllocator = .init(gpa);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const servers = try config.loadMcp(a, app.io, session.options.home);
+            if (arg.len > 0) {
+                var words = std.mem.tokenizeAny(u8, arg, " \t");
+                const action = words.next().?;
+                const id = words.next() orelse return app.transcript.add(gpa, .err, "usage: /mcp [on|off <id>]");
+                if (words.next() != null or (!std.mem.eql(u8, action, "on") and !std.mem.eql(u8, action, "off"))) return app.transcript.add(gpa, .err, "usage: /mcp [on|off <id>]");
+                const exists = for (servers) |server| {
+                    if (std.mem.eql(u8, server.id, id)) break true;
+                } else false;
+                if (!exists) return app.report(.err, "MCP server not found: {s}", .{id});
+                config.saveMcp(gpa, app.io, session.options.home, id, std.mem.eql(u8, action, "on")) catch |err| return app.report(.err, "could not save MCP settings: {s}", .{@errorName(err)});
+                return app.report(.info, "{s}: {s} · Applies to new sessions.", .{ id, action });
+            }
+            var text: std.ArrayList(u8) = .empty;
+            const mcp_client = session.tools.mcp_client;
+            if (mcp_client) |client| client.mutex.lockUncancelable(app.io);
+            defer if (mcp_client) |client| client.mutex.unlock(app.io);
+            for (servers) |server| {
+                try text.print(a, "{s}  {s}", .{ server.id, if (server.enabled) @as([]const u8, "on") else "off" });
+                if (server.enabled) if (mcp_client) |client| if (client.state(server.id)) |state| {
+                    if (state.failure) |reason| try text.print(a, " · failed: {s}", .{reason}) else if (state.listed) try text.print(a, " · {d} tools", .{state.tools.len});
+                };
+                try text.append(a, '\n');
+            }
+            if (servers.len == 0) try text.appendSlice(a, "No MCP servers configured.\n");
+            try text.appendSlice(a, "Applies to new sessions.");
+            try app.transcript.add(gpa, .info, text.items);
         },
         .skills => {
             var arena: std.heap.ArenaAllocator = .init(gpa);

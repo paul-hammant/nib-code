@@ -104,8 +104,12 @@ pub const Entry = struct {
                 var buf: [512]u8 = undefined;
                 const used = if (e.tool_summary) |summary| actualToolSummary(summary, e.changes.file_count, &buf) else "";
                 if (e.tool_summary) |summary| for (summary.files, 0..) |file, i| {
-                    if (i > 0) try e.files.appendSlice(gpa, " · ");
+                    if (i > 0) try e.files.appendSlice(gpa, if (file.duration_ms != null or summary.files[i - 1].duration_ms != null) "\n" else " · ");
                     try e.files.print(gpa, "{s} {s}", .{ file.tool, file.path });
+                    if (file.duration_ms) |ms| {
+                        try e.files.print(gpa, " · {d}.{d}s", .{ ms / 1000, ms % 1000 / 100 });
+                        if (file.failed) try e.files.appendSlice(gpa, " · failed");
+                    }
                 };
                 if (used.len > 0) try e.label.print(gpa, " · {s}", .{used});
                 for (e.agents.items) |p| {

@@ -13,6 +13,7 @@ const Stop = error{ Canceled, TimedOut };
 pub const Options = struct {
     execution: ?*Execution = null,
     inherit_api_key: ?[]const u8 = null,
+    inherit_env: []const []const u8 = &.{},
     strip_api_key: ?[]const u8 = null,
     spawn: std.process.SpawnOptions,
     cancel: *const std.atomic.Value(bool),
@@ -48,6 +49,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Result {
     secrets.removeFrom(&env);
     if (options.strip_api_key) |name| _ = env.swapRemove(name);
     if (options.inherit_api_key) |name| if (options.spawn.environ_map) |source| {
+        if (source.get(name)) |value| try env.put(name, value);
+    };
+    if (options.spawn.environ_map) |source| for (options.inherit_env) |name| {
         if (source.get(name)) |value| try env.put(name, value);
     };
     opts.environ_map = &env;

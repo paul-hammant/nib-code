@@ -3,7 +3,26 @@ const Allocator = std.mem.Allocator;
 const timing = @import("../sandbox/timing.zig");
 const Image = @import("../image.zig").Image;
 
-pub const File = struct { tool: []const u8, path: []const u8 };
+pub const File = struct {
+    tool: []const u8,
+    path: []const u8,
+    duration_ms: ?u64 = null,
+    failed: bool = false,
+    pub fn jsonStringify(f: File, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("tool");
+        try jw.write(f.tool);
+        try jw.objectField("path");
+        try jw.write(f.path);
+        if (f.duration_ms) |ms| {
+            try jw.objectField("duration_ms");
+            try jw.write(ms);
+            try jw.objectField("failed");
+            try jw.write(f.failed);
+        }
+        try jw.endObject();
+    }
+};
 
 pub const Count = struct { name: []const u8, count: u64 };
 
@@ -43,13 +62,13 @@ pub const Summary = struct {
             if (!call.dispatched or call.run_index != run_index) continue;
             const path = call.path orelse continue;
             for (files.items) |file| {
-                if (std.mem.eql(u8, file.tool, call.name) and std.mem.eql(u8, file.path, path)) break;
+                if (!std.mem.eql(u8, call.name, "mcp") and std.mem.eql(u8, file.tool, call.name) and std.mem.eql(u8, file.path, path)) break;
             } else {
                 const tool = try gpa.dupe(u8, call.name);
                 errdefer gpa.free(tool);
                 const copy = try gpa.dupe(u8, path);
                 errdefer gpa.free(copy);
-                try files.append(gpa, .{ .tool = tool, .path = copy });
+                try files.append(gpa, .{ .tool = tool, .path = copy, .duration_ms = if (std.mem.eql(u8, call.name, "mcp")) call.end_ms -| call.start_ms else null, .failed = std.mem.eql(u8, call.name, "mcp") and !call.ok });
             }
         }
         const owned_files = try files.toOwnedSlice(gpa);
@@ -100,7 +119,7 @@ pub const Summary = struct {
         for (s.files, files) |file, *copy| {
             const tool = try gpa.dupe(u8, file.tool);
             errdefer gpa.free(tool);
-            copy.* = .{ .tool = tool, .path = try gpa.dupe(u8, file.path) };
+            copy.* = .{ .tool = tool, .path = try gpa.dupe(u8, file.path), .duration_ms = file.duration_ms, .failed = file.failed };
             copied_files += 1;
         }
         return .{ .counts = counts, .omitted = s.omitted, .files = files };

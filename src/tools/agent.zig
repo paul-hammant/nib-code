@@ -119,10 +119,18 @@ pub fn execute(t: *Tools, gpa: std.mem.Allocator, args: []const u8, cancel: *con
     defer if (fork_input == null) gpa.free(input);
     if (background) t.background.beginTask(t.io, id, a.value.timeout_ms);
     const started = std.Io.Clock.awake.now(t.io);
+    var mcp_env: std.ArrayList([]const u8) = .empty;
+    defer mcp_env.deinit(gpa);
+    for (cfg.mcp_servers) |server| {
+        if (!server.enabled) continue;
+        try mcp_env.appendSlice(gpa, server.env);
+        if (server.header_env) |name| try mcp_env.append(gpa, name);
+    }
     const result = process.run(gpa, t.io, .{
         .spawn = .{ .argv = if (session) |child| &.{ executable, "ask", "--json", "--agent-input", "--resume", child, "-" } else &.{ executable, "ask", "--json", "--agent-input", "-" }, .environ_map = &env, .stdout = .pipe, .stderr = .ignore },
         .input = input,
         .inherit_api_key = cfg.api_key_env,
+        .inherit_env = mcp_env.items,
         .cancel = cancel,
         .timeout_ms = a.value.timeout_ms,
         .termination_grace_ms = 500,

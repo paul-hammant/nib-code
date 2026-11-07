@@ -98,8 +98,11 @@ pub const Session = struct {
         const enabled = try a.alloc([]const u8, cfg.enabled_skills.len);
         for (cfg.enabled_skills, enabled) |name, *copy| copy.* = try a.dupe(u8, name);
         s.cfg.enabled_skills = enabled;
+        s.cfg.mcp_servers = try @import("mcp/config.zig").copy(a, cfg.mcp_servers);
         s.tools.cfg = s.cfg;
         const cwd = try std.process.currentPathAlloc(io, a);
+        s.tools.mcp_client = try @import("mcp.zig").Client.create(gpa, io, s.cfg.mcp_servers, options.environ, options.home, options.user_home, s.cfg.sandbox.writable, s.cfg.sandbox.mode != .off);
+        errdefer if (s.tools.mcp_client) |c| c.destroy();
         const directory = try std.fs.path.join(a, &.{ options.home, "sessions" });
         try std.Io.Dir.cwd().createDirPath(io, directory);
         if (options.resume_id != null or options.continue_latest) {
@@ -109,8 +112,13 @@ pub const Session = struct {
             } else try session_log.latest(io, a, directory, cwd);
             s.id = try a.dupe(u8, std.fs.path.stem(path));
             s.log = try session_log.Log.restore(io, gpa, a, path, &s.history, &s.context_tokens, options.parent_session_id);
-            s.pending_background_bytes = s.log.pending_background_bytes;
             errdefer s.log.close(io);
+            s.tools.mcp_client.?.destroy();
+            s.tools.mcp_client = null;
+            s.cfg.mcp_servers = try @import("mcp/config.zig").copy(a, s.log.mcp_servers);
+            s.tools.cfg = s.cfg;
+            s.tools.mcp_client = try @import("mcp.zig").Client.create(gpa, io, s.cfg.mcp_servers, options.environ, options.home, options.user_home, s.cfg.sandbox.writable, s.cfg.sandbox.mode != .off);
+            s.pending_background_bytes = s.log.pending_background_bytes;
             try cfg.checkSession(s.log.provider, s.log.model);
             if (!std.mem.eql(u8, cfg.custom_provider orelse "", s.log.custom_provider orelse "")) return error.SessionProviderMismatch;
             s.cache_key = s.log.cache_key orelse s.id;
@@ -133,6 +141,7 @@ pub const Session = struct {
                 try s.tools.file_state.importVersions(io, gpa, fork.file_versions);
                 const messages = try session_history.inherit(a, fork);
                 try s.log.commit(io, gpa, &s.history, &s.context_tokens, .{
+                    .mcp_servers = s.cfg.mcp_servers,
                     .messages = messages,
                     .context_tokens = compaction.estimateTokens(messages),
                     .cwd = cwd,
@@ -187,7 +196,7 @@ pub const Session = struct {
         const project = try std.fs.path.join(a, &.{ root, "AGENTS.md" });
         const discovered = try skills.load(s.io, a, s.options.home, s.options.user_home, root);
         const found = try skills.select(a, discovered, s.cfg.enabled_skills);
-        const system = try skills.append(a, try instructions.append(s.io, a, base, global, project), found.skills);
+        const system = try s.tools.mcp_client.?.prompt(a, try skills.append(a, try instructions.append(s.io, a, base, global, project), found.skills));
         s.log.skills = found.summary;
         const sha = prompt.systemSha(base);
         try s.log.commit(s.io, s.gpa, &s.history, &s.context_tokens, .{
@@ -201,6 +210,7 @@ pub const Session = struct {
             .nib_version = @import("build_options").nib_version,
             .system_sha = &sha,
             .skills = found.summary,
+            .mcp_servers = s.cfg.mcp_servers,
             .patches_off = try prompt.disabledPatches(a, s.options.environ),
         });
     }
@@ -217,6 +227,7 @@ pub const Session = struct {
         if (id == null) {
             const config = @import("config.zig");
             cfg.enabled_skills = try config.enabledSkills(arena.allocator(), try config.loadSkills(arena.allocator(), s.io, options.home));
+            cfg.mcp_servers = try config.loadMcp(arena.allocator(), s.io, options.home);
         }
         const next = try Session.init(s.gpa, s.io, s.client, cfg, options);
         s.deinit();
@@ -236,6 +247,7 @@ pub const Session = struct {
         s.finishHooks();
         s.codex_state.reset(s.gpa);
         s.tools.background.stop(s.gpa);
+        if (s.tools.mcp_client) |c| c.destroy();
         s.undo_history.deinit(s.io, s.gpa);
         s.tools.progress.deinit(s.gpa);
         s.tools.agent_sessions.deinit(s.gpa);

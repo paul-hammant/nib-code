@@ -70,6 +70,13 @@ pub const State = struct {
             defer st.mutex.unlock(st.io);
             if (timing) |t| {
                 t.complete(call.timing_index.?, start_ms, end_ms, result == .ok);
+                if (result == .ok and std.mem.eql(u8, call.name, "mcp")) {
+                    const parsed = std.json.parseFromSlice(struct { ok: bool = true }, st.gpa, result.ok, .{ .ignore_unknown_fields = true }) catch null;
+                    if (parsed) |p| {
+                        defer p.deinit();
+                        t.entries[call.timing_index.?].ok = p.value.ok;
+                    }
+                }
                 if (sandbox.tool_identity.id) |id| {
                     t.entries[call.timing_index.?].id = id;
                     t.entries[call.timing_index.?].background = sandbox.tool_identity.background;

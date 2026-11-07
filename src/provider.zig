@@ -80,6 +80,7 @@ pub const Config = struct {
     sandbox: Sandbox = .{},
     hooks: Hooks = .{},
     enabled_skills: []const []const u8 = &.{},
+    mcp_servers: []const @import("mcp/config.zig").Server = &.{},
     limits: Limits = .{},
     provider: Id = .chat_completions,
     custom_provider: ?[]const u8 = null,

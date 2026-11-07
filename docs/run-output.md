@@ -125,3 +125,7 @@ TUI original Runs show neutral → run background → rN for registration; final
 ## After-edit hooks
 
 A failed configured `after_edit` hook adds `{"hook":{"command":"...","exit_code":1,"output":"..."}}` to its Run result. Exit code 124 denotes timeout. Complete captured output remains available until model-side rendering applies the normal Run display budget. Successful hooks add no result data. Commands run once per settled Run containing edit/write changes; child Sessions report their own hooks. Replay does not run hooks.
+
+## MCP tools
+
+`tools.mcp("server.tool", args)` returns `{ok, content, structured?, error?}`; `tools.mcp_schema("server.tool")` returns its full input JSON Schema. Servers must be enabled in configuration. Server/transport failures return data; malformed arguments reject. Text remains complete inside JS and uses the shared Run display budget. MCP images use the same image store and four-image limit as view; nonvision models get `[image omitted]`. Calls/results are recorded and replayed normally. Wire requests time out after 60 seconds (stdio discovery probe: two seconds); wire messages over 16 MiB fail without truncation. See [MCP tools](mcp.md).

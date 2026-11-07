@@ -113,7 +113,7 @@ const prelude =
     \\    try { r = await host(name, JSON.stringify(args ?? {})); } catch (e) { throw new Error(name + ": " + e.message); }
     \\    return r;
     \\  };
-    \\  globalThis.tools = Object.freeze(Object.fromEntries(names.map((n) => [n, (a) => call(n, a)])));
+    \\  globalThis.tools = Object.freeze(Object.fromEntries(names.map((n) => [n, (a, b) => call(n, n === "mcp" ? {name: a, arguments: b === undefined ? {} : b} : n === "mcp_schema" ? {name: a} : a)])));
     \\})();
 ;
 

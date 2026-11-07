@@ -130,3 +130,6 @@ Tool/bash statistics estimate JS/static-shell call sites, not actual loop/dynami
 | One HTTPS request peak RSS (including TLS) | 7.6 MB (2026-11-01, ReleaseFast) | — | `/usr/bin/time -f %M nib ask hi` (invalid key, 401) |
 
 See [tui-ux.md](tui-ux.md) for background-task management, waiting phases, and recovery notices.
+
+- [MCP tools](mcp.md): opt-in servers, context index, transports, protocol detection, lifecycle, sandbox, and limits.
+- [0024: Opt-in MCP tools](adr/0024-mcp-tools.md)
