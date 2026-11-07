@@ -9,6 +9,9 @@ pub const Result = union(enum) {
     too_large,
 };
 
+/// A hung clipboard tool must not freeze the UI; its child is killed and the read counts as no image.
+const timeout_ms = 2000;
+
 const script =
     \\case "$(uname)" in
     \\  Darwin)
@@ -25,14 +28,20 @@ const script =
     \\esac
 ;
 
+/// Tests only: replaces the system clipboard reader.
+pub var reader_override: ?*const fn (std.mem.Allocator) Result = null;
+
 pub fn readImage(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !Result {
+    if (reader_override) |read| return read(gpa);
     const ran = std.process.run(gpa, io, .{
         .argv = &.{ "/bin/sh", "-c", script },
         .environ_map = env,
         .stdout_limit = .limited(image.max_bytes + 1),
         .stderr_limit = .limited(4096),
+        .timeout = .{ .duration = .{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake } },
     }) catch |err| switch (err) {
         error.StreamTooLong => return .too_large,
+        error.Timeout => return .no_image,
         else => return err,
     };
     defer gpa.free(ran.stderr);

@@ -453,11 +453,8 @@ fn printTable(win: vaxis.Window, block: []const u8, theme: Theme, commit: bool) 
     var height: u16 = 0;
     const header = std.mem.trimEnd(u8, lines.next().?, "\r");
     _ = lines.next();
-    if (commit) {
-        t.printRow(win, header, .{ .bold = true }, theme);
-        for (0..t.total) |c| _ = win.printSegment(.{ .text = "─", .style = .{ .dim = true } }, .{ .row_offset = 1, .col_offset = @intCast(c), .wrap = .none });
-    }
-    height = 2;
+    if (commit) t.printRow(win, header, .{ .dim = true }, theme);
+    height = 1;
     while (lines.next()) |line| : (height +|= 1) {
         if (commit) t.printRow(win.child(.{ .y_off = @intCast(height) }), std.mem.trimEnd(u8, line, "\r"), .{}, theme);
     }
@@ -722,16 +719,14 @@ test "table renders aligned borderless columns by display width" {
     try shot.init(a, 60);
     defer shot.deinit(a);
     const text = "| 文件 | 改动 | 说明 |\n|---|:---:|---:|\n| src/grep.zig | +38 −9 | 边界检查 |\n| tests/a.py | +54 | 空 |";
-    try testing.expectEqual(@as(u16, 4), drawText(&shot, text, .{}));
+    try testing.expectEqual(@as(u16, 3), drawText(&shot, text, .{}));
     try shot.expect(a, &.{
         "文件" ++ "           " ++ "改动" ++ "       " ++ "说明",
-        "──────────────────────────────",
         "src/grep.zig  +38 −9  边界检查",
         "tests/a.py" ++ "     " ++ "+54" ++ "          " ++ "空",
     });
-    try testing.expect(shot.cell(0, 0).style.bold);
-    try testing.expect(!shot.cell(0, 2).style.bold);
-    try testing.expect(shot.cell(0, 1).style.dim);
+    try testing.expect(shot.cell(0, 0).style.dim and !shot.cell(0, 0).style.bold);
+    try testing.expect(!shot.cell(0, 1).style.dim and !shot.cell(0, 1).style.bold);
 }
 
 test "table cells keep inline styles, unescape pipes, pad ragged rows" {
@@ -740,15 +735,15 @@ test "table cells keep inline styles, unescape pipes, pad ragged rows" {
     try shot.init(a, 40);
     defer shot.deinit(a);
     _ = drawText(&shot, "a|b\n-|-\n`x`|**y**", .{ .tint = tint });
-    try shot.expect(a, &.{ "a  b", "────", "x  y" });
-    try testing.expectEqual(tint, shot.cell(0, 2).style.bg);
-    try testing.expect(shot.cell(3, 2).style.bold);
+    try shot.expect(a, &.{ "a  b", "x  y" });
+    try testing.expectEqual(tint, shot.cell(0, 1).style.bg);
+    try testing.expect(shot.cell(3, 1).style.bold);
     shot.screen.clear();
     _ = drawText(&shot, "| a | b |\n|---|---|\n| x\\|y | z |", .{});
-    try shot.expect(a, &.{ "a    b", "──────", "x|y  z" });
+    try shot.expect(a, &.{ "a    b", "x|y  z" });
     shot.screen.clear();
-    try testing.expectEqual(@as(u16, 4), drawText(&shot, "|a|b|c|\n|-|-|-|\n|1|\n|1|2|3|4|", .{}));
-    try shot.expect(a, &.{ "a  b  c", "───────", "1", "1  2  3" });
+    try testing.expectEqual(@as(u16, 3), drawText(&shot, "|a|b|c|\n|-|-|-|\n|1|\n|1|2|3|4|", .{}));
+    try shot.expect(a, &.{ "a  b  c", "1", "1  2  3" });
 }
 
 test "too-wide tables and non-tables render as plain lines" {
@@ -780,10 +775,10 @@ test "table streaming: renders once header and delimiter exist and relays out as
     };
     const want = [_][]const []const u8{
         &.{"| a | b |"},
-        &.{ "a  b", "────" },
-        &.{ "a  b", "────", "1  2" },
-        &.{ "a          b", "────────────", "1          2", "long cell  3" },
-        &.{ "a          b", "────────────", "1          2", "long cell  3", "", "tail" },
+        &.{"a  b"},
+        &.{ "a  b", "1  2" },
+        &.{ "a          b", "1          2", "long cell  3" },
+        &.{ "a          b", "1          2", "long cell  3", "", "tail" },
     };
     for (steps, want) |text, rows_want| {
         shot.screen.clear();

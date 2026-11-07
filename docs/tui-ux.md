@@ -39,3 +39,5 @@ Simple mode hides Turn footers; `/status` retains all details. Width, margins, t
 The signed-out hint, activity, menus, provider flows, notices, errors and warnings remain available.
 
 Collapsed Runs use one title line with no success mark, existing red failure/yellow warning marks, or live running text. Running agent trees remain visible to preserve progress. Opening retains normal summaries and details. User shading and Markdown are unchanged.
+
+Image paste: Ctrl+V attaches the clipboard image. Terminals that handle Ctrl+V themselves send an empty bracketed paste when only an image is on the clipboard; nib treats an empty or whitespace-only paste as Ctrl+V. Pasted image file paths still attach as before. See [ui-style.md](ui-style.md).

@@ -318,6 +318,8 @@ pub const App = struct {
                 app.pasting = false;
                 if (app.flow.takesText()) {
                     try providers.pasted(app, app.paste_buf.items);
+                } else if (std.mem.trim(u8, app.paste_buf.items, &std.ascii.whitespace).len == 0) {
+                    try app.attachClipboardImage();
                 } else {
                     if (!try app.attachPastedFile(app.paste_buf.items)) try app.input.paste(gpa, app.paste_buf.items);
                     app.menu.inputChanged(app.input.text());
@@ -969,6 +971,47 @@ test "bracketed paste buffers newline and slash keys without executing them" {
     const expanded = try app.input.expanded(gpa);
     defer gpa.free(expanded);
     try std.testing.expectEqualStrings("/help\nx\nx\nx\nx\nx", expanded);
+}
+
+var clipboard_reads: usize = 0;
+
+fn countingClipboard(_: std.mem.Allocator) clipboard.Result {
+    clipboard_reads += 1;
+    return .no_image;
+}
+
+test "empty or whitespace-only paste reads the clipboard image like Ctrl+V" {
+    const gpa = std.testing.allocator;
+    var app: App = undefined;
+    app.flow = .{ .gpa = gpa };
+    app.signed_out = false;
+    app.gpa = gpa;
+    app.input = .{};
+    defer app.input.deinit(gpa);
+    app.paste_buf = .empty;
+    defer app.paste_buf.deinit(gpa);
+    app.menu = .init(gpa);
+    app.cfg = .{ .provider = .custom, .base_url = "", .api_key = "", .model = "m", .custom_vision = true };
+    app.notice = null;
+    clipboard.reader_override = countingClipboard;
+    defer clipboard.reader_override = null;
+    clipboard_reads = 0;
+
+    _ = try app.handle(.paste_start);
+    _ = try app.handle(.paste_end);
+    try std.testing.expectEqual(@as(usize, 1), clipboard_reads);
+    try std.testing.expectEqualStrings("No image in clipboard", app.notice.?);
+
+    _ = try app.handle(.paste_start);
+    try app.paste_buf.appendSlice(gpa, " \n\t");
+    _ = try app.handle(.paste_end);
+    try std.testing.expectEqual(@as(usize, 2), clipboard_reads);
+
+    _ = try app.handle(.paste_start);
+    try app.paste_buf.appendSlice(gpa, "text");
+    _ = try app.handle(.paste_end);
+    try std.testing.expectEqual(@as(usize, 2), clipboard_reads);
+    try std.testing.expectEqualStrings("text", app.input.text());
 }
 
 test "usage snapshots refresh the footer without reading the running Session" {

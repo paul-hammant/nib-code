@@ -164,6 +164,42 @@ def test_tui_refuses_images_without_vision(tmp):
     shot.unlink()
 
 
+def fake_clipboard(tmp, image):
+    """Fake wl-paste (Linux) and osascript (macOS) on PATH; `image` None makes both fail like an empty clipboard."""
+    tools = tmp.parent / (tmp.name + "-tools")
+    tools.mkdir()
+    source = tools / "clip.png"
+    if image:
+        source.write_bytes(image)
+    body = f'cat {source}' if image else "exit 1"
+    (tools / "wl-paste").write_text(f"#!/bin/sh\n{body}\n")
+    out = f'for last; do :; done; cat {source} > "$last"' if image else "exit 1"
+    (tools / "osascript").write_text(f"#!/bin/sh\n{out}\n")
+    for name in ("wl-paste", "osascript"):
+        (tools / name).chmod(0o755)
+    return {"PATH": f"{tools}:{os.environ['PATH']}", "WAYLAND_DISPLAY": "wayland-nib-test"}
+
+
+def test_tui_empty_paste_attaches_clipboard_image(tmp):
+    environment = fake_clipboard(tmp, PNG)
+    reply = Reply("seen")
+    with fixture(tmp, [reply], config=vision_config(), provider="site", environment=environment) as (terminal, home, _):
+        paste(terminal, "")
+        terminal.until(b"[Image #1]")
+        terminal.send(" look\r")
+        assert reply.received.wait(5)
+        content = reply.messages[-1]["content"]
+        assert content[1] == {"type": "image_url", "image_url": {"url": DATA_URL}}, content
+
+
+def test_tui_empty_paste_without_clipboard_image_shows_notice(tmp):
+    environment = fake_clipboard(tmp, None)
+    with fixture(tmp, [Reply("never")], config=vision_config(), provider="site", environment=environment) as (terminal, home, _):
+        paste(terminal, "")
+        terminal.until(b"No image in clipboard")
+        assert b"[Image #1]" not in terminal.read()
+
+
 if __name__ == "__main__":
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(View)
     result = unittest.TextTestRunner(verbosity=1).run(suite)
@@ -171,6 +207,6 @@ if __name__ == "__main__":
         sys.exit(1)
     with tempfile.TemporaryDirectory(prefix="nib-tui-images-") as directory:
         base = Path(directory)
-        for index, check in enumerate((test_tui_paste_path_attaches_image, test_tui_refuses_images_without_vision)):
+        for index, check in enumerate((test_tui_paste_path_attaches_image, test_tui_refuses_images_without_vision, test_tui_empty_paste_attaches_clipboard_image, test_tui_empty_paste_without_clipboard_image_shows_notice)):
             check(base / f"case{index}")
             print(check.__name__ + ": ok")
