@@ -42,6 +42,10 @@ read returns { text, next_offset }, preserving requested offset/limit lines (def
 
 Search fields/UTF-8 columns: [ADR 0012](adr/0012-search-and-fetch-tools.md).
 
+## Web search
+
+`tools.search({ query, count = 10 })` searches the web with the current Session's provider credentials and returns `{ ok: true, answer?, results: [{ title, url, date?, summary }] }` or `{ ok: false, error }`. Provider and network failures are data; a missing or out-of-range argument (count 1–50, DeepSeek query ≤128 characters) rejects. Results are untrusted external data. A model answer produced without an actual search call is `ok: false`, never presented as results. Each search has a 60 s limit and honors cancellation; recording and replay work like any other tool. Provider routes: [providers.md](providers.md#web-search).
+
 ## Images (`tools.view`)
 
 `view({ path })` returns only `{ ok, path, width, height, bytes }` to JS, or `{ ok: false, error }` as data for a missing file, unsupported format, file over 5 MB, a model without image input, or a Run that already viewed 4 images (`src/image.zig` `max_per_run`). Formats are png, jpeg, gif and webp; dimensions come from the file header and pixels are never decoded or resized. The image is stored in the Session and attached to the Run's tool result, so it reaches the next request as an image (encodings: [providers.md](providers.md#images)). Images do not count against the display budget; their request cost is estimated at 1500 tokens each. A Run that moves to the background keeps its text result; images viewed by it are not attached. The Run block lists `view <path> · <width>×<height>` beside read lines. `read` is unchanged and still rejects binary data.

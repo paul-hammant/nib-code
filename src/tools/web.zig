@@ -46,27 +46,28 @@ const accept = "text/markdown, text/plain;q=0.9, text/html;q=0.8, */*;q=0.5";
 /// thread uses at a time; `gpa` must be thread-safe. On error.BinaryContent `content_type` is set.
 pub fn get(io: std.Io, gpa: std.mem.Allocator, a: std.mem.Allocator, environ: ?*const std.process.Environ.Map, options: Options, cancel: *const std.atomic.Value(bool), content_type: *[]const u8) !Page {
     if (!std.mem.startsWith(u8, options.url, "http://") and !std.mem.startsWith(u8, options.url, "https://")) return error.UnsupportedUrlScheme;
-    const Stop = enum { canceled, timed_out };
     const U = union(enum) { page: anyerror!Page, stop: Stop };
     var buffer: [2]U = undefined;
     var select = std.Io.Select(U).init(io, &buffer);
     // Blocking reads only return once canceled, so the request runs as its own task.
     defer select.cancelDiscard();
     try select.concurrent(.page, request, .{ io, gpa, a, environ, options, content_type });
-    try select.concurrent(.stop, struct {
-        fn watch(w_io: std.Io, flag: *const std.atomic.Value(bool), ms: u64) Stop {
-            var waited: u64 = 0;
-            while (waited < ms) : (waited += 50) {
-                if (flag.load(.acquire)) return .canceled;
-                std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(50), .clock = .awake }, w_io) catch return .canceled;
-            }
-            return .timed_out;
-        }
-    }.watch, .{ io, cancel, options.timeout_ms });
+    try select.concurrent(.stop, watch, .{ io, cancel, options.timeout_ms });
     return switch (try select.await()) {
         .page => |page| page,
         .stop => |stop| if (stop == .canceled) error.Canceled else error.Timeout,
     };
+}
+
+pub const Stop = enum { canceled, timed_out };
+
+pub fn watch(io: std.Io, flag: *const std.atomic.Value(bool), ms: u64) Stop {
+    var waited: u64 = 0;
+    while (waited < ms) : (waited += 50) {
+        if (flag.load(.acquire)) return .canceled;
+        std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(50), .clock = .awake }, io) catch return .canceled;
+    }
+    return .timed_out;
 }
 
 fn request(io: std.Io, gpa: std.mem.Allocator, a: std.mem.Allocator, environ: ?*const std.process.Environ.Map, options: Options, content_type: *[]const u8) anyerror!Page {

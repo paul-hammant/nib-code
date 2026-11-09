@@ -14,6 +14,19 @@ Service identity is separate from wire protocol: codex, openai, anthropic, deeps
 
 Snapshot: user-provided models.dev `api.json`, fetched **2026-11-06**. OpenAI lists gpt-6.1-sol/terra, both window 1050000/output 128000. Anthropic lists claude-opus-5-5, `claude-sonnet-5-5`, claude-haiku-5-5, claude-fable-5-1, all window 1000000/output 128000. xAI lists grok-4.7/4.6, both window 500000. DeepSeek retains deepseek-flash/deepseek-v4-pro, both window 1000000. Codex retains its list/windows/defaults; see [codex.md](codex.md). This short catalog neither guarantees account access nor calls discovery endpoints.
 
+## Web search
+
+`tools.search` uses the Session's own service and credentials; there is no setting and no fallback. It makes a separate request outside the Session (its usage is not added to Session totals).
+
+| Service | Request |
+| --- | --- |
+| codex | Responses `web_search` through the Codex backend (`<base_url>/codex/responses`, ChatGPT sign-in), model `gpt-6-luna`; answer plus cited and consulted sources |
+| openai | Same Responses request at `<base_url>/responses` with the API key |
+| anthropic | Messages request with model `claude-haiku-5-5` and the server-side `web_search_20250305` tool; answer plus cited and found pages |
+| deepseek | `POST <base_url>/v1/tools/search` with the API key; results only, no answer. DeepSeek bills each search request ([guide](https://api-docs.deepseek.com/guides/search)) |
+
+Other services, including `chat_completions`, xai and custom endpoints, return `{ ok: false, error: "web search is not available for provider <id>" }`.
+
 ## Signing in and choosing
 
 Run `nib`, then `/provider`. The menu lists every built-in service and each custom `[providers.<id>]` with where its credential comes from (`signed in · ChatGPT`, an environment variable name, `key stored`, a host, or `—`); the current one is marked `current`.

@@ -40,7 +40,7 @@ pub fn reasoningEffort(cfg: p.Config) ?[]const u8 {
 
 const login = @import("../auth/codex.zig");
 
-fn credentials(gpa: std.mem.Allocator, client: *std.http.Client, cfg: p.Config, detail: *?[]u8, rejected: ?[]const u8) !login.Login {
+pub fn credentials(gpa: std.mem.Allocator, client: *std.http.Client, cfg: p.Config, detail: *?[]u8, rejected: ?[]const u8) !login.Login {
     return login.current(gpa, client.io, client, .{ .nib_home = cfg.nib_home, .codex_home = cfg.codex_home, .issuer = cfg.auth_issuer }, rejected) catch |err| switch (err) {
         error.NotSignedIn => authError(gpa, detail, "Codex credentials unavailable; run nib login codex to log in."),
         error.InvalidCredentials => authError(gpa, detail, "Invalid or incomplete Codex credentials; run nib login codex to log in again."),

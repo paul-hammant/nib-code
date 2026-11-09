@@ -6,8 +6,9 @@ import threading
 
 
 class Mock:
-    def __init__(self, protocol, custom_run=False, key="fake-provider-key", code=None, models=None):
-        self.protocol, self.custom_run, self.key, self.code = protocol, custom_run, key, code
+    def __init__(self, protocol, custom_run=False, key="fake-provider-key", code=None, models=None, codex=False):
+        self.protocol, self.custom_run, self.key, self.code, self.codex = protocol, custom_run, key, code, codex
+        self.searches = []
         self.models = models
         self.gets = []
         self.requests = []
@@ -49,17 +50,50 @@ class Mock:
         self.server.server_close()
         self.thread.join()
 
+    def serve_search(self, h, body):
+        """Web search fixtures: Responses SSE, Messages JSON, DeepSeek JSON. Query "nosearch" never searches."""
+        self.searches.append((h.path, dict(h.headers), body))
+        if self.protocol == "responses":
+            query = body["input"][0]["content"][0]["text"]
+            events = []
+            if query != "nosearch":
+                sources = [{"type": "url", "url": "https://a.dev/1"}, {"type": "url", "url": "https://b.dev/2"}]
+                events.append({"type": "response.output_item.done", "item": {"type": "web_search_call", "action": {"type": "search", "sources": sources}}})
+            note = {"type": "url_citation", "url": "https://b.dev/2", "title": "B page"}
+            events.append({"type": "response.output_item.done", "item": {"type": "message", "content": [{"type": "output_text", "text": "answer for " + query, "annotations": [note]}]}})
+            payload, kind = "".join("data: " + json.dumps(e) + "\n\n" for e in events) + "data: [DONE]\n\n", "text/event-stream"
+        elif self.protocol == "anthropic_messages":
+            query = body["messages"][0]["content"]
+            content = [{"type": "text", "text": "answer for " + query, "citations": [{"type": "web_search_result_location", "url": "https://b.dev/2", "title": "B page", "cited_text": "quote"}]}]
+            if query != "nosearch":
+                hits = [{"type": "web_search_result", "url": "https://a.dev/1", "title": "A page", "page_age": "May 1, 2026"}]
+                content = [{"type": "server_tool_use", "name": "web_search", "input": {"query": query}}, {"type": "web_search_tool_result", "content": hits}] + content
+            payload, kind = json.dumps({"content": content}), "application/json"
+        else:
+            hits = [{"title": "A page", "url": "https://a.dev/1", "snippet": "snip", "summary": "sum", "date": None}, {"title": "B page", "url": "https://b.dev/2", "snippet": "only snippet", "summary": None, "date": "2026-01-02"}]
+            payload, kind = json.dumps({"results": hits[:body["count"]]}), "application/json"
+        data = payload.encode()
+        h.send_response(200)
+        h.send_header("Content-Type", kind)
+        h.send_header("Content-Length", str(len(data)))
+        h.end_headers()
+        h.wfile.write(data)
+
     def serve(self, h, body):
-        expected = {"responses": "/responses", "anthropic_messages": "/v1/messages", "chat_completions": "/chat/completions"}[self.protocol]
+        tools_list = body.get("tools") or []
+        first = tools_list[0] if tools_list and isinstance(tools_list[0], dict) else {}
+        if h.path.endswith("/v1/tools/search") or str(first.get("type", "")).startswith("web_search"):
+            return self.serve_search(h, body)
+        expected = {"responses": "/codex/responses" if self.codex else "/responses", "anthropic_messages": "/v1/messages", "chat_completions": "/chat/completions"}[self.protocol]
         assert h.path == expected, h.path
-        assert not h.headers.get("chatgpt-account-id")
+        assert bool(h.headers.get("chatgpt-account-id")) == self.codex
         if self.protocol == "anthropic_messages":
             assert h.headers["anthropic-version"] == "2023-06-01"
             assert h.headers.get("x-api-key", "") == self.key
             messages = body["messages"]
             assert body["system"][-1]["cache_control"] == {"type": "ephemeral"}
         else:
-            assert h.headers.get("Authorization", "") == (f"Bearer {self.key}" if self.key else "")
+            assert self.codex or h.headers.get("Authorization", "") == (f"Bearer {self.key}" if self.key else "")
             messages = body.get("input", body.get("messages"))
         users = [m for m in messages if m.get("role") == "user"]
         def content(m):
