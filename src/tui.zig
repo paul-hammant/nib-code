@@ -552,7 +552,7 @@ pub const App = struct {
         } else if (selected != null and k.matches(vaxis.Key.down, .{})) {
             app.menu.move(input.text(), true);
         } else if (selected != null and selected.?.is_path and (k.matches(vaxis.Key.tab, .{}) or k.matches(vaxis.Key.enter, .{}))) {
-            if (input.fileMention()) |m| try input.completeMention(gpa, m.start, selected.?.value.?);
+            if (input.fileMention() orelse input.skillMention()) |m| try input.completeMention(gpa, m.start, selected.?.value.?);
         } else if (selected != null and (k.matches(vaxis.Key.tab, .{}) or (k.matches(vaxis.Key.enter, .{}) and !app.pasting and !selected.?.runs()))) {
             const completion = try selected.?.completion(gpa);
             defer gpa.free(completion);

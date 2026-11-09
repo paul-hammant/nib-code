@@ -35,9 +35,12 @@ pub const Menu = struct {
     file_generation: u64 = 0,
     file_fresh: bool = false,
     reflect_enabled: bool = false,
+    /// Skills listed when a `$` mention starts; owned by `skill_arena`.
+    skill_arena: std.heap.ArenaAllocator,
+    skill_list: []const @import("../session/skills.zig").Skill = &.{},
 
     pub fn init(gpa: std.mem.Allocator) Menu {
-        return .{ .arena = .init(gpa), .gpa = gpa, .file_arena = .init(gpa), .pin_arena = .init(gpa) };
+        return .{ .arena = .init(gpa), .gpa = gpa, .file_arena = .init(gpa), .pin_arena = .init(gpa), .skill_arena = .init(gpa) };
     }
 
     pub fn deinit(m: *Menu) void {
@@ -46,6 +49,7 @@ pub const Menu = struct {
             m.gpa.destroy(ix);
         }
         m.file_arena.deinit();
+        m.skill_arena.deinit();
         m.pin_arena.deinit();
         m.arena.deinit();
     }
@@ -94,6 +98,7 @@ pub const Menu = struct {
     /// Follows the editor's `@` mention: starts or refreshes the path listing and ranks it.
     pub fn sync(m: *Menu, io: std.Io, e: *const Editor, session: *const Session) void {
         const found = e.fileMention() orelse {
+            if (e.skillMention()) |skill| return m.syncSkills(@constCast(session), skill.query);
             m.mentioning = false;
             m.file_fresh = false;
             m.file_len = 0;
@@ -113,6 +118,28 @@ pub const Menu = struct {
         const query = found.query[0..@min(found.query.len, m.file_query.len)];
         const same = m.file_fresh and std.mem.eql(u8, query, m.file_query[0..m.file_query_len]);
         ix.withEntries(Rank{ .m = m, .query = query, .same = same, .generation = &ix.generation }, Rank.run);
+    }
+
+    /// Lists discovered skills whose names start with `query`; they reuse the `@` rows.
+    fn syncSkills(m: *Menu, session: *Session, query: []const u8) void {
+        if (!m.mentioning) {
+            m.mentioning = true;
+            _ = m.skill_arena.reset(.retain_capacity);
+            m.skill_list = session.discoverSkills(m.skill_arena.allocator()) catch &.{};
+        }
+        m.file_fresh = false;
+        _ = m.file_arena.reset(.retain_capacity);
+        const a = m.file_arena.allocator();
+        m.file_len = 0;
+        for (m.skill_list) |skill| {
+            if (m.file_len == m.file_buf.len) break;
+            if (query.len > skill.name.len or !std.ascii.eqlIgnoreCase(skill.name[0..query.len], query)) continue;
+            const value = std.fmt.allocPrint(a, "${s} ", .{skill.name}) catch break;
+            const line = std.mem.sliceTo(skill.description, '\n');
+            m.file_buf[m.file_len] = .{ .command = .help, .value = value, .label = skill.name, .detail = line, .is_path = true };
+            m.file_len += 1;
+        }
+        if (m.sel >= m.file_len) m.sel = 0;
     }
 
     const Rank = struct {

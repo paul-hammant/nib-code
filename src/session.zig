@@ -287,6 +287,20 @@ pub const Session = struct {
         return s.turnWithImages(user_text, &.{}, sink, cancel, detail);
     }
 
+    /// Every discovered skill, from this Session's project and home.
+    pub fn discoverSkills(s: *Session, a: std.mem.Allocator) ![]const skills.Skill {
+        const cwd = try std.process.currentPathAlloc(s.io, a);
+        const root = try instructions.projectRoot(s.io, a, cwd);
+        return (try skills.load(s.io, a, s.options.home, s.options.user_home, root)).skills;
+    }
+
+    /// `text` with the SKILL.md of every skill named by `$name`, or `text` itself when none is.
+    pub fn expandSkills(s: *Session, text: []const u8) ![]const u8 {
+        if (std.mem.indexOfScalar(u8, text, '$') == null) return text;
+        const a = s.arena.allocator();
+        return skills.expand(s.io, a, text, s.discoverSkills(a) catch return text);
+    }
+
     /// Directory holding this Session's stored images.
     pub fn imageDirectory(s: *Session, a: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(a, "{s}/sessions/{s}.images", .{ s.options.home, s.id });
@@ -338,7 +352,7 @@ pub const Session = struct {
         defer partial.deinit(s.gpa);
         const attached = try s.arena.allocator().alloc(@import("image.zig").Image, images.len);
         for (images, attached) |item, *copy| copy.* = try item.clone(s.arena.allocator());
-        try pending.append(s.gpa, .{ .role = "user", .content = try prompt.turnBudgetText(s.arena.allocator(), s.history.items[0].content orelse "", s.cfg.limits.max_steps, user_text), .images = if (images.len > 0) attached else null });
+        try pending.append(s.gpa, .{ .role = "user", .content = try prompt.turnBudgetText(s.arena.allocator(), s.history.items[0].content orelse "", s.cfg.limits.max_steps, try s.expandSkills(user_text)), .images = if (images.len > 0) attached else null });
         s.usage = .{};
         s.steps = 0;
         try sink.emit(sink.ctx, .{ .usage = s.usage });

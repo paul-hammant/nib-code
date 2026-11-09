@@ -35,3 +35,9 @@ Switches affect new Sessions only; the current Session's system is unchanged. `/
 After AGENTS.md, system appends a name-sorted index only of user-enabled skills. For matching tasks, the model loads full instructions with `tools.read`, resolving relative paths against the skill directory. With no enabled skills (even if skills exist on disk), no prompt text or model calls are added. Each enabled skill's description enters every new Session's system prompt, so it costs index tokens even when unused.
 
 Resumed Sessions retain their original system without rediscovering skills; file changes affect new Sessions only. `/status` shows enabled, discovered, and skipped counts; reasons are recorded in the Session log's `skills.skipped`, not the conversation.
+
+## Mentioning a skill
+
+`$name` anywhere in a message uses that skill for the message only, without enabling it: `$release prepare 0.11.0`, `review this PR with $review`. A token is `$` at the start or after whitespace, followed by letters, digits, `_` or `-`; it counts only when it exactly matches a discovered skill name (so `$HOME`, `$1` and misspellings stay plain text). Skills with `disable-model-invocation: true` can be mentioned. Typing `$` in the TUI opens the same completion menu as `@`, listing discovered skills.
+
+On send, each distinct mentioned skill's SKILL.md (same 64 KiB limit) is appended after the message as `<skill name="…" location="…">body without frontmatter</skill>`, with one line saying relative paths resolve against its directory. The expanded text is what the Session log stores and what resume sends, so files are not read again; the TUI transcript shows only what was typed. The system prompt, config and `/skills` are unaffected. `nib ask` expands the same way.

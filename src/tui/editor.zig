@@ -211,6 +211,13 @@ pub const Editor = struct {
         return m;
     }
 
+    /// The `$` skill mention ending at the cursor, unless it touches an atomic paste block.
+    pub fn skillMention(e: *const Editor) ?paths.Mention {
+        const m = @import("../session/skills.zig").mentionAt(e.buf.items, e.cursor) orelse return null;
+        for (e.blocks.items) |b| if (b.end > m.start and b.start < e.cursor) return null;
+        return .{ .start = m.start, .query = m.query };
+    }
+
     /// Replaces the text from `start` to the cursor with `s`.
     pub fn completeMention(e: *Editor, gpa: std.mem.Allocator, start: usize, s: []const u8) !void {
         try e.buf.ensureUnusedCapacity(gpa, s.len);

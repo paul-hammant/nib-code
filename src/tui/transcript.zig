@@ -534,7 +534,7 @@ pub const Transcript = struct {
             } else if (m.source == .undo) {
                 try t.add(gpa, .info, content);
             } else if (std.mem.eql(u8, m.role, "user")) {
-                try t.add(gpa, .user, content);
+                try t.add(gpa, .user, @import("../session/skills.zig").typed(content));
             } else if (std.mem.eql(u8, m.role, "assistant")) {
                 if (content.len > 0) try t.add(gpa, if (m.waiting orelse false) .info else .assistant, content);
                 for (m.tool_calls orelse &.{}) |call| {

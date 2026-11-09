@@ -251,6 +251,127 @@ test "discovery overrides, symlinks and empty prompt" {
     try t.expect(std.mem.indexOf(u8, xml, "&lt;&amp;") != null);
 }
 
+fn isNameChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '-';
+}
+
+/// A `$name` word ending at `cursor`: `$` at the start or after whitespace, then name characters.
+pub fn mentionAt(text: []const u8, cursor: usize) ?struct { start: usize, query: []const u8 } {
+    var w = cursor;
+    while (w > 0 and isNameChar(text[w - 1])) w -= 1;
+    if (w == 0 or text[w - 1] != '$') return null;
+    const start = w - 1;
+    if (start > 0 and !std.ascii.isWhitespace(text[start - 1])) return null;
+    return .{ .start = start, .query = text[w..cursor] };
+}
+
+/// Distinct skills named by `$name` tokens in `text`, in order of first mention.
+pub fn mentioned(a: std.mem.Allocator, text: []const u8, found: []const Skill) ![]const Skill {
+    var out: std.ArrayList(Skill) = .empty;
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, text, i, '$')) |at| {
+        i = at + 1;
+        if (at > 0 and !std.ascii.isWhitespace(text[at - 1])) continue;
+        var end = i;
+        while (end < text.len and isNameChar(text[end])) end += 1;
+        if (end == i) continue;
+        const name = text[i..end];
+        const skill = for (found) |skill| {
+            if (std.mem.eql(u8, skill.name, name)) break skill;
+        } else continue;
+        const seen = for (out.items) |previous| {
+            if (std.mem.eql(u8, previous.name, name)) break true;
+        } else false;
+        if (!seen) try out.append(a, skill);
+        i = end;
+    }
+    return out.items;
+}
+
+fn body(text: []const u8) []const u8 {
+    var offset: usize = 0;
+    var fences: u8 = 0;
+    while (offset < text.len) {
+        const end = std.mem.indexOfScalarPos(u8, text, offset, '\n') orelse text.len;
+        const line = trim(u8, text[offset..end], "\r");
+        offset = @min(end + 1, text.len);
+        if (std.mem.eql(u8, line, "---")) {
+            fences += 1;
+            if (fences == 2) break;
+        }
+    }
+    return trim(u8, text[offset..], "\r\n");
+}
+
+/// `text` followed by one `<skill>` block per distinct mentioned skill whose SKILL.md still reads and parses.
+pub const mention_intro = "\n\nSkills named with $name in this message; relative paths in them resolve against the skill's directory (parent of SKILL.md).";
+
+/// The user's own text of a message that `expand` extended.
+pub fn typed(content: []const u8) []const u8 {
+    return content[0 .. std.mem.indexOf(u8, content, mention_intro) orelse content.len];
+}
+
+pub fn expand(io: std.Io, a: std.mem.Allocator, text: []const u8, found: []const Skill) ![]const u8 {
+    const used = try mentioned(a, text, found);
+    if (used.len == 0) return text;
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, text);
+    var first = true;
+    for (used) |skill| {
+        const raw = std.Io.Dir.cwd().readFileAlloc(io, skill.location, a, .limited(64 * 1024)) catch continue;
+        _ = parse(a, raw, skill.name, skill.location) catch continue;
+        if (first) try out.appendSlice(a, mention_intro);
+        first = false;
+        try out.print(a, "\n\n<skill name=\"{s}\" location=\"{s}\">\n{s}\n</skill>", .{ skill.name, skill.location, body(raw) });
+    }
+    return out.items;
+}
+
+test "mentions need a boundary and an exact skill name" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const found = [_]Skill{
+        .{ .name = "review", .description = "", .location = "/r" },
+        .{ .name = "release", .description = "", .location = "/l", .disabled = true },
+        .{ .name = "HOME", .description = "", .location = "/h" },
+    };
+    const hits = try mentioned(a, "$release go, then $review, $review again, a$review $unknown $1 $HOMEx\n$release", &found);
+    try t.expectEqual(@as(usize, 2), hits.len);
+    try t.expectEqualStrings("release", hits[0].name);
+    try t.expectEqualStrings("review", hits[1].name);
+    try t.expectEqual(@as(usize, 1), (try mentioned(a, "use $HOME.", &found)).len);
+    try t.expectEqual(@as(usize, 0), (try mentioned(a, "echo $HOMEDIR $PATH", &found)).len);
+    try t.expectEqual(@as(usize, 0), (try mentioned(a, "$", &found)).len);
+    const m = mentionAt("see $rev", 8).?;
+    try t.expectEqual(@as(usize, 4), m.start);
+    try t.expectEqualStrings("rev", m.query);
+    try t.expect(mentionAt("a$rev", 5) == null);
+    try t.expectEqualStrings("", mentionAt("$", 1).?.query);
+}
+
+test "expansion appends the body and skips unreadable skills" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.createDirPath(t.io, "s/one");
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "s/one/SKILL.md", .data = "---\ndescription: d\ndisable-model-invocation: true\n---\nDo the thing.\n" });
+    const found = try discover(t.io, a, &.{try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/s", .{tmp.sub_path})});
+    try t.expect(found.skills[0].disabled);
+    const out = try expand(t.io, a, "go $one", found.skills);
+    try t.expect(std.mem.startsWith(u8, out, "go $one\n\n"));
+    try t.expect(std.mem.indexOf(u8, out, "<skill name=\"one\" location=\"") != null);
+    try t.expect(std.mem.endsWith(u8, out, "\nDo the thing.\n</skill>"));
+    try t.expect(std.mem.indexOf(u8, out, "description: d") == null);
+    try t.expectEqualStrings("go $none", try expand(t.io, a, "go $none", found.skills));
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "s/one/SKILL.md", .data = try a.alloc(u8, 65 * 1024) });
+    try t.expectEqualStrings("go $one", try expand(t.io, a, "go $one", found.skills));
+}
+
 pub fn source(a: std.mem.Allocator, path: []const u8, home: []const u8, user_home: []const u8, root: []const u8) ![]const u8 {
     const roots = [_][]const u8{
         try std.fs.path.join(a, &.{ user_home, ".agents/skills" }),
