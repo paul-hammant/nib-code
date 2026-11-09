@@ -1742,3 +1742,43 @@ test "latest details entry is the newest Run, background or failure" {
     t.toggle(t.latestDetails().?);
     try testing.expect(t.entries.items[3].open and !t.entries.items[1].open);
 }
+
+fn firstRow(gpa: std.mem.Allocator, screen: *vaxis.Screen, width: u16) ![]u8 {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(gpa);
+    for (0..width) |x| try row.appendSlice(gpa, screen.readCell(@intCast(x), 0).?.char.grapheme);
+    return row.toOwnedSlice(gpa);
+}
+
+test "Simple collapsed Run shows path facts on its title row" {
+    const gpa = testing.allocator;
+    const Case = struct { files: []const @import("../session/tool_summary.zig").File, counts: []const @import("../session/tool_summary.zig").Count, changed: usize, simple: []const u8, normal: []const u8 };
+    const cases = [_]Case{
+        .{ .files = &.{.{ .tool = "glob", .path = "**/*.md" }}, .counts = &.{.{ .name = "glob", .count = 1 }}, .changed = 0, .simple = "  Run · glob **/*.md", .normal = "  Run" },
+        .{
+            .files = &.{ .{ .tool = "read", .path = "src/a.zig" }, .{ .tool = "read", .path = "src/b.zig" } },
+            .counts = &.{ .{ .name = "read", .count = 2 }, .{ .name = "edit", .count = 1 } },
+            .changed = 1,
+            .simple = "  Run · read src/a.zig · read src/b.zig · edit 1 file",
+            .normal = "  Run · edit 1 file",
+        },
+    };
+    for (cases) |c| for ([_]bool{ true, false }) |simple| {
+        var screen = try vaxis.Screen.init(gpa, .{ .cols = 60, .rows = 4, .x_pixel = 0, .y_pixel = 0 });
+        defer screen.deinit(gpa);
+        const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 60, .height = 4, .screen = &screen };
+        var t: Transcript = .{};
+        defer t.deinit(gpa);
+        try t.startRun(gpa, "await tools.read({})");
+        const changes = [_]Change{.{ .path = "a", .added = 1, .removed = 0, .diff = "+x\n" }};
+        try t.endRunWithSummary(gpa, true, "", 10, try .init(gpa, if (c.changed > 0) &changes else &.{}), .{ .counts = c.counts, .files = c.files });
+        const e = &t.entries.items[0];
+        e.simple = simple;
+        if (simple) try testing.expectEqual(@as(u16, 1), e.print(win, true));
+        if (!simple) _ = e.print(win, true);
+        const row = try firstRow(gpa, &screen, 60);
+        defer gpa.free(row);
+        const expected = if (simple) c.simple else c.normal;
+        try testing.expectEqualStrings(expected, std.mem.trimEnd(u8, row, " "));
+    };
+}

@@ -47,6 +47,9 @@ pub const Entry = struct {
     /// until render, so this must outlive draw(); see `refreshLabel`.
     label: std.ArrayList(u8) = .empty,
     files: std.ArrayList(u8) = .empty,
+    /// Simple-mode title facts, spliced into `label` at `title_files_at`.
+    title_files: std.ArrayList(u8) = .empty,
+    title_files_at: usize = 0,
     run: enum { running, background, superseded, ok, failed, warning, lost, timed_out, canceled } = .running,
     elapsed_ms: u64 = 0,
     step_effort: ?provider.StepEffort = null,
@@ -76,6 +79,7 @@ pub const Entry = struct {
         e.hook_notice.deinit(gpa);
         e.label.deinit(gpa);
         e.files.deinit(gpa);
+        e.title_files.deinit(gpa);
         e.changes.deinit(gpa);
         for (e.agents.items) |*p| p.deinit(gpa);
         e.agents.deinit(gpa);
@@ -87,6 +91,8 @@ pub const Entry = struct {
     pub fn refreshLabel(e: *Entry, gpa: std.mem.Allocator) !void {
         e.label.clearRetainingCapacity();
         e.files.clearRetainingCapacity();
+        e.title_files.clearRetainingCapacity();
+        e.title_files_at = 0;
         switch (e.kind) {
             .run => {
                 try e.label.appendSlice(gpa, "Run");
@@ -109,11 +115,13 @@ pub const Entry = struct {
                 if (e.tool_summary) |summary| for (summary.files, 0..) |file, i| {
                     if (i > 0) try e.files.appendSlice(gpa, if (file.duration_ms != null or summary.files[i - 1].duration_ms != null) "\n" else " · ");
                     try e.files.print(gpa, "{s} {s}", .{ file.tool, file.path });
+                    try e.title_files.print(gpa, " · {s} {s}", .{ file.tool, file.path });
                     if (file.duration_ms) |ms| {
                         try e.files.print(gpa, " · {d}.{d}s", .{ ms / 1000, ms % 1000 / 100 });
                         if (file.failed) try e.files.appendSlice(gpa, " · failed");
                     }
                 };
+                e.title_files_at = e.label.items.len;
                 if (used.len > 0) try e.label.print(gpa, " · {s}", .{used});
                 for (e.agents.items) |p| {
                     if (!p.background or p.kind == .run or p.state == .failed or p.state == .timed_out or p.state == .canceled) continue;
@@ -171,7 +179,12 @@ pub const Entry = struct {
         const wrap: @FieldType(vaxis.Window.PrintOptions, "wrap") = if (folded) .none else if (e.kind == .run or e.kind == .background or e.kind == .failure) .grapheme else .word;
         const shown = segments(e, &segs);
         if (e.kind == .run) {
-            _ = win.print(shown[0..3], .{ .wrap = .none, .commit = commit });
+            if (e.simple and !e.open and e.title_files.items.len > 0) {
+                const title_text = e.label.items;
+                const at = @min(e.title_files_at, title_text.len);
+                const title = [_]vaxis.Segment{ shown[0], shown[1], .{ .text = title_text[0..at] }, .{ .text = e.title_files.items }, .{ .text = title_text[at..] } };
+                _ = win.print(&title, .{ .wrap = .none, .commit = commit });
+            } else _ = win.print(shown[0..3], .{ .wrap = .none, .commit = commit });
             if (e.simple and !e.open and e.run != .running) return 1;
             if (e.simple and !e.open) return 1 +| e.agent_tree.print(win.child(.{ .y_off = 1 }), commit);
             var rows: u16 = 1;
