@@ -1,7 +1,7 @@
 """TUI interjections through a PTY and a gated local mock. Run after zig build."""
 import contextlib
 import fcntl
-from mock_http import ThreadingHTTPServer
+from mock_http import ThreadingHTTPServer, is_prediction
 import http.server
 import json
 import os
@@ -61,6 +61,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+        if is_prediction(body):
+            return self.send_error(400)
         reply = self.server.replies.get(timeout=5)
         reply.messages = body["messages"]
         reply.received.set()

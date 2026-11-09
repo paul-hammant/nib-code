@@ -1,5 +1,5 @@
 """Local wire fixtures for Responses, Messages and Chat Completions; fake keys only."""
-from mock_http import ThreadingHTTPServer
+from mock_http import ThreadingHTTPServer, is_prediction
 import http.server
 import json
 import threading
@@ -34,6 +34,8 @@ class Mock:
             def do_POST(self):
                 try:
                     body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                    if is_prediction(body):
+                        return self.send_error(400)
                     owner.requests.append((self.path, dict(self.headers), body))
                     owner.serve(self, body)
                 except Exception as error:

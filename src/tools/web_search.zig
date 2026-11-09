@@ -12,8 +12,6 @@ const timeout_ms = 60_000;
 const max_body = 8 * 1024 * 1024;
 const max_count = 50;
 const deepseek_query_chars = 128;
-const responses_model = "gpt-6-luna";
-const anthropic_model = "claude-haiku-5-5";
 const anthropic_tool = "web_search_20250305";
 const instructions = "Search the web and answer concisely, citing sources.";
 
@@ -92,7 +90,7 @@ fn buildCall(a: std.mem.Allocator, cfg: provider.Config, kind: Route, query: []c
     };
     const body = switch (kind) {
         .codex, .openai => try std.json.Stringify.valueAlloc(a, .{
-            .model = responses_model,
+            .model = provider.smallModel(cfg.provider).?,
             .instructions = instructions,
             .input = &.{.{ .role = "user", .content = &.{.{ .type = "input_text", .text = query }} }},
             .tools = &.{.{ .type = "web_search", .search_context_size = "high" }},
@@ -102,7 +100,7 @@ fn buildCall(a: std.mem.Allocator, cfg: provider.Config, kind: Route, query: []c
             .stream = true,
         }, .{}),
         .anthropic => try std.json.Stringify.valueAlloc(a, .{
-            .model = anthropic_model,
+            .model = provider.smallModel(cfg.provider).?,
             .max_tokens = 4096,
             .messages = &.{.{ .role = "user", .content = query }},
             .tools = &.{.{ .type = anthropic_tool, .name = "web_search", .max_uses = 5 }},

@@ -1,7 +1,7 @@
 """Responses WebSocket prototype E2E; Python stdlib, local mocks and fake credentials only."""
 import base64
 import hashlib
-from mock_http import ThreadingHTTPServer
+from mock_http import ThreadingHTTPServer, is_prediction
 import http.server
 import json
 import os
@@ -201,6 +201,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+        if is_prediction(body):
+            return self.send_error(400)
         self.server.posts += 1
         self.server.requests.append(dict(transport="sse", body=body))
         events, _ = response(body["input"], "sse-response", self.server.mode, body)

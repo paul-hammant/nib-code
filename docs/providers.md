@@ -14,6 +14,10 @@ Service identity is separate from wire protocol: codex, openai, anthropic, deeps
 
 Snapshot: user-provided models.dev `api.json`, fetched **2026-11-06**. OpenAI lists gpt-6.1-sol/terra, both window 1050000/output 128000. Anthropic lists claude-opus-5-5, `claude-sonnet-5-5`, claude-haiku-5-5, claude-fable-5-1, all window 1000000/output 128000. xAI lists grok-4.7/4.6, both window 500000. DeepSeek retains deepseek-flash/deepseek-v4-pro, both window 1000000. Codex retains its list/windows/defaults; see [codex.md](codex.md). This short catalog neither guarantees account access nor calls discovery endpoints.
 
+## Small model
+
+`provider.smallModel` names each service's cheap model: codex and openai `gpt-6-luna`, anthropic `claude-haiku-5-5`, deepseek `deepseek-flash`. Web search and TUI input prediction both use it; prediction is a stateless out-of-Session request (SSE, lowest effort, 15 s timeout). Services without an entry (chat_completions, xai, custom) predict with the Session's current model at the lowest effort.
+
 ## Web search
 
 `tools.search` uses the Session's own service and credentials; there is no setting and no fallback. It makes a separate request outside the Session (its usage is not added to Session totals).

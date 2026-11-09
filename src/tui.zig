@@ -20,6 +20,7 @@ const clipboard = @import("tui/clipboard.zig");
 const providers = @import("tui/providers.zig");
 const provider_flow = @import("tui/provider_flow.zig");
 const config = @import("config.zig");
+const prediction = @import("tui/prediction.zig");
 const Turn = @import("tui/turn.zig").Turn;
 const Ticker = @import("tui/turn.zig").Ticker;
 const Frames = @import("tui/frames.zig").Frames;
@@ -67,6 +68,8 @@ pub const Event = union(enum) {
     paths_ready,
     /// A sign-in or model-listing job finished; freed with the event.
     flow: *provider_flow.Result,
+    /// A predicted next message; `text` is owned by the receiver.
+    prediction: struct { generation: u64, text: []u8 },
 
     pub fn flushesVisible(event: Event) bool {
         return switch (event) {
@@ -78,7 +81,7 @@ pub const Event = union(enum) {
     pub fn refresh(event: Event) Frames.Refresh {
         return switch (event) {
             .tick => .animation,
-            .key_press, .paste_end, .mouse, .winsize, .color_report, .color_scheme, .done, .failed, .issues_done, .flow => .immediate,
+            .key_press, .paste_end, .mouse, .winsize, .color_report, .color_scheme, .done, .failed, .issues_done, .flow, .prediction => .immediate,
             else => .content,
         };
     }
@@ -96,6 +99,7 @@ pub const Event = union(enum) {
                 if (r.tool_summary) |summary| summary.deinit(gpa);
             },
             .retry, .notice, .issue => |text| gpa.free(text),
+            .prediction => |p| gpa.free(p.text),
             .failed => |failure| gpa.free(failure.message),
             .progress => |p| {
                 var owned = p;
@@ -252,6 +256,7 @@ pub const App = struct {
     last_summary: ?TurnSummary = null,
     turn_runs: usize = 0,
     flow: provider_flow.Flow = .{ .gpa = undefined },
+    prediction: prediction.State = .{},
     /// No usable credentials for the current service; see refreshCredentials.
     signed_out: bool = false,
     prompt_view: Editor = .{ .placeholder = "" },
@@ -269,6 +274,7 @@ pub const App = struct {
             t.cancel.store(true, .release);
             t.finish();
         }
+        app.prediction.deinit(app.gpa);
         app.flow.deinit();
         app.stopReflecting();
         app.clearStepEffort();
@@ -363,6 +369,10 @@ pub const App = struct {
                 }
             },
             .paths_ready => {},
+            .prediction => |p| {
+                app.prediction.arrive(gpa, p.generation, p.text);
+                event.prediction.text = &.{};
+            },
             .flow => |r| try providers.result(app, r),
             .tick => if (app.turn == null) {
                 app.session.tools.progress.sink = .{ .ctx = app, .emit = idleProgress };
@@ -466,11 +476,13 @@ pub const App = struct {
             .done => {
                 app.transcript.clearRetry(gpa, &app.scroll);
                 const canceled = app.turn.?.cancel.load(.acquire);
+                const predict = !canceled and !app.turn.?.compact and app.reflecting == null;
                 try app.finishTurn();
                 try app.saveReflection();
                 try app.appendBill();
                 if (canceled) try app.recoveryHint(.canceled);
                 try app.finishQueued(!canceled);
+                if (predict) app.predictNext();
             },
             .issue => |msg| {
                 try app.transcript.add(gpa, .info, msg);
@@ -531,7 +543,9 @@ pub const App = struct {
         const before = std.hash.Wyhash.hash(0, input.text());
         var submitted: ?[]u8 = null;
 
-        if (selected != null and k.matches(vaxis.Key.escape, .{})) {
+        if (selected == null and k.matches(vaxis.Key.tab, .{}) and app.turn == null and try app.prediction.accept(gpa, input)) {
+            // Accepted into the editor; Enter sends it.
+        } else if (selected != null and k.matches(vaxis.Key.escape, .{})) {
             app.menu.closed = true;
         } else if (selected != null and k.matches(vaxis.Key.up, .{})) {
             app.menu.move(input.text(), false);
@@ -661,11 +675,34 @@ pub const App = struct {
 
     fn startTurnWithImages(app: *App, text: []u8, images: []const @import("image.zig").Image) !void {
         errdefer app.gpa.free(text);
+        app.dropPrediction();
         try app.transcript.add(app.gpa, .user, text);
         app.turn = try Turn.spawnWithImages(app.gpa, app.session, app.loop, text, images, false);
         app.live_steps = 0;
         app.turn_runs = 0;
         app.activity = .start(app.io, .thinking);
+    }
+
+    pub fn dropPrediction(app: *App) void {
+        app.prediction.invalidate(app.gpa);
+    }
+
+    fn predictNext(app: *App) void {
+        if (app.turn != null or app.flow.active() or app.menu.isPinned() or !app.credentialed()) return;
+        var user: ?[]const u8 = null;
+        var reply: ?[]const u8 = null;
+        var i = app.session.history.items.len;
+        while (i > 0) : (i -= 1) {
+            const m = app.session.history.items[i - 1];
+            const content = m.content orelse continue;
+            if (content.len == 0) continue;
+            if (reply == null and std.mem.eql(u8, m.role, "assistant")) reply = content;
+            if (std.mem.eql(u8, m.role, "user") and m.source == null) {
+                user = content;
+                break;
+            }
+        }
+        app.prediction.start(app.gpa, app.io, app.loop, app.cfg, app.session.id, user orelse return, reply orelse return);
     }
 
     pub fn report(app: *App, kind: EntryKind, comptime fmt: []const u8, args: anytype) !void {
@@ -783,6 +820,7 @@ pub const App = struct {
             try app.prompt_view.replace(app.gpa, app.prompt_text.items);
             visible_input = &app.prompt_view;
         }
+        app.input.ghost = if (app.turn == null and !app.flow.active() and !app.menu.isPinned()) app.prediction.visible(&app.input) else "";
         const menu = app.menu.items(app.input.text());
         for (menu) |*candidate| if (candidate.command == .reflect and candidate.value == null) {
             candidate.detail = commands.reflectHelp(&app.reflect_help, reflect.issueRepo(app));

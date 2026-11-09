@@ -222,6 +222,7 @@ pub fn select(app: *App, selection: config.ModelSelection, note: ?[]const u8) !v
     };
     cfg.thinking = app.cfg.thinking;
     cfg.reasoning_effort = app.cfg.reasoning_effort;
+    app.dropPrediction();
     const fresh = session.log.steps > 0;
     const previous = session.cfg;
     session.cfg = cfg;
@@ -399,6 +400,7 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
             };
             if (id != null and std.mem.eql(u8, id.?, session.id)) return app.transcript.add(gpa, .info, "already in this session");
             session.reopen(id) catch |err| return app.report(.err, "could not open session: {s}", .{@errorName(err)});
+            app.dropPrediction();
             session.tools.recovery.enabled = true;
             app.transcript.clear(gpa);
             app.background_count = 0;
@@ -454,6 +456,7 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
             if (changes.diff.len > 0) try app.transcript.add(gpa, .info, std.mem.trimEnd(u8, changes.diff, "\n"));
         },
         .compact => {
+            app.dropPrediction();
             app.turn = try Turn.spawn(gpa, session, app.loop, try gpa.dupe(u8, line), true);
             app.live_steps = 0;
             app.turn_runs = 0;
@@ -468,6 +471,7 @@ pub fn execute(app: *App, c: Command, arg: []const u8, line: []const u8) !void {
             const focus = try gpa.dupe(u8, arg);
             errdefer gpa.free(focus);
             try app.transcript.add(gpa, .user, line);
+            app.dropPrediction();
             app.turn = try Turn.spawn(gpa, session, app.loop, text, false);
             app.live_steps = 0;
             app.turn_runs = 0;

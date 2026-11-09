@@ -4,7 +4,7 @@ Run after zig build: python3 tests/test_replay.py
 """
 import contextlib
 import hashlib
-from mock_http import ThreadingHTTPServer
+from mock_http import ThreadingHTTPServer, is_prediction
 import http.server
 import json
 import os
@@ -47,6 +47,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if is_prediction(body):
+            return self.send_error(400)
         self.server.requests.append(body)
         codes, text = self.server.replies.get(timeout=5)
         delta = {"content": text, "reasoning_content": "mock reasoning"}

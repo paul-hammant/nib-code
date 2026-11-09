@@ -1,7 +1,7 @@
 """Turn undo through the TUI and real child processes, using only local mock models."""
 import json
 from http.server import BaseHTTPRequestHandler
-from mock_http import ThreadingHTTPServer
+from mock_http import ThreadingHTTPServer, is_prediction
 import os
 from pathlib import Path
 import tempfile
@@ -248,6 +248,8 @@ def test_background_agent(tmp):
 
         def do_POST(self):
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if is_prediction(request):
+                return self.send_error(400)
             messages = request["messages"]
             child = any(m.get("content") == "child-work" for m in messages)
             code = None

@@ -27,6 +27,16 @@ pub const Id = blk: {
     break :blk @Enum(u8, .exhaustive, &names, &values);
 };
 
+/// The cheap model of a service for side requests (search, input prediction); null when none is known.
+pub fn smallModel(id: Id) ?[]const u8 {
+    return switch (id) {
+        .codex, .openai => "gpt-6-luna",
+        .anthropic => "claude-haiku-5-5",
+        .deepseek => "deepseek-flash",
+        else => null,
+    };
+}
+
 pub const Model = struct { id: []const u8, context_window: u64, max_output: u32 = 128000, can_disable_reasoning: bool = true, vision: ?bool = null };
 
 pub const Definition = struct {

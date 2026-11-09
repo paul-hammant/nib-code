@@ -22,6 +22,8 @@ For agents changing the TUI, CLI help, or fixed text.
 
 Hooks: successful commands are silent. After-edit failure adds one warning-colored line in the Run block: `hook <command> · exit <code>`. Turn-end failure adds a dim notice: `hook turn_end · exit <code>`. `/status` adds `Hooks: after_edit <count> · turn_end <count>` only when any hooks are configured.
 
+Input prediction: after a root Turn ends normally, a background request (last user message and the tail of the last reply only) predicts the next message and shows it as dim ghost text in place of the placeholder (also in Simple mode), only while the editor is completely empty. Tab inserts it (Enter sends); typing hides it, clearing shows it again. It is dropped when the next Turn starts, on `/compact`, `/new`, `/resume` and model or provider changes; late results are discarded by generation. Failures, timeouts and empty or trivial replies show nothing, with no notice or status text.
+
 ## Typography and color
 
 Assistant Markdown stays plain and quiet: three emphasis levels (bold, normal, dim), one accent color.

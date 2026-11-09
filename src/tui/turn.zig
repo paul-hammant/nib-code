@@ -33,6 +33,7 @@ pub const Turn = struct {
     loop: *vaxis.Loop(Event),
     cancel: std.atomic.Value(bool) = .init(false),
     thread: std.Thread = undefined,
+    compact: bool = false,
     failure_stage: @import("../tools/changes.zig").Recovery.Reason = .model,
     last_script_activity: ?std.Io.Clock.Timestamp = null,
     last_model_activity: ?std.Io.Clock.Timestamp = null,
@@ -55,7 +56,7 @@ pub const Turn = struct {
             copy.* = try item.clone(gpa);
             copied += 1;
         }
-        t.* = .{ .gpa = gpa, .session = session, .text = text, .images = copies, .loop = loop };
+        t.* = .{ .gpa = gpa, .session = session, .text = text, .images = copies, .loop = loop, .compact = compact };
         t.thread = try std.Thread.spawn(.{}, work, .{ t, compact });
         return t;
     }
