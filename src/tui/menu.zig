@@ -23,7 +23,7 @@ pub const Menu = struct {
     pin_arena: std.heap.ArenaAllocator,
     gpa: std.mem.Allocator,
     /// `@` completions: set while the cursor ends an `@` mention.
-    mentioning: bool = false,
+    mention: enum { none, file, skill } = .none,
     index: ?*paths.Index = null,
     wake: ?paths.Index.Wake = null,
     /// Owns the strings of `file_buf`; reset when the matches are recomputed.
@@ -91,7 +91,7 @@ pub const Menu = struct {
             }
             slash = slash[0..n];
         }
-        if (slash.len > 0 or !m.mentioning) return slash;
+        if (slash.len > 0 or m.mention == .none) return slash;
         return m.file_buf[0..m.file_len];
     }
 
@@ -99,7 +99,7 @@ pub const Menu = struct {
     pub fn sync(m: *Menu, io: std.Io, e: *const Editor, session: *const Session) void {
         const found = e.fileMention() orelse {
             if (e.skillMention()) |skill| return m.syncSkills(@constCast(session), skill.query);
-            m.mentioning = false;
+            m.mention = .none;
             m.file_fresh = false;
             m.file_len = 0;
             return;
@@ -110,8 +110,8 @@ pub const Menu = struct {
             m.index = ix;
         }
         const ix = m.index.?;
-        if (!m.mentioning) {
-            m.mentioning = true;
+        if (m.mention != .file) {
+            m.mention = .file;
             m.file_fresh = false;
             ix.refresh(@constCast(&session.tools));
         }
@@ -122,8 +122,8 @@ pub const Menu = struct {
 
     /// Lists discovered skills whose names start with `query`; they reuse the `@` rows.
     fn syncSkills(m: *Menu, session: *Session, query: []const u8) void {
-        if (!m.mentioning) {
-            m.mentioning = true;
+        if (m.mention != .skill) {
+            m.mention = .skill;
             _ = m.skill_arena.reset(.retain_capacity);
             m.skill_list = session.discoverSkills(m.skill_arena.allocator()) catch &.{};
         }
@@ -295,4 +295,25 @@ test "reflection is hidden unless enabled" {
     try testing.expectEqual(@as(usize, 0), m.items("/ref").len);
     m.reflect_enabled = true;
     try testing.expectEqualStrings("/reflect", m.items("/ref")[0].label);
+}
+
+test "moving straight from an @ mention to a $ mention loads skills" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "skills/review");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "skills/review/SKILL.md", .data = "---\nname: review\ndescription: Review a change.\n---\nBody\n" });
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    var session: Session = undefined;
+    session.io = testing.io;
+    session.options = .{ .home = root, .user_home = root };
+    var m: Menu = .init(testing.allocator);
+    defer m.deinit();
+    m.mention = .file;
+    var e: Editor = .{};
+    defer e.deinit(testing.allocator);
+    try e.replace(testing.allocator, "$re");
+    m.sync(testing.io, &e, &session);
+    try testing.expect(m.mention == .skill);
+    try testing.expectEqualStrings("review", m.selected("$re").?.label);
 }
