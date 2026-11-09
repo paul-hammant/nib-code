@@ -39,6 +39,10 @@ fn route(cfg: provider.Config) ?Route {
     };
 }
 
+pub fn supported(cfg: provider.Config) bool {
+    return route(cfg) != null;
+}
+
 fn failure(gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !sandbox.ToolResult {
     const message = try std.fmt.allocPrint(gpa, fmt, args);
     defer gpa.free(message);
