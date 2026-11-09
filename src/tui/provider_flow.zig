@@ -370,6 +370,103 @@ pub const Flow = struct {
         f.kind = .form;
     }
 
+    /// Everything a background job needs from the host.
+    pub const Launch = struct { io: std.Io, environ: *const Env, home: []const u8, post: Post };
+
+    pub const Settled = union(enum) {
+        /// No job is waiting for this reply.
+        ignored,
+        prompt: struct { url: []const u8, code: []const u8 },
+        /// The flow is over; strings belong to the reply.
+        signed_in: struct { ok: bool, canceled: bool, message: []const u8 },
+        /// `listed` is ready to choose from; the kind is now `.pick`.
+        listed,
+        /// The listing failed; the form asks for the model id as text.
+        listing_failed,
+    };
+
+    pub fn startLogin(f: *Flow, launch: Launch) !void {
+        f.reset();
+        try f.startWorker(launch, .{ .login = .{ .device_only = false } }, .login);
+    }
+
+    fn startWorker(f: *Flow, launch: Launch, job: Worker.Job, waiting: Waiting) !void {
+        f.worker = try Worker.start(f.gpa, launch.io, launch.environ, launch.home, launch.post, job);
+        f.kind = .waiting;
+        f.waiting = waiting;
+    }
+
+    /// Submits the current entry to the form; the result tells the caller what to do next.
+    pub fn submitEntry(f: *Flow, launch: Launch) !Outcome {
+        const outcome = try f.form.?.submit(f.text.items);
+        if (outcome == .invalid) return outcome;
+        f.wipe();
+        try f.settle(outcome, launch);
+        return outcome;
+    }
+
+    pub fn chooseProtocol(f: *Flow, value: []const u8, launch: Launch) !Outcome {
+        f.kind = .form;
+        const outcome = try f.form.?.submit(value);
+        try f.settle(outcome, launch);
+        return outcome;
+    }
+
+    /// Null when `id` is not in the listing.
+    pub fn chooseModel(f: *Flow, id: []const u8, launch: Launch) !?Outcome {
+        const entry = for (f.listed) |item| {
+            if (std.mem.eql(u8, item.id, id)) break item;
+        } else return null;
+        f.kind = .form;
+        const outcome = try f.form.?.pick(entry);
+        try f.settle(outcome, launch);
+        return outcome;
+    }
+
+    fn settle(f: *Flow, outcome: Outcome, launch: Launch) !void {
+        switch (outcome) {
+            .next => if (f.form.?.step == .protocol) {
+                f.kind = .protocol;
+            },
+            .list_models => {
+                const form = &f.form.?;
+                const base_url = try f.gpa.dupe(u8, form.base_url);
+                errdefer f.gpa.free(base_url);
+                const key = try f.gpa.dupe(u8, form.key);
+                errdefer f.gpa.free(key);
+                try f.startWorker(launch, .{ .models = .{ .base_url = base_url, .protocol = form.protocol, .key = key } }, .listing);
+            },
+            .invalid, .ready => {},
+        }
+    }
+
+    /// A background job replied. Takes the model list out of `r`; the caller still frees `r`.
+    pub fn settleResult(f: *Flow, r: *Result) Settled {
+        if (f.kind != .waiting) return .ignored;
+        switch (r.*) {
+            .prompt => |p| return if (f.waiting == .login) .{ .prompt = .{ .url = p.url, .code = p.code } } else .ignored,
+            .login => |l| {
+                if (f.waiting != .login) return .ignored;
+                f.reset();
+                return .{ .signed_in = .{ .ok = l.ok, .canceled = l.canceled, .message = l.message } };
+            },
+            .models => |m| {
+                if (f.waiting != .listing) return .ignored;
+                f.worker.?.finish();
+                f.worker = null;
+                if (m.ok and m.list.len > 0) {
+                    f.listed = m.list;
+                    r.models.list = &.{};
+                    f.kind = .pick;
+                    return .listed;
+                }
+                f.form.?.typeModel();
+                f.kind = .form;
+                return .listing_failed;
+            },
+        }
+    }
+
     pub fn insert(f: *Flow, s: []const u8) !void {
         for (s) |c| if (c == '\n' or c == '\r') return;
         try f.text.appendSlice(f.gpa, s);
@@ -494,4 +591,68 @@ test "form steps mask only the key and show plain text elsewhere" {
     defer shown.deinit(testing.allocator);
     try flow.display(&shown, testing.allocator);
     try testing.expect(std.mem.indexOf(u8, shown.items, "secret") == null);
+}
+
+fn testWorker(gpa: std.mem.Allocator) !*Worker {
+    const w = try gpa.create(Worker);
+    w.* = .{ .gpa = gpa, .io = testing.io, .environ = undefined, .home = try gpa.dupe(u8, ""), .post = undefined, .job = .{ .login = .{ .device_only = false } } };
+    return w;
+}
+
+fn testListing(flow: *Flow) !void {
+    try flow.startForm(&.{});
+    _ = try flow.form.?.submit("site");
+    _ = try flow.form.?.submit("http://h");
+    _ = try flow.form.?.submit("");
+    flow.worker = try testWorker(flow.gpa);
+    flow.kind = .waiting;
+    flow.waiting = .listing;
+}
+
+test "listing reply moves the model list into the flow and picks the next state" {
+    var flow: Flow = .{ .gpa = testing.allocator };
+    defer flow.deinit();
+    try testListing(&flow);
+    const list = try testing.allocator.alloc(auth.models.Listed, 1);
+    list[0] = .{ .id = try testing.allocator.dupe(u8, "m1") };
+    var r: Result = .{ .models = .{ .ok = true, .list = list } };
+    defer r.deinit(testing.allocator);
+    try testing.expect(flow.settleResult(&r) == .listed);
+    try testing.expectEqual(Kind.pick, flow.kind);
+    try testing.expect(flow.worker == null);
+    try testing.expectEqual(@as(usize, 0), r.models.list.len);
+    try testing.expectEqual(@as(usize, 1), flow.listed.len);
+    const outcome = (try flow.chooseModel("m1", undefined)).?;
+    try testing.expect(outcome == .next);
+    try testing.expectEqual(Kind.form, flow.kind);
+    try testing.expectEqual(Step.window, flow.form.?.step);
+    try testing.expect(try flow.chooseModel("missing", undefined) == null);
+}
+
+test "failed listing falls back to typing the model id and stale replies are ignored" {
+    var flow: Flow = .{ .gpa = testing.allocator };
+    defer flow.deinit();
+    var stale: Result = .{ .login = .{ .ok = true, .canceled = false, .message = try testing.allocator.dupe(u8, "Plus") } };
+    defer stale.deinit(testing.allocator);
+    try testListing(&flow);
+    try testing.expect(flow.settleResult(&stale) == .ignored);
+    try testing.expectEqual(Kind.waiting, flow.kind);
+    var r: Result = .{ .models = .{ .ok = false, .list = &.{} } };
+    try testing.expect(flow.settleResult(&r) == .listing_failed);
+    try testing.expectEqual(Kind.form, flow.kind);
+    try testing.expectEqual(Step.model, flow.form.?.step);
+    try testing.expect(flow.worker == null);
+}
+
+test "sign-in reply ends the flow" {
+    var flow: Flow = .{ .gpa = testing.allocator };
+    defer flow.deinit();
+    flow.worker = try testWorker(testing.allocator);
+    flow.kind = .waiting;
+    flow.waiting = .login;
+    var r: Result = .{ .login = .{ .ok = true, .canceled = false, .message = try testing.allocator.dupe(u8, "Plus") } };
+    defer r.deinit(testing.allocator);
+    const settled = flow.settleResult(&r);
+    try testing.expectEqualStrings("Plus", settled.signed_in.message);
+    try testing.expect(!flow.active() and flow.worker == null);
 }

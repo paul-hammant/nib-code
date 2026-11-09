@@ -62,7 +62,7 @@ pub fn command(app: *App, arg: []const u8) !void {
     }
     const svc = auth.find(list, first) orelse return app.report(.err, "unknown service {s} · /provider lists services", .{first});
     if (svc.signed_in) return commands.select(app, .{ .provider = svc.id, .model = null }, null);
-    if (std.mem.eql(u8, svc.id, "codex")) return startLogin(app);
+    if (std.mem.eql(u8, svc.id, "codex")) return app.flow.startLogin(launch(app));
     try app.flow.startKey(svc.id, svc.name);
 }
 
@@ -95,16 +95,8 @@ fn postResult(ctx: *anyopaque, boxed: *flow.Result) void {
     };
 }
 
-fn startWorker(app: *App, job: flow.Worker.Job, waiting: flow.Waiting) !void {
-    const w = try flow.Worker.start(app.gpa, app.io, app.environ, app.session.options.home, .{ .ctx = app, .call = postResult }, job);
-    app.flow.worker = w;
-    app.flow.kind = .waiting;
-    app.flow.waiting = waiting;
-}
-
-fn startLogin(app: *App) !void {
-    app.flow.reset();
-    try startWorker(app, .{ .login = .{ .device_only = false } }, .login);
+fn launch(app: *App) flow.Flow.Launch {
+    return .{ .io = app.io, .environ = app.environ, .home = app.session.options.home, .post = .{ .ctx = app, .call = postResult } };
 }
 
 /// A key press while a flow is open or the service menu is pinned.
@@ -120,16 +112,12 @@ pub fn key(app: *App, k: vaxis.Key) !void {
     const value = chosen.value orelse return;
     if (f.kind == .protocol) {
         app.menu.unpin();
-        f.kind = .form;
-        return advance(app, try f.form.?.submit(value));
+        return advance(app, try f.chooseProtocol(value, launch(app)));
     }
     if (f.kind == .pick) {
-        const entry = for (f.listed) |item| {
-            if (std.mem.eql(u8, item.id, value)) break item;
-        } else return;
+        const outcome = try f.chooseModel(value, launch(app)) orelse return;
         app.menu.unpin();
-        f.kind = .form;
-        return advance(app, try f.form.?.pick(entry));
+        return advance(app, outcome);
     }
     app.menu.unpin();
     try command(app, value);
@@ -163,38 +151,21 @@ fn submit(app: *App) !void {
         f.reset();
         return commands.select(app, .{ .provider = id, .model = null }, null);
     }
-    const form = &f.form.?;
-    const outcome = try form.submit(f.text.items);
-    switch (outcome) {
-        .invalid => |message| return app.transcript.add(app.gpa, .err, message),
-        else => f.wipe(),
-    }
+    const outcome = try f.submitEntry(launch(app));
+    if (outcome == .invalid) return app.transcript.add(app.gpa, .err, outcome.invalid);
     try advance(app, outcome);
 }
 
 fn advance(app: *App, outcome: flow.Outcome) !void {
-    const f = &app.flow;
     switch (outcome) {
-        .next => {
-            if (f.form) |form| if (form.step == .protocol) {
-                try app.menu.pin(&.{
-                    .{ .command = .provider, .value = "1", .label = "OpenAI-compatible", .detail = "" },
-                    .{ .command = .provider, .value = "2", .label = "Responses", .detail = "" },
-                    .{ .command = .provider, .value = "3", .label = "Anthropic Messages", .detail = "" },
-                });
-                f.kind = .protocol;
-            };
+        .next => if (app.flow.kind == .protocol) {
+            try app.menu.pin(&.{
+                .{ .command = .provider, .value = "1", .label = "OpenAI-compatible", .detail = "" },
+                .{ .command = .provider, .value = "2", .label = "Responses", .detail = "" },
+                .{ .command = .provider, .value = "3", .label = "Anthropic Messages", .detail = "" },
+            });
         },
-        .invalid => {},
-        .list_models => {
-            const form = &f.form.?;
-            const job: flow.Worker.Job = .{ .models = .{
-                .base_url = try app.gpa.dupe(u8, form.base_url),
-                .protocol = form.protocol,
-                .key = try app.gpa.dupe(u8, form.key),
-            } };
-            try startWorker(app, job, .listing);
-        },
+        .invalid, .list_models => {},
         .ready => try finishEndpoint(app),
     }
 }
@@ -222,45 +193,28 @@ fn finishEndpoint(app: *App) !void {
 pub fn result(app: *App, r: *flow.Result) !void {
     const gpa = app.gpa;
     const f = &app.flow;
-    if (f.kind != .waiting) return;
-    switch (r.*) {
-        .prompt => |p| if (f.waiting == .login) {
-            try app.report(.info, "Open {s} and enter code {s}", .{ p.url, p.code });
-        },
-        .login => |l| {
-            if (f.waiting != .login) return;
-            f.reset();
+    switch (f.settleResult(r)) {
+        .ignored => {},
+        .prompt => |p| try app.report(.info, "Open {s} and enter code {s}", .{ p.url, p.code }),
+        .signed_in => |l| {
             app.refreshCredentials();
             if (!l.ok) return app.report(if (l.canceled) .info else .err, "{s}", .{l.message});
             const note = try std.fmt.allocPrint(gpa, "Codex · signed in · {s}", .{l.message});
             defer gpa.free(note);
             try commands.select(app, .{ .provider = "codex", .model = null }, note);
         },
-        .models => |m| {
-            if (f.waiting != .listing) return;
-            if (f.worker) |w| {
-                w.finish();
-                f.worker = null;
+        .listed => {
+            var arena: std.heap.ArenaAllocator = .init(gpa);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const rows = try a.alloc(commands.Candidate, f.listed.len);
+            for (f.listed, rows) |item, *row| {
+                var buf: [32]u8 = undefined;
+                row.* = .{ .command = .model, .value = item.id, .label = item.id, .detail = if (item.context_window) |n| try std.fmt.allocPrint(a, "{s} tokens", .{format.number(&buf, n)}) else "" };
             }
-            if (m.ok and m.list.len > 0) {
-                f.listed = m.list;
-                r.models.list = &.{};
-                var arena: std.heap.ArenaAllocator = .init(gpa);
-                defer arena.deinit();
-                const a = arena.allocator();
-                const rows = try a.alloc(commands.Candidate, f.listed.len);
-                for (f.listed, rows) |item, *row| {
-                    var buf: [32]u8 = undefined;
-                    row.* = .{ .command = .model, .value = item.id, .label = item.id, .detail = if (item.context_window) |n| try std.fmt.allocPrint(a, "{s} tokens", .{format.number(&buf, n)}) else "" };
-                }
-                try app.menu.pin(rows);
-                f.kind = .pick;
-            } else {
-                f.form.?.typeModel();
-                f.kind = .form;
-                try app.transcript.add(gpa, .info, "Could not list models · type the model id");
-            }
+            try app.menu.pin(rows);
         },
+        .listing_failed => try app.transcript.add(gpa, .info, "Could not list models · type the model id"),
     }
 }
 
