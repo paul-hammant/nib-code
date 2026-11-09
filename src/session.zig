@@ -234,6 +234,52 @@ pub const Session = struct {
         s.* = next;
     }
 
+    pub const Switched = union(enum) {
+        updated,
+        new_session,
+        /// The Session keeps its previous config.
+        update_failed: anyerror,
+        open_failed: anyerror,
+    };
+
+    /// Applies a new provider/model config: in place before the first Step, as a new Session after.
+    pub fn switchConfig(s: *Session, cfg: provider.Config) Switched {
+        const previous = s.cfg;
+        if (s.log.steps > 0) {
+            s.cfg = cfg;
+            s.reopen(null) catch |err| {
+                s.cfg = previous;
+                return .{ .open_failed = err };
+            };
+            s.tools.recovery.enabled = true;
+            return .new_session;
+        }
+        s.cfg = cfg;
+        s.tools.cfg = cfg;
+        const cwd = std.process.currentPathAlloc(s.io, s.arena.allocator()) catch |err| {
+            s.cfg = previous;
+            s.tools.cfg = previous;
+            return .{ .update_failed = err };
+        };
+        s.initializeHistory(cwd) catch |err| {
+            s.cfg = previous;
+            s.tools.cfg = previous;
+            return .{ .update_failed = err };
+        };
+        s.log.provider = cfg.provider;
+        s.log.custom_provider = cfg.custom_provider;
+        s.log.model = cfg.model;
+        return .updated;
+    }
+
+    /// Stops using a key that was just removed from the credential store.
+    pub fn dropStoredKey(s: *Session) void {
+        if (s.cfg.key_source != .store) return;
+        s.cfg.api_key = "";
+        s.cfg.key_source = .none;
+        s.tools.cfg = s.cfg;
+    }
+
     pub fn finishHooks(s: *Session) void {
         for (s.hook_jobs.items) |job| {
             job.thread.join();
@@ -878,4 +924,80 @@ test "fork initialization copies history and resume retains independent identity
     try session.reopen(null);
     try t.expect(!session.tools.forked);
     try t.expectEqualStrings(session.id, session.cache_key);
+}
+
+test "switchConfig updates a zero-Step Session in place and replaces one with Steps" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var client: std.http.Client = .{ .allocator = t.allocator, .io = t.io };
+    defer client.deinit();
+    const cfg: provider.Config = .{ .base_url = "invalid://local", .api_key = "mock", .model = "mock" };
+    var session = try Session.init(t.allocator, t.io, &client, cfg, .{ .home = root, .user_home = root });
+    defer session.deinit();
+
+    var next = cfg;
+    next.model = "other";
+    const id = try a.dupe(u8, session.id);
+    try t.expect(session.switchConfig(next) == .updated);
+    try t.expectEqualStrings(id, session.id);
+    try t.expectEqualStrings("other", session.cfg.model);
+    try t.expectEqualStrings("other", session.tools.cfg.?.model);
+    try t.expectEqualStrings("other", session.log.model.?);
+
+    try session.commit(session.history.items.len, &.{ .{ .role = "user", .content = "hi" }, .{ .role = "assistant", .content = "yo" } }, 10, null);
+    try t.expect(session.log.steps > 0);
+    next.model = "third";
+    try t.expect(session.switchConfig(next) == .new_session);
+    try t.expect(!std.mem.eql(u8, id, session.id));
+    try t.expectEqual(@as(usize, 0), session.log.steps);
+    try t.expectEqualStrings("third", session.cfg.model);
+}
+
+test "switchConfig keeps the previous config when the new Session cannot open" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var client: std.http.Client = .{ .allocator = t.allocator, .io = t.io };
+    defer client.deinit();
+    const cfg: provider.Config = .{ .base_url = "invalid://local", .api_key = "mock", .model = "mock" };
+    var session = try Session.init(t.allocator, t.io, &client, cfg, .{ .home = root, .user_home = root });
+    defer session.deinit();
+    try session.commit(session.history.items.len, &.{ .{ .role = "user", .content = "hi" }, .{ .role = "assistant", .content = "yo" } }, 10, null);
+    try tmp.dir.deleteTree(t.io, "sessions");
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "sessions", .data = "not a directory" });
+    var next = cfg;
+    next.model = "other";
+    const id = try a.dupe(u8, session.id);
+    try t.expect(session.switchConfig(next) == .open_failed);
+    try t.expectEqualStrings("mock", session.cfg.model);
+    try t.expectEqualStrings(id, session.id);
+}
+
+test "dropStoredKey clears only a key from the store" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const root = try std.fmt.allocPrint(arena.allocator(), ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var client: std.http.Client = .{ .allocator = t.allocator, .io = t.io };
+    defer client.deinit();
+    const cfg: provider.Config = .{ .base_url = "invalid://local", .api_key = "mock", .model = "mock", .key_source = .env };
+    var session = try Session.init(t.allocator, t.io, &client, cfg, .{ .home = root, .user_home = root });
+    defer session.deinit();
+    session.dropStoredKey();
+    try t.expectEqualStrings("mock", session.tools.cfg.?.api_key);
+    session.cfg.key_source = .store;
+    session.dropStoredKey();
+    try t.expectEqualStrings("", session.cfg.api_key);
+    try t.expectEqualStrings("", session.tools.cfg.?.api_key);
 }

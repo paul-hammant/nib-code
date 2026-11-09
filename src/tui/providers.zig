@@ -82,9 +82,7 @@ fn dropKey(app: *App) void {
     if (app.cfg.key_source != .store) return;
     app.cfg.api_key = "";
     app.cfg.key_source = .none;
-    app.session.cfg.api_key = "";
-    app.session.cfg.key_source = .none;
-    app.session.tools.cfg = app.session.cfg;
+    app.session.dropStoredKey();
 }
 
 fn postResult(ctx: *anyopaque, boxed: *flow.Result) void {

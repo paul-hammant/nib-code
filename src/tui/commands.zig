@@ -223,31 +223,18 @@ pub fn select(app: *App, selection: config.ModelSelection, note: ?[]const u8) !v
     cfg.thinking = app.cfg.thinking;
     cfg.reasoning_effort = app.cfg.reasoning_effort;
     app.dropPrediction();
-    const fresh = session.log.steps > 0;
-    const previous = session.cfg;
-    session.cfg = cfg;
+    const fresh = switch (session.switchConfig(cfg)) {
+        .updated => false,
+        .new_session => true,
+        .open_failed => |err| return app.report(.err, "could not open session: {s}", .{@errorName(err)}),
+        .update_failed => |err| return app.report(.err, "model saved, but could not update session: {s}", .{@errorName(err)}),
+    };
     if (fresh) {
-        session.reopen(null) catch |err| {
-            session.cfg = previous;
-            return app.report(.err, "could not open session: {s}", .{@errorName(err)});
-        };
-        session.tools.recovery.enabled = true;
         app.transcript.clear(gpa);
         app.background_count = 0;
         app.usage = .{};
         app.steps = 0;
         app.last_summary = null;
-    } else {
-        session.tools.cfg = cfg;
-        const cwd = try std.process.currentPathAlloc(app.io, a);
-        session.initializeHistory(cwd) catch |err| {
-            session.cfg = previous;
-            session.tools.cfg = previous;
-            return app.report(.err, "model saved, but could not update session: {s}", .{@errorName(err)});
-        };
-        session.log.provider = cfg.provider;
-        session.log.custom_provider = cfg.custom_provider;
-        session.log.model = cfg.model;
     }
     app.cfg = session.cfg;
     app.context = session.context_tokens;
