@@ -48,7 +48,7 @@ def ask_expansion():
             content = ask("prepare 0.11.0 with $release, $release")
             assert content.startswith("prepare 0.11.0 with $release, $release\n\n")
             assert content.count("<skill name=\"release\"") == 1, content
-            assert f'location="{skill}"' in content and "RELEASE-BODY-MARKER" in content
+            assert f'location="{skill.resolve()}"' in content and "RELEASE-BODY-MARKER" in content
             assert "description: Ship it" not in content
             assert not (data / "config.toml").exists()
             session = max((p for p in (data / "sessions").glob("*.jsonl") if not p.name.endswith(".calls.jsonl")), key=lambda p: p.stat().st_mtime)
