@@ -39,10 +39,40 @@ const Entry = struct {
         }
     }
 
-    fn omitted(e: Entry, w: *std.Io.Writer, bytes: usize) !void {
-        try w.print("[{d} of {d} bytes omitted]\n", .{ bytes, e.bytes });
+    fn omitted(e: Entry, w: *std.Io.Writer, bytes: usize, lines: ?[2]usize) !void {
+        try w.print("[{d} of {d} bytes omitted", .{ bytes, e.bytes });
+        if (lines) |l| try w.print(" · lines {d}–{d}", .{ l[0], l[1] });
+        try w.writeAll("]\n");
     }
 };
+
+fn separatorsWithin(text: []const u8, limit: usize, escaped: bool) usize {
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const escape = escaped and text[i] == '\\';
+        const end = i + @as(usize, if (escape) 2 else 1);
+        if (end > limit) break;
+        if (escaped) {
+            if (escape and end <= text.len and text[i + 1] == 'n') count += 1;
+        } else if (text[i] == '\n') count += 1;
+        i = end;
+    }
+    return count;
+}
+
+// Lines of the first and last omitted byte of text[cut_start..cut_end), or null when
+// both are on one line or the line structure is unknown. Text without real newlines
+// (ignoring a final one) that starts like JSON (`{`, `[`, `"`) is console.log'ed or returned data whose
+// newlines are `\n` escapes (`\\n` is an escaped backslash then `n`); any other text
+// separates lines by real newlines. A partly shown line counts as omitted.
+fn omittedLines(text: []const u8, cut_start: usize, cut_end: usize) ?[2]usize {
+    if (cut_end <= cut_start or cut_end > text.len) return null;
+    const escaped = text.len > 0 and std.mem.indexOfScalar(u8, "{[\"", text[0]) != null and std.mem.indexOfScalar(u8, std.mem.trimEnd(u8, text, "\n"), '\n') == null;
+    const first = 1 + separatorsWithin(text, cut_start, escaped);
+    const last = 1 + separatorsWithin(text, cut_end - 1, escaped);
+    return if (last > first) .{ first, last } else null;
+}
 
 pub fn format(gpa: std.mem.Allocator, o: sandbox.Outcome, limit: usize) ![]u8 {
     if (o.hook.len > 0) {
@@ -120,7 +150,7 @@ fn renderLimit(gpa: std.mem.Allocator, o: sandbox.Outcome, limit: usize) ![]u8 {
     for (entries) |e| {
         const before = out.written().len;
         try e.heading(&out.writer, total);
-        try e.omitted(&out.writer, e.bytes);
+        try e.omitted(&out.writer, e.bytes, .{ e.bytes + 1, e.bytes + 1 });
         available -= out.written().len - before + 2;
     }
     out.clearRetainingCapacity();
@@ -160,7 +190,8 @@ fn renderLimit(gpa: std.mem.Allocator, o: sandbox.Outcome, limit: usize) ![]u8 {
             const tail = trimStart(suffix[suffix.len - tail_keep ..]);
             try out.writer.writeAll(head);
             if (head.len > 0 and head[head.len - 1] != '\n') try out.writer.writeByte('\n');
-            try e.omitted(&out.writer, e.bytes - head.len - tail.len);
+            const lines = if (complete) omittedLines(e.text, head.len, e.bytes - tail.len) else null;
+            try e.omitted(&out.writer, e.bytes - head.len - tail.len, lines);
             try out.writer.writeAll(tail);
         }
         if (out.written().len > 0 and out.written()[out.written().len - 1] != '\n') try out.writer.writeByte('\n');
@@ -468,4 +499,98 @@ test "formatOutcome" {
     const silent = try format(gpa, .{ .ok = true, .text = &undef, .logs = &none }, max_bytes);
     defer gpa.free(silent);
     try std.testing.expectEqualStrings("(no output)", silent);
+}
+
+fn expectMarker(out: []const u8, lines: ?[]const u8) !void {
+    const at = std.mem.indexOf(u8, out, " bytes omitted") orelse return error.TestUnexpectedResult;
+    const end = std.mem.indexOfScalarPos(u8, out, at, ']').?;
+    const tail = out[at..end];
+    if (lines) |want| {
+        try testing.expect(std.mem.indexOf(u8, tail, want) != null);
+    } else {
+        try testing.expect(std.mem.indexOf(u8, tail, "lines") == null);
+    }
+}
+
+test "omittedLines counts real and escaped newlines" {
+    try testing.expectEqual(@as(?[2]usize, .{ 2, 3 }), omittedLines("a\nbb\ncc\nd", 3, 7));
+    try testing.expectEqual(@as(?[2]usize, .{ 2, 3 }), omittedLines("\"a\\nbb\\ncc\\nd\"", 5, 12));
+    try testing.expectEqual(@as(?[2]usize, null), omittedLines("\"a\\\\nbbbbb\"", 3, 8));
+    try testing.expectEqual(@as(?[2]usize, null), omittedLines("a\\nb\\nc\\nd", 2, 8));
+    try testing.expectEqual(@as(?[2]usize, null), omittedLines("abc\ndef", 4, 6));
+    try testing.expectEqual(@as(?[2]usize, .{ 1, 2 }), omittedLines("abc\ndef", 1, 5));
+    try testing.expectEqual(@as(?[2]usize, .{ 2, 3 }), omittedLines("a\nb\nc", 2, 5));
+}
+
+test "marker names omitted lines of a logged read object" {
+    const o = try evaluate("let t = ''; for (let i = 1; i <= 3000; i++) t += 'line ' + i + '\\n'; console.log({ text: t, next_offset: 3001 });", .{});
+    defer o.deinit(testing.allocator);
+    const out = try format(testing.allocator, o, max_bytes);
+    defer testing.allocator.free(out);
+    try testing.expect(out.len <= max_bytes);
+    const at = std.mem.indexOf(u8, out, "lines ").?;
+    const dash = std.mem.indexOfPos(u8, out, at, "–").?;
+    const a = try std.fmt.parseInt(usize, out[at + 6 .. dash], 10);
+    const close = std.mem.indexOfScalarPos(u8, out, dash, ']').?;
+    const b = try std.fmt.parseInt(usize, out[dash + "–".len .. close], 10);
+    try testing.expect(a > 1 and b < 3000 and a < b);
+    // Entry line n is file line n: every line outside a..b is shown whole.
+    const shown_lines = std.mem.count(u8, out, "line ");
+    try testing.expectEqual(@as(usize, 3000 - (b - a + 1)), shown_lines);
+}
+
+test "marker names omitted lines of raw text and ignores escaped backslash before n" {
+    const raw = try evaluate("let t = ''; for (let i = 1; i <= 3000; i++) t += 'line ' + i + '\\n'; console.log(t);", .{});
+    defer raw.deinit(testing.allocator);
+    const out = try format(testing.allocator, raw, max_bytes);
+    defer testing.allocator.free(out);
+    try expectMarker(out, " · lines ");
+    const none = try evaluate("console.log('a\\\\n'.repeat(20000));", .{});
+    defer none.deinit(testing.allocator);
+    const out2 = try format(testing.allocator, none, max_bytes);
+    defer testing.allocator.free(out2);
+    try testing.expect(std.mem.indexOf(u8, out2, "bytes omitted") != null);
+    try expectMarker(out2, null);
+}
+
+test "marker omits lines when capture lost bytes or the region has no newline" {
+    const lost = try evaluate("let t = ''; for (let i = 1; i <= 20000; i++) t += 'line ' + i + '\\n'; console.log(t);", .{});
+    defer lost.deinit(testing.allocator);
+    try testing.expect(lost.log_truncated);
+    const out = try format(testing.allocator, lost, max_bytes);
+    defer testing.allocator.free(out);
+    try expectMarker(out, null);
+    const flat = try evaluate("console.log('x'.repeat(40000));", .{});
+    defer flat.deinit(testing.allocator);
+    const out2 = try format(testing.allocator, flat, max_bytes);
+    defer testing.allocator.free(out2);
+    try expectMarker(out2, null);
+}
+
+test "line ranges apply to results and background messages within budget" {
+    const o = try evaluate("let t = ''; for (let i = 1; i <= 3000; i++) t += 'row ' + i + '\\n'; t", .{});
+    defer o.deinit(testing.allocator);
+    const out = try format(testing.allocator, o, max_bytes);
+    defer testing.allocator.free(out);
+    try testing.expect(out.len <= max_bytes);
+    try expectMarker(out, " · lines ");
+    var json: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer json.deinit();
+    for (0..4000) |i| try json.writer.print("row {d}\n", .{i});
+    const message = try formatMessage(testing.allocator, "[background bash b1 finished]\n", json.written(), max_bytes);
+    defer testing.allocator.free(message);
+    try testing.expect(message.len <= max_bytes);
+    try expectMarker(message, " · lines ");
+}
+
+test "budget holds for every size around the marker with line ranges" {
+    var size: usize = max_bytes - 40;
+    while (size < max_bytes + 200) : (size += 7) {
+        const buf = try testing.allocator.alloc(u8, size);
+        defer testing.allocator.free(buf);
+        for (buf, 0..) |*c, i| c.* = if (i % 9 == 8) '\n' else 'x';
+        const out = try format(testing.allocator, .{ .ok = true, .text = @constCast("undefined"), .logs = buf }, max_bytes);
+        defer testing.allocator.free(out);
+        try testing.expect(out.len <= max_bytes);
+    }
 }
