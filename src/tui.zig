@@ -229,6 +229,8 @@ pub const App = struct {
     /// Shown on the status line until the next key or click; not part of the transcript.
     notice: ?[]const u8 = null,
     notice_buf: [256]u8 = undefined,
+    /// Set by the first ctrl+c; any other key or click disarms it, a second ctrl+c quits.
+    quit_armed: bool = false,
     /// Set while a /reflect Turn runs: its focus, owned.
     reflecting: ?[]u8 = null,
     issues: ?*reflect.Issues = null,
@@ -347,7 +349,10 @@ pub const App = struct {
                     return true;
                 }
                 app.hovered = null;
-                if (m.type == .press) app.notice = null;
+                if (m.type == .press) {
+                    app.notice = null;
+                    app.quit_armed = false;
+                }
                 if (m.button == .wheel_up or m.button == .wheel_down) {
                     if (m.type == .press) {
                         if (!app.selection.active or app.selection.history == null) app.selection.clear();
@@ -528,11 +533,18 @@ pub const App = struct {
             return true;
         }
         const input = &app.input;
+        const armed = app.quit_armed;
+        app.quit_armed = false;
         if ((k.matches(@import("tui/mode.zig").key, .{ .ctrl = true }) or k.matches(@import("tui/mode.zig").key, .{ .ctrl = true, .shift = true }))) {
             try app.toggleSimple();
             return true;
         }
-        if (k.matches('c', .{ .ctrl = true })) return false;
+        if (k.matches('c', .{ .ctrl = true })) {
+            if (armed) return false;
+            app.quit_armed = true;
+            app.notice = "press ctrl+c again to quit";
+            return true;
+        }
         if (k.matches('d', .{ .ctrl = true }) and input.text().len == 0) return false;
         if (app.flow.active() or app.menu.isPinned()) {
             try providers.key(app, k);
@@ -1011,6 +1023,37 @@ test "bracketed paste buffers newline and slash keys without executing them" {
     try std.testing.expectEqualStrings("/help\nx\nx\nx\nx\nx", expanded);
 }
 
+test "ctrl+c quits only on a second consecutive press" {
+    const t = std.testing;
+    var vx: vaxis.Vaxis = undefined;
+    vx.screen = try vaxis.Screen.init(t.allocator, .{ .cols = 8, .rows = 3, .x_pixel = 0, .y_pixel = 0 });
+    defer vx.screen.deinit(t.allocator);
+    var app: App = undefined;
+    app.flow = .{ .gpa = t.allocator };
+    app.signed_out = false;
+    app.gpa = t.allocator;
+    app.io = t.io;
+    app.vx = &vx;
+    app.menu = .init(t.allocator);
+    defer app.menu.deinit();
+    app.input = .{};
+    defer app.input.deinit(t.allocator);
+    app.selection = .{};
+    app.pasting = false;
+    app.turn = null;
+    app.notice = null;
+    app.quit_armed = false;
+    app.session = undefined;
+    const ctrl_c: vaxis.Key = .{ .codepoint = 'c', .mods = .{ .ctrl = true } };
+    try t.expect(try app.onKey(ctrl_c));
+    try t.expect(app.quit_armed);
+    try t.expectEqualStrings("press ctrl+c again to quit", app.notice.?);
+    try t.expect(try app.onKey(.{ .codepoint = 'x', .text = "x" }));
+    try t.expect(!app.quit_armed);
+    try t.expect(try app.onKey(ctrl_c));
+    try t.expect(!try app.onKey(ctrl_c));
+}
+
 var clipboard_reads: usize = 0;
 
 fn countingClipboard(_: std.mem.Allocator) clipboard.Result {
@@ -1222,7 +1265,7 @@ test "quit drains owned events and closed queues reject Turn payloads without le
             .menu = .init(t.allocator),
             .activity = .start(t.io, .thinking),
         };
-        if (closed) loop.queue.close(error.Closed) else try loop.postEvent(.{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } });
+        if (closed) loop.queue.close(error.Closed) else for (0..2) |_| try loop.postEvent(.{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } });
         var session: Session = undefined;
         session.steps = 0;
         var turn: Turn = .{ .gpa = t.allocator, .session = &session, .loop = &loop, .text = "" };
@@ -1253,6 +1296,7 @@ test "quit drains owned events and closed queues reject Turn payloads without le
         if (!closed) {
             try loop.postEvent(.{ .failed = .{ .message = try t.allocator.dupe(u8, "canceled"), .reason = .canceled } });
             try loop.postEvent(.{ .issue = try t.allocator.dupe(u8, "issue outcome") });
+            try t.expect(try app.handle(try loop.nextEvent()));
             try t.expect(!try app.handle(try loop.nextEvent()));
         }
         app.deinit();

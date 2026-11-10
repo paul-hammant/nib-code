@@ -66,6 +66,7 @@ class Terminal:
     def close(self):
         if self.p.poll() is None:
             self.send('\x03')
+            self.send('\x03')
             try: self.p.wait(3)
             except subprocess.TimeoutExpired: self.p.kill();self.p.wait()
         self.drain(.1)

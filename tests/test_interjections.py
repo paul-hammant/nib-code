@@ -144,6 +144,7 @@ class Terminal:
             return
         if self.child.poll() is None:
             self.send("\x03")
+            self.send("\x03")
             deadline = time.monotonic() + 5
             while self.child.poll() is None and time.monotonic() < deadline:
                 time.sleep(.02)
