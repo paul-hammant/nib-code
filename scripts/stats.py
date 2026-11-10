@@ -824,6 +824,97 @@ class Timing:
                                      sorted(self.bash.items(), key=lambda p: (-sum(p[1]), p[0]))[:10]]))
 
 
+READ_PATH = re.compile(r'''\btools\.read\s*\(\s*\{[^{}]*?["']?path["']?\s*:\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')''', re.S)
+OMITTED_MARKER = re.compile(r'\[\d+ of \d+ bytes omitted')
+EXPLORE_TOOLS = frozenset(('read', 'grep', 'glob'))
+
+
+class Exploration:
+    """Root-Session exploration cost: Steps before the first edit, re-reads, display truncation."""
+
+    def __init__(self):
+        self.turns = 0
+        self.edit_positions = []
+        self.reads = self.rereads = self.unknown_reads = 0
+        self.runs = dict(all=[0, 0], explore=[0, 0])
+
+    @staticmethod
+    def new_turn():
+        return dict(edit=None, steps=[])
+
+    def add_step(self, turn, position, record, runs, outputs):
+        calls = [c for c in record.get('calls') or [] if isinstance(c, dict)]
+        by_run = {}
+        for call in calls:
+            by_run.setdefault(call.get('run_index'), []).append(call)
+        edited = any(c.get('name') in ('edit', 'write') and c.get('dispatched') is not False for c in calls)
+        if not calls:
+            edited = any(name in ('edit', 'write') for _, code, _ in runs if isinstance(code, str)
+                         for name in TOOL_CALL.findall(code))
+        reads = []
+        for index, (call_id, code, _) in enumerate(runs):
+            run_calls = by_run.get(index, [])
+            read_calls = [c for c in run_calls if c.get('name') == 'read' and c.get('dispatched') is not False]
+            literal = [literal_string(m) for m in READ_PATH.findall(code)] if isinstance(code, str) else []
+            if not calls:
+                reads.extend(path if isinstance(path, str) else None for path in literal)
+            for n, call in enumerate(read_calls):
+                path = call.get('path')
+                if not isinstance(path, str) and len(literal) == len(read_calls):
+                    path = literal[n]
+                reads.append(path if isinstance(path, str) else None)
+        turn['steps'].append((position, reads))
+        if edited and turn['edit'] is None:
+            turn['edit'] = position
+        results = record.get('run_results') if isinstance(record.get('run_results'), list) else []
+        for index, (call_id, _, _) in enumerate(runs):
+            result = results[index] if index < len(results) and isinstance(results[index], dict) else {}
+            text = outputs.get(call_id)
+            if text is not None:
+                hit = bool(OMITTED_MARKER.search(text))
+            elif number(result.get('tool_bytes')) and number(result.get('output_bytes')):
+                hit = result['tool_bytes'] > result['output_bytes']
+            else:
+                continue
+            names = ({c.get('name') for c in by_run.get(index, [])} if calls else
+                     set(TOOL_CALL.findall(runs[index][1])) if isinstance(runs[index][1], str) else set())
+            kinds = ['all'] + (['explore'] if names and names <= EXPLORE_TOOLS and not record.get('calls_omitted') else [])
+            for kind in kinds:
+                self.runs[kind][0] += hit
+                self.runs[kind][1] += 1
+
+    def finish_turn(self, turn):
+        self.turns += 1
+        if turn['edit'] is None:
+            return
+        self.edit_positions.append(turn['edit'])
+        seen = set()
+        for position, reads in turn['steps']:
+            if position >= turn['edit']:
+                break
+            for path in reads:
+                if path is None:
+                    self.unknown_reads += 1
+                    continue
+                self.reads += 1
+                self.rereads += path in seen
+                seen.add(path)
+
+    def report(self):
+        def share(pair):
+            return dict(count=pair[0], runs=pair[1], ratio=pair[0] / pair[1] if pair[1] else None)
+        return dict(
+            turns=self.turns,
+            steps_before_first_edit=distribution(self.edit_positions),
+            turns_without_edit=dict(count=self.turns - len(self.edit_positions), turns=self.turns,
+                                    ratio=(self.turns - len(self.edit_positions)) / self.turns if self.turns else None),
+            reread_before_first_edit=dict(rereads=self.rereads, reads=self.reads, unknown_path_reads=self.unknown_reads,
+                                          ratio=self.rereads / self.reads if self.reads else None),
+            truncated_runs=share(self.runs['all']),
+            truncated_explore_runs=share(self.runs['explore']),
+            notes=["Root-Session Turns only. steps_before_first_edit is the 1-based Step of the first edit/write call in each Turn that has one; turns_without_edit are excluded from it. Re-reads count read calls whose path was read earlier in the same Turn, using only Steps before the first edit (Turns without edits are excluded); paths come from calls[].path, else literal tools.read({path}) in the Run code, else the read is counted as unknown. Truncated Runs contain the omitted-bytes marker in the logged tool message (fallback tool_bytes>output_bytes); explore Runs call only read/grep/glob."])
+
+
 def records(path):
     try:
         with path.open(encoding='utf-8', errors='replace') as stream:
@@ -903,6 +994,7 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
     bash_superseded = 0
     agents = AgentStats()
     child_costs = ChildCosts()
+    exploration = Exploration()
     errors = {name: {'count': 0, 'examples': []} for name in ERRORS}
     slowest, turn_steps, turn_times = [], [], []
 
@@ -950,6 +1042,8 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
 
         def finish_turn():
             if current is not None and current['selected']:
+                if not header.get('parent_session_id'):
+                    exploration.finish_turn(current['exploration'])
                 totals['turns'] += 1
                 turn_steps.append(current['steps'])
                 if (current['complete'] and current['steps'] and
@@ -999,7 +1093,8 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
             if new_turn or (explicit_turn and current is None):
                 finish_turn()
                 current = dict(steps=0, full_steps=0, timed=0, ms=0, complete=False, selected=False,
-                               previous=None, previous_effort=None, mechanical_previous=None)
+                               previous=None, previous_effort=None, mechanical_previous=None,
+                               exploration=Exploration.new_turn())
             if current is not None and include:
                 current['selected'] = True
             interrupted = False
@@ -1069,7 +1164,7 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
                         and type(r.get('ok')) is bool} if isinstance(statuses, list) else {}
             outputs = {m['tool_call_id']: m.get('content') or '' for m in messages
                        if m['role'] == 'tool' and isinstance(m.get('tool_call_id'), str)}
-            sources, run_statuses, step_codes = {}, [], []
+            sources, run_statuses, step_codes, step_runs = {}, [], [], []
             for m in messages:
                 for call in m.get('tool_calls') or []:
                     if not isinstance(call, dict) or not isinstance(call.get('function'), dict):
@@ -1083,6 +1178,7 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
                     call_id = call.get('id')
                     ok = statuses.get(call_id) if isinstance(call_id, str) else None
                     run_statuses.append(ok)
+                    step_runs.append((call_id, None, None))
                     if ok is not None:
                         totals['runs_with_status'] += 1
                         totals['runs_failed'] += not ok
@@ -1092,6 +1188,7 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
                         args = None
                     code = args.get('code') if isinstance(args, dict) else None
                     step_codes.append(code)
+                    step_runs[-1] = (call_id, code, None)
                     if isinstance(code, str):
                         if isinstance(call_id, str):
                             sources[call_id] = code
@@ -1108,6 +1205,9 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
                     if not matched and (ok is False or candidates):
                         error('other_failure', candidates[0] if candidates else text, path.stem)
             timing.add(record, sources, run_statuses, recorded_commands.get(recorded_step))
+            if current is not None and not header.get('parent_session_id'):
+                exploration.add_step(current['exploration'], turn_step if explicit_turn else current['full_steps'],
+                                     record, step_runs, outputs)
             tool_data.add(record)
             if current is not None:
                 timing.effort.add_transition(current['previous_effort'], record, header)
@@ -1170,6 +1270,7 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
             'errors': errors, 'slowest_steps': slowest, 'timing': timing.report(),
             'tool_data': tool_data.report(), 'child_costs': child_costs.report(),
             'agents': agents.report(), 'bash_calls': agents.report('bash'), 'background_runs': agents.report('run'),
+            'exploration': exploration.report(),
             'round_trips': dict(steps_per_turn=distribution(turn_steps),
                                write_to_validation=pair_summary(write_validation_pairs, adjacent_pairs),
                                mechanical_followups=mechanical,
@@ -1232,6 +1333,16 @@ def text_report(report):
             format_value = pct if field == 'first_request_cache_hit_rate' else fmt
             lines.append(f"    {field}: samples={value['samples']} median={format_value(value['median'])} p90={format_value(value['p90'])}")
     lines.extend('  ' + note for note in costs['notes'])
+    ex = report['exploration']
+    steps_to_edit = ex['steps_before_first_edit']
+    reread = ex['reread_before_first_edit']
+    lines.append('Exploration (root Turns):')
+    lines.append(f"  Step of first edit: samples={steps_to_edit['samples']} median={fmt(steps_to_edit['median'])} p90={fmt(steps_to_edit['p90'])}; Turns without edit {ex['turns_without_edit']['count']}/{ex['turns_without_edit']['turns']} = {pct(ex['turns_without_edit']['ratio'])}")
+    lines.append(f"  Re-read before first edit: {reread['rereads']}/{reread['reads']} reads = {pct(reread['ratio'])} (unknown path {reread['unknown_path_reads']})")
+    for label, key in (('all Runs', 'truncated_runs'), ('read/grep/glob-only Runs', 'truncated_explore_runs')):
+        item = ex[key]
+        lines.append(f"  Truncated output, {label}: {item['count']}/{item['runs']} = {pct(item['ratio'])}")
+    lines.extend('  ' + note for note in ex['notes'])
     structure = report['round_trips']
     steps = structure['steps_per_turn']
     section = ["Round-trip structure:", f"  Steps per Turn: samples={steps['samples']} median={fmt(steps['median'])} p90={fmt(steps['p90'])}"]

@@ -551,6 +551,36 @@ class StatsTest(unittest.TestCase):
         self.assertEqual(len(actual["notes"]), 3)
         self.assertEqual({key: value for key, value in actual.items() if key != "notes"}, expected)
 
+    def test_exploration_metrics(self):
+        def read(path):
+            return 'tools.read({path: ' + json.dumps(path) + '})'
+
+        edit = 'tools.edit({path: "a", old_text: "x", new_text: "y"})'
+        marker = '[entry 1 of 1 (console)]\nabc\n[19000 of 20000 bytes omitted \u00b7 lines 3\u201390]\nxyz\n'
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'explore.jsonl'
+            records = synthetic_log(path, [
+                [read('a'), [read('b'), read('a')], read('b'), edit, read('a'), None],
+                [read('c'), None],
+                [edit, None]])
+            for record in records[1:]:
+                for message in record['messages']:
+                    if message['role'] == 'assistant' and any(
+                            read('c') in call['function']['arguments'].replace('\\"', '"')
+                            for call in message.get('tool_calls', [])):
+                        marked = [m for m in record['messages'] if m['role'] == 'tool']
+                        marked[0]['content'] = marker
+            path.write_text('\n'.join(map(json.dumps, records)) + '\n')
+            report = stats.summarize([path])['exploration']
+            self.assertEqual(report['steps_before_first_edit'], dict(samples=2, median=2.5, p90=4))
+            self.assertEqual(report['turns_without_edit'], dict(count=1, turns=3, ratio=1 / 3))
+            reread = report['reread_before_first_edit']
+            self.assertEqual((reread['rereads'], reread['reads']), (2, 4))
+            self.assertEqual(report['truncated_runs'], dict(count=1, runs=8, ratio=1 / 8))
+            self.assertEqual(report['truncated_explore_runs'], dict(count=1, runs=6, ratio=1 / 6))
+            text = subprocess.check_output(['python3', str(ROOT / 'scripts/stats.py'), str(path)]).decode()
+            self.assertIn('Re-read before first edit: 2/4 reads', text)
+
     def test_round_trips_exact_counts_and_cli(self):
         def write(path):
             return 'tools.write({path: ' + json.dumps(path) + ', content: "x"})'
