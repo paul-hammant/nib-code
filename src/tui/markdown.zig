@@ -1,9 +1,12 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
+const syntax = @import("syntax.zig");
 
 pub const Theme = struct {
     /// Background of inline code and code blocks; `.default` renders them unshaded.
     tint: vaxis.Color = .default,
+    /// Strings in tagged code blocks: a palette color, which terminals keep readable on light and dark backgrounds.
+    string: vaxis.Color = .{ .index = 6 },
 };
 
 const Kind = enum { prose, heading, code, table, quote, list, other };
@@ -20,11 +23,15 @@ const Line = struct {
     closed: bool = true,
     /// Classification may change when more text arrives.
     undecided: bool = false,
+    /// Code lines of a recognized language, with the lexer state at the start of the line.
+    lang: ?syntax.Lang = null,
+    lex: syntax.State = .none,
 };
 
 const State = struct {
     pos: usize = 0,
-    fence: ?struct { char: u8, len: usize } = null,
+    fence: ?struct { char: u8, len: usize, lang: ?syntax.Lang = null } = null,
+    lex: syntax.State = .none,
     prev: Kind = .other,
     blank: bool = false,
     emitted: bool = false,
@@ -146,15 +153,21 @@ const Lines = struct {
                     if (self.st.fence) |f| {
                         if (body[0] == f.char and n >= f.len and std.mem.trim(u8, body[n..], " \t").len == 0) {
                             self.st.fence = null;
+                            self.st.lex = .none;
                             continue;
                         }
                     } else {
-                        self.st.fence = .{ .char = body[0], .len = n };
+                        self.st.fence = .{ .char = body[0], .len = n, .lang = syntax.langFromInfo(body[n..]) };
+                        self.st.lex = .none;
                         continue;
                     }
                 }
             }
-            if (self.st.fence != null) return self.emit(.{ .text = raw, .kind = .code }, false);
+            if (self.st.fence) |f| {
+                const line = self.emit(.{ .text = raw, .kind = .code, .lang = f.lang, .lex = self.st.lex }, false);
+                if (f.lang) |lang| self.st.lex = syntax.advance(lang, self.st.lex, raw);
+                return line;
+            }
             if (isBlank(raw)) {
                 self.st.blank = true;
                 self.st.prev = .other;
@@ -306,8 +319,8 @@ fn rows(result: vaxis.Window.PrintResult) u16 {
     return @max(1, result.row + @intFromBool(result.col > 0));
 }
 
-fn codeLine(win: vaxis.Window, text: []const u8, style: vaxis.Style, commit: bool) u16 {
-    var result: vaxis.Window.PrintResult = .{ .row = 0, .col = 0, .overflow = false };
+fn printTabbed(win: vaxis.Window, text: []const u8, style: vaxis.Style, from: vaxis.Window.PrintResult, commit: bool) vaxis.Window.PrintResult {
+    var result = from;
     var pos: usize = 0;
     while (pos < text.len) {
         const tab = std.mem.indexOfScalarPos(u8, text, pos, '\t') orelse text.len;
@@ -316,6 +329,33 @@ fn codeLine(win: vaxis.Window, text: []const u8, style: vaxis.Style, commit: boo
         result = win.printSegment(.{ .text = "    ", .style = style }, .{ .row_offset = result.row, .col_offset = result.col, .commit = commit });
         pos = tab + 1;
     }
+    return result;
+}
+
+const Code = struct {
+    lang: ?syntax.Lang = null,
+    lex: syntax.State = .none,
+};
+
+fn tokenStyle(base: vaxis.Style, class: syntax.Class, theme: Theme) vaxis.Style {
+    var style = base;
+    switch (class) {
+        .plain => {},
+        .comment => style.dim = true,
+        .string => style.fg = theme.string,
+        .keyword => style.bold = true,
+    }
+    return style;
+}
+
+fn codeLine(win: vaxis.Window, text: []const u8, base: vaxis.Style, code: Code, theme: Theme, commit: bool) u16 {
+    var result: vaxis.Window.PrintResult = .{ .row = 0, .col = 0, .overflow = false };
+    if (code.lang) |lang| {
+        var lexer = syntax.Lexer.init(lang, code.lex, text);
+        while (lexer.next()) |token| {
+            result = printTabbed(win, text[token.start..token.end], tokenStyle(base, token.class, theme), result, commit);
+        }
+    } else result = printTabbed(win, text, base, result, commit);
     return rows(result);
 }
 
@@ -328,15 +368,15 @@ fn shade(win: vaxis.Window, count: u16, bg: vaxis.Color) void {
     };
 }
 
-fn printCode(row: vaxis.Window, text: []const u8, theme: Theme, commit: bool) u16 {
-    if (row.width <= 2) return codeLine(row, text, .{}, commit);
+fn printCode(row: vaxis.Window, text: []const u8, code: Code, theme: Theme, commit: bool) u16 {
+    if (row.width <= 2) return codeLine(row, text, .{}, code, theme, commit);
     if (theme.tint != .default) {
-        const used = codeLine(row.child(.{ .x_off = 1, .width = row.width - 2 }), text, .{ .bg = theme.tint }, commit);
+        const used = codeLine(row.child(.{ .x_off = 1, .width = row.width - 2 }), text, .{ .bg = theme.tint }, code, theme, commit);
         if (commit) shade(row, used, theme.tint);
         return used;
     }
     const bar: vaxis.Style = .{ .dim = true };
-    const used = codeLine(row.child(.{ .x_off = 2 }), text, .{}, commit);
+    const used = codeLine(row.child(.{ .x_off = 2 }), text, .{}, code, theme, commit);
     for (0..used) |r| _ = row.printSegment(.{ .text = "│ ", .style = bar }, .{ .row_offset = @intCast(r), .commit = commit });
     return used;
 }
@@ -465,7 +505,7 @@ fn printLine(win: vaxis.Window, line: Line, theme: Theme, commit: bool) u16 {
     const top: u16 = @intFromBool(line.gap);
     const row = win.child(.{ .y_off = top });
     const used = switch (line.kind) {
-        .code => printCode(row, line.text, theme, commit),
+        .code => printCode(row, line.text, .{ .lang = line.lang, .lex = line.lex }, theme, commit),
         .heading => printProse(row, line.text, .{ .bold = true, .fg = .{ .index = 4 } }, theme, commit),
         .quote => printQuote(row, line.text, theme, commit),
         .table => printTable(row, line.text, theme, commit),
@@ -485,7 +525,7 @@ pub fn print(win: vaxis.Window, text: []const u8, theme: Theme, commit: bool) u1
 }
 
 pub const Cache = struct {
-    const CachedLine = struct { offset: usize, len: usize, kind: Kind, gap: bool, y: u16, rows: u16 };
+    const CachedLine = struct { offset: usize, len: usize, kind: Kind, gap: bool, lang: ?syntax.Lang, lex: syntax.State, y: u16, rows: u16 };
     lines: std.ArrayList(CachedLine) = .empty,
     width: u16 = 0,
     st: State = .{},
@@ -512,14 +552,14 @@ pub const Cache = struct {
                 break;
             }
             const h = printLine(win, line, theme, false);
-            c.lines.append(gpa, .{ .offset = @intFromPtr(line.text.ptr) - @intFromPtr(text.ptr), .len = line.text.len, .kind = line.kind, .gap = line.gap, .y = c.height, .rows = h }) catch return print(win, text, theme, commit);
+            c.lines.append(gpa, .{ .offset = @intFromPtr(line.text.ptr) - @intFromPtr(text.ptr), .len = line.text.len, .kind = line.kind, .gap = line.gap, .lang = line.lang, .lex = line.lex, .y = c.height, .rows = h }) catch return print(win, text, theme, commit);
             c.height +|= h;
             c.st = parser.st;
         }
         if (commit) for (c.lines.items) |line| {
             if (@as(i32, win.y_off) + line.y + line.rows <= 0) continue;
             if (@as(i32, win.y_off) + line.y >= win.screen.height) break;
-            _ = printLine(win.child(.{ .y_off = @intCast(line.y) }), .{ .text = text[line.offset..][0..line.len], .kind = line.kind, .gap = line.gap }, theme, true);
+            _ = printLine(win.child(.{ .y_off = @intCast(line.y) }), .{ .text = text[line.offset..][0..line.len], .kind = line.kind, .gap = line.gap, .lang = line.lang, .lex = line.lex }, theme, true);
         };
         var height = c.height;
         parser = .{ .text = text, .st = c.st };
@@ -835,4 +875,100 @@ test "cached append and resize match uncached markdown" {
             win.y_off = 0;
         }
     };
+}
+
+const green: vaxis.Color = .{ .index = 2 };
+const theme_syntax: Theme = .{ .tint = tint, .string = green };
+
+test "tagged code blocks: dim comments, colored strings, bold keywords" {
+    const a = testing.allocator;
+    var shot: Shot = undefined;
+    try shot.init(a, 40);
+    defer shot.deinit(a);
+    _ = drawText(&shot, "```zig\nconst s = \"hi\"; // c\n```", theme_syntax);
+    try shot.expect(a, &.{" const s = \"hi\"; // c"});
+    try testing.expect(shot.cell(1, 0).style.bold);
+    try testing.expect(!shot.cell(7, 0).style.bold);
+    try testing.expectEqual(vaxis.Color.default, shot.cell(7, 0).style.fg);
+    try testing.expectEqual(green, shot.cell(11, 0).style.fg);
+    try testing.expectEqual(green, shot.cell(14, 0).style.fg);
+    try testing.expect(!shot.cell(15, 0).style.dim and shot.cell(15, 0).style.fg == .default);
+    try testing.expect(shot.cell(17, 0).style.dim);
+    try testing.expect(shot.cell(20, 0).style.dim);
+    for (0..40) |c| try testing.expectEqual(tint, shot.cell(@intCast(c), 0).style.bg);
+}
+
+test "untagged and unknown-language blocks and inline code stay plain" {
+    const a = testing.allocator;
+    var shot: Shot = undefined;
+    try shot.init(a, 40);
+    defer shot.deinit(a);
+    for ([_][]const u8{ "```\nconst s = \"hi\"; // c\n```", "```text\nconst s = \"hi\"; // c\n```" }) |text| {
+        shot.screen.clear();
+        _ = drawText(&shot, text, theme_syntax);
+        for (1..22) |c| {
+            const style = shot.cell(@intCast(c), 0).style;
+            try testing.expect(!style.bold and !style.dim);
+            try testing.expectEqual(vaxis.Color.default, style.fg);
+        }
+    }
+    shot.screen.clear();
+    _ = drawText(&shot, "`const \"x\" // y`", theme_syntax);
+    for (0..14) |c| {
+        const style = shot.cell(@intCast(c), 0).style;
+        try testing.expect(!style.bold and !style.dim);
+        try testing.expectEqual(vaxis.Color.default, style.fg);
+    }
+}
+
+test "lexer state carries across code lines and resets at the fence" {
+    const a = testing.allocator;
+    var shot: Shot = undefined;
+    try shot.init(a, 40);
+    defer shot.deinit(a);
+    _ = drawText(&shot, "```c\n/* one\ntwo */ return\n```\n```c\nreturn\n```", theme_syntax);
+    try testing.expect(shot.cell(1, 0).style.dim);
+    try testing.expect(shot.cell(1, 1).style.dim);
+    try testing.expect(!shot.cell(8, 1).style.dim and shot.cell(8, 1).style.bold);
+    try testing.expect(shot.cell(1, 2).style.bold);
+    shot.screen.clear();
+    _ = drawText(&shot, "```c\n/* open\n```\n```c\nreturn\n```", theme_syntax);
+    try testing.expect(shot.cell(1, 1).style.bold and !shot.cell(1, 1).style.dim);
+}
+
+test "python triple quotes and tabs render within width" {
+    const a = testing.allocator;
+    var shot: Shot = undefined;
+    try shot.init(a, 20);
+    defer shot.deinit(a);
+    try testing.expectEqual(@as(u16, 2), drawText(&shot, "```py\n\"\"\"a\n\tb\"\"\" x\n```", theme_syntax));
+    try shot.expect(a, &.{ " \"\"\"a", "     b\"\"\" x" });
+    try testing.expectEqual(green, shot.cell(1, 0).style.fg);
+    try testing.expectEqual(green, shot.cell(5, 1).style.fg);
+    try testing.expect(shot.cell(10, 1).style.fg == .default);
+}
+
+test "syntax colored blocks stream like uncached ones" {
+    const a = testing.allocator;
+    var cache: Cache = .{};
+    defer cache.deinit(a);
+    var shot: Shot = undefined;
+    try shot.init(a, 24);
+    defer shot.deinit(a);
+    var win = shot.win;
+    const text = "x\n```zig\nconst a = \"é̈\"; /* open\n\tmore */ pub\n\\\\raw 中文 // z\n```\ntail";
+    for ([_]u16{ 24, 9, 24 }) |width| {
+        win.width = width;
+        for (0..text.len + 1) |n| {
+            if (!std.unicode.utf8ValidateSlice(text[0..n])) continue;
+            try testing.expectEqual(print(win, text[0..n], theme_syntax, false), cache.draw(a, win, text[0..n], theme_syntax, false));
+            win.clear();
+            _ = print(win, text[0..n], theme_syntax, true);
+            const expected = try a.dupe(vaxis.Cell, shot.screen.buf);
+            defer a.free(expected);
+            win.clear();
+            _ = cache.draw(a, win, text[0..n], theme_syntax, true);
+            try testing.expectEqualDeep(expected, shot.screen.buf);
+        }
+    }
 }

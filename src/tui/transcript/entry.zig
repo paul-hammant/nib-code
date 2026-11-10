@@ -11,10 +11,11 @@ const BackgroundKind = @FieldType(@import("../../session/events.zig").Background
 const ToolSummary = @import("../../session/tool_summary.zig").Summary;
 const ChangeText = @import("changes.zig").ChangeText;
 const label = @import("label.zig");
+const intraline = @import("intraline.zig");
 const actualToolSummary = label.actualToolSummary;
 
 pub const max_diff_lines = 60;
-pub const max_segments = 16 + max_diff_lines;
+pub const max_segments = 16 + 3 * max_diff_lines;
 
 pub const Kind = enum { user, assistant, run, background, info, err, bill, failure };
 
@@ -303,17 +304,27 @@ pub const Entry = struct {
                     segs[n] = .{ .text = "No file changes\n", .style = dim };
                     n += 1;
                 }
-                var start: usize = 0;
-                while (start < diff.len and n < segs.len - 5) : (n += 1) {
-                    const end = if (std.mem.indexOfScalarPos(u8, diff, start, '\n')) |nl| nl + 1 else diff.len;
-                    const line = diff[start..end];
-                    segs[n] = .{ .text = line, .style = switch (line[0]) {
+                var lines: intraline.Lines = .{ .text = diff };
+                while (n + 3 <= segs.len - 5) {
+                    const item = lines.next() orelse break;
+                    const line = item.line;
+                    const style: vaxis.Style = switch (line[0]) {
                         '+' => .{ .fg = .{ .index = 2 } },
                         '-' => .{ .fg = .{ .index = 1 } },
                         ' ' => dim,
                         else => .{ .bold = true, .dim = true },
-                    } };
-                    start = end;
+                    };
+                    if (item.emphasis) |r| {
+                        var strong = style;
+                        strong.bold = true;
+                        segs[n] = .{ .text = line[0..r.start], .style = style };
+                        segs[n + 1] = .{ .text = line[r.start..r.end], .style = strong };
+                        segs[n + 2] = .{ .text = line[r.end..], .style = style };
+                        n += 3;
+                    } else {
+                        segs[n] = .{ .text = line, .style = style };
+                        n += 1;
+                    }
                 }
                 segs[n] = .{ .text = "Result\n", .style = .{ .bold = true, .dim = true } };
                 segs[n + 1] = .{ .text = if (e.output.items.len == 0) "No result" else std.mem.trimEnd(u8, e.output.items, "\n"), .style = if (e.run == .failed) .{ .fg = .{ .index = 1 }, .dim = true } else dim };

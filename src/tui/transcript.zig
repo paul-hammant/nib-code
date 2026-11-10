@@ -836,6 +836,34 @@ test "a Run shows changed files in its summary and a colored diff when open" {
     try testing.expectEqualStrings("x +2 −1 · x +2 −1 · x +2 −1", text.summary);
 }
 
+test "an open Run emphasizes the changed middle of paired diff lines" {
+    const gpa = testing.allocator;
+    var screen: vaxis.Screen = try .init(gpa, .{ .cols = 40, .rows = 20, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(gpa);
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 40, .height = 20, .screen = &screen };
+    var t: Transcript = .{};
+    defer t.deinit(gpa);
+    try t.startRun(gpa, "x");
+    const diff = "-let count = 10; // total\n+let count = 11; // total\n";
+    try t.endRun(gpa, true, "", 300, try .init(gpa, &.{.{ .path = "a.zig", .added = 1, .removed = 1, .diff = diff }}));
+    toggleAll(&t);
+    const e = &t.entries.items[0];
+    var segs: [max_segments]vaxis.Segment = undefined;
+    const shown = e.segments(&segs);
+    try testing.expectEqualStrings("-let count = 1", shown[7].text);
+    try testing.expectEqualStrings("0", shown[8].text);
+    try testing.expect(shown[8].style.bold and !shown[7].style.bold);
+    try testing.expectEqual(@as(u8, 1), shown[8].style.fg.index);
+    try testing.expectEqualStrings("+let count = 1", shown[10].text);
+    try testing.expectEqualStrings("1", shown[11].text);
+    try testing.expectEqual(@as(u8, 2), shown[11].style.fg.index);
+    const rows = e.print(win, true);
+    try testing.expectEqual(e.height(win), rows);
+    try testing.expectEqualStrings("0", screen.readCell(14, 4).?.char.grapheme);
+    try testing.expect(screen.readCell(14, 4).?.style.bold);
+    try testing.expect(!screen.readCell(13, 4).?.style.bold);
+}
+
 test "agent tree stays visible folded, expanded and after Run ends" {
     const gpa = testing.allocator;
     var t: Transcript = .{};
