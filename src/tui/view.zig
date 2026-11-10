@@ -20,10 +20,12 @@ pub fn drawFrame(outer: vaxis.Window, entries: []Entry, input: *Editor, scroll: 
     outer.clear();
     const win = outer;
     win.hideCursor();
-    for (entries) |*e| {
+    for (entries, 0..) |*e, i| {
         if (e.simple != s.cfg.simple) e.cached = null;
         e.simple = s.cfg.simple;
-        e.gap = if (s.cfg.simple and e.kind == .bill) 0 else 1;
+        const hidden = s.cfg.simple and (e.kind == .bill or e.kind == .changes);
+        const joined = e.kind == .bill and i + 1 < entries.len and entries[i + 1].kind == .changes;
+        e.gap = if (hidden or joined) 0 else 1;
     }
     if (win.height == 0 or win.width == 0) return null;
 
@@ -77,6 +79,8 @@ pub fn drawFrame(outer: vaxis.Window, entries: []Entry, input: *Editor, scroll: 
 
     if (s.signed_out and entries.len == 0 and body_h > 0) {
         _ = body.printSegment(.{ .text = "No provider · /provider to sign in", .style = .{ .dim = true } }, .{ .wrap = .none });
+    } else if (s.title.len > 0 and entries.len == 0 and body_h > 0) {
+        _ = body.printSegment(.{ .text = s.title, .style = .{ .dim = true } }, .{ .wrap = .none });
     }
 
     if (activity_h > 0) {
@@ -679,4 +683,62 @@ test "resize and mode transitions match a fresh frame" {
         defer a.free(after);
         try testing.expectEqualStrings(after, before);
     }
+}
+
+fn drawText(a: std.mem.Allocator, t: *Transcript, cfg: provider.Config, title: []const u8, signed_out: bool, width: u16) ![]u8 {
+    var input: Editor = .{};
+    defer input.deinit(a);
+    var scroll: Viewport = .{};
+    var text: status.Text = .{};
+    var screen = try vaxis.Screen.init(a, .{ .cols = width, .rows = 16, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = width, .height = 16, .screen = &screen };
+    draw(win, t.entries.items, &input, &scroll, &.{}, 0, .{ .cfg = cfg, .title = title, .signed_out = signed_out }, &text);
+    return snapshot(a, &screen);
+}
+
+test "title line shows on an empty transcript, also in Simple mode, never when signed out or with entries" {
+    const a = testing.allocator;
+    var t: Transcript = .{};
+    defer t.deinit(a);
+    var cfg = mock_cfg;
+    const empty = try drawText(a, &t, cfg, "nibcode · main · mock", false, 60);
+    defer a.free(empty);
+    try testing.expect(std.mem.startsWith(u8, empty, " nibcode · main · mock\n"));
+    cfg.simple = true;
+    const simple = try drawText(a, &t, cfg, "nibcode · main · mock", false, 60);
+    defer a.free(simple);
+    try testing.expect(std.mem.startsWith(u8, simple, " nibcode · main · mock\n"));
+    const out = try drawText(a, &t, mock_cfg, "", true, 60);
+    defer a.free(out);
+    try testing.expect(std.mem.startsWith(u8, out, " No provider · /provider to sign in\n"));
+    try t.add(a, .assistant, "Hello");
+    const used = try drawText(a, &t, mock_cfg, "nibcode · main · mock", false, 60);
+    defer a.free(used);
+    try testing.expect(std.mem.indexOf(u8, used, "nibcode") == null);
+}
+
+test "changes line sits directly under the footer, opens to file rows and is hidden in Simple mode" {
+    const a = testing.allocator;
+    var t: Transcript = .{};
+    defer t.deinit(a);
+    try t.add(a, .assistant, "Done");
+    try t.add(a, .bill, "2 Runs · 6 steps · 48s · 120k tokens");
+    try t.addChanges(a, try @import("transcript/changes.zig").turnChanges(a, &.{
+        .{ .path = "src/tui.zig", .added = 30, .removed = 4 },
+        .{ .path = "docs/ui-style.md", .added = 2, .removed = 0 },
+    }));
+    const closed = try drawText(a, &t, mock_cfg, "", false, 60);
+    defer a.free(closed);
+    try testing.expect(std.mem.startsWith(u8, closed, " Done\n\n 2 Runs · 6 steps · 48s · 120k tokens\n 2 files changed · +32 −4\n\n"));
+    t.entries.items[2].open = true;
+    const open = try drawText(a, &t, mock_cfg, "", false, 60);
+    defer a.free(open);
+    try testing.expect(std.mem.indexOf(u8, open, " 2 files changed · +32 −4\n   src/tui.zig       +30 −4\n   docs/ui-style.md   +2\n") != null);
+    var simple_cfg = mock_cfg;
+    simple_cfg.simple = true;
+    const simple = try drawText(a, &t, simple_cfg, "", false, 60);
+    defer a.free(simple);
+    try testing.expect(std.mem.indexOf(u8, simple, "files changed") == null);
+    try testing.expect(std.mem.indexOf(u8, simple, "120k") == null);
 }

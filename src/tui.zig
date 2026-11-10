@@ -25,6 +25,8 @@ const Turn = @import("tui/turn.zig").Turn;
 const Ticker = @import("tui/turn.zig").Ticker;
 const Frames = @import("tui/frames.zig").Frames;
 const bill = @import("tui/bill.zig");
+const open = @import("tui/open.zig");
+const title = @import("tui/title.zig");
 const TurnSummary = @import("session/events.zig").TurnSummary;
 const ToolSummary = @import("session/tool_summary.zig").Summary;
 
@@ -190,10 +192,11 @@ pub fn run(init: std.process.Init, session: *Session) !void {
         const event = try loop.nextEvent();
         const refresh = event.refresh();
         const old_hover = app.hovered;
+        const old_link = app.link;
         const motion = event == .mouse and event.mouse.type == .motion and !app.selection.active;
         if (!motion and event.flushesVisible()) app.transcript.flushVisible();
         if (!try app.handle(event)) break;
-        if (motion and old_hover == app.hovered) continue;
+        if (motion and old_hover == app.hovered and std.meta.eql(old_link, app.link)) continue;
         const frame_start = std.Io.Clock.Timestamp.now(io, .awake);
         if (frames.due(frame_start, if (refresh != .immediate and app.transcript.hasBacklog()) .content else refresh)) {
             app.transcript.advanceVisible(frame_start);
@@ -208,6 +211,8 @@ fn pathsReady(ctx: *anyopaque) void {
     const app: *App = @ptrCast(@alignCast(ctx));
     app.loop.postEvent(.paths_ready) catch {};
 }
+
+const Link = struct { row: u16, x0: u16, x1: u16 };
 
 pub const App = struct {
     gpa: std.mem.Allocator,
@@ -226,6 +231,16 @@ pub const App = struct {
     hover_bg: vaxis.Color = .default,
     terminal_bg: ?[3]u8 = null,
     hovered: ?usize = null,
+    /// Underlined file path under the pointer; only when `open` is configured.
+    link: ?Link = null,
+    files: open.Files = .{},
+    files_revision: usize = 0,
+    project: ?[]u8 = null,
+    work_dir: ?[]u8 = null,
+    title_loaded: bool = false,
+    title_project: ?[]u8 = null,
+    title_branch: ?[]u8 = null,
+    title_buf: [512]u8 = undefined,
     /// Shown on the status line until the next key or click; not part of the transcript.
     notice: ?[]const u8 = null,
     notice_buf: [256]u8 = undefined,
@@ -277,6 +292,8 @@ pub const App = struct {
             t.finish();
         }
         app.prediction.deinit(app.gpa);
+        app.files.deinit(app.gpa);
+        for ([_]?[]u8{ app.project, app.work_dir, app.title_project, app.title_branch }) |owned| if (owned) |text| app.gpa.free(text);
         app.flow.deinit();
         app.stopReflecting();
         app.clearStepEffort();
@@ -316,6 +333,7 @@ pub const App = struct {
         switch (event) {
             .key_press => |k| {
                 app.hovered = null;
+                app.link = null;
                 return app.onKey(k);
             },
             .paste_start => {
@@ -338,17 +356,21 @@ pub const App = struct {
             .mouse => |m| {
                 if (m.type == .motion and !app.selection.active) {
                     app.hovered = null;
+                    app.link = null;
                     if (app.selection.dragged) return true;
                     if (app.body) |body| {
                         if (m.col >= body.window.x_off and m.col < body.window.x_off + body.window.width and m.row >= 0 and m.row < body.window.height) {
                             if (@import("tui/selection/history.zig").position(body, app.transcript.entries.items, @intCast(m.col), @intCast(m.row))) |p| {
                                 if (p.row < app.transcript.entries.items[p.entry].toggleRows(body.window)) app.hovered = p.entry;
+                                var text: [open_buf_len]u8 = undefined;
+                                if (app.hitAt(p.entry, p.row, m.col, m.row, &text)) |hit| app.link = .{ .row = @intCast(m.row), .x0 = hit.found.x0, .x1 = hit.found.x1 };
                             }
                         }
                     }
                     return true;
                 }
                 app.hovered = null;
+                app.link = null;
                 if (m.type == .press) {
                     app.notice = null;
                     app.quit_armed = false;
@@ -368,7 +390,9 @@ pub const App = struct {
                         app.notice = std.fmt.bufPrint(&app.notice_buf, "copied {d} chars", .{std.unicode.utf8CountCodepoints(text) catch text.len}) catch null;
                     }
                 }
-                if (app.selection.takeClick()) |c| app.clickEntry(c.entry, c.row);
+                if (app.selection.takeClick()) |c| {
+                    if (!app.openClick(c.entry, c.row, m)) app.clickEntry(c.entry, c.row);
+                }
                 if (app.selection.active and app.selection.history != null) {
                     if (app.body) |body| app.scroll.top = body.top;
                 }
@@ -485,7 +509,7 @@ pub const App = struct {
                 try app.finishTurn();
                 try app.saveReflection();
                 try app.appendBill();
-                if (canceled) try app.recoveryHint(.canceled);
+                if (canceled) try app.recoveryHint(.canceled) else try app.appendChanges();
                 try app.finishQueued(!canceled);
                 if (predict) app.predictNext();
             },
@@ -740,6 +764,14 @@ pub const App = struct {
         app.pending_bill = null;
     }
 
+    fn appendChanges(app: *App) !void {
+        var arena: std.heap.ArenaAllocator = .init(app.gpa);
+        defer arena.deinit();
+        const cwd = try std.process.currentPathAlloc(app.io, arena.allocator());
+        const files = try app.session.tools.recovery.files(arena.allocator(), app.io, cwd);
+        try app.transcript.addChanges(app.gpa, try @import("tui/transcript/changes.zig").turnChanges(app.gpa, files));
+    }
+
     fn clearStepEffort(app: *App) void {
         if (app.step_effort) |effort| app.gpa.free(effort.effort);
         app.step_effort = null;
@@ -800,6 +832,90 @@ pub const App = struct {
         return "";
     }
 
+    fn workDirs(app: *App) ?struct { cwd: []const u8, project: []const u8 } {
+        if (app.work_dir == null or app.project == null) {
+            var arena: std.heap.ArenaAllocator = .init(app.gpa);
+            defer arena.deinit();
+            const cwd = std.process.currentPathAlloc(app.io, arena.allocator()) catch return null;
+            const root = @import("session/instructions.zig").projectRoot(app.io, arena.allocator(), cwd) catch return null;
+            const owned_cwd = app.gpa.dupe(u8, cwd) catch return null;
+            const owned_root = app.gpa.dupe(u8, root) catch {
+                app.gpa.free(owned_cwd);
+                return null;
+            };
+            app.work_dir = owned_cwd;
+            app.project = owned_root;
+        }
+        return .{ .cwd = app.work_dir.?, .project = app.project.? };
+    }
+
+    const open_buf_len = 512 + 1024;
+    const Hit = struct { found: open.Found, path: []const u8 };
+
+    /// A clickable file path at screen cell (col, row) inside `entry`; null unless `open` is configured.
+    fn hitAt(app: *App, entry: usize, entry_row: u16, col: i16, row: i16, text: *[open_buf_len]u8) ?Hit {
+        if (app.cfg.open == null or col < 0 or row < 0) return null;
+        const body = (app.body orelse return null).window;
+        const x: u16 = @intCast(col);
+        const y: u16 = @intCast(row);
+        if (x < body.x_off or x >= body.x_off + body.width or y >= body.height or entry >= app.transcript.entries.items.len) return null;
+        if (app.files_revision != app.transcript.revision) {
+            app.files.clear(app.gpa);
+            app.files_revision = app.transcript.revision;
+        }
+        const e = &app.transcript.entries.items[entry];
+        const rows_only = switch (e.kind) {
+            .assistant => false,
+            .changes => e.open and entry_row >= 1,
+            .run => e.open,
+            else => return null,
+        };
+        var grs: [512]open.Gr = undefined;
+        var n: usize = 0;
+        const x_off: u16 = @intCast(body.x_off);
+        var c: u16 = x_off;
+        while (c < x_off + body.width and n < grs.len) {
+            const cell = app.vx.screen.readCell(c, y) orelse break;
+            const width: u16 = @max(1, cell.char.width);
+            grs[n] = .{ .col = c, .width = width, .text = cell.char.grapheme };
+            n += 1;
+            c += width;
+        }
+        const found = (if (rows_only) open.changeRowAt(grs[0..n], x, text[0..512]) else open.tokenAt(grs[0..n], x, text[0..512])) orelse return null;
+        const dirs = app.workDirs() orelse return null;
+        const path = app.files.find(app.gpa, app.io, dirs.cwd, dirs.project, found.token.path, text[512..]) orelse return null;
+        return .{ .found = found, .path = path };
+    }
+
+    fn openClick(app: *App, entry: usize, entry_row: u16, m: vaxis.Mouse) bool {
+        var text: [open_buf_len]u8 = undefined;
+        const hit = app.hitAt(entry, entry_row, m.col, m.row, &text) orelse return false;
+        var arena: std.heap.ArenaAllocator = .init(app.gpa);
+        defer arena.deinit();
+        const argv = open.argv(arena.allocator(), app.cfg.open.?, hit.path, hit.found.token.line) catch return true;
+        open.launch(app.io, app.environ, argv) catch {
+            app.notice = std.fmt.bufPrint(&app.notice_buf, "Could not run {s}", .{std.fs.path.basename(argv[0])}) catch null;
+        };
+        return true;
+    }
+
+    fn titleLine(app: *App) []const u8 {
+        if (!app.title_loaded) {
+            if (app.title_project) |old| app.gpa.free(old);
+            if (app.title_branch) |old| app.gpa.free(old);
+            app.title_project = null;
+            app.title_branch = null;
+            if (app.workDirs()) |dirs| {
+                const name = std.fs.path.basename(dirs.project);
+                app.title_project = app.gpa.dupe(u8, if (name.len == 0) dirs.project else name) catch null;
+                app.title_branch = title.readBranch(app.io, app.gpa, dirs.project);
+            }
+            app.title_loaded = true;
+        }
+        const project = app.title_project orelse return "";
+        return title.compose(&app.title_buf, project, app.title_branch, app.cfg.model);
+    }
+
     fn clickEntry(app: *App, entry: usize, row: u16) void {
         const frame = app.body orelse return;
         if (entry < app.transcript.entries.items.len and row < app.transcript.entries.items[entry].toggleRows(frame.window)) app.toggleEntry(entry);
@@ -838,7 +954,13 @@ pub const App = struct {
             candidate.detail = commands.reflectHelp(&app.reflect_help, reflect.issueRepo(app));
         };
         if (app.scroll.pending != 0 and (!app.selection.active or app.selection.history == null)) app.selection.clear();
-        if (app.scroll.pending != 0 or app.selection.dragged) app.hovered = null;
+        if (app.scroll.pending != 0 or app.selection.dragged) {
+            app.hovered = null;
+            app.link = null;
+        }
+        const empty = app.transcript.entries.items.len == 0;
+        if (!empty) app.title_loaded = false;
+        const heading = if (empty and !app.signed_out) app.titleLine() else "";
         app.body = view.drawFrame(app.vx.window(), app.transcript.entries.items, visible_input, &app.scroll, menu, @min(app.menu.sel, menu.len -| 1), .{
             .cfg = app.cfg,
             .user_bg = app.user_bg,
@@ -854,8 +976,14 @@ pub const App = struct {
             .detail = app.activityDetail(),
             .hint = if (app.flow.active()) app.flow.hint(&app.flow_hint) else if (app.menu.isPinned()) "Choose a service" else "",
             .signed_out = app.signed_out,
+            .title = heading,
             .revision = app.transcript.revision,
         }, &app.status_text);
+        if (app.link) |l| if (l.row < app.vx.screen.height) for (l.x0..@min(@as(usize, l.x1) + 1, app.vx.screen.width)) |col| {
+            const cell = &app.vx.screen.buf[@as(usize, l.row) * app.vx.screen.width + col];
+            cell.style.ul_style = .single;
+            cell.default = false;
+        };
         if (app.selection.active and app.selection.history != null) {
             if (app.body) |body| app.scroll.top = body.top;
         }
@@ -1569,6 +1697,12 @@ fn clickApp(app: *App, vx: *vaxis.Vaxis, top: @import("tui/viewport.zig").Anchor
     app.selection = .{};
     app.scroll = .{ .top = scroll_top };
     app.notice = null;
+    app.cfg = .{ .base_url = "", .api_key = "", .model = "mock" };
+    app.link = null;
+    app.files = .{};
+    app.files_revision = 0;
+    app.project = null;
+    app.work_dir = null;
     app.transcript = .{};
     app.body = .{ .top = top, .window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 8, .height = 8, .screen = &vx.screen } };
 }
@@ -1730,4 +1864,48 @@ test "Simple key variants and command toggle silently and persist" {
     }
     try commands.execute(&app, .simple, "", "/simple");
     try t.expect(app.cfg.simple);
+}
+
+test "file paths are links only when open is configured; a click runs the command and reports a failed start" {
+    const gpa = std.testing.allocator;
+    var vx: vaxis.Vaxis = undefined;
+    vx.screen = try vaxis.Screen.init(gpa, .{ .cols = 40, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
+    defer vx.screen.deinit(gpa);
+    var app: App = undefined;
+    app.flow = .{ .gpa = gpa };
+    app.signed_out = false;
+    app.gpa = gpa;
+    app.io = std.testing.io;
+    clickApp(&app, &vx, .{}, .{});
+    app.body.?.window.width = 40;
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+    app.environ = &env;
+    defer app.transcript.deinit(gpa);
+    defer app.files.deinit(gpa);
+    defer for ([_]?[]u8{ app.project, app.work_dir }) |owned| if (owned) |text| gpa.free(text);
+    const line = "see build.zig:12 and nope.zig now";
+    try app.transcript.add(gpa, .assistant, line);
+    _ = app.body.?.window.printSegment(.{ .text = line }, .{ .wrap = .none });
+
+    const hover = mouseEvent(6, 0, .motion);
+    _ = try app.handle(hover);
+    try std.testing.expectEqual(@as(?Link, null), app.link);
+
+    app.cfg.open = "/bin/true {path}:{line}";
+    _ = try app.handle(hover);
+    try std.testing.expectEqual(@as(?Link, .{ .row = 0, .x0 = 4, .x1 = 15 }), app.link);
+    _ = try app.handle(mouseEvent(20, 0, .motion));
+    try std.testing.expectEqual(@as(?Link, null), app.link);
+    _ = try app.handle(mouseEvent(0, 0, .motion));
+    try std.testing.expectEqual(@as(?Link, null), app.link);
+
+    _ = try app.handle(mouseEvent(6, 0, .press));
+    _ = try app.handle(mouseEvent(6, 0, .release));
+    try std.testing.expectEqual(@as(?[]const u8, null), app.notice);
+
+    app.cfg.open = "/nonexistent/open-tool {path}";
+    _ = try app.handle(mouseEvent(6, 0, .press));
+    _ = try app.handle(mouseEvent(6, 0, .release));
+    try std.testing.expectEqualStrings("Could not run open-tool", app.notice.?);
 }

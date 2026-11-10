@@ -88,6 +88,7 @@ pub const KeySource = enum { none, env, store };
 
 pub const Config = struct {
     simple: bool = false,
+    open: ?[]const u8 = null,
     sandbox: Sandbox = .{},
     hooks: Hooks = .{},
     enabled_skills: []const []const u8 = &.{},

@@ -75,6 +75,8 @@ pub const Status = struct {
     hint: []const u8 = "",
     /// No usable credentials: the footer says so instead of naming a model.
     signed_out: bool = false,
+    /// Dim line at the top of an empty transcript; empty for none.
+    title: []const u8 = "",
     revision: usize = 0,
     new_output: bool = false,
 

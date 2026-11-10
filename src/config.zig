@@ -176,6 +176,7 @@ const File = struct {
     hooks: provider.Hooks = .{},
     provider_id: ?provider.Id = null,
     simple: bool = false,
+    open: ?[]const u8 = null,
     ui_value: ?Span = null,
     effort: ?[]const u8 = null,
     codex_settings: Settings = .{},
@@ -447,7 +448,7 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
             continue;
         }
         const index: usize = if (section == null)
-            if (std.mem.eql(u8, key, "provider")) 0 else if (std.mem.eql(u8, key, "effort")) 1 else if (std.mem.eql(u8, key, "ui")) 2 else return p.bad("unknown top-level key '{s}'", .{key})
+            if (std.mem.eql(u8, key, "provider")) 0 else if (std.mem.eql(u8, key, "effort")) 1 else if (std.mem.eql(u8, key, "ui")) 2 else if (std.mem.eql(u8, key, "open")) 3 else return p.bad("unknown top-level key '{s}'", .{key})
         else if (section == .limits) blk: {
             const names = .{ "llm_concurrency", "llm_calls_per_run", "llm_input_kib", "agent_concurrency", "max_steps", "stream_idle_timeout_s", "run_background_after_ms", "stream_content_timeout_s", "request_timeout_s", "run_output_bytes" };
             inline for (names, 0..) |name, i| {
@@ -502,6 +503,9 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
                     file.simple = std.mem.eql(u8, decoded, mode.value);
                     const value_start = start + @intFromPtr(value.ptr) - @intFromPtr(raw.ptr);
                     file.ui_value = .{ .start = value_start, .end = value_start + consumed };
+                } else if (index == 3) {
+                    if (std.mem.trim(u8, decoded, " \t").len == 0) return p.bad("open must not be empty", .{});
+                    file.open = decoded;
                 } else {
                     file.effort = knownEffort(decoded) orelse return p.bad("invalid effort; expected default|off|none|minimal|low|medium|high|xhigh|max", .{});
                     const value_start = start + @intFromPtr(value.ptr) - @intFromPtr(raw.ptr);
@@ -603,6 +607,7 @@ pub fn resolve(a: Allocator, env: *const Env, text: []const u8, path: []const u8
         return error.InvalidConfig;
     } else file.codex_settings.transport;
     cfg.simple = file.simple;
+    cfg.open = if (file.open) |value| try a.dupe(u8, value) else null;
     cfg.codex_run_tool = if (env.get("NIB_CODEX_RUN_TOOL")) |v| std.meta.stringToEnum(@FieldType(provider.Config, "codex_run_tool"), v) orelse {
         detail.* = try a.dupe(u8, "NIB_CODEX_RUN_TOOL: expected custom or function");
         return error.InvalidConfig;
@@ -1659,4 +1664,17 @@ test "simple persistence preserves surrounding configuration and rejects invalid
         try t.expectEqual(simple, (try resolve(a, &env, text, "test", &detail)).simple);
     }
     for ([_][]const u8{ "ui = true", "ui = \"bad\"", "ui = \"normal\"\nui = \"simple\"" }) |text| try t.expectError(error.InvalidConfig, parse(a, a, text, "test", &detail));
+}
+
+test "open command template is an optional non-empty top-level string" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: Env = .init(a);
+    defer env.deinit();
+    var detail: ?[]u8 = null;
+    try t.expect((try resolve(a, &env, "", "test", &detail)).open == null);
+    try t.expectEqualStrings("zed {path}:{line}", (try resolve(a, &env, "open = \"zed {path}:{line}\"\n[codex]\n", "test", &detail)).open.?);
+    for ([_][]const u8{ "open = \"\"", "open = \"  \"", "open = 3", "open = \"a\"\nopen = \"b\"" }) |text| try t.expectError(error.InvalidConfig, parse(a, a, text, "test", &detail));
 }

@@ -130,7 +130,12 @@ pub const Recovery = struct {
     enabled: bool = false,
     mutex: std.Io.Mutex = .init,
     paths: std.ArrayList([]const u8) = .empty,
+    counts: std.ArrayList(Counts) = .empty,
     bash: bool = false,
+
+    const Counts = struct { added: usize = 0, removed: usize = 0 };
+
+    pub const File = struct { path: []const u8, added: usize, removed: usize };
 
     pub const Reason = enum { model, tool, timeout, canceled, limit };
 
@@ -143,14 +148,35 @@ pub const Recovery = struct {
         };
     }
 
-    pub fn record(r: *Recovery, gpa: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    pub fn record(r: *Recovery, gpa: std.mem.Allocator, io: std.Io, path: []const u8, before: ?[]const u8, after: []const u8) !void {
         if (!r.enabled) return;
+        var scratch: std.heap.ArenaAllocator = .init(gpa);
+        defer scratch.deinit();
+        const stat = try diff.compare(scratch.allocator(), before orelse "", after);
         r.mutex.lockUncancelable(io);
         defer r.mutex.unlock(io);
-        for (r.paths.items) |old| if (std.mem.eql(u8, old, path)) return;
+        for (r.paths.items, r.counts.items) |old, *counts| if (std.mem.eql(u8, old, path)) {
+            counts.added += stat.added;
+            counts.removed += stat.removed;
+            return;
+        };
         const copy = try gpa.dupe(u8, path);
         errdefer gpa.free(copy);
+        try r.counts.append(gpa, .{ .added = stat.added, .removed = stat.removed });
+        errdefer _ = r.counts.pop();
         try r.paths.append(gpa, copy);
+    }
+
+    /// Directly edited files in first-change order, paths relative to `cwd` when inside it; allocated from `a`.
+    pub fn files(r: *Recovery, a: std.mem.Allocator, io: std.Io, cwd: []const u8) ![]File {
+        r.mutex.lockUncancelable(io);
+        defer r.mutex.unlock(io);
+        const out = try a.alloc(File, r.paths.items.len);
+        for (r.paths.items, r.counts.items, out) |path, counts, *file| {
+            const shown = if (path.len > cwd.len and std.mem.startsWith(u8, path, cwd) and path[cwd.len] == '/') path[cwd.len + 1 ..] else path;
+            file.* = .{ .path = try a.dupe(u8, shown), .added = counts.added, .removed = counts.removed };
+        }
+        return out;
     }
 
     pub fn noteBash(r: *Recovery, io: std.Io) void {
@@ -165,6 +191,7 @@ pub const Recovery = struct {
         defer r.mutex.unlock(io);
         for (r.paths.items) |path| gpa.free(path);
         r.paths.clearAndFree(gpa);
+        r.counts.clearAndFree(gpa);
         r.bash = false;
     }
 
@@ -199,10 +226,20 @@ pub const Recovery = struct {
 test "recovery records only this Turn's unique paths and distinguishes failure categories" {
     var r: Recovery = .{ .enabled = true };
     defer r.clear(testing.allocator, testing.io);
-    try r.record(testing.allocator, testing.io, "/project/a.zig");
-    try r.record(testing.allocator, testing.io, "/project/a.zig");
-    try r.record(testing.allocator, testing.io, "/project/b.zig");
+    try r.record(testing.allocator, testing.io, "/project/a.zig", "x\n", "y\n");
+    try r.record(testing.allocator, testing.io, "/project/a.zig", "y\n", "y\nz\n");
+    try r.record(testing.allocator, testing.io, "/project/b.zig", null, "new\n");
     r.noteBash(testing.io);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const list = try r.files(arena.allocator(), testing.io, "/project");
+    try testing.expectEqual(@as(usize, 2), list.len);
+    try testing.expectEqualStrings("a.zig", list[0].path);
+    try testing.expectEqual(@as(usize, 2), list[0].added);
+    try testing.expectEqual(@as(usize, 1), list[0].removed);
+    try testing.expectEqualStrings("b.zig", list[1].path);
+    try testing.expectEqual(@as(usize, 1), list[1].added);
+    try testing.expectEqual(@as(usize, 0), list[1].removed);
     const text = try r.hint(testing.allocator, testing.io, .canceled, "/project");
     defer testing.allocator.free(text);
     try testing.expectEqualStrings("Canceled · edited: a.zig, b.zig · bash changes untracked · /undo to revert edit/write · type continue to resume", text);

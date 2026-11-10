@@ -17,7 +17,7 @@ const actualToolSummary = label.actualToolSummary;
 pub const max_diff_lines = 60;
 pub const max_segments = 16 + 3 * max_diff_lines;
 
-pub const Kind = enum { user, assistant, run, background, info, err, bill, failure };
+pub const Kind = enum { user, assistant, run, background, info, err, bill, failure, changes };
 
 pub const Entry = struct {
     kind: Kind,
@@ -153,7 +153,7 @@ pub const Entry = struct {
     }
 
     pub fn collapsible(e: *const Entry) bool {
-        return e.kind == .run or e.kind == .background or e.kind == .failure or (e.kind == .user and long_text.isLong(e.text.items));
+        return e.kind == .run or e.kind == .background or e.kind == .failure or e.kind == .changes or (e.kind == .user and long_text.isLong(e.text.items));
     }
 
     pub fn toggleRows(e: *Entry, win: vaxis.Window) u16 {
@@ -165,7 +165,8 @@ pub const Entry = struct {
     }
 
     pub fn print(e: *Entry, win: vaxis.Window, commit: bool) u16 {
-        if (e.simple and e.kind == .bill) return 0;
+        if (e.simple and (e.kind == .bill or e.kind == .changes)) return 0;
+        if (e.kind == .changes) return e.printChanges(win, commit);
         if (e.kind == .assistant) {
             if (e.allocator) |a| return e.markdown_cache.draw(a, win, e.displayText(), .{ .tint = e.code_bg }, commit);
             return markdown.print(win, e.displayText(), .{ .tint = e.code_bg }, commit);
@@ -219,6 +220,19 @@ pub const Entry = struct {
         }
         const r = win.print(shown, .{ .wrap = wrap, .commit = commit });
         return if (folded) 1 else @max(1, r.row +| @intFromBool(r.col > 0));
+    }
+
+    /// `label` is the summary line, `text` one row per file while open.
+    fn printChanges(e: *const Entry, win: vaxis.Window, commit: bool) u16 {
+        const dim: vaxis.Style = .{ .dim = true };
+        _ = win.print(&.{.{ .text = e.label.items, .style = dim }}, .{ .wrap = .none, .commit = commit });
+        if (!e.open) return 1;
+        var rows: u16 = 1;
+        var lines = std.mem.splitScalar(u8, e.text.items, '\n');
+        while (lines.next()) |line| : (rows +|= 1) {
+            _ = win.child(.{ .y_off = rows }).printSegment(.{ .text = line, .style = dim }, .{ .wrap = .none, .commit = commit });
+        }
+        return rows;
     }
 
     fn printUser(e: *const Entry, win: vaxis.Window, commit: bool) u16 {
@@ -349,6 +363,7 @@ pub const Entry = struct {
                 return segs[0..3];
             },
             .info, .bill => segs[0] = .{ .text = e.text.items, .style = dim },
+            .changes => segs[0] = .{ .text = e.label.items, .style = dim },
             .err => segs[0] = .{ .text = e.text.items, .style = .{ .fg = .{ .index = 1 } } },
         }
         return segs[0..1];

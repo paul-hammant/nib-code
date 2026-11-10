@@ -83,7 +83,7 @@ pub fn edit(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolRe
     const written = atomic_file.replace(t.io, gpa, path, out, .{}) catch |err|
         return fail(gpa, "{s}: {s}", .{ v.path, @errorName(err) });
     if (snapshot) |*s| s.commit(t, gpa, out);
-    if (!std.mem.eql(u8, data, out)) try t.recovery.record(gpa, t.io, path);
+    if (!std.mem.eql(u8, data, out)) try t.recovery.record(gpa, t.io, path, data, out);
     try t.file_state.remember(t.io, gpa, path, written);
     try t.noteChange(gpa, path, data, out);
     return .{ .ok = try std.fmt.allocPrint(gpa, "{{\"replaced\":{d}}}", .{count}) };
@@ -126,7 +126,7 @@ pub fn write(t: *Tools, gpa: std.mem.Allocator, args: []const u8) !sandbox.ToolR
     const written = atomic_file.replace(t.io, gpa, path, v.content, .{}) catch |err|
         return fail(gpa, "{s}: {s}", .{ v.path, @errorName(err) });
     if (snapshot) |*s| s.commit(t, gpa, v.content);
-    if (before == null or !std.mem.eql(u8, before.?, v.content)) try t.recovery.record(gpa, t.io, path);
+    if (before == null or !std.mem.eql(u8, before.?, v.content)) try t.recovery.record(gpa, t.io, path, before, v.content);
     try t.file_state.remember(t.io, gpa, path, written);
     if (can_track) try t.noteChange(gpa, path, before, v.content) else t.bash_commands.changed(t.io);
     return .{ .ok = try std.fmt.allocPrint(gpa, "{{\"bytes\":{d}}}", .{v.content.len}) };

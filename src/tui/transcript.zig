@@ -51,6 +51,19 @@ pub const Transcript = struct {
         try t.entries.append(gpa, e);
     }
 
+    /// The line under a Turn footer; null `changes` adds nothing.
+    pub fn addChanges(t: *Transcript, gpa: std.mem.Allocator, changes: ?@import("transcript/changes.zig").TurnChanges) !void {
+        const c = changes orelse return;
+        defer gpa.free(c.head);
+        defer gpa.free(c.rows);
+        t.revision +%= 1;
+        var e: Entry = .{ .kind = .changes, .allocator = gpa };
+        errdefer e.deinit(gpa);
+        try e.label.appendSlice(gpa, c.head);
+        try e.text.appendSlice(gpa, c.rows);
+        try t.entries.append(gpa, e);
+    }
+
     pub fn backgroundResult(t: *Transcript, gpa: std.mem.Allocator, kind: BackgroundKind, id: []const u8, ok: bool, result: []const u8) !void {
         t.revision +%= 1;
         try t.settleBackgroundProgress(gpa, kind, id, ok);
@@ -210,7 +223,7 @@ pub const Transcript = struct {
         while (i > 0) {
             i -= 1;
             const k = t.entries.items[i].kind;
-            if (k == .run or k == .background or k == .failure) return i;
+            if (k == .run or k == .background or k == .failure or (k == .changes and !t.entries.items[i].simple)) return i;
         }
         return null;
     }
