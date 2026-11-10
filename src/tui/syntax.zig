@@ -44,57 +44,57 @@ pub fn langFromInfo(info: []const u8) ?Lang {
 }
 
 const zig_keywords = [_][]const u8{
-    "addrspace", "align",    "allowzero", "and",         "anyframe",       "anytype",     "asm",      "async",    "await",       "break",
-    "callconv",  "catch",    "comptime",  "const",       "continue",       "defer",       "else",     "enum",     "errdefer",    "error",
-    "export",    "extern",   "fn",        "for",         "if",             "inline",      "linksection", "noalias", "noinline",   "nosuspend",
-    "opaque",    "or",       "orelse",    "packed",      "pub",            "resume",      "return",   "struct",   "suspend",     "switch",
-    "test",      "threadlocal", "try",    "union",       "unreachable",    "usingnamespace", "var",   "volatile", "while",
+    "addrspace", "align",       "allowzero", "and",    "anyframe",    "anytype",        "asm",         "async",    "await",    "break",
+    "callconv",  "catch",       "comptime",  "const",  "continue",    "defer",          "else",        "enum",     "errdefer", "error",
+    "export",    "extern",      "fn",        "for",    "if",          "inline",         "linksection", "noalias",  "noinline", "nosuspend",
+    "opaque",    "or",          "orelse",    "packed", "pub",         "resume",         "return",      "struct",   "suspend",  "switch",
+    "test",      "threadlocal", "try",       "union",  "unreachable", "usingnamespace", "var",         "volatile", "while",
 };
 
 const js_keywords = [_][]const u8{
-    "abstract", "async",  "await",   "break",    "case",      "catch",      "class",    "const",   "continue", "debugger",
-    "declare",  "default", "delete", "do",       "else",      "enum",       "export",   "extends", "finally",  "for",
-    "function", "if",     "implements", "import", "in",       "instanceof", "interface", "let",    "namespace", "new",
-    "private",  "protected", "public", "readonly", "return",  "static",     "super",    "switch",  "this",     "throw",
-    "try",      "typeof", "var",     "void",     "while",     "with",       "yield",
+    "abstract", "async",     "await",      "break",    "case",   "catch",      "class",     "const",   "continue",  "debugger",
+    "declare",  "default",   "delete",     "do",       "else",   "enum",       "export",    "extends", "finally",   "for",
+    "function", "if",        "implements", "import",   "in",     "instanceof", "interface", "let",     "namespace", "new",
+    "private",  "protected", "public",     "readonly", "return", "static",     "super",     "switch",  "this",      "throw",
+    "try",      "typeof",    "var",        "void",     "while",  "with",       "yield",
 };
 
 const python_keywords = [_][]const u8{
-    "and",    "as",     "assert", "async",    "await", "break", "class",  "continue", "def",   "del",
-    "elif",   "else",   "except", "finally",  "for",   "from",  "global", "if",       "import", "in",
-    "is",     "lambda", "nonlocal", "not",    "or",    "pass",  "raise",  "return",   "try",   "while",
-    "with",   "yield",
+    "and",  "as",     "assert",   "async",   "await", "break", "class",  "continue", "def",    "del",
+    "elif", "else",   "except",   "finally", "for",   "from",  "global", "if",       "import", "in",
+    "is",   "lambda", "nonlocal", "not",     "or",    "pass",  "raise",  "return",   "try",    "while",
+    "with", "yield",
 };
 
 const shell_keywords = [_][]const u8{
-    "if",    "then",   "else",     "elif",   "fi",     "for",   "while",  "until", "do",    "done",
-    "case",  "esac",   "in",       "function", "select", "return", "break", "continue", "local", "export",
+    "if",       "then",    "else", "elif",     "fi",     "for",    "while", "until",    "do",    "done",
+    "case",     "esac",    "in",   "function", "select", "return", "break", "continue", "local", "export",
     "readonly", "declare",
 };
 
 const rust_keywords = [_][]const u8{
-    "as",     "async",  "await",  "break", "const",  "continue", "crate", "dyn",   "else",  "enum",
-    "extern", "fn",     "for",    "if",    "impl",   "in",       "let",   "loop",  "match", "mod",
-    "move",   "mut",    "pub",    "ref",   "return", "self",     "Self",  "static", "struct", "super",
-    "trait",  "type",   "unsafe", "use",   "where",  "while",
+    "as",     "async", "await",  "break", "const",  "continue", "crate", "dyn",    "else",   "enum",
+    "extern", "fn",    "for",    "if",    "impl",   "in",       "let",   "loop",   "match",  "mod",
+    "move",   "mut",   "pub",    "ref",   "return", "self",     "Self",  "static", "struct", "super",
+    "trait",  "type",  "unsafe", "use",   "where",  "while",
 };
 
 const go_keywords = [_][]const u8{
-    "break",  "case",   "chan",   "const", "continue", "default", "defer",  "else", "fallthrough", "for",
-    "func",   "go",     "goto",   "if",    "import",   "interface", "map",  "package", "range",   "return",
+    "break",  "case",   "chan",   "const", "continue", "default",   "defer", "else",    "fallthrough", "for",
+    "func",   "go",     "goto",   "if",    "import",   "interface", "map",   "package", "range",       "return",
     "select", "struct", "switch", "type",  "var",
 };
 
 const c_keywords = [_][]const u8{
-    "auto",   "break",  "case",    "const",  "continue", "default", "do",     "else",   "enum",    "extern",
-    "for",    "goto",   "if",      "inline", "register", "restrict", "return", "sizeof", "static",  "struct",
-    "switch", "typedef", "union",  "volatile", "while",
+    "auto",   "break",   "case",  "const",    "continue", "default",  "do",     "else",   "enum",   "extern",
+    "for",    "goto",    "if",    "inline",   "register", "restrict", "return", "sizeof", "static", "struct",
+    "switch", "typedef", "union", "volatile", "while",
 };
 
 const cpp_extra_keywords = [_][]const u8{
-    "catch",    "class",     "constexpr", "delete",  "explicit", "final",  "friend",   "mutable", "namespace", "new",
-    "noexcept", "nullptr",   "operator",  "override", "private", "protected", "public", "template", "this",    "throw",
-    "try",      "typename",  "using",     "virtual",
+    "catch",    "class",    "constexpr", "delete",   "explicit", "final",     "friend", "mutable",  "namespace", "new",
+    "noexcept", "nullptr",  "operator",  "override", "private",  "protected", "public", "template", "this",      "throw",
+    "try",      "typename", "using",     "virtual",
 };
 
 fn isKeyword(lang: Lang, word: []const u8) bool {
