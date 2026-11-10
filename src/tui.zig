@@ -701,20 +701,20 @@ pub const App = struct {
 
     fn predictNext(app: *App) void {
         if (app.turn != null or app.flow.active() or app.menu.isPinned() or !app.credentialed()) return;
-        var user: ?[]const u8 = null;
         var reply: ?[]const u8 = null;
         var i = app.session.history.items.len;
         while (i > 0) : (i -= 1) {
             const m = app.session.history.items[i - 1];
             const content = m.content orelse continue;
-            if (content.len == 0) continue;
-            if (reply == null and std.mem.eql(u8, m.role, "assistant")) reply = content;
-            if (std.mem.eql(u8, m.role, "user") and m.source == null) {
-                user = content;
+            if (content.len != 0 and std.mem.eql(u8, m.role, "assistant")) {
+                reply = content;
                 break;
             }
         }
-        app.prediction.start(app.gpa, app.io, app.loop, app.cfg, app.session.id, user orelse return, reply orelse return);
+        const recent = prediction.recentUserMessages(app.gpa, app.session.history.items) catch return;
+        defer app.gpa.free(recent);
+        if (recent.len == 0) return;
+        app.prediction.start(app.gpa, app.io, app.loop, app.cfg, app.session.id, recent, reply orelse return);
     }
 
     pub fn report(app: *App, kind: EntryKind, comptime fmt: []const u8, args: anytype) !void {

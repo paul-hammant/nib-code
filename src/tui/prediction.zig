@@ -7,15 +7,25 @@ const provider = @import("../provider.zig");
 const web = @import("../tools/web.zig");
 const tui = @import("../tui.zig");
 const Editor = @import("editor.zig").Editor;
+const skills = @import("../session/skills.zig");
 
 const timeout_ms = 15_000;
 const max_reply_bytes = 3 * 1024;
 const max_user_bytes = 1024;
+const max_recent = 8;
+const max_recent_message_bytes = 300;
+const max_recent_bytes = 3 * 1024;
 const max_tokens = 256;
 
-const instruction = "Predict the user's next message to this coding agent, as the user would type it, in the user's language. One line, at most 80 characters. If unsure, reply with nothing. Return only the text.";
+const instruction =
+    \\Predict the user's next message to this coding agent: the exact text they would type, in their language.
+    \\Match the length and tone of their recent messages; be short if they are short.
+    \\If the assistant's reply ends with a question or a proposal awaiting a decision, predict the user's answer.
+    \\One line, at most 80 characters. If unsure, output exactly NONE. Return only the text.
+;
 
-const acknowledgements = [_][]const u8{ "ok", "okay", "thanks", "thank you", "thx", "好的", "谢谢", "嗯" };
+const no_reply = [_][]const u8{ "none", "nothing", "(nothing)", "no reply", "no reply needed", "no response", "n/a", "na", "无", "无需回复", "不需要回复", "无需回应" };
+const thanks = [_][]const u8{ "thanks", "thank you", "thx", "谢谢", "感谢" };
 
 fn headEnd(text: []const u8, max: usize) usize {
     var end = @min(text.len, max);
@@ -29,15 +39,76 @@ fn tailStart(text: []const u8, max: usize) usize {
     return start;
 }
 
-/// The model input: the head of the user's message and the tail of the reply.
-pub fn buildInput(a: std.mem.Allocator, user: []const u8, reply: []const u8) ![]u8 {
-    return std.fmt.allocPrint(a, "User's last message:\n{s}\n\nAssistant's last reply:\n{s}", .{
-        user[0..headEnd(user, max_user_bytes)],
-        reply[tailStart(reply, max_reply_bytes)..],
-    });
+/// Typed user messages, newest last, borrowed from the history; skips background and undo messages.
+pub fn recentUserMessages(a: std.mem.Allocator, history: []const provider.Message) ![][]const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(a);
+    var i = history.len;
+    while (i > 0 and out.items.len < max_recent) : (i -= 1) {
+        const m = history[i - 1];
+        if (m.source != null or !std.mem.eql(u8, m.role, "user")) continue;
+        const text = std.mem.trim(u8, skills.typed(m.content orelse continue), " \t\r\n");
+        if (text.len != 0) try out.append(a, text);
+    }
+    std.mem.reverse([]const u8, out.items);
+    return out.toOwnedSlice(a);
 }
 
-/// First line without surrounding quotes, owned; null when empty or a trivial acknowledgement.
+/// The model input: the user's recent messages (oldest first), the head of the last one and the tail of the reply.
+pub fn buildInput(a: std.mem.Allocator, recent: []const []const u8, reply: []const u8) ![]u8 {
+    const last = if (recent.len > 0) recent[recent.len - 1] else "";
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    var first: usize = recent.len;
+    var used: usize = 0;
+    while (first > 0) {
+        const n = headEnd(recent[first - 1], max_recent_message_bytes) + 3;
+        if (used + n > max_recent_bytes) break;
+        used += n;
+        first -= 1;
+    }
+    if (first < recent.len) {
+        try out.appendSlice(a, "User's recent messages, oldest first:\n");
+        for (recent[first..]) |text| {
+            try out.appendSlice(a, "- ");
+            for (text[0..headEnd(text, max_recent_message_bytes)]) |c| try out.append(a, if (c == '\n' or c == '\r') ' ' else c);
+            try out.append(a, '\n');
+        }
+        try out.append(a, '\n');
+    }
+    try out.print(a, "User's last message:\n{s}\n\nAssistant's last reply:\n{s}", .{
+        last[0..headEnd(last, max_user_bytes)],
+        reply[tailStart(reply, max_reply_bytes)..],
+    });
+    return out.toOwnedSlice(a);
+}
+
+fn matchesAny(text: []const u8, list: []const []const u8) bool {
+    for (list) |item| if (std.ascii.eqlIgnoreCase(text, item)) return true;
+    return false;
+}
+
+const punctuation = [_][]const u8{ ".", "!", ",", ":", ";", "*", "_", "[", "]", "(", ")", "<", ">", "\"", "'", "`", " ", "。", "！", "，", "：", "；", "（", "）", "《", "》", "“", "”", "「", "」" };
+
+fn trimPunctuation(text: []const u8) []const u8 {
+    var t = text;
+    outer: while (t.len > 0) {
+        for (punctuation) |p| {
+            if (std.mem.startsWith(u8, t, p)) {
+                t = t[p.len..];
+                continue :outer;
+            }
+            if (std.mem.endsWith(u8, t, p)) {
+                t = t[0 .. t.len - p.len];
+                continue :outer;
+            }
+        }
+        break;
+    }
+    return t;
+}
+
+/// First line without surrounding quotes, owned; null when empty, "no reply" or a thanks.
 pub fn filter(gpa: std.mem.Allocator, raw: []const u8) !?[]u8 {
     const first = std.mem.sliceTo(std.mem.trim(u8, raw, " \t\r\n"), '\n');
     var line = std.mem.trim(u8, first, " \t\r");
@@ -50,8 +121,8 @@ pub fn filter(gpa: std.mem.Allocator, raw: []const u8) !?[]u8 {
     }
     const chars = std.unicode.utf8CountCodepoints(line) catch return null;
     if (chars < 2) return null;
-    const bare = std.mem.trimEnd(u8, line, ".!。！");
-    for (acknowledgements) |ack| if (std.ascii.eqlIgnoreCase(bare, ack)) return null;
+    const bare = trimPunctuation(line);
+    if (bare.len == 0 or matchesAny(bare, &no_reply) or matchesAny(bare, &thanks)) return null;
     return try gpa.dupe(u8, line);
 }
 
@@ -174,13 +245,13 @@ pub const State = struct {
     }
 
     /// Starts a request for the next message; any failure to start is silent.
-    pub fn start(s: *State, gpa: std.mem.Allocator, io: std.Io, loop: *vaxis.Loop(tui.Event), session_cfg: provider.Config, session_id: []const u8, user: []const u8, reply: []const u8) void {
+    pub fn start(s: *State, gpa: std.mem.Allocator, io: std.Io, loop: *vaxis.Loop(tui.Event), session_cfg: provider.Config, session_id: []const u8, recent: []const []const u8, reply: []const u8) void {
         s.invalidate(gpa);
         s.reap();
-        startWorker(s, gpa, io, loop, session_cfg, session_id, user, reply) catch {};
+        startWorker(s, gpa, io, loop, session_cfg, session_id, recent, reply) catch {};
     }
 
-    fn startWorker(s: *State, gpa: std.mem.Allocator, io: std.Io, loop: *vaxis.Loop(tui.Event), session_cfg: provider.Config, session_id: []const u8, user: []const u8, reply: []const u8) !void {
+    fn startWorker(s: *State, gpa: std.mem.Allocator, io: std.Io, loop: *vaxis.Loop(tui.Event), session_cfg: provider.Config, session_id: []const u8, recent: []const []const u8, reply: []const u8) !void {
         var cfg = session_cfg;
         cfg.model = provider.smallModel(cfg.provider) orelse cfg.model;
         try cfg.setEffort("off");
@@ -191,7 +262,7 @@ pub const State = struct {
         errdefer gpa.destroy(w);
         const key = try std.fmt.allocPrint(gpa, "{s}:predict", .{session_id});
         errdefer gpa.free(key);
-        const input = try buildInput(gpa, user, reply);
+        const input = try buildInput(gpa, recent, reply);
         errdefer gpa.free(input);
         w.* = .{ .gpa = gpa, .io = io, .loop = loop, .cfg = cfg, .cache_key = key, .input = input, .generation = s.generation };
         w.thread = try std.Thread.spawn(.{}, Worker.run, .{w});
@@ -211,18 +282,55 @@ test "input keeps the head of the user message and the tail of the reply on code
     defer a.free(reply);
     @memset(reply, '2');
     @memcpy(reply[reply.len - 3 ..], "end");
-    const text = try buildInput(a, user, reply);
+    const text = try buildInput(a, &.{user}, reply);
     defer a.free(text);
-    try testing.expectEqual(@as(usize, max_user_bytes), std.mem.count(u8, text, "1"));
+    try testing.expectEqual(@as(usize, max_user_bytes + max_recent_message_bytes), std.mem.count(u8, text, "1"));
     try testing.expectEqual(@as(usize, max_reply_bytes - 3), std.mem.count(u8, text, "2"));
     try testing.expect(std.mem.endsWith(u8, text, "2end"));
 
     const wide = try a.alloc(u8, 6000);
     defer a.free(wide);
     for (0..2000) |i| @memcpy(wide[i * 3 ..][0..3], "界");
-    const cut = try buildInput(a, wide, wide);
+    const cut = try buildInput(a, &.{wide}, wide);
     defer a.free(cut);
     try testing.expect(std.unicode.utf8ValidateSlice(cut));
+}
+
+test "input lists recent messages oldest first, cut and capped" {
+    const a = testing.allocator;
+    const text = try buildInput(a, &.{ "合并", "ship 0.11.1\nnow" }, "done");
+    defer a.free(text);
+    try testing.expectEqualStrings("User's recent messages, oldest first:\n- 合并\n- ship 0.11.1 now\n\nUser's last message:\nship 0.11.1\nnow\n\nAssistant's last reply:\ndone", text);
+
+    const long: [400]u8 = @splat('x');
+    var many: [20][]const u8 = undefined;
+    for (&many, 0..) |*m, i| m.* = if (i == 19) "newest" else &long;
+    const capped = try buildInput(a, &many, "r");
+    defer a.free(capped);
+    const section = capped[0..std.mem.indexOf(u8, capped, "\n\nUser's last").?];
+    try testing.expect(section.len <= max_recent_bytes + 64);
+    try testing.expect(std.mem.endsWith(u8, section, "- newest"));
+    try testing.expectEqual(@as(usize, 11), std.mem.count(u8, section, "\n- "));
+
+    const none = try buildInput(a, &.{}, "r");
+    defer a.free(none);
+    try testing.expect(std.mem.startsWith(u8, none, "User's last message:"));
+}
+
+test "recent user messages skip background, undo and skill blocks" {
+    const a = testing.allocator;
+    const history = [_]provider.Message{
+        .{ .role = "user", .content = "one" },
+        .{ .role = "assistant", .content = "a" },
+        .{ .role = "user", .content = "bg", .source = .background },
+        .{ .role = "user", .content = "two" ++ skills.mention_intro ++ "\n\n<skill name=\"x\">y</skill>" },
+        .{ .role = "user", .content = "  " },
+    };
+    const got = try recentUserMessages(a, &history);
+    defer a.free(got);
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqualStrings("one", got[0]);
+    try testing.expectEqualStrings("two", got[1]);
 }
 
 test "filter keeps the first line without quotes and drops trivia" {
@@ -231,13 +339,17 @@ test "filter keeps the first line without quotes and drops trivia" {
         .{ "  \"run the tests\"\nextra", "run the tests" },
         .{ "“修一下这个 bug”", "修一下这个 bug" },
         .{ "commit it", "commit it" },
+        .{ "可以", "可以" },
+        .{ "合并", "合并" },
+        .{ "ok", "ok" },
+        .{ "好的", "好的" },
     };
     for (keep) |pair| {
         const got = (try filter(a, pair[0])).?;
         defer a.free(got);
         try testing.expectEqualStrings(pair[1], got);
     }
-    for ([_][]const u8{ "", "  \n ", "a", "\"\"", "ok", "Thanks!", "谢谢" }) |raw| {
+    for ([_][]const u8{ "", "  \n ", "a", "\"\"", "Thanks!", "谢谢", "感谢", "thx", "NONE", "none.", "\"NONE\"", "(nothing)", "Nothing", "No reply needed.", "N/A", "无需回复", "无", "不需要回复", "（无需回复）" }) |raw| {
         try testing.expect((try filter(a, raw)) == null);
     }
 }
