@@ -148,7 +148,7 @@ def tui_toggle():
         with fixture(directory, [reply], config=MCP().stdio_config(enabled=False)) as (terminal, home, _):
             config = home / "config.toml"
             terminal.send("/mcp\r")
-            terminal.until(b"local  off")
+            terminal.until(b"Applies to new sessions.")
             terminal.send("/mcp on local\r")
             wait_for(lambda: "local = true" in config.read_text(), "MCP enabled")
             terminal.until(b"Applies to new sessions.")

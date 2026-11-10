@@ -1892,7 +1892,7 @@ test "file paths are links only when open is configured; a click runs the comman
     _ = try app.handle(hover);
     try std.testing.expectEqual(@as(?Link, null), app.link);
 
-    app.cfg.open = "/bin/true {path}:{line}";
+    app.cfg.open = "/usr/bin/env true {path}:{line}";
     _ = try app.handle(hover);
     try std.testing.expectEqual(@as(?Link, .{ .row = 0, .x0 = 4, .x1 = 15 }), app.link);
     _ = try app.handle(mouseEvent(20, 0, .motion));
