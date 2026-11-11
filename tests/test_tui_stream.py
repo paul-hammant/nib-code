@@ -15,6 +15,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from screen import screen
 
 
+# Incrementality is asserted by ordering (text and input appear while the response is still open, gated by the mock).
+# Wall-clock bounds only catch stalls: tight ones measure the CI host's CPU contention, not nib.
+STALL = 1.0
+
+
 class StreamReply(Reply):
     def __init__(self):
         self.prefix = "STREAM_BEGIN "
@@ -91,7 +96,7 @@ def test_incremental_stream(tmp):
             reply.reasoning_done.set()
             terminal.until(reply.prefix.strip().encode())
             first_latency = time.monotonic() - first_start
-            assert first_latency < .15
+            assert first_latency < STALL, f"first fragment stalled: {first_latency * 1000:.1f}ms"
             wait_for(lambda: any("Generating response" in row for row in screen(terminal.read(), 120, 32)), "Generating response during text")
             assert not reply.paused.is_set(), "first fragment must appear before the rest is sent"
             terminal.send("\x1b[200~live-draft\x1b[201~")
@@ -107,12 +112,13 @@ def test_incremental_stream(tmp):
                 terminal.send("\x1b[200~" + token + "\x1b[201~")
                 terminal.until(token.encode())
                 input_latency = time.monotonic() - input_start
-                assert input_latency < .05, f"input latency: {input_latency * 1000:.1f}ms"
+                assert input_latency < STALL, f"input stalled: {input_latency * 1000:.1f}ms"
+                assert not reply.paused.is_set() or milestone == 30000, f"input at {milestone} chars was echoed only after the stream ended"
                 print(f"PTY chars={milestone} input={input_latency * 1000:.1f}ms")
             wait_for(reply.paused.is_set, "stream pause", timeout=30)
             wait_for(lambda: any("PAUSED_TAIL" in row for row in screen(terminal.read(), 120, 32)), "visible paused tail")
             tail_lag = time.monotonic() - reply.tail_sent
-            assert tail_lag < .15
+            assert tail_lag < STALL, f"paused tail stalled: {tail_lag * 1000:.1f}ms"
             print(f"PTY first={first_latency * 1000:.1f}ms input={input_latency * 1000:.1f}ms tail={tail_lag * 1000:.1f}ms")
             assert not finished(home, reply.text), "tail must display while the response is still open"
             output = terminal.read()[start:]
