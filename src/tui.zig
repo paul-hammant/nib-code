@@ -42,7 +42,7 @@ pub const Event = union(enum) {
     tool_activity: []const u8,
     model_activity: struct { state: ModelActivity, at: std.Io.Clock.Timestamp },
     /// Slices are owned by the receiver.
-    step: struct { n: u32, effort: []u8, source: provider.EffortSource },
+    step: struct { n: u32, effort: []u8 },
     delta: struct { kind: provider.Kind, text: []u8, step: u32 },
     run_start: struct { code: []u8, step: u32 },
     run_end: struct { background_id: ?[]const u8 = null, ok: bool, output: []u8, changes: ChangeText, tool_summary: ?ToolSummary = null },
@@ -439,7 +439,7 @@ pub const App = struct {
             },
             .step => |s| {
                 app.clearStepEffort();
-                app.step_effort = .{ .effort = s.effort, .source = s.source };
+                app.step_effort = .{ .effort = s.effort };
                 event.step.effort = &.{};
                 app.live_steps = s.n;
             },
@@ -1399,7 +1399,7 @@ test "quit drains owned events and closed queues reject Turn payloads without le
         var turn: Turn = .{ .gpa = t.allocator, .session = &session, .loop = &loop, .text = "" };
         const changes: []const @import("tools/diff.zig").Change = &.{.{ .path = "changed.txt", .added = 1, .removed = 0, .diff = "+new\n" }};
         const events = [_]SessionEvent{
-            .{ .step = .{ .n = 1, .effort = "high", .source = .model } },
+            .{ .step = .{ .n = 1, .effort = "high" } },
             .{ .delta = .{ .kind = .text, .text = "answer" } },
             .{ .run_start = "tools.write({})" },
             .{ .run_end = .{ .background_id = "r1", .ok = true, .output = "registered", .changes = changes, .tool_summary = .{ .counts = &.{.{ .name = "write", .count = 1 }} } } },
@@ -1484,14 +1484,14 @@ test "Step events own effort and Runs keep their generating Step metadata" {
     turn.gpa = t.allocator;
     turn.loop = &loop;
     var effort = [_]u8{ 'h', 'i', 'g', 'h' };
-    try Turn.emit(&turn, .{ .step = .{ .n = 3, .effort = &effort, .source = .guard } });
+    try Turn.emit(&turn, .{ .step = .{ .n = 3, .effort = &effort } });
     effort[0] = 'x';
     _ = try app.handle((try loop.tryEvent()).?);
     try t.expectEqual(@as(u32, 3), app.live_steps);
     app.turn_runs = 0;
     _ = try app.handle(.{ .run_start = .{ .code = try t.allocator.dupe(u8, "tools.read({})"), .step = 3 } });
     _ = try app.handle(.{ .run_end = .{ .ok = true, .output = try t.allocator.dupe(u8, "out"), .changes = .{} } });
-    _ = try app.handle(.{ .step = .{ .n = 4, .effort = try t.allocator.dupe(u8, "low"), .source = .model } });
+    _ = try app.handle(.{ .step = .{ .n = 4, .effort = try t.allocator.dupe(u8, "low") } });
     try t.expectEqualStrings("high", app.transcript.entries.items[0].step_effort.?.effort);
     try t.expectEqualStrings("low", app.step_effort.?.effort);
     try t.expectEqualStrings("Run", app.transcript.entries.items[0].label.items);

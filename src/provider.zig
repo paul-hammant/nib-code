@@ -174,6 +174,13 @@ pub const Config = struct {
         return cfg.reasoning_effort orelse if (cfg.thinking == true) "on (server default effort)" else "server default";
     }
 
+    /// Effort name logged per Step: the effective effort, with server defaults as "default".
+    pub fn loggedEffort(cfg: Config) []const u8 {
+        const effective = cfg.effectiveEffort();
+        if (std.mem.eql(u8, effective, "server default") or std.mem.eql(u8, effective, "on (server default effort)")) return "default";
+        return effective;
+    }
+
     /// What a 401 asks the user to check, without revealing any key.
     pub fn keyHint(cfg: Config) []const u8 {
         return if (cfg.key_source == .store) "the key stored by nib (run nib login)" else cfg.api_key_env orelse "API key";
@@ -206,11 +213,8 @@ pub const Reasoning = struct {
     includes_output: bool = false,
 };
 
-pub const EffortSource = enum { model, default, guard };
-
 pub const StepEffort = struct {
     effort: []const u8,
-    source: EffortSource,
 };
 
 pub const Message = struct {

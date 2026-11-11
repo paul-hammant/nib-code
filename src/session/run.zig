@@ -4,7 +4,6 @@ const provider = @import("../provider.zig");
 const Change = @import("../tools/diff.zig").Change;
 const Image = @import("../image.zig").Image;
 const output_format = @import("output.zig");
-const effort = @import("effort.zig");
 const ToolSummary = @import("tool_summary.zig").Summary;
 const Session = @import("../session.zig").Session;
 const Sink = @import("../session.zig").Sink;
@@ -79,7 +78,7 @@ pub const PollTarget = struct {
     }
 };
 
-pub const Executed = struct { images: []const Image = &.{}, output: []const u8, ok: bool, empty: bool = false, run_ms: ?u64 = null, effort: ?effort.Declaration = null, remaining_steps: ?usize = null, tool_summary: ?ToolSummary = null, background_id: ?[]const u8 = null };
+pub const Executed = struct { images: []const Image = &.{}, output: []const u8, ok: bool, empty: bool = false, run_ms: ?u64 = null, remaining_steps: ?usize = null, tool_summary: ?ToolSummary = null, background_id: ?[]const u8 = null };
 
 /// Output is arena-owned.
 pub fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const std.atomic.Value(bool), timing: *sandbox.RunTiming) !Executed {
@@ -87,15 +86,13 @@ pub fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const 
     if (!std.mem.eql(u8, call.function.name, "run"))
         return .{ .ok = false, .output = try std.fmt.allocPrint(a, "error: unknown tool `{s}`; the only tool is `run`", .{call.function.name}) };
 
-    const Args = struct { code: ?std.json.Value = null, effort: ?effort.Declaration = null };
+    const Args = struct { code: ?std.json.Value = null };
     const args = std.json.parseFromSlice(Args, s.gpa, call.function.arguments, .{ .ignore_unknown_fields = true }) catch
         return .{ .ok = false, .output = try a.dupe(u8, "error: arguments must be a JSON object { \"code\": string }") };
     defer args.deinit();
 
     const code = if (args.value.code) |value| (if (value == .string) value.string else null) else null;
-    if (code == null) return .{ .ok = false, .output = try a.dupe(u8, "error: arguments must be a JSON object { \"code\": string }"), .effort = args.value.effort };
-    const declaration = if (std.mem.eql(u8, call.type, "custom")) effort.fromCode(s.gpa, code.?) catch
-        return .{ .ok = false, .output = "error: invalid first-line // @run: pragma; use {\"effort\":\"low|medium|high|default\"}. Fix the script and continue the task." } else args.value.effort;
+    if (code == null) return .{ .ok = false, .output = try a.dupe(u8, "error: arguments must be a JSON object { \"code\": string }") };
     try sink.emit(sink.ctx, .{ .run_start = code.? });
     const before_omitted = timing.omitted;
     const started: std.Io.Clock.Timestamp = .now(s.io, .awake);
@@ -117,7 +114,7 @@ pub fn execute(s: *Session, call: provider.ToolCall, sink: Sink, cancel: *const 
     const tool_summary = try ToolSummary.init(a, timing.entries[0..timing.count], timing.run_index, timing.omitted - before_omitted);
     try tool_summary.annotateViews(a, ran.?.images);
     try sink.emit(sink.ctx, .{ .run_end = .{ .ok = o.ok, .output = output, .changes = ran.?.changes, .tool_summary = tool_summary } });
-    return .{ .output = output, .ok = o.ok, .empty = std.mem.eql(u8, o.text, "undefined") and std.mem.trim(u8, o.logs, " \t\r\n").len == 0, .run_ms = run_ms, .effort = declaration, .remaining_steps = remaining_steps, .tool_summary = tool_summary, .images = ran.?.images };
+    return .{ .output = output, .ok = o.ok, .empty = std.mem.eql(u8, o.text, "undefined") and std.mem.trim(u8, o.logs, " \t\r\n").len == 0, .run_ms = run_ms, .remaining_steps = remaining_steps, .tool_summary = tool_summary, .images = ran.?.images };
 }
 
 fn executeTimed(s: *Session, code: []const u8, cancel: *const std.atomic.Value(bool), timing: *sandbox.RunTiming, sink: Sink) !?Ran {

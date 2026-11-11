@@ -583,7 +583,7 @@ pub const Transcript = struct {
     fn addRun(t: *Transcript, gpa: std.mem.Allocator, code: []const u8, open: bool, effort: ?provider.StepEffort) !void {
         var e: Entry = .{ .kind = .run, .open = open };
         errdefer e.deinit(gpa);
-        if (effort) |value| e.step_effort = .{ .effort = try gpa.dupe(u8, value.effort), .source = value.source };
+        if (effort) |value| e.step_effort = .{ .effort = try gpa.dupe(u8, value.effort) };
         try e.text.appendSlice(gpa, std.mem.trim(u8, code, "\n"));
         try e.refreshLabel(gpa);
         try t.entries.append(gpa, e);
@@ -1058,16 +1058,15 @@ test "Run retains effort metadata without exposing it in the title" {
     var t: Transcript = .{};
     defer t.deinit(gpa);
     for ([_]provider.StepEffort{
-        .{ .effort = "low", .source = .model },
-        .{ .effort = "high", .source = .default },
-        .{ .effort = "high", .source = .guard },
-        .{ .effort = "default", .source = .default },
+        .{ .effort = "low" },
+        .{ .effort = "high" },
+        .{ .effort = "default" },
     }) |effort| {
         try t.startRunWithEffort(gpa, "tools.edit({})", effort);
         const e = &t.entries.items[t.entries.items.len - 1];
         try testing.expectEqualStrings(effort.effort, e.step_effort.?.effort);
         try testing.expectEqualStrings("Run · running", e.label.items);
-        try t.endRun(gpa, effort.source != .guard, "output", 1234, .{ .summary = try gpa.dupe(u8, "a.zig +1 −0") });
+        try t.endRun(gpa, true, "output", 1234, .{ .summary = try gpa.dupe(u8, "a.zig +1 −0") });
         try testing.expectEqualStrings("Run", e.label.items);
         try testing.expectEqualStrings("a.zig +1 −0", e.changes.summary);
     }
@@ -1080,7 +1079,7 @@ test "history Run effort is copied from assistant metadata and absent in legacy 
     var effort = [_]u8{ 'h', 'i', 'g', 'h' };
     const calls: []const provider.ToolCall = &.{.{ .id = "1", .function = .{ .name = "run", .arguments = "{\"code\":\"tools.bash({})\"}" } }};
     try t.addHistory(gpa, &.{
-        .{ .role = "assistant", .tool_calls = calls, .step_effort = .{ .effort = &effort, .source = .guard } },
+        .{ .role = "assistant", .tool_calls = calls, .step_effort = .{ .effort = &effort } },
         .{ .role = "tool", .tool_call_id = "1", .content = "out" },
         .{ .role = "assistant", .tool_calls = calls },
         .{ .role = "tool", .tool_call_id = "1", .content = "out" },

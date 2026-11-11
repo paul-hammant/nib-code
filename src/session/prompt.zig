@@ -6,9 +6,7 @@ pub const tools_json =
     \\[{"type":"function","function":{"name":"run",
     \\"description":"Run JavaScript in a fresh sandbox. The `tools` API it can call is described in the system prompt.",
     \\"parameters":{"type":"object","properties":{"code":{"type":"string",
-    \\"description":"JavaScript source. Top-level await is allowed; the last expression's value is returned."},
-    \\"effort":{"type":"string","enum":["low","medium","high","default"],
-    \\"description":"Reasoning effort for only the next model request after this Run; default restores the user setting."}},
+    \\"description":"JavaScript source. Top-level await is allowed; the last expression's value is returned."}},
     \\"required":["code"]}}}]
 ;
 
@@ -84,23 +82,19 @@ pub const system_template =
     \\- The last expression and console.log output share {s} per Run, truncated by console call and final result with markers; tool results inside JS remain complete. Locate with grep, then read needed line ranges. Large multi-file output can exceed this display budget: batch reads or print only needed snippets.
     \\- Before full builds/tests, finish implementation, known regression tests, expected results/fixtures and formatting; aim for one full validation. On failure, fix the failures and revalidate. Keep all necessary checks.
     \\- A run script's syntax or runtime error means the script needs correction. Fix it and continue the task; do not end the Turn just because a script failed.
-    \\- run's effort sets reasoning for only the next model request; lower effort answers faster but reasons less.{s}
     \\{s}
     \\When the task is done, answer the user directly without calling the tool.
 ;
-
-const codex_effort_cache_fact = "Codex prompt caches are effort-specific: measured median hit rates were 96% with unchanged effort and 0% just after a switch, potentially billing the full context as uncached. Run failure or user interjection automatically restores the user's effort, so one downgrade typically causes two cache misses.";
 
 pub fn renderSystem(a: std.mem.Allocator, cwd: []const u8, host: *const tools.Tools, environ: ?*const std.process.Environ.Map) ![]const u8 {
     const docs = try host.documentation(a);
     defer a.free(docs);
     const lines = try patchLines(a, environ);
     defer a.free(lines);
-    const effort_cache = if (host.cfg != null and host.cfg.?.provider == .codex) "\n- " ++ codex_effort_cache_fact else "";
     const bytes = if (host.cfg) |cfg| cfg.limits.run_output_bytes else @import("output.zig").max_bytes;
     const budget = if (bytes % 1024 == 0) try std.fmt.allocPrint(a, "{d} KiB", .{bytes / 1024}) else try std.fmt.allocPrint(a, "{d} bytes", .{bytes});
     defer a.free(budget);
-    return std.fmt.allocPrint(a, system_template, .{ cwd, docs, budget, effort_cache, lines });
+    return std.fmt.allocPrint(a, system_template, .{ cwd, docs, budget, lines });
 }
 
 pub fn turnBudgetText(a: std.mem.Allocator, system: []const u8, max_steps: ?usize, user_text: []const u8) ![]const u8 {
@@ -169,25 +163,13 @@ test "system prompt renders configured Run display budget" {
     try t.expect(std.mem.indexOf(u8, system, "known regression tests, expected results/fixtures and formatting") != null);
 }
 
-test "only Codex system prompts include effort cache facts, independent of patches" {
+test "system prompt never mentions run effort" {
     const t = std.testing;
     var host: tools.Tools = .{ .io = t.io, .home = "/unused", .cfg = .{ .provider = .codex, .base_url = "", .api_key = "", .model = @import("../provider/responses.zig").default_model } };
-    var env: std.process.Environ.Map = .init(t.allocator);
-    defer env.deinit();
-    try env.put("NIB_PATCHES_OFF", "all");
-    inline for (.{ @import("../provider.zig").Id.codex, .chat_completions }) |id| {
-        host.cfg.?.provider = id;
-        const system = try renderSystem(t.allocator, "/work", &host, &env);
-        defer t.allocator.free(system);
-        const fact = std.mem.indexOf(u8, system, codex_effort_cache_fact);
-        try t.expectEqual(id == .codex, fact != null);
-        if (fact) |index| {
-            const effort = std.mem.indexOf(u8, system, "run's effort sets reasoning").?;
-            try t.expect(effort < index);
-            try t.expect(std.mem.endsWith(u8, system[effort..index], "reasons less.\n- "));
-        }
-        for (patches) |patch| try t.expect(std.mem.indexOf(u8, system, patch.text) == null);
-    }
+    const system = try renderSystem(t.allocator, "/work", &host, null);
+    defer t.allocator.free(system);
+    try t.expect(std.mem.indexOf(u8, system, "run's effort") == null);
+    try t.expect(std.mem.indexOf(u8, system, "effort-specific") == null);
 }
 
 test "prompt patches can be disabled individually or all at once" {
@@ -261,7 +243,7 @@ test "json-escape patch example survives JS parsing verbatim" {
     try std.testing.expectEqualStrings("` ${x} \\path \"quoted\"\n", content);
 }
 
-test "run schema exposes optional one-shot effort enum" {
+test "run schema takes only code" {
     const t = std.testing;
     const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, tools_json, .{});
     defer parsed.deinit();
@@ -269,9 +251,7 @@ test "run schema exposes optional one-shot effort enum" {
     const required = parameters.object.get("required").?.array.items;
     try t.expectEqual(@as(usize, 1), required.len);
     try t.expectEqualStrings("code", required[0].string);
-    const values = parameters.object.get("properties").?.object.get("effort").?.object.get("enum").?.array.items;
-    try t.expectEqual(@as(usize, 4), values.len);
-    inline for (.{ "low", "medium", "high", "default" }, 0..) |value, index| try t.expectEqualStrings(value, values[index].string);
+    try t.expectEqual(@as(usize, 1), parameters.object.get("properties").?.object.count());
 }
 
 test "Step budget facts leave unlimited prompts unchanged" {

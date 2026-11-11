@@ -557,12 +557,12 @@ class EffortStats:
         self.groups = {}
         self.cache_transitions = {}
 
-    def add(self, record, run_statuses):
+    def add(self, record):
         effort = record.get('effort')
         if not isinstance(effort, str) or not effort.strip():
             return
         group = self.groups.setdefault(effort, dict(steps=0, model_ms=[], steps_with_cache_usage=0,
-            prompt_tokens=0, prompt_cache_hit_tokens=0, downgraded=Counter()))
+            prompt_tokens=0, prompt_cache_hit_tokens=0))
         group['steps'] += 1
         if number(record.get('model_ms')):
             group['model_ms'].append(record['model_ms'])
@@ -571,13 +571,6 @@ class EffortStats:
             group['steps_with_cache_usage'] += 1
             for key in CACHE_TOKEN_KEYS:
                 group[key] += usage[key]
-        downgraded = record.get('effort_downgraded')
-        if record.get('effort_source') == 'model' and (downgraded is None or downgraded is True):
-            counts = group['downgraded']
-            counts['steps'] += 1
-            counts['steps_with_runs'] += bool(run_statuses)
-            counts['steps_with_failed_run'] += any(ok is False for ok in run_statuses)
-            counts['steps_with_unknown_run_status'] += any(ok is None for ok in run_statuses)
 
     def add_transition(self, previous, record, header):
         if previous is None:
@@ -597,25 +590,16 @@ class EffortStats:
         transitions[kind].append(usage['prompt_cache_hit_tokens'] / usage['prompt_tokens'])
 
     def report(self):
-        def downgrade_summary(counts):
-            result = {key: counts[key] for key in ('steps', 'steps_with_runs', 'steps_with_failed_run',
-                                                  'steps_with_unknown_run_status')}
-            result['run_failure_rate'] = (counts['steps_with_failed_run'] / counts['steps_with_runs']
-                                          if counts['steps_with_runs'] else None)
-            return result
-
-        groups, total = {}, Counter()
+        groups = {}
         for effort, group in sorted(self.groups.items()):
-            total.update(group['downgraded'])
             groups[effort] = dict(group, model_ms=distribution(group['model_ms']),
                 cache_hit_rate=group['prompt_cache_hit_tokens'] / group['prompt_tokens']
-                               if group['prompt_tokens'] else None,
-                downgraded=downgrade_summary(group['downgraded']))
+                               if group['prompt_tokens'] else None)
         def cache_summary(values):
             return dict(samples=len(values), median=median(values) if values else None,
                         mean=sum(values) / len(values) if values else None)
 
-        return dict(by_effort=groups, downgraded=downgrade_summary(total),
+        return dict(by_effort=groups,
                     cache_transitions=[dict(provider=provider, model=model,
                         **{kind: cache_summary(values) for kind, values in transitions.items()})
                         for (provider, model), transitions in sorted(self.cache_transitions.items())])
@@ -737,7 +721,7 @@ class Timing:
         self.bash_sources = Counter(recorded=0, static=0)
 
     def add(self, record, sources, run_statuses=(), recorded_commands=None):
-        self.effort.add(record, run_statuses)
+        self.effort.add(record)
         for key in ('model_ms', 'run_ms', 'first_data_ms', 'max_gap_ms', 'attempts'):
             if number(record.get(key)):
                 self.values[key].append(record[key])
@@ -1281,7 +1265,7 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
             'notes': ["Only selected records count; failure rates use explicit run_results only; token=prompt+completion (cache is not added again), cache rate uses prompt as denominator; error categories may overlap, and tool/command counts are static estimates.",
                       "Average Turn time includes only finished Turns with all Steps selected and ms present; --since uses record at (local dates), with missing or invalid at falling back to file modification time.",
                       f"Time sources: {time_filter['selected_records_with_at']} records by at, {time_filter['selected_records_using_mtime']} records using file time (including {time_filter['selected_steps_using_mtime']} complete Steps); timing uses valid fields only, without zero-fill; p90=nearest-rank; first_data_ms is the first receipt of any stream data, not a content token; model_ms includes retries/backoff.",
-                      "run_ms is total Run time within a Step; run_result_ms is per Run; code_first_ms is the wait for the first code fragment, code_span_ms=last-first, and streaming is the fraction >50 ms. calls includes failures; parallel durations can overlap. Bash timing splits on &&/||/;/|/newlines (excluding quoted text and heredoc bodies), joining each segment's first two words with \u2192; prefer actual args.command from calls.jsonl, falling back to static literals for old logs. timing.bash.sources counts successfully grouped recorded/static entries; unjoinable or ungroupable entries are unmatched. Durations remain whole-bash durations, not subcommand durations. Write-to-validation still uses only static extraction; the shared classifier also recognizes git status/log/fetch/show, gh pr view/checks, and tail/cat/ls/head/pwd. These status commands may increase hits; read still does not count as validation-only. timing.effort.by_effort groups complete Steps by top-level effort, skipping missing effort but counting Steps without timing; cache rate is the ratio of sums of valid prompt/cache pairs. timing.effort.cache_transitions groups by header provider/model (unknown if missing), comparing equal/different effort in adjacent selected complete Steps of the same Turn, and reports samples/median/mean of later-Step cache/prompt (equal Step weights, not token weights). Skip pairs missing effort or valid prompt/cache; later prompt must be positive. Do not cross filters/cancellations/compaction gaps or zero-fill. For each group and timing.effort.downgraded, effort_source=model with effort_downgraded=true or missing/null counts as downgraded (known equal effort should record false). run_failure_rate=steps_with_failed_run/steps_with_runs, joining only Runs produced by this Step's model response; any explicit ok=false means failure. Unknown statuses remain in the denominator and are listed as steps_with_unknown_run_status; Steps without Runs are excluded."]}
+                      "run_ms is total Run time within a Step; run_result_ms is per Run; code_first_ms is the wait for the first code fragment, code_span_ms=last-first, and streaming is the fraction >50 ms. calls includes failures; parallel durations can overlap. Bash timing splits on &&/||/;/|/newlines (excluding quoted text and heredoc bodies), joining each segment's first two words with \u2192; prefer actual args.command from calls.jsonl, falling back to static literals for old logs. timing.bash.sources counts successfully grouped recorded/static entries; unjoinable or ungroupable entries are unmatched. Durations remain whole-bash durations, not subcommand durations. Write-to-validation still uses only static extraction; the shared classifier also recognizes git status/log/fetch/show, gh pr view/checks, and tail/cat/ls/head/pwd. These status commands may increase hits; read still does not count as validation-only. timing.effort.by_effort groups complete Steps by top-level effort, skipping missing effort but counting Steps without timing; cache rate is the ratio of sums of valid prompt/cache pairs. timing.effort.cache_transitions groups by header provider/model (unknown if missing), comparing equal/different effort in adjacent selected complete Steps of the same Turn, and reports samples/median/mean of later-Step cache/prompt (equal Step weights, not token weights). Skip pairs missing effort or valid prompt/cache; later prompt must be positive. Do not cross filters/cancellations/compaction gaps or zero-fill."]}
 
     if group_by is not None:
         report['group_by'] = group_by
@@ -1372,9 +1356,7 @@ def text_report(report):
     effort = timing['effort']
     lines.append('  Step effort (top-level metadata):')
     for level, item in effort['by_effort'].items():
-        down = item['downgraded']
         lines.append(f"    {level}: steps={item['steps']} model_ms median={fmt(item['model_ms']['median'])} samples={item['model_ms']['samples']} cache_hit_rate={pct(item['cache_hit_rate'])} ({item['prompt_cache_hit_tokens']}/{item['prompt_tokens']})")
-        lines.append(f"      downgraded steps={down['steps']}; Run failures in this Step {down['steps_with_failed_run']}/{down['steps_with_runs']} = {pct(down['run_failure_rate'])} (unknown status Step={down['steps_with_unknown_run_status']})")
     if not effort['by_effort']:
         lines.append('    No effort records')
     lines.append('    effort cache transitions (adjacent fully selected complete Steps in the same Turn; later-Step cache/prompt):')
@@ -1385,8 +1367,6 @@ def text_report(report):
             lines.append(f"        {kind}: samples={summary['samples']} median={pct(summary['median'])} mean={pct(summary['mean'])}")
     if not effort['cache_transitions']:
         lines.append('      No valid transition samples')
-    down = effort['downgraded']
-    lines.append(f"  Total downgraded Steps {down['steps']}; Run failures in this Step {down['steps_with_failed_run']}/{down['steps_with_runs']} = {pct(down['run_failure_rate'])} (unknown status Step={down['steps_with_unknown_run_status']})")
     streaming = timing['streaming']
     lines.append(f"  code streaming (last-first > 50 ms): {streaming['over_50_ms']}/{streaming['samples']} = {pct(streaming['ratio'])}")
     lines.append(f"  Tool runtime timing (calls Steps={timing['calls_steps']}, omitted={timing['calls_omitted']}):")

@@ -112,7 +112,7 @@ pub const Background = struct {
 };
 
 pub const Event = union(enum) {
-    step: struct { n: u32, effort: []const u8, source: provider.EffortSource },
+    step: struct { n: u32, effort: []const u8 },
     /// Slices are valid only during the callback.
     delta: struct { kind: provider.Kind, text: []const u8 },
     run_start: []const u8,

@@ -379,14 +379,10 @@ fn requestBody(gpa: std.mem.Allocator, io: std.Io, cfg: p.Config, cache_key: []c
     , .{ std.json.fmt(cfg.model, .{}), std.json.fmt(cache_key, .{}), std.json.fmt(instructions, .{}), input.written(), if (tools.len == 0) "" else try std.fmt.allocPrint(a, ",\"tools\":{s}", .{tool_writer.written()}), reasoning, format });
 }
 
-const custom_run_description = "Run JavaScript in a fresh sandbox using the tools API described in the system prompt. Send raw JavaScript, not JSON, a quoted string or markdown fences. Top-level await is allowed; the last expression's value is returned. Optional first line: // @run: {\"effort\":\"low\"}. Effort low|medium|high|default applies only to the next model request after a successful Run; omission keeps the user setting.";
+const custom_run_description = "Run JavaScript in a fresh sandbox using the tools API described in the system prompt. Send raw JavaScript, not JSON, a quoted string or markdown fences. Top-level await is allowed; the last expression's value is returned.";
 
 const custom_run_grammar =
-    \\start: pragma_source | plain_source
-    \\pragma_source: PRAGMA_LINE NEWLINE SOURCE
-    \\plain_source: SOURCE
-    \\PRAGMA_LINE: /[ \t]*\/\/ @run:[^\r\n]*/
-    \\NEWLINE: /\r?\n/
+    \\start: SOURCE
     \\SOURCE: /[\s\S]+/
 ;
 
