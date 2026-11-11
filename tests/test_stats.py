@@ -2054,5 +2054,92 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(json.loads(output)['groups']['true']['overall']['steps'], 2)
 
 
+    def cache_log(self, path, *, child=False):
+        rows = [dict({'from': 0}, cwd=str(path.parent), messages=[dict(role='system', content='base')])]
+        if child:
+            rows[0]['parent_session_id'] = 'p'
+        state = dict(length=1)
+
+        def add(messages, **fields):
+            rows.append(dict({'from': state['length']}, messages=messages, **fields))
+            state['length'] += len(messages)
+
+        def step(turn_step, prompt, hit, effort='low', user=False, completion=7):
+            messages = ([dict(role='user', content='go')] if user else []) + [dict(role='assistant', content='x')]
+            add(messages, turn_step=turn_step, effort=effort, usage=dict(
+                prompt_tokens=prompt, completion_tokens=completion, prompt_cache_hit_tokens=hit))
+
+        step(1, 1000, 0, user=True)
+        step(2, 1200, 1000)
+        step(3, 1400, 1000)
+        step(4, 1600, 1350)
+        step(5, 1800, 1000, effort='high')
+        add([dict(role='user', content='also')])
+        step(6, 2000, 1000, effort='high')
+        add([dict(role='user', content='result', source='background')])
+        step(7, 2100, 1500, effort='high')
+        rows.append(dict({'from': 1}, messages=[dict(role='user', content='summary')]))
+        state['length'] = 2
+        step(8, 500, 0, effort='high')
+        step(1, 600, 100, effort='high', user=True)
+        path.write_text('\n'.join(map(json.dumps, rows)) + '\n')
+
+    def test_cache_breakdown_attributes_each_cause_and_tolerates_block_rounding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'cache.jsonl'
+            self.cache_log(path)
+            cache = stats.summarize([path])['cache']
+            self.assertEqual((cache['steps'], cache['skipped_steps']), (9, 0))
+            self.assertEqual(cache['prompt_tokens'], 12200)
+            self.assertEqual(cache['uncached_input_tokens'], 12200 - 6950)
+            self.assertEqual(cache['cached_input_tokens'], 6950)
+            self.assertEqual(cache['output_tokens'], 63)
+            causes = {name: item['tokens'] for name, item in cache['mid_turn_causes'].items()}
+            self.assertEqual(causes, dict(effort_change=536, compaction=436, background=436,
+                                          user_message=736, unknown=136))
+            tokens = cache['tokens']
+            self.assertEqual((tokens['session_first'], tokens['turn_start'], tokens['mid_turn']), (1000, 336, 2280))
+            self.assertEqual(tokens['inherent'], 200 + 200 + 200 + 200 + 200 + 100 + 100)
+            self.assertEqual(sum(tokens.values()), cache['uncached_input_tokens'])
+            self.assertAlmostEqual(sum(cache['shares'].values()), 1)
+            self.assertEqual([e['lost'] for e in cache['largest_losses']], [736, 536, 436, 436, 336])
+            self.assertEqual(cache['largest_losses'][0], dict(
+                session_id='cache', turn_step=6, previous_prompt=1800, prompt_tokens=2000,
+                prompt_cache_hit_tokens=1000, lost=736, cause='user_message'))
+            self.assertEqual(cache['uncached_per_turn']['samples'], 2)
+            self.assertEqual((cache['uncached_per_turn']['samples'], cache['uncached_per_turn']['p90']), (2, 4750))
+            text = stats.text_report(stats.summarize([path]))
+            self.assertIn('Mid-turn loss by cause: effort_change 536', text)
+            self.assertIn('5 largest losses', text)
+
+    def test_cache_skips_children_missing_usage_and_filter_gaps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            child = Path(directory) / 'child.jsonl'
+            self.cache_log(child, child=True)
+            self.assertEqual(stats.summarize([child])['cache']['steps'], 0)
+            path = Path(directory) / 'old.jsonl'
+            rows = synthetic_log(path, [["1", "2", "3", "4"]])
+            for number, row in enumerate(rows[1:], 1):
+                row['turn_step'] = number
+            rows[2].pop('usage')
+            path.write_text('\n'.join(map(json.dumps, rows)) + '\n')
+            cache = stats.summarize([path])['cache']
+            self.assertEqual((cache['steps'], cache['skipped_steps']), (2, 1))
+            self.assertIsNone(stats.summarize([child])['cache']['hit_rate'])
+
+    def test_cache_section_follows_group_by_and_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'cache.jsonl'
+            self.cache_log(path)
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            rows[0]['nib_version'] = '1.0.0'
+            path.write_text('\n'.join(map(json.dumps, rows)) + '\n')
+            output = subprocess.check_output([sys.executable, str(ROOT / 'scripts/stats.py'), str(path),
+                                              '--group-by', 'version', '--json'])
+            report = json.loads(output)
+            self.assertEqual(report['cache']['steps'], 9)
+            self.assertEqual(report['groups']['1.0.0']['cache']['tokens']['mid_turn'], 2280)
+
+
 if __name__ == '__main__':
     unittest.main()

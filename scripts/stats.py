@@ -552,6 +552,115 @@ class ChildCosts:
                            "by_parent_system joins parent_session_id to the parent header.system_sha in the input logs; missing parent logs or invalid tags mean unknown, with no fallback to the child system_sha. --group-by still uses each log's own header."])
 
 
+CACHE_BLOCK = 64
+CACHE_CAUSES = ('effort_change', 'compaction', 'background', 'user_message', 'unknown')
+
+
+class CacheStats:
+    def __init__(self):
+        self.steps = self.skipped = 0
+        self.prompt = self.uncached = self.cached = self.output = 0
+        self.session_first = self.inherent = self.rounding = 0
+        self.turn_start = self.mid_turn = 0
+        self.causes = dict.fromkeys(CACHE_CAUSES, 0)
+        self.largest = []
+        self.turns = []
+
+    @staticmethod
+    def new_session():
+        return dict(previous=None, effort=None, causes=set(), first=True, uncached=None)
+
+    @staticmethod
+    def note_messages(state, messages):
+        for m in messages:
+            if m['role'] == 'user':
+                background = m.get('source') in ('background', 'background_agent')
+                state['causes'].add('background' if background else 'user_message')
+
+    @staticmethod
+    def note_compaction(state):
+        state['causes'] = {'compaction'}
+
+    @staticmethod
+    def reset(state):
+        state.update(previous=None, effort=None, causes=set(), first=False)
+
+    def finish_turn(self, state):
+        if state['uncached'] is not None:
+            self.turns.append(state['uncached'])
+        state['uncached'] = None
+
+    def add(self, state, record, session, turn_step):
+        if turn_step == 1:
+            self.finish_turn(state)
+        causes, state['causes'] = state['causes'], set()
+        previous, state['previous'] = state['previous'], None
+        first, state['first'] = state['first'], False
+        effort = record.get('effort')
+        effort = effort if isinstance(effort, str) and effort.strip() else None
+        previous_effort, state['effort'] = state['effort'], effort
+        u = record.get('usage')
+        if not (isinstance(u, dict) and all(number(u.get(k)) for k in TOKEN_KEYS)
+                and u['prompt_tokens'] > 0 and u['prompt_cache_hit_tokens'] <= u['prompt_tokens']):
+            return
+        prompt, hit = u['prompt_tokens'], u['prompt_cache_hit_tokens']
+        state['previous'] = prompt
+        if not first and (previous is None or not number(turn_step) or turn_step < 1):
+            self.skipped += 1
+            return
+        uncached = prompt - hit
+        self.steps += 1
+        self.prompt += prompt
+        self.uncached += uncached
+        self.cached += hit
+        self.output += u['completion_tokens']
+        state['uncached'] = (state['uncached'] or 0) + uncached
+        if first:
+            self.session_first += uncached
+            return
+        expected = min(previous, prompt)
+        lost = max(0, expected - hit - CACHE_BLOCK)
+        inherent = max(0, prompt - expected)
+        self.inherent += inherent
+        self.rounding += uncached - inherent - lost
+        if not lost:
+            return
+        if turn_step == 1:
+            cause = 'turn_start'
+            self.turn_start += lost
+        else:
+            if effort is not None and previous_effort is not None and effort != previous_effort:
+                cause = 'effort_change'
+            else:
+                cause = next((c for c in ('compaction', 'background', 'user_message') if c in causes), 'unknown')
+            self.mid_turn += lost
+            self.causes[cause] += lost
+        self.largest.append(dict(session_id=session[:8], turn_step=turn_step, previous_prompt=previous,
+                                 prompt_tokens=prompt, prompt_cache_hit_tokens=hit, lost=lost, cause=cause))
+        self.largest.sort(key=lambda item: -item['lost'])
+        del self.largest[5:]
+
+    def report(self):
+        def share(value, whole):
+            return value / whole if whole else None
+        return dict(
+            steps=self.steps, skipped_steps=self.skipped,
+            prompt_tokens=self.prompt, uncached_input_tokens=self.uncached,
+            cached_input_tokens=self.cached, output_tokens=self.output,
+            hit_rate=share(self.cached, self.prompt),
+            tokens=dict(session_first=self.session_first, inherent=self.inherent,
+                        turn_start=self.turn_start, mid_turn=self.mid_turn, rounding=self.rounding),
+            shares={name: share(value, self.uncached) for name, value in
+                    dict(session_first=self.session_first, inherent=self.inherent,
+                         turn_start=self.turn_start, mid_turn=self.mid_turn, rounding=self.rounding).items()},
+            mid_turn_causes={name: dict(tokens=tokens, share=share(tokens, self.mid_turn))
+                             for name, tokens in self.causes.items()},
+            largest_losses=self.largest,
+            uncached_per_turn=distribution(self.turns),
+            notes=["Root-session complete Steps with prompt_tokens>0 and cache-hit<=prompt; child sessions excluded. Expected cache = min(previous Step prompt, this prompt); lost = max(0, expected - hit - 64) (64-token cache block rounding); inherent = max(0, prompt - expected). A Session's first Step is session_first (prompt - hit). rounding = uncached - inherent - lost (tolerance; negative when hit exceeds expected), so shares of uncached input sum to 1.",
+                   "Losses at turn_step==1 are turn_start; later ones are mid_turn, attributed from changes since the previous Step, first match: effort_change (top-level effort differs), compaction (history replacement), background (background/background_agent user message), user_message (other user message: interjection, undo), else unknown. Steps without an adjacent selected predecessor (filter, interruption, missing usage) or turn_step are excluded from the section, never zero-filled; skipped_steps counts them. uncached_per_turn sums uncached input per root Turn."])
+
+
 class EffortStats:
     def __init__(self):
         self.groups = {}
@@ -979,6 +1088,7 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
     agents = AgentStats()
     child_costs = ChildCosts()
     exploration = Exploration()
+    cache_stats = CacheStats()
     errors = {name: {'count': 0, 'examples': []} for name in ERRORS}
     slowest, turn_steps, turn_times = [], [], []
 
@@ -1015,6 +1125,8 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
         length = header['from'] + len(header['messages'])
         current = None
         session_step = 0
+        cache_state = CacheStats.new_session()
+        is_root = not header.get('parent_session_id')
         child_selected_steps = 0
         child_model_ms, child_prompt_tokens, child_uncached_prompt_tokens = [], [], []
         child_first_request_cache_hit_rate = None
@@ -1036,6 +1148,8 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
 
         for record in log:
             include = selected(record)
+            if not include:
+                CacheStats.reset(cache_state)
             if not include and current is not None:
                 current['previous_effort'] = None
                 current['mechanical_previous'] = None
@@ -1054,6 +1168,8 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
                 replacement = record['from'] < length
                 length = record['from'] + len(messages)
                 if replacement:
+                    if include:
+                        CacheStats.note_compaction(cache_state)
                     if current is not None:
                         current['previous_effort'] = None
                         current['mechanical_previous'] = None
@@ -1071,6 +1187,8 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
                 agents.add(record, session_step, include, pending_agents, seen_agents,
                            allow_agent=not header.get('parent_session_id'))
                 continue
+            if include:
+                CacheStats.note_messages(cache_state, messages)
             turn_step = record.get('turn_step')
             explicit_turn = number(turn_step) and turn_step > 0
             new_turn = (turn_step == 1 if explicit_turn else any(m['role'] == 'user' and m.get('source') not in ('background', 'background_agent', 'undo') for m in messages))
@@ -1092,6 +1210,8 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
                         current['previous_effort'] = None
                         current['mechanical_previous'] = None
             is_step = any(m['role'] == 'assistant' for m in messages) and not interrupted
+            if interrupted:
+                CacheStats.reset(cache_state)
             if interrupted:
                 pending_agents.clear()
             agents.add(record, session_step, include, pending_agents, seen_agents, is_step,
@@ -1193,6 +1313,8 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
                 exploration.add_step(current['exploration'], turn_step if explicit_turn else current['full_steps'],
                                      record, step_runs, outputs)
             tool_data.add(record)
+            if is_root and current is not None:
+                cache_stats.add(cache_state, record, path.stem, turn_step if explicit_turn else None)
             if current is not None:
                 timing.effort.add_transition(current['previous_effort'], record, header)
                 current['previous_effort'] = record
@@ -1223,6 +1345,7 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
                 current['mechanical_previous'] = dict(
                     position=position, ok=bool(run_statuses) and all(ok is True for ok in run_statuses))
         finish_turn()
+        cache_stats.finish_turn(cache_state)
         if session_selected:
             totals['sessions'] += 1
             totals['child_sessions' if header.get('parent_session_id') else 'root_sessions'] += 1
@@ -1254,7 +1377,7 @@ def summarize(paths, since=None, cwd=None, group_by=None, *, _systems=None, _ste
             'errors': errors, 'slowest_steps': slowest, 'timing': timing.report(),
             'tool_data': tool_data.report(), 'child_costs': child_costs.report(),
             'agents': agents.report(), 'bash_calls': agents.report('bash'), 'background_runs': agents.report('run'),
-            'exploration': exploration.report(),
+            'exploration': exploration.report(), 'cache': cache_stats.report(),
             'round_trips': dict(steps_per_turn=distribution(turn_steps),
                                write_to_validation=pair_summary(write_validation_pairs, adjacent_pairs),
                                mechanical_followups=mechanical,
@@ -1339,6 +1462,18 @@ def text_report(report):
         section.append(f"    {label}: " + ", ".join(f"{name}={count}" for name, count in followups[key].items()))
     section.extend("  " + note for note in structure['notes'])
     lines[4:4] = section
+    cache = report['cache']
+    lines.append('Cache (root Steps; uncached input breakdown, tokens; not fees):')
+    lines.append(f"  Steps {cache['steps']} (excluded {cache['skipped_steps']}); prompt {cache['prompt_tokens']} / uncached {cache['uncached_input_tokens']} / cached {cache['cached_input_tokens']} / output {cache['output_tokens']}; weighted hit rate {pct(cache['hit_rate'])}")
+    lines.append('  Uncached input: ' + ', '.join(f"{name} {pct(cache['shares'][name])} ({cache['tokens'][name]})" for name in cache['tokens']))
+    lines.append('  Mid-turn loss by cause: ' + ', '.join(f"{name} {item['tokens']} ({pct(item['share'])})" for name, item in cache['mid_turn_causes'].items()))
+    turn = cache['uncached_per_turn']
+    lines.append(f"  Uncached input per Turn: samples={turn['samples']} median={fmt(turn['median'])} p90={fmt(turn['p90'])}")
+    lines.append('  5 largest losses (session, turn_step, prev prompt, prompt, hit, cause):')
+    lines.extend(f"    {e['session_id']}  step {e['turn_step']}  {e['previous_prompt']} -> {e['prompt_tokens']}  hit {e['prompt_cache_hit_tokens']}  lost {e['lost']}  {e['cause']}" for e in cache['largest_losses'])
+    if not cache['largest_losses']:
+        lines.append('    None')
+    lines.extend('  ' + note for note in cache['notes'])
     lines.append('Error categories:')
     for name, item in report['errors'].items():
         lines.append(f"  {name}: {item['count']}")
