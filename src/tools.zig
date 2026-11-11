@@ -344,7 +344,7 @@ pub const Tools = struct {
             if (std.mem.eql(u8, cfg.model, model)) break true;
         } else false;
         if (!known) try models.append(a, cfg.model);
-        const options = try std.fmt.allocPrint(a, "model: {f}; current: {f}; effort low/medium/high (else inherit); smaller model/lower effort: faster, cheaper; schema→parsed JSON data.", .{ std.json.fmt(models.items, .{}), std.json.fmt(cfg.model, .{}) });
+        const options = try std.fmt.allocPrint(a, "model: {f}; current: {f}; default: provider small model; effort low/medium/high (else inherit); lower effort: faster; schema→parsed data.", .{ std.json.fmt(models.items, .{}), std.json.fmt(cfg.model, .{}) });
         defer a.free(options);
         const limits = try std.fmt.allocPrint(a, "{d} concurrent/process, {d}/Run, {d} KiB", .{ cfg.limits.llm_concurrency, cfg.limits.llm_calls_per_run, cfg.limits.llm_input_kib });
         defer a.free(limits);

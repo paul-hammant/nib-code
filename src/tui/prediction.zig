@@ -252,8 +252,7 @@ pub const State = struct {
     }
 
     fn startWorker(s: *State, gpa: std.mem.Allocator, io: std.Io, loop: *vaxis.Loop(tui.Event), session_cfg: provider.Config, session_id: []const u8, recent: []const []const u8, reply: []const u8) !void {
-        var cfg = session_cfg;
-        cfg.model = provider.smallModel(cfg.provider) orelse cfg.model;
+        var cfg = provider.withSmallModel(session_cfg) orelse session_cfg;
         try cfg.setEffort("off");
         cfg.codex_transport = .sse;
         cfg.output_schema = null;

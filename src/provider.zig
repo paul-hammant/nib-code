@@ -37,6 +37,15 @@ pub fn smallModel(id: Id) ?[]const u8 {
     };
 }
 
+/// Session config switched to the service's small model with its own default effort; null when the service has none.
+pub fn withSmallModel(cfg: Config) ?Config {
+    var small = cfg;
+    small.model = smallModel(cfg.provider) orelse return null;
+    small.thinking = null;
+    small.reasoning_effort = null;
+    return small;
+}
+
 pub const Model = struct { id: []const u8, context_window: u64, max_output: u32 = 128000, can_disable_reasoning: bool = true, vision: ?bool = null };
 
 pub const Definition = struct {

@@ -133,7 +133,7 @@ class LlmTests:
         self.assertIn("model: [", system)
         self.assertIn("current: \"mock-parent-model\"", system)
         self.assertNotIn("off may map", system)
-        self.assertIn("smaller model/lower effort: faster, cheaper", system)
+        self.assertIn("lower effort: faster", system)
         self.assertNotIn("Read a few files yourself (cheapest)", system)
         self.assertIn("async llm({", system)
         self.assertEqual("async agent({" in system, not child)
@@ -281,7 +281,9 @@ class LlmTests:
         self.assert_result(result["override"], "reply:override input")
         self.assert_result(result["inherited"], "reply:default input")
         self.assertEqual(len(self.starts()), 2)
-        for start, model, effort in zip(self.starts(), ("mock-llm-override", "mock-parent-model"), ("low", "high")):
+        small = self.provider == "codex"
+        expected = (("mock-llm-override", "low"), ("gpt-6-luna", None) if small else ("mock-parent-model", "high"))
+        for start, (model, effort) in zip(self.starts(), expected):
             self.assert_request(start)
             body = start["body"]
             self.assertEqual(body["model"], model)

@@ -194,7 +194,7 @@ Session applies guardrails centrally:
 - Effective user effort is default and ceiling: low < medium < high < xhigh < max. Above-ceiling declarations revert to user settings; `off/none/minimal` cannot be raised either.
 - Actual server-default effort is unknown: allow only low or default; `medium/high` revert without guessing.
 - Ignore a reduction if its declaring Run returns `ok=false`, reverting next time; failures in other undeclared Runs do not alter the last declaration.
-- First Turn requests and requests carrying new interjections always use user settings. Compaction keeps independent policy; `tools.llm` uses user configuration/its own effort, not temporary main-model reductions.
+- First Turn requests and requests carrying new interjections always use user settings. Compaction keeps independent policy; `tools.llm` uses the small model's default effort (or user configuration with an explicit model), not temporary main-model reductions.
 - Existing Codex mappings remain; non-disableable models map off→low. Scheduling changes no user configuration/files/child-inherited configuration.
 
 TUI Run summaries show actual effort of the **request producing them**, not next-Step declarations, with (guard) for guarded sources. Restore history from logs; omit effort for old logs without it. Explicit bottom-border settings show effort ≤high; server default displays unchanged.

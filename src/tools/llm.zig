@@ -59,7 +59,9 @@ fn invoke(comptime complete: anytype, t: *tools.Tools, gpa: std.mem.Allocator, a
     if (p.prompt.len > max_input_bytes or input_len > max_input_bytes - p.prompt.len)
         return tools.fail(gpa, "llm prompt + input exceeds {d} bytes ({d} KiB); split or filter the input", .{ max_input_bytes, cfg.limits.llm_input_kib });
     if (p.schema) |schema| if (schema != .object) return tools.fail(gpa, "llm schema must be a JSON Schema object", .{});
-    if (p.model) |model| cfg.model = model;
+    if (p.model) |model| {
+        cfg.model = model;
+    } else if (provider.withSmallModel(cfg)) |small| cfg = small;
     if (p.effort) |effort| try cfg.setEffort(effort);
     cfg.output_schema = p.schema;
     var messages: std.ArrayList(provider.Message) = .empty;
@@ -201,4 +203,44 @@ test "llm snippet clips UTF-8 at a bounded byte boundary" {
     const text = prefix ++ "🙂tail";
     try testing.expectEqual(@as(usize, 511), snippetEnd(text));
     try testing.expect(std.unicode.utf8ValidateSlice(text[0..snippetEnd(text)]));
+}
+
+test "llm defaults to the small model without inheriting effort; explicit model keeps session effort" {
+    const Capture = struct {
+        var model_buf: [64]u8 = undefined;
+        var effort_buf: [16]u8 = undefined;
+        var model: []const u8 = "";
+        var effort: ?[]const u8 = null;
+        var thinking: ?bool = null;
+        fn complete(gpa: std.mem.Allocator, out: std.mem.Allocator, client: *std.http.Client, cfg: provider.Config, key: []const u8, messages: []const provider.Message, tool_json: []const u8, max: ?u32, sink: provider.Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8, attempts: *u32, retry: ?provider.RetrySink) !provider.Reply {
+            model = std.fmt.bufPrint(&model_buf, "{s}", .{cfg.model}) catch unreachable;
+            effort = if (cfg.reasoning_effort) |e| std.fmt.bufPrint(&effort_buf, "{s}", .{e}) catch unreachable else null;
+            thinking = cfg.thinking;
+            _ = .{ gpa, client, key, messages, tool_json, max, sink, cancel, detail, attempts, retry };
+            return .{ .text = try out.dupe(u8, "ok"), .tool_calls = &.{}, .usage = .{} };
+        }
+    };
+    const Case = struct { id: provider.Id, args: []const u8, model: []const u8, effort: ?[]const u8, thinking: ?bool };
+    const cases = [_]Case{
+        .{ .id = .codex, .args = "{\"prompt\":\"x\"}", .model = "gpt-6-luna", .effort = null, .thinking = null },
+        .{ .id = .openai, .args = "{\"prompt\":\"x\"}", .model = "gpt-6-luna", .effort = null, .thinking = null },
+        .{ .id = .anthropic, .args = "{\"prompt\":\"x\"}", .model = "claude-haiku-5-5", .effort = null, .thinking = null },
+        .{ .id = .deepseek, .args = "{\"prompt\":\"x\"}", .model = "deepseek-flash", .effort = null, .thinking = null },
+        .{ .id = .anthropic, .args = "{\"prompt\":\"x\",\"effort\":\"low\"}", .model = "claude-haiku-5-5", .effort = "low", .thinking = true },
+        .{ .id = .anthropic, .args = "{\"prompt\":\"x\",\"model\":\"claude-opus-5-5\"}", .model = "claude-opus-5-5", .effort = "max", .thinking = true },
+        .{ .id = .anthropic, .args = "{\"prompt\":\"x\",\"model\":\"claude-opus-5-5\",\"effort\":\"medium\"}", .model = "claude-opus-5-5", .effort = "medium", .thinking = true },
+        .{ .id = .xai, .args = "{\"prompt\":\"x\"}", .model = "main-model", .effort = "max", .thinking = true },
+        .{ .id = .custom, .args = "{\"prompt\":\"x\"}", .model = "main-model", .effort = "max", .thinking = true },
+    };
+    for (cases) |c| {
+        var state = fixture.state();
+        state.cfg = .{ .provider = c.id, .base_url = "", .api_key = "", .model = "main-model", .thinking = true, .reasoning_effort = "max" };
+        const result = try invoke(Capture.complete, &state, testing.allocator, c.args);
+        defer tools.freeResult(result);
+        try testing.expect(result == .ok);
+        try testing.expectEqualStrings(c.model, Capture.model);
+        try testing.expectEqual(c.effort == null, Capture.effort == null);
+        if (c.effort) |e| try testing.expectEqualStrings(e, Capture.effort.?);
+        try testing.expectEqual(c.thinking, Capture.thinking);
+    }
 }

@@ -5,7 +5,7 @@ date: 2026-11-03
 
 # tools.llm: a lightweight single-step map unit
 
-Within a Run, `await tools.llm({ prompt, input, schema, model, effort })` returns `{ text, data, usage }`. The host calls the provider in the current process for one request/answer, without tools, Session history, or project instructions. input is separate from prompt; model/effort inherit current configuration by default. This fits batch judgments, classification, and extraction such as `Promise.all(items.map(input => tools.llm({prompt: "Classify", input})))`.
+Within a Run, `await tools.llm({ prompt, input, schema, model, effort })` returns `{ text, data, usage }`. The host calls the provider in the current process for one request/answer, without tools, Session history, or project instructions. input is separate from prompt; model defaults to the provider's small model at its own default effort (Session model/effort when the provider has none); an explicit model inherits the Session effort. This fits batch judgments, classification, and extraction such as `Promise.all(items.map(input => tools.llm({prompt: "Classify", input})))`.
 
 **Why a separate name:** agent means doing work: an independent subprocess, multiple Steps, tools, and code investigation/modification. llm means computing a value: no subprocess startup, full agent prompt, or tool loop, filling the gap where agent is too heavy for small map tasks. Separate names expose capabilities and side-effect boundaries directly to callers/models rather than switching semantics through a mode parameter. Pure-function describes the execution boundary, not deterministic models or zero quota consumption.
 
