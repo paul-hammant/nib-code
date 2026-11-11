@@ -81,7 +81,7 @@ Default 5-minute Run timeout accumulates QuickJS segments (initial script, jobs,
 
 Ordinary foreground/explicit-background bash without timeout_ms defaults to 1800000 ms (30 minutes). Automatic Run backgrounding changes delivery only, never deadlines. Cold-cache concurrent smoke tests hit the old 120-second limit on first zig build test; reruns still took 130 seconds. Increase 15-fold to agent’s 30-minute budget for cold builds/contention while bounding ordinary commands. This is budget policy, not guaranteed completion; known longer work needs explicit timeout_ms.
 
-Explicit positive timeout_ms applies from command start. Reject negatives; zero only with background:true, detached:true. Detached defaults zero for Session services. Timeout/stop/cancellation/Turn failure/Session exit clean groups; ordinary Turn cleanup waits for non-detached results, normal shell exits clean groups including nohup/& descendants. Output cap remains 16 MiB.
+Explicit positive timeout_ms applies from command start. Reject negatives; zero only with background:true, detached:true. Detached defaults zero for Session services. Timeout/stop/cancellation/Turn failure/Session exit clean groups; ordinary Turn cleanup waits for non-detached results, normal shell exits clean groups including nohup/& descendants; the call returns when the shell exits, draining output for at most 500 ms more, so daemons that left the group (setsid, services) keep running and cannot hold the call open. Output cap remains 16 MiB.
 
 ## Delays and polling within Runs
 
