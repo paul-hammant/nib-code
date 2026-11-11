@@ -86,9 +86,9 @@ Resume maps calls[].run_index to assistant `tool_calls` indices then results by 
 
 ## Step effort fields
 
-Complete Steps optionally log effort/effort_source/effort_downgraded. effort is actual request level or server default; source model|default|guard means applied model declaration, user default including explicit Run default, or guard fallback. downgraded true only below effective user level; accepted low under unknown server default counts too. Equal declarations may source model but not downgraded. Retries keep effort, compaction creates no Step effort. Old logs remain resumable.
+Complete Steps optionally log `effort`: the actual request level, or `default` when the server picks it. Retries keep it; compaction creates no Step effort. Older logs also carry `effort_source`, `effort_downgraded` and assistant `step_effort.source` from the removed per-Step scheduling ([ADR 0025](adr/0025-model-profiles.md)); readers ignore them and old logs stay resumable.
 
-Assistant step_effort: {effort, source} is UI metadata preserving retained Run levels across compaction; complete-Step top-level fields govern resume. Never send to providers or affect resumed scheduling; first new-Turn Steps use current user settings. [Guardrails](config.md#per-step-effort-scheduling).
+Assistant `step_effort: {effort}` is UI metadata preserving retained Run levels across compaction; complete-Step top-level fields govern resume. Never sent to providers.
 
 ## Session statistics
 
@@ -117,8 +117,6 @@ All version/system/patches/transport/incremental/full_reason groups recompute al
 `timing.effort.by_effort` groups complete-Step effort, Step counts/model_ms distribution including medians/samples, prompt/cache totals/hit rate. Missing effort skips; missing timings still count Steps. Cache rate sums valid paired fields, not per-Step means.
 
 timing.effort.cache_transitions groups header provider/model (each missing/invalid unknown), comparing same_effort/different_effort adjacent selected same-Turn complete Steps by later cache/prompt samples/median/mean. Equal Step weights, not aggregate-token ratios; empty 0/null/null. Both need nonempty effort/nonnegative integer prompt/cache, no completion requirement; later prompt>0. Skip invalid/missing Steps without pairing across them; no cross-Turn/Session/filter/cancel/compaction gaps. Existing `by_effort` rate unchanged. Observe associations, not causal group effects.
-
-Per-level downgraded and overall `timing.effort.downgraded` report Run failures: denominator downgraded Steps with Runs, numerator any explicit `ok=false` Run produced by that Step, never next Step or tool-free finals. Unknown statuses remain denominator/list steps_with_unknown_run_status. Require `effort_source=model` plus downgraded=true; transitional missing downgraded inferred from model source, explicit false excludes equal declarations.
 
 Machine events: [ask-json.md](ask-json.md).
 
