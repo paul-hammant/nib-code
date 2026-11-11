@@ -322,11 +322,11 @@ test "bash returns when a silent background job holds stdout" {
 test "bash returns once the shell exits although detached daemons keep the output pipe" {
     const prelude = "sd() { python3 -c 'import os,sys;os.setsid();os.execvp(sys.argv[1],sys.argv[1:])' \"$@\"; }; export -f sd; ";
     const bodies = [_][]const u8{
-        "sd sh -c 'sleep 30' & echo one",
-        "bash -c 'sd sleep 30 &'; echo one",
-        "sd sh -c 'sleep 30 >/dev/null' 2>&1 & echo one",
-        "(sd sleep 30 >/dev/null </dev/null &) ; echo one",
-        "sd sh -c 'exec sleep 30 >&2' & echo one",
+        "sd sh -c 'sleep 29.137' & echo one",
+        "bash -c 'sd sleep 29.137 &'; echo one",
+        "sd sh -c 'sleep 29.137 >/dev/null' 2>&1 & echo one",
+        "(sd sleep 29.137 >/dev/null </dev/null &) ; echo one",
+        "sd sh -c 'exec sleep 29.137 >&2' & echo one",
     };
     var cases: [bodies.len][]u8 = undefined;
     for (bodies, 0..) |body, i| cases[i] = try std.mem.concat(testing.allocator, u8, &.{ prelude, body });
@@ -340,7 +340,7 @@ test "bash returns once the shell exits although detached daemons keep the outpu
         try testing.expectEqualStrings("{\"exit_code\":0,\"output\":\"one\\n\"}", r.ok);
         try testing.expect(start.durationTo(std.Io.Clock.awake.now(testing.io)).toMilliseconds() < 3000);
     }
-    const left = try std.process.run(testing.allocator, testing.io, .{ .argv = &.{ "pkill", "-f", "sleep 30" } });
+    const left = try std.process.run(testing.allocator, testing.io, .{ .argv = &.{ "pkill", "-f", "sleep 29.137" } });
     testing.allocator.free(left.stdout);
     testing.allocator.free(left.stderr);
 }
