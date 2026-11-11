@@ -8,6 +8,9 @@ pub const Result = struct {
     stop: ?Stop = null,
 };
 
+// Descendants outside the process group (setsid daemons) may hold the pipe forever.
+const drain_cap_ms = 500;
+
 const Stop = error{ Canceled, TimedOut };
 
 pub const Options = struct {
@@ -113,20 +116,23 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Result {
     var stop: ?Stop = null;
     var line_start: usize = 0;
     var scanned: usize = 0;
+    var exited_at: ?std.Io.Clock.Timestamp = null;
     while (true) {
         if (options.on_tick) |observer| observer.emit(observer.ctx);
         if (done.isSet()) {
             group.grace_ms = 0;
             group.kill();
+            if (exited_at == null) exited_at = .now(io, .awake);
         } else if (stop == null) check(io, options.cancel, deadline) catch |err| {
             stop = err;
             group.kill();
         };
         mr.fill(4096, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch |err| switch (err) {
             error.EndOfStream => break,
-            error.Timeout => {},
+            error.Timeout => if (exited_at != null) break,
             else => return err,
         };
+        if (exited_at) |at| if (at.durationTo(.now(io, .awake)).raw.toMilliseconds() > drain_cap_ms) break;
         const buffered = mr.reader(0).buffered();
         if (buffered.len > options.max_output_bytes) return error.OutputLimit;
         if (options.on_line) |observer| {
@@ -260,6 +266,19 @@ test "process returns on shell exit and kills descendants holding stdout" {
     try testing.expect(start.durationTo(std.Io.Clock.awake.now(testing.io)).toMilliseconds() < 1000);
     try std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(600), .clock = .awake }, testing.io);
     try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "survived", .{}));
+}
+
+test "process returns on shell exit when a setsid daemon holds the pipe" {
+    var cancel: std.atomic.Value(bool) = .init(false);
+    const start = std.Io.Clock.awake.now(testing.io);
+    const result = try run(testing.allocator, testing.io, .{
+        .spawn = .{ .argv = &.{ "bash", "-c", "setsid sh -c 'sleep 30' & echo before; exit 0" }, .stdout = .pipe, .stderr = .ignore },
+        .cancel = &cancel,
+        .timeout_ms = 10000,
+    });
+    defer testing.allocator.free(result.output);
+    try testing.expectEqualStrings("before\n", result.output);
+    try testing.expect(start.durationTo(std.Io.Clock.awake.now(testing.io)).toMilliseconds() < 3000);
 }
 
 test "process drains buffered output and final lines after shell exit" {

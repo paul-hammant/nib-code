@@ -319,6 +319,32 @@ test "bash returns when a silent background job holds stdout" {
     try testing.expectEqualStrings("{\"exit_code\":0,\"output\":\"\"}", r.ok);
 }
 
+test "bash returns once the shell exits although detached daemons keep the output pipe" {
+    const prelude = "sd() { python3 -c 'import os,sys;os.setsid();os.execvp(sys.argv[1],sys.argv[1:])' \"$@\"; }; export -f sd; ";
+    const bodies = [_][]const u8{
+        "sd sh -c 'sleep 29.137' & echo one",
+        "bash -c 'sd sleep 29.137 &'; echo one",
+        "sd sh -c 'sleep 29.137 >/dev/null' 2>&1 & echo one",
+        "(sd sleep 29.137 >/dev/null </dev/null &) ; echo one",
+        "sd sh -c 'exec sleep 29.137 >&2' & echo one",
+    };
+    var cases: [bodies.len][]u8 = undefined;
+    for (bodies, 0..) |body, i| cases[i] = try std.mem.concat(testing.allocator, u8, &.{ prelude, body });
+    defer for (cases) |c| testing.allocator.free(c);
+    for (cases) |command| {
+        const args = try std.json.Stringify.valueAlloc(testing.allocator, .{ .command = command, .timeout_ms = 10000 }, .{});
+        defer testing.allocator.free(args);
+        const start = std.Io.Clock.awake.now(testing.io);
+        const r = try callTool("bash", args);
+        defer freeResult(r);
+        try testing.expectEqualStrings("{\"exit_code\":0,\"output\":\"one\\n\"}", r.ok);
+        try testing.expect(start.durationTo(std.Io.Clock.awake.now(testing.io)).toMilliseconds() < 3000);
+    }
+    const left = try std.process.run(testing.allocator, testing.io, .{ .argv = &.{ "pkill", "-f", "sleep 29.137" } });
+    testing.allocator.free(left.stdout);
+    testing.allocator.free(left.stderr);
+}
+
 test "foreground bash allocates only at the visibility threshold and advances once per second" {
     var t: Tools = .{ .io = testing.io, .home = "/unused", .run_id = 3 };
     defer t.progress.deinit(testing.allocator);
