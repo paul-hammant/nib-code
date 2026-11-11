@@ -913,7 +913,7 @@ pub const App = struct {
             app.title_loaded = true;
         }
         const project = app.title_project orelse return "";
-        return title.compose(&app.title_buf, project, app.title_branch, app.cfg.model);
+        return title.compose(&app.title_buf, project, app.title_branch, app.cfg.model, app.cfg.effectiveEffort());
     }
 
     fn clickEntry(app: *App, entry: usize, row: u16) void {

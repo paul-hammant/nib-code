@@ -22,7 +22,7 @@ For agents changing the TUI, CLI help, or fixed text.
 
 Changes line: below the Turn footer after a successful Turn with direct edit/write changes, dim, normal mode only: `3 files changed · +42 −7`, singular `1 file changed`, zero `+`/`−` parts omitted. Opened, it adds one row per file indented two spaces: path relative to the working directory, then counts with `+` right-aligned and `−` after it (`  src/tui.zig  +30 −4`). It is a toggle block: hover highlight, click and Ctrl+O as for Runs.
 
-Title line: an empty transcript shows dim `<project> · <branch> · <model>` at its top-left (`nibcode · main · deepseek-flash`); the branch part is omitted without git. Signed out shows `No provider · /provider to sign in` instead.
+Title line: an empty transcript shows dim `<project> · <branch> · <model> · <effort>` at its top-left (`nibcode · main · deepseek-flash · high`); the branch part is omitted without git, the effort part when the server picks it. Signed out shows `No provider · /provider to sign in` instead.
 
 Open command (only with `open` configured): paths that resolve to project files look like normal text and are underlined while hovered. A failed start shows the dim notice `Could not run <program>`.
 

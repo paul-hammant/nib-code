@@ -48,12 +48,14 @@ pub fn readBranch(io: std.Io, a: std.mem.Allocator, root: []const u8) ?[]u8 {
     };
 }
 
-/// `<project> · <branch> · <model>`; the branch is omitted when null.
-pub fn compose(buf: []u8, project: []const u8, branch: ?[]const u8, model: []const u8) []const u8 {
+/// `<project> · <branch> · <model> · <effort>`; the branch is omitted when null, the
+/// effort when the server picks it.
+pub fn compose(buf: []u8, project: []const u8, branch: ?[]const u8, model: []const u8, effort: []const u8) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
     w.writeAll(project) catch return w.buffered();
     if (branch) |b| w.print(" · {s}", .{b}) catch return w.buffered();
-    w.print(" · {s}", .{model}) catch {};
+    w.print(" · {s}", .{model}) catch return w.buffered();
+    if (std.mem.indexOf(u8, effort, "default") == null) w.print(" · {s}", .{effort}) catch {};
     return w.buffered();
 }
 
@@ -92,6 +94,8 @@ test "branch from a plain repository, a worktree gitdir file and no git" {
 
 test "title composition" {
     var buf: [128]u8 = undefined;
-    try testing.expectEqualStrings("nibcode · main · deepseek-flash", compose(&buf, "nibcode", "main", "deepseek-flash"));
-    try testing.expectEqualStrings("nibcode · deepseek-flash", compose(&buf, "nibcode", null, "deepseek-flash"));
+    try testing.expectEqualStrings("nibcode · main · deepseek-flash · high", compose(&buf, "nibcode", "main", "deepseek-flash", "high"));
+    try testing.expectEqualStrings("nibcode · deepseek-flash · off", compose(&buf, "nibcode", null, "deepseek-flash", "off"));
+    try testing.expectEqualStrings("nibcode · main · m", compose(&buf, "nibcode", "main", "m", "server default"));
+    try testing.expectEqualStrings("nibcode · main · m", compose(&buf, "nibcode", "main", "m", "on (server default effort)"));
 }
