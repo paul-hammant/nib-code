@@ -8,6 +8,7 @@ const session_log = @import("session/log.zig");
 const skills = @import("session/skills.zig");
 const instructions = @import("session/instructions.zig");
 const prompt = @import("session/prompt.zig");
+const Profile = @import("session/profile.zig").Profile;
 const compaction = @import("session/compact.zig");
 const runner = @import("session/run.zig");
 const session_history = @import("session/history.zig");
@@ -211,6 +212,7 @@ pub const Session = struct {
             .skills = found.summary,
             .mcp_servers = s.cfg.mcp_servers,
             .patches_off = try prompt.disabledPatches(a, s.options.environ),
+            .profile = @tagName(Profile.forModel(s.cfg.model)),
         });
     }
 

@@ -1060,6 +1060,20 @@ class StatsTest(unittest.TestCase):
             path.write_text('\n'.join(map(json.dumps, records)) + '\n')
             self.assertEqual(stats.summarize([path])['round_trips']['steps_per_turn'], before)
 
+    def test_group_by_profile_header(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = {}
+            for name, metadata in (('old', {}), ('deepseek', dict(profile='deepseek')),
+                                   ('codex', dict(profile='codex')), ('codex2', dict(profile='codex')),
+                                   ('invalid', dict(profile=3))):
+                paths[name] = Path(directory) / (name + '.jsonl')
+                synthetic_log(paths[name], [[None]], **metadata)
+            report = stats.summarize(sorted(paths.values()), group_by='profile')
+            self.assertEqual({key: group['overall']['sessions'] for key, group in report['groups'].items()},
+                             {'codex': 2, 'deepseek': 1, 'unknown': 2})
+            cli = ['python3', str(ROOT / 'scripts/stats.py'), directory, '--group-by', 'profile']
+            self.assertIn('=== profile=codex ===', subprocess.check_output(cli).decode())
+
     def test_group_by_header_mixed_versions_systems_patches_and_cli(self):
         write_a = 'tools.write({path: "a", content: "x"})'
         write_b = 'tools.edit({path: "b", old_text: "x", new_text: "y"})'

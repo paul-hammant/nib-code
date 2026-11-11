@@ -306,5 +306,6 @@ test {
     _ = @import("tui/view.zig");
     _ = @import("tui/selection.zig");
     _ = @import("session.zig");
+    _ = @import("session/profile.zig");
     _ = @import("update.zig");
 }

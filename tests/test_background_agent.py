@@ -151,7 +151,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.server.gates[prompt.split(":")[1]].wait(15)
             text = "done:" + prompt
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-            reply(self, provider, code, text, effort="low" if self.server.case == "fifo" and prompt == "initial" and step == 1 else None)
+            reply(self, provider, code, text)
 
 
 class BackgroundTests:

@@ -1,6 +1,7 @@
 const std = @import("std");
 const tools = @import("../tools.zig");
 const sandbox = @import("../sandbox.zig");
+const Profile = @import("profile.zig").Profile;
 
 pub const tools_json =
     \\[{"type":"function","function":{"name":"run",
@@ -12,7 +13,9 @@ pub const tools_json =
 
 /// Prompt lines that compensate for current models. Each id is registered in
 /// docs/compromises.md; NIB_PATCHES_OFF=<id,...|all> drops them so their effect can be measured.
-pub const patches = [_]struct { id: []const u8, text: []const u8 }{
+pub const Patch = struct { id: []const u8, text: []const u8, applies_to: Profile.Set = Profile.all };
+
+pub const patches = [_]Patch{
     .{
         .id = "json-escape",
         .text =
@@ -26,11 +29,15 @@ pub const patches = [_]struct { id: []const u8, text: []const u8 }{
     },
 };
 
-pub fn patchLines(a: std.mem.Allocator, environ: ?*const std.process.Environ.Map) ![]const u8 {
+pub fn patchLines(a: std.mem.Allocator, environ: ?*const std.process.Environ.Map, profile: Profile) ![]const u8 {
+    return renderPatches(a, &patches, environ, profile);
+}
+
+fn renderPatches(a: std.mem.Allocator, list: []const Patch, environ: ?*const std.process.Environ.Map, profile: Profile) ![]const u8 {
     const off = if (environ) |e| e.get("NIB_PATCHES_OFF") orelse "" else "";
     var out: std.ArrayList(u8) = .empty;
-    for (patches) |patch| {
-        if (patchDisabled(off, patch.id)) continue;
+    for (list) |patch| {
+        if (!patch.applies_to.contains(profile) or patchDisabled(off, patch.id)) continue;
         try out.print(a, "- {s}\n", .{patch.text});
     }
     return out.toOwnedSlice(a);
@@ -89,7 +96,7 @@ pub const system_template =
 pub fn renderSystem(a: std.mem.Allocator, cwd: []const u8, host: *const tools.Tools, environ: ?*const std.process.Environ.Map) ![]const u8 {
     const docs = try host.documentation(a);
     defer a.free(docs);
-    const lines = try patchLines(a, environ);
+    const lines = try patchLines(a, environ, if (host.cfg) |cfg| Profile.forModel(cfg.model) else .default);
     defer a.free(lines);
     const bytes = if (host.cfg) |cfg| cfg.limits.run_output_bytes else @import("output.zig").max_bytes;
     const budget = if (bytes % 1024 == 0) try std.fmt.allocPrint(a, "{d} KiB", .{bytes / 1024}) else try std.fmt.allocPrint(a, "{d} bytes", .{bytes});
@@ -176,12 +183,12 @@ test "prompt patches can be disabled individually or all at once" {
     const gpa = std.testing.allocator;
     var env: std.process.Environ.Map = .init(gpa);
     defer env.deinit();
-    const all_on = try patchLines(gpa, &env);
+    const all_on = try patchLines(gpa, &env, .default);
     defer gpa.free(all_on);
     for (patches) |patch| try std.testing.expect(std.mem.indexOf(u8, all_on, patch.text) != null);
     for (patches) |disabled| {
         try env.put("NIB_PATCHES_OFF", disabled.id);
-        const one_off = try patchLines(gpa, &env);
+        const one_off = try patchLines(gpa, &env, .default);
         defer gpa.free(one_off);
         for (patches) |patch| {
             try std.testing.expectEqual(
@@ -191,9 +198,39 @@ test "prompt patches can be disabled individually or all at once" {
         }
     }
     try env.put("NIB_PATCHES_OFF", "no-shell-search, all");
-    const none = try patchLines(gpa, &env);
+    const none = try patchLines(gpa, &env, .default);
     defer gpa.free(none);
     try std.testing.expectEqualStrings("", none);
+}
+
+test "patches apply only to their profiles" {
+    const t = std.testing;
+    const list = [_]Patch{
+        .{ .id = "everywhere", .text = "A" },
+        .{ .id = "codex-only", .text = "B", .applies_to = .initOne(.codex) },
+        .{ .id = "not-claude", .text = "C", .applies_to = Profile.all.differenceWith(.initOne(.claude)) },
+    };
+    const expected = [_]struct { Profile, []const u8 }{
+        .{ .codex, "- A\n- B\n- C\n" },
+        .{ .deepseek, "- A\n- C\n" },
+        .{ .claude, "- A\n" },
+        .{ .default, "- A\n- C\n" },
+    };
+    for (expected) |case| {
+        const lines = try renderPatches(t.allocator, &list, null, case[0]);
+        defer t.allocator.free(lines);
+        try t.expectEqualStrings(case[1], lines);
+    }
+    var env: std.process.Environ.Map = .init(t.allocator);
+    defer env.deinit();
+    try env.put("NIB_PATCHES_OFF", "codex-only");
+    const off = try renderPatches(t.allocator, &list, &env, .codex);
+    defer t.allocator.free(off);
+    try t.expectEqualStrings("- A\n- C\n", off);
+}
+
+test "every shipped patch applies to every profile" {
+    for (patches) |patch| try std.testing.expect(patch.applies_to.eql(Profile.all));
 }
 
 test "experiment labels hash exact base text and normalize actual disabled patches" {

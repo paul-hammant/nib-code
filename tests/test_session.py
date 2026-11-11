@@ -234,7 +234,8 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
             assert header["nib_version"] == version + "+" + git_commit.stdout.strip(), header
         assert header["system_sha"] == hashlib.sha256(base.encode()).hexdigest()[:12], header
         assert "patches_off" not in header
-        assert all(not any(key in record for key in ("nib_version", "system_sha", "patches_off"))
+        assert header["profile"] == "deepseek", header["profile"]
+        assert all(not any(key in record for key in ("nib_version", "system_sha", "patches_off", "profile"))
                    for record in initial_records[1:])
         assert system.index("You are nib") < system.index("GLOBAL_MARKER") < system.index("PROJECT_MARKER")
         assert "async mcp(" not in system and "<mcp_tools>" not in system
@@ -270,7 +271,7 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         ask("no session", "-c", workdir=other, ok=False)
         ask("one", workdir=other, window="6656")
         ask("one", "--continue", workdir=other, window="6656")
-        result = ask("two" + " " * 6144, "--continue", workdir=other, window="6656")
+        result = ask("two" + " " * 6336, "--continue", workdir=other, window="6656")
         assert b"compacted context:" in result.stderr, result.stderr
         compact_log = next(p for p in (tmp / "nib/sessions").glob("[0-9a-f]" * 32 + ".jsonl") if p != log)
         compacted, records = replay(compact_log)
