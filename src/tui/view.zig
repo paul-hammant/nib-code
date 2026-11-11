@@ -84,7 +84,7 @@ pub fn drawFrame(outer: vaxis.Window, entries: []Entry, input: *Editor, scroll: 
     }
 
     if (activity_h > 0) {
-        _ = win.child(.{ .x_off = 1, .y_off = body_h, .height = 1 }).printSegment(.{ .text = text.formatWidth(activity_status, scroll.top != null, win.width -| 2), .style = s.activityStyle() }, .{ .wrap = .none });
+        _ = win.child(.{ .x_off = 1, .y_off = body_h + activity_h - 1, .height = 1 }).printSegment(.{ .text = text.formatWidth(activity_status, scroll.top != null, win.width -| 2), .style = s.activityStyle() }, .{ .wrap = .none });
     }
     var menu_y = body_h + activity_h;
     for (menu_layout.first..menu_layout.end) |i| {
@@ -135,10 +135,10 @@ pub fn drawFrame(outer: vaxis.Window, entries: []Entry, input: *Editor, scroll: 
     return .{ .top = top, .window = body };
 }
 
-/// Framed terminals of 8+ rows always reserve one status row so the input never moves; smaller ones reserve it only while it has text.
+/// Framed terminals of 8+ rows always reserve the status row so the input never moves; while the line has text it also reserves a blank row above it, keeping the line off the transcript. Smaller ones reserve the text row only while it has text.
 fn statusHeight(fixed: bool, visible: bool, available: u16) u16 {
-    if (available == 0) return 0;
-    return @intFromBool(fixed or visible);
+    if (!fixed and !visible) return 0;
+    return @min(@as(u16, if (fixed and visible) 2 else 1), available);
 }
 
 const MenuLayout = struct { first: usize = 0, end: usize = 0, rows: u16 = 0 };
@@ -338,10 +338,13 @@ test "status row is reserved so the input box never moves" {
             var viewport: Viewport = .{ .pending = 0 };
             var text: status.Text = .{};
             const frame = drawFrame(win, transcript.entries.items, &input, &viewport, &.{}, 0, s, &text).?;
-            try testing.expectEqual(status_y, frame.window.height);
+            try testing.expectEqual(if (height >= 8) status_y - 1 else status_y, frame.window.height);
             try testing.expectEqualStrings("╭", screen.readCell(0, status_y + 1).?.char.grapheme);
             try testing.expectEqualStrings("╰", screen.readCell(0, height - 1).?.char.grapheme);
             try testing.expect(!std.mem.eql(u8, " ", screen.readCell(1, status_y).?.char.grapheme));
+            if (height >= 8) for (0..width) |col| {
+                try testing.expectEqualStrings(" ", screen.readCell(@intCast(col), frame.window.height).?.char.grapheme);
+            };
             try testing.expect(screen.cursor_vis);
             try testing.expectEqual(height - 2, screen.cursor.row);
         }
