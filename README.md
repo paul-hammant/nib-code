@@ -19,6 +19,11 @@ Against Codex CLI on the same model:
 
 **12% faster · 44% cheaper · 32% fewer requests · 20/20 passed**
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/bench-versus-dark.svg">
+  <img src="docs/assets/bench-versus-light.svg" alt="nib vs Codex CLI on the same model: wall time 128 s vs 144 s; cost per task $0.044 vs $0.079; requests 13 vs 19; input tokens 192k vs 623k." width="880">
+</picture>
+
 **Ten agents open:**
 
 <picture>

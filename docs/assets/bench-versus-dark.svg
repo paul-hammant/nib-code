@@ -1,0 +1,31 @@
+<?xml version='1.0' encoding='utf-8'?>
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="248" viewBox="0 0 880 248" font-family="-apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, Helvetica, Arial, sans-serif" font-size="13">
+  <text x="124" y="36" fill="#9198a1" text-anchor="end" font-weight="400">Wall time</text>
+  <rect x="136" y="13" width="469.3" height="14" rx="3" fill="#4C8DFF" />
+  <text x="615.3333333333333" y="25" fill="#4C8DFF" text-anchor="start" font-weight="700">128 s</text>
+  <rect x="136" y="35" width="528.0" height="14" rx="3" fill="#3D444D" />
+  <text x="674.0" y="47" fill="#e6edf3" text-anchor="start" font-weight="400">144 s</text>
+  <text x="872" y="36" fill="#4C8DFF" text-anchor="end" font-weight="700">12% faster</text>
+  <text x="124" y="88" fill="#9198a1" text-anchor="end" font-weight="400">Cost per task</text>
+  <rect x="136" y="65" width="294.1" height="14" rx="3" fill="#4C8DFF" />
+  <text x="440.0759493670886" y="77" fill="#4C8DFF" text-anchor="start" font-weight="700">$0.044</text>
+  <rect x="136" y="87" width="528.0" height="14" rx="3" fill="#3D444D" />
+  <text x="674.0" y="99" fill="#e6edf3" text-anchor="start" font-weight="400">$0.079</text>
+  <text x="872" y="88" fill="#4C8DFF" text-anchor="end" font-weight="700">44% cheaper</text>
+  <text x="124" y="140" fill="#9198a1" text-anchor="end" font-weight="400">Requests</text>
+  <rect x="136" y="117" width="361.3" height="14" rx="3" fill="#4C8DFF" />
+  <text x="507.2631578947369" y="129" fill="#4C8DFF" text-anchor="start" font-weight="700">13</text>
+  <rect x="136" y="139" width="528.0" height="14" rx="3" fill="#3D444D" />
+  <text x="674.0" y="151" fill="#e6edf3" text-anchor="start" font-weight="400">19</text>
+  <text x="872" y="140" fill="#4C8DFF" text-anchor="end" font-weight="700">32% fewer</text>
+  <text x="124" y="192" fill="#9198a1" text-anchor="end" font-weight="400">Input tokens</text>
+  <rect x="136" y="169" width="162.7" height="14" rx="3" fill="#4C8DFF" />
+  <text x="308.7223113964687" y="181" fill="#4C8DFF" text-anchor="start" font-weight="700">192k</text>
+  <rect x="136" y="191" width="528.0" height="14" rx="3" fill="#3D444D" />
+  <text x="674.0" y="203" fill="#e6edf3" text-anchor="start" font-weight="400">623k</text>
+  <text x="872" y="192" fill="#4C8DFF" text-anchor="end" font-weight="700">69% fewer</text>
+  <circle cx="142" cy="226" r="5" fill="#4C8DFF" />
+  <text x="154" y="230" fill="#4C8DFF" text-anchor="start" font-weight="700">nib</text>
+  <circle cx="202" cy="226" r="5" fill="#3D444D" />
+  <text x="214" y="230" fill="#9198a1" text-anchor="start" font-weight="400">Codex CLI</text>
+</svg>

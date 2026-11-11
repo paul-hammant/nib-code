@@ -19,6 +19,11 @@ nib 以 Run 为工作单位：模型写一段 JavaScript，一步完成读取、
 
 **快 12% · 费用低 44% · 请求少 32% · 20/20 通过**
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/bench-versus-dark.svg">
+  <img src="docs/assets/bench-versus-light.svg" alt="nib 与 Codex CLI 同模型对比：耗时 128 秒 vs 144 秒；每个任务费用 $0.044 vs $0.079；请求 13 vs 19；输入 token 192k vs 623k。" width="880">
+</picture>
+
 **同时打开十个 agent：**
 
 <picture>

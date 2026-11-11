@@ -57,4 +57,4 @@
 - Record wall time, API cost, model requests, input tokens, and tasks passed.
 - Measure installed size and idle RSS locally; measure total RSS of 10 instances separately.
 - Fixed prompts count system and tool definitions carried by each request.
-- Source: [benchmarks/data.json](benchmarks/data.json); run `python3 scripts/charts.py` to regenerate six light/dark SVGs.
+- Source: [benchmarks/data.json](benchmarks/data.json); run `python3 scripts/charts.py` to regenerate eight light/dark SVGs.

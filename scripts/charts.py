@@ -75,6 +75,36 @@ def costs(rows, blue, foreground, muted, gray):
     return svg
 
 
+def versus(comparison, blue, foreground, muted, gray):
+    pct = comparison["headline_percent"]
+    rows = [
+        ("Wall time", comparison["median_wall_seconds"], lambda v: f"{v} s", f'{pct["faster"]}% faster'),
+        ("Cost per task", comparison["cost_usd_per_task"], lambda v: f"${v:.3f}", f'{pct["cheaper"]}% cheaper'),
+        ("Requests", comparison["median_requests"], lambda v: f"{v}", f'{pct["fewer_requests"]}% fewer'),
+        ("Input tokens", comparison["input_tokens_per_task"], lambda v: f"{v // 1000}k", f'{pct["fewer_input_tokens"]}% fewer'),
+    ]
+    svg = chart(52 * len(rows) + 40)
+    span = WIDTH - BAR - 96 - 120
+    for i, (label, values, fmt, delta) in enumerate(rows):
+        y = 20 + 52 * i
+        maximum = max(values.values())
+        text(svg, LABEL, y + 16, label, muted, anchor="end")
+        for offset, key, color in [(0, "nib", blue), (22, "codex", gray)]:
+            width = max(3, values[key] / maximum * span)
+            ET.SubElement(svg, "rect", {
+                "x": str(BAR), "y": str(y + offset - 7), "width": f"{width:.1f}",
+                "height": "14", "rx": "3", "fill": color,
+            })
+            text(svg, BAR + width + 10, y + offset + 5, fmt(values[key]),
+                 blue if key == "nib" else foreground, key == "nib")
+        text(svg, WIDTH - 8, y + 16, delta, blue, True, "end")
+    y = 52 * len(rows) + 22
+    for x, label, color, dot in [(BAR + 6, "nib", blue, blue), (BAR + 66, "Codex CLI", muted, gray)]:
+        ET.SubElement(svg, "circle", {"cx": str(x), "cy": str(y - 4), "r": "5", "fill": dot})
+        text(svg, x + 12, y, label, color, label == "nib")
+    return svg
+
+
 def main():
     data = json.loads((ROOT / "docs/benchmarks/data.json").read_text())
     output = ROOT / "docs/assets"
@@ -84,6 +114,7 @@ def main():
             "memory": bars(data["footprint"], "ten_rss_mb", "MB", *palette),
             "prompt": bars(data["footprint"], "prompt_tokens", "tokens", *palette),
             "cost": costs(data["comparison"]["task_cost_usd"], *palette),
+            "versus": versus(data["comparison"], *palette),
         }
         for name, svg in charts.items():
             width, height = map(float, svg.attrib["viewBox"].split()[2:])
