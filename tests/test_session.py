@@ -224,7 +224,7 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         header = initial_records[0]
         original_header = log.read_bytes().splitlines()[0]
         system = first[0]["content"]
-        assert "Codex prompt caches are effort-specific" not in system
+        assert "effort-specific" not in system and "run's effort" not in system
         base = system.split("\n\nInstructions below apply in order; later instructions take priority.\n", 1)[0]
         version = re.search(r'\.version = "([^"]+)"', (ROOT / "build.zig.zon").read_text())[1]
         assert re.fullmatch(re.escape(version) + r"(?:\+[0-9a-f]+)?", header["nib_version"]), header
@@ -234,7 +234,8 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
             assert header["nib_version"] == version + "+" + git_commit.stdout.strip(), header
         assert header["system_sha"] == hashlib.sha256(base.encode()).hexdigest()[:12], header
         assert "patches_off" not in header
-        assert all(not any(key in record for key in ("nib_version", "system_sha", "patches_off"))
+        assert header["profile"] == "deepseek", header["profile"]
+        assert all(not any(key in record for key in ("nib_version", "system_sha", "patches_off", "profile"))
                    for record in initial_records[1:])
         assert system.index("You are nib") < system.index("GLOBAL_MARKER") < system.index("PROJECT_MARKER")
         assert "async mcp(" not in system and "<mcp_tools>" not in system
@@ -270,7 +271,7 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         ask("no session", "-c", workdir=other, ok=False)
         ask("one", workdir=other, window="6656")
         ask("one", "--continue", workdir=other, window="6656")
-        result = ask("two" + " " * 6144, "--continue", workdir=other, window="6656")
+        result = ask("two" + " " * 6336, "--continue", workdir=other, window="6656")
         assert b"compacted context:" in result.stderr, result.stderr
         compact_log = next(p for p in (tmp / "nib/sessions").glob("[0-9a-f]" * 32 + ".jsonl") if p != log)
         compacted, records = replay(compact_log)
@@ -311,8 +312,8 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         assert "hello from bash" in final["text"], final
         assert any(e.get("delta", {}).get("kind") == "reasoning" for e in streamed)
         assert [e["step"] for e in streamed if "step" in e] == [
-            {"n": 1, "effort": "default", "source": "default"},
-            {"n": 2, "effort": "default", "source": "default"},
+            {"n": 1, "effort": "default"},
+            {"n": 2, "effort": "default"},
         ], streamed
         assert all(isinstance(e["run_start"], str) for e in streamed if "run_start" in e), streamed
         assert next(i for i, e in enumerate(streamed) if "step" in e) < next(
@@ -333,7 +334,7 @@ with tempfile.TemporaryDirectory(prefix="nib-session-e2e-") as directory:
         assert "start" in failed[0] and "error" in failed[-1]
         assert not any("end" in e for e in failed)
         assert [e["step"] for e in failed if "step" in e] == [
-            {"n": 1, "effort": "default", "source": "default"}], failed
+            {"n": 1, "effort": "default"}], failed
         assert_turn_timing(failed[-1]["error"], [])
         failed_step = events(ask("reject2", "--json", ok=False))
         failed_id = failed_step[0]["start"]["session_id"]

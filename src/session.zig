@@ -7,8 +7,8 @@ const provider = @import("provider.zig");
 const session_log = @import("session/log.zig");
 const skills = @import("session/skills.zig");
 const instructions = @import("session/instructions.zig");
-const effort = @import("session/effort.zig");
 const prompt = @import("session/prompt.zig");
+const Profile = @import("session/profile.zig").Profile;
 const compaction = @import("session/compact.zig");
 const runner = @import("session/run.zig");
 const session_history = @import("session/history.zig");
@@ -212,6 +212,7 @@ pub const Session = struct {
             .skills = found.summary,
             .mcp_servers = s.cfg.mcp_servers,
             .patches_off = try prompt.disabledPatches(a, s.options.environ),
+            .profile = @tagName(Profile.forModel(s.cfg.model)),
         });
     }
 
@@ -503,7 +504,6 @@ pub const Session = struct {
     }
 
     fn runSteps(s: *Session, pending: *std.ArrayList(provider.Message), partial: *Partial, sink: Sink, cancel: *const std.atomic.Value(bool), detail: *?[]u8) !void {
-        var next_effort: ?effort.Pending = null;
         var step_index: usize = 0;
         while (true) : (step_index += 1) {
             if (cancel.load(.acquire)) return error.Canceled;
@@ -525,15 +525,14 @@ pub const Session = struct {
             try request.appendSlice(s.gpa, pending.items);
             try tools.Tools.poll(&s.tools);
             s.tools.background.setTurnStep(s.io, s.steps + 1);
-            const decision = effort.decide(s.cfg, step_index == 0 or inserted.items.items.len > 0, next_effort);
-            next_effort = null;
-            try sink.emit(sink.ctx, .{ .step = .{ .n = s.steps + 1, .effort = decision.metadata.effort, .source = decision.metadata.source } });
+            const step_effort: provider.StepEffort = .{ .effort = s.cfg.loggedEffort() };
+            try sink.emit(sink.ctx, .{ .step = .{ .n = s.steps + 1, .effort = step_effort.effort } });
             const started: std.Io.Clock.Timestamp = .now(s.io, .awake);
             var model_timing: provider.ModelTiming = .init(s.io, started);
             var attempts: u32 = 0;
             var first_data_ms: ?u64 = null;
             const buffer_text = s.tools.background.pending(s.io);
-            const reply = try s.complete(decision.cfg, request.items, sink, cancel, detail, partial, &model_timing, &attempts, &first_data_ms, buffer_text);
+            const reply = try s.complete(s.cfg, request.items, sink, cancel, detail, partial, &model_timing, &attempts, &first_data_ms, buffer_text);
             var waiting = reply.tool_calls.len == 0 and s.tools.background.pending(s.io);
             if (waiting) {
                 try sink.emit(sink.ctx, .{ .notice = if (reply.text.len > 0) reply.text else "Waiting for background results." });
@@ -555,7 +554,7 @@ pub const Session = struct {
                 .reasoning = reply.reasoning,
                 .phase = reply.phase,
                 .waiting = if (waiting) true else null,
-                .step_effort = decision.metadata,
+                .step_effort = step_effort,
             });
             const fork_prefix = if (reply.tool_calls.len > 0 and s.tools.depth == 0 and !s.tools.forked)
                 try session_history.snapshot(s.gpa, s.history.items, pending.items)
@@ -574,8 +573,8 @@ pub const Session = struct {
                     .provider = s.cfg.provider,
                     .custom_provider = s.cfg.custom_provider,
                     .model = s.cfg.model,
-                    .thinking = decision.cfg.thinking,
-                    .reasoning_effort = decision.cfg.reasoning_effort,
+                    .thinking = s.cfg.thinking,
+                    .reasoning_effort = s.cfg.reasoning_effort,
                     .file_versions = fork_versions.?,
                 };
             }
@@ -592,7 +591,6 @@ pub const Session = struct {
                 empty_runs = empty_runs and result.ok and result.empty and result.background_id == null and
                     result.tool_summary != null and result.tool_summary.?.counts.len == 0 and result.tool_summary.?.omitted == 0;
                 run_timing.output_bytes += result.output.len;
-                effort.Pending.record(&next_effort, result.effort, result.ok);
                 run_ms += result.run_ms orelse 0;
                 try sink.emit(sink.ctx, .{ .usage = s.usage });
                 try pending.append(s.gpa, .{ .role = "tool", .content = result.output, .tool_call_id = call.id, .background_id = result.background_id, .run_ok = if (result.background_id == null) result.ok else null, .tool_summary = result.tool_summary, .images = if (result.images.len > 0) result.images else null });
@@ -635,9 +633,7 @@ pub const Session = struct {
                 .mismatch_index = s.codex_state.last.mismatch_index,
                 .model_attempts = model_timing.attempts[0..model_timing.attempt_count],
                 .max_content_gap_ms = model_timing.max_content_gap_ms,
-                .effort = decision.metadata.effort,
-                .effort_source = decision.metadata.source,
-                .effort_downgraded = decision.downgraded,
+                .effort = step_effort.effort,
                 .attempts = attempts,
                 .first_data_ms = first_data_ms,
                 .max_gap_ms = model_timing.max_gap_ms,

@@ -60,6 +60,10 @@ _Avoid_: backend, API (too broad)
 Model-generated thought summaries and reasoning data needed by subsequent requests. Stored and returned according to the provider; readable content is shown to the user, while encrypted items serve only to continue the session.
 _Avoid_: thinking (synonymous here; use Reasoning consistently)
 
+**Profile**:
+The model family a Session's behavior is tuned for: codex (gpt-*, codex), deepseek, claude, or default. Resolved from the model name, never the provider, so a custom endpoint serving `deepseek-flash` gets the deepseek Profile. Today it selects which prompt patches apply; context policy and request parameters that differ by family belong here too ([ADR 0025](docs/adr/0025-model-profiles.md)). The resolved name is recorded in the Session log header.
+_Avoid_: model config, preset
+
 **Context compaction**:
 Replacing older model context with a summary, preserving system and recent complete Turns or Steps. The Session log appends a replacement record; original records remain in the file, and resume uses the latest replacement.
 _Avoid_: clearing the session, deleting the log

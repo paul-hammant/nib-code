@@ -615,14 +615,14 @@ class ForkTests:
                 self.assert_stale_write(result, path)
                 self.assertEqual(agent_result["changes"], [])
 
-    def test_fork_defaults_to_actual_low_step_effort_and_explicit_override_wins(self):
+    def test_fork_inherits_parent_effort_and_explicit_override_wins(self):
         mock = self.mock()
-        mock.plan("parent:step-effort", {"code": "null", "effort": "low"},
-                  "const implicit = await " + fork("implicit-low") +
-                  "; const background = await " + fork("background-low", background=True) +
-                  "; const explicit = await " + fork("explicit-high", effort="high") +
+        mock.plan("parent:step-effort", "null",
+                  "const implicit = await " + fork("implicit") +
+                  "; const background = await " + fork("background", background=True) +
+                  "; const explicit = await " + fork("explicit-low", effort="low") +
                   "; [implicit, background, explicit]")
-        for name in ("implicit-low", "background-low", "explicit-high"):
+        for name in ("implicit", "background", "explicit-low"):
             mock.plan("child:" + name)
         events = self.finish(self.start("parent:step-effort"))
         results = self.outputs(events)[1]
@@ -634,8 +634,8 @@ class ForkTests:
         def effort(body):
             return body.get("reasoning", {}).get("effort") if self.provider == "codex" else body.get("reasoning_effort")
 
-        self.assertEqual([effort(r["body"]) for r in parent_requests[:3]], ["high", "low", "high"])
-        for name, expected in (("implicit-low", "low"), ("background-low", "low"), ("explicit-high", "high")):
+        self.assertEqual([effort(r["body"]) for r in parent_requests[:3]], ["high", "high", "high"])
+        for name, expected in (("implicit", "high"), ("background", "high"), ("explicit-low", "low")):
             child = mock.observed("child:" + name)[0]
             self.assertEqual(effort(child["body"]), expected, name)
             self.assert_prefix(child, parent_requests[2])
@@ -664,11 +664,11 @@ class ForkTests:
             if step == 0:
                 return "await " + read, "parent observes V1 before queue"
             if step == 1:
-                return {"code": "await " + agent("slot-blocker", background=True), "effort": "low"}, "occupy only agent slot"
+                return "await " + agent("slot-blocker", background=True), "occupy only agent slot"
             if step == 2:
                 if not mock.holding.wait(5):
                     raise AssertionError("blocking child did not occupy the agent slot")
-                return "await " + fork("queued-snapshot", background=True), "enqueue fork in low effort Step"
+                return "await " + fork("queued-snapshot", background=True), "enqueue fork"
             if step in (3, 4):
                 if mock.observed("child:queued-snapshot"):
                     raise AssertionError("queued fork ran before the agent slot was released")
@@ -700,7 +700,7 @@ class ForkTests:
         self.assertEqual(path.read_text(), updated)
         effort = (queued[0]["body"].get("reasoning", {}).get("effort") if self.provider == "codex"
                   else queued[0]["body"].get("reasoning_effort"))
-        self.assertEqual(effort, "low")
+        self.assertEqual(effort, "high")
         done = completions(parent_requests[-1]["messages"])
         self.assertEqual({r["id"] for r in done}, {"a1", "a2"})
         fork_result = next(r for r in done if r["id"] == "a2")

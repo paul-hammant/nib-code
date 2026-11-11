@@ -129,7 +129,7 @@ pub const Turn = struct {
         const gpa = t.gpa;
         if (ev == .run_start) t.failure_stage = .tool;
         const event: Event = switch (ev) {
-            .step => |s| .{ .step = .{ .n = s.n, .effort = try gpa.dupe(u8, s.effort), .source = s.source } },
+            .step => |s| .{ .step = .{ .n = s.n, .effort = try gpa.dupe(u8, s.effort) } },
             .delta => |d| .{ .delta = .{ .kind = d.kind, .text = try gpa.dupe(u8, d.text), .step = t.session.steps + 1 } },
             .run_start => |code| .{ .run_start = .{ .code = try gpa.dupe(u8, code), .step = t.session.steps } },
             .run_end => |r| blk: {

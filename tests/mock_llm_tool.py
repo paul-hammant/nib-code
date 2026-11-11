@@ -1,4 +1,4 @@
-"""Shared tools.llm and Run effort probes for both provider mocks.
+"""Shared tools.llm and constant-effort probes for both provider mocks.
 
 llm_* session prompts generate Runs; the exact SYSTEM identifies pure model
 requests, not summaries. MOCK_LLM_TOOL_LOG enables start/end JSONL observations
@@ -191,27 +191,18 @@ def serve(handler, body, provider):
 
 
 EFFORT_PLAN = [
-    [{"code": "1", "effort": "low"}],
-    [{"code": "2"}],
-    [{"code": "3", "effort": "medium"}],
-    [{"code": "4", "effort": "low"}, {"code": "5", "effort": "high"}, {"code": "6"}],
-    [{"code": "7", "effort": "default"}],
-    [{"code": 'throw new Error("effort failed low")', "effort": "low"}],
-    [{"code": "8", "effort": "low"}, {"code": 'throw new Error("effort failed high")', "effort": "high"}],
-    [{"code": 'throw new Error("effort failed first")', "effort": "high"}, {"code": "9", "effort": "medium"}],
-    [{"code": "10", "effort": "low"}, {"code": 'throw new Error("effort failed undeclared")'}],
-    [{"code": "11", "effort": "high"}],
-    [{"code": "12"}],
+    [{"code": "1"}],
+    [{"code": "2", "effort": "low"}],
+    [{"code": '// @run: {"effort":"low"}\n3'}],
+    [{"code": 'throw new Error("effort probe failed")'}],
+    [{"code": "5"}],
 ]
 
 
 def codex_run(body, arguments, call_id):
     custom = any(t.get("type") == "custom" and t.get("name") == "run" for t in body.get("tools", []))
     if custom:
-        code = arguments["code"]
-        if "effort" in arguments:
-            code = "// @run: " + json.dumps({"effort": arguments["effort"]}) + "\n" + code
-        return dict(type="custom_tool_call", name="run", call_id=call_id, input=code)
+        return dict(type="custom_tool_call", name="run", call_id=call_id, input=arguments["code"])
     return dict(type="function_call", name="run", call_id=call_id, arguments=json.dumps(arguments, ensure_ascii=False))
 
 

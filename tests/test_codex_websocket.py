@@ -230,8 +230,6 @@ def response(inputs, response_id, mode, body):
             args["code"] = "console.log(await tools.view({path: %s}))" % json.dumps(VIEW["path"])
         if mode == "fork":
             args["code"] = 'console.log(await tools.agent({prompt: "resumed", fork: true}))'
-        if mode == "effort":
-            args["effort"] = "low"
         item = dict(codex_run(body, args, "call1"), id="fc1", status="completed")
     else:
         text = "finished🙂" if not summary else "Earlier summary"
@@ -442,15 +440,15 @@ def main():
         assert any(i.get("type") == "custom_tool_call" for i in resumed.requests[0]["body"]["input"])
         assert any(i.get("type") == "custom_tool_call_output" for i in resumed.requests[0]["body"]["input"])
         assert resumed_steps[-1]["incremental"] is False
-        for mode in ("ordered", "prefix", "unsupported", "effort", "content-heartbeats", "content-metadata", "request-progress", "content-progress", "invalid-response"):
+        for mode in ("ordered", "prefix", "unsupported", "content-heartbeats", "content-metadata", "request-progress", "content-progress", "invalid-response"):
             server, steps, _, _ = run_case(tmp, mode)
-            if mode in ("ordered", "prefix", "unsupported", "effort", "content-progress"):
+            if mode in ("ordered", "prefix", "unsupported", "content-progress"):
                 assert len(server.requests) == 2 and server.connections == 1
                 if mode == "content-progress":
                     assert steps[0]["model_ms"] > 1200 and steps[0]["attempts"] == 1
                     assert steps[0]["max_content_gap_ms"] < 1000
-                assert steps[1]["incremental"] == (mode not in ("effort", "unsupported")), (mode, steps)
-                assert steps[1].get("full_reason") == ("effort_changed" if mode == "effort" else "unsupported_output" if mode == "unsupported" else None)
+                assert steps[1]["incremental"] == (mode != "unsupported"), (mode, steps)
+                assert steps[1].get("full_reason") == ("unsupported_output" if mode == "unsupported" else None)
             else:
                 assert server.connections == 2 and server.posts == 0, (mode, server.requests)
                 attempts = steps[0]["model_attempts"]

@@ -185,9 +185,9 @@ Local request-flags comparisons showed earlier first arguments with summaries of
 
 ## Custom Run tool
 
-Default Responses custom emits direct JS, removing function JSON-string escaping. Lark grammar (`SOURCE: /[\s\S]+/`) accepts optional first `// @run: {"effort":"low"}`; outer-form only, no JS validation. User ceilings/one-shot/failed-Run guards remain; [configuration](config.md#per-step-effort-scheduling). [codex] run_tool = "function" or `NIB_CODEX_RUN_TOOL=function` falls back; Chat Completions unchanged.
+Default Responses custom emits direct JS, removing function JSON-string escaping. Lark grammar (`SOURCE: /[\s\S]+/`) accepts any non-empty source; outer-form only, no JS validation. Per-Step effort declarations were removed ([ADR 0025](adr/0025-model-profiles.md)); old `// @run:` lines in history replay verbatim and are plain comments if re-run. [codex] run_tool = "function" or `NIB_CODEX_RUN_TOOL=function` falls back; Chat Completions unchanged.
 
-Encode each historical call by its own type: custom_tool_call/custom_tool_call_output versus function_call/function_call_output. Resume never converts old JSON code/effort to custom, nor reverse fallback history. Preserve raw args/encrypted reasoning/cache prefixes, with expected changes only at tool-definition differences. Resume already uses new full-history connections; unchanged same-connection tools allow normalized custom output prefix matching and incremental results.
+Encode each historical call by its own type: custom_tool_call/custom_tool_call_output versus function_call/function_call_output. Resume never converts old JSON code to custom, nor reverse fallback history. Preserve raw args/encrypted reasoning/cache prefixes, with expected changes only at tool-definition differences. Resume already uses new full-history connections; unchanged same-connection tools allow normalized custom output prefix matching and incremental results.
 
 Internal/main-log `tool_calls[].function.arguments` remains JSON {code}, custom marked `type:"custom"`; retain raw Responses output too. Reuse execution/fork/resume/replay paths. Argument timing measures wire payloads: raw JS UTF-8 custom input versus function JSON args, not normalized JSON lengths.
 

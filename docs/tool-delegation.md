@@ -67,7 +67,7 @@ Each fork creates independent child/new aN, later resumable. Passing fork and re
 
 Copy observations only on fork creation, never log them; later resume restarts observations like ordinary resume.
 
-Fork model/effort inherit actual effective initiating-request configuration, including one-shot Run effort; overrides win. Both must match for parent-prefix benefits. Responses/Messages enforce resume model consistency against encrypted/signed parent history despite overrides. Codex shares parent `prompt_cache_key` for routing, but hit/savings remain measured hypotheses, not guarantees; [codex.md](codex.md#fork-and-parent-cache-routing), [ADR 0015](adr/0015-agent-fork.md).
+Fork model/effort inherit the parent's configuration; overrides win. Both must match for parent-prefix benefits. Responses/Messages enforce resume model consistency against encrypted/signed parent history despite overrides. Codex shares parent `prompt_cache_key` for routing, but hit/savings remain measured hypotheses, not guarantees; [codex.md](codex.md#fork-and-parent-cache-routing), [ADR 0015](adr/0015-agent-fork.md).
 
 Foreground success { ok: true, id, text, usage, changes }; timeout/crash/nonzero/NDJSON error { ok: false, id, error, text, usage, changes }, without rejection/sibling cancellation. id is task id, never internal child ids in results/errors/background. Only argument errors (including malformed resume) and user cancellation reject. Successful text=end.text; failures keep received final text deltas excluding reasoning/tool code, otherwise empty. error preserves cause, actual time including grace, task id, possible incomplete files. usage/changes this invocation only, no prior-history recounting.
 

@@ -1060,6 +1060,20 @@ class StatsTest(unittest.TestCase):
             path.write_text('\n'.join(map(json.dumps, records)) + '\n')
             self.assertEqual(stats.summarize([path])['round_trips']['steps_per_turn'], before)
 
+    def test_group_by_profile_header(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = {}
+            for name, metadata in (('old', {}), ('deepseek', dict(profile='deepseek')),
+                                   ('codex', dict(profile='codex')), ('codex2', dict(profile='codex')),
+                                   ('invalid', dict(profile=3))):
+                paths[name] = Path(directory) / (name + '.jsonl')
+                synthetic_log(paths[name], [[None]], **metadata)
+            report = stats.summarize(sorted(paths.values()), group_by='profile')
+            self.assertEqual({key: group['overall']['sessions'] for key, group in report['groups'].items()},
+                             {'codex': 2, 'deepseek': 1, 'unknown': 2})
+            cli = ['python3', str(ROOT / 'scripts/stats.py'), directory, '--group-by', 'profile']
+            self.assertIn('=== profile=codex ===', subprocess.check_output(cli).decode())
+
     def test_group_by_header_mixed_versions_systems_patches_and_cli(self):
         write_a = 'tools.write({path: "a", content: "x"})'
         write_b = 'tools.edit({path: "b", old_text: "x", new_text: "y"})'
@@ -1445,7 +1459,6 @@ class StatsTest(unittest.TestCase):
             timing = report['timing']
             self.assertEqual(report['overall']['steps'], 4)
             self.assertEqual(timing['effort']['by_effort'], {})
-            self.assertIsNone(timing['effort']['downgraded']['run_failure_rate'])
             self.assertEqual(timing['step_ms'], dict(samples=3, median=100, p90=300))
             self.assertEqual(timing['model_ms'], dict(samples=2, median=75, p90=150))
             self.assertEqual(timing['run_ms'], dict(samples=2, median=50, p90=100))
@@ -1474,7 +1487,7 @@ class StatsTest(unittest.TestCase):
                             'heuristic', 'unmatched=1', 'git status: count=1 total=60 ms'):
                 self.assertIn(snippet, text)
 
-    def test_effort_groups_downgraded_same_step_run_failures_json_and_text(self):
+    def test_effort_groups_ignore_legacy_scheduling_fields_json_and_text(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'effort.jsonl'
             records = [dict(cwd=directory, **{'from': 0},
@@ -1528,26 +1541,21 @@ class StatsTest(unittest.TestCase):
             self.assertEqual(low['steps_with_cache_usage'], 2)
             self.assertEqual((low['prompt_tokens'], low['prompt_cache_hit_tokens'], low['cache_hit_rate']),
                              (400, 50, .125))
-            self.assertEqual(low['downgraded'], dict(steps=3, steps_with_runs=2, steps_with_failed_run=1,
-                steps_with_unknown_run_status=0, run_failure_rate=.5))
-            self.assertEqual(groups['medium']['downgraded'], dict(steps=2, steps_with_runs=1,
-                steps_with_failed_run=0, steps_with_unknown_run_status=1, run_failure_rate=0))
-            self.assertEqual(effort['downgraded'], dict(steps=5, steps_with_runs=3, steps_with_failed_run=1,
-                steps_with_unknown_run_status=1, run_failure_rate=1 / 3))
+            self.assertNotIn('downgraded', effort)
+            self.assertTrue(all('downgraded' not in group for group in groups.values()))
             self.assertEqual(groups['high']['model_ms']['samples'], 0)
             self.assertIsNone(groups['high']['model_ms']['median'])
             self.assertIsNone(groups['high']['cache_hit_rate'])
-            self.assertIsNone(groups['high']['downgraded']['run_failure_rate'])
             cli = ['python3', str(ROOT / 'scripts/stats.py'), str(path)]
             self.assertEqual(json.loads(subprocess.check_output(cli + ['--json']))['timing']['effort'], effort)
             text = subprocess.check_output(cli).decode()
             for snippet in ('Step effort', 'low: steps=7 model_ms median=20.00 samples=2',
-                            'cache_hit_rate=12.50% (50/400)', 'Run failures in this Step 1/2 = 50.00%',
-                            'Total downgraded Steps 5; Run failures in this Step 1/3 = 33.33%',
+                            'cache_hit_rate=12.50% (50/400)',
                             'high: steps=1 model_ms median=n/a samples=0 cache_hit_rate=n/a',
-                            'timing.effort.by_effort', 'steps_with_failed_run/steps_with_runs',
-                            'effort_downgraded', 'Unknown statuses remain in the denominator'):
+                            'timing.effort.by_effort'):
                 self.assertIn(snippet, text)
+            for snippet in ('downgraded', 'effort_downgraded'):
+                self.assertNotIn(snippet, text)
 
     def test_effort_cache_transitions_rates_median_mean_and_text(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1682,24 +1690,22 @@ class StatsTest(unittest.TestCase):
     def test_effort_empty_invalid_fields_and_zero_samples(self):
         effort = stats.EffortStats()
         self.assertEqual(effort.report()['by_effort'], {})
-        self.assertIsNone(effort.report()['downgraded']['run_failure_rate'])
         for value in (None, '', '  ', 5, False, [], {}):
-            effort.add(dict(effort=value, effort_source='model'), [False])
+            effort.add(dict(effort=value, effort_source='model'))
         self.assertEqual(effort.report()['by_effort'], {})
         for usage in (None, {}, dict(prompt_tokens=10), dict(prompt_cache_hit_tokens=5),
                       dict(prompt_tokens=True, prompt_cache_hit_tokens=5),
                       dict(prompt_tokens=10, prompt_cache_hit_tokens=-1)):
             effort.add(dict(effort='low', effort_source='model', effort_downgraded=False,
-                            model_ms=False, usage=usage), [False])
+                            model_ms=False, usage=usage))
         effort.add(dict(effort='low', model_ms=0,
-                        usage=dict(prompt_tokens=0, prompt_cache_hit_tokens=0)), [])
+                        usage=dict(prompt_tokens=0, prompt_cache_hit_tokens=0)))
         low = effort.report()['by_effort']['low']
         self.assertEqual(low['steps'], 7)
         self.assertEqual(low['model_ms'], dict(samples=1, median=0, p90=0))
         self.assertEqual(low['steps_with_cache_usage'], 1)
         self.assertEqual(low['prompt_cache_hit_tokens'], 0)
         self.assertIsNone(low['cache_hit_rate'])
-        self.assertEqual(low['downgraded']['steps'], 0)
 
     def test_since_timing_uses_only_selected_complete_steps_text_and_json(self):
         cutoff = int(datetime(2025, 1, 2).timestamp() * 1000)
@@ -1752,8 +1758,6 @@ class StatsTest(unittest.TestCase):
                     self.assertEqual(set(effort['by_effort']), {'low'})
                     self.assertEqual(effort['by_effort']['low']['steps'], count)
                     self.assertEqual(effort['by_effort']['low']['prompt_tokens'], total)
-                    self.assertEqual(effort['downgraded'], dict(steps=count, steps_with_runs=count,
-                        steps_with_failed_run=0, steps_with_unknown_run_status=0, run_failure_rate=0))
                     t = report['overall']
                     self.assertEqual((t['steps'], t['runs'], t['steps_with_ms'], t['steps_with_usage']),
                                      (steps, count, count, count))

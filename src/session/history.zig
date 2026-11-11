@@ -47,7 +47,7 @@ fn clone(a: std.mem.Allocator, message: provider.Message) !provider.Message {
     copy.phase = try dupeOptional(a, message.phase);
     copy.background_id = try dupeOptional(a, message.background_id);
     if (message.reasoning) |reasoning| copy.reasoning = .{ .provider = reasoning.provider, .data = try a.dupe(u8, reasoning.data), .includes_output = reasoning.includes_output };
-    if (message.step_effort) |effort| copy.step_effort = .{ .effort = try a.dupe(u8, effort.effort), .source = effort.source };
+    if (message.step_effort) |effort| copy.step_effort = .{ .effort = try a.dupe(u8, effort.effort) };
     if (message.tool_summary) |summary| copy.tool_summary = try summary.clone(a);
     if (message.images) |images| {
         const copies = try a.alloc(@import("../image.zig").Image, images.len);
@@ -102,7 +102,7 @@ test "inherit deep copies messages and completes only unpaired tool calls" {
     const original = [_]provider.Message{
         .{ .role = "system", .content = "exact system" },
         .{ .role = "user", .content = "compacted summary", .source = .background, .background_id = "b1", .background_ok = true, .background_kind = .bash },
-        .{ .role = "assistant", .content = "launch", .phase = "commentary", .reasoning = .{ .provider = .codex, .data = "opaque reasoning" }, .step_effort = .{ .effort = "high", .source = .guard }, .tool_calls = &.{
+        .{ .role = "assistant", .content = "launch", .phase = "commentary", .reasoning = .{ .provider = .codex, .data = "opaque reasoning" }, .step_effort = .{ .effort = "high" }, .tool_calls = &.{
             .{ .id = "one", .function = .{ .name = "run", .arguments = "{}" } },
             .{ .id = "two", .function = .{ .name = "run", .arguments = "{}" } },
             .{ .id = "three", .function = .{ .name = "run", .arguments = "{}" } },

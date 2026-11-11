@@ -46,8 +46,6 @@ pub const Record = struct {
     bash: ?@import("../tools/bash/registry.zig").Event = null,
     usage: ?provider.Usage = null,
     effort: ?[]const u8 = null,
-    effort_source: ?provider.EffortSource = null,
-    effort_downgraded: ?bool = null,
     turn_step: ?u32 = null,
     ms: ?u64 = null,
     model_ms: ?u64 = null,
@@ -76,6 +74,7 @@ pub const Record = struct {
     nib_version: ?[]const u8 = null,
     system_sha: ?[]const u8 = null,
     patches_off: ?[]const []const u8 = null,
+    profile: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
     provider: ?provider.Id = null,
     custom_provider: ?[]const u8 = null,
@@ -240,9 +239,8 @@ fn apply(history: *std.ArrayList(provider.Message), record: Record) void {
     history.shrinkRetainingCapacity(record.from);
     history.appendSliceAssumeCapacity(record.messages);
     if (record.effort) |effort| {
-        const source = record.effort_source orelse .default;
         for (history.items[record.from..]) |*message| {
-            if (std.mem.eql(u8, message.role, "assistant")) message.step_effort = .{ .effort = effort, .source = source };
+            if (std.mem.eql(u8, message.role, "assistant")) message.step_effort = .{ .effort = effort };
         }
     }
 }
@@ -441,7 +439,7 @@ fn parseRecord(a: std.mem.Allocator, line: []const u8) !Record {
             }
         };
     };
-    return std.json.parseFromValueLeaky(Record, a, value, .{});
+    return std.json.parseFromValueLeaky(Record, a, value, .{ .ignore_unknown_fields = true });
 }
 
 fn validate(messages: []const provider.Message) !void {
@@ -792,8 +790,8 @@ test "Step effort restores from Record and survives compacted message snapshots"
         .{ .role = "user", .content = "task" },
         .{ .role = "assistant", .content = "legacy" },
     } };
-    const step: Record = .{ .from = 3, .effort = "high", .effort_source = .guard, .context_tokens = 99, .messages = &.{
-        .{ .role = "assistant", .content = "new", .step_effort = .{ .effort = "low", .source = .model } },
+    const step: Record = .{ .from = 3, .effort = "high", .context_tokens = 99, .messages = &.{
+        .{ .role = "assistant", .content = "new", .step_effort = .{ .effort = "low" } },
     } };
     const data = try std.fmt.allocPrint(a, "{f}\n{f}\n", .{ std.json.fmt(base, .{ .emit_null_optional_fields = false }), std.json.fmt(step, .{ .emit_null_optional_fields = false }) });
     var history: std.ArrayList(provider.Message) = .empty;
@@ -801,7 +799,6 @@ test "Step effort restores from Record and survives compacted message snapshots"
     _ = try replay(a, a, data, &history, &tokens);
     try t.expect(history.items[2].step_effort == null);
     try t.expectEqualStrings("high", history.items[3].step_effort.?.effort);
-    try t.expectEqual(provider.EffortSource.guard, history.items[3].step_effort.?.source);
     const compacted: Record = .{ .from = 0, .messages = history.items, .context_tokens = 20 };
     const compacted_data = try std.fmt.allocPrint(a, "{s}{f}\n", .{ data, std.json.fmt(compacted, .{ .emit_null_optional_fields = false }) });
     var restored: std.ArrayList(provider.Message) = .empty;
@@ -810,8 +807,11 @@ test "Step effort restores from Record and survives compacted message snapshots"
     try t.expectEqualDeep(history.items, restored.items);
     try t.expectEqual(@as(u64, 20), tokens);
     const old = try parseRecord(a, "{\"messages\":[{\"role\":\"assistant\",\"content\":\"old\"}]}");
-    try t.expect(old.effort == null and old.effort_source == null);
+    try t.expect(old.effort == null);
     try t.expect(old.messages[0].step_effort == null);
+    const scheduled = try parseRecord(a, "{\"effort\":\"low\",\"effort_source\":\"model\",\"effort_downgraded\":true,\"messages\":[{\"role\":\"assistant\",\"content\":\"x\",\"step_effort\":{\"effort\":\"low\",\"source\":\"model\"}}]}");
+    try t.expectEqualStrings("low", scheduled.effort.?);
+    try t.expectEqualStrings("low", scheduled.messages[0].step_effort.?.effort);
 }
 
 test "child restore checks parent before repairing and keeps the session exclusively locked" {

@@ -35,7 +35,7 @@ model = "gpt-6.1-sol"
 base_url = "https://chatgpt.com/backend-api"
 context_window = 500000
 reasoning_summary = "off" # auto enables readable reasoning summaries
-run_tool = "custom" # function falls back to JSON code/effort
+run_tool = "custom" # function falls back to JSON code
 transport = "websocket" # Session falls back to SSE after handshake/protocol failure; sse forces HTTP
 
 [chat_completions]
@@ -165,7 +165,7 @@ Children inherit effective provider/model/limits through anonymous stdin, skippi
 | `NIB_PROVIDER` | codex / openai / anthropic / deepseek / xai / chat_completions or configured custom id |
 | `NIB_BASE_URL` | Current provider endpoint |
 | `NIB_CODEX_TRANSPORT` | websocket (default) or sse; overrides [codex].transport; Session SSE fallback after handshake/protocol failure; [transport](codex.md#responses-websocket-transport) |
-| `NIB_CODEX_RUN_TOOL` | custom (default, direct JS) or function (JSON code/effort); overrides `[codex].run_tool`, preserving history types; Chat Completions always function |
+| `NIB_CODEX_RUN_TOOL` | custom (default, direct JS) or function (JSON code); overrides `[codex].run_tool`, preserving history types; Chat Completions always function |
 | `NIB_REASONING_SUMMARY` | off (default, omit summary) or auto; overrides `[codex].reasoning_summary`, preserving effort/encrypted continuation |
 | `NIB_SANDBOX` | off (default) or workspace; overrides `[sandbox].mode`; [details](#sandbox) |
 | `NIB_RUN_OUTPUT_BYTES` | Model display bytes, 16384–16777216; overrides `[limits].run_output_bytes`, default 16384; JS data/console capture unchanged |
@@ -185,19 +185,11 @@ Recording defaults on. `NIB_RECORD=off` disables subsequent recording without de
 
 Offline commands, JSONL, SHA-256 deduplication, per-item 1 MiB truncation, privacy/capability boundaries: [replay.md](replay.md).
 
-## Per-Step effort scheduling
+## Run effort
 
-Codex custom run accepts JS directly; optional first line `// @run: {"effort":"low"}` declares effort, body starts next line. Preserve it in source/logs; recognize only the first line, returning correctable Run errors for invalid syntax/levels. Chat Completions/Codex run_tool = "function" use run({code: "...", effort: "low"}). Values: low|medium|high|default. Apply once to the **next main-model Step request** after this result, then restore user settings unless redeclared. Last declaration in a Step wins; undeclared Runs do not overwrite it. default explicitly restores user settings. Mechanical next Steps fit low; redesign/difficult diagnosis should not reduce effort.
+The `run` tool takes only `code`; the model cannot change reasoning effort per Step. Every Step requests the user's effort (`/effort`, `--effort`, config `effort`), and `tools.llm` keeps its own policy. Per-Step scheduling was removed by [ADR 0025](adr/0025-model-profiles.md): switching effort empties the provider prompt cache on Codex and DeepSeek. A first line `// @run: …` is an ordinary JS comment, and an `effort` argument in `run` arguments from old history is ignored.
 
-Session applies guardrails centrally:
-
-- Effective user effort is default and ceiling: low < medium < high < xhigh < max. Above-ceiling declarations revert to user settings; `off/none/minimal` cannot be raised either.
-- Actual server-default effort is unknown: allow only low or default; `medium/high` revert without guessing.
-- Ignore a reduction if its declaring Run returns `ok=false`, reverting next time; failures in other undeclared Runs do not alter the last declaration.
-- First Turn requests and requests carrying new interjections always use user settings. Compaction keeps independent policy; `tools.llm` uses the small model's default effort (or user configuration with an explicit model), not temporary main-model reductions.
-- Existing Codex mappings remain; non-disableable models map off→low. Scheduling changes no user configuration/files/child-inherited configuration.
-
-TUI Run summaries show actual effort of the **request producing them**, not next-Step declarations, with (guard) for guarded sources. Restore history from logs; omit effort for old logs without it. Explicit bottom-border settings show effort ≤high; server default displays unchanged.
+TUI Run summaries and logs record the effort of the request that produced them; old logs without it show none.
 
 ## Effort persistence
 

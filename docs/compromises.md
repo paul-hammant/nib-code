@@ -4,7 +4,7 @@ See [README.md](README.md#grounded-in-the-present-ready-for-the-future) for prin
 
 ## Model patches
 
-Prompt patches are centralized in `src/session/prompt.zig`'s `patches`; disable with `NIB_PATCHES_OFF=<id,...|all>` (child Sessions inherit the variable). Verification: disable temporarily, then compare signals using `scripts/stats.py --since` against comparable enabled-period data.
+Prompt patches are centralized in `src/session/prompt.zig`'s `patches`; each applies to all [Profiles](../CONTEXT.md) unless its `applies_to` set narrows it. Disable with `NIB_PATCHES_OFF=<id,...|all>` (child Sessions inherit the variable). Verification: disable temporarily, then compare signals using `scripts/stats.py --since` against comparable enabled-period data.
 
 | id / name | Location | Reason | Signal | Removal condition |
 |---|---|---|---|---|

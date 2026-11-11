@@ -119,10 +119,8 @@ def child_code(case, step):
     return None
 
 
-def reply(handler, provider, code, text, effort=None):
+def reply(handler, provider, code, text):
     run_args = {"code": code}
-    if effort is not None:
-        run_args["effort"] = effort
     handler.send_response(200)
     handler.send_header("Content-Type", "text/event-stream")
     handler.send_header("Transfer-Encoding", "chunked")
