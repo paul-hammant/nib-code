@@ -219,6 +219,7 @@ test "continuation requires live connection, same properties and input plus outp
         try changed.object.put(a, key, .{ .string = "changed" });
         _ = try s.payload(a, try std.json.Stringify.valueAlloc(a, changed, .{}), false);
         try t.expect(!s.last.incremental);
+        try t.expectEqualStrings(if (std.mem.eql(u8, key, "reasoning")) "effort_changed" else "properties_changed", s.last.full_reason.?);
     }
     s.socket = null;
     _ = try s.payload(a, next, false);
