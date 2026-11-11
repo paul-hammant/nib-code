@@ -27,6 +27,9 @@ from test_agent import alive
 from test_interjections import Terminal, history
 from test_llm import records, wait_for
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from screen import screen
+
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "zig-out/bin/nib"
 
@@ -1333,7 +1336,8 @@ class ChatTests(BackgroundBashTests, unittest.TestCase):
         terminal.send("initial\r")
         wait_for(lambda: len(mock.observed()) == 2)
         terminal.send("while waiting\r")
-        terminal.until(b"queued")
+        # A bare b"queued" also matches the background task's own "queued" label, which can precede the keystroke being handled.
+        wait_for(lambda: any("while waiting" in row and "queued" in row for row in screen(terminal.read(), 120, 32)))
         wait_for(lambda: (self.cwd / "worker.started").exists())
         self.release()
         wait_for(lambda: not alive(int((self.cwd / "worker.started").read_text())))
