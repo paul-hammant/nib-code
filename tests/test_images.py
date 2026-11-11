@@ -133,7 +133,8 @@ def test_tui_paste_path_attaches_image(tmp):
     shot = tmp.parent / (tmp.name + "-my shot.png")
     shot.write_bytes(PNG)
     reply = Reply("seen")
-    with fixture(tmp, [reply], config=vision_config(), provider="site") as (terminal, home, _):
+    environment = fake_clipboard(tmp, None)
+    with fixture(tmp, [reply], config=vision_config(), provider="site", environment=environment) as (terminal, home, _):
         paste(terminal, str(shot).replace(" ", "\\ "))
         terminal.until(b"[Image #1]")
         paste(terminal, "/does/not/exist.png")
@@ -150,14 +151,14 @@ def test_tui_paste_path_attaches_image(tmp):
         assert user["images"][0]["name"] == shot.name and user["images"][0]["width"] == 640, user
         assert ENCODED not in "".join(p.read_text() for p in (home / "sessions").glob("*.jsonl"))
         terminal.send("\x16")
-        terminal.until(b"clipboard")
+        terminal.until(b"No image in clipboard")
     shot.unlink()
 
 
 def test_tui_refuses_images_without_vision(tmp):
     shot = tmp.parent / (tmp.name + "-shot.png")
     shot.write_bytes(PNG)
-    with fixture(tmp, [Reply("never")]) as (terminal, home, _):
+    with fixture(tmp, [Reply("never")], environment=fake_clipboard(tmp, None)) as (terminal, home, _):
         paste(terminal, str(shot))
         terminal.until(b"has no image input")
         assert b"[Image #1]" not in terminal.read()
