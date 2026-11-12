@@ -55,6 +55,7 @@ import nib.tools.agent_input
 import nib.tools.agent_sessions
 
 exports(Session, Options, Sink, new_options, new_sink, init, turn, compact_now, close, turn_end_hooks, error_message, timing_json, undo,
+        set_activity, enqueue, take_queued, switch_config, steps_logged,
         VERSION)
 
 const VERSION = "0.13.0-ae"   // `nib --version`; Session headers record build_info.nib_version()
@@ -78,6 +79,10 @@ struct Sink {
     ctx: ptr
     emit: fn                 // |ctx: ptr, event_json: string|
     guard: ptr               // events are written one at a time
+    // The TUI's activity callbacks (upstream Sink.onModelActivity,
+    // onToolActivity, onUserInserted); `nib ask` has none.
+    on_activity: fn          // |ctx: ptr, kind: string, value: string|: model <state>, tool <name>, user_inserted <id>
+    has_activity: int
 }
 
 struct Session {
@@ -146,6 +151,61 @@ emit_(sp: ptr, ev: string) {
 }
 
 // main's errorMessage: the user-facing text of an error name.
+// Activity callbacks for a TUI sink (see Sink.on_activity).
+set_activity(sp: ptr, f: @keep fn) {
+    s = sp as *Sink
+    s.on_activity = f
+    s.has_activity = 1
+}
+
+activity_(sp: ptr, kind: string, value: string) {
+    if sp == null { return }
+    s = sp as *Sink
+    if s.has_activity == 0 { return }
+    call(s.on_activity, s.ctx, kind, value)
+}
+
+// A user interjection while a Turn runs (upstream Session.enqueue): its id.
+enqueue(sp: ptr, text: string) -> long {
+    s = sp as *Session
+    return background.enqueue_user((s.tools as *tools.Tools).background, text)
+}
+
+// The interjections no Step took (upstream takeQueued): a list of strings.
+take_queued(sp: ptr) -> ptr {
+    s = sp as *Session
+    return background.take_users((s.tools as *tools.Tools).background)
+}
+
+// Steps committed to this Session's log.
+steps_logged(sp: ptr) -> int {
+    s = sp as *Session
+    return (s.log as *log.Log).steps
+}
+
+// Applies a new provider/model config in place before the first Step
+// (upstream switchConfig's .updated): "updated", "reopen" when Steps exist
+// (the caller opens a new Session with it), or "update_failed:<error>".
+switch_config(sp: ptr, cp: @keep ptr) -> string {
+    s = sp as *Session
+    if (s.log as *log.Log).steps > 0 { return "reopen" }
+    previous = s.cfg
+    s.cfg = cp
+    tools.set_config(s.tools, cp, s.id)
+    err = initialize_history_(s, os.getcwd())
+    if err != "" {
+        s.cfg = previous
+        tools.set_config(s.tools, previous, s.id)
+        return "update_failed:${err}"
+    }
+    c = cp as *types.Config
+    l = s.log as *log.Log
+    l.provider = c.provider
+    l.custom_provider = c.custom_provider
+    l.model = c.model
+    return "updated"
+}
+
 error_message(err: string) -> string {
     match err {
         "InvalidArguments" -> { return "Invalid arguments · run nib --help" }
@@ -816,9 +876,18 @@ insert_background_(s: *Session, pending: ptr, sk: ptr, include_detached: int) ->
     if n == 0 { return "" }
     l = (s.cfg as *types.Config).limits as *types.Limits
     added = list.list_new()
+    has_background = 0
     i = 0
     while i < n {
         it = list.list_get_raw(items, i) as *background.Item
+        if it.kind == "user" {
+            // A user interjection: into this Step's request, committed with it.
+            list.list_add(pending, msg.user(it.text))
+            activity_(sk, "user_inserted", it.id)
+            i = i + 1
+            continue
+        }
+        has_background = 1
         content = it.text
         if it.state == "finished" && it.completion == "" {
             nl = string.index_of(it.text, "\n")
@@ -853,6 +922,7 @@ insert_background_(s: *Session, pending: ptr, sk: ptr, include_detached: int) ->
         emit_(sk, "{\"background\":${event}}")
         i = i + 1
     }
+    if has_background == 0 { return "" }
     tokens = (s.log as *log.Log).context_tokens + compact.estimate_tokens(pending, 0, list.list_size(pending))
     e = log.commit(s.log, s.history, list.list_size(s.history), pending, tokens, "", 0)
     if e != "" { return e }
@@ -889,8 +959,14 @@ complete_(s: *Session, request: ptr, sk: @keep ptr, cancel: @keep ptr, buffer_te
     pk.on_data = |ctx: ptr| {
         f = ctx as *Fwd
         if f.first_data_ms < 0 { f.first_data_ms = os.now_monotonic_ms() - f.started_ms }
+        activity_(f.sink, "model", "data")
     }
     pk.has_data = 1
+    pk.on_tool_arguments = |ctx: ptr| {
+        f = ctx as *Fwd
+        activity_(f.sink, "model", "script")
+    }
+    pk.has_tool_arguments = 1
     rp = provider.retry_new(fp)
     rr = rp as *provider.Retry
     rr.on_event = |ctx: ptr, kind: string, attempt: int, delay: long, reason: string| {
@@ -1094,7 +1170,9 @@ run_steps_(s: *Session, pending: ptr, sk: @keep ptr, cancel: @keep ptr) -> (stri
         fwd.model = modeltiming.new(step_started)
         s.partial_text = ""
         s.partial_reasoning = ""
+        activity_(sk, "model", "started")
         rep, err, detail, attempts = complete_(s, request, sk, cancel, buffer_text, fwd)
+        activity_(sk, "model", "finished")
         if err != "" {
             modeltiming.release(fwd.model)
             return err, detail
@@ -1198,6 +1276,7 @@ run_steps_(s: *Session, pending: ptr, sk: @keep ptr, cancel: @keep ptr) -> (stri
         if ncalls == 0 || waiting == 1 {
             if background.pending(t.background) == 0 { return "", "" }
             if lim.max_steps < 0 || s.steps < lim.max_steps {
+                activity_(sk, "model", "waiting")
                 while background.inbox_size(t.background) == 0 && background.pending(t.background) == 1 {
                     if canceled_(cancel) == 1 { return "Canceled", "" }
                     poll_(s, sk)
@@ -1220,6 +1299,7 @@ finish_step_limit_(s: *Session, pending: ptr, sk: ptr, cancel: ptr, max_steps: i
     plural = "s"
     if max_steps == 1 { plural = "" }
     if waited != "" { emit_(sk, "{\"notice\":${jsonx.quote("Step limit reached; waiting for background tasks: ${waited}")}}") }
+    if waited != "" { activity_(sk, "model", "waiting") }
     while background.pending(t.background) == 1 {
         if canceled_(cancel) == 1 { return "Canceled", "" }
         poll_(s, sk)

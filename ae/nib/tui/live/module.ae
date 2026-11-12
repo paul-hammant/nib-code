@@ -1,0 +1,321 @@
+// live: the TUI's Session port over the real Session (nib.session), the
+// half of upstream src/tui/turn.zig that runs a Turn on its own thread plus
+// the Session calls upstream's App makes directly (reopen, switchConfig,
+// enqueue, takeQueued, undo, the background tasks, recovery, /js).
+//
+// A Turn runs on a std.worker thread; its events reach the app's queue as the
+// JSON text the Session emits, with what upstream's Turn.emit adds: the Step
+// on deltas and Run starts, the context and Step count on usage events. Model
+// activity goes through nib.tui.turn's throttle. The Turn ends with its
+// summary ({"turn_end":..}) and {"done":{}} or {"failed":..}.
+//
+// Not here yet (marked): hooks after a Turn (src/session/hooks.zig), skills
+// and MCP reloads on /new, tool activity names (the transcript shows the
+// running tool from the Run's progress instead).
+
+import std.list
+import std.string
+import std.sync
+import std.worker
+import std.os
+import nib.jsonx
+import nib.provider.types
+import nib.session
+import nib.session.log
+import nib.tools
+import nib.tools.background
+import nib.tools.changes
+import nib.tools.diff
+import nib.sandbox
+import nib.tui.app_queue
+import nib.tui.port
+import nib.tui.turn
+
+exports(Live, new, session_of)
+
+struct Live {
+    sp: ptr                  // the *session.Session
+    cfg: ptr
+    op: ptr                  // the Options it was opened with
+    home: string
+    running: ptr             // std.sync cell: a Turn's thread is running
+    stage: ptr               // std.sync cell: 1 once a Run started (failure stage tool)
+    stops: ptr               // std.list of ids whose stop waits for the Turn's end
+}
+
+session_of(p: *port.Port) -> ptr { return (p.ctx as *Live).sp }
+
+sess_(l: *Live) -> *session.Session { return l.sp as *session.Session }
+
+tools_(l: *Live) -> *tools.Tools { return sess_(l).tools as *tools.Tools }
+
+context_(l: *Live) -> long { return (sess_(l).log as *log.Log).context_tokens }
+
+// What upstream's Turn.emit adds to a Session event.
+adapt_(l: *Live, ev: string) -> string {
+    s = sess_(l)
+    if string.starts_with(ev, "{\"delta\":{") != 0 {
+        return "{\"delta\":{\"step\":${s.steps + 1},${string.substring(ev, 10, string.length(ev))}"
+    }
+    if string.starts_with(ev, "{\"run_start\":") != 0 {
+        sync.atomic_store(l.stage, 1)
+        return "${string.substring(ev, 0, string.length(ev) - 1)},\"step\":${s.steps}}"
+    }
+    if string.starts_with(ev, "{\"usage\":") != 0 {
+        return "${string.substring(ev, 0, string.length(ev) - 1)},\"context\":${context_(l)},\"steps\":${s.steps}}"
+    }
+    return ev
+}
+
+reason_name_(r: int) -> string {
+    if r == changes.REASON_TOOL { return "tool" }
+    if r == changes.REASON_TIMEOUT { return "timeout" }
+    if r == changes.REASON_CANCELED { return "canceled" }
+    if r == changes.REASON_LIMIT { return "limit" }
+    return "model"
+}
+
+stats_(l: *Live) -> string {
+    s = sess_(l)
+    return "{\"usage\":${types.usage_json(s.usage)},\"steps\":${s.steps},\"context\":${context_(l)}}"
+}
+
+// A port over an open Session.
+new(sp: @keep ptr, cfg: @keep ptr, op: @keep ptr, home: string) -> *port.Port {
+    l = heap.new(Live)
+    l.sp = sp
+    l.cfg = cfg
+    l.op = op
+    l.home = home
+    l.running = sync.atomic_new(0)
+    l.stage = sync.atomic_new(0)
+    l.stops = list.list_new()
+    (tools_(l).recovery as *changes.Recovery).enabled = 1
+    p = heap.new(port.Port)
+    p.ctx = l as ptr
+    p.start_turn = |ctx: @keep ptr, text: string, compact: int, qp: @keep ptr, cancel: @keep ptr| {
+        lv = ctx as *Live
+        q = qp as *app_queue.Queue
+        tr = turn.new(text, compact, qp)
+        tr.cancel = cancel
+        sync.atomic_store(lv.running, 1)
+        sync.atomic_store(lv.stage, 0)
+        changes.recovery_clear(tools_(lv).recovery as *changes.Recovery)
+        lp = ctx
+        worker.run_detached(|| {
+            lw = lp as *Live
+            sk = session.new_sink(lp, |c: ptr, ev: string| {
+                app_queue.post(q, adapt_(c as *Live, ev))
+            })
+            session.set_activity(sk, |c: ptr, kind: string, value: string| {
+                if kind == "model" {
+                    st = 1
+                    for i in 0..5 {
+                        if turn.STATES[i] == value { st = i }
+                    }
+                    if st == 0 { sync.atomic_store((c as *Live).stage, 0) }
+                    turn.model_activity_at(tr, st, os.now_monotonic_ms())
+                } else if kind == "user_inserted" {
+                    turn.user_inserted(tr, jsonx.long_of(value))
+                } else if kind == "tool" {
+                    turn.tool_activity(tr, value)
+                }
+            })
+            err = ""
+            detail = ""
+            if compact != 0 {
+                e1, d1 = session.compact_now(lw.sp, sk, cancel, 0)
+                err = e1
+                detail = d1
+            } else {
+                e2, d2 = session.turn(lw.sp, text, sk, cancel)
+                err = e2
+                detail = d2
+            }
+            s = sess_(lw)
+            if compact == 0 {
+                app_queue.post(q, "{\"turn_end\":{\"status\":${jsonx.quote(s.status)},\"steps\":${s.steps},\"usage\":${types.usage_json(s.usage)},\"timing\":${session.timing_json(lw.sp)}}}")
+            }
+            if err == "" {
+                app_queue.post(q, "{\"done\":{}}")
+            } else {
+                canceled = sync.atomic_load(cancel) != 0
+                stage = if sync.atomic_load(lw.stage) != 0 { changes.REASON_TOOL } else { changes.REASON_MODEL }
+                r = changes.classify(err, if canceled { 1 } else { 0 }, stage)
+                msg = if detail != "" { detail } else { err }
+                app_queue.post(q, "{\"failed\":{\"message\":${jsonx.quote(msg)},\"reason\":${jsonx.quote(reason_name_(r))}}}")
+            }
+            sync.atomic_store(lw.running, 0)
+            return null
+        })
+    }
+    p.finish_turn = |ctx: ptr| {
+        lv = ctx as *Live
+        while sync.atomic_load(lv.running) != 0 { sleep(2) }
+    }
+    p.enqueue = |ctx: ptr, text: string| {
+        lv = ctx as *Live
+        id = session.enqueue(lv.sp, text)
+        return "${id}"
+    }
+    p.take_queued = |ctx: ptr| {
+        lv = ctx as *Live
+        ptr q = session.take_queued(lv.sp)
+        return q
+    }
+    p.history = |ctx: ptr| {
+        lv = ctx as *Live
+        ptr h = sess_(lv).history
+        return h
+    }
+    p.stats = |ctx: ptr| {
+        string st = stats_(ctx as *Live)
+        return st
+    }
+    p.cfg = |ctx: ptr| {
+        ptr c = (ctx as *Live).cfg
+        return c
+    }
+    p.home = |ctx: ptr| {
+        string h = (ctx as *Live).home
+        return h
+    }
+    p.session_id = |ctx: ptr| {
+        string id = sess_(ctx as *Live).id
+        return id
+    }
+    p.undo = |ctx: ptr| {
+        lv = ctx as *Live
+        text, err = session.undo(lv.sp)
+        string out = if err != "" { "{\"error\":${jsonx.quote(err)}}" } else { "{\"text\":${jsonx.quote(text)}}" }
+        return out
+    }
+    p.reopen = |ctx: ptr, id: string| {
+        string e = reopen_(ctx as *Live, id, (ctx as *Live).cfg)
+        return e
+    }
+    p.switch_config = |ctx: ptr, cfg: @keep ptr| {
+        lv = ctx as *Live
+        r = session.switch_config(lv.sp, cfg)
+        if r == "updated" {
+            lv.cfg = cfg
+            return "updated"
+        }
+        if r == "reopen" {
+            err = reopen_(lv, "", cfg)
+            string out = if err != "" { "open_failed:${err}" } else { "new_session" }
+            return out
+        }
+        return r
+    }
+    p.sessions = |ctx: ptr| {
+        lv = ctx as *Live
+        string out = sessions_json_(lv)
+        return out
+    }
+    p.tasks = |ctx: ptr| { return "[]" }
+    p.request_stop = |ctx: ptr, id: string| {
+        lv = ctx as *Live
+        list.list_add(lv.stops, string.copy(id))
+    }
+    p.user_stop = |ctx: ptr, id: string| {
+        lv = ctx as *Live
+        stopped, err = background.stop_task(tools_(lv).background, id)
+        string out = if err != "" { "${id}: ${err}" } else if stopped == 1 { "${id}: stopped by user · partial changes may remain" } else { "${id}: already finished · partial changes may remain" }
+        return out
+    }
+    p.take_stop = |ctx: ptr| {
+        lv = ctx as *Live
+        if list.list_size(lv.stops) == 0 {
+            return ""
+        }
+        id, _g = list.get_string(lv.stops, 0)
+        rest = list.list_new()
+        for i in 1..list.list_size(lv.stops) {
+            v, _g2 = list.get_string(lv.stops, i)
+            list.list_add(rest, v)
+        }
+        lv.stops = rest
+        string out = id
+        return out
+    }
+    p.any_pending = |ctx: ptr| {
+        int n = background.any_pending(tools_(ctx as *Live).background)
+        return n
+    }
+    p.waiting_task = |ctx: ptr| { return "" }
+    p.recovery_hint = |ctx: ptr, reason: string| {
+        lv = ctx as *Live
+        r = changes.REASON_MODEL
+        if reason == "tool" { r = changes.REASON_TOOL }
+        if reason == "timeout" { r = changes.REASON_TIMEOUT }
+        if reason == "canceled" { r = changes.REASON_CANCELED }
+        if reason == "limit" { r = changes.REASON_LIMIT }
+        string out = changes.recovery_hint(tools_(lv).recovery as *changes.Recovery, r, os.getcwd())
+        return out
+    }
+    p.recovery_files = |ctx: ptr| {
+        lv = ctx as *Live
+        ptr out = changes.recovery_files(tools_(lv).recovery as *changes.Recovery, os.getcwd())
+        return out
+    }
+    p.run_js = |ctx: ptr, code: string| {
+        lv = ctx as *Live
+        t = tools_(lv)
+        ss = sess_(lv)
+        ss.run_id = ss.run_id + 1
+        sc = tools.new_scope(t as ptr, ss.run_id)
+        jo = sandbox.eval(code, sandbox.limits(), tools.host(sc), null) as *sandbox.Outcome
+        ch = tools.take_changes(sc)
+        d = ""
+        for i in 0..list.list_size(ch) {
+            c = list.list_get_raw(ch, i) as *diff.Change
+            d = "${d}${c.diff}"
+        }
+        string out = "{\"ok\":${if jo.ok == 1 { "true" } else { "false" }},\"text\":${jsonx.quote(jo.text)},\"logs\":${jsonx.quote(jo.logs)},\"diff\":${jsonx.quote(d)}}"
+        return out
+    }
+    p.sandbox_status = |ctx: ptr| { return "bash runs in the Session's sandbox" }
+    p.drain_progress = |ctx: ptr| {
+        ptr out = list.list_new()
+        return out
+    }
+    p.predict = |ctx: ptr, instruction: string, input_text: string, cancel: ptr| { return "" }
+    return p
+}
+
+// Opens Session `id` ("" a new one) with `cfg` in place of the current one.
+reopen_(l: *Live, id: string, cfg: @keep ptr) -> string {
+    o = l.op as *session.Options
+    op2 = session.new_options(o.home, o.user_home)
+    o2 = op2 as *session.Options
+    o2.resume_id = id
+    o2.continue_latest = 0
+    o2.patches_off = o.patches_off
+    o2.self_exe = o.self_exe
+    o2.undo_enabled = o.undo_enabled
+    sp2, err, detail = session.init(cfg, op2)
+    if err != "" {
+        return if detail != "" { detail } else { err }
+    }
+    session.close(l.sp)
+    l.sp = sp2
+    l.cfg = cfg
+    l.op = op2
+    (tools_(l).recovery as *changes.Recovery).enabled = 1
+    return ""
+}
+
+sessions_json_(l: *Live) -> string {
+    found = log.list_sessions("${l.home}/sessions", os.getcwd())
+    now_ns = os.os_wall_micros_raw() * 1000
+    out = "["
+    for i in 0..list.list_size(found) {
+        f = list.list_get_raw(found, i) as *log.Summary
+        if i > 0 { out = "${out}," }
+        age = (now_ns - f.modified_ns) / 1000000
+        if age < (0 as long) { age = 0 as long }
+        out = "${out}{\"id\":${jsonx.quote(f.id)},\"age_ms\":${age},\"preview\":${jsonx.quote(f.preview)}}"
+    }
+    return "${out}]"
+}

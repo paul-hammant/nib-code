@@ -18,7 +18,8 @@ import nib.jsonx
 
 exports(Background, Job, Item, BASH_LIMIT, new, set_log, set_turn_step, begin_turn, start, stop_task,
         finish_turn, stop_all, take_inbox, take_items, inbox_size, active_bash, set_result, poll, start_agent, agent_message, stop_task_from, active_runs, adopt_run, take_done_runs, enqueue_run, RUN_LIMIT,
-        pending, any_pending, pending_names, delivered, enqueue_lost, enqueue_finished)
+        pending, any_pending, pending_names, delivered, enqueue_lost, enqueue_finished,
+        enqueue_user, take_users)
 
 const BASH_LIMIT = 8
 const RUN_LIMIT = 8
@@ -67,6 +68,7 @@ struct Background {
     has_log: int
     log_ctx: ptr
     log_fn: fn       // |ctx: ptr, event_json: string, step: int|: the synchronous `started` record
+    next_user_id: long // the TUI's user interjections (upstream Inbox.enqueue ids)
 }
 
 new() -> ptr {
@@ -394,7 +396,7 @@ take_items(bp: ptr, include_detached: int) -> ptr {
     i = 0
     while i < list.list_size(b.inbox) {
         it = list.list_get_raw(b.inbox, i) as *Item
-        if include_detached == 0 && it.detached == 1 {
+        if include_detached == 0 && (it.detached == 1 || it.kind == "user") {
             list.list_add(kept, it as ptr)
         } else {
             list.list_add(taken, it as ptr)
@@ -404,6 +406,51 @@ take_items(bp: ptr, include_detached: int) -> ptr {
     b.inbox = kept
     lock.release(b.guard)
     return taken
+}
+
+// A user interjection (the TUI's, upstream Inbox.enqueue): FIFO with the
+// background results, kind "user", inserted before the next Step. Its id.
+enqueue_user(bp: ptr, text: string) -> long {
+    b = bp as *Background
+    lock.acquire(b.guard)
+    b.next_user_id = b.next_user_id + 1
+    id = b.next_user_id
+    it = heap.new(Item)
+    it.id = "${id}"
+    it.invocation = 0
+    it.completion = ""
+    it.kind = "user"
+    it.state = "user"
+    it.ok = -1
+    it.text = string.copy(text)
+    it.detached = 0
+    it.exec_start = 0 as long
+    it.exec_end = 0 as long
+    list.list_add(b.inbox, it as ptr)
+    lock.release(b.guard)
+    return id
+}
+
+// The queued user interjections (a list of strings), removed; background
+// results stay (upstream Inbox.takeUsers).
+take_users(bp: ptr) -> ptr {
+    b = bp as *Background
+    out = list.list_new()
+    lock.acquire(b.guard)
+    kept = list.list_new()
+    i = 0
+    while i < list.list_size(b.inbox) {
+        it = list.list_get_raw(b.inbox, i) as *Item
+        if it.kind == "user" {
+            list.list_add(out, it.text)
+        } else {
+            list.list_add(kept, it as ptr)
+        }
+        i = i + 1
+    }
+    b.inbox = kept
+    lock.release(b.guard)
+    return out
 }
 
 // The queued completion messages (a list of strings), emptied.

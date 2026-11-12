@@ -25,8 +25,54 @@ import nib.config
 import nib.config.env
 import nib.auth
 import nib.session
+import term
+import term.input
+import nib.tui
+import nib.tui.live
+import nib.tui.clock
 
 const HELP = "nib · a coding agent whose unit of work is a Run\n\nUsage:\n  nib [options]                         Open the TUI\n  nib ask [options] <prompt|->           Ask once; - reads stdin\n  nib js <code>                         Run sandbox JavaScript\n  nib login [service] [--device]        Sign in or store a key; no service lists them\n  nib update [version]                  Upgrade in place\n  nib logout <service>                  Remove nib's stored credential\n  nib replay <session-id> --all [--json] Replay recorded Runs offline\n\nOptions:\n  -h, --help            Show help\n  -V, --version         Show version\n  -c, --continue        Continue this directory's latest session\n  --resume <id>         Resume a session (32 lowercase hex characters)\n  --effort <level>      Set reasoning effort; /effort lists levels\n  --json                Stream NDJSON events (ask only)\n\nTUI: Enter sends · Shift+Enter adds a line · Esc cancels · Ctrl+O opens latest details · click a Run\nType / for commands, /help for keys, /status for timing and cache details.\nFirst run: nib, then /provider to sign in; /model picks a model.\nSetup: see README.md and docs/config.md.\n"
+
+// Bare `nib`: the TUI (upstream tui.run) on the controlling terminal, over
+// a Session with undo on; -c/--resume reopen one.
+run_tui_(envp: @keep ptr, ap: ptr) {
+    a = ap as *Args
+    home, herr = config.home(envp)
+    if herr != "" { fail_(0, herr, "", zero_usage_(), 0, "") }
+    cfg, cerr, cdetail = config.load(envp, home)
+    if cerr != "" { fail_(0, cerr, cdetail, zero_usage_(), 0, "") }
+    if a.has_effort == 1 {
+        eerr = types.set_effort(cfg, a.effort)
+        if eerr != "" { fail_(0, eerr, "", zero_usage_(), 0, "") }
+    }
+    op = session.new_options(home, env.get(envp, "HOME"))
+    o = op as *session.Options
+    o.resume_id = a.resume_id
+    o.continue_latest = a.continue_latest
+    o.patches_off = env.get(envp, "NIB_PATCHES_OFF")
+    o.self_exe = self_exe_()
+    o.undo_enabled = 1
+    sp, serr, sdetail = session.init(cfg, op)
+    if serr != "" { fail_(0, serr, sdetail, zero_usage_(), 0, "") }
+    t, terr = term.open()
+    if terr != "" {
+        session.close(sp)
+        eprint_("nib: ${terr}\n")
+        exit(1)
+    }
+    term.enter_alt_screen(t)
+    term.query_terminal(t, 1000)
+    term.set_bracketed_paste(t, true)
+    term.set_mouse_mode(t, true)
+    term.query_color(t, input.REPORT_BG)
+    if t.cap_color_scheme_updates { term.subscribe_color_scheme(t) }
+    p = live.new(sp, cfg, op, home)
+    app = tui.new(t as ptr, p as ptr, clock.of_terminal(t as ptr) as ptr, envp)
+    tui.run(app)
+    tui.free(app)
+    term.close(t)
+    session.close(live.session_of(p))
+}
 
 self_exe_() -> string {
     a0 = os.args_get(0)
@@ -278,8 +324,8 @@ main() {
     a = ap as *Args
     if a.err != "" { fail_(a.json, a.err, a.detail, zero_usage_(), 0, "") }
     if a.ask == 0 {
-        eprint_("nib: the TUI is not ported yet; use nib ask '<prompt>' · run nib --help\n")
-        exit(2)
+        run_tui_(envp, ap)
+        return
     }
     home, herr = config.home(envp)
     if herr != "" { fail_(a.json, herr, "", zero_usage_(), 0, "") }
