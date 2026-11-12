@@ -1,0 +1,253 @@
+// Ports the 7 tests of upstream src/tui/selection.zig under their names; they
+// exercise nib.tui.sel_history (position, highlight, text, append_row) too.
+// Not ported: none. Added (not upstream): "copy writes OSC 52 then calls the
+// local copier", "local copy is wanted only with a display".
+// Differences: the Selection is a heap box and optionals are flag/field pairs
+// (see the module header); a Zig `for ([_]bool{false, true}) |reverse|` is a
+// loop over 0..2.
+import std.spec
+import std.string
+import std.strbuilder
+import term
+import term.screen
+import term.input
+import nib.tui.selection
+import nib.tui.sel_history
+import nib.tui.viewport
+import nib.tui.transcript
+import nib.tui.entry
+
+mouse_(col: int, row: int, kind: int) -> input.Mouse {
+    return input.Mouse { col: col, row: row, button: input.BUTTON_LEFT, mods: 0, kind: kind }
+}
+
+expect_text_(s: *selection.Selection, surf: *screen.Surface, expected: string) {
+    spec.assert_str_eq(selection.text(s, surf), expected, "text")
+}
+
+test_screen_() -> *screen.Surface {
+    surf = screen.surface(8, 3)
+    win = screen.window(surf)
+    screen.draw_segment(win, screen.seg("abc  \n中x y  \nend"))
+    return surf
+}
+
+reversed_(surf: *screen.Surface, col: int, row: int) -> bool {
+    c, _ok = screen.read_cell(surf, col, row)
+    return screen.has_attr(c.style, screen.REVERSE)
+}
+
+draw_history_(surf: *screen.Surface, entries: ptr[], top: viewport.Anchor) -> sel_history.Frame {
+    win = screen.window(surf)
+    screen.clear(win)
+    y = 0 - top.row
+    i = top.entry
+    while i < entries.len {
+        if y >= win.height { break }
+        en = entries[i] as *entry.Entry
+        height = entry.height(en, win)
+        if y + height > 0 { entry.draw(en, screen.child(win, y_off: y, height: height), true) }
+        y = y + height + 1
+        i = i + 1
+    }
+    return sel_history.Frame { top: top, window: win }
+}
+
+anchor_(e: int, r: int) -> viewport.Anchor {
+    return viewport.Anchor { entry: e, row: r }
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.selection") {
+        spec.it("history selection scrolls both ways and copies offscreen rows including gaps and Unicode") callback {
+            surf = screen.surface(8, 3)
+            t = transcript.new()
+            transcript.add(t, entry.KIND_INFO, "abc\n中x\nend")
+            transcript.add(t, entry.KIND_INFO, "four\nfive\nsix")
+            entries = t.entries
+            for pass in 0..2 {
+                reverse = pass == 1
+                s = selection.new()
+                first = anchor_(0, 0)
+                second = anchor_(1, 0)
+                if reverse {
+                    first = anchor_(1, 0)
+                    second = anchor_(0, 0)
+                }
+                frame = draw_history_(surf, entries, first)
+                selection.mouse_in_history(s, mouse_(1, 0, input.MOUSE_PRESS), surf, frame, true, entries)
+                frame = draw_history_(surf, entries, second)
+                selection.update_history(s, frame, true, entries)
+                spec.assert_true(s.active != 0, "active")
+                spec.assert_true(s.dragged != 0, "dragged")
+                selection.highlight_history(s, surf, frame, true, entries)
+                spec.assert_true(reversed_(surf, 1, 0), "reversed")
+                selection.highlight_history(s, surf, frame, true, entries)
+                spec.assert_false(reversed_(surf, 1, 0), "second highlight toggles back")
+                spec.assert_true(selection.mouse_in_history(s, mouse_(1, 0, input.MOUSE_RELEASE), surf, frame, true, entries), "copied")
+                copied = selection.text_in_history(s, surf, frame, true, entries)
+                spec.assert_str_eq(copied, "bc\n中x\nend\n\nfo", "copied text")
+                spec.assert_true(s.active == 0, "inactive")
+            }
+        }
+        spec.it("history selection clamps the pointer to the body and keeps the start when scrolling back") callback {
+            surf = screen.surface(8, 3)
+            t = transcript.new()
+            transcript.add(t, entry.KIND_INFO, "0\n1\n2\n3\n4\n5\n6\n7")
+            entries = t.entries
+            s = selection.new()
+            frame = draw_history_(surf, entries, anchor_(0, 1))
+            selection.mouse_in_history(s, mouse_(0, 0, input.MOUSE_PRESS), surf, frame, true, entries)
+            anchor = s.history.anchor
+            frame = draw_history_(surf, entries, anchor_(0, 5))
+            selection.mouse_in_history(s, mouse_(0, 100, input.MOUSE_DRAG), surf, frame, true, entries)
+            spec.assert_true(s.history.anchor.entry == anchor.entry && s.history.anchor.row == anchor.row && s.history.anchor.col == anchor.col, "anchor kept")
+            spec.assert_eq(s.history.end.row, 7, "end row 7")
+            frame = draw_history_(surf, entries, anchor_(0, 1))
+            selection.update_history(s, frame, true, entries)
+            spec.assert_eq(s.history.end.row, 3, "end row 3")
+            spec.assert_true(selection.mouse_in_history(s, mouse_(0, 2, input.MOUSE_RELEASE), surf, frame, true, entries), "copied")
+            copied = selection.text_in_history(s, surf, frame, true, entries)
+            spec.assert_str_eq(copied, "1\n2\n3", "text")
+        }
+        spec.it("history copy spans scratch buffers without losing wrapped text or blank lines") callback {
+            surf = screen.surface(8, 3)
+            t = transcript.new()
+            sb = strbuilder.new(256)
+            for i in 0..80 {
+                strbuilder.append(sb, "${i}\n")
+            }
+            expected = strbuilder.finish(sb)
+            transcript.add(t, entry.KIND_INFO, expected)
+            entries = t.entries
+            s = selection.new()
+            frame = draw_history_(surf, entries, anchor_(0, 0))
+            selection.mouse_in_history(s, mouse_(0, 0, input.MOUSE_PRESS), surf, frame, true, entries)
+            frame = draw_history_(surf, entries, anchor_(0, 78))
+            spec.assert_true(selection.mouse_in_history(s, mouse_(1, 1, input.MOUSE_RELEASE), surf, frame, true, entries), "copied")
+            copied = selection.text_in_history(s, surf, frame, true, entries)
+            spec.assert_str_eq(copied, string.substring(expected, 0, string.length(expected) - 1), "text")
+        }
+        spec.it("selection forward and reverse on one row, click clears") callback {
+            surf = test_screen_()
+            for pass in 0..2 {
+                reverse = pass == 1
+                s = selection.new()
+                a = 0
+                b = 2
+                if reverse {
+                    a = 2
+                    b = 0
+                }
+                selection.mouse(s, mouse_(a, 0, input.MOUSE_PRESS), surf)
+                selection.mouse(s, mouse_(b, 0, input.MOUSE_DRAG), surf)
+                spec.assert_true(selection.mouse(s, mouse_(b, 0, input.MOUSE_RELEASE), surf), "copied")
+                expect_text_(s, surf, "abc")
+                selection.highlight(s, surf)
+                spec.assert_true(reversed_(surf, 0, 0), "reversed")
+                spec.assert_false(reversed_(surf, 3, 0), "not reversed")
+                selection.highlight(s, surf)
+                spec.assert_false(reversed_(surf, 0, 0), "second highlight toggles back")
+                selection.mouse(s, mouse_(1, 0, input.MOUSE_PRESS), surf)
+                spec.assert_false(selection.mouse(s, mouse_(1, 0, input.MOUSE_RELEASE), surf), "click not copied")
+                expect_text_(s, surf, "")
+            }
+        }
+        spec.it("selection multiline in both directions trims trailing spaces and skips wide continuations") callback {
+            surf = test_screen_()
+            for pass in 0..2 {
+                reverse = pass == 1
+                s = selection.new()
+                r0 = 0
+                r1 = 2
+                if reverse {
+                    r0 = 2
+                    r1 = 0
+                }
+                selection.mouse(s, mouse_(1, r0, input.MOUSE_PRESS), surf)
+                selection.mouse(s, mouse_(1, r1, input.MOUSE_DRAG), surf)
+                selection.mouse(s, mouse_(1, r1, input.MOUSE_RELEASE), surf)
+                expect_text_(s, surf, "bc\n中x y\nen")
+                selection.clear(s)
+                expect_text_(s, surf, "")
+            }
+            s2 = selection.new()
+            selection.mouse(s2, mouse_(1, 1, input.MOUSE_PRESS), surf)
+            selection.mouse(s2, mouse_(7, 1, input.MOUSE_DRAG), surf)
+            selection.mouse(s2, mouse_(7, 1, input.MOUSE_RELEASE), surf)
+            expect_text_(s2, surf, "x y")
+        }
+        spec.it("selection preserves empty rows and clamps coordinates to the screen") callback {
+            surf = test_screen_()
+            for col in 0..surf.width {
+                screen.write_cell(surf, col, 1, screen.blank_cell())
+            }
+            s = selection.new()
+            selection.mouse(s, mouse_(-10, -10, input.MOUSE_PRESS), surf)
+            selection.mouse(s, mouse_(100, 100, input.MOUSE_DRAG), surf)
+            spec.assert_true(selection.mouse(s, mouse_(100, 100, input.MOUSE_RELEASE), surf), "copied")
+            expect_text_(s, surf, "abc\n\nend")
+            selection.highlight(s, surf)
+            for i in 0..surf.cells.len {
+                spec.assert_true(screen.has_attr(surf.cells[i].style, screen.REVERSE), "cell ${i} reversed")
+            }
+            selection.clear(s)
+            expect_text_(s, surf, "")
+            spec.assert_false(selection.mouse(s, mouse_(0, 0, input.MOUSE_RELEASE), surf), "stray release")
+        }
+        spec.it("selection reads the screen at release rather than press") callback {
+            surf = test_screen_()
+            s = selection.new()
+            selection.mouse(s, mouse_(0, 0, input.MOUSE_PRESS), surf)
+            selection.mouse(s, mouse_(2, 0, input.MOUSE_DRAG), surf)
+            c = screen.blank_cell()
+            c.grapheme = "新"
+            c.width = 2
+            screen.write_cell(surf, 1, 0, c)
+            selection.mouse(s, mouse_(2, 0, input.MOUSE_RELEASE), surf)
+            expect_text_(s, surf, "a新")
+        }
+        spec.it("dragging below the content ends at the last entry's last row (added)") callback {
+            surf = screen.surface(8, 4)
+            t = transcript.new()
+            transcript.add(t, entry.KIND_INFO, "ab\ncd")
+            entries = t.entries
+            s = selection.new()
+            frame = draw_history_(surf, entries, anchor_(0, 0))
+            selection.mouse_in_history(s, mouse_(0, 0, input.MOUSE_PRESS), surf, frame, true, entries)
+            selection.mouse_in_history(s, mouse_(3, 3, input.MOUSE_DRAG), surf, frame, true, entries)
+            spec.assert_eq(s.history.end.entry, 0, "entry")
+            spec.assert_eq(s.history.end.row, 2, "row = height")
+            spec.assert_eq(s.history.end.col, 3, "col")
+        }
+        spec.it("a click in history leaves its position for take_click once (added)") callback {
+            surf = screen.surface(8, 4)
+            t = transcript.new()
+            transcript.add(t, entry.KIND_INFO, "ab\ncd")
+            entries = t.entries
+            s = selection.new()
+            frame = draw_history_(surf, entries, anchor_(0, 0))
+            selection.mouse_in_history(s, mouse_(1, 1, input.MOUSE_PRESS), surf, frame, true, entries)
+            spec.assert_false(selection.mouse_in_history(s, mouse_(1, 1, input.MOUSE_RELEASE), surf, frame, true, entries), "not copied")
+            p, found = selection.take_click(s)
+            spec.assert_true(found, "click")
+            spec.assert_true(p.entry == 0 && p.row == 1 && p.col == 1, "position")
+            _p2, found2 = selection.take_click(s)
+            spec.assert_false(found2, "taken once")
+        }
+        spec.it("copy writes OSC 52 then calls the local copier") callback {
+            t = term.memory(10, 3)
+            got = make([]string, 0)
+            selection.copy(t, "hello", |x: string| { got.push(x) })
+            spec.assert_str_eq(term.clipboard(t), "hello", "clipboard")
+            spec.assert_eq(got.len, 1, "local called")
+            spec.assert_str_eq(got[0], "hello", "local text")
+        }
+        spec.it("local copy is wanted only with a display") callback {
+            spec.assert_false(selection.local_copy_wanted(false, false), "none")
+            spec.assert_true(selection.local_copy_wanted(true, false), "wayland")
+            spec.assert_true(selection.local_copy_wanted(false, true), "x11")
+        }
+    }
+}

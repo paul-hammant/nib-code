@@ -1,0 +1,210 @@
+// Ports the tests of upstream src/tui/reflect.zig under their names.
+// Differences: the fake gh of "file skips an existing title..." is the same
+// shell script, run through the real runner (reflect.gh_run), by absolute path;
+// "append creates the file..." writes under a fresh temp dir.
+// Extra tests (not upstream): file_issue through an injected runner closure
+// (search failure, unparseable output, create failure, the argv and stdin it
+// sends); the Issues job (credential draft not filed, outcomes recorded in
+// the reflections file and reported, on_done at the end).
+import std.spec
+import std.fs
+import std.list
+import std.string
+import std.sync
+import nib.sysgap
+import nib.tui.reflect
+
+tmp_() -> string {
+    d, _e = fs.make_temp_dir("", "nib-reflect")
+    real, _k, _m = fs.realpath(d)
+    return real
+}
+
+read_(p: string) -> string {
+    s, _e = fs.read(p)
+    return s
+}
+
+has_(hay: string, needle: string) -> int {
+    if string.contains(hay, needle) != 0 { return 1 }
+    return 0
+}
+
+draft_(title: string, body: string) -> *reflect.Draft {
+    d = heap.new(reflect.Draft)
+    d.title = title
+    d.body = body
+    return d
+}
+
+dated_(path: string, secs: long, want: string) {
+    e = reflect.Entry { unix_seconds: secs, session_id: "s", cwd: "/", model: "m", effort: "e", focus: "x", answer: "a" }
+    reflect.append(path, e)
+    spec.assert_true(string.contains(read_(path), "## ${want} UTC · session s") != 0, "date ${want}")
+    spec.assert_true(string.contains(read_(path), "\nfocus: x\n\na\n\n") != 0, "short focus line")
+    fs.delete(path)
+}
+
+waited_(done: ptr) {
+    i = 0
+    while sync.atomic_load(done) == 0 && i < 2000 {
+        sleep(5)
+        i = i + 1
+    }
+}
+
+join_(l: ptr, sep: string) -> string {
+    out = ""
+    i = 0
+    while i < list.list_size(l) {
+        s, _g = list.get_string(l, i)
+        if i > 0 { out = "${out}${sep}" }
+        out = "${out}${s}"
+        i = i + 1
+    }
+    return out
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.reflect") {
+        spec.it("prompt fills the session, log path, issue repo and optional focus") callback {
+            plain = reflect.prompt("abc123", "/h/.nib/sessions/abc123.jsonl", "o/r", "")
+            spec.assert_true(has_(plain, "This session's log is /h/.nib/sessions/abc123.jsonl") == 1, "log path")
+            spec.assert_true(has_(plain, "This session's ID is abc123") == 1, "id")
+            spec.assert_true(has_(plain, "Read only the explicitly specified main log path for this session") == 1, "scope")
+            spec.assert_true(has_(plain, "Do not enumerate, glob, or search the sessions directory") == 1, "no enumeration")
+            spec.assert_true(has_(plain, "`.calls.jsonl`") == 1, "sidecars")
+            spec.assert_true(has_(plain, "Answer in English") == 1, "english")
+            spec.assert_true(has_(plain, "Write all issue titles and bodies in English.") == 1, "titles in English")
+            spec.assert_true(has_(plain, "gh issue list --repo o/r ") == 1, "repo")
+            spec.assert_true(has_(plain, "{{") == 0, "no placeholders left")
+            spec.assert_true(has_(plain, "The user particularly wants to understand") == 0, "no focus")
+            focused = reflect.prompt("abc123", "/l", "o/r", "subagents")
+            trimmed = string.trim(focused)
+            spec.assert_true(string.ends_with(trimmed, "The user particularly wants to understand: subagents") != 0, "focus last")
+            spec.assert_true(string.contains(focused, "in English.\n\nThe user particularly wants to understand: subagents") != 0, "focus after a blank line")
+        }
+        spec.it("append creates the file, then adds entries after earlier ones") callback {
+            root = tmp_()
+            path = "${root}/nib/reflections.md"
+            base = reflect.Entry { unix_seconds: 1793600000 as long, session_id: "0123456789abcdef", cwd: "/p", model: "m", effort: "high", focus: "", answer: "\n### Summary\nEverything is normal\n" }
+            spec.assert_str_eq(reflect.append(path, base), "", "first append")
+            second = reflect.Entry { unix_seconds: 1793600000 as long, session_id: "0123456789abcdef", cwd: "/p", model: "m", effort: "high", focus: "timeout", answer: "Second time" }
+            spec.assert_str_eq(reflect.append(path, second), "", "second append")
+            expected = "## 2026-11-02 06:13 UTC · session 01234567 · /p · m · effort high\n\n### Summary\nEverything is normal\n\n## 2026-11-02 06:13 UTC · session 01234567 · /p · m · effort high\nfocus: timeout\n\nSecond time\n\n"
+            spec.assert_str_eq(read_(path), expected, "file")
+        }
+        spec.it("append writes the UTC date and time across months, years and leap days") callback {
+            path = "${tmp_()}/dates.md"
+            dated_(path, 0, "1970-01-01 00:00")
+            dated_(path, 1799193540, "2027-01-05 23:59")
+            dated_(path, 1835395200, "2028-02-29 00:00")
+            dated_(path, 1798718820, "2026-12-31 12:07")
+            dated_(path, 1772355900, "2026-03-01 09:05")
+            dated_(path, 1728555000, "2024-10-10 10:10")
+        }
+        spec.it("drafts come from the last json block, trimmed and capped") callback {
+            answer = "### Summary\n```json\n[{\"title\": \"old\"}]\n```\n### Issue drafts\n```json\n[{\"title\": \" grep: misses dotfiles \", \"body\": \"\\nSymptom\\n\"}, {\"title\": \"\", \"body\": \"x\"},\n {\"title\": \"b\", \"body\": \"\"}, {\"title\": \"c\", \"body\": \"\"}, {\"title\": \"d\", \"body\": \"\", \"extra\": 1}]\n```"
+            found = reflect.drafts(answer)
+            spec.assert_eq(list.list_size(found), 3, "three")
+            d0 = list.list_get_raw(found, 0) as *reflect.Draft
+            d2 = list.list_get_raw(found, 2) as *reflect.Draft
+            spec.assert_str_eq(d0.title, "grep: misses dotfiles", "title trimmed")
+            spec.assert_str_eq(d0.body, "Symptom", "body trimmed")
+            spec.assert_str_eq(d2.title, "c", "third is c")
+            spec.assert_eq(list.list_size(reflect.drafts("no block")), 0, "no block")
+            spec.assert_eq(list.list_size(reflect.drafts("```json\nnot json\n```")), 0, "not json")
+            spec.assert_eq(list.list_size(reflect.drafts("```json\n[]\n```")), 0, "empty")
+        }
+        spec.it("file skips an existing title and files new drafts through gh") callback {
+            root = tmp_()
+            script = "#!/bin/sh\nif [ \"$2\" = list ]; then echo '[{\"number\":7,\"title\":\"Known Bug\",\"url\":\"https://x/7\"}]'; exit 0; fi\ncat > \"$(dirname \"$0\")/body\"; echo \"$@\" > \"$(dirname \"$0\")/args\"; echo https://x/8"
+            fake = "${root}/gh"
+            fs.write(fake, script)
+            sysgap.chmod(fake, 493)
+            skipped = reflect.file_issue(reflect.gh_run, fake, "o/r", draft_("known bug", "b"), "footer")
+            spec.assert_str_eq(skipped, "skipped: #7 already has this title · https://x/7", "skipped")
+            filed = reflect.file_issue(reflect.gh_run, fake, "o/r", draft_("New bug", "body"), "footer")
+            spec.assert_str_eq(filed, "filed https://x/8", "filed")
+            spec.assert_str_eq(read_("${root}/body"), "body\n\n---\nfooter\n", "body on stdin")
+            spec.assert_str_eq(read_("${root}/args"), "issue create --repo o/r --title New bug --body-file -\n", "create args")
+        }
+        spec.it("sanitize replaces private paths and refuses credential-like drafts") callback {
+            clean, ok = reflect.sanitize(draft_("write fails in /home/u/work/acme", "/home/u/work/acme/app.py and /home/u/.nib"), "/home/u", "/home/u/work/acme")
+            spec.assert_eq(ok, 1, "kept")
+            c = clean as *reflect.Draft
+            spec.assert_str_eq(c.title, "write fails in <project>", "title")
+            spec.assert_str_eq(c.body, "<project>/app.py and ~/.nib", "body")
+            _x, ok2 = reflect.sanitize(draft_("t", "token ghp_abc"), "/home/u", "/w")
+            spec.assert_eq(ok2, 0, "credential refused")
+        }
+        spec.it("reflection requires an explicit repository") callback {
+            spec.assert_str_eq(reflect.repository("off"), "", "off")
+            spec.assert_str_eq(reflect.repository(""), "", "empty")
+            spec.assert_str_eq(reflect.repository("owner"), "", "owner only")
+            spec.assert_str_eq(reflect.repository("owner/name/extra"), "", "three parts")
+            spec.assert_str_eq(reflect.repository("owner/name"), "owner/name", "ok")
+            spec.assert_str_eq(reflect.repository("My-Org_1/a.b-c"), "My-Org_1/a.b-c", "punctuation allowed")
+            spec.assert_str_eq(reflect.repository("own er/name"), "", "space")
+            spec.assert_str_eq(reflect.repository("/name"), "", "no owner")
+        }
+        spec.it("file_issue reports gh failures through an injected runner") callback {
+            seen = list.list_new()
+            fail_search = |argv: ptr, input: string, out: ptr| {
+                list.list_add(seen, join_(argv, " "))
+                o = out as *reflect.Output
+                o.ok = 0
+                o.err = "gh: not logged in\nmore"
+                return 0
+            }
+            spec.assert_str_eq(reflect.file_issue(fail_search, "gh", "o/r", draft_("t", "b"), "f"), "could not search o/r: gh: not logged in", "search fails")
+            first, _g = list.get_string(seen, 0)
+            spec.assert_str_eq(first, "gh issue list --repo o/r --state all --search t in:title --json number,title,url --limit 20", "list argv")
+            garbage = |argv: ptr, input: string, out: ptr| {
+                o = out as *reflect.Output
+                o.ok = 1
+                o.out = "[{\"number\":-1,\"title\":\"x\",\"url\":\"u\"}]"
+                return 1
+            }
+            spec.assert_str_eq(reflect.file_issue(garbage, "gh", "o/r", draft_("t", "b"), "f"), "could not read gh output while searching o/r", "bad output")
+            create_fails = |argv: ptr, input: string, out: ptr| {
+                o = out as *reflect.Output
+                if string.contains(join_(argv, " "), "issue list") != 0 {
+                    o.ok = 1
+                    o.out = "[]"
+                    return 1
+                }
+                o.ok = 0
+                o.err = "HTTP 403\n"
+                return 0
+            }
+            spec.assert_str_eq(reflect.file_issue(create_fails, "gh", "o/r", draft_("t", "b"), "f"), "could not file the issue: HTTP 403", "create fails")
+        }
+        spec.it("the Issues job files each draft, refuses credentials and records outcomes") callback {
+            root = tmp_()
+            path = "${root}/r/reflections.md"
+            ds = list.list_new()
+            list.list_add_raw(ds, draft_("Good bug in /w/p", "see /w/p/x") as ptr)
+            list.list_add_raw(ds, draft_("Leaky", "key sk-abc") as ptr)
+            job = reflect.issues_new(ds, "o/r", path, "abcd1234", "/home/u", "/w/p", "foot")
+            lines = list.list_new()
+            done = sync.atomic_new(0)
+            reflect.issues_start(job, |argv: ptr, input: string, out: ptr| {
+                o = out as *reflect.Output
+                o.ok = 1
+                if string.contains(join_(argv, " "), "issue list") != 0 { o.out = "[]" } else { o.out = "https://x/9\n" }
+                return 1
+            }, |line: string| { list.list_add(lines, line) }, || { sync.atomic_store(done, 1) })
+            waited_(done)
+            spec.assert_eq(list.list_size(lines), 2, "two lines")
+            l0, _g = list.get_string(lines, 0)
+            l1, _h = list.get_string(lines, 1)
+            spec.assert_str_eq(l0, "issue · Good bug in /w/p · filed https://x/9", "filed line")
+            spec.assert_str_eq(l1, "issue · Leaky · not filed: the draft looks like it contains a credential", "refused line")
+            spec.assert_str_eq(read_(path), "- session abcd1234 · ${l0}\n- session abcd1234 · ${l1}\n", "recorded")
+            reflect.issues_finish(job)
+        }
+    }
+    return spec.run_summary(fw)
+}

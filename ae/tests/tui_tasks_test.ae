@@ -1,0 +1,26 @@
+// Ports the 1 test of upstream src/tui/tasks.zig under its name. Tasks are
+// tasks.Task boxes (see the module header).
+import std.spec
+import nib.tui.tasks
+import nib.tui.agent_tree
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.tasks") {
+        spec.it("tasks include state elapsed deadlines and detached lifetime") callback {
+            none_ = make([]ptr, 0)
+            spec.assert_str_eq(tasks.format(none_, 0 as long), "no background tasks in this Session", "empty")
+            ts = make([]ptr, 0)
+            ts.push(tasks.new_task("a1", agent_tree.BK_AGENT, "investigate", "working", 1200 as long, has_deadline: 1, deadline_ms: 30000 as long) as ptr)
+            ts.push(tasks.new_task("b1", agent_tree.BK_BASH, "server", "working", 61000 as long, detached: 1) as ptr)
+            ts.push(tasks.new_task("r1", agent_tree.BK_RUN, "Run (step 1)", "done", 10000 as long) as ptr)
+            spec.assert_str_eq(tasks.format(ts, 10000 as long), "a1 agent · running · 1s · deadline 00:00:30 UTC (20s) · investigate\nb1 bash · running · 1m1s · no deadline (detached) · server\nr1 Run · completed · 10s · per-tool deadlines · Run (step 1)", "text")
+        }
+        spec.it("deadline clock pads and clamps (added)") callback {
+            ts = make([]ptr, 0)
+            ts.push(tasks.new_task("a1", agent_tree.BK_AGENT, "x\ty", "working", 0 as long, has_deadline: 1, deadline_ms: 3661000 as long) as ptr)
+            ts.push(tasks.new_task("a2", agent_tree.BK_BASH, "z", "done", 0 as long) as ptr)
+            spec.assert_str_eq(tasks.format(ts, 4000000 as long), "a1 agent · running · <1s · deadline 01:01:01 UTC (0s) · x y\na2 bash · completed · <1s · deadline pending · z", "text")
+        }
+    }
+}

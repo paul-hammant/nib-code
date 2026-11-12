@@ -1,0 +1,183 @@
+// Ports all 8 tests of upstream src/tui/status.zig under their names.
+// Differences: the config is types.new_config; Status is built with
+// status.new(cfg) and its fields set; busy is (has_busy, busy: Label).
+import std.spec
+import std.string
+import term.screen
+import nib.provider.types
+import nib.tui.status
+
+cfg_(model: string, cw: long) -> ptr {
+    c = types.new_config("", "", "", model) as *types.Config
+    c.context_window = cw
+    return c as ptr
+}
+
+busy_(s: *status.Status, phase: int, ms: long, turn_ms: long, quiet_ms: long) {
+    s.has_busy = 1
+    s.busy = status.Label { phase: phase, ms: ms, turn_ms: turn_ms, quiet_ms: quiet_ms }
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.status") {
+        spec.it("activity is optional and footer shows latest reported usage") callback {
+            cfg = cfg_("m", 1000 as long)
+            s = status.new(cfg)
+            spec.assert_str_eq(status.format_line(s, false), "", "empty")
+            spec.assert_str_eq(status.format_line(s, true), "", "empty scrolled")
+            busy_(&s, status.PHASE_RUNNING, 150 as long, 0 as long, 0 as long)
+            s.has_notice = 1
+            s.notice = "copied 3 chars"
+            spec.assert_str_eq(status.format_line(s, false), "⠙ Running Run · turn <1s · copied 3 chars", "busy")
+            t = status.new(cfg)
+            t.context = 250 as long
+            t.steps = 2
+            t.usage.prompt_tokens = 1800000 as long
+            spec.assert_str_eq(status.footer(t, 200), "m · context 25%", "footer")
+            u = status.new(cfg)
+            u.context = 400 as long
+            busy_(&u, status.PHASE_RUNNING, 100 as long, 0 as long, 0 as long)
+            spec.assert_str_eq(status.footer(u, 200), "m · context 40%", "busy footer")
+        }
+        spec.it("background task count remains visible during model work") callback {
+            cfg = types.new_config("", "", "", "m")
+            s = status.new(cfg)
+            busy_(&s, status.PHASE_THINKING, 0 as long, 0 as long, 0 as long)
+            s.background_count = 2
+            spec.assert_str_eq(status.format_line(s, false), "⠋ Waiting for model · turn <1s · 2 background tasks", "busy")
+            spec.assert_str_eq(status.footer(s, 200), "m", "footer")
+            t = status.new(cfg)
+            t.background_count = 2
+            spec.assert_str_eq(status.format_line(t, false), "2 background tasks", "idle")
+            t.background_count = 1
+            spec.assert_str_eq(status.format_line(t, false), "1 background task", "singular")
+        }
+        spec.it("only content advances progress; stage changes preserve Turn duration") callback {
+            a = status.activity_start(1000 as long, status.PHASE_THINKING)
+            start = a.since
+            later = start + 45000
+            status.model_activity(&a, status.MA_STARTED, later)
+            status.model_activity(&a, status.MA_FINISHED, later)
+            spec.assert_eq_long(status.label_at(a, later).quiet_ms, 45000 as long, "quiet 45000")
+            status.model_activity(&a, status.MA_SCRIPT, later)
+            spec.assert_eq_long(status.label_at(a, later).quiet_ms, 0 as long, "quiet 0")
+            status.activity_set(&a, 1000 as long, status.PHASE_RUNNING)
+            spec.assert_eq_long(status.label_at(a, later).turn_ms, 45000 as long, "turn")
+            status.model_activity(&a, status.MA_WAITING, later)
+            spec.assert_eq_long(a.last_progress, later, "waiting is not progress")
+            cfg = types.new_config("", "", "", "m")
+            s = status.new(cfg)
+            s.detail = "r3 · 32s"
+            busy_(&s, status.PHASE_WAITING, 0 as long, 574000 as long, 30000 as long)
+            spec.assert_str_eq(status.format_line(s, false), "⠋ Waiting for r3 · 32s · turn 9m34s · no progress 30s", "line")
+            w = 0
+            while w < 100 {
+                line = status.format_width(s, false, w)
+                spec.assert_true(screen.gwidth(line, screen.WIDTH_UNICODE) <= w, "fits ${w}")
+                spec.assert_true(string.index_of(line, "\n") < 0, "single line ${w}")
+                w = w + 1
+            }
+        }
+        spec.it("footer is quiet initially and contains only model and context") callback {
+            cfg = cfg_("m", 1000 as long)
+            s = status.new(cfg)
+            spec.assert_str_eq(status.footer(s, 200), "m", "initial")
+            s.context = 250 as long
+            spec.assert_str_eq(status.footer(s, 200), "m · context 25%", "context")
+            spec.assert_str_eq(status.footer(s, 10), "m", "narrow")
+        }
+        spec.it("retry line names the next attempt and a concise cause") callback {
+            cfg = types.new_config("", "", "", "m")
+            s = status.new(cfg)
+            s.detail = "attempt 2/5 · rate limit"
+            busy_(&s, status.PHASE_RETRYING, 0 as long, 100000 as long, 0 as long)
+            spec.assert_str_eq(status.format_line(s, false), "⠋ Retrying · attempt 2/5 · rate limit · turn 1m40s", "line")
+            spec.assert_str_eq(status.retry_reason("Codex stream failed: rate_limit_exceeded: mock error"), "rate limit", "reason")
+            spec.assert_str_eq(status.retry_reason("HTTP 500"), "provider error", "500")
+            spec.assert_str_eq(status.retry_reason("x\ny"), "x", "first line")
+        }
+        spec.it("narrow activity preserves Turn time before long command details") callback {
+            cfg = types.new_config("", "", "", "m")
+            s = status.new(cfg)
+            s.detail = "bash 很长的构建命令很长的构建命令很长的构建命令很长的构建命令"
+            busy_(&s, status.PHASE_RUNNING, 0 as long, 100000 as long, 0 as long)
+            line = status.format_width(s, false, 60)
+            spec.assert_true(string.ends_with(line, " · turn 1m40s") != 0, "ends with turn")
+            spec.assert_true(string.index_of(line, "…") >= 0, "ellipsis")
+            spec.assert_true(screen.gwidth(line, screen.WIDTH_UNICODE) <= 60, "width")
+        }
+        spec.it("reasoning and text phases and attention colors describe known facts") callback {
+            spec.assert_eq(status.delta_phase(1), status.PHASE_REASONING, "reasoning")
+            spec.assert_eq(status.delta_phase(0), status.PHASE_WRITING, "text")
+            cfg = types.new_config("", "", "", "m")
+            p = 0
+            while p < status.PHASE_COUNT {
+                s = status.new(cfg)
+                busy_(&s, p, 0 as long, 0 as long, 0 as long)
+                dim = screen.has_attr(status.activity_style(s), screen.DIM)
+                spec.assert_eq(dim, p != status.PHASE_RETRYING, "dim ${p}")
+                s.busy.quiet_ms = 30000 as long
+                spec.assert_eq(status.activity_style(s).fg, screen.color_index(3), "fg ${p}")
+                p = p + 1
+            }
+            names = ["Thinking", "Generating response", "Writing Run"]
+            phases = [status.PHASE_REASONING, status.PHASE_WRITING, status.PHASE_SCRIPTING]
+            i = 0
+            while i < 3 {
+                s = status.new(cfg)
+                busy_(&s, phases[i], 0 as long, 0 as long, 0 as long)
+                spec.assert_contains(status.format_line(s, false), names[i], "phase ${i}")
+                i = i + 1
+            }
+            widths = [58, 60, 120, 160]
+            j = 0
+            while j < 4 {
+                k = 0
+                while k < 2 {
+                    s = status.new(cfg)
+                    s.new_output = k
+                    s.detail = "bash a very long command with many arguments that will not fit"
+                    busy_(&s, status.PHASE_RUNNING, 0 as long, 120000 as long, 0 as long)
+                    line = status.format_width(s, true, widths[j])
+                    want = ""
+                    if k == 1 { want = "New output below" }
+                    spec.assert_true(string.index_of(line, want) >= 0, "has ${want} at ${widths[j]}")
+                    spec.assert_true(screen.gwidth(line, screen.WIDTH_UNICODE) <= widths[j], "width ${widths[j]}")
+                    k = k + 1
+                }
+                j = j + 1
+            }
+        }
+        spec.it("extra: spinner wraps, signed-out width edge, narrow hint edge") callback {
+            cfg = types.new_config("", "", "", "m")
+            s = status.new(cfg)
+            busy_(&s, status.PHASE_THINKING, 950 as long, 0 as long, 0 as long)
+            spec.assert_true(string.starts_with(status.format_line(s, false), "⠏ ") != 0, "frame 9")
+            busy_(&s, status.PHASE_THINKING, 1000 as long, 0 as long, 0 as long)
+            spec.assert_true(string.starts_with(status.format_line(s, false), "⠋ ") != 0, "frame 0 again")
+            s.signed_out = 1
+            spec.assert_str_eq(status.footer(s, 13), "", "13")
+            spec.assert_str_eq(status.footer(s, 14), "Not signed in", "14")
+            t = status.new(cfg)
+            t.new_output = 1
+            t.detail = "bash a very long command with many arguments that will not fit"
+            busy_(&t, status.PHASE_RUNNING, 0 as long, 120000 as long, 0 as long)
+            spec.assert_str_eq(status.format_width(t, true, 19), "New output below", "19")
+            spec.assert_str_eq(status.format_width(t, true, 20), "… · New output below", "20")
+        }
+        spec.it("signed-out footer names no model and a provider step hint joins the activity line") callback {
+            cfg = types.new_config("", "", "", "gpt-6.1-sol")
+            s = status.new(cfg)
+            s.signed_out = 1
+            s.context = 10 as long
+            spec.assert_str_eq(status.footer(s, 40), "Not signed in", "signed out")
+            spec.assert_str_eq(status.footer(s, 5), "", "signed out narrow")
+            t = status.new(cfg)
+            spec.assert_str_eq(status.footer(t, 40), "gpt-6.1-sol", "model")
+            t.hint = "Waiting for ChatGPT sign-in"
+            spec.assert_str_eq(status.format_line(t, false), "Waiting for ChatGPT sign-in", "hint")
+        }
+    }
+    return spec.run_summary(fw)
+}

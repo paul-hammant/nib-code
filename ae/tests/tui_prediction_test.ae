@@ -1,0 +1,263 @@
+// Ports the tests of upstream src/tui/prediction.zig under their names.
+// Differences: the history is a list of message JSON texts (nib.msg), the
+// "skill blocks" test uses prediction.MENTION_INTRO (skills are not ported).
+// Extra tests (not upstream): start() runs the injected predict on a thread,
+// filters its reply and posts (generation, text); a predict that ignores
+// nothing but runs past the timeout is cancelled; an invalidated request is
+// not posted.
+import std.spec
+import std.list
+import std.string
+import std.strbuilder
+import std.sync
+import nib.msg
+import nib.tui.editor
+import nib.tui.prediction
+
+repeat_(s: string, n: int) -> string {
+    sb = strbuilder.new(64)
+    for i in 0..n { strbuilder.append(sb, s) }
+    return strbuilder.finish(sb)
+}
+
+count_(hay: string, needle: string) -> int {
+    n = 0
+    at = 0
+    while true {
+        ix = string.index_of_from(hay, needle, at)
+        if ix < 0 { break }
+        n = n + 1
+        at = ix + string.length(needle)
+    }
+    return n
+}
+
+one_(a: string) -> ptr {
+    l = list.list_new()
+    list.list_add(l, a)
+    return l
+}
+
+two_(a: string, b: string) -> ptr {
+    l = one_(a)
+    list.list_add(l, b)
+    return l
+}
+
+// 1 when `s` is well-formed UTF-8 (3-byte "界" aware is enough here: lead bytes with their continuations).
+valid_utf8_(s: string) -> int {
+    i = 0
+    n = string.length(s)
+    while i < n {
+        c = string.char_at(s, i)
+        need = 0
+        if c >= 240 { need = 3 } else if c >= 224 { need = 2 } else if c >= 192 { need = 1 } else if c >= 128 { return 0 }
+        k = 1
+        while k <= need {
+            if i + k >= n { return 0 }
+            if (string.char_at(s, i + k) & 192) != 128 { return 0 }
+            k = k + 1
+        }
+        i = i + need + 1
+    }
+    return 1
+}
+
+waited_(done: ptr) {
+    i = 0
+    while sync.atomic_load(done) == 0 && i < 2000 {
+        sleep(5)
+        i = i + 1
+    }
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.prediction") {
+        spec.it("input keeps the head of the user message and the tail of the reply on codepoint boundaries") callback {
+            user = repeat_("1", 3000)
+            reply_text = "${repeat_("2", 8997)}end"
+            text = prediction.build_input(one_(user), reply_text)
+            spec.assert_eq(count_(text, "1"), prediction.MAX_USER_BYTES + prediction.MAX_RECENT_MESSAGE_BYTES, "user digits")
+            spec.assert_eq(count_(text, "2"), prediction.MAX_REPLY_BYTES - 3, "reply digits")
+            spec.assert_true(string.ends_with(text, "2end") != 0, "ends with the reply tail")
+            wide = repeat_("界", 2000)
+            cut = prediction.build_input(one_(wide), wide)
+            spec.assert_eq(valid_utf8_(cut), 1, "valid utf-8")
+            skewed = "${wide}x"
+            cut2 = prediction.build_input(one_(skewed), skewed)
+            spec.assert_eq(valid_utf8_(cut2), 1, "valid utf-8 when the tail starts inside a character")
+            spec.assert_true(string.ends_with(cut2, "界x") != 0, "tail kept whole characters")
+        }
+        spec.it("input lists recent messages oldest first, cut and capped") callback {
+            crlf = prediction.build_input(one_("a\rb"), "r")
+            spec.assert_true(string.starts_with(crlf, "User's recent messages, oldest first:\n- a b\n") != 0, "carriage return flattened")
+            text = prediction.build_input(two_("合并", "ship 0.11.1\nnow"), "done")
+            spec.assert_str_eq(text, "User's recent messages, oldest first:\n- 合并\n- ship 0.11.1 now\n\nUser's last message:\nship 0.11.1\nnow\n\nAssistant's last reply:\ndone", "layout")
+            long_text = repeat_("x", 400)
+            many = list.list_new()
+            for i in 0..20 {
+                if i == 19 { list.list_add(many, "newest") } else { list.list_add(many, string.copy(long_text)) }
+            }
+            capped = prediction.build_input(many, "r")
+            cut_at = string.index_of(capped, "\n\nUser's last")
+            section = string.substring(capped, 0, cut_at)
+            spec.assert_true(string.length(section) <= prediction.MAX_RECENT_BYTES + 64, "section capped")
+            spec.assert_true(string.ends_with(section, "- newest") != 0, "newest last")
+            spec.assert_eq(count_(section, "\n- "), 11, "eleven entries")
+            bare = prediction.build_input(list.list_new(), "r")
+            spec.assert_true(string.starts_with(bare, "User's last message:") != 0, "no recent section")
+        }
+        spec.it("recent user messages skip background, undo and skill blocks") callback {
+            history = list.list_new()
+            list.list_add(history, msg.user("one"))
+            list.list_add(history, msg.assistant("a", null, "", "", -1, "", -1, ""))
+            list.list_add(history, msg.user_from("bg", "background"))
+            list.list_add(history, msg.user("two${prediction.MENTION_INTRO}\n\n<skill name=\"x\">y</skill>"))
+            list.list_add(history, msg.user("  "))
+            list.list_add(history, msg.user_from("undone", "undo"))
+            got = prediction.recent_user_messages(history)
+            spec.assert_eq(list.list_size(got), 2, "two")
+            a, _g = list.get_string(got, 0)
+            b, _h = list.get_string(got, 1)
+            spec.assert_str_eq(a, "one", "one")
+            spec.assert_str_eq(b, "two", "two")
+        }
+        spec.it("filter keeps the first line without quotes and drops trivia") callback {
+            keep = [
+                "  \"run the tests\"\nextra", "run the tests",
+                "“修一下这个 bug”", "修一下这个 bug",
+                "commit it", "commit it",
+                "可以", "可以",
+                "合并", "合并",
+                "ok", "ok",
+                "好的", "好的"
+            ]
+            i = 0
+            while i < keep.len {
+                got, ok = prediction.filter(keep[i])
+                spec.assert_eq(ok, 1, "kept ${keep[i]}")
+                spec.assert_str_eq(got, keep[i + 1], "text ${keep[i]}")
+                i = i + 2
+            }
+            drop = ["", "  \n ", "a", "\"\"", "Thanks!", "谢谢", "感谢", "thx", "NONE", "none.", "\"NONE\"", "(nothing)", "Nothing", "No reply needed.", "N/A", "无需回复", "无", "不需要回复", "（无需回复）"]
+            j = 0
+            while j < drop.len {
+                _t, ok2 = prediction.filter(drop[j])
+                spec.assert_eq(ok2, 0, "dropped '${drop[j]}'")
+                j = j + 1
+            }
+        }
+        spec.it("prediction shows only on an empty editor and survives typing and clearing") callback {
+            s = prediction.new()
+            e = editor.new()
+            spec.assert_str_eq(prediction.visible(s, e), "", "nothing yet")
+            prediction.arrive(s, s.generation, "run the tests")
+            spec.assert_str_eq(prediction.visible(s, e), "run the tests", "shown")
+            editor.insert(e, "x")
+            spec.assert_str_eq(prediction.visible(s, e), "", "hidden while typing")
+            editor.replace(e, "")
+            spec.assert_str_eq(prediction.visible(s, e), "run the tests", "back after clearing")
+            editor.free(e)
+            prediction.free(s)
+        }
+        spec.it("late arrival while typing waits for an empty editor and old generations drop") callback {
+            s = prediction.new()
+            e = editor.new()
+            generation = s.generation
+            editor.insert(e, "typing")
+            prediction.arrive(s, generation, "late")
+            spec.assert_str_eq(prediction.visible(s, e), "", "typing")
+            editor.replace(e, "")
+            spec.assert_str_eq(prediction.visible(s, e), "late", "late shows")
+            prediction.invalidate(s)
+            spec.assert_str_eq(prediction.visible(s, e), "", "invalidated")
+            prediction.arrive(s, generation, "stale")
+            spec.assert_str_eq(prediction.visible(s, e), "", "stale dropped")
+            prediction.arrive(s, s.generation, "fresh")
+            spec.assert_str_eq(prediction.visible(s, e), "fresh", "fresh")
+            editor.free(e)
+            prediction.free(s)
+        }
+        spec.it("Tab inserts a visible prediction and otherwise is left alone") callback {
+            s = prediction.new()
+            e = editor.new()
+            spec.assert_eq(prediction.accept(s, e), 0, "nothing to accept")
+            prediction.arrive(s, s.generation, "commit it")
+            editor.insert(e, "x")
+            spec.assert_eq(prediction.accept(s, e), 0, "not on a non-empty editor")
+            spec.assert_str_eq(editor.text(e), "x", "untouched")
+            editor.replace(e, "")
+            spec.assert_eq(prediction.accept(s, e), 1, "accepted")
+            spec.assert_str_eq(editor.text(e), "commit it", "inserted")
+            editor.replace(e, "")
+            spec.assert_str_eq(prediction.visible(s, e), "", "consumed")
+            editor.free(e)
+            prediction.free(s)
+        }
+        spec.it("start asks the injected predict, filters the reply and posts it") callback {
+            s = prediction.new()
+            posted = list.list_new()
+            seen = list.list_new()
+            done = sync.atomic_new(0)
+            recent = two_("hello", "run it")
+            prediction.arrive(s, s.generation, "old prediction")
+            spec.assert_eq_long(s.generation, 0 as long, "generation before")
+            prediction.start(s, |instruction: string, input: string, cancel: ptr| {
+                list.list_add(seen, instruction)
+                list.list_add(seen, input)
+                return "  \"run the tests\"\nignored"
+            }, |generation: long, text: string| {
+                list.list_add(posted, text)
+                list.list_add(posted, string.from_long(generation))
+                sync.atomic_store(done, 1)
+            }, recent, "all done?", prediction.TIMEOUT_MS)
+            spec.assert_eq_long(s.generation, 1 as long, "start invalidates")
+            spec.assert_str_eq(s.text, "", "start drops the old prediction")
+            waited_(done)
+            spec.assert_eq(list.list_size(posted), 2, "posted once")
+            t, _g = list.get_string(posted, 0)
+            gen, _h = list.get_string(posted, 1)
+            spec.assert_str_eq(t, "run the tests", "filtered text")
+            spec.assert_str_eq(gen, "${s.generation}", "generation")
+            ins, _i = list.get_string(seen, 0)
+            inp, _j = list.get_string(seen, 1)
+            spec.assert_str_eq(ins, prediction.INSTRUCTION, "instruction")
+            spec.assert_str_eq(inp, prediction.build_input(recent, "all done?"), "input")
+            prediction.arrive(s, s.generation, t)
+            prediction.free(s)
+        }
+        spec.it("a NONE reply, an invalidated request and a timeout post nothing") callback {
+            s = prediction.new()
+            posted = list.list_new()
+            noop = |instruction: string, input: string, cancel: ptr| { return "NONE" }
+            prediction.start(s, noop, |generation: long, text: string| { list.list_add(posted, text) }, one_("x"), "r", prediction.TIMEOUT_MS)
+            prediction.free(s)
+            spec.assert_eq(list.list_size(posted), 0, "NONE")
+            s2 = prediction.new()
+            prediction.start(s2, |instruction: string, input: string, cancel: ptr| {
+                sleep(150)
+                return "late text"
+            }, |generation: long, text: string| { list.list_add(posted, text) }, one_("x"), "r", prediction.TIMEOUT_MS)
+            prediction.invalidate(s2)
+            prediction.free(s2)
+            spec.assert_eq(list.list_size(posted), 0, "invalidated")
+            s3 = prediction.new()
+            saw = sync.atomic_new(0)
+            prediction.start(s3, |instruction: string, input: string, cancel: ptr| {
+                i = 0
+                while sync.atomic_load(cancel) == 0 && i < 400 {
+                    sleep(5)
+                    i = i + 1
+                }
+                if sync.atomic_load(cancel) == 1 { sync.atomic_store(saw, 1) }
+                return "after cancel"
+            }, |generation: long, text: string| { list.list_add(posted, text) }, one_("x"), "r", 30)
+            waited_(saw)
+            spec.assert_eq(sync.atomic_load(saw), 1, "the watcher cancelled the request at the timeout")
+            prediction.free(s3)
+            spec.assert_eq(list.list_size(posted), 0, "timeout")
+        }
+    }
+    return spec.run_summary(fw)
+}

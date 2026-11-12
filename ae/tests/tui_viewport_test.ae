@@ -1,0 +1,108 @@
+// Ports the 3 tests of upstream src/tui/viewport.zig under their names.
+// Differences: the Viewport is a heap box (`viewport.new()`), `top` is
+// has_top/top_entry/top_row; anchors compare by their two fields.
+import std.spec
+import nib.tui.viewport
+import nib.tui.transcript
+import nib.tui.entry
+import term.screen
+
+anchor_eq_(a: viewport.Anchor, entry_: int, row: int, msg: string) {
+    spec.assert_eq(a.entry, entry_, "${msg}: entry")
+    spec.assert_eq(a.row, row, "${msg}: row")
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.viewport") {
+        spec.it("viewport anchors survive streaming and appended Run output then resume following") callback {
+            win = screen.window(screen.surface(20, 4))
+            t = transcript.new()
+            transcript.add(t, entry.KIND_USER, "one")
+            transcript.add(t, entry.KIND_ASSISTANT, "two\nthree\nfour")
+            view = viewport.new()
+            view.pending = -2
+            top = viewport.layout(view, t.entries, win)
+            spec.assert_true(view.has_top != 0, "top set")
+            e1 = transcript.at(t, 1)
+            e1.text = "${e1.text}\nfive\nsix"
+            anchor_eq_(viewport.layout(view, t.entries, win), top.entry, top.row, "streamed")
+            transcript.add(t, entry.KIND_INFO, "output\nmore output")
+            anchor_eq_(viewport.layout(view, t.entries, win), top.entry, top.row, "appended")
+            view.pending = 100
+            viewport.layout(view, t.entries, win)
+            spec.assert_true(view.has_top == 0, "following again")
+            transcript.add(t, entry.KIND_ASSISTANT, "done")
+            b = viewport.bottom(t.entries, win)
+            anchor_eq_(viewport.layout(view, t.entries, win), b.entry, b.row, "bottom")
+        }
+        spec.it("viewport can traverse all 5000 entries and gaps in both directions") callback {
+            entries = make([]ptr, 0)
+            for i in 0..5000 {
+                entries.push(entry.new_entry(entry.KIND_INFO) as ptr)
+            }
+            win = screen.window(screen.surface(10, 4))
+            view = viewport.new()
+            view.pending = -100000
+            anchor_eq_(viewport.layout(view, entries, win), 0, 0, "top")
+            view.pending = 1
+            anchor_eq_(viewport.layout(view, entries, win), 0, 1, "row 1")
+            view.pending = 1
+            anchor_eq_(viewport.layout(view, entries, win), 1, 0, "entry 1")
+            view.pending = -1
+            anchor_eq_(viewport.layout(view, entries, win), 0, 1, "back")
+            view.pending = 100000
+            b = viewport.bottom(entries, win)
+            anchor_eq_(viewport.layout(view, entries, win), b.entry, b.row, "bottom")
+            spec.assert_true(view.has_top == 0, "following")
+        }
+        spec.it("scrolling exactly to the bottom resumes following (added)") callback {
+            win = screen.window(screen.surface(10, 4))
+            t = transcript.new()
+            for i in 0..6 {
+                transcript.add(t, entry.KIND_INFO, "row ${i}")
+            }
+            view = viewport.new()
+            view.pending = -1000
+            viewport.layout(view, t.entries, win)
+            b = viewport.bottom(t.entries, win)
+            // scroll down to exactly the bottom anchor, no further
+            n = 0
+            while view.has_top != 0 && n < 100 {
+                view.pending = 1
+                a = viewport.layout(view, t.entries, win)
+                n = n + 1
+                if a.entry == b.entry && a.row == b.row { break }
+            }
+            spec.assert_true(view.has_top == 0, "following at the bottom anchor")
+        }
+        spec.it("toggled pins the top unless following, removed shifts it (added)") callback {
+            v = viewport.new()
+            viewport.toggled(v, viewport.Anchor { entry: 3, row: 2 }, true)
+            spec.assert_true(v.has_top == 0, "follow: no pin")
+            viewport.toggled(v, viewport.Anchor { entry: 3, row: 2 }, false)
+            spec.assert_true(v.has_top != 0 && v.top_entry == 3 && v.top_row == 2, "pinned")
+            viewport.removed(v, 1)
+            spec.assert_eq(v.top_entry, 2, "shifted")
+            viewport.removed(v, 2)
+            spec.assert_true(v.top_entry == 2 && v.top_row == 0, "row reset")
+            viewport.removed(v, 5)
+            spec.assert_eq(v.top_entry, 2, "later removal")
+        }
+        spec.it("new output is sticky only while browsing history") callback {
+            v = viewport.new()
+            v.has_top = 1
+            viewport.observe(v, 1 as long, false)
+            spec.assert_true(v.new_output == 0, "unscrolled")
+            viewport.observe(v, 1 as long, true)
+            spec.assert_true(v.new_output == 0, "same revision")
+            viewport.observe(v, 2 as long, true)
+            spec.assert_true(v.new_output != 0, "new revision")
+            viewport.observe(v, 2 as long, true)
+            spec.assert_true(v.new_output != 0, "sticky")
+            v.has_top = 0
+            viewport.observe(v, 3 as long, true)
+            spec.assert_true(v.new_output == 0, "following clears")
+        }
+    }
+}

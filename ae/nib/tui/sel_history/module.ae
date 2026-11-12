@@ -1,0 +1,171 @@
+// tui.sel_history: a mouse selection over transcript entries rather than
+// over screen cells, so it survives scrolling (upstream
+// src/tui/selection/history.zig). Named sel_history because module basenames
+// must be unique and `history` is taken.
+//
+// Differences from upstream:
+//  - Entries are a ptr[] of *entry.Entry; rows, columns and entry indexes are
+//    ints. position() returns (Position, found).
+//  - highlight takes the *screen.Surface (upstream's *vaxis.Screen) and the
+//    frame's window; text() takes no allocator and returns a string; the
+//    scratch screen is 32 rows tall as upstream.
+//  - appendRow is append_row(sb, surf, row, first, last): it appends the
+//    cells first..last of the row to the strbuilder `sb`, trailing spaces of
+//    what it added trimmed (built in a piece first: a strbuilder cannot be
+//    read back before finish).
+
+import std.string
+import std.strbuilder
+import term.screen
+import nib.tui.entry
+import nib.tui.viewport
+
+exports(Frame, Position, History, before, position, ordered_first, ordered_last, highlight,
+        text, append_row)
+
+struct Frame {
+    top: viewport.Anchor
+    window: screen.Window
+}
+
+struct Position {
+    entry: int
+    row: int
+    col: int
+}
+
+before(a: Position, b: Position) -> bool {
+    if a.entry != b.entry { return a.entry < b.entry }
+    if a.row != b.row { return a.row < b.row }
+    return a.col < b.col
+}
+
+position(frame: Frame, entries: ptr[], col: int, row: int) -> (Position, bool) {
+    if frame.window.height == 0 { return Position { entry: 0, row: 0, col: 0 }, false }
+    r = row
+    if r > frame.window.height - 1 { r = frame.window.height - 1 }
+    remaining = frame.top.row + r
+    i = frame.top.entry
+    while i < entries.len {
+        ext = entry.extent(entries[i] as *entry.Entry, frame.window)
+        if remaining < ext { return Position { entry: i, row: remaining, col: col }, true }
+        remaining = remaining - ext
+        i = i + 1
+    }
+    return Position { entry: 0, row: 0, col: 0 }, false
+}
+
+struct History {
+    anchor: Position
+    end: Position
+}
+
+// h.ordered().first / .last
+ordered_first(h: History) -> Position {
+    if before(h.end, h.anchor) { return h.end }
+    return h.anchor
+}
+
+ordered_last(h: History) -> Position {
+    if before(h.end, h.anchor) { return h.anchor }
+    return h.end
+}
+
+_sat1(n: int) -> int {
+    if n < 1 { return 0 }
+    return n - 1
+}
+
+highlight(h: History, surf: *screen.Surface, frame: Frame, entries: ptr[]) {
+    first_p = ordered_first(h)
+    last_p = ordered_last(h)
+    rows = frame.window.height
+    if surf.height < rows { rows = surf.height }
+    for row in 0..rows {
+        p, found = position(frame, entries, 0, row)
+        if !found { break }
+        first = 0
+        if p.entry == first_p.entry && p.row == first_p.row { first = first_p.col }
+        last = _sat1(surf.width)
+        if p.entry == last_p.entry && p.row == last_p.row { last = last_p.col }
+        if before(Position { entry: p.entry, row: p.row, col: _sat1(surf.width) }, first_p) || before(last_p, p) { continue }
+        c0 = first
+        if c0 > surf.width { c0 = surf.width }
+        c1 = last + 1
+        if c1 > surf.width { c1 = surf.width }
+        col = c0
+        while col < c1 {
+            i = row * surf.width + col
+            surf.cells[i].style.attrs = surf.cells[i].style.attrs ^ screen.REVERSE
+            surf.cells[i].is_default = false
+            col = col + 1
+        }
+    }
+}
+
+text(h: History, frame: Frame, entries: ptr[]) -> string {
+    first_p = ordered_first(h)
+    last_p = ordered_last(h)
+    if last_p.entry >= entries.len { return "" }
+    out = strbuilder.new(256)
+    scratch = screen.surface(frame.window.surf.width, 32)
+    scratch.width_method = frame.window.surf.width_method
+    win = screen.window(scratch)
+    body = screen.child(win, x_off: frame.window.x_off, width: frame.window.width)
+    wrote_row = false
+    i = first_p.entry
+    while i <= last_p.entry {
+        en = entries[i] as *entry.Entry
+        height = entry.height(en, body)
+        start = 0
+        if i == first_p.entry {
+            start = first_p.row
+            if start > height { start = height }
+        }
+        end = height
+        if i == last_p.entry {
+            end = last_p.row
+            if end > height { end = height }
+        }
+        row = start
+        while row <= end {
+            screen.clear(win)
+            entry.draw(en, screen.child(body, y_off: 0 - row, height: height), true)
+            count = scratch.height
+            if end - row + 1 < count { count = end - row + 1 }
+            for r in 0..count {
+                if wrote_row { strbuilder.append(out, "\n") }
+                wrote_row = true
+                first = 0
+                if i == first_p.entry && row + r == first_p.row { first = first_p.col }
+                last = _sat1(scratch.width)
+                if i == last_p.entry && row + r == last_p.row { last = last_p.col }
+                append_row(out, scratch, r, first, last)
+            }
+            row = row + count
+        }
+        i = i + 1
+    }
+    screen.surface_free(scratch)
+    return strbuilder.finish(out)
+}
+
+append_row(out: ptr, surf: *screen.Surface, row: int, first: int, last: int) {
+    piece = strbuilder.new(64)
+    col = 0
+    while col <= last && col < surf.width {
+        cell, _ok = screen.read_cell(surf, col, row)
+        if col >= first { strbuilder.append(piece, cell.grapheme) }
+        // Vaxis leaves covered cells untouched; only the leading cell owns the glyph.
+        w = cell.width
+        if w == 0 { w = screen.gwidth(cell.grapheme, surf.width_method) }
+        if w < 1 { w = 1 }
+        col = col + w
+    }
+    s = strbuilder.finish(piece)
+    n = string.length(s)
+    while n > 0 && s[n - 1] == 32 {
+        n = n - 1
+    }
+    strbuilder.append(out, string.substring(s, 0, n))
+}

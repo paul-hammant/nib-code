@@ -1,0 +1,306 @@
+// tui.status: the activity line and footer text, and the Activity clock
+// (upstream src/tui/status.zig).
+// Differences from upstream:
+//  - Phase is int constants PHASE_*; ModelActivity is int constants MA_*.
+//  - There is no global clock: timestamps are `long` milliseconds and every
+//    function that upstream gives `io` takes `now: long`.
+//  - Optionals: busy is (has_busy, busy: Label); notice is (has_notice,
+//    notice), because upstream distinguishes a null notice from "" (an empty
+//    notice still adds the " · " separator). hovered is -1 for none.
+//  - Status.cfg is a `ptr` to provider.types Config; colours are ints
+//    (term.screen); activity_style() returns a screen.Style.
+//  - Upstream's Text buffers are gone: format / format_width / footer are
+//    plain functions that return a new string.
+//  - delta_phase takes 1 for a reasoning delta, 0 for text (upstream's
+//    provider.Kind).
+
+import std.string
+import std.strbuilder
+import term.screen
+import nib.provider.types
+import nib.tui.format
+import nib.tui.label
+import nib.tui.turn_summary
+
+exports(PHASE_THINKING, PHASE_REASONING, PHASE_WRITING, PHASE_SCRIPTING, PHASE_RUNNING,
+        PHASE_WAITING, PHASE_RETRYING, PHASE_COMPACTING, PHASE_COUNT,
+        MA_STARTED, MA_DATA, MA_SCRIPT, MA_WAITING, MA_FINISHED,
+        Label, Activity, Status, activity_start, activity_set, delta_phase, model_activity, progress,
+        activity_label, label_at, new, activity_style, format_line, format_width, footer, retry_reason)
+
+const PHASE_THINKING = 0
+const PHASE_REASONING = 1
+const PHASE_WRITING = 2
+const PHASE_SCRIPTING = 3
+const PHASE_RUNNING = 4
+const PHASE_WAITING = 5
+const PHASE_RETRYING = 6
+const PHASE_COMPACTING = 7
+const PHASE_COUNT = 8
+
+const MA_STARTED = 0
+const MA_DATA = 1
+const MA_SCRIPT = 2
+const MA_WAITING = 3
+const MA_FINISHED = 4
+
+const SPINNER[] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+struct Label {
+    phase: int
+    ms: long
+    turn_ms: long
+    quiet_ms: long
+}
+
+struct Activity {
+    phase: int
+    since: long
+    turn_since: long
+    last_progress: long
+    tool: string
+}
+
+activity_start(now: long, phase: int) -> Activity {
+    return Activity { phase: phase, since: now, turn_since: now, last_progress: now, tool: "" }
+}
+
+activity_set(a: *Activity, now: long, phase: int) {
+    if a.phase == phase { return }
+    a.phase = phase
+    a.since = now
+}
+
+delta_phase(reasoning: int) -> int {
+    if reasoning != 0 { return PHASE_REASONING }
+    return PHASE_WRITING
+}
+
+model_activity(a: *Activity, activity: int, at: long) {
+    if activity == MA_DATA || activity == MA_SCRIPT { progress(a, at) }
+}
+
+progress(a: *Activity, at: long) {
+    a.last_progress = at
+}
+
+max0_(n: long) -> long {
+    if n < 0 { return 0 }
+    return n
+}
+
+label_at(a: Activity, now: long) -> Label {
+    return Label {
+        phase: a.phase,
+        ms: max0_(now - a.since),
+        turn_ms: max0_(now - a.turn_since),
+        quiet_ms: max0_(now - a.last_progress)
+    }
+}
+
+activity_label(a: Activity, now: long) -> Label {
+    return label_at(a, now)
+}
+
+struct Status {
+    cfg: ptr                      // *types.Config
+    hovered: int                  // -1 none
+    hover_bg: int
+    user_bg: int
+    code_bg: int
+    usage: turn_summary.Usage
+    steps: int
+    background_count: int
+    context: long
+    has_busy: int                 // set while a Turn runs
+    busy: Label
+    has_notice: int               // a transient message, such as a copy confirmation
+    notice: string
+    detail: string
+    hint: string                  // what an open /provider step asks for; appended to the activity line
+    signed_out: int               // no usable credentials: the footer says so instead of naming a model
+    title: string                 // dim line at the top of an empty transcript; "" for none
+    revision: int
+    new_output: int
+}
+
+new(cfg: @keep ptr) -> Status {
+    return Status {
+        cfg: cfg,
+        hovered: -1,
+        hover_bg: screen.DEFAULT,
+        user_bg: screen.DEFAULT,
+        code_bg: screen.DEFAULT,
+        usage: turn_summary.usage(),
+        steps: 0,
+        background_count: 0,
+        context: 0 as long,
+        has_busy: 0,
+        busy: Label { phase: PHASE_THINKING, ms: 0, turn_ms: 0, quiet_ms: 0 },
+        has_notice: 0,
+        notice: "",
+        detail: "",
+        hint: "",
+        signed_out: 0,
+        title: "",
+        revision: 0,
+        new_output: 0
+    }
+}
+
+activity_style(s: Status) -> screen.Style {
+    if s.has_busy != 0 {
+        if s.busy.phase == PHASE_RETRYING || s.busy.quiet_ms >= 30000 {
+            return screen.style(fg: screen.color_index(3))
+        }
+    }
+    return screen.style(attrs: screen.DIM)
+}
+
+phase_text_(s: Status, phase: int) -> string {
+    has_detail = string.length(s.detail) > 0
+    match phase {
+        0 -> { return "Waiting for model" }
+        1 -> { return "Thinking" }
+        2 -> { return "Generating response" }
+        3 -> { return "Writing Run" }
+        4 -> { if has_detail { return "Running" } else { return "Running Run" } }
+        5 -> { if has_detail { return "Waiting for" } else { return "Waiting for background tasks" } }
+        6 -> { return "Retrying" }
+        _ -> { return "Compacting context" }
+    }
+}
+
+// Last byte offset of `sub` in `s`, or -1.
+last_index_of_(s: string, sub: string) -> int {
+    at = -1
+    from = 0
+    while true {
+        i = string.index_of_from(s, sub, from)
+        if i < 0 { break }
+        at = i
+        from = i + 1
+    }
+    return at
+}
+
+format_line(s: Status, scrolled: bool) -> string {
+    sb = strbuilder.new(128)
+    n = 0
+    if s.has_busy != 0 {
+        b = s.busy
+        phase = phase_text_(s, b.phase)
+        strbuilder.append(sb, SPINNER[((b.ms / 100) % 10) as int])
+        strbuilder.append(sb, " ")
+        strbuilder.append(sb, phase)
+        if string.length(s.detail) > 0 {
+            if b.phase == PHASE_RETRYING { strbuilder.append(sb, " · ") } else { strbuilder.append(sb, " ") }
+            strbuilder.append(sb, s.detail)
+        }
+        strbuilder.append(sb, " · turn ${format.duration(b.turn_ms)}")
+        if b.quiet_ms >= 30000 { strbuilder.append(sb, " · no progress ${format.duration(b.quiet_ms)}") }
+        n = 1
+    }
+    if s.background_count > 0 {
+        if n > 0 { strbuilder.append(sb, " · ") }
+        plural = "s"
+        if s.background_count == 1 { plural = "" }
+        strbuilder.append(sb, "${s.background_count} background task${plural}")
+        n = 1
+    }
+    if scrolled && s.new_output != 0 {
+        if n > 0 { strbuilder.append(sb, " · ") }
+        strbuilder.append(sb, "New output below")
+        n = 1
+    }
+    if string.length(s.hint) > 0 {
+        if n > 0 { strbuilder.append(sb, " · ") }
+        strbuilder.append(sb, s.hint)
+        n = 1
+    }
+    if s.has_notice != 0 {
+        if n > 0 { strbuilder.append(sb, " · ") }
+        strbuilder.append(sb, s.notice)
+    }
+    return strbuilder.finish(sb)
+}
+
+format_width(s: Status, scrolled: bool, width: int) -> string {
+    line = format_line(s, scrolled)
+    w = screen.gwidth(line, screen.WIDTH_UNICODE)
+    if scrolled && s.new_output != 0 && w > width {
+        hint = "New output below"
+        hint_width = screen.gwidth(hint, screen.WIDTH_UNICODE)
+        if width <= hint_width + 3 {
+            fitted = format.fit(hint, width)
+            return "${fitted.text}${fitted.suffix}"
+        }
+        full = format_line(s, false)
+        idx = string.index_of(full, " · turn ")
+        primary = full
+        if idx >= 0 { primary = string.substring(full, 0, idx) }
+        fitted = format.fit(primary, width - hint_width - 3)
+        return "${fitted.text}${fitted.suffix} · ${hint}"
+    }
+    turn_at = -1
+    if s.has_busy != 0 { turn_at = last_index_of_(line, " · turn ") }
+    while screen.gwidth(line, screen.WIDTH_UNICODE) > width {
+        separator = last_index_of_(line, " · ")
+        if separator >= 0 {
+            if turn_at == separator {
+                suffix = string.substring(line, separator, string.length(line))
+                suffix_width = screen.gwidth(suffix, screen.WIDTH_UNICODE)
+                if width > suffix_width {
+                    head = format.fit(string.substring(line, 0, separator), width - suffix_width)
+                    return "${head.text}${head.suffix}${suffix}"
+                }
+            }
+            line = string.substring(line, 0, separator)
+        } else {
+            end = 0
+            len = string.length(line)
+            while end < len {
+                next = screen.grapheme_end(line, end)
+                if screen.gwidth(string.substring(line, 0, next), screen.WIDTH_UNICODE) > width { break }
+                end = next
+            }
+            return string.substring(line, 0, end)
+        }
+    }
+    return line
+}
+
+footer(s: Status, width: int) -> string {
+    if s.signed_out != 0 {
+        if width >= 14 { return "Not signed in" }
+        return ""
+    }
+    cfg = s.cfg as *types.Config
+    line = cfg.model
+    if s.context > 0 {
+        cw = cfg.context_window
+        if cw < 1 { cw = 1 }
+        line = "${cfg.model} · context ${s.context * 100 / cw}%"
+    }
+    while screen.gwidth(line, screen.WIDTH_UNICODE) > width {
+        separator = last_index_of_(line, " · ")
+        if separator < 0 { return "" }
+        line = string.substring(line, 0, separator)
+    }
+    return line
+}
+
+retry_reason(reason: string) -> string {
+    if string.contains(reason, "rate_limit") != 0 || string.contains(reason, "429") != 0 { return "rate limit" }
+    if string.contains(reason, "server_error") != 0 || string.contains(reason, "500") != 0 { return "provider error" }
+    if string.contains(reason, "Timeout") != 0 || string.contains(reason, "timed out") != 0 { return "connection timed out" }
+    if string.contains(reason, "IncompleteResponse") != 0 { return "response interrupted" }
+    len = string.length(reason)
+    end = len
+    i = 0
+    while i < len {
+        if reason[i] == 13 || reason[i] == 10 { end = i; break }
+        i = i + 1
+    }
+    return label.prompt_prefix(string.substring(reason, 0, end))
+}

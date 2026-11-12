@@ -1,0 +1,257 @@
+// tui.selection: mouse selection over the screen's cells, and over transcript
+// entries while browsing history, with highlight (reverse video), text
+// extraction and copying (upstream src/tui/selection.zig).
+//
+// Differences from upstream:
+//  - A Selection is a heap box (`new()`); the methods are functions taking it
+//    first, in snake_case (`mouse_in_history`, `update_history`,
+//    `highlight_history`, `text_in_history`, `take_click`, `clear`). `clear`
+//    resets every field (upstream `s.* = .{}`).
+//  - Optionals are flags: `anchor` is `has_anchor` + `anchor`; `history` is
+//    `has_history` + `history`; `click` is `has_click` + `click`;
+//    take_click returns (Position, found). The optional history `frame` is a
+//    `(frame, has_frame)` pair of arguments. `active` and `dragged` are ints.
+//  - Mouse events are term.input.Mouse; the screen is a *screen.Surface;
+//    columns and rows are ints.
+//  - text() / text_in_history() take no allocator and return a string.
+//  - copy(t, text, local): upstream writes OSC 52 through vaxis and then runs
+//    localCopy, which (only when WAYLAND_DISPLAY or DISPLAY is set) spawns
+//    wl-copy / xsel / xclip through /bin/sh with a one second wait. Here the
+//    OSC 52 goes through `term.copy_to_clipboard(t, text)` and the local
+//    copier is the `local` closure, `|text: string| { ... }`, called after
+//    it and expected to swallow its own failures (upstream `catch {}`).
+//    Nothing is spawned in this module: pass a no-op closure in specs. The
+//    sh script upstream runs is LOCAL_COPY_SCRIPT and the environment test
+//    is local_copy_wanted(has_wayland, has_display), for whoever wires a real
+//    spawner (feed `text` on stdin of `/bin/sh -c LOCAL_COPY_SCRIPT`).
+
+import std.string
+import std.strbuilder
+import term.screen
+import term.input
+import term
+import nib.tui.entry
+import nib.tui.sel_history
+
+exports(Point, Selection, new, take_click, clear, mouse, mouse_in_history, update_history,
+        highlight_history, text_in_history, highlight, text, copy, local_copy_wanted,
+        LOCAL_COPY_SCRIPT)
+
+struct Point {
+    col: int
+    row: int
+}
+
+struct Selection {
+    has_anchor: int
+    anchor: Point
+    end: Point
+    active: int
+    dragged: int
+    has_history: int
+    history: sel_history.History
+    has_click: int
+    click: sel_history.Position
+}
+
+new() -> *Selection {
+    return heap.new(Selection)
+}
+
+_pos0_() -> sel_history.Position {
+    return sel_history.Position { entry: 0, row: 0, col: 0 }
+}
+
+take_click(s: *Selection) -> (sel_history.Position, bool) {
+    c = s.click
+    had = s.has_click != 0
+    s.has_click = 0
+    s.click = _pos0_()
+    return c, had
+}
+
+clear(s: *Selection) {
+    s.has_anchor = 0
+    s.anchor = Point { col: 0, row: 0 }
+    s.end = Point { col: 0, row: 0 }
+    s.active = 0
+    s.dragged = 0
+    s.has_history = 0
+    s.history = sel_history.History { anchor: _pos0_(), end: _pos0_() }
+    s.has_click = 0
+    s.click = _pos0_()
+}
+
+_clamp_(v: int, hi: int) -> int {
+    r = v
+    if r < 0 { r = 0 }
+    if r > hi { r = hi }
+    return r
+}
+
+_point_eq_(a: Point, b: Point) -> bool {
+    return a.col == b.col && a.row == b.row
+}
+
+_pos_eq_(a: sel_history.Position, b: sel_history.Position) -> bool {
+    return a.entry == b.entry && a.row == b.row && a.col == b.col
+}
+
+_is_release_(m: input.Mouse) -> bool {
+    return m.kind == input.MOUSE_RELEASE && (m.button == input.BUTTON_LEFT || m.button == input.BUTTON_NONE)
+}
+
+mouse(s: *Selection, m: input.Mouse, surf: *screen.Surface) -> bool {
+    if surf.width == 0 || surf.height == 0 { return false }
+    p = Point { col: _clamp_(m.col, surf.width - 1), row: _clamp_(m.row, surf.height - 1) }
+    if m.kind == input.MOUSE_PRESS && m.button == input.BUTTON_LEFT {
+        clear(s)
+        s.has_anchor = 1
+        s.anchor = p
+        s.end = p
+        s.active = 1
+    } else if s.active != 0 && (m.kind == input.MOUSE_DRAG || m.kind == input.MOUSE_MOTION) && m.button == input.BUTTON_LEFT {
+        s.end = p
+        if s.dragged != 0 || !_point_eq_(s.anchor, p) { s.dragged = 1 }
+    } else if s.active != 0 && _is_release_(m) {
+        s.end = p
+        s.active = 0
+        if s.dragged == 0 {
+            clear(s)
+            return false
+        }
+        return true
+    }
+    return false
+}
+
+mouse_in_history(s: *Selection, m: input.Mouse, surf: *screen.Surface, frame: sel_history.Frame, has_frame: bool, entries: ptr[]) -> bool {
+    if s.active != 0 && s.has_history != 0 {
+        if has_frame {
+            w = surf.width - 1
+            if w < 0 { w = 0 }
+            col = _clamp_(m.col, w)
+            row = m.row
+            if row < 0 { row = 0 }
+            update_end_(s, frame, entries, col, row)
+        }
+    }
+    click_found = false
+    click = _pos0_()
+    if s.active != 0 && s.dragged == 0 && _is_release_(m) && s.has_history != 0 {
+        click_found = true
+        click = s.history.anchor
+    }
+    copied = mouse(s, m, surf)
+    if click_found {
+        s.has_click = 1
+        s.click = click
+    }
+    if m.kind == input.MOUSE_PRESS && m.button == input.BUTTON_LEFT {
+        if has_frame {
+            if m.row >= 0 && m.row < frame.window.height && s.has_anchor != 0 {
+                p, found = sel_history.position(frame, entries, s.end.col, s.end.row)
+                if found {
+                    s.has_history = 1
+                    s.history = sel_history.History { anchor: p, end: p }
+                }
+            }
+        }
+    }
+    return copied
+}
+
+update_end_(s: *Selection, frame: sel_history.Frame, entries: ptr[], col: int, row: int) {
+    if entries.len == 0 { return }
+    p, found = sel_history.position(frame, entries, col, row)
+    if !found {
+        last = entries[entries.len - 1] as *entry.Entry
+        p = sel_history.Position { entry: entries.len - 1, row: entry.height(last, frame.window), col: col }
+    }
+    s.history.end = p
+    if s.dragged != 0 || !_pos_eq_(s.history.anchor, p) { s.dragged = 1 }
+}
+
+update_history(s: *Selection, frame: sel_history.Frame, has_frame: bool, entries: ptr[]) {
+    if s.active != 0 && s.has_history != 0 {
+        if has_frame { update_end_(s, frame, entries, s.end.col, s.end.row) }
+    }
+}
+
+highlight_history(s: *Selection, surf: *screen.Surface, frame: sel_history.Frame, has_frame: bool, entries: ptr[]) {
+    if s.has_history != 0 {
+        if s.dragged != 0 && has_frame { sel_history.highlight(s.history, surf, frame, entries) }
+    } else {
+        highlight(s, surf)
+    }
+}
+
+text_in_history(s: *Selection, surf: *screen.Surface, frame: sel_history.Frame, has_frame: bool, entries: ptr[]) -> string {
+    if s.dragged != 0 && s.has_history != 0 && has_frame {
+        return sel_history.text(s.history, frame, entries)
+    }
+    return text(s, surf)
+}
+
+// The ordered range: (first, last, found). Not selected until dragged.
+range_(s: *Selection) -> (Point, Point, bool) {
+    a = s.anchor
+    if s.has_anchor == 0 || s.dragged == 0 { return a, a, false }
+    forward = a.row < s.end.row || (a.row == s.end.row && a.col <= s.end.col)
+    if forward { return a, s.end, true }
+    return s.end, a, true
+}
+
+highlight(s: *Selection, surf: *screen.Surface) {
+    first, last, found = range_(s)
+    if !found { return }
+    row = first.row
+    while row <= last.row && row < surf.height {
+        c0 = 0
+        if row == first.row { c0 = first.col }
+        c1 = surf.width - 1
+        if c1 < 0 { c1 = 0 }
+        if row == last.row { c1 = last.col }
+        col = c0
+        while col <= c1 && col < surf.width {
+            i = row * surf.width + col
+            surf.cells[i].style.attrs = surf.cells[i].style.attrs ^ screen.REVERSE
+            surf.cells[i].is_default = false
+            col = col + 1
+        }
+        row = row + 1
+    }
+}
+
+text(s: *Selection, surf: *screen.Surface) -> string {
+    out = strbuilder.new(128)
+    first, last, found = range_(s)
+    if found {
+        row = first.row
+        while row <= last.row && row < surf.height {
+            if row != first.row { strbuilder.append(out, "\n") }
+            c0 = 0
+            if row == first.row { c0 = first.col }
+            c1 = surf.width - 1
+            if c1 < 0 { c1 = 0 }
+            if row == last.row { c1 = last.col }
+            sel_history.append_row(out, surf, row, c0, c1)
+            row = row + 1
+        }
+    }
+    return strbuilder.finish(out)
+}
+
+// The script upstream's localCopy runs under /bin/sh with the text on stdin.
+const LOCAL_COPY_SCRIPT = "if [ -n \"$WAYLAND_DISPLAY\" ] && command -v wl-copy >/dev/null 2>&1; then exec wl-copy\nelif [ -n \"$DISPLAY\" ]; then\n  if command -v xsel >/dev/null 2>&1; then exec xsel --clipboard --input\n  elif command -v xclip >/dev/null 2>&1; then exec xclip -selection clipboard; fi\nfi\nexit 1"
+
+// Upstream localCopy does nothing without WAYLAND_DISPLAY or DISPLAY.
+local_copy_wanted(has_wayland: bool, has_display: bool) -> bool {
+    return has_wayland || has_display
+}
+
+// OSC 52 through the terminal, then the `local` copier (see the header).
+copy(t: *term.Terminal, text: string, local: fn) {
+    term.copy_to_clipboard(t, text)
+    call(local, text)
+}

@@ -1,0 +1,122 @@
+// Ports all 8 tests of upstream src/tui/commands.zig under their names.
+// None of them needs the App; modelSelection/select/execute (which do) are
+// not part of nib.tui.commands and have no tests here.
+import std.spec
+import std.string
+import nib.tui.mode
+import nib.tui.commands
+
+none_() -> commands.Choice[] {
+    return commands.no_choices()
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.commands") {
+        spec.it("parse tells commands from paths and messages") callback {
+            spec.assert_eq(commands.parse("hello").kind, commands.PARSE_NONE, "hello")
+            spec.assert_eq(commands.parse("/etc/hosts 是什么").kind, commands.PARSE_NONE, "path")
+            spec.assert_eq(commands.parse("/effort high").command, commands.CMD_EFFORT, "effort")
+            spec.assert_eq(commands.parse("/effort high").kind, commands.PARSE_KNOWN, "known")
+            spec.assert_str_eq(commands.parse("/effort  high ").arg, "high", "arg")
+            spec.assert_eq(commands.parse("/nope x").kind, commands.PARSE_UNKNOWN, "unknown")
+            spec.assert_str_eq(commands.parse("/nope x").unknown_name, "nope", "unknown name")
+            spec.assert_eq(commands.parse("/undo").command, commands.CMD_UNDO, "undo")
+            spec.assert_true(commands.allowed_while_busy("/undo"), "undo busy")
+            spec.assert_false(commands.allowed_while_busy("/new"), "new not busy")
+            spec.assert_false(commands.allowed_while_busy("/nope"), "unknown not busy")
+            spec.assert_false(commands.allowed_while_busy("hello"), "message not busy")
+        }
+        spec.it("candidates complete command names, then argument choices") callback {
+            e = none_()
+            spec.assert_eq(commands.candidates("/", e, e, e, e).len, commands.CMD_COUNT, "all")
+            co = commands.candidates("/co", e, e, e, e)
+            spec.assert_eq(co.len, 2, "/co")
+            spec.assert_str_eq(co[0].label, "/copy", "copy")
+            spec.assert_str_eq(co[1].label, "/compact", "compact")
+            spec.assert_eq(commands.candidates("/js 1 + 1", e, e, e, e).len, 0, "js")
+            spec.assert_eq(commands.candidates("hi /co", e, e, e, e).len, 0, "hi")
+
+            efforts = commands.candidates("/effort h", e, e, e, e)
+            spec.assert_eq(efforts.len, 1, "efforts")
+            spec.assert_str_eq(efforts[0].value, "high", "high")
+            spec.assert_str_eq(commands.candidate_line(efforts[0]), "/effort high", "line")
+
+            sessions = commands.no_choices()
+            sessions.push(commands.choice("abc123", "abc1", "now"))
+            sessions.push(commands.choice("def456", "def4", "1h"))
+            picked = commands.candidates("/resume d", sessions, e, e, e)
+            spec.assert_eq(picked.len, 1, "picked")
+            spec.assert_str_eq(picked[0].value, "def456", "def456")
+            spec.assert_eq(commands.candidates("/effort   h", e, e, e, e).len, 1, "extra spaces")
+            spec.assert_eq(commands.candidates("/all", e, e, e, e, 1).len, 0, "none")
+            spec.assert_eq(commands.candidates("/", e, e, e, e, 5).len, 5, "limit")
+        }
+        spec.it("accepting a command waits for required arguments only") callback {
+            e = none_()
+            js = commands.candidates("/j", e, e, e, e)[0]
+            spec.assert_false(commands.candidate_runs(js), "js runs")
+            spec.assert_str_eq(commands.candidate_completion(js), "/js ", "tab")
+            effort = commands.candidates("/ef", e, e, e, e)[0]
+            spec.assert_true(commands.candidate_runs(effort), "effort runs")
+            help = commands.help_text("owner/repo")
+            spec.assert_true(string.index_of(help, "/resume <id>") >= 0, "resume in help")
+        }
+        spec.it("task commands run while busy and stop completes current task ids") callback {
+            e = none_()
+            spec.assert_true(commands.allowed_while_busy("/tasks"), "tasks")
+            spec.assert_true(commands.allowed_while_busy("/stop r3"), "stop")
+            tasks = commands.no_choices()
+            tasks.push(commands.choice("r3", "r3", "Run"))
+            selected = commands.candidates("/stop r", e, tasks, e, e)
+            spec.assert_eq(selected.len, 1, "selected")
+            spec.assert_str_eq(selected[0].value, "r3", "r3")
+            spec.assert_true(commands.candidate_runs(selected[0]), "value runs")
+            spec.assert_false(commands.candidate_runs(commands.candidates("/stop", e, tasks, e, e)[0]), "bare stop")
+        }
+        spec.it("help groups commands and states the real issue destination or disabled state") callback {
+            on = commands.help_text("owner/repo")
+            spec.assert_true(string.index_of(on, "Send\n") < string.index_of(on, "View\n"), "order")
+            spec.assert_true(string.index_of(on, "publish issue drafts: owner/repo") >= 0, "repo")
+            off = commands.help_text("")
+            spec.assert_true(string.index_of(off, "/reflect") < 0, "no reflect")
+            spec.assert_true(string.index_of(off, "owner/repo") < 0, "no repo")
+        }
+        spec.it("model choices filter and complete without running the bare command") callback {
+            e = none_()
+            models = commands.no_choices()
+            models.push(commands.choice("gpt-6.1-sol", "gpt-6.1-sol", "current"))
+            models.push(commands.choice("gpt-6.1-terra", "gpt-6.1-terra", ""))
+            spec.assert_false(commands.allowed_while_busy("/model gpt-6.1-sol"), "busy")
+            spec.assert_false(commands.candidate_runs(commands.candidates("/model", e, e, models, e)[0]), "bare")
+            selected = commands.candidates("/model gpt-6.1-s", e, e, models, e)
+            spec.assert_eq(selected.len, 1, "one")
+            spec.assert_str_eq(selected[0].detail, "current", "detail")
+            spec.assert_str_eq(commands.candidate_line(selected[0]), "/model gpt-6.1-sol", "line")
+        }
+        spec.it("service choices complete /provider and run on Enter") callback {
+            e = none_()
+            services = commands.no_choices()
+            services.push(commands.choice("codex", "Codex", "signed in · ChatGPT"))
+            services.push(commands.choice("anthropic", "Anthropic", "—"))
+            spec.assert_false(commands.allowed_while_busy("/provider anthropic"), "busy")
+            spec.assert_false(commands.candidate_runs(commands.candidates("/provider", e, e, e, services)[0]), "bare")
+            all = commands.candidates("/provider ", e, e, e, services)
+            spec.assert_eq(all.len, 2, "all")
+            one = commands.candidates("/provider an", e, e, e, services)
+            spec.assert_true(commands.candidate_runs(one[0]), "runs")
+            spec.assert_str_eq(commands.candidate_line(one[0]), "/provider anthropic", "line")
+        }
+        spec.it("simple command is a busy-safe view change") callback {
+            spec.assert_eq(commands.parse("/${mode.COMMAND}").command, commands.CMD_SIMPLE, "parse")
+            spec.assert_true(commands.allowed_while_busy("/${mode.COMMAND}"), "busy")
+            spec.assert_str_eq(commands.slash_name(commands.CMD_SIMPLE), "/simple", "slash")
+            spec.assert_eq(commands.candidate_group(commands.candidates("/", e_(), e_(), e_(), e_())[0]), commands.G_SEND, "first group")
+        }
+    }
+    return spec.run_summary(fw)
+}
+
+e_() -> commands.Choice[] {
+    return commands.no_choices()
+}

@@ -1,0 +1,135 @@
+// Ports the tests of upstream src/auth/models.zig under their names, with the
+// differences the port has: protocols are name strings, an absent window is -1,
+// and the Zig errors are (list, error name) returns.
+// Extra tests (not upstream): fetch against a one-shot loopback mock server
+// (the request's path and headers, a rejected status, an unreachable port).
+import std.spec
+import std.list
+import std.string
+import std.tcp
+import std.worker
+import std.sync
+import nib.auth.models
+
+item_(l: ptr, i: int) -> *models.Listed {
+    return list.list_get_raw(l, i) as *models.Listed
+}
+
+struct Mock {
+    server: ptr
+    port: int
+    status: int
+    body: string
+    seen: string
+    done: ptr
+}
+
+// Answers one request on 127.0.0.1 with `status` and `body`; `seen` keeps the request head.
+mock_(status: int, body: string) -> *Mock {
+    m = heap.new(Mock)
+    srv, _e = tcp.listen_on("127.0.0.1", 0)
+    m.server = srv
+    m.port = tcp.server_port(srv)
+    m.status = status
+    m.body = body
+    m.seen = ""
+    m.done = sync.atomic_new(0)
+    mp = m as ptr
+    worker.run_detached(|| {
+        mm = mp as *Mock
+        if tcp.server_poll(mm.server, 10000) == 1 {
+            sock, _a = tcp.accept(mm.server)
+            req = ""
+            while string.contains(req, "\r\n\r\n") == 0 {
+                chunk, rerr = tcp.read(sock, 4096)
+                if rerr != "" { break }
+                req = "${req}${chunk}"
+            }
+            mm.seen = req
+            resp_text = "HTTP/1.1 ${mm.status} X\r\ncontent-type: application/json\r\ncontent-length: ${string.length(mm.body)}\r\nconnection: close\r\n\r\n${mm.body}"
+            tcp.write(sock, resp_text)
+            tcp.close_drained(sock)
+        }
+        sync.atomic_store(mm.done, 1)
+        return null
+    })
+    return m
+}
+
+wait_(m: *Mock) {
+    i = 0
+    while sync.atomic_load(m.done) == 0 && i < 4000 {
+        sleep(5)
+        i = i + 1
+    }
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "auth.models") {
+        spec.it("model list URLs follow the protocol") callback {
+            spec.assert_str_eq(models.url("https://h/v1/", "chat_completions"), "https://h/v1/models", "chat")
+            spec.assert_str_eq(models.url("https://h", "responses"), "https://h/models", "responses")
+            spec.assert_str_eq(models.url("https://h/", "anthropic_messages"), "https://h/v1/models?limit=1000", "anthropic")
+        }
+        spec.it("model lists parse ids and optional windows") callback {
+            l, err = models.parse("{\"object\":\"list\",\"data\":[{\"id\":\"a\"},{\"id\":\"b\",\"context_length\":32768},{\"nope\":1},{\"id\":\"\"},{\"id\":\"c\",\"max_input_tokens\":200000},3]}")
+            spec.assert_str_eq(err, "", "ok")
+            spec.assert_eq(list.list_size(l), 3, "three entries")
+            spec.assert_str_eq(item_(l, 0).id, "a", "a")
+            spec.assert_true(item_(l, 0).context_window == -1, "a has no window")
+            spec.assert_eq_long(item_(l, 1).context_window, 32768 as long, "b window")
+            spec.assert_eq_long(item_(l, 2).context_window, 200000 as long, "c window")
+            _x, e1 = models.parse("[]")
+            spec.assert_str_eq(e1, "InvalidModelList", "array")
+            _y, e2 = models.parse("{\"data\":1}")
+            spec.assert_str_eq(e2, "InvalidModelList", "data not array")
+            _z, e3 = models.parse("<html>")
+            spec.assert_str_eq(e3, "InvalidModelList", "html")
+            empty, e4 = models.parse("{\"data\":[]}")
+            spec.assert_str_eq(e4, "", "empty ok")
+            spec.assert_eq(list.list_size(empty), 0, "empty list")
+        }
+        spec.it("window fields: first positive wins, floats truncate, zero is skipped") callback {
+            l, _e = models.parse("{\"data\":[{\"id\":\"z\",\"context_window\":0,\"context_length\":4096},{\"id\":\"f\",\"context_window\":8192.0},{\"id\":\"s\",\"context_window\":\"big\"},{\"id\":\"one\",\"context_window\":1.0},{\"id\":\"half\",\"context_window\":0.5}]}")
+            spec.assert_eq_long(item_(l, 0).context_window, 4096 as long, "zero skipped")
+            spec.assert_eq_long(item_(l, 1).context_window, 8192 as long, "float")
+            spec.assert_true(item_(l, 2).context_window == -1, "string ignored")
+            spec.assert_eq_long(item_(l, 3).context_window, 1 as long, "1.0 counts")
+            spec.assert_true(item_(l, 4).context_window == -1, "0.5 does not")
+        }
+        spec.it("fetch sends the key as each protocol documents and parses the reply") callback {
+            m = mock_(200, "{\"data\":[{\"id\":\"m1\",\"context_window\":1000}]}")
+            l, err = models.fetch("http://127.0.0.1:${m.port}/v1/", "chat_completions", "sk-test")
+            wait_(m)
+            spec.assert_str_eq(err, "", "no error")
+            spec.assert_eq(list.list_size(l), 1, "one model")
+            spec.assert_str_eq(item_(l, 0).id, "m1", "id")
+            spec.assert_true(string.starts_with(m.seen, "GET /v1/models HTTP/1.1") != 0, "path")
+            spec.assert_true(string.contains(string.to_lower(m.seen), "authorization: bearer sk-test") != 0, "bearer")
+            spec.assert_true(string.contains(string.to_lower(m.seen), "x-api-key") == 0, "no x-api-key")
+            m2 = mock_(200, "{\"data\":[{\"id\":\"c1\"}]}")
+            _l2, err2 = models.fetch("http://127.0.0.1:${m2.port}", "anthropic_messages", "sk-ant")
+            wait_(m2)
+            spec.assert_str_eq(err2, "", "anthropic ok")
+            spec.assert_true(string.starts_with(m2.seen, "GET /v1/models?limit=1000 HTTP/1.1") != 0, "anthropic path")
+            low = string.to_lower(m2.seen)
+            spec.assert_true(string.contains(low, "x-api-key: sk-ant") != 0, "x-api-key")
+            spec.assert_true(string.contains(low, "anthropic-version: 2023-06-01") != 0, "version")
+            spec.assert_true(string.contains(low, "authorization") == 0, "no authorization")
+            m3 = mock_(200, "{\"data\":[]}")
+            models.fetch("http://127.0.0.1:${m3.port}", "responses", "")
+            wait_(m3)
+            spec.assert_true(string.contains(string.to_lower(m3.seen), "authorization") == 0, "no key, no header")
+        }
+        spec.it("fetch reports a rejected status and an unreachable host") callback {
+            m = mock_(401, "{\"error\":\"no\"}")
+            _l, err = models.fetch("http://127.0.0.1:${m.port}", "chat_completions", "bad")
+            wait_(m)
+            spec.assert_str_eq(err, "ModelListRejected", "401")
+            __l2, err2 = models.fetch("http://127.0.0.1:1", "chat_completions", "")
+            spec.assert_true(string.length(err2) > 0, "transport error")
+        }
+    }
+    return spec.run_summary(fw)
+}

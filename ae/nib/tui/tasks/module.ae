@@ -1,0 +1,95 @@
+// tui.tasks: the text of the "background tasks" listing, one line per task
+// (upstream src/tui/tasks.zig).
+//
+// Differences from upstream:
+//  - Upstream's Task is Background.Task (src/tools/background.zig, not fully
+//    ported). Here Task is the TUI's view of it with the fields `format`
+//    reads: id, kind (agent_tree.BK_AGENT / BK_BASH / BK_RUN), description,
+//    `state` (the raw state string, mapped through format.state),
+//    elapsed_ms (long), has_deadline + deadline_ms (long; upstream
+//    ?i64), detached (int). `new_task` builds one.
+//  - format takes a Task[] / ptr[]: a ptr[] of *Task; now_ms is a long.
+//  - The deadline's wall clock (upstream std.time.epoch) is computed from
+//    deadline_ms as UTC hours:minutes:seconds of the day.
+
+import std.string
+import std.strbuilder
+import nib.tui.agent_tree
+import nib.tui.format
+
+exports(Task, new_task, format)
+
+struct Task {
+    id: string
+    kind: int
+    description: string
+    `state`: string
+    elapsed_ms: long
+    has_deadline: int
+    deadline_ms: long
+    detached: int
+}
+
+new_task(id: string, kind: int, description: string, state_: string, elapsed_ms: long,
+         has_deadline: int = 0, deadline_ms: long = 0, detached: int = 0) -> *Task {
+    t = heap.new(Task)
+    t.id = id
+    t.kind = kind
+    t.description = description
+    t.`state` = state_
+    t.elapsed_ms = elapsed_ms
+    t.has_deadline = has_deadline
+    t.deadline_ms = deadline_ms
+    t.detached = detached
+    return t
+}
+
+_kind_name_(k: int) -> string {
+    if k == agent_tree.BK_RUN { return "Run" }
+    if k == agent_tree.BK_BASH { return "bash" }
+    return "agent"
+}
+
+_pad2_(n: long) -> string {
+    if n < 10 { return "0${n}" }
+    return "${n}"
+}
+
+format(tasks: ptr[], now_ms: long) -> string {
+    if tasks.len == 0 { return "no background tasks in this Session" }
+    sb = strbuilder.new(256)
+    for i in 0..tasks.len {
+        task = tasks[i] as *Task
+        if i > 0 { strbuilder.append(sb, "\n") }
+        strbuilder.append(sb, "${task.id} ${_kind_name_(task.kind)} · ${format.`state`(task.`state`)} · ")
+        strbuilder.append(sb, agent_tree.append_elapsed("", task.elapsed_ms))
+        if task.detached != 0 {
+            strbuilder.append(sb, " · no deadline (detached)")
+        } else if task.has_deadline != 0 {
+            d = task.deadline_ms
+            if d < 0 { d = 0 }
+            secs = d / 1000
+            day = secs % 86400
+            left = task.deadline_ms - now_ms
+            if left < 0 { left = 0 }
+            strbuilder.append(sb, " · deadline ${_pad2_(day / 3600)}:${_pad2_(day % 3600 / 60)}:${_pad2_(day % 60)} UTC (${left / 1000}s)")
+        } else if task.kind == agent_tree.BK_RUN {
+            strbuilder.append(sb, " · per-tool deadlines")
+        } else {
+            strbuilder.append(sb, " · deadline pending")
+        }
+        strbuilder.append(sb, " · ${task.description}")
+    }
+    raw = strbuilder.finish(sb)
+    // control characters other than newline, and DEL, become spaces
+    out = strbuilder.new(string.length(raw) + 1)
+    for i in 0..string.length(raw) {
+        c = raw[i]
+        if (c < 32 && c != 10) || c == 127 {
+            strbuilder.append_byte(out, 32)
+        } else {
+            strbuilder.append_byte(out, c)
+        }
+    }
+    return strbuilder.finish(out)
+}

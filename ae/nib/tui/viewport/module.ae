@@ -1,0 +1,132 @@
+// tui.viewport: which rows of the transcript are on screen. Follows the
+// bottom until scrolled up; then stays anchored to the top entry, so streamed
+// output does not move what is on screen (upstream src/tui/viewport.zig).
+//
+// Differences from upstream:
+//  - A Viewport is a heap box (`new()`). `top: ?Anchor` is `has_top` (int,
+//    0 while following the bottom) plus `top_entry` / `top_row`; `pending` is
+//    a long (upstream i64), rows to scroll at the next layout, negative up.
+//    `revision` is a long, `new_output` an int.
+//  - Entries are a ptr[] of *entry.Entry (as Transcript.entries); the window
+//    is a screen.Window. Row and entry counts are ints.
+//  - `top(v)` returns the anchor as a value; `bottom` and `layout` return an
+//    Anchor. Anchor is a plain value struct {entry, row}.
+
+import term.screen
+import nib.tui.entry
+
+exports(Anchor, Viewport, new, at_or_after, observe, removed, bottom, toggled, layout, top)
+
+struct Anchor {
+    entry: int
+    row: int
+}
+
+at_or_after(a: Anchor, b: Anchor) -> bool {
+    return a.entry > b.entry || (a.entry == b.entry && a.row >= b.row)
+}
+
+struct Viewport {
+    has_top: int       // 0 while following the bottom
+    top_entry: int
+    top_row: int
+    // Rows to scroll at the next layout; negative is up.
+    pending: long
+    revision: long
+    new_output: int
+}
+
+new() -> *Viewport {
+    return heap.new(Viewport)
+}
+
+// The pinned top anchor (meaningful only when has_top != 0).
+top(v: *Viewport) -> Anchor {
+    return Anchor { entry: v.top_entry, row: v.top_row }
+}
+
+observe(v: *Viewport, revision: long, was_scrolled: bool) {
+    if v.has_top == 0 || !was_scrolled {
+        v.new_output = 0
+    } else if v.revision != revision {
+        v.new_output = 1
+    }
+    v.revision = revision
+}
+
+removed(v: *Viewport, index: int) {
+    if v.has_top != 0 {
+        if v.top_entry > index {
+            v.top_entry = v.top_entry - 1
+        } else if v.top_entry == index {
+            v.top_row = 0
+        }
+    }
+}
+
+bottom(entries: ptr[], win: screen.Window) -> Anchor {
+    i = entries.len
+    rows = -1
+    while i > 0 && rows < win.height {
+        i = i - 1
+        rows = rows + entry.extent(entries[i] as *entry.Entry, win)
+    }
+    over = rows - win.height
+    if over < 0 { over = 0 }
+    return Anchor { entry: i, row: over }
+}
+
+// Call after toggling an entry the user is looking at: pins the current top
+// so its title keeps its screen row, unless it is the latest details entry
+// while following the bottom.
+toggled(v: *Viewport, frame: Anchor, follow: bool) {
+    if v.has_top == 0 && !follow {
+        v.has_top = 1
+        v.top_entry = frame.entry
+        v.top_row = frame.row
+    }
+}
+
+layout(v: *Viewport, entries: ptr[], win: screen.Window) -> Anchor {
+    end = bottom(entries, win)
+    tp = end
+    if v.has_top != 0 { tp = top(v) }
+    if entries.len > 0 {
+        if tp.entry > entries.len - 1 { tp.entry = entries.len - 1 }
+        h = entry.height(entries[tp.entry] as *entry.Entry, win)
+        if tp.row > h { tp.row = h }
+    }
+    left = v.pending
+    if left < 0 { left = 0 - left }
+    while left > 0 && entries.len > 0 {
+        if v.pending < 0 {
+            step = left
+            if step > tp.row { step = tp.row }
+            tp.row = tp.row - step as int
+            left = left - step
+            if left == 0 || tp.entry == 0 { break }
+            tp.entry = tp.entry - 1
+            tp.row = entry.extent(entries[tp.entry] as *entry.Entry, win)
+        } else {
+            ext = entry.extent(entries[tp.entry] as *entry.Entry, win)
+            step = left
+            room = (ext - tp.row) as long
+            if step > room { step = room }
+            tp.row = tp.row + step as int
+            left = left - step
+            if tp.row < ext { break }
+            if tp.entry + 1 == entries.len { break }
+            tp.entry = tp.entry + 1
+            tp.row = 0
+        }
+    }
+    v.pending = 0
+    if at_or_after(tp, end) {
+        v.has_top = 0
+        return end
+    }
+    v.has_top = 1
+    v.top_entry = tp.entry
+    v.top_row = tp.row
+    return tp
+}

@@ -16,11 +16,8 @@
 //    *tool_summary.Summary of nib.session.tool_summary (null: none).
 //  - Time is a `long` of milliseconds from the caller's clock (smooth_delta,
 //    advance_visible), never read here.
-//  - The viewport (upstream viewport.zig, ported elsewhere) enters through
-//    `Scroll`, the three fields clear_retry and retry_attempt read and write:
-//    has_top / top_entry / top_row (upstream Viewport.top: ?Anchor{entry,row}).
-//    `scroll_removed` is Viewport.removed. Copy the fields to and from the
-//    real Viewport around the call (or make the Viewport hold a Scroll).
+//  - The viewport is nib.tui.viewport's *Viewport: clear_retry and
+//    retry_attempt take it and adjust its top anchor (has_top/top_entry/top_row).
 //  - Optionals: last_answer returns (text, found); latest_details returns -1
 //    for null; add_changes ignores a TurnChanges whose head is "".
 //  - add_history takes the history as a ptr list of message JSON texts (the
@@ -45,12 +42,13 @@ import nib.tools.changes
 import nib.tools.diff
 import nib.tui.agent_tree
 import nib.tui.entry
+import nib.tui.viewport
 import nib.tui.label
 import nib.tui.long_text
 import nib.tui.smooth
 import nib.tui.turn_changes
 
-exports(DELTA_TEXT, DELTA_REASONING, Scroll, scroll_removed, PendingResult, Transcript,
+exports(DELTA_TEXT, DELTA_REASONING, PendingResult, Transcript,
         new, clear, count, at, add, add_changes, background_result, lost_background,
         clear_background_progress, user_inserted, remove_queued, toggle, toggle_all,
         latest_details, last_answer, append_delta, smooth_delta, flush_visible,
@@ -63,24 +61,6 @@ exports(DELTA_TEXT, DELTA_REASONING, Scroll, scroll_removed, PendingResult, Tran
 // provider.Kind of a streamed delta.
 const DELTA_TEXT = 0
 const DELTA_REASONING = 1
-
-// What the viewport shares with the transcript: upstream Viewport.top.
-struct Scroll {
-    has_top: int
-    top_entry: int
-    top_row: int
-}
-
-// Viewport.removed: entry `index` left the transcript.
-scroll_removed(s: *Scroll, index: int) {
-    if s.has_top != 0 {
-        if s.top_entry > index {
-            s.top_entry = s.top_entry - 1
-        } else if s.top_entry == index {
-            s.top_row = 0
-        }
-    }
-}
 
 struct PendingResult {
     id: string
@@ -520,7 +500,7 @@ discard_attempt(t: *Transcript) {
     }
 }
 
-clear_retry(t: *Transcript, scroll: *Scroll) {
+clear_retry(t: *Transcript, view: *viewport.Viewport) {
     i = 0
     while i < t.entries.len {
         if at(t, i).retry_placeholder == 0 {
@@ -528,12 +508,12 @@ clear_retry(t: *Transcript, scroll: *Scroll) {
             continue
         }
         remove_at_(t, i)
-        scroll_removed(scroll, i)
+        viewport.removed(view, i)
         t.revision = t.revision + 1
     }
 }
 
-retry_attempt(t: *Transcript, scroll: *Scroll) {
+retry_attempt(t: *Transcript, view: *viewport.Viewport) {
     kept = false
     i = 0
     while i < t.entries.len {
@@ -550,12 +530,12 @@ retry_attempt(t: *Transcript, scroll: *Scroll) {
             entry.free_entry(en)
             t.entries[i] = ph as ptr
             t.revision = t.revision + 1
-            if scroll.has_top != 0 && scroll.top_entry == i { scroll.top_row = 0 }
+            if view.has_top != 0 && view.top_entry == i { view.top_row = 0 }
             kept = true
             i = i + 1
         } else {
             remove_at_(t, i)
-            scroll_removed(scroll, i)
+            viewport.removed(view, i)
         }
     }
 }

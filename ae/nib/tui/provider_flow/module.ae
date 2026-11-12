@@ -1,0 +1,552 @@
+// tui.provider_flow: the state behind `/provider`: masked key entry, the
+// add-endpoint form and the background model listing. No terminal or Session
+// code here (upstream src/tui/provider_flow.zig, API keys only).
+//
+// Policy (API keys only): upstream's sign-in screens (the Codex OAuth login:
+// Worker.Job.login, Result.prompt/.login, Flow.startLogin, Waiting.login,
+// Settled.prompt/.signed_in, loginError, the "Waiting for ChatGPT sign-in"
+// hint) are not ported. `/provider` is key entry, the custom-endpoint form,
+// the protocol pick and the model pick.
+//
+// Differences from upstream:
+//  - Everything is a struct value or a heap box with functions taking it
+//    first: form_*(f, ...) for Form, flow_*(f, ...) for Flow, worker_*(w).
+//    Enums are int constants (STEP_*, OUT_*, KIND_*, WAITING_*, RESULT_*,
+//    SETTLED_*). A protocol is its name (types.PROTOCOLS); parse_protocol
+//    returns "" for none. An absent window is -1 (upstream ?u64).
+//  - Outcome is a struct { kind, problem } (message is the invalid text).
+//    A Listed is auth.models.Listed. Result is a heap box { kind, ok, list }
+//    (kind RESULT_MODELS); result_free releases it.
+//  - The host is a Launch { home, post, list_models }: post is the closure
+//    the Worker calls with the boxed Result (upstream Post), list_models is
+//    the listing call, `|base_url, protocol, key, out| -> ok` (adds *Listed to `out`); the
+//    app wraps `models.fetch`, specs pass a fake. There is no io/environ.
+//  - A Worker runs on a std.worker detached thread; finish() sets cancel and
+//    waits for it, then frees the box. worker_idle() makes one without a
+//    thread (upstream's testWorker).
+//  - Strings are immutable: upstream's secureZero of key buffers has no
+//    equivalent; wipe() empties the entry and the key fields are dropped.
+//  - flow_choose_model returns (Outcome, found).
+
+import std.string
+import std.strbuilder
+import std.list
+import std.sync
+import std.worker
+import nib.config
+import nib.auth.models
+
+exports(DEFAULT_WINDOW, STEP_NAME, STEP_BASE_URL, STEP_KEY, STEP_PROTOCOL, STEP_MODEL, STEP_WINDOW,
+        OUT_NEXT, OUT_INVALID, OUT_LIST_MODELS, OUT_READY,
+        KIND_NONE, KIND_KEY, KIND_FORM, KIND_PROTOCOL, KIND_PICK, KIND_WAITING,
+        WAITING_LISTING, RESULT_MODELS, SETTLED_IGNORED, SETTLED_LISTED, SETTLED_LISTING_FAILED,
+        Outcome, Endpoint, Form, Result, Launch, Worker, Flow,
+        parse_protocol, form_new, form_free, form_masked, form_hint, form_submit, form_pick,
+        form_type_model, form_endpoint,
+        result_models, result_free,
+        worker_start, worker_idle, worker_finish,
+        flow_new, flow_free, flow_active, flow_takes_text, flow_masked, flow_reset, flow_wipe,
+        flow_start_key, flow_start_form, flow_form, flow_submit_entry, flow_choose_protocol,
+        flow_choose_model, flow_settle_result, flow_insert, flow_backspace, flow_display, flow_hint)
+
+const DEFAULT_WINDOW = 128000
+
+const STEP_NAME = 0
+const STEP_BASE_URL = 1
+const STEP_KEY = 2
+const STEP_PROTOCOL = 3
+const STEP_MODEL = 4
+const STEP_WINDOW = 5
+
+const OUT_NEXT = 0
+const OUT_INVALID = 1
+const OUT_LIST_MODELS = 2
+const OUT_READY = 3
+
+const KIND_NONE = 0
+const KIND_KEY = 1
+const KIND_FORM = 2
+const KIND_PROTOCOL = 3
+const KIND_PICK = 4
+const KIND_WAITING = 5
+
+const WAITING_LISTING = 1
+
+const RESULT_MODELS = 1
+
+const SETTLED_IGNORED = 0
+const SETTLED_LISTED = 1
+const SETTLED_LISTING_FAILED = 2
+
+struct Outcome {
+    kind: int
+    problem: string       // the invalid text, for OUT_INVALID
+}
+
+struct Endpoint {
+    id: string
+    protocol: string
+    base_url: string
+    model: string
+    context_window: long
+}
+
+outcome_(kind: int) -> Outcome { return Outcome { kind: kind, problem: "" } }
+
+invalid_(message_text: string) -> Outcome { return Outcome { kind: OUT_INVALID, problem: message_text } }
+
+trim_ws_(s: string) -> string {
+    a = 0
+    b = string.length(s)
+    while a < b && ws_(string.char_at(s, a)) == 1 { a = a + 1 }
+    while b > a && ws_(string.char_at(s, b - 1)) == 1 { b = b - 1 }
+    return string.substring(s, a, b)
+}
+
+ws_(c: int) -> int {
+    if c == 32 || c == 9 || c == 13 || c == 10 { return 1 }
+    return 0
+}
+
+// "" when `text` names no protocol.
+parse_protocol(text: string) -> string {
+    t = string.to_lower(string.trim(text))
+    if t == "" || t == "1" || t == "chat" || t == "chat_completions" || t == "openai" { return "chat_completions" }
+    if t == "2" || t == "responses" { return "responses" }
+    if t == "3" || t == "anthropic" || t == "anthropic_messages" || t == "messages" { return "anthropic_messages" }
+    return ""
+}
+
+// ---- Form ----------------------------------------------------------------
+
+// The add-endpoint form: name, base URL, key, protocol, then model and context window.
+struct Form {
+    existing: ptr         // list of service ids already in use
+    step: int
+    id: string
+    base_url: string
+    key: string
+    protocol: string
+    model: string
+    window: long          // -1 none
+}
+
+form_new(existing: @keep ptr) -> *Form {
+    f = heap.new(Form)
+    f.existing = existing
+    f.step = STEP_NAME
+    f.id = ""
+    f.base_url = ""
+    f.key = ""
+    f.protocol = "chat_completions"
+    f.model = ""
+    f.window = -1 as long
+    return f
+}
+
+form_free(f: *Form) {
+    f.key = ""
+}
+
+form_masked(f: *Form) -> int {
+    if f.step == STEP_KEY { return 1 }
+    return 0
+}
+
+form_hint(f: *Form) -> string {
+    match f.step {
+        0 -> { return "Add endpoint 1/4 · Name" }
+        1 -> { return "Add endpoint 2/4 · Base URL" }
+        2 -> { return "Add endpoint 3/4 · API key, empty for none" }
+        3 -> { return "Add endpoint 4/4 · Protocol" }
+        4 -> { return "Add endpoint · Model id" }
+        _ -> { return "Add endpoint · Context window · default 128000" }
+    }
+}
+
+// A decimal count > 0, or -1 (upstream parseInt u64 and the zero check).
+parse_window_(s: string) -> long {
+    n = string.length(s)
+    if n == 0 || n > 18 { return -1 as long }
+    v = 0 as long
+    i = 0
+    while i < n {
+        c = string.char_at(s, i)
+        if c < 48 || c > 57 { return -1 as long }
+        v = v * (10 as long) + ((c - 48) as long)
+        i = i + 1
+    }
+    if v == (0 as long) { return -1 as long }
+    return v
+}
+
+after_model_(f: *Form) -> Outcome {
+    if f.window >= (0 as long) { return outcome_(OUT_READY) }
+    f.step = STEP_WINDOW
+    return outcome_(OUT_NEXT)
+}
+
+form_submit(f: *Form, raw: string) -> Outcome {
+    text = trim_ws_(raw)
+    match f.step {
+        0 -> {
+            problem = config.endpoint_id_problem(text, f.existing)
+            if problem != "" { return invalid_(problem) }
+            f.id = string.copy(text)
+            f.step = STEP_BASE_URL
+        }
+        1 -> {
+            if string.starts_with(text, "http://") == 0 && string.starts_with(text, "https://") == 0 {
+                return invalid_("Base URL must start with http:// or https://")
+            }
+            n = string.length(text)
+            while n > 0 && string.char_at(text, n - 1) == 47 { n = n - 1 }
+            trimmed = string.substring(text, 0, n)
+            scheme_end = string.index_of(trimmed, "://")
+            if scheme_end < 0 { return invalid_("Base URL needs a host") }
+            if scheme_end + 3 >= string.length(trimmed) { return invalid_("Base URL needs a host") }
+            f.base_url = string.copy(trimmed)
+            f.step = STEP_KEY
+        }
+        2 -> {
+            f.key = string.copy(text)
+            f.step = STEP_PROTOCOL
+        }
+        3 -> {
+            p = parse_protocol(text)
+            if p == "" { return invalid_("Choose 1, 2 or 3") }
+            f.protocol = p
+            return outcome_(OUT_LIST_MODELS)
+        }
+        4 -> {
+            if string.length(text) == 0 { return invalid_("Model id cannot be empty") }
+            f.model = string.copy(text)
+            return after_model_(f)
+        }
+        _ -> {
+            if string.length(text) == 0 {
+                f.window = DEFAULT_WINDOW as long
+            } else {
+                n = parse_window_(text)
+                if n < (0 as long) { return invalid_("Context window must be a positive integer") }
+                f.window = n
+            }
+            return outcome_(OUT_READY)
+        }
+    }
+    return outcome_(OUT_NEXT)
+}
+
+// A model chosen from the listing, with the listed window when there is one.
+form_pick(f: *Form, entry: *models.Listed) -> Outcome {
+    f.model = string.copy(entry.id)
+    f.window = entry.context_window
+    return after_model_(f)
+}
+
+// Listing failed or came back empty: ask for the id as text.
+form_type_model(f: *Form) {
+    f.step = STEP_MODEL
+}
+
+form_endpoint(f: *Form) -> Endpoint {
+    w = f.window
+    if w < (0 as long) { w = DEFAULT_WINDOW as long }
+    return Endpoint { id: f.id, protocol: f.protocol, base_url: f.base_url, model: f.model, context_window: w }
+}
+
+// ---- Result and Worker ---------------------------------------------------
+
+// One reply from a background job. `list` is a list of *models.Listed.
+struct Result {
+    kind: int             // RESULT_MODELS
+    ok: int
+    list: ptr
+}
+
+result_models(ok: int, entries: @keep ptr) -> *Result {
+    r = heap.new(Result)
+    r.kind = RESULT_MODELS
+    r.ok = ok
+    r.list = entries
+    if entries == null { r.list = list.list_new() }
+    return r
+}
+
+result_free(r: *Result) {
+    free_listed_(r.list)
+    heap.free(r)
+}
+
+free_listed_(entries: ptr) {
+    if entries == null { return }
+    i = 0
+    while i < list.list_size(entries) {
+        heap.free(list.list_get_raw(entries, i) as *models.Listed)
+        i = i + 1
+    }
+    list.list_free(entries)
+}
+
+// Everything a background job needs from the host.
+struct Launch {
+    home: string
+    post: fn(@keep ptr)   // |result| called on the worker thread with a boxed *Result
+    list_models: fn        // |base_url, protocol, key, out| -> int: adds *Listed boxes to the list `out`; 1 ok, 0 failed
+}
+
+// A model listing on its own thread. Heap allocated; `worker_finish` joins and frees.
+struct Worker {
+    home: string
+    post: fn(@keep ptr)
+    list_models: fn
+    base_url: string
+    protocol: string
+    key: string
+    cancel: ptr           // std.sync cell
+    done: ptr             // std.sync cell: 1 when the thread finished
+    started: int
+}
+
+worker_idle(home: string) -> *Worker {
+    w = heap.new(Worker)
+    w.home = home
+    w.base_url = ""
+    w.protocol = ""
+    w.key = ""
+    w.cancel = sync.atomic_new(0)
+    w.done = sync.atomic_new(1)
+    w.started = 0
+    return w
+}
+
+worker_start(launch: @keep Launch, base_url: string, protocol: string, key: string) -> *Worker {
+    w = worker_idle(launch.home)
+    w.post = launch.post
+    w.list_models = launch.list_models
+    w.base_url = string.copy(base_url)
+    w.protocol = string.copy(protocol)
+    w.key = string.copy(key)
+    w.started = 1
+    sync.atomic_store(w.done, 0)
+    wp = w as ptr
+    worker.run_detached(|| {
+        ww = wp as *Worker
+        entries = list.list_new()
+        int ok = call(ww.list_models, ww.base_url, ww.protocol, ww.key, entries)
+        r = result_models(ok, entries)
+        call(ww.post, r as ptr)
+        sync.atomic_store(ww.done, 1)
+        return null
+    })
+    return w
+}
+
+worker_finish(w: *Worker) {
+    sync.atomic_store(w.cancel, 1)
+    while sync.atomic_load(w.done) == 0 { sleep(2) }
+    sync.atomic_free(w.cancel)
+    sync.atomic_free(w.done)
+    heap.free(w)
+}
+
+// ---- Flow ----------------------------------------------------------------
+
+// What the TUI is doing for `/provider` besides ordinary editing.
+struct Flow {
+    kind: int
+    waiting: int
+    service_id: string
+    service_name: string
+    text: string          // the current entry; a secret while masked
+    form: ptr             // *Form or null
+    worker: ptr           // *Worker or null
+    listed: ptr           // list of *models.Listed, owned, or null
+}
+
+flow_new() -> *Flow {
+    f = heap.new(Flow)
+    f.kind = KIND_NONE
+    f.waiting = WAITING_LISTING
+    f.service_id = ""
+    f.service_name = ""
+    f.text = ""
+    f.form = null
+    f.worker = null
+    f.listed = null
+    return f
+}
+
+flow_free(f: *Flow) {
+    flow_reset(f)
+    heap.free(f)
+}
+
+flow_active(f: *Flow) -> int {
+    if f.kind != KIND_NONE { return 1 }
+    return 0
+}
+
+flow_takes_text(f: *Flow) -> int {
+    if f.kind == KIND_KEY || f.kind == KIND_FORM { return 1 }
+    return 0
+}
+
+flow_masked(f: *Flow) -> int {
+    if f.kind == KIND_KEY { return 1 }
+    if f.form != null && f.kind == KIND_FORM { return form_masked(f.form as *Form) }
+    return 0
+}
+
+flow_form(f: *Flow) -> *Form { return f.form as *Form }
+
+flow_reset(f: *Flow) {
+    if f.worker != null {
+        worker_finish(f.worker as *Worker)
+        f.worker = null
+    }
+    flow_wipe(f)
+    f.service_id = ""
+    f.service_name = ""
+    if f.form != null {
+        form_free(f.form as *Form)
+        heap.free(f.form as *Form)
+    }
+    f.form = null
+    free_listed_(f.listed)
+    f.listed = null
+    f.kind = KIND_NONE
+}
+
+// Empties the entry so a key no longer sits in the flow.
+flow_wipe(f: *Flow) {
+    f.text = ""
+}
+
+flow_start_key(f: *Flow, id: string, name: string) {
+    flow_reset(f)
+    f.service_id = string.copy(id)
+    f.service_name = string.copy(name)
+    f.kind = KIND_KEY
+}
+
+// `existing`: list of service ids the form checks names against (copied).
+flow_start_form(f: *Flow, existing: @keep ptr) {
+    flow_reset(f)
+    ids = list.list_new()
+    i = 0
+    while existing != null && i < list.list_size(existing) {
+        s, _g = list.get_string(existing, i)
+        list.list_add(ids, string.copy(s))
+        i = i + 1
+    }
+    f.form = form_new(ids) as ptr
+    f.kind = KIND_FORM
+}
+
+start_worker_(f: *Flow, launch: @keep Launch, base_url: string, protocol: string, key: string) {
+    f.worker = worker_start(launch, base_url, protocol, key) as ptr
+    f.kind = KIND_WAITING
+    f.waiting = WAITING_LISTING
+}
+
+settle_(f: *Flow, outcome: Outcome, launch: @keep Launch) {
+    if outcome.kind == OUT_NEXT {
+        if (f.form as *Form).step == STEP_PROTOCOL { f.kind = KIND_PROTOCOL }
+    } else if outcome.kind == OUT_LIST_MODELS {
+        form = f.form as *Form
+        start_worker_(f, launch, form.base_url, form.protocol, form.key)
+    }
+}
+
+// Submits the current entry to the form; the result tells the caller what to do next.
+flow_submit_entry(f: *Flow, launch: @keep Launch) -> Outcome {
+    outcome = form_submit(f.form as *Form, f.text)
+    if outcome.kind == OUT_INVALID { return outcome }
+    flow_wipe(f)
+    settle_(f, outcome, launch)
+    return outcome
+}
+
+flow_choose_protocol(f: *Flow, value: string, launch: @keep Launch) -> Outcome {
+    f.kind = KIND_FORM
+    outcome = form_submit(f.form as *Form, value)
+    settle_(f, outcome, launch)
+    return outcome
+}
+
+// (Outcome, found): found is 0 when `id` is not in the listing.
+flow_choose_model(f: *Flow, id: string, launch: @keep Launch) -> (Outcome, int) {
+    i = 0
+    while f.listed != null && i < list.list_size(f.listed) {
+        entry = list.list_get_raw(f.listed, i) as *models.Listed
+        i = i + 1
+        if entry.id == id {
+            f.kind = KIND_FORM
+            outcome = form_pick(f.form as *Form, entry)
+            settle_(f, outcome, launch)
+            return outcome, 1
+        }
+    }
+    return outcome_(OUT_NEXT), 0
+}
+
+// A background job replied. Takes the model list out of `r` (leaving it
+// empty); the caller still frees `r`. Returns SETTLED_*.
+flow_settle_result(f: *Flow, r: *Result) -> int {
+    if f.kind != KIND_WAITING { return SETTLED_IGNORED }
+    if r.kind != RESULT_MODELS { return SETTLED_IGNORED }
+    if f.waiting != WAITING_LISTING { return SETTLED_IGNORED }
+    worker_finish(f.worker as *Worker)
+    f.worker = null
+    if r.ok == 1 && list.list_size(r.list) > 0 {
+        f.listed = r.list
+        r.list = list.list_new()
+        f.kind = KIND_PICK
+        return SETTLED_LISTED
+    }
+    form_type_model(f.form as *Form)
+    f.kind = KIND_FORM
+    return SETTLED_LISTING_FAILED
+}
+
+flow_insert(f: *Flow, s: string) {
+    i = 0
+    while i < string.length(s) {
+        c = string.char_at(s, i)
+        if c == 10 || c == 13 { return }
+        i = i + 1
+    }
+    f.text = "${f.text}${s}"
+}
+
+flow_backspace(f: *Flow) {
+    n = string.length(f.text)
+    if n == 0 { return }
+    k = n - 1
+    while k > 0 && (string.char_at(f.text, k) & 192) == 128 { k = k - 1 }
+    f.text = string.substring(f.text, 0, k)
+}
+
+// Characters shown in the input: dots for secrets.
+flow_display(f: *Flow) -> string {
+    if flow_masked(f) == 0 { return f.text }
+    sb = strbuilder.new(32)
+    i = 0
+    while i < string.length(f.text) {
+        if (string.char_at(f.text, i) & 192) != 128 { strbuilder.append(sb, "•") }
+        i = i + 1
+    }
+    return strbuilder.finish(sb)
+}
+
+flow_hint(f: *Flow) -> string {
+    match f.kind {
+        0 -> { return "" }
+        1 -> { return "${f.service_name} API key" }
+        2 -> { return form_hint(f.form as *Form) }
+        3 -> { return "Add endpoint 4/4 · Protocol" }
+        4 -> { return "Choose a model" }
+        _ -> { return "Listing models" }
+    }
+}

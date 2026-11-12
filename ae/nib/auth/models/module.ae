@@ -1,0 +1,113 @@
+// auth.models: model listing for custom endpoints, `GET <base>/models`
+// (OpenAI style) or `<base>/v1/models` (Anthropic). Only used when adding an
+// endpoint (upstream src/auth/models.zig, API keys only).
+//
+// Differences from upstream: a protocol is its name string (types.PROTOCOLS);
+// a Listed's absent context window is -1 (upstream ?u64); parse and fetch
+// return (list of *Listed, error name) with error "InvalidModelList" or
+// "ModelListRejected" (or the transport error text); fetch runs on
+// std.http.client and takes no client or allocator.
+
+import std.string
+import std.list
+import std.json
+import std.http.client
+import std.time
+import nib.jsonx
+
+exports(Listed, url, parse, fetch, window_of)
+
+struct Listed {
+    id: string
+    context_window: long      // -1: none
+}
+
+const ANTHROPIC = "anthropic_messages"
+
+trim_end_slash_(s: string) -> string {
+    n = string.length(s)
+    while n > 0 && string.char_at(s, n - 1) == 47 { n = n - 1 }
+    return string.substring(s, 0, n)
+}
+
+url(base_url: string, protocol: string) -> string {
+    base = trim_end_slash_(base_url)
+    if protocol == ANTHROPIC { return "${base}/v1/models?limit=1000" }
+    return "${base}/models"
+}
+
+// The first positive window among the known field names, or -1.
+window_of(item: ptr) -> long {
+    names = ["context_window", "context_length", "max_context_length", "max_input_tokens"]
+    i = 0
+    while i < 4 {
+        v = jsonx.field(item, names[i])
+        i = i + 1
+        if v == null { continue }
+        if json.json_type(v) != json.JSON_NUMBER { continue }
+        if jsonx.is_integer(v) == 1 {
+            n = json.json_get_long(v)
+            if n > 0 { return n }
+        } else {
+            f = json.json_get_number(v)
+            if f >= 1.0 { return f as long }
+        }
+    }
+    return -1 as long
+}
+
+// `{ "data": [ { "id": ..., ... } ] }`; entries without a string id are skipped.
+// (list of *Listed, "") or (null, "InvalidModelList").
+parse(body: string) -> (ptr, string) {
+    root = jsonx.parse(body)
+    if root == null { return null, "InvalidModelList" }
+    if json.json_type(root) != json.JSON_OBJECT {
+        jsonx.free(root)
+        return null, "InvalidModelList"
+    }
+    data = jsonx.field(root, "data")
+    if data == null || json.json_type(data) != json.JSON_ARRAY {
+        jsonx.free(root)
+        return null, "InvalidModelList"
+    }
+    out = list.list_new()
+    n = jsonx.array_size(data)
+    i = 0
+    while i < n {
+        item = jsonx.array_at(data, i)
+        i = i + 1
+        if json.json_type(item) != json.JSON_OBJECT { continue }
+        idv = jsonx.field(item, "id")
+        if idv == null || json.json_type(idv) != json.JSON_STRING { continue }
+        id = string.copy(jsonx.str_field(idv))
+        if string.length(id) == 0 { continue }
+        l = heap.new(Listed)
+        l.id = id
+        l.context_window = window_of(item)
+        list.list_add_raw(out, l as ptr)
+    }
+    jsonx.free(root)
+    return out, ""
+}
+
+// Lists the endpoint's models with `key` ("" for none). Blocking: callers run
+// it on a worker thread.
+fetch(base_url: string, protocol: string, key: string) -> (ptr, string) {
+    req = client.request("GET", url(base_url, protocol))
+    client.set_header(req, "accept", "application/json")
+    if protocol == ANTHROPIC {
+        if string.length(key) > 0 { client.set_header(req, "x-api-key", key) }
+        client.set_header(req, "anthropic-version", "2023-06-01")
+    } else if string.length(key) > 0 {
+        client.set_header(req, "authorization", "Bearer ${key}")
+    }
+    client.set_timeout(req, 30s)
+    resp, err = client.send_request(req)
+    client.request_free(req)
+    if err != "" { return null, err }
+    status = client.response_status(resp)
+    body = client.response_body(resp)
+    client.response_free(resp)
+    if status < 200 || status >= 300 { return null, "ModelListRejected" }
+    return parse(body)
+}

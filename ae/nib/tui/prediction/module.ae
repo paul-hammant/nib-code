@@ -1,0 +1,412 @@
+// tui.prediction: ghost-text prediction of the user's next message.
+// Background, stateless and silent: every failure shows nothing (upstream
+// src/tui/prediction.zig).
+//
+// Differences from upstream:
+//  - The history is a std.list of message JSON texts (nib.msg values), as
+//    Session.history holds. recent_user_messages returns a list of strings
+//    (copies, not borrows).
+//  - skills are not ported: MENTION_INTRO and typed() stand in for
+//    session/skills.zig's mention_intro and typed (they only cut text).
+//  - The model call is a closure parameter. start(s, predict, post, recent,
+//    reply, timeout_ms) builds the model input (build_input) and runs, on a
+//    std.worker thread,
+//        string raw = call(predict, INSTRUCTION, input, cancel)
+//    where `cancel` is a std.sync cell the worker sets on invalidation, on
+//    timeout and on finish. The app's predict closure picks the small model,
+//    sets effort "off", clears the output schema, sends [system INSTRUCTION,
+//    user input] with MAX_TOKENS through provider.complete (cache key
+//    "<session id>:predict") and returns the reply text, or "" on any
+//    failure. The reply goes through filter(); a kept line is handed to
+//    `post(generation, text)` (upstream: the loop's .prediction event),
+//    unless cancelled. post(generation: long, text: string) must end up in
+//    State.arrive on the UI thread.
+//  - The 15 s timeout (upstream: web.watch racing the request) is a
+//    watcher thread that sets `cancel`; `predict` must honour it.
+//  - Optionals: State.text is "" for none; filter returns (text, ok).
+//  - State is a heap box made by new(); free() is upstream's deinit
+//    (cancels and joins every worker).
+
+import std.string
+import std.strbuilder
+import std.list
+import std.sync
+import std.worker
+import nib.msg
+import nib.tui.editor
+
+exports(TIMEOUT_MS, MAX_REPLY_BYTES, MAX_USER_BYTES, MAX_RECENT, MAX_RECENT_MESSAGE_BYTES,
+        MAX_RECENT_BYTES, MAX_TOKENS, INSTRUCTION, MENTION_INTRO, State, Worker,
+        typed, recent_user_messages, build_input, filter,
+        new, free, invalidate, arrive, visible, accept, start)
+
+const TIMEOUT_MS = 15000
+const MAX_REPLY_BYTES = 3072
+const MAX_USER_BYTES = 1024
+const MAX_RECENT = 8
+const MAX_RECENT_MESSAGE_BYTES = 300
+const MAX_RECENT_BYTES = 3072
+const MAX_TOKENS = 256
+
+const INSTRUCTION = "Predict the user's next message to this coding agent: the exact text they would type, in their language.\nMatch the length and tone of their recent messages; be short if they are short.\nIf the assistant's reply ends with a question or a proposal awaiting a decision, predict the user's answer.\nOne line, at most 80 characters. If unsure, output exactly NONE. Return only the text."
+
+// Stand-in for session/skills.zig mention_intro.
+const MENTION_INTRO = "\n\nSkills named with $name in this message; relative paths in them resolve against the skill's directory (parent of SKILL.md)."
+
+const NO_REPLY[] = ["none", "nothing", "(nothing)", "no reply", "no reply needed", "no response", "n/a", "na", "无", "无需回复", "不需要回复", "无需回应"]
+const THANKS[] = ["thanks", "thank you", "thx", "谢谢", "感谢"]
+const PUNCTUATION[] = [".", "!", ",", ":", ";", "*", "_", "[", "]", "(", ")", "<", ">", "\"", "'", "`", " ", "。", "！", "，", "：", "；", "（", "）", "《", "》", "“", "”", "「", "」"]
+const PAIRS[] = ["\"", "\"", "'", "'", "`", "`", "“", "”", "「", "」"]
+
+// The largest end <= max that is not inside a UTF-8 sequence.
+head_end_(text: string, max: int) -> int {
+    n = string.length(text)
+    end = n
+    if max < end { end = max }
+    while end < n && end > 0 && (string.char_at(text, end) & 192) == 128 { end = end - 1 }
+    return end
+}
+
+// The first start >= len - max that is not inside a UTF-8 sequence.
+tail_start_(text: string, max: int) -> int {
+    n = string.length(text)
+    start = 0
+    if n > max { start = n - max }
+    while start < n && (string.char_at(text, start) & 192) == 128 { start = start + 1 }
+    return start
+}
+
+// The user's own text of a message that skills extended.
+typed(content: string) -> string {
+    ix = string.index_of(content, MENTION_INTRO)
+    if ix < 0 { return content }
+    return string.substring(content, 0, ix)
+}
+
+ws_(c: int, with_nl: int) -> int {
+    if c == 32 || c == 9 || c == 13 { return 1 }
+    if c == 10 && with_nl == 1 { return 1 }
+    return 0
+}
+
+// Trims " \t\r" (and "\n" with_nl).
+trim_(s: string, with_nl: int) -> string {
+    a = 0
+    b = string.length(s)
+    while a < b && ws_(string.char_at(s, a), with_nl) == 1 { a = a + 1 }
+    while b > a && ws_(string.char_at(s, b - 1), with_nl) == 1 { b = b - 1 }
+    return string.substring(s, a, b)
+}
+
+// Typed user messages, newest last; skips background and undo messages.
+// `history`: list of message JSON texts. Returns a list of strings.
+recent_user_messages(history: ptr) -> ptr {
+    found = list.list_new()
+    i = list.list_size(history)
+    while i > 0 && list.list_size(found) < MAX_RECENT {
+        m, _g = list.get_string(history, i - 1)
+        i = i - 1
+        if msg.str_or(m, "source", "") != "" { continue }
+        if msg.role(m) != "user" { continue }
+        if msg.has_content(m) == 0 { continue }
+        text = trim_(typed(msg.content(m)), 1)
+        if string.length(text) != 0 { list.list_add(found, string.copy(text)) }
+    }
+    out = list.list_new()
+    j = list.list_size(found)
+    while j > 0 {
+        t, _g = list.get_string(found, j - 1)
+        list.list_add(out, string.copy(t))
+        j = j - 1
+    }
+    return out
+}
+
+// The model input: the user's recent messages (oldest first), the head of the last one and the tail of the reply.
+build_input(recent: ptr, reply_text: string) -> string {
+    n = list.list_size(recent)
+    last = ""
+    if n > 0 { last, _g = list.get_string(recent, n - 1) }
+    out = strbuilder.new(256)
+    first = n
+    used = 0
+    while first > 0 {
+        t, _g = list.get_string(recent, first - 1)
+        w = head_end_(t, MAX_RECENT_MESSAGE_BYTES) + 3
+        if used + w > MAX_RECENT_BYTES { break }
+        used = used + w
+        first = first - 1
+    }
+    if first < n {
+        strbuilder.append(out, "User's recent messages, oldest first:\n")
+        k = first
+        while k < n {
+            t, _g = list.get_string(recent, k)
+            k = k + 1
+            strbuilder.append(out, "- ")
+            e = head_end_(t, MAX_RECENT_MESSAGE_BYTES)
+            b = 0
+            while b < e {
+                c = string.char_at(t, b)
+                if c == 10 || c == 13 {
+                    strbuilder.append(out, " ")
+                } else {
+                    strbuilder.append(out, string.substring(t, b, b + 1))
+                }
+                b = b + 1
+            }
+            strbuilder.append(out, "\n")
+        }
+        strbuilder.append(out, "\n")
+    }
+    strbuilder.append(out, "User's last message:\n")
+    strbuilder.append(out, string.substring(last, 0, head_end_(last, MAX_USER_BYTES)))
+    strbuilder.append(out, "\n\nAssistant's last reply:\n")
+    strbuilder.append(out, string.substring(reply_text, tail_start_(reply_text, MAX_REPLY_BYTES), string.length(reply_text)))
+    return strbuilder.finish(out)
+}
+
+ascii_lower_(c: int) -> int {
+    if c >= 65 && c <= 90 { return c + 32 }
+    return c
+}
+
+eql_ignore_case_(a: string, b: string) -> int {
+    if string.length(a) != string.length(b) { return 0 }
+    i = 0
+    while i < string.length(a) {
+        if ascii_lower_(string.char_at(a, i)) != ascii_lower_(string.char_at(b, i)) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+matches_any_(text: string, names: string[]) -> int {
+    i = 0
+    while i < names.len {
+        if eql_ignore_case_(text, names[i]) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+trim_punctuation_(text: string) -> string {
+    t = text
+    again = 1
+    while again == 1 && string.length(t) > 0 {
+        again = 0
+        i = 0
+        while i < PUNCTUATION.len {
+            p = PUNCTUATION[i]
+            i = i + 1
+            if string.starts_with(t, p) != 0 {
+                t = string.substring(t, string.length(p), string.length(t))
+                again = 1
+                break
+            }
+            if string.ends_with(t, p) != 0 {
+                t = string.substring(t, 0, string.length(t) - string.length(p))
+                again = 1
+                break
+            }
+        }
+    }
+    return t
+}
+
+// The number of codepoints in `s`, or -1 when it is not valid UTF-8.
+utf8_count_(s: string) -> int {
+    n = string.length(s)
+    i = 0
+    count = 0
+    while i < n {
+        c = string.char_at(s, i)
+        need = 0
+        if c < 128 {
+            need = 0
+        } else if c >= 194 && c <= 223 {
+            need = 1
+        } else if c >= 224 && c <= 239 {
+            need = 2
+        } else if c >= 240 && c <= 244 {
+            need = 3
+        } else {
+            return -1
+        }
+        if need > 0 && i + need >= n { return -1 }
+        k = 1
+        while k <= need {
+            d = string.char_at(s, i + k)
+            if (d & 192) != 128 { return -1 }
+            k = k + 1
+        }
+        if need >= 2 {
+            d1 = string.char_at(s, i + 1)
+            if c == 224 && d1 < 160 { return -1 }
+            if c == 237 && d1 >= 160 { return -1 }
+            if c == 240 && d1 < 144 { return -1 }
+            if c == 244 && d1 >= 144 { return -1 }
+        }
+        i = i + need + 1
+        count = count + 1
+    }
+    return count
+}
+
+// First line without surrounding quotes; (text, 1), or ("", 0) when empty, "no reply" or a thanks.
+filter(raw: string) -> (string, int) {
+    whole = trim_(raw, 1)
+    nl = string.index_of(whole, "\n")
+    first = whole
+    if nl >= 0 { first = string.substring(whole, 0, nl) }
+    line = trim_(first, 0)
+    p = 0
+    while p < PAIRS.len {
+        open = PAIRS[p]
+        close = PAIRS[p + 1]
+        p = p + 2
+        if string.length(line) >= string.length(open) + string.length(close) && string.starts_with(line, open) != 0 && string.ends_with(line, close) != 0 {
+            line = trim_(string.substring(line, string.length(open), string.length(line) - string.length(close)), 0)
+            break
+        }
+    }
+    chars = utf8_count_(line)
+    if chars < 2 { return "", 0 }
+    bare = trim_punctuation_(line)
+    if string.length(bare) == 0 || matches_any_(bare, NO_REPLY) == 1 || matches_any_(bare, THANKS) == 1 { return "", 0 }
+    return string.copy(line), 1
+}
+
+// ---- State and workers -----------------------------------------------------
+
+// One background request. Heap allocated; finish() cancels, joins and frees.
+struct Worker {
+    predict: fn           // |instruction, input, cancel| -> string reply text, "" on failure
+    post: fn              // |generation: long, text: string|
+    input: string
+    generation: long
+    timeout_ms: int
+    cancel: ptr           // std.sync cell
+    done: ptr             // std.sync cell: 1 when the request thread ended
+    watch_done: ptr       // std.sync cell: 1 when the timeout watcher ended
+}
+
+struct State {
+    generation: long      // bumped by every invalidation; a result carrying an older value is dropped
+    text: string          // "" none
+    current: ptr          // *Worker or null
+    workers: ptr          // list of *Worker
+}
+
+new() -> *State {
+    s = heap.new(State)
+    s.generation = 0 as long
+    s.text = ""
+    s.current = null
+    s.workers = list.list_new()
+    return s
+}
+
+worker_finish_(w: *Worker) {
+    sync.atomic_store(w.cancel, 1)
+    while sync.atomic_load(w.done) == 0 || sync.atomic_load(w.watch_done) == 0 { sleep(2) }
+    sync.atomic_free(w.cancel)
+    sync.atomic_free(w.done)
+    sync.atomic_free(w.watch_done)
+    heap.free(w)
+}
+
+free(s: *State) {
+    i = 0
+    while i < list.list_size(s.workers) {
+        worker_finish_(list.list_get_raw(s.workers, i) as *Worker)
+        i = i + 1
+    }
+    list.list_free(s.workers)
+    heap.free(s)
+}
+
+invalidate(s: *State) {
+    s.generation = s.generation + (1 as long)
+    s.text = ""
+    if s.current != null { sync.atomic_store((s.current as *Worker).cancel, 1) }
+    s.current = null
+}
+
+// A prediction arrived; dropped unless it is for the current generation.
+arrive(s: *State, generation: long, text: string) {
+    if generation != s.generation { return }
+    s.text = string.copy(text)
+}
+
+// The ghost text, only while the editor holds nothing at all.
+visible(s: *State, e: *editor.Editor) -> string {
+    if string.length(editor.text(e)) != 0 { return "" }
+    return s.text
+}
+
+// Tab: moves a visible prediction into the editor. 0 leaves Tab to its other uses.
+accept(s: *State, e: *editor.Editor) -> int {
+    text = visible(s, e)
+    if string.length(text) == 0 { return 0 }
+    editor.insert(e, text)
+    s.text = ""
+    return 1
+}
+
+reap_(s: *State) {
+    i = 0
+    while i < list.list_size(s.workers) {
+        w = list.list_get_raw(s.workers, i) as *Worker
+        if sync.atomic_load(w.done) == 1 && sync.atomic_load(w.watch_done) == 1 {
+            worker_finish_(w)
+            list.list_remove(s.workers, i)
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+// Starts a request for the next message (see the header for predict and
+// post); the model input is built from `recent` (a list of strings) and the
+// last assistant `reply_text`. Any earlier request is invalidated.
+start(s: *State, predict: @keep fn, post: @keep fn, recent: ptr, reply_text: string, timeout_ms: int) {
+    invalidate(s)
+    reap_(s)
+    w = heap.new(Worker)
+    w.predict = predict
+    w.post = post
+    w.input = build_input(recent, reply_text)
+    w.generation = s.generation
+    w.timeout_ms = timeout_ms
+    w.cancel = sync.atomic_new(0)
+    w.done = sync.atomic_new(0)
+    w.watch_done = sync.atomic_new(0)
+    wp = w as ptr
+    worker.run_detached(|| {
+        ww = wp as *Worker
+        string raw = call(ww.predict, INSTRUCTION, ww.input, ww.cancel)
+        if sync.atomic_load(ww.cancel) == 0 {
+            text, ok = filter(raw)
+            if ok == 1 && sync.atomic_load(ww.cancel) == 0 { call(ww.post, ww.generation, text) }
+        }
+        sync.atomic_store(ww.done, 1)
+        return null
+    })
+    worker.run_detached(|| {
+        ww = wp as *Worker
+        waited = 0
+        while sync.atomic_load(ww.done) == 0 && sync.atomic_load(ww.cancel) == 0 {
+            if waited >= ww.timeout_ms {
+                sync.atomic_store(ww.cancel, 1)
+                break
+            }
+            sleep(2)
+            waited = waited + 2
+        }
+        sync.atomic_store(ww.watch_done, 1)
+        return null
+    })
+    list.list_add_raw(s.workers, wp)
+    s.current = wp
+}

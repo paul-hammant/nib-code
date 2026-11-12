@@ -1,0 +1,458 @@
+// tui.reflect: the /reflect command's pieces: the reflection prompt, the
+// reflections.md log, issue drafts, publishing them with the GitHub CLI and
+// the credential and path scrubbing in front of that (upstream
+// src/tui/reflect.zig and its embedded reflect.md).
+//
+// NOT ported here, because they take the App (the lead wires them):
+//   saveReflection(app)   append the answer of a finished /reflect Turn to
+//                         NIB_HOME/reflections.md (uses append() below with the
+//                         session id, cwd, model, effective effort, focus and
+//                         the last assistant message), set the notice
+//                         "reflection saved to {path}" or "could not save
+//                         reflection to {path}: {error}", then fileIssues
+//   issueRepo(app)        repository(NIB_ISSUE_REPO from the environment)
+//   fileIssues(app, ...)  build an Issues job (below) from drafts(answer),
+//                         the repo, the reflections path, the first 8 chars of
+//                         the session id, $HOME, the cwd and the footer
+//                         "_Filed automatically by nib /reflect · nib {version}
+//                         · {model} · effort {effort} · session {id8}_"; start
+//                         it, report "filing {n} issue draft{s} to {repo}"
+//   stopReflecting(app)   clear app.reflecting
+//
+// Differences from upstream:
+//  - template: reflect.md is embedded as the const TEMPLATE (same bytes).
+//  - Draft is a heap box { title, body }; drafts() returns a list of *Draft;
+//    sanitize() returns (*Draft, ok).
+//  - append/append_text return "" or an error text instead of an error set;
+//    the file is created with mode 0600 and appended under an exclusive
+//    flock (sysgap), several nib processes sharing it as upstream.
+//  - gh runs through a replaceable runner: a closure
+//    `|argv: ptr, input: string, out: ptr| -> int` that fills the *Output
+//    box `out` (ok, out, err); argv is a list of strings, program first.
+//    gh_run is the real one: it runs argv through `/bin/sh` with stdin read
+//    from a temp file and stderr to another (nib.tools.process merges
+//    stdout and stderr and has no stdin), in the user's own environment.
+//    A program that cannot start reads as a gh failure whose err is the
+//    shell's text, not an error name.
+//  - Issues is a job box: issues_new, then issues_start(job, run, on_issue,
+//    on_done) works the drafts on a std.worker thread, calling
+//    on_issue(line) per draft and on_done() at the end (upstream's
+//    .issue / .issues_done events); issues_finish joins and frees.
+//    `gh_path` (default "gh") is a field so specs can name a fake.
+//  - eqlIgnoreCase and the title match are ASCII-only, as upstream.
+
+import std.string
+import std.strbuilder
+import std.list
+import std.json
+import std.fs
+import std.os
+import std.sync
+import std.worker
+import std.cryptography
+import nib.jsonx
+import nib.sysgap
+import nib.tools.process
+
+exports(TEMPLATE, MAX_DRAFTS, Draft, Entry, Output, Issues, prompt, append, append_text, drafts,
+        file_issue, sanitize, redact, repository, gh_run, issues_new, issues_start, issues_finish)
+
+const MAX_DRAFTS = 3
+
+// Edit the wording in src/tui/reflect.md upstream; {{session_id}}, {{log_path}}, {{issue_repo}} and {{focus}} are filled in by prompt().
+const TEMPLATE = "This is a reflection, not a continuation of work: do not modify files or run builds, tests, or other commands with side effects.\n\nPurpose: determine whether nib's harness (tools, sandbox, system prompt and tool descriptions, output truncation, timeouts and cancellation, subagents, TUI) caused real problems worth fixing in this session. A smooth session may have no problems; \"None\" is a normal conclusion. Issue drafts are published automatically to a public repository without human review, so report only problems supported by evidence.\n\nEvidence:\n- Check the log before drawing conclusions. This session's log is {{log_path}} (JSONL; each line's messages form a complete Step; messages with role tool are Run results). Use tools.grep to search for failure signals such as `\"exit_code\":127`, `SyntaxError`, `timed out`, `Error:`, `refused by nib`, and `interrupted`; read relevant lines as needed. If context was compacted, the log is the only reliable source.\n- Read only the explicitly specified main log path for this session; tools.grep's path must also point only to that file. Do not enumerate, glob, or search the sessions directory, read sibling logs, subagent logs, or any `.calls.jsonl` tool-recording sidecar, or bypass this scope through bash, fetch, or other tools. Sidecars may contain full file contents, command output, and credentials absent from the main log; they are outside the reflection's evidence scope.\n- This session's ID is {{session_id}}; the specified main log is read-only.\n\nAnswer in English using this structure:\n\n### Summary\nOne sentence: the task, its outcome, roughly how many Steps it took, and roughly how many were spent dealing with the harness.\n\n### Friction\nWrite \"None\" if there was none. Format each item as: `[category] symptom — evidence — cost — attribution`\n- Categories: tool interface / missing tool / sandbox and JS / system prompt and descriptions / output and truncation / timeouts and cancellation / subagents / TUI / other.\n- Evidence: quote the log (trimmed to one line), or identify the Run; label items without direct evidence \"Inference\".\n- Cost: approximate extra Steps or tokens.\n- Attribution: harness / task description / own mistake. Attribute misuse caused by misleading descriptions to the harness. Include a purely personal mistake only if it materially affected the outcome, as a reference item.\n\n### Suggestions (0–3, ranked by cost × recurrence frequency)\nAddress only friction attributed to the harness above; write \"None\" if there is none. For each item specify:\n- Where to change: the specific tool, parameter, description, or file;\n- Which friction item it resolves;\n- How to verify: a metric that can become a test or be measured from session logs.\nIf unsure whether nib already has a capability, check only the specified main log. Mark insufficient evidence as unknown; do not expand the read scope to investigate, or assert that a capability exists or is missing.\n\n### Task description\nWhich missing, ambiguous, or contradictory parts of the user's task description caused guessing or rework? Write \"None\" if there were none.\n\n### Keep\nUp to 2 specific designs that helped in this session and should be preserved; write \"None\" if there were none.\n\n### Issue drafts\nDraft issues only for suggestions meeting all these conditions: attributed to the harness, supported by log quotations (not \"Inference\"), and material cost (e.g. more than 2 extra Steps or an incorrect result). Include at most 3 in a final ```json code block: `[{\"title\": \"...\", \"body\": \"...\"}]`; output `[]` if none qualify. Before drafting, run the read-only command `gh issue list --repo {{issue_repo}} --state open --limit 100` to inspect existing issues (this command complies with the read-only requirement above). Do not draft an issue with the same root cause as an existing issue; note \"existing #number\" under Suggestions instead. If gh is unavailable, draft normally; titles are checked for duplicates again before publication. These drafts are published automatically to nib's **public** GitHub repository, so:\n- Each issue must stand alone: readers cannot see this session or know the user's project;\n- Include no user-project code, file contents, project or company names, paths outside the nib repository, URLs, credentials, or personal information. Rephrase evidence without exposing project content, e.g. \"Writing a Python script of about 400 lines with tools.write produced a SyntaxError\";\n- Keep titles short and specific, identifying the component and problem. Use Markdown bodies with: symptom, evidence (redacted), cost, proposed change, and verification, in that order. Write all issue titles and bodies in English.\n{{focus}}\n"
+
+// The reflection request sent to the model as the user message.
+prompt(session_id: string, log_path: string, issue_repo: string, focus: string) -> string {
+    focus_text = ""
+    if string.length(focus) > 0 { focus_text = "\nThe user particularly wants to understand: ${focus}" }
+    with_id = string.replace_all(TEMPLATE, "{{session_id}}", session_id)
+    with_log = string.replace_all(with_id, "{{log_path}}", log_path)
+    with_repo = string.replace_all(with_log, "{{issue_repo}}", issue_repo)
+    return string.replace_all(with_repo, "{{focus}}", focus_text)
+}
+
+struct Entry {
+    unix_seconds: long
+    session_id: string
+    cwd: string
+    model: string
+    effort: string
+    focus: string         // "" none
+    answer: string
+}
+
+pad2_(n: int) -> string {
+    if n < 10 { return "0${n}" }
+    return "${n}"
+}
+
+trim_set_(s: string, a_ch: int, b_ch: int) -> string {
+    a = 0
+    b = string.length(s)
+    while a < b && (string.char_at(s, a) == a_ch || string.char_at(s, a) == b_ch) { a = a + 1 }
+    while b > a && (string.char_at(s, b - 1) == a_ch || string.char_at(s, b - 1) == b_ch) { b = b - 1 }
+    return string.substring(s, a, b)
+}
+
+// Appends one reflection to `path` (created if missing). "" or an error text.
+append(path: string, e: Entry) -> string {
+    secs = e.unix_seconds
+    if secs < (0 as long) { secs = 0 as long }
+    days = (secs / (86400 as long)) as int
+    in_day = (secs % (86400 as long)) as int
+    // civil date from days since 1970-01-01 (proleptic Gregorian)
+    z = days + 719468
+    era = z / 146097
+    doe = z - era * 146097
+    yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    year = yoe + era * 400
+    doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    mp = (5 * doy + 2) / 153
+    day = doy - (153 * mp + 2) / 5 + 1
+    month = mp + 3
+    if mp >= 10 { month = mp - 9 }
+    if month <= 2 { year = year + 1 }
+    hour = in_day / 3600
+    minute = (in_day % 3600) / 60
+    id8 = e.session_id
+    if string.length(id8) > 8 { id8 = string.substring(id8, 0, 8) }
+    text = "## ${year}-${pad2_(month)}-${pad2_(day)} ${pad2_(hour)}:${pad2_(minute)} UTC · session ${id8} · ${e.cwd} · ${e.model} · effort ${e.effort}\n"
+    if string.length(e.focus) > 0 { text = "${text}focus: ${e.focus}\n" }
+    text = "${text}\n${trim_set_(e.answer, 10, 10)}\n\n"
+    return append_text(path, text)
+}
+
+dirname_(path: string) -> string {
+    i = string.length(path) - 1
+    while i >= 0 && string.char_at(path, i) != 47 { i = i - 1 }
+    if i < 0 { return "" }
+    if i == 0 { return "/" }
+    return string.substring(path, 0, i)
+}
+
+// Under an exclusive lock because several nib processes share one file.
+// "" or an error text.
+append_text(path: string, text: string) -> string {
+    dir = dirname_(path)
+    if dir != "" {
+        _m = fs.mkdir_p(dir)
+    }
+    fd = sysgap.lock_open(path)
+    if fd < 0 { return sysgap.errname(fd) }
+    while true {
+        got = sysgap.try_lock(fd)
+        if got == 1 { break }
+        if got < 0 {
+            sysgap.close(fd)
+            return sysgap.errname(got)
+        }
+        sleep(20)
+    }
+    rc = sysgap.pwrite_all(fd, text, sysgap.fd_size(fd))
+    sysgap.close(fd)
+    if rc != 0 { return sysgap.errname(rc) }
+    return ""
+}
+
+struct Draft {
+    title: string
+    body: string
+}
+
+draft_new_(title: string, body: string) -> *Draft {
+    d = heap.new(Draft)
+    d.title = string.copy(title)
+    d.body = string.copy(body)
+    return d
+}
+
+last_index_of_(s: string, sub: string) -> int {
+    found = -1
+    at = 0
+    while true {
+        ix = string.index_of_from(s, sub, at)
+        if ix < 0 { break }
+        found = ix
+        at = ix + 1
+    }
+    return found
+}
+
+// Issue drafts from the last ```json block of a reflection, trimmed and capped at
+// MAX_DRAFTS; an empty list when the block is absent or malformed (an element
+// that is not an object with string title and body spoils the whole block).
+drafts(answer: string) -> ptr {
+    out = list.list_new()
+    fence = last_index_of_(answer, "```json")
+    if fence < 0 { return out }
+    start = fence + 7
+    end = string.index_of_from(answer, "```", start)
+    if end < 0 { return out }
+    doc = jsonx.parse(string.substring(answer, start, end))
+    if doc == null { return out }
+    if json.json_type(doc) != json.JSON_ARRAY {
+        jsonx.free(doc)
+        return out
+    }
+    n = jsonx.array_size(doc)
+    i = 0
+    while i < n {
+        el = jsonx.array_at(doc, i)
+        i = i + 1
+        if jsonx.kind(el, "title") != json.JSON_STRING || jsonx.kind(el, "body") != json.JSON_STRING {
+            jsonx.free(doc)
+            return list.list_new()
+        }
+    }
+    j = 0
+    while j < n {
+        el = jsonx.array_at(doc, j)
+        j = j + 1
+        title = trim_set_(jsonx.str_or(el, "title", ""), 32, 10)
+        if string.length(title) == 0 || list.list_size(out) == MAX_DRAFTS { continue }
+        list.list_add_raw(out, draft_new_(title, trim_set_(jsonx.str_or(el, "body", ""), 10, 10)) as ptr)
+    }
+    jsonx.free(doc)
+    return out
+}
+
+// What a gh run left: ok (exit 0), stdout and stderr.
+struct Output {
+    ok: int
+    out: string
+    err: string
+}
+
+output_new_() -> *Output {
+    o = heap.new(Output)
+    o.ok = 0
+    o.out = ""
+    o.err = ""
+    return o
+}
+
+first_line_(text: string) -> string {
+    t = trim_set_(text, 32, 10)
+    ix = string.index_of(t, "\n")
+    if ix < 0 { return t }
+    return string.substring(t, 0, ix)
+}
+
+ascii_lower_(c: int) -> int {
+    if c >= 65 && c <= 90 { return c + 32 }
+    return c
+}
+
+eql_ignore_case_(a: string, b: string) -> int {
+    if string.length(a) != string.length(b) { return 0 }
+    i = 0
+    while i < string.length(a) {
+        if ascii_lower_(string.char_at(a, i)) != ascii_lower_(string.char_at(b, i)) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// The real runner: argv (list of strings, program first) in the user's own
+// environment (gh may authenticate through GH_TOKEN), `input` on its stdin.
+gh_run(argv: ptr, input: string, out: ptr) -> int {
+    o = out as *Output
+    hex, _h = cryptography.random_hex(12)
+    in_path = "${os.temp_dir()}/nib-gh-in-${hex}"
+    err_path = "${os.temp_dir()}/nib-gh-err-${hex}"
+    fs.write(in_path, input)
+    args = list.list_new()
+    list.list_add(args, "/bin/sh")
+    list.list_add(args, "-c")
+    list.list_add(args, "in=$1; er=$2; shift 2; exec \"$@\" < \"$in\" 2> \"$er\"")
+    list.list_add(args, "sh")
+    list.list_add(args, in_path)
+    list.list_add(args, err_path)
+    i = 0
+    while i < list.list_size(argv) {
+        a, _g = list.get_string(argv, i)
+        list.list_add(args, a)
+        i = i + 1
+    }
+    r = process.run(args, null, null, null, 0 as long, 1048576) as *process.Result
+    errtext, _e = fs.read(err_path)
+    fs.delete(in_path)
+    fs.delete(err_path)
+    o.out = r.output
+    o.err = errtext
+    o.ok = 0
+    if r.error != "" {
+        o.err = "cannot run gh: ${r.error}"
+    } else if r.exit_code == 0 && r.stop == "" {
+        o.ok = 1
+    }
+    return o.ok
+}
+
+run_gh_(run: fn, argv: ptr, input: string) -> *Output {
+    o = output_new_()
+    int _rc = call(run, argv, input, o as ptr)
+    return o
+}
+
+// Files `draft` with the GitHub CLI unless an issue with the same title exists.
+// Returns a one-line outcome for the transcript. `run` is the runner (gh_run or
+// a replacement); `gh_path` the program to run.
+file_issue(run: fn, gh_path: string, repo: string, draft: *Draft, footer: string) -> string {
+    search = "${draft.title} in:title"
+    a1 = list.list_new()
+    for w in [gh_path, "issue", "list", "--repo", repo, "--state", "all", "--search", search, "--json", "number,title,url", "--limit", "20"] {
+        list.list_add(a1, w)
+    }
+    listed = run_gh_(run, a1, "")
+    if listed.ok == 0 { return "could not search ${repo}: ${first_line_(listed.err)}" }
+    doc = jsonx.parse(listed.out)
+    bad = 0
+    n = 0
+    if doc == null || json.json_type(doc) != json.JSON_ARRAY {
+        bad = 1
+    } else {
+        n = jsonx.array_size(doc)
+        k = 0
+        while k < n {
+            el = jsonx.array_at(doc, k)
+            k = k + 1
+            num = jsonx.field(el, "number")
+            if num == null || jsonx.is_integer(num) == 0 || json.json_get_long(num) < (0 as long) || jsonx.kind(el, "title") != json.JSON_STRING || jsonx.kind(el, "url") != json.JSON_STRING { bad = 1 }
+        }
+    }
+    if bad == 1 {
+        jsonx.free(doc)
+        return "could not read gh output while searching ${repo}"
+    }
+    m = 0
+    while m < n {
+        el = jsonx.array_at(doc, m)
+        m = m + 1
+        if eql_ignore_case_(trim_set_(jsonx.str_or(el, "title", ""), 32, 32), draft.title) == 1 {
+            line = "skipped: #${json.json_get_long(jsonx.field(el, "number"))} already has this title · ${jsonx.str_or(el, "url", "")}"
+            jsonx.free(doc)
+            return line
+        }
+    }
+    jsonx.free(doc)
+    body = "${draft.body}\n\n---\n${footer}\n"
+    a2 = list.list_new()
+    for w in [gh_path, "issue", "create", "--repo", repo, "--title", draft.title, "--body-file", "-"] {
+        list.list_add(a2, w)
+    }
+    created = run_gh_(run, a2, body)
+    if created.ok == 0 { return "could not file the issue: ${first_line_(created.err)}" }
+    return "filed ${trim_set_(created.out, 32, 10)}"
+}
+
+// Prepares a draft for publishing: the project path becomes <project> and the home path ~.
+// (null, 0) when the draft looks like it carries a credential, which must never be published.
+// Best effort only: the reflection prompt is the main guard.
+sanitize(draft: *Draft, home: string, cwd: string) -> (ptr, int) {
+    markers = ["sk-", "ghp_", "gho_", "github_pat_", "xoxb-", "Bearer ", "PRIVATE KEY"]
+    texts = [draft.title, draft.body]
+    t = 0
+    while t < 2 {
+        m = 0
+        while m < markers.len {
+            if string.index_of(texts[t], markers[m]) >= 0 { return null, 0 }
+            m = m + 1
+        }
+        t = t + 1
+    }
+    return draft_new_(redact(draft.title, home, cwd), redact(draft.body, home, cwd)) as ptr, 1
+}
+
+redact(text: string, home: string, cwd: string) -> string {
+    without_project = text
+    if string.length(cwd) > 1 { without_project = string.replace_all(text, cwd, "<project>") }
+    if string.length(home) > 1 { return string.replace_all(without_project, home, "~") }
+    return without_project
+}
+
+// `repo` when it is an owner/name repository, else "".
+repository(repo: string) -> string {
+    slash = string.index_of(repo, "/")
+    if slash <= 0 { return "" }
+    name = string.substring(repo, slash + 1, string.length(repo))
+    if string.length(name) == 0 || string.index_of(name, "/") >= 0 { return "" }
+    i = 0
+    while i < string.length(repo) {
+        c = string.char_at(repo, i)
+        alnum = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+        if !alnum && c != 45 && c != 95 && c != 46 && c != 47 { return "" }
+        i = i + 1
+    }
+    return repo
+}
+
+// Background filing of one reflection's issue drafts; owns copies of everything it needs.
+struct Issues {
+    drafts: ptr           // list of *Draft
+    repo: string
+    reflections_path: string
+    session: string
+    home: string
+    cwd: string
+    footer: string
+    gh_path: string
+    run: fn
+    on_issue: fn          // |line: string| after each draft
+    on_done: fn           // || after the last
+    done: ptr             // std.sync cell
+    started: int
+}
+
+issues_new(drafts_list: @keep ptr, repo: string, reflections_path: string, session: string, home: string, cwd: string, footer: string) -> *Issues {
+    j = heap.new(Issues)
+    j.drafts = drafts_list
+    j.repo = string.copy(repo)
+    j.reflections_path = string.copy(reflections_path)
+    j.session = string.copy(session)
+    j.home = string.copy(home)
+    j.cwd = string.copy(cwd)
+    j.footer = string.copy(footer)
+    j.gh_path = "gh"
+    j.done = sync.atomic_new(1)
+    j.started = 0
+    return j
+}
+
+report_(job: *Issues, draft: *Draft) {
+    outcome = "not filed: the draft looks like it contains a credential"
+    clean, ok = sanitize(draft, job.home, job.cwd)
+    if ok == 1 { outcome = file_issue(job.run, job.gh_path, job.repo, clean as *Draft, job.footer) }
+    line = "issue · ${draft.title} · ${outcome}"
+    append_text(job.reflections_path, "- session ${job.session} · ${line}\n")
+    call(job.on_issue, line)
+}
+
+// Works the drafts in order on a worker thread: on_issue(line) per draft, then on_done().
+issues_start(job: *Issues, run: @keep fn, on_issue: @keep fn, on_done: @keep fn) {
+    job.run = run
+    job.on_issue = on_issue
+    job.on_done = on_done
+    job.started = 1
+    sync.atomic_store(job.done, 0)
+    jp = job as ptr
+    worker.run_detached(|| {
+        jj = jp as *Issues
+        i = 0
+        while i < list.list_size(jj.drafts) {
+            report_(jj, list.list_get_raw(jj.drafts, i) as *Draft)
+            i = i + 1
+        }
+        call(jj.on_done)
+        sync.atomic_store(jj.done, 1)
+        return null
+    })
+}
+
+// Joins the filing thread; gh runs to completion first.
+issues_finish(job: *Issues) {
+    while sync.atomic_load(job.done) == 0 { sleep(5) }
+    sync.atomic_free(job.done)
+    heap.free(job)
+}

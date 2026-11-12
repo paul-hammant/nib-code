@@ -1,0 +1,237 @@
+// Ports the tests of upstream src/tui/provider_flow.zig under their names.
+// Not ported (API keys only: no Codex sign-in): "sign-in reply ends the flow"
+// (it settles a login Result, which the port has no kind for).
+// Adapted: in "failed listing falls back to typing the model id and stale
+// replies are ignored" the stale reply (upstream: a login Result) is a models
+// Result delivered while the Flow is not waiting for a listing.
+// Extra tests (not upstream): the Worker lists models on its own thread
+// through the injected list_models and posts the Result.
+import std.spec
+import std.list
+import std.string
+import std.sync
+import nib.auth.models
+import nib.tui.provider_flow
+
+taken_() -> ptr {
+    l = list.list_new()
+    list.list_add(l, "taken")
+    return l
+}
+
+launch_(posted: @keep ptr) -> provider_flow.Launch {
+    return provider_flow.Launch {
+        home: "",
+        post: |r: @keep ptr| { list.list_add_raw(posted, r) },
+        list_models: |base_url: string, protocol: string, key: string, out: ptr| {
+            m = heap.new(models.Listed)
+            m.id = "${protocol}@${base_url}:${key}"
+            m.context_window = 4096 as long
+            list.list_add_raw(out, m as ptr)
+            return 1
+        }
+    }
+}
+
+listing_(f: *provider_flow.Flow) {
+    provider_flow.flow_start_form(f, null)
+    form = provider_flow.flow_form(f)
+    provider_flow.form_submit(form, "site")
+    provider_flow.form_submit(form, "http://h")
+    provider_flow.form_submit(form, "")
+    f.worker = provider_flow.worker_idle("") as ptr
+    f.kind = provider_flow.KIND_WAITING
+    f.waiting = provider_flow.WAITING_LISTING
+}
+
+listed_one_(id: string) -> ptr {
+    l = list.list_new()
+    m = heap.new(models.Listed)
+    m.id = id
+    m.context_window = -1 as long
+    list.list_add_raw(l, m as ptr)
+    return l
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.provider_flow") {
+        spec.it("form walks name, URL, key, protocol and model with validation") callback {
+            form = provider_flow.form_new(taken_())
+            o = provider_flow.form_submit(form, "taken")
+            spec.assert_str_eq(o.problem, "Name is already used", "taken")
+            spec.assert_eq(o.kind, provider_flow.OUT_INVALID, "taken invalid")
+            o = provider_flow.form_submit(form, "a b")
+            spec.assert_str_eq(o.problem, "Use letters, digits, _ and - only", "charset")
+            o = provider_flow.form_submit(form, "  my-site ")
+            spec.assert_eq(o.kind, provider_flow.OUT_NEXT, "name next")
+            spec.assert_eq(form.step, provider_flow.STEP_BASE_URL, "base_url step")
+            o = provider_flow.form_submit(form, "ftp://x")
+            spec.assert_true(o.kind == provider_flow.OUT_INVALID && string.length(o.problem) > 0, "ftp")
+            o = provider_flow.form_submit(form, "http://")
+            spec.assert_true(o.kind == provider_flow.OUT_INVALID && string.length(o.problem) > 0, "no host")
+            o = provider_flow.form_submit(form, "https://models.example.com/v1/")
+            spec.assert_eq(o.kind, provider_flow.OUT_NEXT, "url next")
+            spec.assert_str_eq(form.base_url, "https://models.example.com/v1", "trimmed")
+            spec.assert_true(provider_flow.form_masked(form) == 1, "masked at key")
+            o = provider_flow.form_submit(form, "fake-secret")
+            spec.assert_eq(o.kind, provider_flow.OUT_NEXT, "key next")
+            spec.assert_str_eq(form.key, "fake-secret", "key")
+            o = provider_flow.form_submit(form, "9")
+            spec.assert_str_eq(o.problem, "Choose 1, 2 or 3", "protocol 9")
+            o = provider_flow.form_submit(form, "2")
+            spec.assert_eq(o.kind, provider_flow.OUT_LIST_MODELS, "list models")
+            spec.assert_str_eq(form.protocol, "responses", "responses")
+            // A listing with a window finishes at once; one without asks for it.
+            other = provider_flow.form_new(list.list_new())
+            form.step = provider_flow.STEP_PROTOCOL
+            m1 = heap.new(models.Listed)
+            m1.id = "m1"
+            m1.context_window = 32000 as long
+            o = provider_flow.form_pick(form, m1)
+            spec.assert_eq(o.kind, provider_flow.OUT_READY, "ready")
+            ep = provider_flow.form_endpoint(form)
+            spec.assert_str_eq(ep.id, "my-site", "endpoint id")
+            spec.assert_eq_long(ep.context_window, 32000 as long, "window")
+            m2 = heap.new(models.Listed)
+            m2.id = "m2"
+            m2.context_window = -1 as long
+            o = provider_flow.form_pick(other, m2)
+            spec.assert_eq(o.kind, provider_flow.OUT_NEXT, "asks window")
+            spec.assert_eq(other.step, provider_flow.STEP_WINDOW, "window step")
+            o = provider_flow.form_submit(other, "0")
+            spec.assert_true(o.kind == provider_flow.OUT_INVALID && string.length(o.problem) > 0, "zero")
+            o = provider_flow.form_submit(other, "many")
+            spec.assert_true(o.kind == provider_flow.OUT_INVALID && string.length(o.problem) > 0, "many")
+            o = provider_flow.form_submit(other, "")
+            spec.assert_eq(o.kind, provider_flow.OUT_READY, "default ready")
+            spec.assert_eq_long(provider_flow.form_endpoint(other).context_window, provider_flow.DEFAULT_WINDOW as long, "default window")
+        }
+        spec.it("failed listing asks for the model id and a typed window") callback {
+            form = provider_flow.form_new(list.list_new())
+            provider_flow.form_type_model(form)
+            o = provider_flow.form_submit(form, "  ")
+            spec.assert_str_eq(o.problem, "Model id cannot be empty", "empty id")
+            o = provider_flow.form_submit(form, "local-model")
+            spec.assert_eq(o.kind, provider_flow.OUT_NEXT, "next")
+            spec.assert_eq(form.step, provider_flow.STEP_WINDOW, "window step")
+            o = provider_flow.form_submit(form, "8192")
+            spec.assert_eq(o.kind, provider_flow.OUT_READY, "ready")
+            spec.assert_eq_long(provider_flow.form_endpoint(form).context_window, 8192 as long, "8192")
+            spec.assert_str_eq(provider_flow.form_endpoint(form).model, "local-model", "model")
+        }
+        spec.it("protocol names") callback {
+            spec.assert_str_eq(provider_flow.parse_protocol(""), "chat_completions", "empty")
+            spec.assert_str_eq(provider_flow.parse_protocol("OpenAI"), "chat_completions", "OpenAI")
+            spec.assert_str_eq(provider_flow.parse_protocol("responses"), "responses", "responses")
+            spec.assert_str_eq(provider_flow.parse_protocol("3"), "anthropic_messages", "3")
+            spec.assert_str_eq(provider_flow.parse_protocol("grpc"), "", "grpc")
+        }
+        spec.it("secret entry is masked, wiped and kept out of the display") callback {
+            flow = provider_flow.flow_new()
+            provider_flow.flow_start_key(flow, "anthropic", "Anthropic")
+            spec.assert_true(provider_flow.flow_masked(flow) == 1 && provider_flow.flow_takes_text(flow) == 1, "masked")
+            provider_flow.flow_insert(flow, "sk-é1")
+            spec.assert_str_eq(provider_flow.flow_display(flow), "•••••", "dots")
+            provider_flow.flow_backspace(flow)
+            provider_flow.flow_backspace(flow)
+            spec.assert_str_eq(flow.text, "sk-", "backspaced")
+            provider_flow.flow_insert(flow, "\rignored")
+            spec.assert_str_eq(flow.text, "sk-", "carriage return refused")
+            provider_flow.flow_insert(flow, "\nignored")
+            spec.assert_str_eq(flow.text, "sk-", "newline refused")
+            spec.assert_str_eq(provider_flow.flow_hint(flow), "Anthropic API key", "hint")
+            provider_flow.flow_wipe(flow)
+            spec.assert_eq(string.length(flow.text), 0, "wiped")
+            provider_flow.flow_reset(flow)
+            spec.assert_true(provider_flow.flow_active(flow) == 0, "inactive")
+            provider_flow.flow_free(flow)
+        }
+        spec.it("form steps mask only the key and show plain text elsewhere") callback {
+            flow = provider_flow.flow_new()
+            provider_flow.flow_start_form(flow, null)
+            spec.assert_true(provider_flow.flow_masked(flow) == 0, "name plain")
+            form = provider_flow.flow_form(flow)
+            provider_flow.form_submit(form, "site")
+            provider_flow.form_submit(form, "http://h")
+            spec.assert_true(provider_flow.flow_masked(flow) == 1, "key masked")
+            provider_flow.flow_insert(flow, "secret")
+            spec.assert_true(string.contains(provider_flow.flow_display(flow), "secret") == 0, "display hides it")
+            provider_flow.flow_free(flow)
+        }
+        spec.it("listing reply moves the model list into the flow and picks the next state") callback {
+            flow = provider_flow.flow_new()
+            listing_(flow)
+            r = provider_flow.result_models(1, listed_one_("m1"))
+            spec.assert_eq(provider_flow.flow_settle_result(flow, r), provider_flow.SETTLED_LISTED, "listed")
+            spec.assert_eq(flow.kind, provider_flow.KIND_PICK, "pick")
+            spec.assert_true(flow.worker == null, "worker gone")
+            spec.assert_eq(list.list_size(r.list), 0, "taken out of the reply")
+            spec.assert_eq(list.list_size(flow.listed), 1, "one listed")
+            provider_flow.result_free(r)
+            o, found = provider_flow.flow_choose_model(flow, "m1", launch_(list.list_new()))
+            spec.assert_eq(found, 1, "found")
+            spec.assert_eq(o.kind, provider_flow.OUT_NEXT, "next")
+            spec.assert_eq(flow.kind, provider_flow.KIND_FORM, "form")
+            spec.assert_eq(provider_flow.flow_form(flow).step, provider_flow.STEP_WINDOW, "window")
+            _o2, found2 = provider_flow.flow_choose_model(flow, "missing", launch_(list.list_new()))
+            spec.assert_eq(found2, 0, "missing")
+            provider_flow.flow_free(flow)
+        }
+        spec.it("failed listing falls back to typing the model id and stale replies are ignored") callback {
+            flow = provider_flow.flow_new()
+            stale = provider_flow.result_models(1, listed_one_("late"))
+            spec.assert_eq(provider_flow.flow_settle_result(flow, stale), provider_flow.SETTLED_IGNORED, "not waiting")
+            listing_(flow)
+            spec.assert_eq(flow.kind, provider_flow.KIND_WAITING, "still waiting")
+            provider_flow.result_free(stale)
+            r = provider_flow.result_models(0, null)
+            spec.assert_eq(provider_flow.flow_settle_result(flow, r), provider_flow.SETTLED_LISTING_FAILED, "failed")
+            spec.assert_eq(flow.kind, provider_flow.KIND_FORM, "form")
+            spec.assert_eq(provider_flow.flow_form(flow).step, provider_flow.STEP_MODEL, "model step")
+            spec.assert_true(flow.worker == null, "worker gone")
+            provider_flow.result_free(r)
+            provider_flow.flow_free(flow)
+        }
+        spec.it("an ok but empty listing also falls back to typing the model id") callback {
+            flow = provider_flow.flow_new()
+            listing_(flow)
+            r = provider_flow.result_models(1, list.list_new())
+            spec.assert_eq(provider_flow.flow_settle_result(flow, r), provider_flow.SETTLED_LISTING_FAILED, "empty list")
+            spec.assert_eq(provider_flow.flow_form(flow).step, provider_flow.STEP_MODEL, "model step")
+            provider_flow.result_free(r)
+            provider_flow.flow_free(flow)
+        }
+        spec.it("the worker lists models on its own thread and posts the Result") callback {
+            posted = list.list_new()
+            flow = provider_flow.flow_new()
+            provider_flow.flow_start_form(flow, null)
+            provider_flow.form_submit(provider_flow.flow_form(flow), "site")
+            provider_flow.form_submit(provider_flow.flow_form(flow), "http://h/")
+            provider_flow.flow_insert(flow, "k1")
+            o = provider_flow.flow_submit_entry(flow, launch_(posted))
+            spec.assert_eq(o.kind, provider_flow.OUT_NEXT, "key next")
+            spec.assert_eq(flow.kind, provider_flow.KIND_PROTOCOL, "protocol pick")
+            spec.assert_str_eq(provider_flow.flow_hint(flow), "Add endpoint 4/4 · Protocol", "protocol hint")
+            o = provider_flow.flow_choose_protocol(flow, "2", launch_(posted))
+            spec.assert_eq(o.kind, provider_flow.OUT_LIST_MODELS, "listing")
+            spec.assert_eq(flow.kind, provider_flow.KIND_WAITING, "waiting")
+            spec.assert_str_eq(provider_flow.flow_hint(flow), "Listing models", "waiting hint")
+            w = flow.worker as *provider_flow.Worker
+            i = 0
+            while sync.atomic_load(w.done) == 0 && i < 1000 {
+                sleep(5)
+                i = i + 1
+            }
+            spec.assert_eq(list.list_size(posted), 1, "posted once")
+            r = list.list_get_raw(posted, 0) as *provider_flow.Result
+            spec.assert_eq(provider_flow.flow_settle_result(flow, r), provider_flow.SETTLED_LISTED, "listed")
+            m = list.list_get_raw(flow.listed, 0) as *models.Listed
+            spec.assert_str_eq(m.id, "responses@http://h:k1", "fake saw the form's endpoint and key")
+            spec.assert_eq_long(m.context_window, 4096 as long, "window")
+            provider_flow.result_free(r)
+            provider_flow.flow_free(flow)
+        }
+    }
+    return spec.run_summary(fw)
+}

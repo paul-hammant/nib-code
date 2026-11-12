@@ -154,6 +154,42 @@ aeb(cap) {
         }
         // The TUI (ae/nib/tui), upstream src/tui*.
         aether.program_test() {
+            source("ae/tests/auth_models_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tui_commands_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tui_prediction_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tui_provider_flow_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tui_reflect_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tui_selection_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tui_status_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tui_tasks_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tui_viewport_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
             source("ae/tests/tui_agent_tree_test.ae")
             lib("ae")
         }

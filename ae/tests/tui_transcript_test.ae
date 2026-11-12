@@ -25,6 +25,7 @@ import std.list
 import nib.jsonx
 import nib.tui.transcript
 import nib.tui.entry
+import nib.tui.viewport
 import nib.tui.agent_tree
 import nib.tui.turn_changes
 import nib.tui.turn_summary
@@ -122,9 +123,9 @@ add_call_(run: ptr, name: string, ok: int, dispatched: int, run_index: int) {
     c.end_ms = 1
 }
 
-// A Scroll anchored at (entry, row), or following the bottom.
-scroll_(has: int, entry_: int, row: int) -> *transcript.Scroll {
-    s = heap.new(transcript.Scroll)
+// A Viewport anchored at (entry, row), or following the bottom.
+scroll_(has: int, entry_: int, row: int) -> *viewport.Viewport {
+    s = viewport.new()
     s.has_top = has
     s.top_entry = entry_
     s.top_row = row

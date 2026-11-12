@@ -1,0 +1,307 @@
+// tui.commands: the slash-command table, parsing, completion candidates and
+// help text (upstream src/tui/commands.zig).
+// Only the pure parts live here. modelSelection, select and execute take the
+// App (config saving, session switching, transcript, turns); they live in
+// nib.tui (the app) and are not ported in this module.
+// Differences from upstream:
+//  - Command/Choices/Group enums are int constants (CMD_*, CH_*, G_*), in
+//    upstream's order; Spec is a set of const tables indexed by command
+//    (spec_group, spec_args, spec_help, spec_while_busy, spec_choices,
+//    spec_needs_arg are the accessors).
+//  - parse() returns a Parsed value: kind PARSE_NONE (upstream null),
+//    PARSE_KNOWN (command, arg) or PARSE_UNKNOWN (unknown_name).
+//  - Candidate.value is (has_value, value); group() returns -1 for none.
+//  - candidates() takes Choice[] slices and returns a new Candidate[]; the
+//    caller's `out` buffer length becomes `limit` (default 32).
+//  - help_text / reflect_help take the issue repo as a string, "" meaning
+//    none (upstream null); keys() is a function (mode.SHORTCUT is spliced in).
+//  - Candidate.completion/line return new strings (no allocator).
+
+import std.string
+import std.strbuilder
+import nib.provider.types
+import nib.tui.mode
+
+exports(no_choices, CMD_SIMPLE, CMD_HELP, CMD_NEW, CMD_RESUME, CMD_COMPACT, CMD_UNDO, CMD_PROVIDER, CMD_MODEL,
+        CMD_EFFORT, CMD_COPY, CMD_REFLECT, CMD_JS, CMD_TASKS, CMD_STOP, CMD_STATUS, CMD_SKILLS,
+        CMD_MCP, CMD_COUNT,
+        CH_NONE, CH_MODELS, CH_EFFORTS, CH_SESSIONS, CH_TASKS, CH_SERVICES,
+        G_SEND, G_VIEW, G_SESSION, G_COUNT,
+        PARSE_NONE, PARSE_KNOWN, PARSE_UNKNOWN,
+        Parsed, Choice, Candidate,
+        spec_group, spec_args, spec_help, spec_while_busy, spec_choices, spec_needs_arg,
+        keys, tag_name, slash_name, parse, allowed_while_busy, choice, effort_choices, candidates,
+        candidate_group, candidate_completion, candidate_runs, candidate_line,
+        group_name, reflect_help, help_text)
+
+const CMD_SIMPLE = 0
+const CMD_HELP = 1
+const CMD_NEW = 2
+const CMD_RESUME = 3
+const CMD_COMPACT = 4
+const CMD_UNDO = 5
+const CMD_PROVIDER = 6
+const CMD_MODEL = 7
+const CMD_EFFORT = 8
+const CMD_COPY = 9
+const CMD_REFLECT = 10
+const CMD_JS = 11
+const CMD_TASKS = 12
+const CMD_STOP = 13
+const CMD_STATUS = 14
+const CMD_SKILLS = 15
+const CMD_MCP = 16
+const CMD_COUNT = 17
+
+const CH_NONE = 0
+const CH_MODELS = 1
+const CH_EFFORTS = 2
+const CH_SESSIONS = 3
+const CH_TASKS = 4
+const CH_SERVICES = 5
+
+const G_SEND = 0
+const G_VIEW = 1
+const G_SESSION = 2
+const G_COUNT = 3
+
+const PARSE_NONE = 0
+const PARSE_KNOWN = 1
+const PARSE_UNKNOWN = 2
+
+// The tables below are indexed by command, in the order of the CMD_ constants:
+// simple help new resume compact undo provider model effort copy reflect js
+// tasks stop status skills mcp.
+const TAGS[] = ["simple", "help", "new", "resume", "compact", "undo", "provider", "model", "effort",
+                "copy", "reflect", "js", "tasks", "stop", "status", "skills", "mcp"]
+const GROUPS[] = [1, 1, 2, 2, 2, 2, 2, 2, 0, 1, 2, 0, 1, 2, 1, 1, 1]
+const ARGS[] = ["", "", "", "<id>", "", "", "[service]", "<model>", "[level]", "", "[focus]", "<code>",
+                "", "<id>", "", "[on|off <name>]", "[on|off <id>]"]
+const HELPS[] = ["toggle Simple mode", "commands and keys", "new session", "resume a session",
+                 "compact earlier history", "undo last edited Turn; edit/write only",
+                 "sign in and switch service", "switch model of this service", "reasoning effort",
+                 "copy last answer", "publish issue drafts", "run JavaScript", "background tasks",
+                 "stop a task; changes may remain", "timing and cache details",
+                 "list or enable skills for new sessions", "list or enable MCP servers for new sessions"]
+const WHILE_BUSY[] = [1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0]
+const CHOICES[] = [0, 0, 0, 3, 0, 0, 5, 1, 2, 0, 0, 0, 0, 4, 0, 0, 0]
+const NEEDS_ARG[] = [0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0]
+
+spec_group(c: int) -> int { return GROUPS[c] }
+spec_args(c: int) -> string { return ARGS[c] }
+spec_help(c: int) -> string {
+    if c == CMD_SIMPLE { return "toggle ${mode.NAME} mode" }
+    return HELPS[c]
+}
+spec_while_busy(c: int) -> bool { return WHILE_BUSY[c] != 0 }
+spec_choices(c: int) -> int { return CHOICES[c] }
+spec_needs_arg(c: int) -> bool { return NEEDS_ARG[c] != 0 }
+
+keys() -> string {
+    return "Enter send · Shift+Enter newline · Esc cancel\n${mode.SHORTCUT} simple mode · Ctrl+O latest details · click a block summary for details\nPgUp/PgDn scroll · ↑ input history · Ctrl+C twice to quit"
+}
+
+// upstream @tagName(c)
+tag_name(c: int) -> string { return TAGS[c] }
+
+slash_name(c: int) -> string {
+    if c == CMD_SIMPLE { return "/${mode.COMMAND}" }
+    return "/${TAGS[c]}"
+}
+
+struct Parsed {
+    kind: int
+    command: int
+    arg: string
+    unknown_name: string
+}
+
+is_space_(b: int) -> bool { return b == 32 || b == 9 || b == 10 }
+
+trim_(s: string) -> string {
+    start = 0
+    end = string.length(s)
+    while start < end && is_space_(s[start]) { start = start + 1 }
+    while end > start && is_space_(s[end - 1]) { end = end - 1 }
+    return string.substring(s, start, end)
+}
+
+command_of_(name: string) -> int {
+    if name == mode.COMMAND { return CMD_SIMPLE }
+    i = 0
+    while i < CMD_COUNT {
+        if TAGS[i] == name { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// PARSE_NONE for ordinary messages, including ones that start with a path like `/etc/hosts`.
+parse(line: string) -> Parsed {
+    nothing = Parsed { kind: PARSE_NONE, command: 0, arg: "", unknown_name: "" }
+    len = string.length(line)
+    if len < 2 || line[0] != 47 { return nothing }
+    end = 0
+    while end < len && !is_space_(line[end]) { end = end + 1 }
+    name = string.substring(line, 1, end)
+    if string.index_of(name, "/") >= 0 { return nothing }
+    command = command_of_(name)
+    if command < 0 { return Parsed { kind: PARSE_UNKNOWN, command: 0, arg: "", unknown_name: name } }
+    return Parsed { kind: PARSE_KNOWN, command: command, arg: trim_(string.substring(line, end, len)), unknown_name: "" }
+}
+
+allowed_while_busy(line: string) -> bool {
+    p = parse(line)
+    if p.kind == PARSE_KNOWN { return spec_while_busy(p.command) }
+    return false
+}
+
+struct Choice {
+    value: string
+    label: string
+    detail: string
+}
+
+choice(value: string, label: string, detail: string) -> Choice {
+    return Choice { value: value, label: label, detail: detail }
+}
+
+struct Candidate {
+    command: int
+    has_value: int                // set when this is an argument choice rather than the command itself
+    value: string
+    label: string
+    detail: string
+    is_path: int                  // an `@` file completion: `value` replaces the mention
+}
+
+// upstream Candidate.group(): -1 when this is an argument choice.
+candidate_group(c: Candidate) -> int {
+    if c.has_value == 0 { return spec_group(c.command) }
+    return -1
+}
+
+// What accepting it with Tab leaves in the input.
+candidate_completion(c: Candidate) -> string {
+    if c.has_value != 0 { return "${slash_name(c.command)} ${c.value}" }
+    sep = ""
+    if string.length(spec_args(c.command)) > 0 { sep = " " }
+    return "${slash_name(c.command)}${sep}"
+}
+
+// Whether Enter on it runs the command now instead of waiting for an argument.
+candidate_runs(c: Candidate) -> bool {
+    return c.has_value != 0 || !spec_needs_arg(c.command)
+}
+
+// The line Enter submits when candidate_runs().
+candidate_line(c: Candidate) -> string {
+    if c.has_value != 0 { return "${slash_name(c.command)} ${c.value}" }
+    return slash_name(c.command)
+}
+
+// An empty Choice[] (a qualified `commands.Choice[] x = []` does not parse in callers).
+no_choices() -> Choice[] {
+    Choice[] out = []
+    return out
+}
+
+effort_choices() -> Choice[] {
+    Choice[] out = []
+    vals = types.EFFORT_VALUES
+    n = string.length(vals)
+    start = 0
+    i = 0
+    while i <= n {
+        if i == n || vals[i] == 32 {
+            v = string.substring(vals, start, i)
+            out.push(Choice { value: v, label: v, detail: "" })
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Prefix matches for `input`: command names before the first space, then
+// argument choices for commands that have them. At most `limit` come back.
+candidates(input: string, sessions: Choice[], tasks: Choice[], models: Choice[], services: Choice[], limit: int = 32) -> Candidate[] {
+    Candidate[] out = []
+    len = string.length(input)
+    if len == 0 || input[0] != 47 || string.index_of(input, "\n") >= 0 { return out }
+    space = string.index_of(input, " ")
+    if space < 0 {
+        prefix = string.substring(input, 1, len)
+        g = 0
+        while g < G_COUNT {
+            c = 0
+            while c < CMD_COUNT {
+                if out.len == limit { return out }
+                if spec_group(c) == g && string.starts_with(TAGS[c], prefix) != 0 {
+                    out.push(Candidate { command: c, has_value: 0, value: "", label: slash_name(c), detail: spec_help(c), is_path: 0 })
+                }
+                c = c + 1
+            }
+            g = g + 1
+        }
+        return out
+    }
+    command = command_of_(string.substring(input, 1, space))
+    if command < 0 { return out }
+    argstart = space + 1
+    while argstart < len && input[argstart] == 32 { argstart = argstart + 1 }
+    arg = string.substring(input, argstart, len)
+    kind = spec_choices(command)
+    if kind == CH_NONE { return out }
+    choices = effort_choices()
+    if kind == CH_SESSIONS { choices = sessions }
+    if kind == CH_TASKS { choices = tasks }
+    if kind == CH_MODELS { choices = models }
+    if kind == CH_SERVICES { choices = services }
+    i = 0
+    while i < choices.len {
+        if out.len == limit { break }
+        ch = choices[i]
+        if string.starts_with(ch.value, arg) != 0 {
+            out.push(Candidate { command: command, has_value: 1, value: ch.value, label: ch.label, detail: ch.detail, is_path: 0 })
+        }
+        i = i + 1
+    }
+    return out
+}
+
+group_name(group: int) -> string {
+    if group == G_SEND { return "Send" }
+    if group == G_VIEW { return "View" }
+    return "Session"
+}
+
+// repo "" is upstream's null: issue publishing off.
+reflect_help(repo: string) -> string {
+    if string.length(repo) > 0 { return "publish issue drafts: ${repo}" }
+    return "review session · issue publishing off"
+}
+
+help_text(issue_repo: string) -> string {
+    sb = strbuilder.new(1024)
+    g = 0
+    while g < G_COUNT {
+        strbuilder.append(sb, "${group_name(g)}\n")
+        c = 0
+        while c < CMD_COUNT {
+            skip = spec_group(c) != g || (c == CMD_REFLECT && string.length(issue_repo) == 0)
+            if !skip {
+                sep = ""
+                if string.length(spec_args(c)) > 0 { sep = " " }
+                text = spec_help(c)
+                if c == CMD_REFLECT { text = reflect_help(issue_repo) }
+                strbuilder.append(sb, "  ${slash_name(c)}${sep}${spec_args(c)} · ${text}\n")
+            }
+            c = c + 1
+        }
+        strbuilder.append(sb, "\n")
+        g = g + 1
+    }
+    strbuilder.append(sb, keys())
+    return strbuilder.finish(sb)
+}
