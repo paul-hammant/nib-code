@@ -1,0 +1,288 @@
+// Ports the tests of upstream src/sandbox/record.zig (a2dd439). Two halves
+// that need Zig's FailingAllocator are not portable (Aether has no allocation
+// failure to inject): "recording IO or allocation failures..." keeps its IO
+// half, and "eval end counts creations..." makes the finish fail on IO (a
+// missing directory) instead of on allocation.
+
+import std.spec
+import std.string
+import std.fs
+import std.list
+import nib.jsonx
+import nib.sysgap
+import nib.sandbox.record
+
+tmp_(tag: string) -> string {
+    d, _e = fs.make_temp_dir("", "nib-record-${tag}")
+    return d
+}
+
+read_(path: string) -> string {
+    t, _e = fs.read(path)
+    return t
+}
+
+contains_(s: string, part: string) -> int {
+    if string.index_of(s, part) >= 0 { return 1 }
+    return 0
+}
+
+// The non-empty lines of `text`.
+lines_(text: string) -> ptr {
+    out = list.list_new()
+    n = string.length(text)
+    start = 0
+    i = 0
+    while i <= n {
+        if i == n || string.char_at(text, i) == 10 {
+            if i > start { list.list_add(out, string.substring(text, start, i)) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+line_(l: ptr, i: int) -> string {
+    s, _g = list.get_string(l, i)
+    return s
+}
+
+mode_(path: string) -> int {
+    st = sysgap.new_stat()
+    sysgap.stat(path, 1, st)
+    return (st as *sysgap.Stat).mode & 511
+}
+
+rec_(p: @into ptr) -> *record.Recorder { return p as *record.Recorder }
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "record") {
+        spec.it("record init and disabled begin finish perform no filesystem IO") callback {
+            dir = tmp_("off")
+            path = "${dir}/calls.jsonl"
+            off = record.new(path, 0)
+            record.begin(off, 1, 0)
+            record.capture(off, 0, "read", "{}", 1, "1")
+            record.finish(off, record.END_OK)
+            spec.assert_eq(fs.exists(path), 0, "disabled wrote nothing")
+            on = record.new(path, 1)
+            record.begin(on, 1, 0)
+            record.capture(on, 1, "read", "{}", 1, "1")
+            spec.assert_eq(fs.exists(path), 0, "nothing before finish")
+            record.finish(on, record.END_OK)
+            spec.assert_eq(mode_(path), 384, "0600")
+            data = read_(path)
+            spec.assert_true(contains_(data, "\"start_ms_epoch\":"), "start")
+            spec.assert_true(contains_(data, "\"index\":1,\"seq\":0"), "index then seq")
+            ls = lines_(data)
+            spec.assert_eq(list.list_size(ls), 2, "two lines")
+            call = jsonx.parse(line_(ls, 0))
+            meta = jsonx.parse(line_(ls, 1))
+            spec.assert_eq(jsonx.has(call, "type"), 0, "no type")
+            spec.assert_str_eq(jsonx.str_or(call, "result", ""), "1", "result")
+            spec.assert_eq(jsonx.has(meta, "step") + jsonx.has(meta, "run") + jsonx.has(meta, "meta"), 3, "meta keys")
+            spec.assert_eq(jsonx.int_or(meta, "step", 0), 1, "step")
+            spec.assert_str_eq(jsonx.str_or(jsonx.field(meta, "meta"), "end", ""), "ok", "end")
+            record.close(on)
+        }
+        spec.it("session dedup uses complete sha256 and UTF8 truncation keeps byte boundary") callback {
+            dir = tmp_("dedup")
+            path = "${dir}/calls.jsonl"
+            r = record.new(path, 1)
+            // MAX_RESULT_BYTES + 10 bytes of x, with a 3-byte 中 straddling the limit.
+            unit = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            k = 0
+            while k < 14 {
+                unit = "${unit}${unit}"
+                k = k + 1
+            }
+            // unit is 64 << 14 = 1 MiB
+            bytes = "${string.substring(unit, 0, record.MAX_RESULT_BYTES - 1)}中${string.substring(unit, 0, 8)}"
+            spec.assert_eq(string.length(bytes), record.MAX_RESULT_BYTES + 10, "size")
+            record.begin(r, 1, 0)
+            record.capture(r, 0, "read", "{}", 1, bytes)
+            record.finish(r, record.END_OK)
+            record.begin(r, 2, 0)
+            record.capture(r, 0, "read", "{}", 1, bytes)
+            record.capture(r, 1, "bash", "{}", 0, bytes)
+            record.capture(r, 2, "bash", "{}", 0, bytes)
+            record.finish(r, record.END_ERROR)
+            ls = lines_(read_(path))
+            hex = ""
+            calls = 0
+            i = 0
+            while i < list.list_size(ls) {
+                o = jsonx.parse(line_(ls, i))
+                spec.assert_eq(jsonx.has(o, "type"), 0, "no type")
+                if jsonx.has(o, "meta") == 0 {
+                    if calls == 0 { hex = string.copy(jsonx.str_or(o, "sha256", "")) }
+                    spec.assert_str_eq(jsonx.str_or(o, "sha256", ""), hex, "full hash")
+                    spec.assert_eq(jsonx.bool_or(o, "truncated", 0), 1, "truncated")
+                    spec.assert_eq(jsonx.has(o, "same_as"), 0, "no top-level same_as")
+                    if calls == 1 {
+                        spec.assert_str_eq(jsonx.str_or(jsonx.field(o, "result"), "same_as", ""), hex, "alias")
+                    } else {
+                        key = "error"
+                        if calls == 0 { key = "result" }
+                        value = jsonx.str_or(o, key, "")
+                        spec.assert_eq(string.length(value), record.MAX_RESULT_BYTES - 1, "cut before 中")
+                        spec.assert_true(string.ends_with(value, "x"), "whole characters")
+                    }
+                    calls = calls + 1
+                }
+                jsonx.free(o)
+                i = i + 1
+            }
+            spec.assert_eq(calls, 4, "calls")
+            spec.assert_eq(string.length(hex), 64, "sha256 hex")
+            record.close(r)
+        }
+        spec.it("restored recorder deduplicates earlier session bytes without init IO") callback {
+            dir = tmp_("restored")
+            path = "${dir}/calls.jsonl"
+            first = record.new(path, 1)
+            record.begin(first, 1, 0)
+            record.capture(first, 0, "read", "{}", 1, "{\"value\":7}")
+            record.capture(first, 1, "bash", "{}", 0, "7")
+            record.finish(first, record.END_OK)
+            record.close(first)
+            resumed = record.new(path, 1)
+            spec.assert_true(rec_(resumed).loaded == 0 && rec_(resumed).fd < 0, "no IO at init")
+            record.begin(resumed, 3, 0)
+            record.capture(resumed, 0, "read", "{}", 1, "{\"value\":7}")
+            spec.assert_true(contains_(record.buffer_text(resumed), "\"same_as\":"), "alias")
+            spec.assert_true(contains_(record.buffer_text(resumed), "\"result\":"), "inside result")
+            record.capture(resumed, 1, "read", "{}", 1, "7")
+            record.finish(resumed, record.END_OK)
+            ls = lines_(read_(path))
+            count = 0
+            i = 0
+            while i < list.list_size(ls) {
+                o = jsonx.parse(line_(ls, i))
+                if jsonx.has(o, "meta") == 0 {
+                    if count == 2 { spec.assert_eq(jsonx.kind(o, "result"), 5, "resumed bytes alias Step 1") }
+                    if count == 3 { spec.assert_str_eq(jsonx.str_or(o, "result", ""), "7", "an error never seeds dedup") }
+                    count = count + 1
+                }
+                jsonx.free(o)
+                i = i + 1
+            }
+            spec.assert_eq(count, 4, "calls")
+            again = record.new(path, 1)
+            record.close(resumed)
+            record.begin(again, 5, 0)
+            record.capture(again, 0, "read", "{}", 1, "{\"value\":7}")
+            spec.assert_eq(rec_(again).enabled, 1, "enabled")
+            o2 = jsonx.parse(string.trim(record.buffer_text(again)))
+            spec.assert_eq(jsonx.kind(o2, "result"), 5, "alias after a second restore")
+            record.finish(again, record.END_OK)
+            record.close(again)
+        }
+        spec.it("recording IO or allocation failures disable once and remain nonfatal") callback {
+            dir = tmp_("missing")
+            path = "${dir}/missing/calls.jsonl"
+            r = record.new(path, 1)
+            record.begin(r, 1, 0)
+            record.capture(r, 0, "read", "{}", 1, "1")
+            record.finish(r, record.END_OK)
+            spec.assert_true(rec_(r).warned == 1 && rec_(r).enabled == 0, "disabled once")
+            seq = rec_(r).seq
+            record.begin(r, 2, 0)
+            record.capture(r, 0, "read", "{}", 1, "2")
+            record.finish(r, record.END_OK)
+            spec.assert_true(rec_(r).warned == 1 && rec_(r).enabled == 0 && rec_(r).seq == seq, "stays off")
+        }
+        spec.it("restore removes uncommitted Steps and rebuilds only retained hashes once") callback {
+            orphan_calls = 0
+            while orphan_calls < 2 {
+                dir = tmp_("restore${orphan_calls}")
+                path = "${dir}/calls.jsonl"
+                old = record.new(path, 1)
+                record.begin(old, 1, 0)
+                record.capture(old, 0, "read", "{}", 1, "1")
+                record.finish(old, record.END_OK)
+                retained = rec_(old).offset
+                record.begin(old, 2, 0)
+                if orphan_calls == 1 { record.capture(old, 0, "read", "{}", 1, "2") }
+                record.finish(old, record.END_OK)
+                record.begin(old, 2, 1)
+                record.capture(old, 0, "read", "{}", 1, "2")
+                record.finish(old, record.END_OK)
+                record.begin(old, 3, 0)
+                record.finish(old, record.END_OK)
+                sysgap.pwrite_all(rec_(old).fd, "{\"step\":3", rec_(old).offset)
+                record.close(old)
+
+                resumed = record.new(path, 1)
+                record.begin(resumed, 2, 0)
+                spec.assert_eq(rec_(resumed).enabled, 1, "enabled")
+                spec.assert_true(rec_(resumed).offset == retained, "offset at the kept Step")
+                spec.assert_true(sysgap.fd_size(rec_(resumed).fd) == retained, "file cut")
+                spec.assert_eq(record.seen_count(resumed), 1, "one retained hash")
+                record.capture(resumed, 0, "read", "{}", 1, "1")
+                record.capture(resumed, 1, "read", "{}", 1, "2")
+                bl = lines_(record.buffer_text(resumed))
+                alias = jsonx.parse(line_(bl, 0))
+                spec.assert_eq(jsonx.kind(alias, "result"), 5, "alias of the kept Step")
+                full = jsonx.parse(line_(bl, 1))
+                spec.assert_str_eq(jsonx.str_or(full, "result", ""), "2", "a dropped Step's bytes are new")
+                record.finish(resumed, record.END_OK)
+                first_run = rec_(resumed).offset
+                record.begin(resumed, 2, 1)
+                spec.assert_true(rec_(resumed).offset == first_run, "no second restore")
+                record.finish(resumed, record.END_OK)
+                rows = lines_(read_(path))
+                metas = 0
+                i = 0
+                while i < list.list_size(rows) {
+                    o = jsonx.parse(line_(rows, i))
+                    spec.assert_true(o != null, "whole lines")
+                    spec.assert_true(jsonx.int_or(o, "step", 99) <= 2, "no Step 3")
+                    if jsonx.has(o, "meta") == 1 { metas = metas + 1 }
+                    jsonx.free(o)
+                    i = i + 1
+                }
+                spec.assert_eq(metas, 3, "metas")
+                spec.assert_eq(mode_(path), 384, "0600")
+                record.close(resumed)
+                orphan_calls = orphan_calls + 1
+            }
+        }
+        spec.it("eval end counts creations including missing highest index and is allocation free") callback {
+            dir = tmp_("evalend")
+            r = record.new("${dir}/missing/calls.jsonl", 1)
+            record.begin(r, 1, 0)
+            record.capture(r, 0, "read", "{}", 1, "1")
+            record.eval_end(r, 2)
+            spec.assert_true(rec_(r).enabled == 1 && rec_(r).incomplete == 1, "incomplete")
+            record.finish(r, record.END_ERROR)
+            spec.assert_true(rec_(r).warned == 1 && rec_(r).enabled == 0, "disabled")
+            record.eval_end(r, 2)
+            record.finish(r, record.END_ERROR)
+        }
+        spec.it("concurrent Run recorders flush in completion order and restore retains earlier Steps") callback {
+            dir = tmp_("forks")
+            path = "${dir}/calls.jsonl"
+            root = record.new(path, 1)
+            first = record.fork(root, 1, 0)
+            orphan = record.fork(root, 3, 0)
+            record.capture(orphan, 0, "read", "{}", 1, "same")
+            record.finish(orphan, record.END_OK)
+            record.capture(first, 0, "read", "{}", 1, "same")
+            record.finish(first, record.END_OK)
+            record.close(root)
+            restored = record.new(path, 1)
+            next = record.fork(restored, 2, 0)
+            record.capture(next, 0, "read", "{}", 1, "same")
+            record.finish(next, record.END_OK)
+            data = read_(path)
+            spec.assert_eq(contains_(data, "\"step\":3"), 0, "the later Step is dropped")
+            spec.assert_true(contains_(data, "\"step\":1"), "the earlier Step is kept")
+            spec.assert_true(contains_(data, "\"same_as\":"), "Step 2 aliases Step 1")
+            record.close(restored)
+        }
+    }
+    return spec.run_summary(fw)
+}

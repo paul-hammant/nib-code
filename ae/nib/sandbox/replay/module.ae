@@ -1,0 +1,376 @@
+// replay: run a Run's code again offline against its recorded tool calls
+// (upstream src/sandbox/replay.zig). No tool is dispatched: the sandbox's
+// Virtual hands each created call to this engine, which binds it to a
+// recorded entry, and settles pending calls in recorded order.
+//
+// Strict mode (the original code): calls must match the recording in
+// creation order (index, name, structurally equal args) and settle in its
+// observed order (seq); the first mismatch is the divergence and stops the
+// Run. Script mode (--script): a call is looked up by name and args alone,
+// settles in creation order, and a miss rejects with "not recorded: <name>".
+//
+// The engine is the Virtual's ctx; nothing here is module state.
+
+import std.json
+import std.list
+import std.string
+import std.sync
+import std.intarr
+import nib.jsonx
+import nib.sandbox
+
+exports(Entry, Report, END_OK, END_ERROR, END_TIMEOUT, END_CANCELLED,
+        new_entry, entry_set_result, entry_set_error, execute, execute_session, json_equal)
+
+const END_OK = "ok"
+const END_ERROR = "error"
+const END_TIMEOUT = "timeout"
+const END_CANCELLED = "cancelled"
+
+// One recorded call; the disk format (same_as references) is resolved
+// before it reaches here.
+struct Entry {
+    index: int
+    seq: int
+    name: string
+    args: string        // compact JSON
+    args_doc: ptr       // parsed args
+    ok: int
+    result: string
+    has_result: int
+    error: string
+    has_error: int
+    sha256: string
+    truncated: int
+    same_as: string
+    has_same_as: int
+}
+
+struct Report {
+    outcome: ptr        // *sandbox.Outcome
+    divergence: string
+    has_divergence: int
+    incomplete: int
+    uses_time: int
+    uses_random: int
+    failed: int         // the engine could not run (bad recorded args)
+}
+
+struct Binding {
+    entry: int          // -1 when not recorded (script mode)
+    missing: string
+}
+
+struct Engine {
+    entries: ptr        // list of *Entry
+    script: int
+    bindings: ptr       // list of *Binding, by creation index
+    divergence: string
+    has_divergence: int
+    failed: int
+    seq: int
+    incomplete: int
+    stopped: ptr        // std.sync cell, the Virtual's stop
+}
+
+// An entry with args `args_json` (JSON text); null if that is not JSON.
+new_entry(index: int, seq: int, name: string, args_json: string, ok: int) -> ptr {
+    doc = jsonx.parse(args_json)
+    if doc == null { return null }
+    e = heap.new(Entry)
+    e.index = index
+    e.seq = seq
+    e.name = name
+    e.args = jsonx.encode(doc)
+    e.args_doc = doc
+    e.ok = ok
+    e.result = ""
+    e.has_result = 0
+    e.error = ""
+    e.has_error = 0
+    e.sha256 = ""
+    e.truncated = 0
+    e.same_as = ""
+    e.has_same_as = 0
+    return e as ptr
+}
+
+entry_set_result(ep: ptr, text: string) {
+    e = ep as *Entry
+    e.result = text
+    e.has_result = 1
+}
+
+entry_set_error(ep: ptr, text: string) {
+    e = ep as *Entry
+    e.error = text
+    e.has_error = 1
+}
+
+entry_(en: *Engine, i: int) -> *Entry { return list.list_get_raw(en.entries, i) as *Entry }
+binding_(en: *Engine, i: int) -> *Binding { return list.list_get_raw(en.bindings, i) as *Binding }
+
+stopped_(en: *Engine) -> int {
+    if en.has_divergence == 1 || en.failed == 1 { return 1 }
+    return 0
+}
+
+diverge_(en: *Engine, text: string) {
+    if stopped_(en) == 1 { return }
+    en.divergence = text
+    en.has_divergence = 1
+    sync.atomic_store(en.stopped, 1)
+}
+
+fail_(en: *Engine) {
+    en.failed = 1
+    sync.atomic_store(en.stopped, 1)
+}
+
+// Structural JSON equality: object member order is irrelevant, array order
+// is not, an integer equals the same float.
+json_equal(a: ptr, b: ptr) -> int {
+    ta = json.json_type(a)
+    tb = json.json_type(b)
+    if ta != tb { return 0 }
+    if ta == json.JSON_NULL { return 1 }
+    if ta == json.JSON_BOOL {
+        if json.json_get_bool(a) == json.json_get_bool(b) { return 1 }
+        return 0
+    }
+    if ta == json.JSON_NUMBER {
+        if json.json_is_integer(a) == 1 && json.json_is_integer(b) == 1 {
+            if json.json_get_long(a) == json.json_get_long(b) { return 1 }
+            return 0
+        }
+        if json.json_get_number(a) == json.json_get_number(b) { return 1 }
+        return 0
+    }
+    if ta == json.JSON_STRING {
+        if jsonx.str_field(a) == jsonx.str_field(b) { return 1 }
+        return 0
+    }
+    if ta == json.JSON_ARRAY {
+        n = json.json_array_size(a)
+        if n != json.json_array_size(b) { return 0 }
+        i = 0
+        while i < n {
+            if json_equal(json.json_array_get_raw(a, i), json.json_array_get_raw(b, i)) == 0 { return 0 }
+            i = i + 1
+        }
+        return 1
+    }
+    n2 = json.object_size(a)
+    if n2 != json.object_size(b) { return 0 }
+    k = 0
+    while k < n2 {
+        key, av, _e = json.object_entry(a, k)
+        if json.json_object_has(b, key) == 0 { return 0 }
+        if json_equal(av, json.json_object_get_raw(b, key)) == 0 { return 0 }
+        k = k + 1
+    }
+    return 1
+}
+
+bind_(en: *Engine, index: int, name: string, args_json: string) {
+    if stopped_(en) == 1 { return }
+    args = jsonx.parse(args_json)
+    if args == null {
+        fail_(en)
+        return
+    }
+    expected = -1
+    found = -1
+    n = list.list_size(en.entries)
+    i = 0
+    while i < n {
+        e = entry_(en, i)
+        if en.script == 1 || e.index == index {
+            if en.script == 0 { expected = i }
+            if name == e.name && json_equal(args, e.args_doc) == 1 {
+                found = i
+                break
+            }
+            if en.script == 0 { break }
+        }
+        i = i + 1
+    }
+    jsonx.free(args)
+    if found < 0 && en.script == 0 {
+        if expected >= 0 {
+            x = entry_(en, expected)
+            diverge_(en, "index ${index}: expected name=${x.name} args=${x.args}; actual name=${name} args=${args_json}")
+        } else {
+            diverge_(en, "index ${index}: expected no call; actual name=${name} args=${args_json}")
+        }
+        return
+    }
+    b = heap.new(Binding)
+    b.entry = found
+    b.missing = ""
+    if found < 0 { b.missing = "not recorded: ${name}" }
+    list.list_add(en.bindings, b as ptr)
+}
+
+select_(en: *Engine, pending: ptr) -> int {
+    np = intarr.intarr_size(pending)
+    if np == 0 || stopped_(en) == 1 { return -1 }
+    if en.script == 1 { return intarr.intarr_get_raw(pending, 0) }
+    first = intarr.intarr_get_raw(pending, 0)
+    n = list.list_size(en.entries)
+    i = 0
+    while i < n {
+        e = entry_(en, i)
+        if e.seq == en.seq {
+            k = 0
+            while k < np {
+                if intarr.intarr_get_raw(pending, k) == e.index { return e.index }
+                k = k + 1
+            }
+            a = entry_(en, binding_(en, first).entry)
+            diverge_(en, "settlement ${en.seq}, index ${e.index}: expected name=${e.name} args=${e.args}; actual index=${a.index} name=${a.name} args=${a.args}")
+            return -1
+        }
+        i = i + 1
+    }
+    a2 = entry_(en, binding_(en, first).entry)
+    diverge_(en, "settlement ${en.seq}, index ${a2.index}: expected no call; actual name=${a2.name} args=${a2.args}")
+    return -1
+}
+
+result_(en: *Engine, index: int, out: ptr) -> int {
+    b = binding_(en, index)
+    en.seq = en.seq + 1
+    if b.entry < 0 {
+        sandbox.result_set_err(out, b.missing)
+        return 0
+    }
+    e = entry_(en, b.entry)
+    if e.truncated == 1 { en.incomplete = 1 }
+    has = e.has_error
+    bytes = e.error
+    if e.ok == 1 {
+        has = e.has_result
+        bytes = e.result
+    }
+    if has == 0 {
+        en.incomplete = 1
+        sandbox.result_set_err(out, "recorded result unavailable")
+        return 0
+    }
+    string_result = 0
+    if e.ok == 1 && e.truncated == 1 {
+        v = jsonx.parse(bytes)
+        if v == null { string_result = 1 } else { jsonx.free(v) }
+    }
+    if e.ok == 1 { sandbox.result_set_ok(out, bytes) } else { sandbox.result_set_err(out, bytes) }
+    return string_result
+}
+
+execute(code: string, entries: @keep ptr, start_ms_epoch: long, end: string, script_mode: int) -> ptr {
+    return execute_session(code, entries, start_ms_epoch, end, script_mode, 0)
+}
+
+// Runs `code` against `entries` (a list of *Entry); a child Session's Runs
+// have no tools.agent. Returns a *Report.
+execute_session(code: string, entries: @keep ptr, start_ms_epoch: long, end: string, script_mode: int, child: int) -> ptr {
+    en = heap.new(Engine)
+    en.entries = entries
+    en.script = script_mode
+    en.bindings = list.list_new()
+    en.divergence = ""
+    en.has_divergence = 0
+    en.failed = 0
+    en.seq = 0
+    en.incomplete = 0
+    if end == END_TIMEOUT || end == END_CANCELLED { en.incomplete = 1 }
+    en.stopped = sync.atomic_new(0)
+    names = list.list_new()
+    base = ["mcp", "mcp_schema", "sleep", "read", "view", "edit", "write", "grep", "glob", "fetch", "search", "bash", "stop", "llm"]
+    bi = 0
+    while bi < 14 {
+        list.list_add(names, base[bi])
+        bi = bi + 1
+    }
+    if child == 0 { list.list_add(names, "agent") }
+    n = list.list_size(entries)
+    i = 0
+    while i < n {
+        e = entry_(en, i)
+        found = 0
+        k = 0
+        while k < list.list_size(names) {
+            nm, _g = list.get_string(names, k)
+            if nm == e.name {
+                found = 1
+                break
+            }
+            k = k + 1
+        }
+        if found == 0 { list.list_add(names, e.name) }
+        if e.truncated == 1 { en.incomplete = 1 }
+        i = i + 1
+    }
+    names_json = "["
+    k2 = 0
+    while k2 < list.list_size(names) {
+        nm2, _g2 = list.get_string(names, k2)
+        if k2 > 0 { names_json = "${names_json}," }
+        names_json = "${names_json}${jsonx.quote(nm2)}"
+        k2 = k2 + 1
+    }
+    names_json = "${names_json}]"
+    ep = en as ptr
+    h = sandbox.new_host(ep, names_json, |ctx: ptr, name: string, args: string, out: ptr| {
+        // A virtual host never dispatches a real tool (upstream panics here).
+        sandbox.result_set_err(out, "virtual host must never dispatch real tools")
+    })
+    v = sandbox.new_virtual(ep, |ctx: ptr, index: int, name: string, args: string| {
+        bind_(ctx as *Engine, index, name, args)
+    }, |ctx: ptr, pending: ptr| {
+        int s = select_(ctx as *Engine, pending)
+        return s
+    }, |ctx: ptr, index: int, out: ptr| {
+        int r = result_(ctx as *Engine, index, out)
+        return r
+    }, en.stopped, start_ms_epoch)
+    sandbox.host_set_virtual(h, v)
+    outcome = sandbox.eval(code, sandbox.limits(), h, null)
+    nb = list.list_size(en.bindings)
+    if script_mode == 0 && en.has_divergence == 0 && en.failed == 0 && (nb != n || en.seq != n) {
+        first = -1
+        j = 0
+        while j < n {
+            e2 = entry_(en, j)
+            if e2.index >= nb {
+                if first < 0 || e2.index < entry_(en, first).index { first = j }
+            }
+            j = j + 1
+        }
+        if first >= 0 {
+            f = entry_(en, first)
+            diverge_(en, "index ${f.index}: expected name=${f.name} args=${f.args}; actual no call")
+        } else {
+            j2 = 0
+            while j2 < n {
+                e3 = entry_(en, j2)
+                if e3.seq == en.seq {
+                    diverge_(en, "settlement ${e3.seq}, index ${e3.index}: expected name=${e3.name} args=${e3.args}; actual no settlement")
+                    break
+                }
+                j2 = j2 + 1
+            }
+        }
+    }
+    vv = v as *sandbox.Virtual
+    r = heap.new(Report)
+    r.outcome = outcome
+    r.divergence = en.divergence
+    r.has_divergence = en.has_divergence
+    r.incomplete = en.incomplete
+    r.uses_time = vv.uses_time
+    r.uses_random = vv.uses_random
+    r.failed = en.failed
+    sync.atomic_free(en.stopped)
+    return r as ptr
+}

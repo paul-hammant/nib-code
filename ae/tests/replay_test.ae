@@ -1,0 +1,122 @@
+// Ports the tests of upstream src/sandbox/replay.zig (a2dd439).
+
+import std.spec
+import std.string
+import std.list
+import nib.sandbox
+import nib.sandbox.replay
+
+contains_(s: string, part: string) -> int {
+    if string.index_of(s, part) >= 0 { return 1 }
+    return 0
+}
+
+// Adds an ok entry with result `result`, or an error entry (ok 0) with
+// error text `result`; returns the entry.
+add_(l: ptr, index: int, seq: int, name: string, args: string, ok: int, result: string) -> ptr {
+    e = replay.new_entry(index, seq, name, args, ok)
+    if ok == 1 { replay.entry_set_result(e, result) } else { replay.entry_set_error(e, result) }
+    list.list_add(l, e)
+    return e
+}
+
+run_(code: string, entries: @keep ptr, epoch: long, end: string, script: int) -> *replay.Report {
+    return replay.execute(code, entries, epoch, end, script) as *replay.Report
+}
+
+out_(r: *replay.Report) -> *sandbox.Outcome { return r.outcome as *sandbox.Outcome }
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "replay") {
+        spec.it("replay race obeys settlement seq rather than entry or creation order") callback {
+            entries = list.list_new()
+            add_(entries, 1, 0, "fast", "{}", 1, "2")
+            add_(entries, 0, 1, "slow", "{}", 1, "1")
+            add_(entries, 2, 2, "fast", "{}", 1, "3")
+            i = 0
+            while i < 8 {
+                r = run_("const winner = await Promise.race([tools.slow(), tools.fast()]); const after = await tools.fast(); [winner,after]", entries, 0 as long, replay.END_OK, 0)
+                spec.assert_eq(out_(r).ok, 1, "ok: ${out_(r).text}")
+                spec.assert_str_eq(out_(r).text, "[2,3]", "seq order")
+                spec.assert_eq(r.has_divergence, 0, "no divergence: ${r.divergence}")
+                i = i + 1
+            }
+        }
+        spec.it("strict replay detects creation mismatch, different args, extra and fewer calls") callback {
+            entries = list.list_new()
+            add_(entries, 0, 0, "read", "{\"x\":1,\"y\":[true,null]}", 1, "7")
+            good = run_("await tools.read({y:[true,null],x:1.0})", entries, 0 as long, replay.END_OK, 0)
+            spec.assert_eq(good.has_divergence, 0, "member order and 1.0: ${good.divergence}")
+            spec.assert_str_eq(out_(good).text, "7", "value")
+            codes = ["await tools.write({x:1,y:[true,null]})", "await tools.read({x:2,y:[true,null]})", "42", "await tools.read({x:1,y:[true,null]}); await tools.read({x:1,y:[true,null]})"]
+            k = 0
+            while k < 4 {
+                code = codes[k]
+                r = run_(code, entries, 0 as long, replay.END_OK, 0)
+                d = r.divergence
+                spec.assert_eq(r.has_divergence, 1, "diverged: ${code}")
+                spec.assert_true(contains_(d, "index "), "index: ${d}")
+                spec.assert_true(contains_(d, "expected "), "expected: ${d}")
+                spec.assert_true(contains_(d, "actual "), "actual: ${d}")
+                spec.assert_true(contains_(d, "name=read args="), "name and args: ${d}")
+                if code == "42" { spec.assert_true(contains_(d, "actual no call"), "no call: ${d}") }
+                k = k + 1
+            }
+        }
+        spec.it("script lookup reuses recordings and rejects misses, never performs IO") callback {
+            entries = list.list_new()
+            add_(entries, 1, 0, "read", "{}", 1, "1")
+            add_(entries, 0, 1, "write", "{}", 1, "2")
+            r = run_("const winner = await Promise.race([tools.write(),tools.read()]); const again = await tools.read(); let miss; try { await tools.bash({command:'touch /tmp/replay-MUST-NOT-EXIST'}); } catch(e) { miss=e.message; } [winner,again,miss]", entries, 0 as long, replay.END_OK, 1)
+            spec.assert_eq(r.has_divergence, 0, "no divergence")
+            spec.assert_eq(out_(r).ok, 1, "ok: ${out_(r).text}")
+            spec.assert_str_eq(out_(r).text, "[2,1,\"bash: not recorded: bash\"]", "lookup")
+        }
+        spec.it("recorded reject and truncated payload are handed back with incomplete flag") callback {
+            entries = list.list_new()
+            add_(entries, 0, 0, "bash", "{}", 0, "denied")
+            t = add_(entries, 1, 1, "read", "{}", 1, "{\"text\":\"prefix")
+            (t as *replay.Entry).truncated = 1
+            r = run_("let msg; try { await tools.bash(); } catch(e) { msg=e.message; } [msg,await tools.read()]", entries, 0 as long, replay.END_OK, 0)
+            spec.assert_eq(r.has_divergence, 0, "no divergence: ${r.divergence}")
+            spec.assert_eq(out_(r).ok, 1, "ok: ${out_(r).text}")
+            spec.assert_eq(r.incomplete, 1, "incomplete")
+            spec.assert_str_eq(out_(r).text, "[\"bash: denied\",\"{\\\"text\\\":\\\"prefix\"]", "a cut result is a string")
+        }
+        spec.it("virtual Date and random are fixed and tracked") callback {
+            code = "[Date.now(),new Date().getTime(),Date(),Math.random(),Math.random(),new Date(123).getTime(),Date.parse('1970-01-01T00:00:00Z'),Date.UTC(1970,0,1),new Date() instanceof Date]"
+            none_ = list.list_new()
+            a = run_(code, none_, 1700000000123 as long, replay.END_OK, 0)
+            b = run_(code, none_, 1700000000123 as long, replay.END_OK, 0)
+            spec.assert_eq(out_(a).ok, 1, "ok: ${out_(a).text}")
+            spec.assert_true(a.uses_time == 1 && a.uses_random == 1, "tracked")
+            spec.assert_str_eq(out_(a).text, out_(b).text, "deterministic")
+            spec.assert_true(string.starts_with(out_(a).text, "[1700000000123,1700000000123,") == 1, "fixed: ${out_(a).text}")
+            spec.assert_true(string.ends_with(out_(a).text, ",123,0,0,true]") == 1, "native rest: ${out_(a).text}")
+            plain = run_("42", none_, 0 as long, replay.END_CANCELLED, 0)
+            spec.assert_true(plain.uses_time == 0 && plain.uses_random == 0, "untouched")
+            spec.assert_eq(plain.incomplete, 1, "cancelled is incomplete")
+        }
+        spec.it("ordinary Run errors are complete and recorded timeout remains incomplete") callback {
+            none_ = list.list_new()
+            failed = run_("throw new Error('complete failure')", none_, 0 as long, replay.END_ERROR, 0)
+            spec.assert_eq(out_(failed).ok, 0, "failed")
+            spec.assert_eq(failed.incomplete, 0, "complete")
+            spec.assert_eq(failed.has_divergence, 0, "no divergence")
+            timeout = run_("42", none_, 0 as long, replay.END_TIMEOUT, 0)
+            spec.assert_eq(timeout.incomplete, 1, "timeout incomplete")
+            spec.assert_eq(out_(timeout).ok, 1, "ok")
+            spec.assert_eq(timeout.has_divergence, 0, "no divergence")
+            spec.assert_str_eq(out_(timeout).text, "42", "value")
+        }
+        spec.it("fewer calls reports first missing creation index not first settlement") callback {
+            entries = list.list_new()
+            add_(entries, 1, 0, "fast", "{}", 1, "2")
+            add_(entries, 0, 1, "slow", "{}", 1, "1")
+            r = run_("42", entries, 0 as long, replay.END_OK, 0)
+            spec.assert_str_eq(r.divergence, "index 0: expected name=slow args={}; actual no call", "first missing index")
+        }
+    }
+    return spec.run_summary(fw)
+}

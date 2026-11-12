@@ -1,0 +1,399 @@
+// record: a Run's tool calls as they settle, appended to the Session's
+// `<id>.calls.jsonl` sidecar (upstream src/sandbox/record.zig).
+//
+// One Recorder per Session (the root, which owns the file) and one per Run
+// (a fork: its own buffer and dedup set, written through the root at the
+// Run's end). Every line carries step and run; a Run writes zero or more
+// call rows, then one metadata row. A first ok result is kept as raw JSON
+// text (at most MAX_RESULT_BYTES, cut at a UTF-8 boundary); a repeat of the
+// same bytes within the Session is {"same_as": <sha256>}. Errors are never
+// deduplicated. A failure to write disables recording once, with a warning,
+// and never fails a tool or the Session.
+//
+// The first begin (or fork) after a resume restores the file: lines of Steps
+// at or after the new Step (uncommitted ones) are dropped and the dedup set
+// is rebuilt from what is kept. No module state: a Recorder is a *Recorder.
+
+import std.string
+import std.strbuilder
+import std.list
+import std.map
+import std.fs
+import std.io
+import std.os
+import std.cryptography
+import nib.lock
+import nib.sysgap
+import nib.jsonx
+
+exports(Recorder, MAX_RESULT_BYTES, END_OK, END_ERROR, END_TIMEOUT, END_CANCELLED,
+        new, fork, begin, capture, settle, eval_end, finish, close, buffer_text, seen_count)
+
+const MAX_RESULT_BYTES = 1024 * 1024
+const END_OK = "ok"
+const END_ERROR = "error"
+const END_TIMEOUT = "timeout"
+const END_CANCELLED = "cancelled"
+
+struct Recorder {
+    parent: ptr        // *Recorder of a Run's fork, null for the Session's
+    guard: ptr         // nib.lock
+    path: string
+    enabled: int
+    warned: int
+    active: int
+    step: int
+    run: int
+    start_ms_epoch: long
+    run_output_bytes: long
+    seq: int
+    incomplete: int
+    lines: ptr         // list of this Run's JSONL lines, unwritten
+    seen: ptr          // map sha256 hex -> *Seen
+    seen_keys: ptr     // list of the map's keys
+    fd: int            // -1 none
+    offset: long
+    loaded: int
+}
+
+struct Seen {
+    step: int
+}
+
+new_(path: string, enabled: int) -> *Recorder {
+    r = heap.new(Recorder)
+    r.parent = null
+    r.guard = lock.new()
+    r.path = ""
+    if enabled == 1 { r.path = path }
+    r.enabled = enabled
+    r.warned = 0
+    r.active = 0
+    r.step = 0
+    r.run = 0
+    r.start_ms_epoch = 0 as long
+    r.run_output_bytes = 16 * 1024
+    r.seq = 0
+    r.incomplete = 0
+    r.lines = list.list_new()
+    r.seen = map.map_new()
+    r.seen_keys = list.list_new()
+    r.fd = -1
+    r.offset = 0 as long
+    r.loaded = 0
+    return r
+}
+
+// The Session's recorder for `path`; disabled ones do no file IO at all.
+new(path: string, enabled: int) -> ptr { return new_(path, enabled) as ptr }
+
+// A Run's recorder, begun at (step, run); restores the file first if this
+// Session has not yet.
+fork(rp: @keep ptr, step: int, run: int) -> ptr {
+    r = rp as *Recorder
+    lock.acquire(r.guard)
+    if r.enabled == 1 && r.loaded == 0 {
+        if restore_(r, step) != "" { fail_root_(r) }
+    }
+    child = new_("", r.enabled)
+    child.loaded = 1
+    child.parent = rp
+    lock.release(r.guard)
+    begin(child as ptr, step, run)
+    return child as ptr
+}
+
+// Stop recording, once, with a warning (the root's); a fork disables itself
+// and the root.
+fail_(r: *Recorder) {
+    if r.parent != null {
+        p = r.parent as *Recorder
+        lock.acquire(p.guard)
+        fail_root_(p)
+        lock.release(p.guard)
+        r.enabled = 0
+        r.active = 0
+        r.warned = 1
+        return
+    }
+    fail_root_(r)
+}
+
+fail_root_(r: *Recorder) {
+    r.enabled = 0
+    r.active = 0
+    if r.warned == 0 {
+        r.warned = 1
+        io.fd_write(2, string.bytes("warning: tool call recording disabled (cannot write calls JSONL)\n"))
+    }
+}
+
+begin(rp: ptr, step: int, run: int) {
+    r = rp as *Recorder
+    if r.enabled == 0 { return }
+    if r.path == "" && r.parent == null {
+        fail_(r)
+        return
+    }
+    if r.loaded == 0 {
+        if restore_(r, step) != "" {
+            fail_(r)
+            return
+        }
+    }
+    list.list_clear(r.lines)
+    r.step = step
+    r.run = run
+    r.seq = 0
+    r.incomplete = 0
+    r.start_ms_epoch = os.now_unix_ms()
+    r.active = 1
+}
+
+is_hex64_(s: string) -> int {
+    if string.length(s) != 64 { return 0 }
+    i = 0
+    while i < 64 {
+        c = string.char_at(s, i)
+        if !((c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70)) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+put_seen_(r: *Recorder, hex: string, step: int) {
+    if map.map_has(r.seen, hex) == 1 {
+        (map.map_get_raw(r.seen, hex) as *Seen).step = step
+        return
+    }
+    v = heap.new(Seen)
+    v.step = step
+    map.map_put(r.seen, hex, v as ptr)
+    list.list_add(r.seen_keys, string.copy(hex))
+}
+
+// Opens an existing file (locked, 0600), keeps only lines of Steps before
+// `step` and rebuilds the dedup set from them. "" or the error.
+restore_(r: *Recorder, step: int) -> string {
+    r.loaded = 1
+    if fs.exists(r.path) == 0 { return "" }
+    fd = sysgap.lock_open(r.path)
+    if fd < 0 { return "open" }
+    if sysgap.try_lock(fd) != 1 {
+        sysgap.close(fd)
+        return "locked"
+    }
+    r.fd = fd
+    if sysgap.fchmod(fd, 384) != 0 { return "chmod" }
+    r.offset = sysgap.fd_size(fd)
+    data, rerr = fs.read(r.path)
+    if rerr != "" { return rerr }
+    n = string.length(data)
+    offset = 0 as long
+    retained = 0 as long
+    start = 0
+    while start < n {
+        stop = start
+        while stop < n && string.char_at(data, stop) != 10 { stop = stop + 1 }
+        if stop == n {
+            // A torn last line, with nothing dropped before it, is not ours to cut.
+            if retained == offset { return "IncompleteRecording" }
+            break
+        }
+        line = string.substring(data, start, stop)
+        line_start = offset
+        len = (stop - start) as long
+        offset = offset + len + 1
+        start = stop + 1
+        if len == 0 { continue }
+        v = jsonx.parse(line)
+        if v == null { return "InvalidRecording" }
+        if jsonx.kind(v, "step") != 2 {
+            jsonx.free(v)
+            return "InvalidRecording"
+        }
+        row_step = jsonx.int_or(v, "step", 0)
+        if row_step >= step {
+            jsonx.free(v)
+            continue
+        }
+        if retained != line_start {
+            if sysgap.pwrite_all(r.fd, "${line}\n", retained) != 0 {
+                jsonx.free(v)
+                return "write"
+            }
+        }
+        retained = retained + len + 1
+        if jsonx.bool_or(v, "ok", 0) == 1 && jsonx.kind(v, "sha256") == 3 {
+            hash = string.copy(jsonx.str_or(v, "sha256", ""))
+            if is_hex64_(hash) == 0 {
+                jsonx.free(v)
+                return "InvalidRecordingHash"
+            }
+            put_seen_(r, string.string_to_lower(hash), row_step)
+        }
+        jsonx.free(v)
+    }
+    if retained != r.offset {
+        if sysgap.fd_truncate(r.fd, retained) != 0 { return "truncate" }
+        if sysgap.fsync(r.fd) != 0 { return "sync" }
+    }
+    r.offset = retained
+    return ""
+}
+
+// At eval exit: a created call never delivered to JS leaves the Run incomplete.
+eval_end(rp: ptr, created: int) {
+    r = rp as *Recorder
+    if r.enabled == 0 || r.active == 0 { return }
+    r.incomplete = 0
+    if created != r.seq { r.incomplete = 1 }
+}
+
+settle(rp: ptr, index: int, name: string, args_json: string, ok: int, bytes: string) {
+    capture(rp, index, name, args_json, ok, bytes)
+}
+
+capture(rp: ptr, index: int, name: string, args_json: string, ok: int, bytes: string) {
+    r = rp as *Recorder
+    if r.enabled == 0 || r.active == 0 { return }
+    if capture_(r, index, name, args_json, ok, bytes) != "" { fail_(r) }
+}
+
+capture_(r: *Recorder, index: int, name: string, args_json: string, ok: int, bytes: string) -> string {
+    args = jsonx.parse(args_json)
+    if args == null { return "args" }
+    args_text = jsonx.encode(args)
+    jsonx.free(args)
+    total = string.length(bytes)
+    hex, herr = cryptography.sha256_hex(string.bytes(bytes)[0..total])
+    if herr != "" { return herr }
+    duplicate = 0
+    if ok == 1 {
+        if r.parent != null {
+            p = r.parent as *Recorder
+            lock.acquire(p.guard)
+            if map.map_has(p.seen, hex) == 1 {
+                if (map.map_get_raw(p.seen, hex) as *Seen).step <= r.step { duplicate = 1 }
+            }
+            lock.release(p.guard)
+        }
+        if duplicate == 0 {
+            if map.map_has(r.seen, hex) == 1 {
+                duplicate = 1
+            } else {
+                put_seen_(r, hex, r.step)
+            }
+        }
+    }
+    len = total
+    if len > MAX_RESULT_BYTES { len = MAX_RESULT_BYTES }
+    if len < total {
+        while len > 0 && (string.char_at(bytes, len) & 192) == 128 { len = len - 1 }
+    }
+    kept = bytes
+    if len < total { kept = string.substring(bytes, 0, len) }
+    b = strbuilder.new(len + 256)
+    strbuilder.append(b, "{\"step\":${r.step},\"run\":${r.run},\"index\":${index},\"seq\":${r.seq},\"name\":")
+    strbuilder.append(b, jsonx.quote(name))
+    strbuilder.append(b, ",\"args\":")
+    strbuilder.append(b, args_text)
+    if ok == 1 {
+        strbuilder.append(b, ",\"ok\":true,\"result\":")
+        if duplicate == 1 {
+            strbuilder.append(b, "{\"same_as\":\"${hex}\"}")
+        } else {
+            strbuilder.append(b, jsonx.quote(kept))
+        }
+    } else {
+        strbuilder.append(b, ",\"ok\":false,\"error\":")
+        strbuilder.append(b, jsonx.quote(kept))
+    }
+    truncated = "false"
+    if len < total { truncated = "true" }
+    strbuilder.append(b, ",\"sha256\":\"${hex}\",\"truncated\":${truncated}}\n")
+    list.list_add(r.lines, strbuilder.finish(b))
+    r.seq = r.seq + 1
+    return ""
+}
+
+// end: END_OK, END_ERROR, END_TIMEOUT or END_CANCELLED.
+finish(rp: ptr, end: string) {
+    r = rp as *Recorder
+    if r.enabled == 0 || r.active == 0 { return }
+    if flush_(r, end) != "" { fail_(r) }
+    r.active = 0
+    list.list_clear(r.lines)
+}
+
+flush_(r: *Recorder, end: string) -> string {
+    inc = ""
+    if r.incomplete == 1 { inc = ",\"incomplete\":true" }
+    list.list_add(r.lines, "{\"step\":${r.step},\"run\":${r.run},\"meta\":{\"start_ms_epoch\":${r.start_ms_epoch},\"run_output_bytes\":${r.run_output_bytes},\"end\":\"${end}\"${inc}}}\n")
+    data = buffer_text(r as ptr)
+    target = r
+    if r.parent != null { target = r.parent as *Recorder }
+    lock.acquire(target.guard)
+    err = write_(target, data)
+    if err == "" && r.parent != null {
+        i = 0
+        while i < list.list_size(r.seen_keys) {
+            k, _g = list.get_string(r.seen_keys, i)
+            st = (map.map_get_raw(r.seen, k) as *Seen).step
+            if map.map_has(target.seen, k) == 1 {
+                cur = map.map_get_raw(target.seen, k) as *Seen
+                if st < cur.step { cur.step = st }
+            } else {
+                put_seen_(target, k, st)
+            }
+            i = i + 1
+        }
+    }
+    lock.release(target.guard)
+    return err
+}
+
+// Appends `data` at the file's end, creating it (0600, locked) first. Under
+// target.guard.
+write_(target: *Recorder, data: string) -> string {
+    if target.enabled == 0 { return "RecordingDisabled" }
+    if target.fd < 0 {
+        fd = sysgap.lock_open(target.path)
+        if fd < 0 { return "create" }
+        if sysgap.try_lock(fd) != 1 {
+            sysgap.close(fd)
+            return "locked"
+        }
+        target.fd = fd
+        if sysgap.fchmod(fd, 384) != 0 { return "chmod" }
+        target.offset = sysgap.fd_size(fd)
+    }
+    if sysgap.pwrite_all(target.fd, data, target.offset) != 0 { return "write" }
+    if sysgap.fsync(target.fd) != 0 { return "sync" }
+    target.offset = target.offset + string.length(data) as long
+    return ""
+}
+
+// Releases the file (and its lock).
+close(rp: ptr) {
+    r = rp as *Recorder
+    if r.fd >= 0 {
+        sysgap.close(r.fd)
+        r.fd = -1
+    }
+}
+
+// This Run's unwritten lines.
+buffer_text(rp: ptr) -> string {
+    r = rp as *Recorder
+    b = strbuilder.new(256)
+    i = 0
+    while i < list.list_size(r.lines) {
+        s, _g = list.get_string(r.lines, i)
+        strbuilder.append(b, s)
+        i = i + 1
+    }
+    return strbuilder.finish(b)
+}
+
+seen_count(rp: ptr) -> int { return map.map_size((rp as *Recorder).seen) }

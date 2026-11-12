@@ -1,6 +1,6 @@
-// Ports the tests of upstream src/sandbox.zig (a2dd439), less the record and
-// replay ones (that slice is not ported yet) and the half of one test that
-// formats model output (session/output.zig, the session slice).
+// Ports the tests of upstream src/sandbox.zig (a2dd439), less the half of one
+// test that formats model output (session/output.zig, the session slice).
+// A Recorder's path is never written by these tests: none finishes a Run.
 
 import std.spec
 import std.string
@@ -9,6 +9,10 @@ import std.worker
 import std.os
 import nib.sandbox
 import nib.sandbox.timing
+import nib.sandbox.record
+import nib.sandbox.replay
+import nib.jsonx
+import std.list
 
 limits_(timeout_ms: long) -> ptr {
     l = sandbox.limits() as *sandbox.Limits
@@ -86,6 +90,52 @@ timing_host_(g: *Gate, names: string, t: @keep ptr) -> ptr {
 }
 
 entry_(t: ptr, i: int) -> *timing.Call { return timing.entry(t, i) as *timing.Call }
+
+rec_(p: @into ptr) -> *record.Recorder { return p as *record.Recorder }
+
+// The replay entries of a Recorder's unwritten lines, its same_as references
+// resolved (upstream's test does the same by hand).
+entries_of_(rp: ptr) -> ptr {
+    out = list.list_new()
+    text = record.buffer_text(rp)
+    n = string.length(text)
+    start = 0
+    i = 0
+    while i < n {
+        if string.char_at(text, i) == 10 {
+            row = jsonx.parse(string.substring(text, start, i))
+            start = i + 1
+            if jsonx.has(row, "meta") == 0 {
+                ok = jsonx.bool_or(row, "ok", 0)
+                e = replay.new_entry(jsonx.int_or(row, "index", -1), jsonx.int_or(row, "seq", -1), string.copy(jsonx.str_or(row, "name", "")), jsonx.encode(jsonx.field(row, "args")), ok)
+                ee = e as *replay.Entry
+                ee.sha256 = string.copy(jsonx.str_or(row, "sha256", ""))
+                if ok == 1 {
+                    if jsonx.kind(row, "result") == 3 {
+                        replay.entry_set_result(e, string.copy(jsonx.str_or(row, "result", "")))
+                    } else {
+                        hash = jsonx.str_or(jsonx.field(row, "result"), "same_as", "")
+                        k = 0
+                        while k < list.list_size(out) {
+                            prev = list.list_get_raw(out, k) as *replay.Entry
+                            if prev.ok == 1 && prev.sha256 == hash {
+                                replay.entry_set_result(e, prev.result)
+                                break
+                            }
+                            k = k + 1
+                        }
+                    }
+                } else {
+                    replay.entry_set_error(e, string.copy(jsonx.str_or(row, "error", "")))
+                }
+                list.list_add(out, e)
+            }
+            jsonx.free(row)
+        }
+        i = i + 1
+    }
+    return out
+}
 
 main() {
     fw = spec.init()
@@ -322,6 +372,9 @@ main() {
                 sandbox.result_set_ok(out, "{\"exit_code\":7}")
             })
             sandbox.host_set_timing(h, t)
+            rec = record.new("unused-record-test-path", 1)
+            record.begin(rec, 1, 0)
+            sandbox.host_set_record(h, rec)
             r = run_("const slow = tools.read().then(async r => {\n  console.log('slow delivered', r.exit_code);\n  const next = await tools.bash();\n  console.log('continuation delivered', next.exit_code);\n});\nawait Promise.all([slow, tools.fetch()]);", h)
             spec.assert_eq(r.ok, 0, "not ok")
             spec.assert_true(starts_(r.text, "Error: fetch: fetch failed"), "original reason: ${r.text}")
@@ -330,6 +383,8 @@ main() {
             spec.assert_eq(timing.count(t), 3, "three calls")
             spec.assert_eq_long(r.tool_bytes, 2 * 15 + 12, "bytes")
             spec.assert_eq_long(timing.tool_bytes(t), r.tool_bytes, "timing bytes")
+            spec.assert_eq(rec_(rec).seq, 3, "recorded settlements")
+            spec.assert_eq(rec_(rec).incomplete, 0, "complete")
         }
         spec.it("cancel and timeout stop only undelivered calls and preserve their creation indices") callback {
             modes = [0, 1]
@@ -355,6 +410,9 @@ main() {
                 sandbox.host_set_cancel(h, g.cancel)
                 t = timing.new()
                 sandbox.host_set_timing(h, t)
+                rec = record.new("unused-record-test-path", 1)
+                record.begin(rec, 1, 0)
+                sandbox.host_set_record(h, rec)
                 if timeout == 0 {
                     worker.run_detached(|| {
                         while sync.atomic_load(g.started) < 2 && sync.atomic_load(g.cancel) == 0 { sleep(0) }
@@ -385,6 +443,8 @@ main() {
                 spec.assert_eq_long(timing.tool_bytes(t), r.tool_bytes, "timing bytes")
                 spec.assert_eq_long(entry_(t, 0).result_bytes, 0, "bash undelivered")
                 spec.assert_eq_long(entry_(t, 2).result_bytes, 0, "agent undelivered")
+                spec.assert_eq(rec_(rec).seq, 2, "recorded settlements")
+                spec.assert_eq(rec_(rec).incomplete, 1, "undelivered calls leave it incomplete")
                 k = k + 1
             }
         }
@@ -404,6 +464,74 @@ main() {
             }
             suffix = ", ..., ${1000 - listed} more]"
             spec.assert_true(string.ends_with(r.stopped, suffix), "suffix ${suffix}")
+        }
+        spec.it("record and virtual replay share settlement path including admission rejects and monotonic creation indices") callback {
+            g = new_gate_()
+            gp = g as ptr
+            h = sandbox.new_host(gp, "[\"slow\",\"fast\",\"denied\",\"fail\"]", |ctx: ptr, name: string, args: string, out: ptr| {
+                gg = ctx as *Gate
+                sync.atomic_add(gg.calls, 1)
+                if name == "slow" {
+                    while sync.atomic_load(gg.fetched) == 0 { sleep(0) }
+                    sleep(30)
+                } else if name == "fast" {
+                    sync.atomic_store(gg.fetched, 1)
+                }
+                if name == "fail" {
+                    sandbox.result_set_err(out, "worker denied")
+                    return
+                }
+                sandbox.result_set_ok(out, jsonx.quote(name))
+            })
+            sandbox.host_set_admit(h, |ctx: ptr, name: string, out: ptr| {
+                if name == "denied" {
+                    sandbox.result_set_err(out, "admission denied")
+                    (out as *sandbox.ToolResult).rejected = 1
+                }
+            })
+            rec = record.new("unused-record-test-path", 1)
+            record.begin(rec, 7, 2)
+            sandbox.host_set_record(h, rec)
+            code = "const pending=[tools.slow(),tools.fast()]; const winner=await Promise.race(pending); await Promise.all(pending); const again=await tools.fast(); let denied,fail; try { await tools.denied(); } catch(e) { denied=e.message; } try { await tools.fail(); } catch(e) { fail=e.message; } [winner,again,denied,fail]"
+            actual = run_(code, h)
+            spec.assert_eq(actual.ok, 1, "ok: ${actual.text}")
+            spec.assert_str_eq(actual.text, "[\"fast\",\"fast\",\"denied: admission denied\",\"fail: worker denied\"]", "value")
+            spec.assert_eq_long(sync.atomic_load(g.calls), 4, "admission rejects dispatch nothing")
+            entries = entries_of_(rec)
+            spec.assert_eq(list.list_size(entries), 5, "entries")
+            spec.assert_eq((list.list_get_raw(entries, 0) as *replay.Entry).index, 1, "fast settled first")
+            spec.assert_eq((list.list_get_raw(entries, 1) as *replay.Entry).index, 0, "then slow")
+            k = 2
+            while k < 5 {
+                spec.assert_eq((list.list_get_raw(entries, k) as *replay.Entry).index, k, "monotonic index")
+                k = k + 1
+            }
+            k = 0
+            while k < 5 {
+                spec.assert_eq((list.list_get_raw(entries, k) as *replay.Entry).seq, k, "seq")
+                k = k + 1
+            }
+            repeated = replay.execute(code, entries, rec_(rec).start_ms_epoch, replay.END_OK, 0) as *replay.Report
+            spec.assert_eq(repeated.has_divergence, 0, "no divergence: ${repeated.divergence}")
+            spec.assert_str_eq((repeated.outcome as *sandbox.Outcome).text, actual.text, "same value")
+        }
+        spec.it("eval exit records all creations even on top-level errors") callback {
+            codes = ["tools.bash(); throw new Error('pending')", "await tools.bash(); tools.bash(); throw new Error('tail pending')", "await Promise.all([tools.read(), tools.fetch()])", "await tools.bash(); throw new Error('settled')", "await tools.fetch()", "throw new Error('zero calls')"]
+            delivered = [1, 2, 2, 1, 1, 0]
+            k = 0
+            while k < 6 {
+                rec = record.new("unused-record-test-path", 1)
+                record.begin(rec, 1, 0)
+                g = new_gate_()
+                g.fail_fetch = 1
+                h = timing_host_(g, "[\"bash\",\"read\",\"fetch\"]", null)
+                sandbox.host_set_record(h, rec)
+                r = run_(codes[k], h)
+                spec.assert_eq(r.ok, 0, "not ok: ${codes[k]}")
+                spec.assert_eq(rec_(rec).incomplete, 0, "complete: ${codes[k]}")
+                spec.assert_eq(rec_(rec).seq, delivered[k], "delivered: ${codes[k]}")
+                k = k + 1
+            }
         }
     }
     return spec.run_summary(fw)

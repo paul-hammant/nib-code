@@ -1,4 +1,4 @@
-// Ports upstream src/sandbox/timer_test.zig (a2dd439), less the replay test.
+// Ports upstream src/sandbox/timer_test.zig (a2dd439).
 
 import std.spec
 import std.string
@@ -7,6 +7,8 @@ import std.worker
 import std.os
 import nib.sandbox
 import nib.sandbox.timing
+import nib.sandbox.replay
+import std.list
 
 struct Counter {
     calls: ptr
@@ -158,6 +160,12 @@ main() {
             spec.assert_true(contains_(r.text, "tool ran"), "tool ran")
             spec.assert_eq_long(sync.atomic_load(c.calls), 1, "one call")
             spec.assert_true(os.now_monotonic_ms() - start < 1000, "timers dropped")
+        }
+        spec.it("script replay exposes sleep even with no recorded sleep calls") callback {
+            r = replay.execute("await tools.sleep(1)", list.list_new(), 0 as long, replay.END_OK, 1) as *replay.Report
+            o = r.outcome as *sandbox.Outcome
+            spec.assert_eq(o.ok, 0, "not ok")
+            spec.assert_true(string.index_of(o.text, "not recorded: sleep") >= 0, "not recorded: ${o.text}")
         }
         spec.it("zero sleeps do not starve queued or ready host calls") callback {
             r = run_("let done = false;\nconst pending = tools.echo().then(() => { done = true; });\nwhile (!done) await tools.sleep(0);\nawait pending; done;", 250, host_(new_counter_()))

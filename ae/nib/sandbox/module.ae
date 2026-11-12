@@ -11,6 +11,12 @@
 // Nothing here is module state: a Run is a *State, a host a *Host, and the
 // tool-call identity upstream keeps in a threadlocal travels on the
 // *ToolResult the tool fills in.
+//
+// A host may carry a Recorder (nib.sandbox.record): every settlement
+// delivered to JS is recorded there, at the one delivery path. A host may
+// instead carry a Virtual (offline replay, nib.sandbox.replay): no tool is
+// dispatched; each created call is reported to it, it picks which pending
+// call settles next and with what, and Date and Math.random are fixed.
 
 import contrib.quickjs
 import std.string
@@ -23,9 +29,12 @@ import nib.sandbox.console
 import nib.sandbox.timing
 import nib.qjsgap
 import nib.jsonx
+import nib.sandbox.record
+import std.intarr
 
-exports(TOOL_CONCURRENCY, MAX_STOPPED_BYTES, Limits, ToolResult, Host, Outcome,
+exports(TOOL_CONCURRENCY, MAX_STOPPED_BYTES, Limits, ToolResult, Host, Outcome, Virtual,
         limits, new_host, host_set_admit, host_set_cancel, host_set_timing, host_set_waiting,
+        host_set_record, host_set_virtual, new_virtual,
         result_ok, result_err, result_set_ok, result_set_err, result_set_identity,
         eval, syntax_context)
 
@@ -60,6 +69,26 @@ struct Host {
     cancel: ptr        // std.sync cell set when the Run stops its tools; may be null
     timing: ptr        // *timing.Run, or null
     waiting: ptr       // std.sync cell, 1 while the Run waits only on tools or timers; may be null
+    record: ptr        // *record.Recorder, or null
+    virtual: ptr       // *Virtual (offline replay), or null
+}
+
+// Offline replay's side of a Run (upstream sandbox.Virtual). Called only on
+// the eval thread.
+struct Virtual {
+    ctx: ptr
+    // |ctx: ptr, index: int, name: string, args: string|: a call was created
+    create: fn
+    // |ctx: ptr, pending: ptr| -> int: of the pending calls' creation indexes
+    // (a std.intarr), the one to settle next, or -1 to stop
+    select: fn
+    // |ctx: ptr, index: int, out: ptr| -> int: fills out (*ToolResult) with
+    // the settlement of call `index`; 1 when its ok text is a JS string, not JSON
+    result: fn
+    stopped: ptr       // std.sync cell, nonzero once replay diverged or failed
+    start_ms_epoch: long
+    uses_time: int
+    uses_random: int
 }
 
 struct Outcome {
@@ -90,6 +119,7 @@ struct Call {
     timing_index: int
     start_ms: long     // monotonic, set by the worker
     end_ms: long
+    string_result: int // replay: an ok text handed back as a JS string
 }
 
 struct State {
@@ -129,7 +159,22 @@ new_host(ctx: @keep ptr, names_json: string, call_fn: @keep fn) -> ptr {
     h.cancel = null
     h.timing = null
     h.waiting = null
+    h.record = null
+    h.virtual = null
     return h as ptr
+}
+
+new_virtual(ctx: @keep ptr, create_fn: @keep fn, select_fn: @keep fn, result_fn: @keep fn, stopped: @keep ptr, start_ms_epoch: long) -> ptr {
+    v = heap.new(Virtual)
+    v.ctx = ctx
+    v.create = create_fn
+    v.select = select_fn
+    v.result = result_fn
+    v.stopped = stopped
+    v.start_ms_epoch = start_ms_epoch
+    v.uses_time = 0
+    v.uses_random = 0
+    return v as ptr
 }
 
 host_set_admit(hp: ptr, admit_fn: @keep fn) {
@@ -141,6 +186,8 @@ host_set_admit(hp: ptr, admit_fn: @keep fn) {
 host_set_cancel(hp: ptr, cell: @keep ptr) { (hp as *Host).cancel = cell }
 host_set_timing(hp: ptr, t: @keep ptr) { (hp as *Host).timing = t }
 host_set_waiting(hp: ptr, cell: @keep ptr) { (hp as *Host).waiting = cell }
+host_set_record(hp: ptr, r: @keep ptr) { (hp as *Host).record = r }
+host_set_virtual(hp: ptr, v: @keep ptr) { (hp as *Host).virtual = v }
 
 new_result_() -> ptr {
     r = heap.new(ToolResult)
@@ -208,6 +255,27 @@ const PRELUDE = <<JS
 })();
 JS
 
+// Replay's fixed clock and random (upstream sandbox/virtual.zig).
+const VIRTUAL_PRELUDE = <<JS
+(() => {
+  const epoch = globalThis.__replayEpoch, time = globalThis.__replayTime, random = globalThis.__replayRandom;
+  delete globalThis.__replayEpoch; delete globalThis.__replayTime; delete globalThis.__replayRandom;
+  const NativeDate = Date;
+  function FixedDate(...args) {
+    time();
+    if (!new.target) return new NativeDate(epoch).toString();
+    return Reflect.construct(NativeDate, args.length ? args : [epoch], new.target);
+  }
+  FixedDate.prototype = NativeDate.prototype;
+  FixedDate.prototype.constructor = FixedDate;
+  FixedDate.now = () => { time(); return epoch; };
+  FixedDate.parse = NativeDate.parse; FixedDate.UTC = NativeDate.UTC;
+  globalThis.Date = FixedDate;
+  let seed = 0x6d2b79f5;
+  Math.random = () => { random(); seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 4294967296; };
+})();
+JS
+
 // ---- the JS budget ----
 
 begin_js_(st: *State) {
@@ -245,6 +313,18 @@ stop_(st: *State) {
 timing_(st: *State) -> ptr {
     if st.host == null { return null }
     return (st.host as *Host).timing
+}
+
+virtual_(st: *State) -> ptr {
+    if st.host == null { return null }
+    return (st.host as *Host).virtual
+}
+
+virtual_stopped_(st: *State) -> int {
+    vp = virtual_(st)
+    if vp == null { return 0 }
+    if sync.atomic_load((vp as *Virtual).stopped) != 0 { return 1 }
+    return 0
 }
 
 // ---- values to text ----
@@ -306,8 +386,16 @@ enqueue_(st: *State, name: string, args: string) -> int {
     c.timing_index = -1
     c.start_ms = 0
     c.end_ms = 0
+    c.string_result = 0
     t = timing_(st)
-    if h.has_admit == 1 {
+    if h.virtual != null {
+        v = h.virtual as *Virtual
+        call(v.create, v.ctx, st.creation_index, name, args)
+        if sync.atomic_load(v.stopped) != 0 {
+            release_call_(st, c)
+            return quickjs.throw_error(q, "Error", "replay diverged")
+        }
+    } else if h.has_admit == 1 {
         r = new_result_()
         call(h.admit, h.ctx, name, r)
         if (r as *ToolResult).rejected == 1 {
@@ -323,7 +411,7 @@ enqueue_(st: *State, name: string, args: string) -> int {
             }
         }
     }
-    if c.result == null && name == "sleep" {
+    if h.virtual == null && c.result == null && name == "sleep" {
         ms = jsonx.long_of(args)
         c.timer = 1
         c.deadline_ns = qjsgap.now_ns() + ms * 1000000
@@ -403,6 +491,10 @@ remove_call_(st: *State, c: *Call) {
 deliver_(st: *State, c: *Call) {
     q = st.q
     r = c.result as *ToolResult
+    if st.host != null {
+        rec = (st.host as *Host).record
+        if rec != null { record.settle(rec, c.creation_index, c.name, c.args, r.ok, r.text) }
+    }
     n = string.length(r.text) as long
     st.tool_bytes = st.tool_bytes + n
     t = timing_(st)
@@ -410,7 +502,9 @@ deliver_(st: *State, c: *Call) {
     begin_js_(st)
     rejected = 0
     value = 0
-    if r.ok == 1 {
+    if r.ok == 1 && c.string_result == 1 {
+        value = quickjs.new_string(q, r.text)
+    } else if r.ok == 1 {
         v, err = quickjs.parse_json(q, r.text)
         if err != "" {
             rejected = 1
@@ -494,6 +588,7 @@ has_timers_(st: *State) -> int {
 jobs_(st: *State) -> int {
     q = st.q
     while true {
+        if virtual_stopped_(st) == 1 { return 0 }
         if interrupted_(st) == 1 {
             stop_(st)
             return 0
@@ -503,6 +598,37 @@ jobs_(st: *State) -> int {
         end_js_(st)
         if err != "" { return 0 }
         if n > 0 { continue }
+        vp = virtual_(st)
+        if vp != null {
+            // Replay: the Virtual settles one pending call at a time, in its order.
+            v = vp as *Virtual
+            if sync.atomic_load(v.stopped) != 0 { return 0 }
+            total_v = list.list_size(st.calls)
+            if total_v == 0 { return 1 }
+            pending = intarr.intarr_new_raw(total_v)
+            pi = 0
+            while pi < total_v {
+                intarr.intarr_set_raw(pending, pi, (list.list_get_raw(st.calls, pi) as *Call).creation_index)
+                pi = pi + 1
+            }
+            int selected = call(v.select, v.ctx, pending)
+            intarr.intarr_free(pending)
+            if selected < 0 { return 0 }
+            pi = 0
+            while pi < total_v {
+                vc = list.list_get_raw(st.calls, pi) as *Call
+                if vc.creation_index == selected {
+                    vr = new_result_()
+                    int sr = call(v.result, v.ctx, selected, vr)
+                    vc.result = vr
+                    vc.string_result = sr
+                    deliver_(st, vc)
+                    break
+                }
+                pi = pi + 1
+            }
+            continue
+        }
         rp = ready_(st)
         if rp != null {
             st.active = st.active - 1
@@ -726,6 +852,36 @@ install_(st: *State) {
     quickjs.release(q, ns)
 }
 
+// Replay's fixed Date and Math.random (upstream native.installVirtual).
+install_virtual_(st: *State) {
+    q = st.q
+    vp = virtual_(st)
+    v = vp as *Virtual
+    epoch = quickjs.new_float(q, v.start_ms_epoch as float)
+    quickjs.set_global(q, "__replayEpoch", epoch)
+    quickjs.release(q, epoch)
+    time_fn = quickjs.function(q, "time", 0, |q: @keep ptr, this_h: int, args: int| {
+        hide os, worker, dispatch_, work_
+        (vp as *Virtual).uses_time = 1
+        return 0
+    })
+    quickjs.set_global(q, "__replayTime", time_fn)
+    quickjs.release(q, time_fn)
+    random_fn = quickjs.function(q, "random", 0, |q: @keep ptr, this_h: int, args: int| {
+        hide os, worker, dispatch_, work_
+        (vp as *Virtual).uses_random = 1
+        return 0
+    })
+    quickjs.set_global(q, "__replayRandom", random_fn)
+    quickjs.release(q, random_fn)
+    rv, rerr = quickjs.eval(q, VIRTUAL_PRELUDE, "<virtual>")
+    if rerr != "" {
+        println("nib: sandbox virtual prelude failed: ${rerr}")
+    } else {
+        quickjs.release(q, rv)
+    }
+}
+
 take_global_(st: *State, name: string) -> int {
     h, _e = quickjs.get_global(st.q, name)
     r, _e2 = quickjs.eval(st.q, "delete globalThis.${name}", "<nib>")
@@ -762,6 +918,10 @@ eval(code: string, lp: ptr, host: @keep ptr, cancel: @keep ptr) -> ptr {
         println("nib: sandbox prelude failed: ${perr}")
     } else {
         quickjs.release(q, pv)
+    }
+    if virtual_(st) != null {
+        qjsgap.set_stop(st.w, (virtual_(st) as *Virtual).stopped)
+        install_virtual_(st)
     }
 
     ok = 0
@@ -804,6 +964,10 @@ eval(code: string, lp: ptr, host: @keep ptr, cancel: @keep ptr) -> ptr {
         text = syntax_context(text, code)
     }
     if jobs_drained == 1 { jobs_(st) }
+    if st.host != null {
+        rec = (st.host as *Host).record
+        if rec != null { record.eval_end(rec, st.creation_index) }
+    }
 
     stopped = ""
     if interrupted_(st) == 1 {

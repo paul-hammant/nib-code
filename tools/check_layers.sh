@@ -28,7 +28,10 @@ T=ae/nib/tools
 expect_imports ae/nib/jsonx/module.ae "std.json|std.strbuilder|std.string"
 expect_imports ae/nib/lock/module.ae "std.sync"
 expect_imports ae/nib/sysgap/module.ae "std.list|std.string"
-expect_imports ae/nib/sandbox/module.ae "contrib.quickjs|nib.jsonx|nib.qjsgap|nib.sandbox.console|nib.sandbox.timing|std.list|std.os|std.strbuilder|std.string|std.sync|std.worker"
+expect_imports ae/nib/sandbox/module.ae "contrib.quickjs|nib.jsonx|nib.qjsgap|nib.sandbox.console|nib.sandbox.record|nib.sandbox.timing|std.intarr|std.list|std.os|std.strbuilder|std.string|std.sync|std.worker"
+# The calls sidecar (record) writes one file through the stand-in; replay runs the sandbox with no tools.
+expect_imports ae/nib/sandbox/record/module.ae "nib.jsonx|nib.lock|nib.sysgap|std.cryptography|std.fs|std.io|std.list|std.map|std.os|std.strbuilder|std.string"
+expect_imports ae/nib/sandbox/replay/module.ae "nib.jsonx|nib.sandbox|std.intarr|std.json|std.list|std.string|std.sync"
 expect_imports ae/nib/sandbox/console/module.ae "std.list|std.strbuilder|std.string"
 expect_imports ae/nib/sandbox/timing/module.ae "nib.jsonx|std.list|std.os|std.string"
 # Pure logic: no file system, process or network.
@@ -116,8 +119,8 @@ rule "a program is started only in tools/process (and the jail's probe and exec 
     "$T/process/|$T/jail/|ae/nib/tui/open/"
 rule "QuickJS is embedded only by the sandbox and grep's private matcher" \
     '^import contrib\.quickjs' "ae/nib/sandbox/module.ae|$T/grep/"
-rule "the file stand-in is used only by the file, undo, process and view tools, the image store, the Session log, the environment and main (signals, echo)" \
-    '^import nib\.sysgap' "$T/atomic_file/|$T/file_state/|$T/files/|$T/undo/|$T/process/|$T/bash/|$T/view/|ae/nib/image/|ae/nib/session/log/|ae/nib/config/env/|ae/main.ae|ae/nib/tui/reflect/"
+rule "the file stand-in is used only by the file, undo, process and view tools, the image store, the Session log, the calls recorder, the environment and main (signals, echo)" \
+    '^import nib\.sysgap' "$T/atomic_file/|$T/file_state/|$T/files/|$T/undo/|$T/process/|$T/bash/|$T/view/|ae/nib/image/|ae/nib/session/log/|ae/nib/sandbox/record/|ae/nib/config/env/|ae/main.ae|ae/nib/tui/reflect/"
 rule "the QuickJS stand-in is used only by the sandbox" \
     '^import nib\.qjsgap' "ae/nib/sandbox/module.ae"
 rule "only provider/http (the model request), auth/models (the /model listing), mcp_transport (Streamable HTTP MCP servers) tools/web_search (the search request) and tools/web (tools.fetch) reach the network" \

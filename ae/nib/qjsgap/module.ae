@@ -1,14 +1,15 @@
-// qjsgap: a marked STAND-IN for three contrib.quickjs gaps (async global
-// eval, a host-controlled interrupt, promise state), until
+// qjsgap: a marked STAND-IN for contrib.quickjs gaps (async global eval, a
+// host-controlled interrupt with cancel and stop cells, promise state), until
 // asks/aether-quickjs-async-eval-and-interrupt.md is answered upstream.
 // qjsgap.c says what it mirrors. Only the sandbox imports this.
 
 @source("qjsgap.c")
 
-exports(watch, unwatch, begin, end, reason, now_ns, eval_async, promise_state, promise_result_to_global)
+exports(watch, unwatch, set_stop, begin, end, reason, now_ns, eval_async, promise_state, promise_result_to_global)
 
 extern nibqjs_watch(q: ptr, cancel_cell: ptr) -> ptr
 extern nibqjs_unwatch(w: ptr)
+extern nibqjs_set_stop(w: ptr, stop_cell: ptr)
 extern nibqjs_begin(w: ptr, remaining_ns: long)
 extern nibqjs_end(w: ptr)
 extern nibqjs_reason(w: ptr) -> int
@@ -19,6 +20,8 @@ extern nibqjs_promise_result_to_global(w: ptr, h: int, name: string)
 
 watch(q: ptr, cancel_cell: ptr) -> ptr { return nibqjs_watch(q, cancel_cell) }
 unwatch(w: ptr) { nibqjs_unwatch(w) }
+// A cell that also interrupts JS (reason 3), for replay's divergence stop.
+set_stop(w: ptr, stop_cell: ptr) { nibqjs_set_stop(w, stop_cell) }
 begin(w: ptr, remaining_ns: long) { nibqjs_begin(w, remaining_ns) }
 end(w: ptr) { nibqjs_end(w) }
 reason(w: ptr) -> int { return nibqjs_reason(w) }

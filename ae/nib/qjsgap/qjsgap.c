@@ -6,7 +6,9 @@
  *   - an interrupt handler the host controls (a cancel flag and a deadline it
  *     moves itself, so the JS budget accumulates across entries instead of
  *     restarting per entry);
- *   - JS_PromiseState on a handle.
+ *   - JS_PromiseState on a handle;
+ *   - a second "stop" cell the interrupt also honours (offline replay stops a
+ *     Run once it diverged, without the Run reading as canceled).
  * It mirrors contrib.quickjs's AeQjs layout (aether_quickjs.c, 0.909.0) and
  * declares the few QuickJS entry points it calls rather than including
  * quickjs.h, which no include path reaches from here. 64-bit only, like the
@@ -52,6 +54,7 @@ extern int64_t aether_sync_atomic_load(void *cell);
 typedef struct {
     NibAeQjsMirror *q;
     void *cancel;          /* std.sync cell, nonzero = canceled; may be NULL */
+    void *stop;            /* std.sync cell, nonzero = stop (replay diverged); may be NULL */
     int64_t deadline_ns;   /* 0 = no JS running */
     int reason;            /* 0 none, 1 deadline, 2 cancel */
 } NibWatch;
@@ -67,6 +70,7 @@ static int nib_interrupt_(JSRuntime *rt, void *opaque) {
     (void)rt;
     if (w->cancel && aether_sync_atomic_load(w->cancel) != 0) { if (!w->reason) w->reason = 2; return 1; }
     if (w->deadline_ns != 0 && nib_now_ns_() >= w->deadline_ns) { if (!w->reason) w->reason = 1; return 1; }
+    if (w->stop && aether_sync_atomic_load(w->stop) != 0) { if (!w->reason) w->reason = 3; return 1; }
     return 0;
 }
 
@@ -93,6 +97,9 @@ void nibqjs_begin(void *wp, int64_t remaining_ns) {
     w->deadline_ns = remaining_ns > 0 ? now + remaining_ns : now;
     JS_UpdateStackTop(w->q->rt);
 }
+
+/* A second cell that interrupts JS (reason 3) without being a cancel. */
+void nibqjs_set_stop(void *wp, void *stop_cell) { ((NibWatch *)wp)->stop = stop_cell; }
 
 void nibqjs_end(void *wp) { ((NibWatch *)wp)->deadline_ns = 0; }
 int nibqjs_reason(void *wp) { return ((NibWatch *)wp)->reason; }
