@@ -51,7 +51,8 @@ expect_imports $T/search/module.ae "nib.jsonx|nib.tools.grep|nib.tools.walk|std.
 expect_imports $T/process/module.ae "nib.sysgap|std.cryptography|std.fs|std.list|std.os|std.string|std.sync|std.worker"
 expect_imports $T/bash/module.ae "nib.jsonx|nib.sysgap|nib.tools.jail|nib.tools.policy|nib.tools.process|nib.tools.progress|nib.tools.registry|nib.tools.secrets|std.list|std.os|std.string|std.sync"
 expect_imports $T/jail/module.ae "nib.tools.atomic_file|std.fs|std.list|std.os|std.string"
-expect_imports $T/module.ae "nib.jsonx|nib.lock|nib.sandbox|nib.tools.atomic_file|nib.tools.background|nib.tools.bash|nib.tools.changes|nib.tools.file_state|nib.tools.files|nib.tools.jail|nib.tools.progress|nib.tools.registry|nib.tools.search|nib.tools.undo|std.list|std.os|std.strbuilder|std.string|std.sync"
+expect_imports $T/llm_call/module.ae "nib.jsonx|nib.lock|nib.msg|nib.provider|nib.provider.sink|nib.provider.types|std.json|std.list|std.strbuilder|std.string|std.sync"
+expect_imports $T/module.ae "nib.jsonx|nib.lock|nib.provider.types|nib.sandbox|nib.tools.atomic_file|nib.tools.background|nib.tools.bash|nib.tools.changes|nib.tools.file_state|nib.tools.files|nib.tools.jail|nib.tools.llm_call|nib.tools.progress|nib.tools.registry|nib.tools.search|nib.tools.undo|std.list|std.os|std.strbuilder|std.string|std.sync"
 
 # The Session + provider slice.
 expect_imports ae/nib/auth/module.ae "nib.auth.store|nib.config|nib.config.env|nib.provider.types|std.list|std.string"

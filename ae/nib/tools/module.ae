@@ -27,10 +27,12 @@ import nib.tools.jail
 import nib.tools.background
 import nib.tools.progress
 import nib.tools.undo
+import nib.tools.llm_call
+import nib.provider.types
 
 exports(Tools, RunScope, new, new_scope, host, call_tool, names_json, docs, all_docs, tool_names,
         is_ported, credential_paths, writable_roots, nib_home, take_changes, set_workspace,
-        cancel_cell, set_log, take_jail_notice, enable_undo, begin_turn_undo, finish_turn_undo, run_undo, turn_undo_dir, attach_turn_undo_dir, close_undo)
+        cancel_cell, set_log, set_config, take_usage, take_jail_notice, enable_undo, begin_turn_undo, finish_turn_undo, run_undo, turn_undo_dir, attach_turn_undo_dir, close_undo)
 
 const DOC_MCP = "  // Call an enabled MCP server tool. Server/transport failures are data; argument errors reject. Full results stay in JS; images share the Run image limit.\n  async mcp(name, args = {}) {}, // → { ok, content, structured?, error? }\n"
 const DOC_MCP_SCHEMA = "  // Full input JSON Schema for an enabled server.tool, including tools omitted from the compact index.\n  async mcp_schema(name) {}, // → JSON Schema or { ok: false, error }\n"
@@ -93,6 +95,7 @@ is_ported(name: string) -> int {
         "glob" -> { return 1 }
         "bash" -> { return 1 }
         "stop" -> { return 1 }
+        "llm" -> { return 1 }
         _ -> { return 0 }
     }
 }
@@ -123,6 +126,8 @@ struct Tools {
     log_ctx: ptr
     log_fn: fn             // |ctx: ptr, members: string|: a session-log record's members
     jail_noticed: int
+    cfg: ptr               // *types.Config of the Session, or null (nib js)
+    llm: ptr               // *llm_call.State
 }
 
 struct RunScope {
@@ -130,6 +135,7 @@ struct RunScope {
     id: int
     cancel: ptr
     changes: ptr           // *changes.Tracker for this Run
+    llm_calls: ptr         // std.sync cell: tools.llm calls admitted in this Run
 }
 
 new(home: string) -> ptr {
@@ -161,10 +167,23 @@ new(home: string) -> ptr {
     t.log_ctx = null
     t.log_fn = |ctx: ptr, members: string| {}
     t.jail_noticed = 0
+    t.cfg = null
+    t.llm = llm_call.new()
     return t as ptr
 }
 
 set_workspace(tp: ptr, on: int) { (tp as *Tools).workspace = on }
+
+// The Session's Config (limits, provider, model: tools.llm and the docs read
+// it) and id (the llm prompt cache key). The Config is shared, not copied.
+set_config(tp: ptr, cfg: @keep ptr, session_id: string) {
+    t = tp as *Tools
+    t.cfg = cfg
+    llm_call.set_config(t.llm, cfg, session_id)
+}
+
+// The usage tools.llm reported since the last take: a fresh *types.Usage.
+take_usage(tp: ptr) -> ptr { return llm_call.take_usage((tp as *Tools).llm) }
 
 // Bash lifecycle (registry), tools.stop and sandbox records go to the session log through f.
 set_log(tp: ptr, ctx: @keep ptr, f: @keep fn) {
@@ -242,6 +261,7 @@ new_scope(tp: @keep ptr, id: int) -> ptr {
     s.id = id
     s.cancel = sync.atomic_new(0)
     s.changes = changes.new() as ptr
+    s.llm_calls = sync.atomic_new(0)
     return s as ptr
 }
 
@@ -276,9 +296,12 @@ wrap_docs_(body: string) -> string {
     return "const tools = {\n${body}};\n// Strings print as-is, other values as JSON.\nconsole.log(...values);\n"
 }
 
-// The API description of the tools this Run has.
+// The API description of the tools this Run has, with the Config's limits
+// and model catalog in the llm description. (Without a Config, the defaults.)
 docs(tp: ptr) -> string {
     t = tp as *Tools
+    cfg = t.cfg
+    if cfg == null { cfg = types.new_config("chat_completions", "", "", "") }
     body = ""
     all = tool_names()
     i = 0
@@ -287,7 +310,7 @@ docs(tp: ptr) -> string {
         if enabled_(t, n) == 1 { body = "${body}${doc_of_(n)}" }
         i = i + 1
     }
-    return wrap_docs_(body)
+    return llm_call.fill_docs(wrap_docs_(body), cfg)
 }
 
 // Every upstream description, ported or not (for checks against upstream).
@@ -515,11 +538,28 @@ call_tool(sp: ptr, name: string, args: string, out: ptr) {
             stop_(s, args, out)
             return
         }
+        "llm" -> {
+            ok, text = llm_call.call(t.llm, args, s.cancel)
+        }
         _ -> {
             text = "SandboxOnlyTool"
         }
     }
     if ok == 1 { sandbox.result_set_ok(out, text) } else { sandbox.result_set_err(out, text) }
+}
+
+// Admission: tools.llm calls are limited per Run (llm_calls_per_run).
+admit_(sp: ptr, name: string, out: ptr) {
+    if name != "llm" { return }
+    s = sp as *RunScope
+    t = s.tools as *Tools
+    n = sync.atomic_add(s.llm_calls, 1 as long)
+    why = llm_call.admit(t.llm, n)
+    if why != "" {
+        r = out as *sandbox.ToolResult
+        r.rejected = 1
+        r.text = why
+    }
 }
 
 // The sandbox Host for one Run of this scope.
@@ -529,6 +569,9 @@ host(sp: @keep ptr) -> ptr {
         call_tool(ctx, name, args, out)
     })
     sandbox.host_set_cancel(h, s.cancel)
+    sandbox.host_set_admit(h, |ctx: ptr, name: string, out: ptr| {
+        admit_(ctx, name, out)
+    })
     return h
 }
 

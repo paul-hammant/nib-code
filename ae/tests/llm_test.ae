@@ -1,0 +1,439 @@
+// Ports the inline tests of upstream src/tools/llm.zig (through llm_test.zig's
+// Mock) and the llm tests of src/tools.zig under their names, on a fake
+// `request` fn (see provider.complete_with), never a network.
+//
+// Adapted, because Codex is not ported (policy):
+//  - "llm defaults to the small model ...": the codex row is dropped; the
+//    other eight rows are upstream's.
+//  - "generated llm options ..." and "configured default model ...": the
+//    codex catalog stands in as the openai one (the nearest built-in
+//    catalog), chat_completions is upstream's.
+//  - "generated llm options ...": `async agent({` is not asserted (the agent
+//    tool is not ported); the rest is.
+// Extra: "llm usage is reported once to the Tools" and the concurrency gate
+// cases, since the gate is a std.sync cell and not a global mutex.
+import std.spec
+import std.string
+import std.strbuilder
+import std.list
+import std.sync
+import std.worker
+import nib.jsonx
+import nib.sandbox
+import nib.tools
+import nib.tools.llm_call
+import nib.provider.types
+
+struct Mock {
+    calls: int
+    invalid: int
+    expected_input: string      // "" none
+    bad: string                 // the first fixture assertion that failed
+    model: string
+    effort: string
+    thinking: int
+    has_schema: int
+    delay_ms: int
+    active: ptr                 // std.sync cell
+    peak: ptr                   // std.sync cell
+}
+
+new_mock_() -> *Mock {
+    m = heap.new(Mock)
+    m.calls = 0
+    m.invalid = 0
+    m.expected_input = ""
+    m.bad = ""
+    m.model = ""
+    m.effort = ""
+    m.thinking = -2
+    m.has_schema = 0
+    m.delay_ms = 0
+    m.active = sync.atomic_new(0)
+    m.peak = sync.atomic_new(0)
+    return m
+}
+
+note_(m: *Mock, what: string) {
+    if m.bad == "" { m.bad = what }
+}
+
+// llm.zig's Mock.complete as a request fn: 11/7/3 usage and the checks.
+fake_(m: *Mock, cfg: ptr, key: string, messages: ptr, tools_json: string, out: ptr) {
+    c = cfg as *types.Config
+    m.calls = m.calls + 1
+    n = list.list_size(messages)
+    if tools_json != "[]" { note_(m, "tool_json ${tools_json}") }
+    if key != "session:llm" { note_(m, "key ${key}") }
+    first, _e = list.get_string(messages, 0)
+    if string.index_of(first, "You are a function called by a program.") < 0 { note_(m, "system ${first}") }
+    if m.expected_input != "" {
+        last, _e2 = list.get_string(messages, n - 1)
+        if string.index_of(last, jsonx.quote(m.expected_input)) < 0 { note_(m, "input ${last}") }
+    }
+    if m.calls > 1 {
+        prev, _e3 = list.get_string(messages, n - 2)
+        if string.index_of(prev, "SyntaxError") < 0 { note_(m, "correction ${prev}") }
+    }
+    m.model = c.model
+    m.effort = c.reasoning_effort
+    m.thinking = c.thinking
+    m.has_schema = 0
+    if c.output_schema != "" { m.has_schema = 1 }
+    text = "plain"
+    if m.calls <= m.invalid { text = "bad raw output {broken" } else if c.output_schema != "" { text = "[1,true,null]" }
+    r = types.reply_new() as *types.Reply
+    r.text = text
+    u = r.usage as *types.Usage
+    u.prompt_tokens = 11 as long
+    u.completion_tokens = 7 as long
+    u.prompt_cache_hit_tokens = 3 as long
+    o = out as *types.Reply
+    o.phase = ""
+    o.text = ""
+    o.tool_calls = r as ptr
+}
+
+// llm_call.invoke over the fixture.
+run_(st: ptr, mp: @keep ptr, args: string, cancel: ptr) -> (int, string) {
+    return llm_call.invoke(st, |cfg: ptr, key: string, messages: ptr, tools_json: string, max_tokens: int, sk: @keep ptr, cn: ptr, out: ptr| {
+        fake_(mp as *Mock, cfg, key, messages, tools_json, out)
+    }, args, cancel)
+}
+
+// A State on a mock-provider Config, "session" as its id.
+state_() -> ptr {
+    st = llm_call.new()
+    llm_call.set_config(st, types.new_config("chat_completions", "", "", "mock"), "session")
+    return st
+}
+
+set_limits_(st: ptr, concurrency: int, per_run: int, kib: int) {
+    l = (llm_call.config_of(st) as *types.Config).limits as *types.Limits
+    l.llm_concurrency = concurrency
+    l.llm_calls_per_run = per_run
+    l.llm_input_kib = kib
+}
+
+repeat_(ch: string, n: int) -> string {
+    sb = strbuilder.new(n + 8)
+    i = 0
+    while i < n {
+        strbuilder.append(sb, ch)
+        i = i + 1
+    }
+    return strbuilder.finish(sb)
+}
+
+has_(s: string, part: string) -> int {
+    if string.index_of(s, part) >= 0 { return 1 }
+    return 0
+}
+
+// The first line of the example following `marker` in `docs`, after "Example: ".
+example_(docs: string, marker: string) -> string {
+    at = string.index_of(docs, marker)
+    if at < 0 { return "" }
+    ex = string.index_of_from(docs, "Example: ", at)
+    if ex < 0 { return "" }
+    start = ex + 9
+    end = string.index_of_from(docs, "\n", start)
+    return string.substring(docs, start, end)
+}
+
+// UTF-8 code points after the first "//" of a line (0 if none).
+comment_chars_(line: string) -> int {
+    at = string.index_of(line, "//")
+    if at < 0 { return 0 }
+    n = 0
+    i = at + 2
+    while i < string.length(line) {
+        c = string.char_at(line, i)
+        if c < 128 || c >= 192 { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// The llm block of rendered docs: from its first comment to its signature line.
+llm_docs_(rendered: string) -> string {
+    start = string.index_of(rendered, "  // Pure single-step")
+    sig = string.index_of_from(rendered, "  async llm(", start)
+    end = string.index_of_from(rendered, "\n", sig)
+    return string.substring(rendered, start, end)
+}
+
+concise_(doc: string, what: string) {
+    lines = string.string_split(doc, "\n")
+    n = string.string_array_size(lines)
+    chars = 0
+    i = 0
+    while i < n {
+        chars = chars + comment_chars_(string.string_array_get(lines, i))
+        i = i + 1
+    }
+    spec.assert_true(chars <= 600, "${what}: ${chars} comment characters")
+}
+
+tools_for_(provider: string, model: string, depth: int) -> ptr {
+    t = tools.new("/unused")
+    (t as *tools.Tools).depth = depth
+    cfg = types.new_config(provider, "", "", model)
+    (cfg as *types.Config).thinking = 1
+    (cfg as *types.Config).reasoning_effort = "high"
+    tools.set_config(t, cfg, "session")
+    return t
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tools.llm") {
+        spec.it("llm serializes arbitrary input separately and accepts legal JSON without schema validation") callback {
+            inputs = ["\"literal\\n🙂\"", "{\"a\":[1,true,null]}", "null", "42"]
+            expected = ["literal\n🙂", "{\"a\":[1,true,null]}", "null", "42"]
+            i = 0
+            while i < 4 {
+                m = new_mock_()
+                m.expected_input = expected[i]
+                st = state_()
+                args = "{\"prompt\":\"extract\",\"input\":${inputs[i]},\"schema\":{\"type\":\"object\"}}"
+                ok, text = run_(st, m as ptr, args, null)
+                spec.assert_eq(ok, 1, "ok ${i}: ${text}")
+                v = jsonx.parse(text)
+                data = jsonx.field(v, "data")
+                spec.assert_eq(jsonx.array_size(data), 3, "data has three items ${i}")
+                u = llm_call.take_usage(st) as *types.Usage
+                spec.assert_eq_long(u.prompt_tokens, 11 as long, "usage ${i}")
+                spec.assert_str_eq(m.bad, "", "fixture checks ${i}")
+                i = i + 1
+            }
+        }
+        spec.it("llm enforces prompt plus serialized input byte boundary without truncation") callback {
+            limits = [256, 1]
+            li = 0
+            while li < 2 {
+                kib = limits[li]
+                m = new_mock_()
+                st = state_()
+                set_limits_(st, 4, 100, kib)
+                text = repeat_("x", kib * 1024)
+                extra = 0
+                while extra < 2 {
+                    args = "{\"prompt\":\"${text}\",\"input\":\"${string.substring(text, 0, extra)}\"}"
+                    ok, out = run_(st, m as ptr, args, null)
+                    if extra == 0 {
+                        spec.assert_eq(ok, 1, "at the limit ${kib}: ${string.substring(out, 0, 80)}")
+                    } else {
+                        spec.assert_eq(ok, 0, "one byte over ${kib}")
+                        spec.assert_true(has_(out, "${kib * 1024} bytes (${kib} KiB)") == 1, "message ${out}")
+                    }
+                    extra = extra + 1
+                }
+                spec.assert_eq(m.calls, 1, "only the in-limit call is sent")
+                li = li + 1
+            }
+        }
+        spec.it("llm retries JSON parsing once with error then rejects with raw snippet and retains usage") callback {
+            n = 1
+            while n <= 2 {
+                m = new_mock_()
+                m.invalid = n
+                m.expected_input = "data"
+                st = state_()
+                ok, text = run_(st, m as ptr, "{\"prompt\":\"extract\",\"input\":\"data\",\"schema\":{}}", null)
+                spec.assert_eq(m.calls, 2, "two attempts ${n}")
+                u = llm_call.take_usage(st) as *types.Usage
+                spec.assert_eq_long(u.prompt_tokens, 22 as long, "usage of both attempts ${n}")
+                spec.assert_str_eq(m.bad, "", "fixture checks ${n}")
+                if n == 1 {
+                    spec.assert_eq(ok, 1, "second attempt parses: ${text}")
+                    v = jsonx.parse(text)
+                    spec.assert_eq_long(jsonx.long_or(jsonx.field(v, "usage"), "prompt_tokens", 0 as long), 22 as long, "reported usage")
+                } else {
+                    spec.assert_eq(ok, 0, "rejected")
+                    spec.assert_true(has_(text, "bad raw output") == 1, "raw output in ${text}")
+                }
+                n = n + 1
+            }
+        }
+        spec.it("llm rejects invalid argument types and effort before sending") callback {
+            m = new_mock_()
+            st = state_()
+            bad = ["{}", "[]", "{\"prompt\":false}", "{\"prompt\":\"x\",\"schema\":[]}", "{\"prompt\":\"x\",\"model\":1}"]
+            i = 0
+            while i < 5 {
+                ok, text = run_(st, m as ptr, bad[i], null)
+                spec.assert_eq(ok, 0, "rejected ${bad[i]}")
+                i = i + 1
+            }
+            ok2, text2 = run_(st, m as ptr, "{\"prompt\":\"x\",\"effort\":\"typo\"}", null)
+            spec.assert_eq(ok2, 0, "typo rejected")
+            spec.assert_str_eq(text2, "InvalidReasoningEffort", "effort error")
+            spec.assert_eq(m.calls, 0, "nothing sent")
+        }
+        spec.it("llm snippet clips UTF-8 at a bounded byte boundary") callback {
+            text = "${repeat_("x", 511)}🙂tail"
+            spec.assert_eq(llm_call.snippet_end(text), 511, "backs up to the boundary")
+            spec.assert_eq(llm_call.snippet_end("short"), 5, "short text whole")
+            spec.assert_eq(llm_call.snippet_end(repeat_("x", 600)), 512, "ASCII at 512")
+        }
+        spec.it("llm defaults to the small model without inheriting effort; explicit model keeps session effort") callback {
+            ids = ["openai", "anthropic", "deepseek", "anthropic", "anthropic", "anthropic", "xai", "custom"]
+            args = ["{\"prompt\":\"x\"}", "{\"prompt\":\"x\"}", "{\"prompt\":\"x\"}", "{\"prompt\":\"x\",\"effort\":\"low\"}", "{\"prompt\":\"x\",\"model\":\"claude-opus-5-5\"}", "{\"prompt\":\"x\",\"model\":\"claude-opus-5-5\",\"effort\":\"medium\"}", "{\"prompt\":\"x\"}", "{\"prompt\":\"x\"}"]
+            models = ["gpt-6-luna", "claude-haiku-5-5", "deepseek-flash", "claude-haiku-5-5", "claude-opus-5-5", "claude-opus-5-5", "main-model", "main-model"]
+            efforts = ["", "", "", "low", "max", "medium", "max", "max"]
+            thinking = [-1, -1, -1, 1, 1, 1, 1, 1]
+            i = 0
+            while i < 8 {
+                m = new_mock_()
+                st = llm_call.new()
+                cfg = types.new_config(ids[i], "", "", "main-model") as *types.Config
+                cfg.thinking = 1
+                cfg.reasoning_effort = "max"
+                llm_call.set_config(st, cfg as ptr, "session")
+                ok, text = run_(st, m as ptr, args[i], null)
+                spec.assert_eq(ok, 1, "ok ${i}: ${text}")
+                spec.assert_str_eq(m.model, models[i], "model ${i}")
+                spec.assert_str_eq(m.effort, efforts[i], "effort ${i}")
+                spec.assert_eq(m.thinking, thinking[i], "thinking ${i}")
+                i = i + 1
+            }
+        }
+        spec.it("llm usage is reported once to the Tools") callback {
+            m = new_mock_()
+            st = state_()
+            ok, text = run_(st, m as ptr, "{\"prompt\":\"a\"}", null)
+            spec.assert_eq(ok, 1, "first")
+            ok, text = run_(st, m as ptr, "{\"prompt\":\"b\"}", null)
+            spec.assert_eq(ok, 1, "second")
+            u = llm_call.take_usage(st) as *types.Usage
+            spec.assert_eq_long(u.prompt_tokens, 22 as long, "both calls")
+            spec.assert_eq_long(u.completion_tokens, 14 as long, "completion")
+            spec.assert_eq_long(u.prompt_cache_hit_tokens, 6 as long, "cache hits")
+            again = llm_call.take_usage(st) as *types.Usage
+            spec.assert_eq_long(again.prompt_tokens, 0 as long, "drained")
+        }
+        spec.it("llm concurrency is bounded by the limit and a canceled wait gives up") callback {
+            m = new_mock_()
+            st = state_()
+            set_limits_(st, 2, 100, 256)
+            peak = sync.atomic_new(0)
+            now = sync.atomic_new(0)
+            done = sync.atomic_new(0)
+            req = |cfg: ptr, key: string, messages: ptr, tools_json: string, max_tokens: int, sk: @keep ptr, cancel: ptr, out: ptr| {
+                n = sync.atomic_add(now, 1 as long)
+                while true {
+                    p = sync.atomic_load(peak)
+                    if n <= p { break }
+                    if sync.atomic_cas(peak, p, n) == 1 { break }
+                }
+                sleep(40)
+                sync.atomic_sub(now, 1 as long)
+                r = types.reply_new() as *types.Reply
+                r.text = "ok"
+                o = out as *types.Reply
+                o.phase = ""
+                o.text = ""
+                o.tool_calls = r as ptr
+            }
+            i = 0
+            while i < 6 {
+                worker.run_detached(|| {
+                    ok, text = llm_call.invoke(st, req, "{\"prompt\":\"p\"}", null)
+                    sync.atomic_add(done, 1 as long)
+                    return null
+                })
+                i = i + 1
+            }
+            while sync.atomic_load(done) < 6 { sleep(5) }
+            spec.assert_eq_long(sync.atomic_load(peak), 2 as long, "never more than 2 in flight, and 2 were")
+            // A full gate and a canceled Run: the waiter returns at once.
+            cancel = sync.atomic_new(1)
+            set_limits_(st, 0, 100, 256)
+            ok, text = llm_call.invoke(st, req, "{\"prompt\":\"p\"}", cancel)
+            spec.assert_eq(ok, 0, "canceled wait fails")
+            spec.assert_str_eq(text, "Canceled", "canceled")
+        }
+        spec.it("llm map documentation example reaches the host byte for byte") callback {
+            t = tools_for_("openai", "gpt-6.1-sol", 0)
+            ex = example_(tools.docs(t), "  // Pure single-step")
+            spec.assert_true(string.length(ex) > 0, "found an example")
+            h = sandbox.new_host(null, "[\"llm\"]", |ctx: ptr, name: string, args: string, out: ptr| {
+                sandbox.result_set_ok(out, args)
+            })
+            r = sandbox.eval(ex, sandbox.limits(), h, null) as *sandbox.Outcome
+            spec.assert_eq(r.ok, 1, "ok: ${r.text}")
+            spec.assert_str_eq(r.text, "[{\"prompt\":\"Classify the input\",\"input\":\"yes\"},{\"prompt\":\"Classify the input\",\"input\":\"no\"}]", "args")
+        }
+        spec.it("llm admission rejects call 101 before dispatch and resets on each Run") callback {
+            t = tools_for_("chat_completions", "m", 0)
+            run = 0
+            codes = ["(await Promise.all(Array.from({length: 100}, () => tools.llm({prompt: 'x'})))).length", "const a = Array.from({length: 101}, () => tools.llm({prompt: 'x'})); await a[100].catch(e => e.message)", "await tools.llm({prompt: 'fresh'})"]
+            texts = ["", "", ""]
+            oks = [0, 0, 0]
+            while run < 3 {
+                scope = tools.new_scope(t, run + 1)
+                h = tools.host(scope) as *sandbox.Host
+                h.call = |ctx: ptr, name: string, args: string, out: ptr| {
+                    sandbox.result_set_ok(out, args)
+                }
+                o = sandbox.eval(codes[run], sandbox.limits(), h as ptr, null) as *sandbox.Outcome
+                texts[run] = o.text
+                oks[run] = o.ok
+                run = run + 1
+            }
+            spec.assert_eq(oks[0], 1, "100 calls ok: ${texts[0]}")
+            spec.assert_str_eq(texts[0], "100", "all 100 resolved")
+            spec.assert_eq(oks[1], 1, "ok: ${texts[1]}")
+            spec.assert_true(has_(texts[1], "100 calls per Run") == 1, "limit in the message: ${texts[1]}")
+            spec.assert_true(has_(texts[1], "filter") == 1, "advice in the message")
+            spec.assert_eq(oks[2], 1, "a fresh Run starts at zero: ${texts[2]}")
+        }
+        spec.it("generated llm options stay concise and follow provider catalog for both depths") callback {
+            ids = ["openai", "chat_completions"]
+            k = 0
+            while k < 2 {
+                depth = 0
+                while depth < 2 {
+                    t = tools_for_(ids[k], "custom\"model\n", depth)
+                    rendered = tools.docs(t)
+                    spec.assert_true(has_(rendered, "{{llm_options}}") == 0, "options filled")
+                    spec.assert_true(has_(rendered, "{{llm_limits}}") == 0, "limits filled")
+                    spec.assert_true(has_(rendered, "effort low/medium/high (else inherit)") == 1, "effort line")
+                    spec.assert_true(has_(rendered, "off may map") == 0, "no off line")
+                    spec.assert_true(has_(rendered, "usage counts toward") == 0, "no usage line")
+                    doc = llm_docs_(rendered)
+                    concise_(doc, "llm docs ${ids[k]}")
+                    spec.assert_true(has_(rendered, "custom\\\"model\\n") == 1, "current model is JSON-escaped")
+                    want_openai = 0
+                    want_chat = 0
+                    if ids[k] == "openai" { want_openai = 1 }
+                    if ids[k] == "chat_completions" { want_chat = 1 }
+                    spec.assert_eq(has_(doc, "gpt-6.1-sol"), want_openai, "openai catalog only for openai")
+                    spec.assert_eq(has_(doc, "deepseek-flash"), want_chat, "default model only for chat_completions")
+                    src = "() => {\n${rendered}}"
+                    r = sandbox.eval(src, sandbox.limits(), null, null) as *sandbox.Outcome
+                    spec.assert_eq(r.ok, 1, "docs parse as JavaScript: ${r.text}")
+                    depth = depth + 1
+                }
+                k = k + 1
+            }
+        }
+        spec.it("configured default model is not duplicated in the model choices") callback {
+            ids = ["openai", "chat_completions"]
+            models = ["gpt-6.1-sol", "deepseek-flash"]
+            k = 0
+            while k < 2 {
+                t = tools_for_(ids[k], models[k], 0)
+                rendered = tools.docs(t)
+                start = string.index_of(rendered, "  // model: ")
+                end = string.index_of_from(rendered, "\n", start)
+                line = string.substring(rendered, start, end)
+                parts = string.string_split(line, models[k])
+                spec.assert_eq(string.string_array_size(parts), 3, "${models[k]} appears twice in: ${line}")
+                k = k + 1
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

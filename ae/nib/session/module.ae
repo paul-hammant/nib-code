@@ -170,7 +170,7 @@ stem_(path: string) -> string {
     return b
 }
 
-new_tools_(cp: ptr, op: ptr) -> ptr {
+new_tools_(cp: @keep ptr, op: ptr) -> ptr {
     c = cp as *types.Config
     o = op as *Options
     t = tools.new(o.user_home)
@@ -179,6 +179,7 @@ new_tools_(cp: ptr, op: ptr) -> ptr {
     tt.depth = o.depth
     tt.track_changes = 1
     tt.self_exe = o.self_exe
+    tools.set_config(t, cp, "")
     if c.sandbox_workspace == 1 { tools.set_workspace(t, 1) }
     i = 0
     while i < list.list_size(c.sandbox_writable) {
@@ -252,6 +253,7 @@ init(cp: @keep ptr, op: @keep ptr) -> (ptr, string, string) {
         ierr = initialize_history_(s, cwd)
         if ierr != "" { return null, ierr, "" }
     }
+    tools.set_config(s.tools, cp, s.id)
     if o.undo_enabled == 1 && s.parent_session_id == "" { tools.enable_undo(s.tools, "${directory}/${s.id}.undo") }
     attach_log_(s as ptr)
     return s as ptr, "", ""
@@ -348,6 +350,19 @@ poll_(s: *Session, sk: ptr) {
         i = i + 1
     }
     progress.drain(t.progress)
+    // tools.llm's usage joins the Turn's as it arrives.
+    llm_usage = tools.take_usage(s.tools) as *types.Usage
+    if llm_usage.prompt_tokens != 0 || llm_usage.completion_tokens != 0 || llm_usage.prompt_cache_hit_tokens != 0 || llm_usage.prompt_cache_write_tokens != 0 {
+        types.usage_add(s.usage, llm_usage as ptr)
+        emit_(sk, usage_event_(s))
+    }
+    lock.release(s.poll_guard)
+}
+
+// Adds a model reply's usage to the Turn's (the poll thread adds tools.llm's).
+add_usage_(s: *Session, u: ptr) {
+    lock.acquire(s.poll_guard)
+    types.usage_add(s.usage, u)
     lock.release(s.poll_guard)
 }
 
@@ -671,7 +686,7 @@ compact_now(sp: @keep ptr, sk: ptr, cancel: ptr, automatic: int) -> (string, str
         o.usage = rr.usage
     })
     if r.usage != null {
-        types.usage_add(s.usage, r.usage)
+        add_usage_(s, r.usage)
         emit_(sk, usage_event_(s))
     }
     if r.err != "" {
@@ -813,7 +828,7 @@ run_steps_(s: *Session, pending: ptr, sk: @keep ptr, cancel: @keep ptr) -> (stri
         model_ms = os.now_monotonic_ms() - step_started
         s.partial_text = ""
         s.partial_reasoning = ""
-        types.usage_add(s.usage, r.usage)
+        add_usage_(s, r.usage)
         emit_(sk, usage_event_(s))
         s.steps = s.steps + 1
         assistant_index = list.list_size(pending)
