@@ -1,0 +1,163 @@
+// session.tool_summary: what one Run called, for run_end events and the log
+// (upstream src/session/tool_summary.zig). Counts per tool name in first
+// dispatch order, the overflow delta, and the unique files/servers touched.
+//
+// Differences from upstream: init() reads a sandbox.timing Run (ptr) instead
+// of a slice of Calls, and the JSON is written by to_json() with the field
+// order events.zig's serializer produces. Not ported: annotateViews (it
+// labels `view` entries with image dimensions; images are not ported).
+
+import std.list
+import std.string
+import std.strbuilder
+import nib.jsonx
+import nib.sandbox.timing
+
+exports(Count, File, Summary, init, empty, clone, to_json)
+
+struct Count {
+    name: string
+    count: long
+}
+
+// duration_ms < 0: absent (then failed is not written either).
+struct File {
+    tool: string
+    path: string
+    duration_ms: long
+    failed: int
+}
+
+struct Summary {
+    counts: ptr     // list of *Count
+    omitted: long
+    files: ptr      // list of *File
+}
+
+empty() -> *Summary {
+    s = heap.new(Summary)
+    s.counts = list.list_new()
+    s.omitted = 0
+    s.files = list.list_new()
+    return s
+}
+
+// The summary of the dispatched calls of Run `run_index` in `run` (a
+// sandbox.timing Run); `omitted` is the overflow delta for that Run.
+init(run: ptr, run_index: int, omitted: long) -> *Summary {
+    s = empty()
+    s.omitted = omitted
+    n = timing.count(run)
+    i = 0
+    while i < n {
+        c = timing.entry(run, i) as *timing.Call
+        if c.dispatched == 1 && c.run_index == run_index {
+            found = 0
+            j = 0
+            while j < list.list_size(s.counts) {
+                item = list.list_get_raw(s.counts, j) as *Count
+                if item.name == c.name {
+                    item.count = item.count + 1
+                    found = 1
+                    break
+                }
+                j = j + 1
+            }
+            if found == 0 {
+                item = heap.new(Count)
+                item.name = string.copy(c.name)
+                item.count = 1
+                list.list_add(s.counts, item as ptr)
+            }
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        c = timing.entry(run, i) as *timing.Call
+        if c.dispatched == 1 && c.run_index == run_index && c.path != "" {
+            dup = 0
+            j = 0
+            while j < list.list_size(s.files) {
+                f = list.list_get_raw(s.files, j) as *File
+                if c.name != "mcp" && f.tool == c.name && f.path == c.path {
+                    dup = 1
+                    break
+                }
+                j = j + 1
+            }
+            if dup == 0 {
+                f = heap.new(File)
+                f.tool = string.copy(c.name)
+                f.path = string.copy(c.path)
+                f.duration_ms = -1
+                f.failed = 0
+                if c.name == "mcp" {
+                    d = c.end_ms - c.start_ms
+                    if d < 0 { d = 0 }
+                    f.duration_ms = d
+                    if c.ok == 0 { f.failed = 1 }
+                }
+                list.list_add(s.files, f as ptr)
+            }
+        }
+        i = i + 1
+    }
+    return s
+}
+
+// A deep copy.
+clone(s: *Summary) -> *Summary {
+    out = empty()
+    out.omitted = s.omitted
+    i = 0
+    while i < list.list_size(s.counts) {
+        item = list.list_get_raw(s.counts, i) as *Count
+        c = heap.new(Count)
+        c.name = string.copy(item.name)
+        c.count = item.count
+        list.list_add(out.counts, c as ptr)
+        i = i + 1
+    }
+    i = 0
+    while i < list.list_size(s.files) {
+        file = list.list_get_raw(s.files, i) as *File
+        f = heap.new(File)
+        f.tool = string.copy(file.tool)
+        f.path = string.copy(file.path)
+        f.duration_ms = file.duration_ms
+        f.failed = file.failed
+        list.list_add(out.files, f as ptr)
+        i = i + 1
+    }
+    return out
+}
+
+// {"counts":[{"name":..,"count":..}],"omitted":N,"files":[{"tool":..,"path":..[,"duration_ms":..,"failed":..]}]}
+to_json(s: *Summary) -> string {
+    b = strbuilder.new(128)
+    strbuilder.append(b, "{\"counts\":[")
+    i = 0
+    while i < list.list_size(s.counts) {
+        item = list.list_get_raw(s.counts, i) as *Count
+        if i > 0 { strbuilder.append(b, ",") }
+        strbuilder.append(b, "{\"name\":${jsonx.quote(item.name)},\"count\":${item.count}}")
+        i = i + 1
+    }
+    strbuilder.append(b, "],\"omitted\":${s.omitted},\"files\":[")
+    i = 0
+    while i < list.list_size(s.files) {
+        file = list.list_get_raw(s.files, i) as *File
+        if i > 0 { strbuilder.append(b, ",") }
+        strbuilder.append(b, "{\"tool\":${jsonx.quote(file.tool)},\"path\":${jsonx.quote(file.path)}")
+        if file.duration_ms >= 0 {
+            failed = "false"
+            if file.failed == 1 { failed = "true" }
+            strbuilder.append(b, ",\"duration_ms\":${file.duration_ms},\"failed\":${failed}")
+        }
+        strbuilder.append(b, "}")
+        i = i + 1
+    }
+    strbuilder.append(b, "]}")
+    return strbuilder.finish(b)
+}

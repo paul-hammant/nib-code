@@ -1,0 +1,328 @@
+// auth: where each service's key comes from and what the UI says about it
+// (upstream src/auth.zig and src/auth/cli.zig, API keys only).
+// Precedence: environment key, then nib's `auth.json`. Keys never leave this
+// module in text meant for people: describe() and the service status name the
+// SOURCE (an environment variable, "key stored by nib"), never the key.
+//
+// Not ported, by policy (API keys only): the Codex login (oauth, device flow,
+// the Codex CLI's auth.json, CODEX_HOME, `nib login codex`, `--device`).
+//
+// login()/logout() are the `nib login` / `nib logout` commands without any
+// terminal I/O of their own. They return (exit_code, stdout_text, stderr_text);
+// main prints the two texts and exits with the code. login asks for input
+// through two closures main supplies:
+//   read_line(prompt: string) -> string   shows `prompt` on stdout, flushes, reads one line
+//   read_secret(prompt: string) -> string the same with the terminal echo off when stdin is a tty
+// Both return the line without its newline, or EOF_LINE ("\n", which no line
+// can contain) at end of input. Errors come back as stderr "nib: <message>\n"
+// with the message text of upstream's main.zig errorMessage.
+
+import std.string
+import std.list
+import nib.config
+import nib.config.env
+import nib.provider.types
+import nib.auth.store
+
+exports(Service, SignOut, EOF_LINE, USAGE_LOGIN, services, find, known_service, describe, set_key,
+        sign_out, sign_out_text, env_key, login, logout)
+
+const EOF_LINE = "\n"
+const USAGE_LOGIN = "Usage: nib login [service]"
+
+struct Service {
+    id: string
+    name: string
+    custom: int
+    signed_in: int            // requests can be sent now
+    stored: int               // nib itself holds a key that sign-out would remove
+    status: string
+}
+
+struct SignOut {
+    removed: int              // nib's own credential was removed
+    env_name: string          // "" or the variable a key still comes from
+}
+
+// The first variable of `names` (a list) that is set to something, or "".
+env_key(envp: ptr, names: ptr) -> string {
+    i = 0
+    while i < list.list_size(names) {
+        n, _g = list.get_string(names, i)
+        if string.length(env.get(envp, n)) > 0 { return string.copy(n) }
+        i = i + 1
+    }
+    return ""
+}
+
+stored_key_(home: string, id: string) -> int {
+    doc, err = store.load(store.path(home))
+    if err != "" { return 0 }
+    k = store.key(doc, id)
+    store.free(doc)
+    if k == "" { return 0 }
+    return 1
+}
+
+// "https://h.example/v1" -> "h.example".
+host_(base_url: string) -> string {
+    rest = base_url
+    ix = string.index_of(base_url, "://")
+    if ix >= 0 { rest = string.substring(base_url, ix + 3, string.length(base_url)) }
+    i = 0
+    while i < string.length(rest) {
+        c = string.char_at(rest, i)
+        if c == 47 || c == 63 || c == 35 { return string.substring(rest, 0, i) }
+        i = i + 1
+    }
+    return rest
+}
+
+service_new_(id: string, name: string, custom: int, signed_in: int, stored: int, status: string) -> ptr {
+    s = heap.new(Service)
+    s.id = id
+    s.name = name
+    s.custom = custom
+    s.signed_in = signed_in
+    s.stored = stored
+    s.status = status
+    return s as ptr
+}
+
+// Built-in services in menu order, then custom ones: (list of *Service, error name).
+services(envp: ptr, home: string) -> (ptr, string) {
+    out = list.list_new()
+    order = config.startup_order()
+    i = 0
+    while i < list.list_size(order) {
+        id, _g = list.get_string(order, i)
+        i = i + 1
+        from_env = env_key(envp, types.definition_key_envs(id))
+        st = stored_key_(home, id)
+        signed_in = 0
+        if from_env != "" || st == 1 { signed_in = 1 }
+        status = "—"
+        if from_env != "" {
+            status = from_env
+        } else if st == 1 {
+            status = "key stored"
+        }
+        list.list_add_raw(out, service_new_(string.copy(id), types.definition_name(id), 0, signed_in, st, status))
+    }
+    customs, err = config.custom_providers(home)
+    if err != "" { return null, err }
+    j = 0
+    while j < list.list_size(customs) {
+        cu = list.list_get_raw(customs, j) as *config.Custom
+        j = j + 1
+        env_set = 0
+        if cu.api_key_env != "" {
+            one = list.list_new()
+            list.list_add(one, cu.api_key_env)
+            if env_key(envp, one) != "" { env_set = 1 }
+        }
+        st = stored_key_(home, cu.id)
+        signed_in = 0
+        if cu.api_key_env == "" || env_set == 1 || st == 1 { signed_in = 1 }
+        h = host_(cu.base_url)
+        status = h
+        if signed_in == 0 { status = "${h} · no key" }
+        list.list_add_raw(out, service_new_(string.copy(cu.id), string.copy(cu.id), 1, signed_in, st, status))
+    }
+    return out, ""
+}
+
+// The service with this id, or null.
+find(services_list: ptr, id: string) -> ptr {
+    i = 0
+    while i < list.list_size(services_list) {
+        s = list.list_get_raw(services_list, i) as *Service
+        if s.id == id { return s as ptr }
+        i = i + 1
+    }
+    return null
+}
+
+known_service(services_list: ptr, id: string) -> int {
+    if find(services_list, id) == null { return 0 }
+    return 1
+}
+
+// One line for /status; never contains a key.
+describe(cp: ptr) -> string {
+    c = cp as *types.Config
+    if c.key_source == "env" {
+        if c.api_key_env != "" { return "key from ${c.api_key_env}" }
+        return "key from environment"
+    }
+    if c.key_source == "store" { return "key stored by nib" }
+    if types.missing_key(cp) == 1 { return "no key" }
+    return "no key needed"
+}
+
+// Stores `key` for service `id` in $home/auth.json (mode 0600). "" or the error name.
+set_key(home: string, id: string, key_text: string) -> string {
+    file = store.path(home)
+    doc, err = store.load(file)
+    if err != "" { return err }
+    store.set_key(doc, id, key_text)
+    serr = store.save_secret(doc, file)
+    store.free(doc)
+    return serr
+}
+
+// Removes nib's own key for `id` (and nothing else); reports a key that still
+// comes from the environment. (*SignOut, error name).
+sign_out(envp: ptr, home: string, id: string) -> (ptr, string) {
+    file = store.path(home)
+    doc, err = store.load(file)
+    if err != "" { return null, err }
+    removed = store.remove_key(doc, id)
+    if removed == 1 {
+        serr = store.save_secret(doc, file)
+        if serr != "" {
+            store.free(doc)
+            return null, serr
+        }
+    }
+    store.free(doc)
+    names = types.definition_key_envs(id)
+    env_name = env_key(envp, names)
+    if env_name == "" {
+        customs, cerr = config.custom_providers(home)
+        if cerr == "" {
+            i = 0
+            while i < list.list_size(customs) {
+                cu = list.list_get_raw(customs, i) as *config.Custom
+                i = i + 1
+                if cu.id == id && cu.api_key_env != "" {
+                    one = list.list_new()
+                    list.list_add(one, cu.api_key_env)
+                    env_name = env_key(envp, one)
+                }
+            }
+        }
+    }
+    so = heap.new(SignOut)
+    so.removed = removed
+    so.env_name = env_name
+    return so as ptr, ""
+}
+
+// The confirmation after signing out; says what is left behind.
+sign_out_text(name: string, op: ptr) -> string {
+    o = op as *SignOut
+    t = "${name} · nothing stored by nib"
+    if o.removed == 1 { t = "${name} · signed out" }
+    if o.env_name != "" { t = "${t} · key still set in ${o.env_name}" }
+    return t
+}
+
+// ---- nib login / nib logout ---------------------------------------------
+
+trim_nl_(s: string) -> string {
+    a = 0
+    b = string.length(s)
+    while a < b && ws_(string.char_at(s, a)) == 1 { a = a + 1 }
+    while b > a && ws_(string.char_at(s, b - 1)) == 1 { b = b - 1 }
+    return string.substring(s, a, b)
+}
+
+ws_(c: int) -> int {
+    if c == 32 || c == 9 || c == 13 || c == 10 { return 1 }
+    return 0
+}
+
+pad_(s: string, n: int) -> string {
+    out = s
+    while string.length(out) < n { out = "${out} " }
+    return out
+}
+
+// A decimal count, or -1.
+number_(s: string) -> int {
+    n = string.length(s)
+    if n == 0 || n > 9 { return -1 }
+    v = 0
+    i = 0
+    while i < n {
+        c = string.char_at(s, i)
+        if c < 48 || c > 57 { return -1 }
+        v = v * 10 + (c - 48)
+        i = i + 1
+    }
+    return v
+}
+
+failure_(message_text: string) -> (int, string, string) {
+    return 1, "", "nib: ${message_text}\n"
+}
+
+const INVALID_ARGUMENTS = "Invalid arguments · run nib --help"
+const UNKNOWN_SERVICE = "Unknown service · run nib login to list services"
+
+// `nib login [service]`: a service name or its menu number, then its key.
+login(home: string, envp: ptr, args: ptr, read_line: fn, read_secret: fn) -> (int, string, string) {
+    wanted = ""
+    have = 0
+    i = 0
+    while i < list.list_size(args) {
+        a, _g = list.get_string(args, i)
+        i = i + 1
+        if string.starts_with(a, "-") == 1 { return failure_(INVALID_ARGUMENTS) }
+        if have == 1 { return failure_(INVALID_ARGUMENTS) }
+        wanted = string.copy(a)
+        have = 1
+    }
+    svcs, err = services(envp, home)
+    if err != "" { return failure_(err) }
+    if have == 0 {
+        menu = ""
+        k = 0
+        while k < list.list_size(svcs) {
+            sv = list.list_get_raw(svcs, k) as *Service
+            menu = "${menu}${k + 1}  ${pad_(sv.name, 12)} ${sv.status}\n"
+            k = k + 1
+        }
+        string line = call(read_line, "${menu}Service (name or number): ")
+        if line == EOF_LINE { return failure_(INVALID_ARGUMENTS) }
+        wanted = trim_nl_(line)
+        n = number_(wanted)
+        if n >= 1 && n <= list.list_size(svcs) {
+            pick = list.list_get_raw(svcs, n - 1) as *Service
+            wanted = string.copy(pick.id)
+        }
+    }
+    svc = find(svcs, wanted)
+    if svc == null {
+        j = 0
+        while j < list.list_size(svcs) {
+            item = list.list_get_raw(svcs, j) as *Service
+            if string.to_lower(item.name) == string.to_lower(wanted) { svc = item as ptr }
+            j = j + 1
+        }
+    }
+    if svc == null { return failure_(UNKNOWN_SERVICE) }
+    s = svc as *Service
+    string secret = call(read_secret, "${s.name} API key: ")
+    if secret == EOF_LINE { return failure_(INVALID_ARGUMENTS) }
+    key_text = trim_nl_(secret)
+    if string.length(key_text) == 0 { return failure_("API key cannot be empty") }
+    serr = set_key(home, s.id, key_text)
+    if serr != "" { return failure_(serr) }
+    return 0, "${s.name} · key stored\n", ""
+}
+
+// `nib logout <service>`.
+logout(home: string, envp: ptr, args: ptr) -> (int, string, string) {
+    if list.list_size(args) != 1 { return failure_(INVALID_ARGUMENTS) }
+    id, _g = list.get_string(args, 0)
+    svcs, err = services(envp, home)
+    if err != "" { return failure_(err) }
+    svc = find(svcs, id)
+    if svc == null { return failure_(UNKNOWN_SERVICE) }
+    s = svc as *Service
+    out, oerr = sign_out(envp, home, s.id)
+    if oerr != "" { return failure_(oerr) }
+    return 0, "${sign_out_text(s.name, out)}\n", ""
+}

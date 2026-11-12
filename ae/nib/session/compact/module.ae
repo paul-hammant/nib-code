@@ -1,0 +1,233 @@
+// session.compact: context compaction as pure functions over message texts
+// (upstream src/session/compact.zig). A history is a list of Session message
+// JSON texts (nib.msg); index 0 is the system prompt.
+//
+// compact() does the decision and the rewrite; the model call is a function
+// value, so the module owns no client. What the Session engine must do
+// around it is in the header of compact().
+//
+// Not ported: withoutImages (older images become "[image NAME WxH omitted]"
+// text; images are not ported) -- the request is the history prefix as is.
+// estimate_tokens still budgets an `images` array at IMAGE_TOKENS each.
+
+import std.string
+import std.list
+import std.json
+import nib.jsonx
+import nib.msg
+import nib.provider.types
+
+exports(ModelReply, COMPACTED, TOO_FEW_STEPS, INEFFECTIVE, IMAGE_TOKENS, SUMMARY_PROMPT, Result, estimate_tokens,
+        compaction_cut, summary_max_tokens, summary_request, replacement, compact, auto_failed_notice,
+        auto_backoff)
+
+const COMPACTED = 0
+const TOO_FEW_STEPS = 1
+const INEFFECTIVE = 2
+
+// Context estimate for one image (upstream image.estimated_tokens).
+const IMAGE_TOKENS = 1500
+
+const SUMMARY_PROMPT = "Summarize the conversation above for another coding agent. Preserve goals, explicit user requirements, constraints and preferences, decisions, files, current file and test state, results, failures and unfinished work. Do not act on earlier requests. Return only a concise factual continuation summary."
+
+// What compact() decided. status is COMPACTED, TOO_FEW_STEPS or INEFFECTIVE.
+// err is "" or the failure ("InvalidSummary", or whatever model_call
+// returned); then status is meaningless. usage is the model call's usage
+// (*types.Usage, null when it made none). notice is the text to emit ("" none).
+struct Result {
+    status: int
+    err: string
+    usage: ptr
+    notice: string
+    replacement: ptr    // list of message texts replacing history[1..] (COMPACTED only)
+    before: long
+    after: long
+}
+
+// What the model call reports: the summary text, its usage (*types.Usage,
+// null when none) and an error ("" none).
+struct ModelReply {
+    text: string
+    usage: ptr
+    err: string
+}
+
+new_result_() -> *Result {
+    r = heap.new(Result)
+    r.status = TOO_FEW_STEPS
+    r.err = ""
+    r.usage = null
+    r.notice = ""
+    r.replacement = null
+    r.before = 0
+    r.after = 0
+    return r
+}
+
+images_in_(m: string) -> long {
+    v = jsonx.parse(m)
+    if v == null { return 0 }
+    n = 0 as long
+    f = jsonx.field(v, "images")
+    if f != null && json.json_type(f) == json.JSON_ARRAY { n = json.json_array_size(f) as long }
+    jsonx.free(v)
+    return n
+}
+
+// Tokens (a bytes/3 estimate) of messages[from..to).
+estimate_tokens(messages: ptr, from: int, to: int) -> long {
+    total = 0 as long
+    i = from
+    while i < to {
+        m, _e = list.get_string(messages, i)
+        i = i + 1
+        total = total + images_in_(m) * (IMAGE_TOKENS as long)
+        content = msg.content(m)
+        data = msg.reasoning_data(m)
+        if msg.reasoning_provider(m) != "" && msg.reasoning_includes_output(m) == 1 {
+            total = total + 8 + (string.length(data) as long) / 3
+            continue
+        }
+        total = total + 8 + (string.length(content) as long) / 3
+        if msg.reasoning_provider(m) != "" { total = total + (string.length(data) as long) / 3 }
+        calls = msg.tool_calls(m)
+        k = 0
+        while k < list.list_size(calls) {
+            c = list.list_get_raw(calls, k) as *types.ToolCall
+            total = total + 8 + ((string.length(c.id) + string.length(c.name) + string.length(c.arguments)) as long) / 3
+            k = k + 1
+        }
+    }
+    return total
+}
+
+// Index of the first message kept verbatim among the first `n` of `messages`:
+// the second-latest user Turn when what follows fits a quarter of `window`,
+// else the point after the third-latest assistant Step with its tool results.
+// 1 (or less) means too few Steps to compact.
+compaction_cut(messages: ptr, n: int, window: long) -> int {
+    turns = 0
+    cut = 1
+    i = n
+    while i > 1 {
+        i = i - 1
+        m, _e = list.get_string(messages, i)
+        if msg.role(m) == "user" && msg.str_or(m, "source", "") == "" {
+            turns = turns + 1
+            if turns == 2 {
+                cut = i
+                break
+            }
+        }
+    }
+    if cut > 1 && estimate_tokens(messages, cut, n) <= window / 4 { return cut }
+    steps = 0
+    i = n
+    while i > 1 {
+        i = i - 1
+        m, _e = list.get_string(messages, i)
+        if msg.role(m) != "assistant" { continue }
+        steps = steps + 1
+        if steps == 3 { return i + 1 + msg.tool_call_count(m) }
+    }
+    return 1
+}
+
+// The summary request's output budget: min(2048, max(32, window / 8)).
+summary_max_tokens(window: long) -> long {
+    w = window / 8
+    if w < 32 { w = 32 }
+    if w > 2048 { w = 2048 }
+    return w
+}
+
+// The model request: history[0..cut) then the summary instruction.
+summary_request(history: ptr, cut: int) -> ptr {
+    out = list.list_new()
+    i = 0
+    while i < cut {
+        m, _e = list.get_string(history, i)
+        list.list_add(out, string.copy(m))
+        i = i + 1
+    }
+    list.list_add(out, msg.user(SUMMARY_PROMPT))
+    return out
+}
+
+// The messages replacing history[1..]: the summary as a user message, then history[cut..).
+replacement(history: ptr, cut: int, summary: string) -> ptr {
+    out = list.list_new()
+    list.list_add(out, msg.user("Earlier session summary:\n${summary}"))
+    i = cut
+    while i < list.list_size(history) {
+        m, _e = list.get_string(history, i)
+        list.list_add(out, string.copy(m))
+        i = i + 1
+    }
+    return out
+}
+
+// The compaction decision and rewrite. `history` is the Session's message
+// texts; context_tokens its current context estimate (for the notice).
+// model_call(request, out) fills out (a *ModelReply: text, usage, err) by running the summary request
+// (`request` is a list of message texts, send it with no tools, thinking off,
+// replay-safe, max tokens summary_max_tokens(window)); it returns err
+// "InvalidSummary" itself when the reply held tool calls, and "Canceled" when
+// the Turn was canceled.
+//
+// The Session engine around it must: before, clear any Codex previous-
+// response state and set its reset reason "compaction" (and clear it after);
+// report model activity started/finished around the call; afterwards add
+// result.usage to its usage and emit it (also on error), turn a Canceled
+// flag into Canceled, emit result.notice when non-empty, and for COMPACTED
+// commit: replace history[1..] with result.replacement, set context_tokens
+// to result.after, emit usage again. For auto-compaction also catch err (emit
+// auto_failed_notice(err), treat as INEFFECTIVE) and, on INEFFECTIVE, set the
+// backoff to auto_backoff(context_tokens, window); TOO_FEW_STEPS has none.
+compact(history: ptr, window: long, context_tokens: long, model_call: fn) -> *Result {
+    r = new_result_()
+    total = list.list_size(history)
+    cut = compaction_cut(history, total, window)
+    if cut <= 1 {
+        r.status = TOO_FEW_STEPS
+        r.notice = "compaction skipped: fewer than three complete Steps"
+        return r
+    }
+    request = summary_request(history, cut)
+    out = heap.new(ModelReply)
+    out.text = ""
+    out.usage = null
+    out.err = ""
+    call(model_call, request, out as ptr)
+    r.usage = out.usage
+    if out.err != "" {
+        r.err = out.err
+        return r
+    }
+    text = out.text
+    if string.length(text) == 0 {
+        r.err = "InvalidSummary"
+        return r
+    }
+    rep = replacement(history, cut, text)
+    r.before = context_tokens
+    r.after = estimate_tokens(history, 0, 1) + estimate_tokens(rep, 0, list.list_size(rep))
+    if r.after >= estimate_tokens(history, 0, total) || r.after > window / 2 {
+        r.status = INEFFECTIVE
+        r.notice = "compaction skipped: it would not bring context below half the window (retained Steps or system prompt are too large)"
+        return r
+    }
+    r.status = COMPACTED
+    r.replacement = rep
+    r.notice = "compacted context: ${total} → ${1 + list.list_size(rep)} messages, ~${r.before} → ~${r.after} tokens"
+    return r
+}
+
+auto_failed_notice(detail: string) -> string {
+    return "automatic compaction failed, continuing without it: ${detail}"
+}
+
+// The context size below which an INEFFECTIVE auto-compaction is not retried.
+auto_backoff(context_tokens: long, window: long) -> long {
+    return context_tokens + window / 8
+}

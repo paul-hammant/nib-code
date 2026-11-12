@@ -1,0 +1,311 @@
+// Ports the tests of upstream src/auth.zig and src/auth/store.zig, API keys
+// only. Skipped, with the reason:
+//   store.zig "timestamps are RFC 3339"  the timestamp serves only the Codex
+//                                        OAuth `last_refresh` field (not ported)
+// Adapted: the Codex rows and token halves of "service status names sources
+// and never keys", "sign out removes only nib's credential and reports the
+// rest" and "store round trip ..." / "invalid files ..." are dropped; every
+// other assertion is kept. The login/logout tests at the end are new (the
+// port's `nib login` / `nib logout` are functions returning their output).
+import std.spec
+import std.fs
+import std.json
+import std.list
+import std.string
+import nib.sysgap
+import nib.config.env
+import nib.provider.types
+import nib.auth
+import nib.auth.store
+
+tmp_() -> string {
+    d, _e = fs.make_temp_dir("", "nib-auth")
+    real, _k, _m = fs.realpath(d)
+    return real
+}
+
+read_(p: string) -> string {
+    s, _e = fs.read(p)
+    return s
+}
+
+mode_(p: string) -> int {
+    st = sysgap.new_stat()
+    sysgap.stat(p, 1, st)
+    return ((st as *sysgap.Stat).mode) & 4095
+}
+
+contains_(s: string, part: string) -> int {
+    if string.index_of(s, part) >= 0 { return 1 }
+    return 0
+}
+
+file_count_(d: string) -> int {
+    l, _e = fs.list_dir(d)
+    return fs.dir_list_count(l)
+}
+
+svc_(l: ptr, i: int) -> *auth.Service { return list.list_get_raw(l, i) as *auth.Service }
+
+// A prompt-free stand-in for main's terminal closures: answers come from a list.
+answers_(items: @keep ptr) -> fn {
+    return |prompt: string| {
+        if list.list_size(items) == 0 { return auth.EOF_LINE }
+        a, _g = list.get_string(items, 0)
+        list.list_remove(items, 0)
+        return string.copy(a)
+    }
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "auth") {
+        spec.it("service status names sources and never keys") callback {
+            d = tmp_()
+            e = env.new()
+            env.set(e, "HOME", d)
+            env.set(e, "ANTHROPIC_API_KEY", "secret-env-value")
+            fs.write("${d}/auth.json", "{\"keys\":{\"deepseek\":\"secret-stored-value\",\"site\":\"secret-site\"}}")
+            fs.write("${d}/config.toml", "[providers.site]\nprotocol = \"responses\"\nbase_url = \"https://models.example.com/v1\"\nmodel = \"m\"\ncontext_window = 9\napi_key_env = \"SITE_KEY\"\n[providers.local]\nprotocol = \"responses\"\nbase_url = \"http://localhost:8080\"\nmodel = \"m\"\ncontext_window = 9\n[providers.gated]\nprotocol = \"responses\"\nbase_url = \"http://gated.test\"\nmodel = \"m\"\ncontext_window = 9\napi_key_env = \"GATED_KEY\"\n")
+            l, err = auth.services(e, d)
+            spec.assert_str_eq(err, "", "no error")
+            ids = ["anthropic", "openai", "deepseek", "xai", "site", "local", "gated"]
+            statuses = ["ANTHROPIC_API_KEY", "—", "key stored", "—", "models.example.com", "localhost:8080", "gated.test · no key"]
+            spec.assert_eq(list.list_size(l), 7, "services")
+            i = 0
+            while i < 7 {
+                spec.assert_str_eq(svc_(l, i).id, ids[i], "id ${i}")
+                spec.assert_str_eq(svc_(l, i).status, statuses[i], "status ${i}")
+                spec.assert_eq(contains_(svc_(l, i).status, "secret"), 0, "no secret in status ${i}")
+                i = i + 1
+            }
+            spec.assert_true(svc_(l, 0).signed_in == 1 && svc_(l, 1).signed_in == 0 && svc_(l, 2).signed_in == 1 && svc_(l, 3).signed_in == 0, "built-in signed in")
+            spec.assert_true(svc_(l, 2).stored == 1 && svc_(l, 4).stored == 1 && svc_(l, 0).stored == 0, "stored")
+            spec.assert_true(svc_(l, 5).signed_in == 1 && svc_(l, 6).signed_in == 0, "custom signed in")
+            spec.assert_str_eq(svc_(l, 0).name, "Anthropic", "display name")
+            fs.remove_tree(d)
+        }
+        spec.it("sign out removes only nib's credential and reports the rest") callback {
+            d = tmp_()
+            e = env.new()
+            env.set(e, "HOME", d)
+            env.set(e, "OPENAI_API_KEY", "env-fake")
+            spec.assert_str_eq(auth.set_key(d, "openai", "stored-fake"), "", "set openai")
+            spec.assert_str_eq(auth.set_key(d, "xai", "stored-fake"), "", "set xai")
+            o, err = auth.sign_out(e, d, "openai")
+            spec.assert_str_eq(err, "", "no error")
+            spec.assert_eq((o as *auth.SignOut).removed, 1, "removed")
+            spec.assert_str_eq((o as *auth.SignOut).env_name, "OPENAI_API_KEY", "env name")
+            o2, _e2 = auth.sign_out(e, d, "openai")
+            spec.assert_eq((o2 as *auth.SignOut).removed, 0, "second removal finds nothing")
+            o3, _e3 = auth.sign_out(e, d, "xai")
+            spec.assert_true((o3 as *auth.SignOut).removed == 1 && (o3 as *auth.SignOut).env_name == "", "xai removed, no env key")
+            spec.assert_str_eq(auth.sign_out_text("OpenAI", o), "OpenAI · signed out · key still set in OPENAI_API_KEY", "text")
+            spec.assert_str_eq(auth.sign_out_text("OpenAI", o2), "OpenAI · nothing stored by nib · key still set in OPENAI_API_KEY", "text 2")
+            spec.assert_str_eq(auth.sign_out_text("xAI", o3), "xAI · signed out", "text 3")
+            fs.remove_tree(d)
+        }
+        spec.it("sign out keeps unknown fields and other services' keys") callback {
+            d = tmp_()
+            e = env.new()
+            fs.write("${d}/auth.json", "{\"future\":{\"a\":[1,2]},\"keys\":{\"openai\":\"o\",\"xai\":\"x\"}}")
+            o, _e1 = auth.sign_out(e, d, "openai")
+            spec.assert_eq((o as *auth.SignOut).removed, 1, "removed")
+            doc, err = store.load("${d}/auth.json")
+            spec.assert_str_eq(err, "", "loads")
+            spec.assert_str_eq(store.key(doc, "xai"), "x", "other key kept")
+            spec.assert_str_eq(store.key(doc, "openai"), "", "key gone")
+            spec.assert_eq(jsonx_has_(store.root(doc), "future"), 1, "unknown field kept")
+            store.free(doc)
+            fs.remove_tree(d)
+        }
+        spec.it("describe names the credential source") callback {
+            cp = types.new_config("anthropic", "", "sk-zzz-secret", "m")
+            c = cp as *types.Config
+            c.key_source = "env"
+            c.api_key_env = "ANTHROPIC_API_KEY"
+            spec.assert_str_eq(auth.describe(cp), "key from ANTHROPIC_API_KEY", "env")
+            spec.assert_eq(contains_(auth.describe(cp), "sk-zzz-secret"), 0, "env text never the key")
+            c.key_source = "store"
+            spec.assert_str_eq(auth.describe(cp), "key stored by nib", "store")
+            spec.assert_eq(contains_(auth.describe(cp), "sk-zzz-secret"), 0, "store text never the key")
+            c.key_source = "none"
+            c.api_key = ""
+            spec.assert_str_eq(auth.describe(cp), "no key", "none")
+        }
+        spec.it("store round trip keeps unknown fields, mode 0600 and removes cleanly") callback {
+            d = tmp_()
+            p = "${d}/nib/auth.json"
+            doc, err = store.load(p)
+            spec.assert_str_eq(err, "", "missing file is empty")
+            spec.assert_eq(json.object_size(store.root(doc)), 0, "empty")
+            store.set_key(doc, "anthropic", "fake-key-1")
+            json.set(store.root(doc), "future", json.from_int(7 as long))
+            spec.assert_str_eq(store.save_secret(doc, p), "", "saved")
+            store.free(doc)
+            again, _e = store.load(p)
+            spec.assert_str_eq(store.key(again, "anthropic"), "fake-key-1", "key")
+            spec.assert_str_eq(store.key(again, "openai"), "", "absent key")
+            spec.assert_eq(json.json_get_int(json.object_get_raw(store.root(again), "future")), 7, "unknown field kept")
+            spec.assert_str_eq(store.save(again, p), "", "saved again")
+            spec.assert_eq(store.remove_key(again, "anthropic"), 1, "removed")
+            spec.assert_eq(store.remove_key(again, "anthropic"), 0, "removed twice")
+            spec.assert_str_eq(store.save(again, p), "", "saved after removal")
+            spec.assert_eq(mode_(p), 384, "0600 for a new file")
+            fs.chmod(p, 420)
+            spec.assert_str_eq(store.save(again, p), "", "plain save")
+            spec.assert_eq(mode_(p), 420, "an existing file keeps its mode")
+            spec.assert_str_eq(store.save_secret(again, p), "", "secret save")
+            spec.assert_eq(mode_(p), 384, "secret save leaves 0600")
+            third, _e3 = store.load(p)
+            spec.assert_str_eq(store.key(third, "anthropic"), "", "key removed on disk")
+            spec.assert_eq(jsonx_has_(store.root(third), "future"), 1, "unknown field survived every save")
+            store.free(again)
+            store.free(third)
+            fs.remove_tree(d)
+        }
+        spec.it("invalid files are errors and incomplete tokens are ignored") callback {
+            d = tmp_()
+            fs.write("${d}/auth.json", "[1]")
+            doc, err = store.load("${d}/auth.json")
+            spec.assert_str_eq(err, "InvalidAuthFile", "not an object")
+            spec.assert_true(doc == null, "no document")
+            fs.write("${d}/auth.json", "not json")
+            doc2, err2 = store.load("${d}/auth.json")
+            spec.assert_str_eq(err2, "InvalidAuthFile", "not json")
+            spec.assert_true(doc2 == null, "no document 2")
+            // Codex `tokens` are not read at all; a file that has them is still a store.
+            fs.write("${d}/auth.json", "{\"tokens\":{\"access_token\":\"x\"}}")
+            doc3, err3 = store.load("${d}/auth.json")
+            spec.assert_str_eq(err3, "", "tokens are just an unknown field")
+            spec.assert_str_eq(store.key(doc3, "tokens"), "", "no key")
+            store.free(doc3)
+            fs.remove_tree(d)
+        }
+        spec.it("save leaves no temporary files behind and replaces atomically") callback {
+            d = tmp_()
+            p = "${d}/auth.json"
+            i = 0
+            while i < 3 {
+                doc, _e = store.load(p)
+                store.set_key(doc, "k", "v${i}")
+                spec.assert_str_eq(store.save(doc, p), "", "save ${i}")
+                store.free(doc)
+                i = i + 1
+            }
+            spec.assert_eq(file_count_(d), 1, "only auth.json is left")
+            last, _e2 = store.load(p)
+            spec.assert_str_eq(store.key(last, "k"), "v2", "last value")
+            store.free(last)
+            fs.remove_tree(d)
+        }
+        spec.it("a stored key is empty text, never a null or a non-string") callback {
+            d = tmp_()
+            fs.write("${d}/auth.json", "{\"keys\":{\"a\":\"\",\"b\":5,\"c\":\"ok\"},\"nonobject\":1}")
+            doc, _e = store.load("${d}/auth.json")
+            spec.assert_str_eq(store.key(doc, "a"), "", "empty key is none")
+            spec.assert_str_eq(store.key(doc, "b"), "", "number is none")
+            spec.assert_str_eq(store.key(doc, "c"), "ok", "string")
+            store.free(doc)
+            fs.remove_tree(d)
+        }
+    }
+    spec.describe(fw, "auth login and logout") {
+        spec.it("login by name stores the key and never prints it") callback {
+            d = tmp_()
+            e = env.new()
+            args = list.list_new()
+            list.list_add(args, "anthropic")
+            ans = list.list_new()
+            list.list_add(ans, "  fake-cli-key \r")
+            code, out, errtext = auth.login(d, e, args, answers_(list.list_new()), answers_(ans))
+            spec.assert_eq(code, 0, "exit ${errtext}")
+            spec.assert_str_eq(out, "Anthropic · key stored\n", "stdout")
+            spec.assert_str_eq(errtext, "", "stderr")
+            spec.assert_eq(contains_(out, "fake-cli-key"), 0, "no key in stdout")
+            spec.assert_str_eq(read_("${d}/auth.json"), "{\n  \"keys\": {\n    \"anthropic\": \"fake-cli-key\"\n  }\n}", "stored file")
+            spec.assert_eq(mode_("${d}/auth.json"), 384, "0600")
+            fs.remove_tree(d)
+        }
+        spec.it("login without a name shows the menu and accepts a number") callback {
+            d = tmp_()
+            e = env.new()
+            asked = list.list_new()
+            lines = list.list_new()
+            list.list_add(lines, "4")
+            rl = |prompt: string| {
+                list.list_add(asked, string.copy(prompt))
+                a, _g = list.get_string(lines, 0)
+                return string.copy(a)
+            }
+            sec = list.list_new()
+            list.list_add(sec, "fake-xai")
+            code, out, _er = auth.login(d, e, list.list_new(), rl, answers_(sec))
+            spec.assert_eq(code, 0, "exit")
+            spec.assert_str_eq(out, "xAI · key stored\n", "stdout")
+            p, _g2 = list.get_string(asked, 0)
+            spec.assert_true(string.starts_with(p, "1  Anthropic    —\n2  OpenAI       —\n"), "menu: ${p}")
+            spec.assert_true(string.ends_with(p, "Service (name or number): "), "prompt: ${p}")
+            doc, _e3 = store.load("${d}/auth.json")
+            spec.assert_str_eq(store.key(doc, "xai"), "fake-xai", "stored under the id")
+            store.free(doc)
+            fs.remove_tree(d)
+        }
+        spec.it("login failures are exit 1 with upstream's messages") callback {
+            d = tmp_()
+            e = env.new()
+            empty = list.list_new()
+            code, out, errtext = auth.login(d, e, empty, answers_(list.list_new()), answers_(list.list_new()))
+            spec.assert_eq(code, 1, "end of input at the menu")
+            spec.assert_str_eq(errtext, "nib: Invalid arguments · run nib --help\n", "stderr")
+            spec.assert_str_eq(out, "", "stdout empty")
+            nope = list.list_new()
+            list.list_add(nope, "nope")
+            code2, _o2, e2 = auth.login(d, e, nope, answers_(list.list_new()), answers_(list.list_new()))
+            spec.assert_eq(code2, 1, "unknown service")
+            spec.assert_str_eq(e2, "nib: Unknown service · run nib login to list services\n", "unknown")
+            one = list.list_new()
+            list.list_add(one, "openai")
+            blank = list.list_new()
+            list.list_add(blank, "")
+            code3, _o3, e3 = auth.login(d, e, one, answers_(list.list_new()), answers_(blank))
+            spec.assert_eq(code3, 1, "empty key")
+            spec.assert_str_eq(e3, "nib: API key cannot be empty\n", "empty key text")
+            flag = list.list_new()
+            list.list_add(flag, "--device")
+            code4, _o4, e4 = auth.login(d, e, flag, answers_(list.list_new()), answers_(list.list_new()))
+            spec.assert_eq(code4, 1, "an option")
+            spec.assert_str_eq(e4, "nib: Invalid arguments · run nib --help\n", "option text")
+            spec.assert_eq(fs.exists("${d}/auth.json"), 0, "nothing was stored")
+            fs.remove_tree(d)
+        }
+        spec.it("logout removes only nib's key and says what is left") callback {
+            d = tmp_()
+            e = env.new()
+            env.set(e, "ANTHROPIC_API_KEY", "from-env")
+            auth.set_key(d, "anthropic", "k1")
+            auth.set_key(d, "xai", "k2")
+            args = list.list_new()
+            list.list_add(args, "anthropic")
+            code, out, _er = auth.logout(d, e, args)
+            spec.assert_eq(code, 0, "exit")
+            spec.assert_str_eq(out, "Anthropic · signed out · key still set in ANTHROPIC_API_KEY\n", "stdout")
+            code2, out2, _e2 = auth.logout(d, env.new(), args)
+            spec.assert_eq(code2, 0, "second exit")
+            spec.assert_str_eq(out2, "Anthropic · nothing stored by nib\n", "nothing stored")
+            doc, _e3 = store.load("${d}/auth.json")
+            spec.assert_str_eq(store.key(doc, "xai"), "k2", "xai kept")
+            store.free(doc)
+            code3, _o3, e3 = auth.logout(d, e, list.list_new())
+            spec.assert_true(code3 == 1 && e3 == "nib: Invalid arguments · run nib --help\n", "no argument")
+            bogus = list.list_new()
+            list.list_add(bogus, "nope")
+            code4, _o4, e4 = auth.logout(d, e, bogus)
+            spec.assert_true(code4 == 1 && e4 == "nib: Unknown service · run nib login to list services\n", "unknown")
+            fs.remove_tree(d)
+        }
+    }
+    return spec.run_summary(fw)
+}
+
+jsonx_has_(o: ptr, k: string) -> int { return json.json_object_has(o, k) }

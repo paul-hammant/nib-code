@@ -1,0 +1,244 @@
+// msg: one Session message (upstream provider.Message) held as the
+// JSON object text the Session log writes, so the history, the log and the
+// provider encoders share one spelling and every optional field upstream
+// may carry survives a round trip untouched. Builders write fields in
+// upstream's struct order and omit absent ones (emit_null_optional_fields
+// = false); readers parse on demand.
+//
+// Fields: role, content, tool_calls, tool_call_id, reasoning {provider,
+// data, includes_output?}, images, phase, waiting, step_effort {effort},
+// bash_replacements, run_ok, tool_summary, step_calls_omitted, source,
+// background_id, background_ok, background_run, background_kind.
+
+import std.json
+import std.list
+import std.string
+import nib.jsonx
+import nib.provider.types
+
+exports(system, user, user_from, assistant, tool, role, content, has_content, str_or, bool_of, raw,
+        set_raw, without, tool_calls, tool_call_count, reasoning_provider, reasoning_data,
+        reasoning_includes_output, step_effort, history_json, ORDER)
+
+const ORDER = "role content tool_calls tool_call_id reasoning images phase waiting step_effort bash_replacements run_ok tool_summary step_calls_omitted source background_id background_ok background_run background_kind"
+
+system(text: string) -> string {
+    return "{\"role\":\"system\",\"content\":${jsonx.quote(text)}}"
+}
+
+user(text: string) -> string {
+    return "{\"role\":\"user\",\"content\":${jsonx.quote(text)}}"
+}
+
+// A user message with a source ("background", "undo"; "" none).
+user_from(text: string, source: string) -> string {
+    if source == "" { return user(text) }
+    return "{\"role\":\"user\",\"content\":${jsonx.quote(text)},\"source\":${jsonx.quote(source)}}"
+}
+
+// An assistant message. calls: list of *types.ToolCall (empty: none).
+// reasoning_provider "" means no reasoning; waiting -1/0/1; effort "" none.
+assistant(text: string, calls: ptr, reasoning_provider: string, reasoning_data: string,
+          includes_output: int, phase: string, waiting: int, effort: string) -> string {
+    out = "{\"role\":\"assistant\",\"content\":${jsonx.quote(text)}"
+    if calls != null && list.list_size(calls) > 0 {
+        out = "${out},\"tool_calls\":${types.tool_calls_json(calls)}"
+    }
+    if reasoning_provider != "" {
+        inc = ""
+        if includes_output == 1 { inc = ",\"includes_output\":true" }
+        out = "${out},\"reasoning\":{\"provider\":${jsonx.quote(reasoning_provider)},\"data\":${jsonx.quote(reasoning_data)}${inc}}"
+    }
+    if phase != "" { out = "${out},\"phase\":${jsonx.quote(phase)}" }
+    if waiting == 1 { out = "${out},\"waiting\":true" }
+    if waiting == 0 { out = "${out},\"waiting\":false" }
+    if effort != "" { out = "${out},\"step_effort\":{\"effort\":${jsonx.quote(effort)}}" }
+    return "${out}}"
+}
+
+// A tool result. extra: further fields as JSON members (",\"run_ok\":true"…) or "".
+tool(call_id: string, text: string, extra: string) -> string {
+    return "{\"role\":\"tool\",\"content\":${jsonx.quote(text)},\"tool_call_id\":${jsonx.quote(call_id)}${extra}}"
+}
+
+role(m: string) -> string { return str_or(m, "role", "") }
+
+content(m: string) -> string { return str_or(m, "content", "") }
+
+has_content(m: string) -> int {
+    v = jsonx.parse(m)
+    k = jsonx.kind(v, "content")
+    jsonx.free(v)
+    if k == json.JSON_STRING { return 1 }
+    return 0
+}
+
+str_or(m: string, key: string, d: string) -> string {
+    v = jsonx.parse(m)
+    if v == null { return d }
+    s = string.copy(jsonx.str_or(v, key, d))
+    jsonx.free(v)
+    return s
+}
+
+// -1 absent, 0 false, 1 true.
+bool_of(m: string, key: string) -> int {
+    v = jsonx.parse(m)
+    if v == null { return -1 }
+    out = -1
+    if jsonx.kind(v, key) == json.JSON_BOOL { out = jsonx.bool_or(v, key, 0) }
+    jsonx.free(v)
+    return out
+}
+
+// The JSON text of field `key`, or "".
+raw(m: string, key: string) -> string {
+    v = jsonx.parse(m)
+    if v == null { return "" }
+    f = jsonx.field(v, key)
+    out = ""
+    if f != null { out = jsonx.encode(f) }
+    jsonx.free(v)
+    return out
+}
+
+order_index_(key: string) -> int {
+    keys = string.split(ORDER, " ")
+    n = string.array_size(keys)
+    i = 0
+    while i < n {
+        if string.array_get(keys, i) == key {
+            string.string_array_free(keys)
+            return i
+        }
+        i = i + 1
+    }
+    string.string_array_free(keys)
+    return 1000
+}
+
+// `m` with field `key` set to the JSON text `value` (replacing any), kept
+// in upstream's field order.
+set_raw(m: string, key: string, value: string) -> string {
+    v = jsonx.parse(m)
+    if v == null { return m }
+    at = order_index_(key)
+    out = "{"
+    placed = 0
+    n = json.object_size(v)
+    i = 0
+    first = 1
+    while i < n {
+        k, fv, _e = json.object_entry(v, i)
+        if placed == 0 && order_index_(k) > at {
+            if first == 0 { out = "${out}," }
+            out = "${out}${jsonx.quote(key)}:${value}"
+            placed = 1
+            first = 0
+        }
+        if k != key {
+            if first == 0 { out = "${out}," }
+            out = "${out}${jsonx.quote(k)}:${jsonx.encode(fv)}"
+            first = 0
+        }
+        i = i + 1
+    }
+    if placed == 0 {
+        if first == 0 { out = "${out}," }
+        out = "${out}${jsonx.quote(key)}:${value}"
+    }
+    jsonx.free(v)
+    return "${out}}"
+}
+
+// `m` without field `key`.
+without(m: string, key: string) -> string {
+    v = jsonx.parse(m)
+    if v == null { return m }
+    out = "{"
+    n = json.object_size(v)
+    i = 0
+    first = 1
+    while i < n {
+        k, fv, _e = json.object_entry(v, i)
+        if k != key {
+            if first == 0 { out = "${out}," }
+            out = "${out}${jsonx.quote(k)}:${jsonx.encode(fv)}"
+            first = 0
+        }
+        i = i + 1
+    }
+    jsonx.free(v)
+    return "${out}}"
+}
+
+// The message's tool calls as a list of *types.ToolCall (empty when none).
+tool_calls(m: string) -> ptr {
+    out = list.list_new()
+    v = jsonx.parse(m)
+    if v == null { return out }
+    calls = jsonx.field(v, "tool_calls")
+    if calls != null && json.json_type(calls) == json.JSON_ARRAY {
+        n = json.json_array_size(calls)
+        i = 0
+        while i < n {
+            c = json.json_array_get_raw(calls, i)
+            f = jsonx.field(c, "function")
+            list.list_add(out, types.tool_call_new(string.copy(jsonx.str_or(c, "id", "")),
+                string.copy(jsonx.str_or(f, "name", "")), string.copy(jsonx.str_or(f, "arguments", ""))))
+            i = i + 1
+        }
+    }
+    jsonx.free(v)
+    return out
+}
+
+tool_call_count(m: string) -> int {
+    return list.list_size(tool_calls(m))
+}
+
+reasoning_field_(m: string, key: string) -> string {
+    v = jsonx.parse(m)
+    if v == null { return "" }
+    r = jsonx.field(v, "reasoning")
+    out = ""
+    if r != null { out = string.copy(jsonx.str_or(r, key, "")) }
+    jsonx.free(v)
+    return out
+}
+
+reasoning_provider(m: string) -> string { return reasoning_field_(m, "provider") }
+reasoning_data(m: string) -> string { return reasoning_field_(m, "data") }
+
+reasoning_includes_output(m: string) -> int {
+    v = jsonx.parse(m)
+    if v == null { return 0 }
+    r = jsonx.field(v, "reasoning")
+    out = 0
+    if r != null { out = jsonx.bool_or(r, "includes_output", 0) }
+    jsonx.free(v)
+    return out
+}
+
+step_effort(m: string) -> string {
+    v = jsonx.parse(m)
+    if v == null { return "" }
+    r = jsonx.field(v, "step_effort")
+    out = ""
+    if r != null { out = string.copy(jsonx.str_or(r, "effort", "")) }
+    jsonx.free(v)
+    return out
+}
+
+// A list of message texts as one JSON array.
+history_json(messages: ptr, from: int) -> string {
+    out = "["
+    i = from
+    while i < list.list_size(messages) {
+        m, _e = list.get_string(messages, i)
+        if i > from { out = "${out}," }
+        out = "${out}${m}"
+        i = i + 1
+    }
+    return "${out}]"
+}

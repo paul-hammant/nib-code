@@ -1,0 +1,545 @@
+// provider.types: the provider Config, the built-in service table, Usage
+// and the Reply a model request returns (upstream src/provider.zig, less
+// the Codex backend, which is not ported by policy: API keys only).
+//
+// Upstream's optional fields map as: ?bool -> int (-1 none, 0 false,
+// 1 true), ?[]const u8 -> string ("" none), ?usize -> int/long (-1 none).
+// A Config is a value: copy() before changing a shared one.
+
+import std.string
+import std.list
+import nib.jsonx
+
+exports(Config, Limits, McpServer, mcp_server_new, mcp_server_copy, Usage, Reply, ToolCall, new_config, new_limits, copy, name, protocol, vision,
+        custom_run, set_effort, check_session, key_hint, missing_key, known_id, definition_protocol,
+        definition_base_url, definition_key_envs, definition_default_model, definition_name,
+        definition_vision, definition_custom_run, definition_models, model_context_window, small_model, builtin_ids,
+        usage_new, usage_add, usage_json, usage_copy, reply_new, tool_call_new, tool_calls_json,
+        EFFORT_VALUES, effort_known, PROTOCOLS, known_protocol, model_can_disable_reasoning)
+
+const EFFORT_VALUES = "default off none minimal low medium high xhigh max"
+const PROTOCOLS = "responses chat_completions anthropic_messages"
+
+struct Limits {
+    llm_concurrency: int
+    llm_calls_per_run: int
+    llm_input_kib: int
+    agent_concurrency: int
+    max_steps: int                // -1: no limit
+    stream_idle_timeout_s: int
+    stream_content_timeout_s: int
+    request_timeout_s: int
+    run_background_after_ms: int
+    run_output_bytes: int
+}
+
+// One [mcp.<id>] server as the config file declares it (MCP itself is not
+// ported yet). command/url/header_env are "" when absent.
+struct McpServer {
+    id: string
+    command: string
+    url: string
+    args: ptr                     // list of strings
+    env: ptr                      // list of environment variable names
+    header_env: string
+    enabled: int
+    line: int
+}
+
+struct Config {
+    simple: int
+    open: string                  // "" none
+    sandbox_workspace: int        // [sandbox] mode = "workspace"
+    sandbox_writable: ptr         // list of absolute extra writable roots
+    hooks_after_edit: ptr         // list of strings (a command array)
+    hooks_turn_end: ptr
+    enabled_skills: ptr           // list of names
+    limits: ptr                   // *Limits
+    provider: string              // a built-in id, or "custom"
+    custom_provider: string       // "" unless custom
+    custom_protocol: string
+    custom_vision: int            // -1 none
+    api_key_env: string           // "" none
+    key_source: string            // none, env, store
+    nib_home: string
+    reasoning_summary: string     // off, auto
+    base_url: string
+    api_key: string
+    model: string
+    context_window: long
+    thinking: int                 // -1 none
+    reasoning_effort: string      // "" none
+    output_schema: string         // JSON text, "" none
+    prompt_cache_key: string
+    mcp_servers: ptr              // list of *McpServer, in file order
+}
+
+struct Usage {
+    prompt_tokens: long
+    completion_tokens: long
+    prompt_cache_hit_tokens: long
+    prompt_cache_write_tokens: long
+}
+
+struct ToolCall {
+    id: string
+    name: string
+    arguments: string             // JSON object text
+}
+
+// One model reply. reasoning_data is opaque provider JSON ("" none).
+struct Reply {
+    text: string
+    reasoning_provider: string
+    reasoning_data: string
+    reasoning_includes_output: int
+    phase: string
+    tool_calls: ptr               // list of *ToolCall
+    usage: ptr                    // *Usage
+}
+
+new_limits() -> ptr {
+    l = heap.new(Limits)
+    l.llm_concurrency = 4
+    l.llm_calls_per_run = 100
+    l.llm_input_kib = 256
+    l.agent_concurrency = 4
+    l.max_steps = -1
+    l.stream_idle_timeout_s = 300
+    l.stream_content_timeout_s = 120
+    l.request_timeout_s = 300
+    l.run_background_after_ms = 10000
+    l.run_output_bytes = 16 * 1024
+    return l as ptr
+}
+
+new_config(provider: string, base_url: string, api_key: string, model: string) -> ptr {
+    c = heap.new(Config)
+    c.simple = 0
+    c.open = ""
+    c.sandbox_workspace = 0
+    c.sandbox_writable = list.list_new()
+    c.hooks_after_edit = list.list_new()
+    c.hooks_turn_end = list.list_new()
+    c.enabled_skills = list.list_new()
+    c.limits = new_limits()
+    c.provider = provider
+    c.custom_provider = ""
+    c.custom_protocol = "chat_completions"
+    c.custom_vision = -1
+    c.api_key_env = ""
+    c.key_source = "none"
+    c.nib_home = ""
+    c.reasoning_summary = "off"
+    c.base_url = base_url
+    c.api_key = api_key
+    c.model = model
+    c.context_window = 1000000 as long
+    c.thinking = -1
+    c.reasoning_effort = ""
+    c.output_schema = ""
+    c.prompt_cache_key = ""
+    c.mcp_servers = list.list_new()
+    return c as ptr
+}
+
+copy_list_(l: ptr) -> ptr {
+    out = list.list_new()
+    i = 0
+    while i < list.list_size(l) {
+        s, _e = list.get_string(l, i)
+        list.list_add(out, string.copy(s))
+        i = i + 1
+    }
+    return out
+}
+
+mcp_server_new(id: string) -> ptr {
+    m = heap.new(McpServer)
+    m.id = id
+    m.command = ""
+    m.url = ""
+    m.args = list.list_new()
+    m.env = list.list_new()
+    m.header_env = ""
+    m.enabled = 0
+    m.line = 1
+    return m as ptr
+}
+
+mcp_server_copy(mp: ptr) -> ptr {
+    m = mp as *McpServer
+    n = mcp_server_new(string.copy(m.id)) as *McpServer
+    n.command = string.copy(m.command)
+    n.url = string.copy(m.url)
+    n.args = copy_list_(m.args)
+    n.env = copy_list_(m.env)
+    n.header_env = string.copy(m.header_env)
+    n.enabled = m.enabled
+    n.line = m.line
+    return n as ptr
+}
+
+// A field-for-field copy; lists and limits are copied too.
+copy(cp: ptr) -> ptr {
+    c = cp as *Config
+    n = new_config(string.copy(c.provider), string.copy(c.base_url), string.copy(c.api_key), string.copy(c.model)) as *Config
+    n.simple = c.simple
+    n.open = string.copy(c.open)
+    n.sandbox_workspace = c.sandbox_workspace
+    n.sandbox_writable = copy_list_(c.sandbox_writable)
+    n.hooks_after_edit = copy_list_(c.hooks_after_edit)
+    n.hooks_turn_end = copy_list_(c.hooks_turn_end)
+    n.enabled_skills = copy_list_(c.enabled_skills)
+    l = c.limits as *Limits
+    nl = n.limits as *Limits
+    nl.llm_concurrency = l.llm_concurrency
+    nl.llm_calls_per_run = l.llm_calls_per_run
+    nl.llm_input_kib = l.llm_input_kib
+    nl.agent_concurrency = l.agent_concurrency
+    nl.max_steps = l.max_steps
+    nl.stream_idle_timeout_s = l.stream_idle_timeout_s
+    nl.stream_content_timeout_s = l.stream_content_timeout_s
+    nl.request_timeout_s = l.request_timeout_s
+    nl.run_background_after_ms = l.run_background_after_ms
+    nl.run_output_bytes = l.run_output_bytes
+    n.custom_provider = string.copy(c.custom_provider)
+    n.custom_protocol = string.copy(c.custom_protocol)
+    n.custom_vision = c.custom_vision
+    n.api_key_env = string.copy(c.api_key_env)
+    n.key_source = string.copy(c.key_source)
+    n.nib_home = string.copy(c.nib_home)
+    n.reasoning_summary = string.copy(c.reasoning_summary)
+    n.context_window = c.context_window
+    n.thinking = c.thinking
+    n.reasoning_effort = string.copy(c.reasoning_effort)
+    n.output_schema = string.copy(c.output_schema)
+    n.prompt_cache_key = string.copy(c.prompt_cache_key)
+    n.mcp_servers = list.list_new()
+    j = 0
+    while j < list.list_size(c.mcp_servers) {
+        list.list_add(n.mcp_servers, mcp_server_copy(list.list_get_raw(c.mcp_servers, j)))
+        j = j + 1
+    }
+    return n as ptr
+}
+
+// ---- the built-in services (upstream `definitions`, less codex) ----------
+
+builtin_ids() -> ptr {
+    l = list.list_new()
+    list.list_add(l, "chat_completions")
+    list.list_add(l, "openai")
+    list.list_add(l, "anthropic")
+    list.list_add(l, "deepseek")
+    list.list_add(l, "xai")
+    return l
+}
+
+known_id(id: string) -> int {
+    match id {
+        "chat_completions" -> { return 1 }
+        "openai" -> { return 1 }
+        "anthropic" -> { return 1 }
+        "deepseek" -> { return 1 }
+        "xai" -> { return 1 }
+        _ -> { return 0 }
+    }
+}
+
+known_protocol(p: string) -> int {
+    match p {
+        "responses" -> { return 1 }
+        "chat_completions" -> { return 1 }
+        "anthropic_messages" -> { return 1 }
+        _ -> { return 0 }
+    }
+}
+
+definition_name(id: string) -> string {
+    match id {
+        "chat_completions" -> { return "Chat Completions" }
+        "openai" -> { return "OpenAI" }
+        "anthropic" -> { return "Anthropic" }
+        "deepseek" -> { return "DeepSeek" }
+        "xai" -> { return "xAI" }
+        _ -> { return id }
+    }
+}
+
+definition_protocol(id: string) -> string {
+    match id {
+        "openai" -> { return "responses" }
+        "xai" -> { return "responses" }
+        "anthropic" -> { return "anthropic_messages" }
+        _ -> { return "chat_completions" }
+    }
+}
+
+definition_base_url(id: string) -> string {
+    match id {
+        "openai" -> { return "https://api.openai.com/v1" }
+        "anthropic" -> { return "https://api.anthropic.com" }
+        "xai" -> { return "https://api.x.ai/v1" }
+        _ -> { return "https://api.deepseek.com" }
+    }
+}
+
+// The key environment variables, in precedence order.
+definition_key_envs(id: string) -> ptr {
+    l = list.list_new()
+    match id {
+        "chat_completions" -> {
+            list.list_add(l, "NIB_API_KEY")
+            list.list_add(l, "DEEPSEEK_API_KEY")
+        }
+        "openai" -> { list.list_add(l, "OPENAI_API_KEY") }
+        "anthropic" -> { list.list_add(l, "ANTHROPIC_API_KEY") }
+        "deepseek" -> { list.list_add(l, "DEEPSEEK_API_KEY") }
+        "xai" -> { list.list_add(l, "XAI_API_KEY") }
+        _ -> {}
+    }
+    return l
+}
+
+definition_default_model(id: string) -> string {
+    match id {
+        "openai" -> { return "gpt-6.1-sol" }
+        "anthropic" -> { return "claude-sonnet-5-5" }
+        "xai" -> { return "grok-4.7" }
+        _ -> { return "deepseek-flash" }
+    }
+}
+
+definition_vision(id: string) -> int {
+    if id == "chat_completions" || id == "deepseek" { return 0 }
+    return 1
+}
+
+definition_custom_run(id: string) -> int {
+    if id == "openai" { return 1 }
+    return 0
+}
+
+// The context window a built-in table lists for `model`, or 0.
+model_context_window(id: string, model: string) -> long {
+    match id {
+        "openai" -> {
+            if model == "gpt-6.1-sol" || model == "gpt-6.1-terra" { return 1050000 as long }
+        }
+        "anthropic" -> {
+            if model == "claude-opus-5-5" || model == "claude-sonnet-5-5" || model == "claude-haiku-5-5" || model == "claude-fable-5-1" { return 1000000 as long }
+        }
+        "deepseek" -> {
+            if model == "deepseek-flash" || model == "deepseek-v4-pro" { return 1000000 as long }
+        }
+        "xai" -> {
+            if model == "grok-4.7" || model == "grok-4.6" { return 500000 as long }
+        }
+        _ -> {}
+    }
+    return 0 as long
+}
+
+// The models a built-in table lists, in order; empty for chat_completions
+// (upstream's `models.len == 0`).
+definition_models(id: string) -> ptr {
+    l = list.list_new()
+    match id {
+        "openai" -> {
+            list.list_add(l, "gpt-6.1-sol")
+            list.list_add(l, "gpt-6.1-terra")
+        }
+        "anthropic" -> {
+            list.list_add(l, "claude-opus-5-5")
+            list.list_add(l, "claude-sonnet-5-5")
+            list.list_add(l, "claude-haiku-5-5")
+            list.list_add(l, "claude-fable-5-1")
+        }
+        "deepseek" -> {
+            list.list_add(l, "deepseek-flash")
+            list.list_add(l, "deepseek-v4-pro")
+        }
+        "xai" -> {
+            list.list_add(l, "grok-4.7")
+            list.list_add(l, "grok-4.6")
+        }
+        _ -> {}
+    }
+    return l
+}
+
+// Responses models that cannot switch reasoning off (upstream responses.zig `models`).
+model_can_disable_reasoning(model: string) -> int {
+    if model == "gpt-6.1-sol" || model == "gpt-6-astra" { return 0 }
+    return 1
+}
+
+// The cheap model of a service for side requests; "" when none is known.
+small_model(id: string) -> string {
+    match id {
+        "openai" -> { return "gpt-6-luna" }
+        "anthropic" -> { return "claude-haiku-5-5" }
+        "deepseek" -> { return "deepseek-flash" }
+        _ -> { return "" }
+    }
+}
+
+// ---- Config methods ----------------------------------------------------
+
+name(cp: ptr) -> string {
+    c = cp as *Config
+    if c.custom_provider != "" { return c.custom_provider }
+    return c.provider
+}
+
+protocol(cp: ptr) -> string {
+    c = cp as *Config
+    if c.provider == "custom" { return c.custom_protocol }
+    return definition_protocol(c.provider)
+}
+
+// Whether the model accepts image input; custom providers declare it.
+vision(cp: ptr) -> int {
+    c = cp as *Config
+    if c.provider == "custom" {
+        if c.custom_vision != -1 { return c.custom_vision }
+        if c.custom_protocol != "chat_completions" { return 1 }
+        return 0
+    }
+    return definition_vision(c.provider)
+}
+
+custom_run(cp: ptr) -> int {
+    c = cp as *Config
+    if c.provider == "custom" { return 0 }
+    return definition_custom_run(c.provider)
+}
+
+effort_known(value: string) -> int {
+    match value {
+        "default" -> { return 1 }
+        "off" -> { return 1 }
+        "none" -> { return 1 }
+        "minimal" -> { return 1 }
+        "low" -> { return 1 }
+        "medium" -> { return 1 }
+        "high" -> { return 1 }
+        "xhigh" -> { return 1 }
+        "max" -> { return 1 }
+        _ -> { return 0 }
+    }
+}
+
+// "" or "InvalidReasoningEffort".
+set_effort(cp: ptr, value: string) -> string {
+    c = cp as *Config
+    if effort_known(value) == 0 { return "InvalidReasoningEffort" }
+    if value == "default" {
+        c.thinking = -1
+        c.reasoning_effort = ""
+    } else if value == "off" {
+        c.thinking = 0
+        c.reasoning_effort = ""
+    } else {
+        c.thinking = 1
+        c.reasoning_effort = string.copy(value)
+    }
+    return ""
+}
+
+// "" or "SessionProviderMismatch" / "SessionModelMismatch".
+check_session(cp: ptr, id: string, model: string) -> string {
+    c = cp as *Config
+    if c.provider != id { return "SessionProviderMismatch" }
+    if protocol(cp) != "chat_completions" && model != "" && model != c.model { return "SessionModelMismatch" }
+    return ""
+}
+
+// What a 401 asks the user to check, without revealing any key.
+key_hint(cp: ptr) -> string {
+    c = cp as *Config
+    if c.key_source == "store" { return "the key stored by nib (run nib login)" }
+    if c.api_key_env != "" { return c.api_key_env }
+    return "API key"
+}
+
+missing_key(cp: ptr) -> int {
+    c = cp as *Config
+    if string.length(c.api_key) != 0 { return 0 }
+    if c.provider != "custom" { return 1 }
+    if c.api_key_env != "" { return 1 }
+    return 0
+}
+
+// ---- Usage, ToolCall, Reply --------------------------------------------
+
+usage_new() -> ptr {
+    u = heap.new(Usage)
+    u.prompt_tokens = 0 as long
+    u.completion_tokens = 0 as long
+    u.prompt_cache_hit_tokens = 0 as long
+    u.prompt_cache_write_tokens = 0 as long
+    return u as ptr
+}
+
+usage_copy(up: ptr) -> ptr {
+    u = up as *Usage
+    n = usage_new() as *Usage
+    n.prompt_tokens = u.prompt_tokens
+    n.completion_tokens = u.completion_tokens
+    n.prompt_cache_hit_tokens = u.prompt_cache_hit_tokens
+    n.prompt_cache_write_tokens = u.prompt_cache_write_tokens
+    return n as ptr
+}
+
+usage_add(up: ptr, op: ptr) {
+    u = up as *Usage
+    o = op as *Usage
+    u.prompt_tokens = u.prompt_tokens + o.prompt_tokens
+    u.completion_tokens = u.completion_tokens + o.completion_tokens
+    u.prompt_cache_hit_tokens = u.prompt_cache_hit_tokens + o.prompt_cache_hit_tokens
+    u.prompt_cache_write_tokens = u.prompt_cache_write_tokens + o.prompt_cache_write_tokens
+}
+
+// Upstream's jsonStringify: cache writes only when nonzero.
+usage_json(up: ptr) -> string {
+    u = up as *Usage
+    w = ""
+    if u.prompt_cache_write_tokens > 0 { w = ",\"prompt_cache_write_tokens\":${u.prompt_cache_write_tokens}" }
+    return "{\"prompt_tokens\":${u.prompt_tokens},\"completion_tokens\":${u.completion_tokens},\"prompt_cache_hit_tokens\":${u.prompt_cache_hit_tokens}${w}}"
+}
+
+tool_call_new(id: string, name: string, arguments: string) -> ptr {
+    t = heap.new(ToolCall)
+    t.id = id
+    t.name = name
+    t.arguments = arguments
+    return t as ptr
+}
+
+// Calls as the log and Chat Completions spell them:
+// [{"id","type":"function","function":{"name","arguments"}}].
+tool_calls_json(calls: ptr) -> string {
+    out = "["
+    i = 0
+    while i < list.list_size(calls) {
+        t = list.list_get_raw(calls, i) as *ToolCall
+        if i > 0 { out = "${out}," }
+        out = "${out}{\"id\":${jsonx.quote(t.id)},\"type\":\"function\",\"function\":{\"name\":${jsonx.quote(t.name)},\"arguments\":${jsonx.quote(t.arguments)}}}"
+        i = i + 1
+    }
+    return "${out}]"
+}
+
+reply_new() -> ptr {
+    r = heap.new(Reply)
+    r.text = ""
+    r.reasoning_provider = ""
+    r.reasoning_data = ""
+    r.reasoning_includes_output = 0
+    r.phase = ""
+    r.tool_calls = list.list_new()
+    r.usage = usage_new()
+    return r as ptr
+}

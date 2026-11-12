@@ -1,0 +1,172 @@
+// session.prompt: the system prompt, the run tool schema, the prompt patches
+// and the Step-budget texts (upstream src/session/prompt.zig).
+//
+// Differences from upstream, all in what is passed: NIB_PATCHES_OFF is a
+// parameter (the caller reads the environment), render_system takes the
+// tools documentation text, the Run output budget and the model name
+// instead of a Tools host (model "" and bytes output.MAX_BYTES when the
+// host has no Config), and a Step limit is a long with -1 for "none".
+
+import std.string
+import std.strbuilder
+import std.list
+import std.cryptography
+import nib.sandbox
+import nib.session.profile
+import nib.session.output
+
+exports(TOOLS_JSON, SYSTEM_TEMPLATE, Patch, patches, patch_lines, render_patches, patch_disabled,
+        disabled_patches, system_sha, render_system, turn_budget_text, step_limit_prompt)
+
+const TOOLS_JSON = "[{\"type\":\"function\",\"function\":{\"name\":\"run\",\n\"description\":\"Run JavaScript in a fresh sandbox. The `tools` API it can call is described in the system prompt.\",\n\"parameters\":{\"type\":\"object\",\"properties\":{\"code\":{\"type\":\"string\",\n\"description\":\"JavaScript source. Top-level await is allowed; the last expression's value is returned.\"}},\n\"required\":[\"code\"]}}}]"
+
+// Four "{s}" markers (cwd, tools docs, output budget, patch lines) and one
+// "{d}" (tool concurrency), as upstream's format string after its comptime step.
+const SYSTEM_TEMPLATE = "You are nib, a coding agent working in {s}.\n\nYou act by calling the `run` tool with JavaScript. Each call runs in a fresh sandbox: no variables survive between calls, so write anything you need later to a file. The script can affect the outside world only through these functions:\n\n```js\n{s}```\n\nWriting scripts:\n- Top-level `await` works. Each Step is a full model round trip, usually 10 s or more; one Run can read several files, make all independent edits, then build and test, returning only what you need (such as failures).\n- Tool calls started without awaiting each one (e.g. Promise.all) run concurrently, up to {d} at a time; commands chained inside one bash call (&&, ;) run one after another.\n- Long Runs auto-background while awaiting tools; scripts and captured output stay intact. Background Run/bash/agent results arrive automatically as messages. Continue useful work meanwhile; never check or wait for them with ps, cat/tail logs, sleep, empty Runs or timeout reruns. Do not read their redirected logs before completion. If no independent work remains, end the model response immediately with a brief text reply and no run/tool call (not even console.log); Session waits locally, delivers the result and continues the Turn. After edit/write changes, rerun the same command/cwd directly: older Run bash stops with {superseded_by}, not failure. Do not wait for the stale result.\n- Default to doing the task yourself. Unless the user requests delegation, delegate only independent read-only investigations that can run in parallel with useful parent work and whose results can be discarded. Keep serial edits, builds, tests and reviews in the main loop. Waiting on a foreground agent is serial; background delegation does not help if you must wait for it to proceed.\n- The last expression and console.log output share {s} per Run, truncated by console call and final result with markers; tool results inside JS remain complete. Locate with grep, then read needed line ranges. Large multi-file output can exceed this display budget: batch reads or print only needed snippets.\n- Before full builds/tests, finish implementation, known regression tests, expected results/fixtures and formatting; aim for one full validation. On failure, fix the failures and revalidate. Keep all necessary checks.\n- A run script's syntax or runtime error means the script needs correction. Fix it and continue the task; do not end the Turn just because a script failed.\n{s}\nWhen the task is done, answer the user directly without calling the tool."
+
+// A prompt line that compensates for current models. Each id is registered
+// in docs/compromises.md; NIB_PATCHES_OFF=<id,...|all> drops them.
+struct Patch {
+    id: string
+    text: string
+    applies_to: int     // a profile.Set
+}
+
+new_patch_(id: string, text: string, applies_to: int) -> *Patch {
+    p = heap.new(Patch)
+    p.id = id
+    p.text = text
+    p.applies_to = applies_to
+    return p
+}
+
+// The shipped patches, in upstream order.
+patches() -> ptr {
+    l = list.list_new()
+    list.list_add(l, new_patch_("json-escape", "For file/shell text with backticks, \${ or backslashes, use JSON-escaped double-quoted strings, not template literals, e.g. content: \"` \${x} \\\\path \\\"quoted\\\"\\n\"", profile.ALL) as ptr)
+    list.list_add(l, new_patch_("no-shell-search", "Search with tools.grep/tools.glob, not shell rg/find/grep.", profile.ALL) as ptr)
+    list.list_add(l, new_patch_("expected-continuation", "A Run can continue while results match expectations and return at the first unexpected result. Command output redirected to a file can be read within the same Run, returning only the needed portion.", profile.ALL) as ptr)
+    return l
+}
+
+// std.mem.trim(u8, s, " "): spaces only.
+trim_spaces_(s: string) -> string {
+    from = 0
+    to = string.length(s)
+    while from < to && string.char_at(s, from) == 32 { from = from + 1 }
+    while to > from && string.char_at(s, to - 1) == 32 { to = to - 1 }
+    return string.substring(s, from, to)
+}
+
+// Whether NIB_PATCHES_OFF value `off` (comma-separated, spaces trimmed) names `id` or "all".
+patch_disabled(off: string, id: string) -> int {
+    parts = string.split(off, ",")
+    n = string.array_size(parts)
+    i = 0
+    while i < n {
+        item = trim_spaces_(string.array_get(parts, i))
+        if item == "all" || item == id {
+            string.string_array_free(parts)
+            return 1
+        }
+        i = i + 1
+    }
+    string.string_array_free(parts)
+    return 0
+}
+
+// "- <text>\n" for each patch of `list` (list of *Patch) that applies to
+// `profile` and is not switched off.
+render_patches(list_: ptr, off: string, profile_: int) -> string {
+    b = strbuilder.new(256)
+    i = 0
+    while i < list.list_size(list_) {
+        p = list.list_get_raw(list_, i) as *Patch
+        if profile.set_contains(p.applies_to, profile_) == 1 && patch_disabled(off, p.id) == 0 {
+            strbuilder.append(b, "- ${p.text}\n")
+        }
+        i = i + 1
+    }
+    return strbuilder.finish(b)
+}
+
+patch_lines(off: string, profile_: int) -> string {
+    return render_patches(patches(), off, profile_)
+}
+
+// The ids of the shipped patches `off` disables, sorted (a list of strings;
+// empty where upstream returns null).
+disabled_patches(off: string) -> ptr {
+    out = list.list_new()
+    all = patches()
+    i = 0
+    while i < list.list_size(all) {
+        p = list.list_get_raw(all, i) as *Patch
+        if patch_disabled(off, p.id) == 1 { list.list_add(out, p.id) }
+        i = i + 1
+    }
+    n = list.list_size(out)
+    a = 1
+    while a < n {
+        j = a
+        while j > 0 {
+            x, _e1 = list.get_string(out, j - 1)
+            y, _e2 = list.get_string(out, j)
+            if string.compare(x, y) <= 0 { break }
+            list.list_set(out, j - 1, y)
+            list.list_set(out, j, x)
+            j = j - 1
+        }
+        a = a + 1
+    }
+    return out
+}
+
+// The first 6 bytes of the SHA-256 of `base`, as 12 lowercase hex digits.
+system_sha(base: string) -> string {
+    hex, _e = cryptography.sha256_hex(string.bytes(base)[0..string.length(base)])
+    return string.substring(hex, 0, 12)
+}
+
+// The system prompt: `tools_docs` is tools.docs(host); run_output_bytes the
+// configured display budget; model picks the profile for the patches.
+render_system(cwd: string, tools_docs: string, run_output_bytes: long, patches_off: string, model: string) -> string {
+    lines = patch_lines(patches_off, profile.for_model(model))
+    budget = "${run_output_bytes} bytes"
+    if run_output_bytes % 1024 == 0 { budget = "${run_output_bytes / 1024} KiB" }
+    tpl = string.replace_all(SYSTEM_TEMPLATE, "{d}", "${sandbox.TOOL_CONCURRENCY}")
+    parts = string.split(tpl, "{s}")
+    b = strbuilder.new(string.length(tpl) + string.length(tools_docs) + 512)
+    strbuilder.append(b, string.array_get(parts, 0))
+    strbuilder.append(b, cwd)
+    strbuilder.append(b, string.array_get(parts, 1))
+    strbuilder.append(b, tools_docs)
+    strbuilder.append(b, string.array_get(parts, 2))
+    strbuilder.append(b, budget)
+    strbuilder.append(b, string.array_get(parts, 3))
+    strbuilder.append(b, lines)
+    strbuilder.append(b, string.array_get(parts, 4))
+    string.string_array_free(parts)
+    return strbuilder.finish(b)
+}
+
+// `user_text`, prefixed with the Turn's Step-budget fact when the system
+// prompt recorded a different one. max_steps -1: no limit.
+turn_budget_text(system: string, max_steps: long, user_text: string) -> string {
+    marker = "This Turn may use at most "
+    if max_steps >= 0 {
+        fact = step_limit_prompt("", max_steps)
+        if string.index_of(system, string.substring(fact, 1, string.length(fact))) < 0 {
+            return "[Current Turn budget; configuration changed since the system prompt was recorded]${fact}\n\n${user_text}"
+        }
+    } else if string.index_of(system, marker) >= 0 {
+        return "[Current Turn budget: no Step limit; configuration changed since the system prompt was recorded]\n\n${user_text}"
+    }
+    return user_text
+}
+
+// `base`, plus the Step limit sentence when there is one (max_steps -1: none).
+step_limit_prompt(base: string, max_steps: long) -> string {
+    if max_steps < 0 { return base }
+    return "${base}\nThis Turn may use at most ${max_steps} Steps; when they run out, the Turn stops without another model request."
+}

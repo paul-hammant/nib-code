@@ -1,0 +1,798 @@
+// Ports the inline tests of upstream src/config.zig, under their upstream
+// names. The Codex provider is not ported (policy: API keys only), so:
+//   skipped  "Codex transport defaults, TOML selection and environment precedence"
+//            (NIB_CODEX_TRANSPORT / [codex].transport do not exist)
+//   skipped  "Codex Run tool defaults custom with validated file and
+//            environment fallback" (NIB_CODEX_RUN_TOOL / [codex].run_tool)
+//   adapted  every other test that used `[codex]` or `provider = "codex"` uses
+//            another built-in section instead ([openai] or [chat_completions]),
+//            and the default service is anthropic, the first of startup_order();
+//            Codex login / CODEX_HOME / NIB_AUTH_ISSUER rows are dropped.
+//   adapted  "summary and Run display budget ...": the `[codex].reasoning_summary`
+//            file key is gone, the environment variable stays.
+// Each adapted assertion says so where it differs. Paths are absolute temp
+// directories (Zig used cwd-relative .zig-cache paths).
+import std.spec
+import std.fs
+import std.list
+import std.string
+import nib.sysgap
+import nib.config
+import nib.config.env
+import nib.provider.types
+
+tmp_() -> string {
+    d, _e = fs.make_temp_dir("", "nib-config")
+    real, _k, _m = fs.realpath(d)
+    return real
+}
+
+read_(p: string) -> string {
+    s, _e = fs.read(p)
+    return s
+}
+
+contains_(s: string, part: string) -> int {
+    if string.index_of(s, part) >= 0 { return 1 }
+    return 0
+}
+
+cfg_(cp: @into ptr) -> *types.Config { return cp as *types.Config }
+lim_(cp: @into ptr) -> *types.Limits { return cfg_(cp).limits as *types.Limits }
+
+// The resolved config, asserting that there is no error.
+ok_(e: ptr, text: string) -> ptr {
+    cp, err, detail = config.resolve(e, text, "test/config.toml")
+    spec.assert_str_eq(err, "", "resolve error ${detail}")
+    return cp
+}
+
+err_(e: ptr, text: string) -> string {
+    _cp, err, _d = config.resolve(e, text, "test/config.toml")
+    return err
+}
+
+detail_(e: ptr, text: string) -> string {
+    _cp, _err, d = config.resolve(e, text, "test/config.toml")
+    return d
+}
+
+// parse must fail with "test/config.toml:<line>: <...message...>".
+expect_parse_error_(text: string, line: int, msg: string) {
+    fp, d = config.parse(text, "test/config.toml")
+    spec.assert_true(fp == null, "parse must fail: ${text}")
+    prefix = "test/config.toml:${line}: "
+    spec.assert_true(string.starts_with(d, prefix), "line ${line} of ${text}: ${d}")
+    spec.assert_true(contains_(d, msg) == 1, "message '${msg}' in '${d}'")
+}
+
+expect_parse_fails_(text: string) {
+    fp, _d = config.parse(text, "bad/config.toml")
+    spec.assert_true(fp == null, "parse must fail: ${text}")
+}
+
+expect_parse_ok_(text: string) -> *config.File {
+    fp, d = config.parse(text, "test/config.toml")
+    spec.assert_true(fp != null, "parse must succeed: ${d}")
+    return fp as *config.File
+}
+
+prov_(f: *config.File, i: int) -> *config.Prov { return list.list_get_raw(f.providers, i) as *config.Prov }
+
+limit_(l: *types.Limits, i: int) -> int {
+    match i {
+        0 -> { return l.llm_concurrency }
+        1 -> { return l.llm_calls_per_run }
+        2 -> { return l.llm_input_kib }
+        3 -> { return l.agent_concurrency }
+        4 -> { return l.max_steps }
+        5 -> { return l.stream_idle_timeout_s }
+        6 -> { return l.run_background_after_ms }
+        7 -> { return l.stream_content_timeout_s }
+        _ -> { return l.request_timeout_s }
+    }
+}
+
+mode_(p: string) -> int {
+    st = sysgap.new_stat()
+    sysgap.stat(p, 1, st)
+    return ((st as *sysgap.Stat).mode) & 4095
+}
+
+env_home_(d: string) -> ptr {
+    e = env.new()
+    env.set(e, "HOME", d)
+    env.set(e, "NIB_HOME", d)
+    return e
+}
+
+str_(l: ptr, i: int) -> string {
+    s, _g = list.get_string(l, i)
+    return s
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "config") {
+        spec.it("TOML sections comments strings and scalar values") callback {
+            text = "# header\nprovider = \"chat_completions\" # provider comment\neffort = \"medium\"\n\n[openai] # validated\nmodel = \"gpt-6.1-sol\"\ncontext_window = 500_000\n[chat_completions]\nmodel = \"a#b\\\"c\\\\d\\ne\"\nbase_url = \"https://example.test\"\ncontext_window = +1000000\n"
+            f = expect_parse_ok_(text)
+            spec.assert_str_eq(f.provider_name, "chat_completions", "provider")
+            spec.assert_eq(f.provider_is_custom, 0, "built-in")
+            spec.assert_str_eq(f.effort, "medium", "effort")
+            chat = f.chat as *config.Prov
+            spec.assert_str_eq(chat.model, "a#b\"c\\d\ne", "escapes")
+            spec.assert_eq(prov_(f, 0).context_window as int, 500000, "underscores")
+            spec.assert_eq(chat.context_window as int, 1000000, "plus sign")
+            pv, m = config.parse_value("true # yes")
+            v = pv as *config.Val
+            spec.assert_true(m == "" && v.kind == 2 && v.b == 1 && v.consumed == 4, "true")
+            pv2, _m2 = config.parse_value("false")
+            spec.assert_eq((pv2 as *config.Val).b, 0, "false")
+            pv3, _m3 = config.parse_value("-42")
+            spec.assert_eq((pv3 as *config.Val).n as int, -42, "negative")
+            pv4, _m4 = config.parse_value("0")
+            spec.assert_true((pv4 as *config.Val).kind == 1 && (pv4 as *config.Val).n == (0 as long), "zero")
+        }
+        spec.it("strict configuration errors report path and exact line") callback {
+            texts = ["# comment\n[unknown]\n", "\nunknown = true\n", "[openai]\neffort = \"high\"\n", "provider = false", "effort = 42",
+                     "[chat_completions]\nmodel = true", "[chat_completions]\nbase_url = 1", "[chat_completions]\ncontext_window = \"500000\"",
+                     "[chat_completions]\ncontext_window = false", "[chat_completions]\ncontext_window = 0", "[chat_completions]\ncontext_window = -1",
+                     "[chat_completions]\ncontext_window = 18446744073709551616", "[chat_completions]\ncontext_window = 1.5",
+                     "[chat_completions]\ncontext_window = 01", "[chat_completions]\ncontext_window = 1__0", "effort = \"invalid\"",
+                     "provider = \"invalid\"", "effort \"high\"", "[chat_completions", "[chat_completions] trailing", "effort = \"high",
+                     "effort = \"high\" extra", "effort = \"hi\\q\"", "effort = \"high\"\neffort = \"low\"", "[chat_completions]\n[chat_completions]",
+                     "\napi_key = \"no\"", "[chat_completions]\naccess_token = \"no\"", "[chat_completions]\napi-key = \"no\"", "[credentials]",
+                     "effort = \"high\"\r", "# \xff", "[codex]\nmodel = \"x\"", "provider = \"codex\""]
+            lines = [2, 2, 2, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1]
+            msgs = ["unknown section", "unknown top-level key", "unknown provider key", "must be a string", "must be a string",
+                    "must be a string", "must be a string", "must be an integer", "must be an integer", "positive u64", "positive u64",
+                    "positive u64", "decimal integer", "leading zero", "separator", "invalid effort", "provider must be", "expected key = value",
+                    "unterminated section", "after section", "unterminated string", "after value", "unsupported string escape", "duplicate key",
+                    "duplicate section", "use NIB_API_KEY", "use NIB_API_KEY", "use NIB_API_KEY", "use NIB_API_KEY", "carriage return",
+                    "invalid UTF-8", "unknown section 'codex'", "unknown 'codex'"]
+            // dropped with Codex: the [codex] cases became [openai] / [chat_completions]; the last two pin the drop
+            i = 0
+            while i < 33 {
+                expect_parse_error_(texts[i], lines[i], msgs[i])
+                i = i + 1
+            }
+            fp, d = config.parse("\napi_key = \"no\"", "test/config.toml")
+            spec.assert_str_eq(d, "test/config.toml:2: secrets are not allowed; use NIB_API_KEY or DEEPSEEK_API_KEY (Codex uses CODEX_HOME/auth.json)", "full secret message")
+        }
+        spec.it("provider defaults file environment and command effort precedence") callback {
+            e = env.new()
+            env.set(e, "HOME", "/fictional")
+            cp = ok_(e, "")
+            spec.assert_str_eq(cfg_(cp).provider, "anthropic", "default provider (upstream: codex)")
+            spec.assert_str_eq(cfg_(cp).model, "claude-sonnet-5-5", "default model")
+            spec.assert_eq(cfg_(cp).context_window as int, 1000000, "default window")
+            text = "provider = \"chat_completions\"\neffort = \"medium\"\n[anthropic]\nmodel = \"claude-opus-5-5\"\nbase_url = \"https://anthropic.test\"\ncontext_window = 200000\n[chat_completions]\nmodel = \"file-model\"\nbase_url = \"https://chat.test\"\ncontext_window = 100000\n"
+            cp = ok_(e, text)
+            spec.assert_str_eq(cfg_(cp).model, "file-model", "file model")
+            spec.assert_str_eq(cfg_(cp).base_url, "https://chat.test", "file url")
+            spec.assert_eq(cfg_(cp).context_window as int, 100000, "file window")
+            spec.assert_str_eq(cfg_(cp).reasoning_effort, "medium", "file effort")
+            env.set(e, "NIB_PROVIDER", "anthropic")
+            cp = ok_(e, text)
+            spec.assert_str_eq(cfg_(cp).model, "claude-opus-5-5", "env provider picks its section")
+            spec.assert_str_eq(cfg_(cp).base_url, "https://anthropic.test", "its url")
+            spec.assert_eq(cfg_(cp).context_window as int, 200000, "its window")
+            env.set(e, "NIB_MODEL", "env-model")
+            env.set(e, "NIB_BASE_URL", "https://env.test")
+            env.set(e, "NIB_CONTEXT_WINDOW", "12345")
+            env.set(e, "NIB_REASONING_EFFORT", "low")
+            env.set(e, "NIB_API_KEY", "mock")
+            cp = ok_(e, text)
+            spec.assert_str_eq(cfg_(cp).model, "env-model", "env model")
+            spec.assert_str_eq(cfg_(cp).base_url, "https://env.test", "env url")
+            spec.assert_eq(cfg_(cp).context_window as int, 12345, "env window")
+            spec.assert_str_eq(cfg_(cp).api_key, "", "NIB_API_KEY is not anthropic's key")
+            spec.assert_str_eq(cfg_(cp).reasoning_effort, "low", "env effort")
+            env.set(e, "NIB_THINKING", "off")
+            cp = ok_(e, text)
+            spec.assert_eq(cfg_(cp).thinking, 0, "thinking off")
+            spec.assert_str_eq(types.set_effort(cp, "high"), "", "set high")
+            spec.assert_str_eq(cfg_(cp).reasoning_effort, "high", "command effort")
+            spec.assert_eq(cfg_(cp).thinking, 1, "command effort turns thinking on")
+            types.set_effort(cp, "default")
+            spec.assert_eq(cfg_(cp).thinking, -1, "default clears thinking")
+            spec.assert_str_eq(cfg_(cp).reasoning_effort, "", "default clears effort")
+            env.set(e, "NIB_PROVIDER", "chat_completions")
+            cp = ok_(e, text)
+            spec.assert_str_eq(cfg_(cp).api_key, "mock", "NIB_API_KEY serves chat_completions")
+            efforts = ["default", "off", "none", "minimal", "low", "medium", "high", "xhigh", "max"]
+            i = 0
+            while i < 9 {
+                empty = env.new()
+                file_cfg = ok_(empty, "effort = \"${efforts[i]}\"")
+                expected = types.new_config("x", "", "", "")
+                types.set_effort(expected, efforts[i])
+                spec.assert_eq(cfg_(file_cfg).thinking, cfg_(expected).thinking, "thinking for ${efforts[i]}")
+                spec.assert_str_eq(cfg_(file_cfg).reasoning_effort, cfg_(expected).reasoning_effort, "effort for ${efforts[i]}")
+                i = i + 1
+            }
+        }
+        spec.it("NIB_HOME alone locates global data and absent configuration is empty") callback {
+            d = tmp_()
+            e = env.new()
+            env.set(e, "HOME", "/fictional")
+            env.set(e, "XDG_CONFIG_HOME", "/unused")
+            env.set(e, "XDG_DATA_HOME", "/unused")
+            h, herr = config.home(e)
+            spec.assert_true(herr == "" && h == "/fictional/.nib", "default home ${h}")
+            env.set(e, "NIB_HOME", "/another")
+            h2, _e2 = config.home(e)
+            spec.assert_str_eq(h2, "/another", "NIB_HOME")
+            h3, e3 = config.home(env.new())
+            spec.assert_true(h3 == "" && e3 == "MissingHome", "no HOME")
+            root = "${d}/absent"
+            cp, err, _dd = config.load(e, root)
+            spec.assert_str_eq(err, "", "absent config loads")
+            spec.assert_str_eq(cfg_(cp).model, "claude-sonnet-5-5", "default model")
+            spec.assert_eq(fs.exists(root), 0, "load creates nothing")
+            fs.remove_tree(d)
+        }
+        spec.it("effort writeback preserves surrounding bytes and inserts at top-level end") callback {
+            before = ["# first\n  effort  =  \"low\"  # keep\n\n[openai]\nmodel = \"gpt-6.1-sol\"\n", "# first\neffort = \"low\"\n[openai]\n",
+                      "# first\n  effort = \"low\" # keep\n[openai]\n", "# top\nprovider = \"openai\"\n\n[openai]\n# end", "[openai]\n",
+                      "[limits]\nmax_steps = 7 # keep\n", "# only comment", "# top\r\n[openai]\r\n", "effort=\"low\"", "# no setting\n[openai]\n"]
+            efforts = ["high", "default", "default", "medium", "off", "off", "high", "high", "max", "default"]
+            after = ["# first\n  effort  =  \"high\"  # keep\n\n[openai]\nmodel = \"gpt-6.1-sol\"\n", "# first\n[openai]\n", "# first\n  # keep\n[openai]\n",
+                     "# top\nprovider = \"openai\"\n\neffort = \"medium\"\n[openai]\n# end", "effort = \"off\"\n[openai]\n",
+                     "effort = \"off\"\n[limits]\nmax_steps = 7 # keep\n", "# only comment\neffort = \"high\"\n", "# top\r\neffort = \"high\"\r\n[openai]\r\n",
+                     "effort=\"max\"", "# no setting\n[openai]\n"]
+            i = 0
+            while i < 10 {
+                d = tmp_()
+                fs.write("${d}/config.toml", before[i])
+                spec.assert_str_eq(config.save_effort(d, efforts[i]), "", "save ${i}")
+                spec.assert_str_eq(read_("${d}/config.toml"), after[i], "case ${i}")
+                fs.remove_tree(d)
+                i = i + 1
+            }
+        }
+        spec.it("effort creates missing home and invalid files are left intact") callback {
+            d = tmp_()
+            root = "${d}/new/home"
+            spec.assert_str_eq(config.save_effort(root, "default"), "", "default on nothing")
+            spec.assert_eq(fs.exists("${d}/new"), 0, "no directory for a no-op")
+            spec.assert_str_eq(config.save_effort(root, "high"), "", "high")
+            spec.assert_str_eq(read_("${root}/config.toml"), "effort = \"high\"\n", "created")
+            spec.assert_eq(mode_("${root}/config.toml"), 384, "0600")
+            fs.write("${root}/config.toml", "broken")
+            spec.assert_str_eq(config.save_effort(root, "low"), "InvalidConfig", "invalid file")
+            spec.assert_str_eq(read_("${root}/config.toml"), "broken", "untouched")
+            spec.assert_str_eq(config.save_effort(root, "bogus"), "InvalidReasoningEffort", "invalid value")
+            fs.remove_tree(d)
+        }
+        spec.it("environment validation and model-dependent defaults") callback {
+            e = env.new()
+            env.set(e, "NIB_PROVIDER", "chat_completions")
+            cp = ok_(e, "")
+            spec.assert_str_eq(cfg_(cp).model, "deepseek-flash", "chat model")
+            spec.assert_str_eq(cfg_(cp).base_url, "https://api.deepseek.com", "chat url")
+            spec.assert_eq(cfg_(cp).context_window as int, 1000000, "chat window")
+            spec.assert_eq(types.missing_key(cp), 1, "missing key")
+            env.set(e, "DEEPSEEK_API_KEY", "mock-fallback")
+            spec.assert_str_eq(cfg_(ok_(e, "")).api_key, "mock-fallback", "fallback key")
+            spec.assert_str_eq(cfg_(ok_(e, "")).key_source, "env", "key source")
+            spec.assert_str_eq(cfg_(ok_(e, "")).api_key_env, "DEEPSEEK_API_KEY", "key variable")
+            // upstream's Codex block, on anthropic
+            env.set(e, "NIB_PROVIDER", "anthropic")
+            env.set(e, "NIB_MODEL", "claude-haiku-5-5")
+            cp = ok_(e, "")
+            spec.assert_eq(cfg_(cp).context_window as int, 1000000, "catalog window")
+            spec.assert_str_eq(types.check_session(cp, "anthropic", "claude-haiku-5-5"), "", "same session")
+            spec.assert_str_eq(types.check_session(cp, "chat_completions", ""), "SessionProviderMismatch", "provider mismatch")
+            env.set(e, "NIB_MODEL", "unknown")
+            spec.assert_str_eq(err_(e, ""), "InvalidConfig", "unknown model window")
+            spec.assert_true(contains_(detail_(e, ""), "unknown model context window; set context_window or NIB_CONTEXT_WINDOW") == 1, "detail")
+            spec.assert_true(string.starts_with(detail_(e, ""), "test/config.toml:1: "), "detail line")
+            env.set(e, "NIB_CONTEXT_WINDOW", "10000")
+            spec.assert_eq(cfg_(ok_(e, "")).context_window as int, 10000, "explicit window")
+            env.set(e, "NIB_CONTEXT_WINDOW", "bad")
+            spec.assert_str_eq(err_(e, ""), "InvalidContextWindow", "bad window")
+            spec.assert_str_eq(detail_(e, ""), "NIB_CONTEXT_WINDOW: expected a positive integer", "bad window detail")
+            env.set(e, "NIB_CONTEXT_WINDOW", "0")
+            spec.assert_str_eq(err_(e, ""), "InvalidContextWindow", "zero window")
+            spec.assert_str_eq(detail_(e, ""), "NIB_CONTEXT_WINDOW: must be greater than zero", "zero window detail")
+            env.set(e, "NIB_CONTEXT_WINDOW", "10000")
+            env.set(e, "NIB_THINKING", "invalid")
+            spec.assert_str_eq(err_(e, ""), "InvalidThinking", "bad thinking")
+            spec.assert_str_eq(detail_(e, ""), "NIB_THINKING: expected on or off", "bad thinking detail")
+            env.set(e, "NIB_THINKING", "on")
+            cp = ok_(e, "effort = \"off\"")
+            spec.assert_eq(cfg_(cp).thinking, 1, "thinking on beats file effort")
+            spec.assert_str_eq(cfg_(cp).reasoning_effort, "", "file effort ignored")
+            env.set(e, "NIB_REASONING_EFFORT", "invalid")
+            spec.assert_str_eq(err_(e, ""), "InvalidReasoningEffort", "bad effort")
+            spec.assert_str_eq(detail_(e, ""), "NIB_REASONING_EFFORT: expected default|off|none|minimal|low|medium|high|xhigh|max", "bad effort detail")
+            env.set(e, "NIB_PROVIDER", "invalid")
+            spec.assert_str_eq(err_(e, ""), "InvalidProvider", "bad provider")
+            spec.assert_str_eq(detail_(e, ""), "NIB_PROVIDER: unknown provider 'invalid'", "bad provider detail")
+            env.set(e, "NIB_PROVIDER", "codex")
+            spec.assert_str_eq(err_(e, ""), "InvalidProvider", "codex is not a provider")
+            env.set(e, "NIB_PROVIDER", "")
+            spec.assert_str_eq(err_(e, ""), "InvalidProvider", "empty provider is present")
+        }
+        spec.it("limits defaults, bounds and diagnostics") callback {
+            e = env.new()
+            l = lim_(ok_(e, ""))
+            spec.assert_true(l.llm_concurrency == 4 && l.llm_calls_per_run == 100 && l.llm_input_kib == 256 && l.agent_concurrency == 4, "defaults")
+            spec.assert_true(l.max_steps == -1 && l.stream_idle_timeout_s == 300 && l.stream_content_timeout_s == 120 && l.request_timeout_s == 300, "defaults 2")
+            spec.assert_true(l.run_background_after_ms == 10000 && l.run_output_bytes == 16384, "defaults 3")
+            spec.assert_eq(lim_(ok_(e, "[limits]\n")).llm_concurrency, 4, "empty section")
+            spec.assert_eq(lim_(ok_(e, "[limits]\nllm_concurrency = 8\n")).max_steps, -1, "unlimited steps")
+            spec.assert_eq(lim_(ok_(e, "[limits]\nmax_steps = 50\n")).max_steps, 50, "50 steps")
+            names = ["llm_concurrency", "llm_calls_per_run", "llm_input_kib", "agent_concurrency", "max_steps", "stream_idle_timeout_s", "run_background_after_ms", "stream_content_timeout_s", "request_timeout_s"]
+            maxima = [64, 10000, 65536, 64, 100000, 3600, 3600000, 3600, 3600]
+            bad_values = ["0", "-1", "true", "\"1\"", "1.5"]
+            i = 0
+            while i < 9 {
+                ns = [1, maxima[i]]
+                k = 0
+                while k < 2 {
+                    got = limit_(lim_(ok_(e, "[limits]\n${names[i]} = ${ns[k]}\n")), i)
+                    spec.assert_eq(got, ns[k], "${names[i]} = ${ns[k]}")
+                    k = k + 1
+                }
+                j = 0
+                while j < 5 {
+                    text = "[limits]\n${names[i]} = ${bad_values[j]}\n"
+                    spec.assert_str_eq(err_(e, text), "InvalidConfig", "${text}")
+                    spec.assert_true(string.starts_with(detail_(e, text), "test/config.toml:2:"), "line: ${detail_(e, text)}")
+                    j = j + 1
+                }
+                over = "[limits]\n${names[i]} = ${maxima[i] + 1}\n"
+                spec.assert_str_eq(err_(e, over), "InvalidConfig", "over max ${names[i]}")
+                spec.assert_true(string.starts_with(detail_(e, over), "test/config.toml:2:"), "over max line")
+                spec.assert_true(contains_(detail_(e, over), "${names[i]} must be between 1 and ${maxima[i]}") == 1, "range text: ${detail_(e, over)}")
+                i = i + 1
+            }
+            bad = ["[limits]\nunknown = 1", "[limits]\nmax_steps = 1\nmax_steps = 2", "[limits]\n[limits]"]
+            b = 0
+            while b < 3 {
+                spec.assert_str_eq(err_(e, bad[b]), "InvalidConfig", "bad ${b}")
+                spec.assert_true(string.starts_with(detail_(e, bad[b]), "test/config.toml:"), "bad line ${b}")
+                b = b + 1
+            }
+        }
+        spec.it("sandbox defaults, file settings and NIB_SANDBOX override") callback {
+            e = env.new()
+            env.set(e, "HOME", "/home/u")
+            d = ok_(e, "")
+            spec.assert_eq(cfg_(d).sandbox_workspace, 0, "default off")
+            spec.assert_eq(list.list_size(cfg_(d).sandbox_writable), 0, "no extra roots")
+            text = "[sandbox]\nmode = \"off\" # trusted machine\nwritable = [\"~/extra\", \"/data/shared\",]\n"
+            f = ok_(e, text)
+            spec.assert_eq(cfg_(f).sandbox_workspace, 0, "file off")
+            spec.assert_eq(list.list_size(cfg_(f).sandbox_writable), 2, "two roots")
+            spec.assert_str_eq(str_(cfg_(f).sandbox_writable, 0), "/home/u/extra", "home expanded")
+            spec.assert_str_eq(str_(cfg_(f).sandbox_writable, 1), "/data/shared", "absolute kept")
+            spec.assert_eq(cfg_(ok_(e, "[sandbox]\nmode = \"workspace\"")).sandbox_workspace, 1, "file workspace")
+            env.set(e, "NIB_SANDBOX", "workspace")
+            spec.assert_eq(cfg_(ok_(e, text)).sandbox_workspace, 1, "env workspace beats file off")
+            env.set(e, "NIB_SANDBOX", "off")
+            spec.assert_eq(cfg_(ok_(e, "[sandbox]\nmode = \"workspace\"")).sandbox_workspace, 0, "env off beats file workspace")
+            env.set(e, "NIB_SANDBOX", "maybe")
+            spec.assert_str_eq(err_(e, text), "InvalidConfig", "bad env")
+            spec.assert_true(string.starts_with(detail_(e, text), "NIB_SANDBOX:"), "env detail")
+            spec.assert_str_eq(detail_(e, text), "NIB_SANDBOX: expected workspace or off", "env detail text")
+            bads = ["[sandbox]\nmode = \"on\"", "[sandbox]\nmode = 1", "[sandbox]\nunknown = 1", "[sandbox]\nmode = \"off\"\nmode = \"off\"",
+                    "[sandbox]\nwritable = [\"relative\"]", "[sandbox]\nwritable = [\"/a\"", "[sandbox]\nwritable = \"/a\"",
+                    "[sandbox]\nwritable = [\"/a\" \"/b\"]", "[sandbox]\n[sandbox]"]
+            i = 0
+            while i < 9 {
+                clean = env.new()
+                spec.assert_str_eq(err_(clean, bads[i]), "InvalidConfig", "bad ${i}")
+                spec.assert_true(string.starts_with(detail_(clean, bads[i]), "test/config.toml:"), "bad line ${i}")
+                i = i + 1
+            }
+        }
+        spec.it("summary and Run display budget file and environment precedence") callback {
+            e = env.new()
+            d = ok_(e, "")
+            spec.assert_str_eq(cfg_(d).reasoning_summary, "off", "default summary off")
+            spec.assert_eq(lim_(d).run_output_bytes, 16384, "default budget")
+            text = "[limits]\nrun_output_bytes = 32768\n"
+            spec.assert_eq(lim_(ok_(e, text)).run_output_bytes, 32768, "file budget")
+            env.set(e, "NIB_REASONING_SUMMARY", "auto")
+            spec.assert_str_eq(cfg_(ok_(e, text)).reasoning_summary, "auto", "env summary auto")
+            env.set(e, "NIB_REASONING_SUMMARY", "off")
+            env.set(e, "NIB_RUN_OUTPUT_BYTES", "65536")
+            o = ok_(e, text)
+            spec.assert_str_eq(cfg_(o).reasoning_summary, "off", "env summary off")
+            spec.assert_eq(lim_(o).run_output_bytes, 65536, "env budget beats file")
+            values = ["0", "16383", "16777217", "many"]
+            i = 0
+            while i < 4 {
+                env.set(e, "NIB_RUN_OUTPUT_BYTES", values[i])
+                spec.assert_str_eq(err_(e, text), "InvalidConfig", "budget ${values[i]}")
+                spec.assert_str_eq(detail_(e, text), "NIB_RUN_OUTPUT_BYTES: expected 16384..16777216 bytes", "budget detail")
+                i = i + 1
+            }
+            env.remove(e, "NIB_RUN_OUTPUT_BYTES")
+            env.set(e, "NIB_REASONING_SUMMARY", "invalid")
+            spec.assert_str_eq(err_(e, text), "InvalidConfig", "bad summary")
+            spec.assert_str_eq(detail_(e, text), "NIB_REASONING_SUMMARY: expected off or auto", "bad summary detail")
+            invalid = ["[limits]\nrun_output_bytes = 16383", "[limits]\nrun_output_bytes = 16777217", "[limits]\nrun_output_bytes = true", "[openai]\nreasoning_summary = \"auto\""]
+            k = 0
+            while k < 4 {
+                expect_parse_fails_(invalid[k])
+                k = k + 1
+            }
+        }
+        spec.it("effort replacement preserves config symlink and permissions") callback {
+            d = tmp_()
+            fs.write("${d}/settings.toml", "effort = \"low\"\n")
+            fs.symlink("settings.toml", "${d}/config.toml")
+            fs.chmod("${d}/settings.toml", 416)
+            spec.assert_str_eq(config.save_effort(d, "high"), "", "saved")
+            st = sysgap.new_stat()
+            sysgap.stat("${d}/config.toml", 0, st)
+            spec.assert_eq((st as *sysgap.Stat).kind, sysgap.KIND_LINK, "still a symlink")
+            spec.assert_eq(mode_("${d}/settings.toml"), 416, "mode 0640 kept")
+            spec.assert_str_eq(read_("${d}/settings.toml"), "effort = \"high\"\n", "target rewritten")
+            l, _e = fs.list_dir(d)
+            n = fs.dir_list_count(l)
+            i = 0
+            while i < n {
+                spec.assert_eq(string.starts_with(fs.dir_list_get(l, i), ".nib-"), 0, "no temp file")
+                i = i + 1
+            }
+            fs.remove_tree(d)
+        }
+        spec.it("skills config booleans and atomic toggles preserve other lines") callback {
+            d = tmp_()
+            original = "# config\r\neffort = \"high\"\r\n[skills]\r\nhallmark = false # keep\r\n[openai]\r\nmodel = \"mock\"\r\n"
+            fs.write("${d}/config.toml", original)
+            spec.assert_str_eq(config.save_skill(d, "hallmark", 1), "", "toggle")
+            spec.assert_str_eq(read_("${d}/config.toml"), string.replace_all(original, "false", "true"), "only the value changed")
+            config.save_skill(d, "other", 1)
+            config.save_skill(d, "hallmark", 0)
+            sw, err = config.load_skills(d)
+            spec.assert_str_eq(err, "", "load")
+            spec.assert_eq(config.skill_enabled(sw, "hallmark"), 0, "hallmark off")
+            spec.assert_eq(config.skill_enabled(sw, "other"), 1, "other on")
+            spec.assert_eq(config.skill_enabled(sw, "absent"), 0, "absent off")
+            expect_parse_fails_("[skills]\na = \"true\"")
+            expect_parse_fails_("[skills]\na = true\na = false")
+            expect_parse_fails_("effort = true")
+            e = env.new()
+            r = ok_(e, "[skills]\non = true\noff = false")
+            spec.assert_eq(list.list_size(cfg_(r).enabled_skills), 1, "one enabled")
+            spec.assert_str_eq(str_(cfg_(r).enabled_skills, 0), "on", "which")
+            spec.assert_str_eq(config.save_skill(d, "bad name", 1), "InvalidSkillName", "invalid name")
+            spec.assert_str_eq(config.save_skill(d, "", 1), "InvalidSkillName", "empty name")
+            fs.remove_tree(d)
+        }
+        spec.it("built-in catalogs custom providers and environment selection") callback {
+            e = env.new()
+            ids = types.builtin_ids()
+            i = 0
+            while i < list.list_size(ids) {
+                id = str_(ids, i)
+                env.set(e, "NIB_PROVIDER", id)
+                keys = types.definition_key_envs(id)
+                env.set(e, str_(keys, 0), "fake-key")
+                cp = ok_(e, "")
+                spec.assert_str_eq(cfg_(cp).provider, id, "provider ${id}")
+                spec.assert_str_eq(cfg_(cp).model, types.definition_default_model(id), "default model ${id}")
+                spec.assert_str_eq(types.protocol(cp), types.definition_protocol(id), "protocol ${id}")
+                models = types.definition_models(id)
+                if list.list_size(models) > 0 {
+                    spec.assert_eq(cfg_(cp).context_window, types.model_context_window(id, str_(models, 0)), "window ${id}")
+                }
+                i = i + 1
+            }
+            env.remove(e, "NIB_PROVIDER")
+            env.set(e, "SITE_KEY", "fake-custom-key")
+            text = "provider = \"mysite\"\n[providers.mysite]\nprotocol = \"responses\"\nbase_url = \"http://localhost:1234/v1\"\nmodel = \"code\"\ncontext_window = 12345\napi_key_env = \"SITE_KEY\"\n"
+            cp = ok_(e, text)
+            spec.assert_str_eq(types.name(cp), "mysite", "name")
+            spec.assert_str_eq(cfg_(cp).provider, "custom", "id is custom")
+            spec.assert_str_eq(cfg_(cp).api_key, "fake-custom-key", "key")
+            spec.assert_str_eq(types.protocol(cp), "responses", "protocol")
+            spec.assert_eq(cfg_(cp).context_window as int, 12345, "window")
+            env.set(e, "NIB_MODEL", "override")
+            env.set(e, "NIB_CONTEXT_WINDOW", "9876")
+            cp = ok_(e, text)
+            spec.assert_str_eq(cfg_(cp).model, "override", "model override")
+            spec.assert_eq(cfg_(cp).context_window as int, 9876, "window override")
+        }
+        spec.it("custom configuration rejects incomplete duplicate conflicting and secret fields") callback {
+            bads = ["[providers.site]\nmodel = \"x\"", "[providers.openai]\n", "[providers.site]\n[providers.site]\n", "[providers.site]\napi_key = \"secret\"",
+                    "[providers.site]\nprotocol = \"fourth_protocol\"", "[providers.site]\napi_key_env = \"BAD-NAME\"", "[openai]\nmodel = \"a\"\nmodel = \"b\"",
+                    "[provider_dynamic]\n", "[providers.custom]\n", "[providers.]\n", "[providers.a b]\n"]
+            i = 0
+            while i < 11 {
+                fp, d = config.parse(bads[i], "bad/config.toml")
+                spec.assert_true(fp == null, "bad ${i}")
+                spec.assert_true(string.starts_with(d, "bad/config.toml:"), "prefix ${d}")
+                i = i + 1
+            }
+        }
+        spec.it("model arguments and configuration preserve comments and sections") callback {
+            p, m, err = config.parse_model("openai/gpt-test")
+            spec.assert_true(p == "openai" && m == "gpt-test" && err == "", "slash form")
+            p2, m2, _e2 = config.parse_model("openai gpt-test")
+            spec.assert_true(p2 == "openai" && m2 == "gpt-test", "space form")
+            p3, m3, _e3 = config.parse_model("openai")
+            spec.assert_true(p3 == "openai" && m3 == "", "provider only")
+            bad = ["", "/model", "openai/", "openai a b", "openai/a b", "   "]
+            i = 0
+            while i < 6 {
+                _p, _m, be = config.parse_model(bad[i])
+                spec.assert_str_eq(be, "InvalidModelArgument", "bad argument '${bad[i]}'")
+                i = i + 1
+            }
+            text = "# header\nprovider = \"deepseek\" # keep\n[openai] # section\nmodel = \"old\" # model\n[skills]\nx = true\n"
+            updated, uerr = config.model_text(text, "openai", "new")
+            spec.assert_str_eq(uerr, "", "no error")
+            spec.assert_str_eq(updated, "# header\nprovider = \"openai\" # keep\n[openai] # section\nmodel = \"new\" # model\n[skills]\nx = true\n", "rewritten in place")
+            fresh, _e4 = config.model_text("", "openai", "new")
+            spec.assert_str_eq(fresh, "provider = \"openai\"\n[openai]\nmodel = \"new\"\n", "from nothing")
+            custom = "[providers.local]\nprotocol = \"responses\"\nbase_url = \"http://localhost\"\nmodel = \"old\" # keep\ncontext_window = 1000\n"
+            changed, _e5 = config.model_text(custom, "local", "new")
+            spec.assert_true(contains_(changed, "model = \"new\" # keep") == 1, "custom model")
+            spec.assert_true(contains_(changed, "[providers.local]") == 1, "custom section")
+            _x, xerr = config.model_text("broken", "openai", "new")
+            spec.assert_str_eq(xerr, "InvalidConfig", "invalid file refused")
+        }
+        spec.it("model entries list only the current service and saving is atomic") callback {
+            d = tmp_()
+            e = env.new()
+            env.set(e, "HOME", d)
+            custom = "[providers.local]\nprotocol = \"responses\"\nbase_url = \"http://localhost\"\nmodel = \"old\"\ncontext_window = 1000\n[providers.locked]\nprotocol = \"responses\"\nbase_url = \"http://localhost\"\nmodel = \"old\"\ncontext_window = 1000\napi_key_env = \"SITE_KEY\"\n"
+            fs.write("${d}/config.toml", custom)
+            ae = env.clone(e)
+            env.set(ae, "NIB_PROVIDER", "anthropic")
+            anthropic = ok_(ae, custom)
+            own, oerr = config.model_entries(d, anthropic)
+            spec.assert_str_eq(oerr, "", "entries")
+            spec.assert_eq(list.list_size(own), 4, "anthropic's catalog")
+            i = 0
+            while i < 4 {
+                spec.assert_str_eq((list.list_get_raw(own, i) as *config.ModelEntry).provider, "anthropic", "entry ${i} provider")
+                i = i + 1
+            }
+            le = env.clone(e)
+            env.set(le, "NIB_PROVIDER", "local")
+            local = ok_(le, custom)
+            listed, _e2 = config.model_entries(d, local)
+            spec.assert_eq(list.list_size(listed), 1, "custom lists its model")
+            spec.assert_str_eq((list.list_get_raw(listed, 0) as *config.ModelEntry).model, "old", "old")
+            saved_cfg, serr, _d3 = config.save_model(e, d, "local", "new")
+            spec.assert_str_eq(serr, "", "saved")
+            spec.assert_str_eq(cfg_(saved_cfg).model, "new", "returned config")
+            saved = read_("${d}/config.toml")
+            spec.assert_true(string.starts_with(saved, "provider = \"local\"\n"), "provider first")
+            spec.assert_true(contains_(saved, "model = \"new\"") == 1, "model written")
+            spec.assert_true(contains_(saved, "[providers.locked]") == 1, "other sections kept")
+            env.set(e, "OPENAI_API_KEY", "fake")
+            _c, berr, bd = config.save_model(e, d, "openai", "unknown")
+            spec.assert_str_eq(berr, "InvalidConfig", "unknown model refused")
+            spec.assert_true(contains_(bd, "unknown model context window") == 1, "refusal detail")
+            spec.assert_str_eq(read_("${d}/config.toml"), saved, "file untouched by the refusal")
+            new_home = "${d}/new"
+            _c2, nerr, _d4 = config.save_model(e, new_home, "openai", "")
+            spec.assert_str_eq(nerr, "", "new home")
+            spec.assert_str_eq(read_("${new_home}/config.toml"), "provider = \"openai\"\n[openai]\nmodel = \"gpt-6.1-sol\"\n", "created")
+            spec.assert_eq(mode_("${new_home}/config.toml"), 384, "0600")
+            cc = env.clone(e)
+            env.set(cc, "NIB_PROVIDER", "chat_completions")
+            fs.write("${d}/chat.toml", "")
+            _c3, cerr, _d5 = config.save_model(e, "${d}/chat", "chat_completions", "other-model")
+            spec.assert_str_eq(cerr, "UnknownModelContextWindow", "chat_completions needs a window for a new model")
+            fs.remove_tree(d)
+        }
+        spec.it("startup picks the first credentialed service without persisting") callback {
+            d = tmp_()
+            e = env_home_(d)
+            cp, err, _x = config.load(e, d)
+            spec.assert_str_eq(err, "", "loads")
+            spec.assert_str_eq(cfg_(cp).provider, "anthropic", "the default stays")
+            spec.assert_eq(config.credentialed(cp), 0, "not credentialed")
+            fs.write("${d}/auth.json", "{\"keys\":{\"xai\":\"stored-fake\"}}")
+            cp, _e1, _x1 = config.load(e, d)
+            spec.assert_str_eq(cfg_(cp).provider, "xai", "stored xAI key")
+            spec.assert_str_eq(cfg_(cp).key_source, "store", "from the store")
+            spec.assert_str_eq(cfg_(cp).api_key, "stored-fake", "the key")
+            env.set(e, "OPENAI_API_KEY", "env-fake")
+            cp, _e2, _x2 = config.load(e, d)
+            spec.assert_str_eq(cfg_(cp).provider, "openai", "OpenAI before xAI")
+            spec.assert_str_eq(cfg_(cp).key_source, "env", "from the environment")
+            env.set(e, "ANTHROPIC_API_KEY", "env-fake")
+            cp, _e3, _x3 = config.load(e, d)
+            spec.assert_str_eq(cfg_(cp).provider, "anthropic", "Anthropic first")
+            // A configured service that is credentialed wins over the order; an explicit NIB_PROVIDER is never replaced.
+            fs.write("${d}/config.toml", "provider = \"deepseek\"\n")
+            cp, _e4, _x4 = config.load(e, d)
+            spec.assert_str_eq(cfg_(cp).provider, "anthropic", "configured but uncredentialed: pick")
+            env.set(e, "DEEPSEEK_API_KEY", "env-fake")
+            cp, _e5, _x5 = config.load(e, d)
+            spec.assert_str_eq(cfg_(cp).provider, "deepseek", "configured and credentialed")
+            env.set(e, "NIB_PROVIDER", "xai")
+            fs.write("${d}/auth.json", "{}")
+            cp, _e6, _x6 = config.load(e, d)
+            spec.assert_str_eq(cfg_(cp).provider, "xai", "explicit provider kept")
+            spec.assert_eq(config.credentialed(cp), 0, "and not credentialed")
+            spec.assert_str_eq(read_("${d}/config.toml"), "provider = \"deepseek\"\n", "nothing persisted")
+            fs.remove_tree(d)
+        }
+        spec.it("custom services come last and a stored key serves a keyless config") callback {
+            d = tmp_()
+            e = env_home_(d)
+            fs.write("${d}/config.toml", "[providers.site]\nprotocol = \"chat_completions\"\nbase_url = \"http://h\"\nmodel = \"m\"\ncontext_window = 9\napi_key_env = \"SITE_KEY\"\n")
+            cp, _e0, _x0 = config.load(e, d)
+            spec.assert_str_eq(cfg_(cp).provider, "anthropic", "no credentials: the default stays")
+            fs.write("${d}/auth.json", "{\"keys\":{\"site\":\"stored-fake\"}}")
+            cp, _e1, _x1 = config.load(e, d)
+            spec.assert_str_eq(cfg_(cp).provider, "custom", "custom picked")
+            spec.assert_str_eq(types.name(cp), "site", "named site")
+            spec.assert_str_eq(cfg_(cp).api_key, "stored-fake", "stored key")
+            spec.assert_str_eq(types.key_hint(cp), "the key stored by nib (run nib login)", "hint")
+            env.set(e, "SITE_KEY", "env-fake")
+            cp, _e2, _x2 = config.load(e, d)
+            spec.assert_str_eq(cfg_(cp).api_key, "env-fake", "environment wins over the store")
+            spec.assert_str_eq(cfg_(cp).key_source, "env", "source")
+            fs.remove_tree(d)
+        }
+        spec.it("adding an endpoint appends one section and validates ids") callback {
+            d = tmp_()
+            fs.write("${d}/config.toml", "# keep\neffort = \"high\"")
+            spec.assert_str_eq(config.add_endpoint(d, "my-site", "chat_completions", "https://x.example/v1", "m\"1", 128000 as long), "", "added")
+            text = read_("${d}/config.toml")
+            spec.assert_true(string.starts_with(text, "# keep\neffort = \"high\"\n\n[providers.my-site]\nprotocol = \"chat_completions\"\n"), "appended: ${text}")
+            found, ferr = config.custom_providers(d)
+            spec.assert_str_eq(ferr, "", "listed")
+            spec.assert_eq(list.list_size(found), 1, "one custom")
+            cu = list.list_get_raw(found, 0) as *config.Custom
+            spec.assert_str_eq(cu.model, "m\"1", "model round trips")
+            spec.assert_str_eq(cu.id, "my-site", "id")
+            spec.assert_eq(cu.context_window as int, 128000, "window")
+            spec.assert_str_eq(config.add_endpoint(d, "my-site", "responses", "http://h", "m", 1 as long), "InvalidConfig", "duplicate refused")
+            spec.assert_str_eq(read_("${d}/config.toml"), text, "file untouched")
+            spec.assert_true(config.endpoint_id_problem("", null) != "", "empty")
+            spec.assert_true(config.endpoint_id_problem("a b", null) != "", "space")
+            spec.assert_true(config.endpoint_id_problem("openai", null) != "", "built-in")
+            spec.assert_true(config.endpoint_id_problem("custom", null) != "", "reserved")
+            taken = list.list_new()
+            list.list_add(taken, "my-site")
+            spec.assert_true(config.endpoint_id_problem("my-site", taken) != "", "taken")
+            other = list.list_new()
+            list.list_add(other, "other")
+            spec.assert_str_eq(config.endpoint_id_problem("ok_1", other), "", "fine")
+            spec.assert_str_eq(config.endpoint_id_problem("openai", null), "Name is taken by a built-in service", "built-in text")
+            spec.assert_str_eq(config.endpoint_id_problem("a b", null), "Use letters, digits, _ and - only", "chars text")
+            spec.assert_str_eq(config.endpoint_id_problem("", null), "Name cannot be empty", "empty text")
+            fs.remove_tree(d)
+        }
+        spec.it("hooks parse command arrays and reject unknown duplicate and malformed values") callback {
+            f = expect_parse_ok_("[hooks]\nafter_edit = [\"zig fmt {files}\"]\nturn_end = []")
+            spec.assert_str_eq(str_(f.hooks_after_edit, 0), "zig fmt {files}", "after_edit")
+            spec.assert_eq(list.list_size(f.hooks_turn_end), 0, "turn_end empty")
+            bads = ["[hooks]\nother = []", "[hooks]\nafter_edit = true", "[hooks]\nafter_edit = [1]", "[hooks]\nafter_edit = []\nafter_edit = []", "[hooks]\n[hooks]", "[hooks]\nturn_end = [\"a\" \"b\"]"]
+            i = 0
+            while i < 6 {
+                expect_parse_fails_(bads[i])
+                i = i + 1
+            }
+            r = ok_(env.new(), "[hooks]\nafter_edit = [\"a\", \"b\"]\nturn_end = [\"c\"]")
+            spec.assert_eq(list.list_size(cfg_(r).hooks_after_edit), 2, "resolved after_edit")
+            spec.assert_str_eq(str_(cfg_(r).hooks_turn_end, 0), "c", "resolved turn_end")
+        }
+        spec.it("MCP config validates transports, names, arrays and switches with line diagnostics") callback {
+            f = expect_parse_ok_("[mcp]\ngithub = true\n[mcp.github]\ncommand = \"server\"\nargs = [\"stdio\"]\nenv = [\"GITHUB_TOKEN\"]\n[mcp.docs]\nurl = \"https://example.com/mcp\"\nheader_env = \"DOCS_MCP_TOKEN\"\n")
+            spec.assert_eq(list.list_size(f.mcp_servers), 2, "two servers")
+            s0 = list.list_get_raw(f.mcp_servers, 0) as *types.McpServer
+            s1 = list.list_get_raw(f.mcp_servers, 1) as *types.McpServer
+            spec.assert_eq(s0.enabled, 1, "github on")
+            spec.assert_eq(s1.enabled, 0, "docs off")
+            spec.assert_str_eq(str_(s0.env, 0), "GITHUB_TOKEN", "env name")
+            spec.assert_str_eq(str_(s0.args, 0), "stdio", "args")
+            spec.assert_str_eq(s0.command, "server", "command")
+            spec.assert_str_eq(s1.url, "https://example.com/mcp", "url")
+            spec.assert_str_eq(s1.header_env, "DOCS_MCP_TOKEN", "header_env")
+            spec.assert_true(s0.line == 3 && s1.line == 7, "section lines ${s0.line} ${s1.line}")
+            bads = ["[mcp.x]\ncommand = \"x\"\nurl = \"http://x\"", "[mcp.x]\nargs = []", "[mcp.x]\nurl = \"file:///x\"", "[mcp.x]\nurl = \"https://user:secret@x\"",
+                    "[mcp.x]\ncommand = \"x\"\nenv = [\"X=secret\"]", "[mcp.x]\ncommand = \"x\"\ncommand = \"y\"", "[mcp.x]\ncommand = \"x\"\nheader_env = \"KEY\"",
+                    "[mcp_dynamic]\ncommand = \"x\"", "[mcp]\nx = \"true\"", "[mcp.bad.id]\ncommand = \"x\"", "[mcp.x]\nurl = \"https://x\"\nargs = [\"x\"]"]
+            i = 0
+            while i < 11 {
+                fp, d = config.parse(bads[i], "test")
+                spec.assert_true(fp == null, "bad ${i}")
+                spec.assert_true(string.starts_with(d, "test:"), "prefix ${d}")
+                i = i + 1
+            }
+            // The two post-checks cite the section's line.
+            _fp1, d1 = config.parse("\n[mcp.x]\ncommand = \"x\"\nurl = \"http://x\"", "test")
+            spec.assert_str_eq(d1, "test:2: MCP server requires exactly one of command or url", "both transports")
+            _fp2, d2 = config.parse("[mcp.x]\ncommand = \"x\"\nheader_env = \"KEY\"", "test")
+            spec.assert_str_eq(d2, "test:1: header_env requires url", "header_env")
+            _fp3, d3 = config.parse("[mcp.x]\nurl = \"https://x\"\nargs = [\"x\"]", "test")
+            spec.assert_str_eq(d3, "test:1: args and env require command", "args with url")
+            r = ok_(env.new(), "[mcp]\ngithub = true\n[mcp.github]\ncommand = \"server\"\n")
+            spec.assert_eq(list.list_size(cfg_(r).mcp_servers), 1, "the config keeps the servers")
+            spec.assert_eq((list.list_get_raw(cfg_(r).mcp_servers, 0) as *types.McpServer).enabled, 1, "enabled")
+        }
+        spec.it("MCP atomic toggles preserve nested definitions and CRLF comments") callback {
+            d = tmp_()
+            fs.write("${d}/config.toml", "[mcp]\r\nx = false # keep\r\n[mcp.x]\r\ncommand = \"server\"\r\n")
+            spec.assert_str_eq(config.save_mcp(d, "x", 1), "", "toggle")
+            spec.assert_str_eq(read_("${d}/config.toml"), "[mcp]\r\nx = true # keep\r\n[mcp.x]\r\ncommand = \"server\"\r\n", "only the value changed")
+            spec.assert_str_eq(config.save_mcp(d, "new", 0), "", "new switch")
+            servers, err = config.load_mcp(d)
+            spec.assert_str_eq(err, "", "load")
+            spec.assert_eq((list.list_get_raw(servers, 0) as *types.McpServer).enabled, 1, "x enabled")
+            spec.assert_true(contains_(read_("${d}/config.toml"), "new = false\r\n[mcp.x]") == 1, "switch added at the end of [mcp]")
+            fs.remove_tree(d)
+        }
+        spec.it("simple persistence preserves surrounding configuration and rejects invalid values") callback {
+            d = tmp_()
+            fs.write("${d}/config.toml", "# keep\n[openai]\n")
+            e = env.new()
+            vals = [1, 0, 1]
+            i = 0
+            while i < 3 {
+                spec.assert_str_eq(config.save_simple(d, vals[i]), "", "save ${i}")
+                text = read_("${d}/config.toml")
+                spec.assert_true(string.ends_with(text, "# keep\n[openai]\n"), "tail kept ${text}")
+                spec.assert_eq(cfg_(ok_(e, text)).simple, vals[i], "simple ${i}")
+                i = i + 1
+            }
+            expect_parse_fails_("ui = true")
+            expect_parse_fails_("ui = \"bad\"")
+            expect_parse_fails_("ui = \"normal\"\nui = \"simple\"")
+            fs.remove_tree(d)
+        }
+        spec.it("open command template is an optional non-empty top-level string") callback {
+            e = env.new()
+            spec.assert_eq(cfg_(ok_(e, "")).open == "", 1, "none by default")
+            spec.assert_str_eq(cfg_(ok_(e, "open = \"zed {path}:{line}\"\n[openai]\n")).open, "zed {path}:{line}", "template")
+            bads = ["open = \"\"", "open = \"  \"", "open = 3", "open = \"a\"\nopen = \"b\""]
+            i = 0
+            while i < 4 {
+                expect_parse_fails_(bads[i])
+                i = i + 1
+            }
+        }
+    }
+    spec.describe(fw, "config (port additions)") {
+        spec.it("the Codex surface is gone") callback {
+            e = env.new()
+            env.set(e, "NIB_CODEX_TRANSPORT", "bogus")
+            env.set(e, "NIB_CODEX_RUN_TOOL", "bogus")
+            spec.assert_str_eq(err_(e, ""), "", "codex variables are ignored")
+            spec.assert_eq(types.known_id("codex"), 0, "codex is not an id")
+            expect_parse_error_("[codex]\ntransport = \"sse\"\n", 1, "unknown section 'codex'")
+        }
+        spec.it("home joins HOME and .nib and rejects nothing else") callback {
+            e = env.new()
+            env.set(e, "HOME", "/h/")
+            h, err = config.home(e)
+            spec.assert_true(err == "" && h == "/h/.nib", "trailing slash joins once: ${h}")
+        }
+        spec.it("environment variables beat the file for every setting they cover") callback {
+            e = env.new()
+            env.set(e, "NIB_PROVIDER", "openai")
+            env.set(e, "OPENAI_API_KEY", "k1")
+            text = "provider = \"anthropic\"\n[openai]\nmodel = \"gpt-6.1-terra\"\nbase_url = \"http://file\"\ncontext_window = 77\n"
+            cp = ok_(e, text)
+            spec.assert_str_eq(cfg_(cp).provider, "openai", "env provider")
+            spec.assert_str_eq(cfg_(cp).model, "gpt-6.1-terra", "file model under env provider")
+            spec.assert_str_eq(cfg_(cp).base_url, "http://file", "file url")
+            spec.assert_eq(cfg_(cp).context_window as int, 77, "file window")
+            env.set(e, "NIB_MODEL", "gpt-6.1-sol")
+            env.set(e, "NIB_BASE_URL", "http://env")
+            env.set(e, "NIB_CONTEXT_WINDOW", "88")
+            cp = ok_(e, text)
+            spec.assert_true(cfg_(cp).model == "gpt-6.1-sol" && cfg_(cp).base_url == "http://env" && cfg_(cp).context_window == (88 as long), "env wins")
+            spec.assert_str_eq(cfg_(cp).api_key, "k1", "key")
+            spec.assert_str_eq(cfg_(cp).api_key_env, "OPENAI_API_KEY", "key variable")
+            spec.assert_eq(types.missing_key(cp), 0, "has a key")
+        }
+    }
+    return spec.run_summary(fw)
+}

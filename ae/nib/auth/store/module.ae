@@ -1,0 +1,138 @@
+// auth.store: `$NIB_HOME/auth.json`, a JSON document edited in place so
+// unknown fields survive (upstream src/auth/store.zig). nib's store holds
+// `keys` (API keys by service id); everything else in the file is kept as
+// found. Codex OAuth `tokens` and the RFC 3339 timestamp that served them
+// are not ported (policy: API keys only).
+//
+// A Doc is a ptr to a Doc struct; free it with store.free. Saves are atomic
+// (a temp file beside the target, then rename) and the secret save leaves
+// the file mode 0600 even if it was wider.
+
+import std.json
+import std.fs
+import std.string
+import nib.jsonx
+import nib.tools.atomic_file
+
+exports(Doc, FILE_NAME, path, load, free, root, key, set_key, remove_key, save, save_secret)
+
+const FILE_NAME = "auth.json"
+const MAX_BYTES = 1048576
+
+struct Doc {
+    root: ptr         // a json object
+}
+
+path(dir: string) -> string {
+    if dir == "" { return FILE_NAME }
+    return atomic_file.join(dir, FILE_NAME)
+}
+
+// A missing file is an empty document; a file that is not a JSON object is
+// "InvalidAuthFile". (doc, "") or (null, error name).
+load(file_path: string) -> (ptr, string) {
+    d = heap.new(Doc)
+    if fs.exists(file_path) == 0 {
+        d.root = json.obj()
+        return d as ptr, ""
+    }
+    text, rerr = fs.read(file_path)
+    if rerr != "" {
+        if string.index_of(rerr, "Is a directory") >= 0 { return null, "IsDir" }
+        if string.index_of(rerr, "Permission denied") >= 0 { return null, "AccessDenied" }
+        return null, "Unexpected"
+    }
+    if string.length(text) > MAX_BYTES { return null, "StreamTooLong" }
+    v = jsonx.parse(text)
+    if v == null { return null, "InvalidAuthFile" }
+    if json.json_type(v) != json.JSON_OBJECT {
+        jsonx.free(v)
+        return null, "InvalidAuthFile"
+    }
+    d.root = v
+    return d as ptr, ""
+}
+
+free(dp: ptr) {
+    if dp == null { return }
+    d = dp as *Doc
+    jsonx.free(d.root)
+}
+
+// The document's root object (borrowed), for callers that keep their own members.
+root(dp: ptr) -> ptr {
+    d = dp as *Doc
+    return d.root
+}
+
+// The `keys` object, or null when absent or not an object.
+keys_(d: *Doc) -> ptr {
+    k = jsonx.field(d.root, "keys")
+    if k == null { return null }
+    if json.json_type(k) != json.JSON_OBJECT { return null }
+    return k
+}
+
+// The stored key for service `id`, or "" when there is none (or it is empty).
+key(dp: ptr, id: string) -> string {
+    d = dp as *Doc
+    k = keys_(d)
+    if k == null { return "" }
+    if jsonx.kind(k, id) != json.JSON_STRING { return "" }
+    return string.copy(jsonx.str_or(k, id, ""))
+}
+
+set_key(dp: ptr, id: string, value: string) {
+    d = dp as *Doc
+    k = keys_(d)
+    if k == null {
+        json.set(d.root, "keys", json.obj())
+        k = jsonx.field(d.root, "keys")
+    }
+    json.set(k, id, json.str(value))
+}
+
+// 1 when a key for `id` was removed. Rebuilds `keys` without it (std.json
+// has no member removal); other members keep their order.
+remove_key(dp: ptr, id: string) -> int {
+    d = dp as *Doc
+    k = keys_(d)
+    if k == null { return 0 }
+    if jsonx.has(k, id) == 0 { return 0 }
+    fresh = json.obj()
+    i = 0
+    n = json.object_size(k)
+    while i < n {
+        name, v, _e = json.object_entry(k, i)
+        if name != id {
+            copy = jsonx.parse(jsonx.encode(v))
+            json.set(fresh, name, copy)
+        }
+        i = i + 1
+    }
+    json.set(d.root, "keys", fresh)
+    return 1
+}
+
+write_(d: *Doc, file_path: string, force: int) -> string {
+    compact = jsonx.encode(d.root)
+    text, perr = json.pretty(compact, 2)
+    if perr != "" { return "Unexpected" }
+    dir = atomic_file.dirname(file_path)
+    if string.index_of(file_path, "/") >= 0 {
+        mk = fs.mkdir_p(dir)
+        if mk != "" { return "Unexpected" }
+    }
+    return atomic_file.replace(file_path, text, 384, force, 1, null)
+}
+
+// Atomic replace; a new file is 0600 and an existing file keeps its mode.
+// "" or the error name.
+save(dp: ptr, file_path: string) -> string {
+    return write_(dp as *Doc, file_path, 0)
+}
+
+// Atomic replace that leaves the file 0600 even if it was wider before.
+save_secret(dp: ptr, file_path: string) -> string {
+    return write_(dp as *Doc, file_path, 1)
+}

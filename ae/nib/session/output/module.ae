@@ -1,0 +1,339 @@
+// session.output: what the model sees of one Run (upstream
+// src/session/output.zig, docs/run-output.md). The whole Run (console
+// entries, the final value or error, the omission markers) is cut to one
+// byte budget; format() is the text shared by run_end.output, the log and
+// the next request.
+//
+// Differences from upstream, all in the types: an Outcome is the
+// sandbox.Outcome (ints for bools, longs for sizes, log entries a list of
+// *console.Entry), the budget a long, "no remaining-steps cap" -1, and
+// upstream's Outcome.hook (a hook's payload) is a parameter of
+// format_hook() because the ported sandbox Outcome carries none.
+
+import std.string
+import std.strbuilder
+import std.list
+import nib.sandbox
+import nib.sandbox.console
+
+exports(MAX_BYTES, format, format_hook, step_limit_output, format_message, omitted_lines)
+
+const MAX_BYTES = 16 * 1024
+const FAILED_NOTICE = "[Run script failed. Correct the script and continue the task; this error is not a reason to end the Turn.]"
+
+const KIND_CONSOLE = 0
+const KIND_RESULT = 1
+const KIND_ERROR = 2
+
+struct Ent {
+    first: long
+    last: long
+    kind: int
+    text: string
+    bytes: long
+    tail: string
+    keep: long        // -1: not decided yet
+}
+
+// Output under construction: the text and its last byte (to end entries on a newline).
+struct Writer {
+    sb: ptr
+    len: long
+    last: int
+}
+
+new_writer_() -> *Writer {
+    w = heap.new(Writer)
+    w.sb = strbuilder.new(256)
+    w.len = 0
+    w.last = 0
+    return w
+}
+
+put_(w: *Writer, s: string) {
+    n = string.length(s)
+    if n == 0 { return }
+    strbuilder.append(w.sb, s)
+    w.len = w.len + (n as long)
+    w.last = string.char_at(s, n - 1)
+}
+
+len_(s: string) -> long { return string.length(s) as long }
+
+sub_(s: string, from: long, to: long) -> string {
+    return string.substring(s, from as int, to as int)
+}
+
+min_(a: long, b: long) -> long {
+    if a < b { return a }
+    return b
+}
+
+// a - b, floored at 0 (Zig's `-|`).
+sat_(a: long, b: long) -> long {
+    if a < b { return 0 }
+    return a - b
+}
+
+// std.mem.trimEnd(u8, s, "\n")
+trim_newlines_(s: string) -> string {
+    n = string.length(s)
+    while n > 0 && string.char_at(s, n - 1) == 10 { n = n - 1 }
+    return string.substring(s, 0, n)
+}
+
+kind_name_(k: int) -> string {
+    if k == KIND_CONSOLE { return "console" }
+    if k == KIND_RESULT { return "result" }
+    return "error"
+}
+
+heading_(w: *Writer, e: *Ent, total: long) {
+    if e.first == e.last {
+        put_(w, "[entry ${e.first} of ${total} (${kind_name_(e.kind)})]\n")
+    } else {
+        put_(w, "[entries ${e.first}-${e.last} of ${total} (${kind_name_(e.kind)})]\n")
+    }
+}
+
+// lo == 0: no line range.
+omitted_marker_(w: *Writer, e: *Ent, bytes: long, lo: long, hi: long) {
+    put_(w, "[${bytes} of ${e.bytes} bytes omitted")
+    if lo > 0 { put_(w, " · lines ${lo}–${hi}") }
+    put_(w, "]\n")
+}
+
+separators_within_(text: string, limit: long, escaped: int) -> long {
+    count = 0 as long
+    i = 0 as long
+    n = len_(text)
+    while i < n {
+        escape = 0
+        if escaped == 1 && string.char_at(text, i as int) == 92 { escape = 1 }
+        end = i + 1 + (escape as long)
+        if end > limit { break }
+        if escaped == 1 {
+            if escape == 1 && end <= n && string.char_at(text, (i + 1) as int) == 110 { count = count + 1 }
+        } else if string.char_at(text, i as int) == 10 {
+            count = count + 1
+        }
+        i = end
+    }
+    return count
+}
+
+// Lines (1-based) of the first and last omitted byte of text[cut_start..cut_end),
+// or (0, 0) when both are on one line or the line structure is unknown. Text
+// without real newlines (ignoring a final one) that starts like JSON (`{`,
+// `[`, `"`) is console.log'ed or returned data whose newlines are `\n`
+// escapes (`\\n` is an escaped backslash then `n`); any other text separates
+// lines by real newlines. A partly shown line counts as omitted.
+omitted_lines(text: string, cut_start: long, cut_end: long) -> (long, long) {
+    n = len_(text)
+    if cut_end <= cut_start || cut_end > n { return 0 as long, 0 as long }
+    escaped = 0
+    c0 = string.char_at(text, 0)
+    if c0 == 123 || c0 == 91 || c0 == 34 {
+        if string.index_of(trim_newlines_(text), "\n") < 0 { escaped = 1 }
+    }
+    first = 1 + separators_within_(text, cut_start, escaped)
+    last = 1 + separators_within_(text, cut_end - 1, escaped)
+    if last > first { return first, last }
+    return 0 as long, 0 as long
+}
+
+new_ent_(first: long, last: long, kind: int, text: string, bytes: long, tail: string) -> *Ent {
+    e = heap.new(Ent)
+    e.first = first
+    e.last = last
+    e.kind = kind
+    e.text = text
+    e.bytes = bytes
+    e.tail = tail
+    e.keep = -1
+    return e
+}
+
+render_limit_(o: *sandbox.Outcome, limit: long) -> string {
+    logs = trim_newlines_(o.logs)
+    value = o.text
+    if o.ok == 1 && o.text == "undefined" { value = "" }
+    sep = ""
+    if len_(logs) > 0 && len_(value) > 0 { sep = "\n" }
+    label = ""
+    if o.ok == 1 && len_(value) > 0 { label = "result: " }
+    if o.log_truncated == 0 && len_(logs) + len_(value) + len_(sep) + len_(label) <= limit {
+        if len_(logs) == 0 && len_(value) == 0 { return "(no output)" }
+        return "${logs}${sep}${label}${value}"
+    }
+
+    ents = list.list_new()
+    total = 0 as long
+    all_logs = o.logs
+    all_len = len_(all_logs)
+    n_entries = 0
+    if o.log_entries != null { n_entries = list.list_size(o.log_entries) }
+    tail_bytes = 0 as long
+    if n_entries > 0 { tail_bytes = all_len - o.log_tail_start }
+    tail_offset = o.log_bytes - tail_bytes
+    i = 0
+    while i < n_entries {
+        lg = list.list_get_raw(o.log_entries, i) as *console.Entry
+        head = sub_(all_logs, min_(lg.start, o.log_head_bytes), min_(lg.end, o.log_head_bytes))
+        tail = sub_(all_logs, o.log_tail_start + sat_(lg.start, tail_offset), o.log_tail_start + sat_(lg.end, tail_offset))
+        bytes = lg.end - lg.start
+        if len_(tail) == bytes {
+            list.list_add(ents, new_ent_(lg.first, lg.last, KIND_CONSOLE, string.copy(tail), bytes, "") as ptr)
+        } else {
+            list.list_add(ents, new_ent_(lg.first, lg.last, KIND_CONSOLE, string.copy(head), bytes, string.copy(tail)) as ptr)
+        }
+        total = lg.last
+        i = i + 1
+    }
+    if list.list_size(ents) == 0 && len_(logs) > 0 {
+        total = 1
+        list.list_add(ents, new_ent_(1, 1, KIND_CONSOLE, string.copy(logs), len_(logs), "") as ptr)
+    }
+    if len_(value) > 0 {
+        total = total + 1
+        kind = KIND_ERROR
+        if o.ok == 1 { kind = KIND_RESULT }
+        list.list_add(ents, new_ent_(total, total, kind, string.copy(value), len_(value), "") as ptr)
+    }
+    count = list.list_size(ents)
+
+    // Reserve each entry's heading and a worst-case marker.
+    available = limit
+    i = 0
+    while i < count {
+        e = list.list_get_raw(ents, i) as *Ent
+        probe = new_writer_()
+        heading_(probe, e, total)
+        omitted_marker_(probe, e, e.bytes, e.bytes + 1, e.bytes + 1)
+        available = available - probe.len - 2
+        i = i + 1
+    }
+
+    // Short entries keep everything; the rest share what is left.
+    remaining = count
+    while remaining > 0 {
+        share = available / (remaining as long)
+        progress = 0
+        i = 0
+        while i < count {
+            e = list.list_get_raw(ents, i) as *Ent
+            held = len_(e.text) + len_(e.tail)
+            if e.keep < 0 && held <= share {
+                e.keep = held
+                available = available - held
+                remaining = remaining - 1
+                progress = 1
+            }
+            i = i + 1
+        }
+        if progress == 0 {
+            i = 0
+            while i < count {
+                e = list.list_get_raw(ents, i) as *Ent
+                if e.keep < 0 { e.keep = share }
+                i = i + 1
+            }
+            break
+        }
+    }
+
+    out = new_writer_()
+    i = 0
+    while i < count {
+        e = list.list_get_raw(ents, i) as *Ent
+        heading_(out, e, total)
+        keep = e.keep
+        if keep == e.bytes {
+            put_(out, e.text)
+            put_(out, e.tail)
+        } else {
+            complete = 0
+            if len_(e.text) == e.bytes { complete = 1 }
+            head_keep = 0 as long
+            tail_keep = 0 as long
+            if complete == 1 {
+                head_keep = (keep + 1) / 2
+                tail_keep = keep / 2
+            } else {
+                head_keep = min_(len_(e.text), keep - min_(len_(e.tail), keep / 2))
+                tail_keep = min_(len_(e.tail), keep - head_keep)
+            }
+            head = console.trim_end_utf8(sub_(e.text, 0, head_keep))
+            suffix = e.tail
+            if complete == 1 { suffix = e.text }
+            tail = console.trim_start_utf8(sub_(suffix, len_(suffix) - tail_keep, len_(suffix)))
+            put_(out, head)
+            if len_(head) > 0 && string.char_at(head, string.length(head) - 1) != 10 { put_(out, "\n") }
+            lo = 0 as long
+            hi = 0 as long
+            if complete == 1 { lo, hi = omitted_lines(e.text, len_(head), e.bytes - len_(tail)) }
+            omitted_marker_(out, e, e.bytes - len_(head) - len_(tail), lo, hi)
+            put_(out, tail)
+        }
+        if out.len > 0 && out.last != 10 { put_(out, "\n") }
+        i = i + 1
+    }
+    return strbuilder.finish(out.sb)
+}
+
+new_plain_(ok: int, text: string) -> *sandbox.Outcome {
+    o = heap.new(sandbox.Outcome)
+    o.ok = ok
+    o.text = text
+    o.logs = ""
+    o.log_entries = null
+    o.log_bytes = 0
+    o.log_head_bytes = 0
+    o.log_tail_start = 0
+    o.log_truncated = 0
+    o.tool_bytes = 0
+    o.stopped = ""
+    return o
+}
+
+// A Run's output for the model within `limit` bytes. Failed Runs end with
+// the correction notice; stopped Runs end with their stopped line, in both
+// cases inside the budget.
+format(op: ptr, limit: long) -> string {
+    return format_hook(op, "", limit)
+}
+
+// As format(), with a hook's payload (upstream Outcome.hook) after the body:
+// body gets half the budget, the payload the rest.
+format_hook(op: ptr, hook: string, limit: long) -> string {
+    o = op as *sandbox.Outcome
+    if len_(hook) > 0 {
+        body = format_hook(op, "", limit / 2)
+        payload = render_limit_(new_plain_(1, hook), limit - len_(body) - 1)
+        return "${body}\n${payload}"
+    }
+    suffix = ""
+    if len_(o.stopped) > 0 {
+        suffix = o.stopped
+    } else if o.ok == 0 {
+        suffix = FAILED_NOTICE
+    } else {
+        return render_limit_(o, limit)
+    }
+    body = render_limit_(o, limit - len_(suffix) - 1)
+    return "${body}\n${suffix}"
+}
+
+// The output with "[N Steps left in this Turn]" appended when at most 3
+// Steps remain; remaining < 0 means the Turn has no Step limit.
+step_limit_output(output: string, remaining: long) -> string {
+    if remaining < 0 || remaining > 3 { return output }
+    return "${output}\n[${remaining} Steps left in this Turn]"
+}
+
+// A background Run's message: `prefix`, then the JSON result cut to what is
+// left of the budget.
+format_message(prefix: string, json: string, limit: long) -> string {
+    payload = render_limit_(new_plain_(0, json), limit - len_(prefix))
+    return "${prefix}${payload}"
+}

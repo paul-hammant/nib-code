@@ -1,0 +1,1701 @@
+// config: $NIB_HOME/config.toml and the environment (upstream src/config.zig).
+//
+// The environment is a value (nib.config.env), passed to every function that
+// reads it: home(env), resolve(env, ...), load(env, home), save_model(env, ...).
+// Failures follow the Go-style convention: an error name ("" for success) and,
+// where upstream fills one, a detail line "path:line: message" (or
+// "NIB_X: expected ...") in the last slot.
+//
+// Not ported, by policy (API keys only): the Codex provider. `codex` is not a
+// known id, so `provider = "codex"` and a `[codex]` section are configuration
+// errors, and the [codex] keys transport / reasoning_summary / run_tool, the
+// NIB_CODEX_TRANSPORT / NIB_CODEX_RUN_TOOL / NIB_AUTH_ISSUER / CODEX_HOME
+// variables and the Codex login in credentialed() are gone. The service a
+// config without a provider selects is the first of startup_order() (anthropic),
+// where upstream's was codex. NIB_REASONING_SUMMARY (off|auto) stays, file key
+// gone with its section.
+//
+// Integers are 64-bit: a context_window above 2^63-1 is refused as not a
+// positive integer (upstream accepts up to 2^64-1).
+
+import std.string
+import std.list
+import std.fs
+import nib.jsonx
+import nib.config.env
+import nib.provider.types
+import nib.auth.store
+import nib.tools.atomic_file
+
+exports(File, Prov, Switch, Custom, ModelEntry, Val, DEFAULT_PROVIDER, home, load, parse, parse_value,
+        resolve, apply_store, credentialed, startup_order, custom_providers, endpoint_id_problem,
+        add_endpoint, parse_model, model_text, save_model, model_entries, save_effort, save_simple,
+        save_skill, save_mcp, load_skills, load_mcp, skill_enabled, enabled_skills, rewrite_value)
+
+const DEFAULT_PROVIDER = "anthropic"
+const SECRET_MSG = "secrets are not allowed; use NIB_API_KEY or DEEPSEEK_API_KEY (Codex uses CODEX_HOME/auth.json)"
+
+// section numbers
+const SEC_TOP = 0
+const SEC_CHAT = 1
+const SEC_LIMITS = 2
+const SEC_SKILLS = 3
+const SEC_SANDBOX = 4
+const SEC_HOOKS = 5
+const SEC_PROVIDER = 6
+const SEC_MCP = 7
+const SEC_MCP_SERVER = 8
+
+// One provider's settings: a built-in's section ([openai], [chat_completions]) or
+// a [providers.<id>] table. Optional strings are "" with a *_set flag when "" is a
+// value; context_window and vision are -1 for none.
+struct Prov {
+    name: string
+    line: int
+    custom: int
+    model: string
+    model_set: int
+    model_line: int
+    base_url: string
+    base_set: int
+    context_window: long
+    protocol: string
+    api_key_env: string
+    vision: int
+    seen: int
+}
+
+// A [skills] or [mcp] switch and the byte span of its `true`/`false` token.
+struct Switch {
+    name: string
+    enabled: int
+    start: int
+    end: int
+}
+
+struct File {
+    providers: ptr            // list of *Prov, file order
+    provider_name: string
+    provider_set: int
+    provider_is_custom: int   // the named provider is not a built-in id
+    provider_line: int
+    skills: ptr               // list of *Switch
+    skills_end: int           // -1 none
+    mcp: ptr                  // list of *Switch
+    mcp_end: int
+    mcp_servers: ptr          // list of *types.McpServer
+    top_end: int
+    limits: ptr               // *types.Limits
+    sandbox_workspace: int
+    sandbox_writable: ptr     // list of strings, as written
+    hooks_after_edit: ptr
+    hooks_turn_end: ptr
+    simple: int
+    open: string
+    open_set: int
+    ui_start: int             // -1 none
+    ui_end: int
+    effort: string
+    effort_set: int
+    effort_start: int
+    effort_end: int
+    eline_start: int
+    eline_end: int
+    chat: ptr                 // *Prov of [chat_completions]
+}
+
+struct Custom {
+    id: string
+    protocol: string
+    base_url: string
+    model: string
+    context_window: long
+    api_key_env: string       // "" none
+}
+
+struct ModelEntry {
+    provider: string
+    model: string
+}
+
+// A parsed TOML value: kind 0 string, 1 integer, 2 boolean.
+struct Val {
+    kind: int
+    s: string
+    n: long
+    b: int
+    consumed: int
+}
+
+struct S {
+    f: ptr
+    section: int
+    seen_sections: int
+    hooks_seen: int
+    sandbox_seen: int
+    top_seen: int
+    limits_seen: int
+    mcp_seen: int
+    cur: ptr
+    line: int
+}
+
+// ---- small helpers ----------------------------------------------------
+
+join_(a: string, b: string) -> string {
+    if a == "" { return b }
+    return atomic_file.join(a, b)
+}
+
+is_digit_(c: int) -> int {
+    if c >= 48 && c <= 57 { return 1 }
+    return 0
+}
+
+is_alpha_(c: int) -> int {
+    if (c >= 65 && c <= 90) || (c >= 97 && c <= 122) { return 1 }
+    return 0
+}
+
+is_alnum_(c: int) -> int {
+    if is_digit_(c) == 1 || is_alpha_(c) == 1 { return 1 }
+    return 0
+}
+
+ws_(c: int, nl: int) -> int {
+    if c == 32 || c == 9 { return 1 }
+    if nl == 1 && (c == 13 || c == 10) { return 1 }
+    return 0
+}
+
+// Trims " \t" (and "\r\n" when nl is 1) from both ends.
+trim_(s: string, nl: int) -> string {
+    a = 0
+    b = string.length(s)
+    while a < b && ws_(string.char_at(s, a), nl) == 1 { a = a + 1 }
+    while b > a && ws_(string.char_at(s, b - 1), nl) == 1 { b = b - 1 }
+    return string.substring(s, a, b)
+}
+
+ltrim_(s: string) -> string {
+    a = 0
+    b = string.length(s)
+    while a < b && ws_(string.char_at(s, a), 0) == 1 { a = a + 1 }
+    return string.substring(s, a, b)
+}
+
+rtrim_(s: string) -> string {
+    b = string.length(s)
+    while b > 0 && ws_(string.char_at(s, b - 1), 0) == 1 { b = b - 1 }
+    return string.substring(s, 0, b)
+}
+
+// Text after a value or section header that is neither blank nor a comment.
+trailing_bad_(rest: string) -> int {
+    t = ltrim_(rest)
+    if string.length(t) > 0 && string.char_at(t, 0) != 35 { return 1 }
+    return 0
+}
+
+// Zig's std.unicode.utf8ValidateSlice.
+utf8_valid_(s: string) -> int {
+    n = string.length(s)
+    i = 0
+    while i < n {
+        c = string.char_at(s, i)
+        if c < 128 {
+            i = i + 1
+            continue
+        }
+        need = 0
+        lo = 128
+        hi = 191
+        if c >= 194 && c <= 223 {
+            need = 1
+        } else if c >= 224 && c <= 239 {
+            need = 2
+            if c == 224 { lo = 160 }
+            if c == 237 { hi = 159 }
+        } else if c >= 240 && c <= 244 {
+            need = 3
+            if c == 240 { lo = 144 }
+            if c == 244 { hi = 143 }
+        } else {
+            return 0
+        }
+        if i + need > n - 1 { return 0 }
+        k = 1
+        while k <= need {
+            d = string.char_at(s, i + k)
+            l = 128
+            h = 191
+            if k == 1 {
+                l = lo
+                h = hi
+            }
+            if d < l || d > h { return 0 }
+            k = k + 1
+        }
+        i = i + need + 1
+    }
+    return 1
+}
+
+secret_key_(key: string) -> int {
+    lower = string.to_lower(string.replace_all(key, "-", "_"))
+    words = ["api_key", "apikey", "token", "secret", "password", "credential", "authorization"]
+    i = 0
+    while i < 7 {
+        if string.index_of(lower, words[i]) >= 0 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// A letter or _ first, then letters, digits and _ (mcp/config.zig envName).
+env_name_ok_(name: string) -> int {
+    n = string.length(name)
+    if n == 0 { return 0 }
+    i = 0
+    while i < n {
+        c = string.char_at(name, i)
+        if !(is_alpha_(c) == 1 || c == 95 || (i > 0 && is_digit_(c) == 1)) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+bare_key_ok_(key: string) -> int {
+    i = 0
+    while i < string.length(key) {
+        c = string.char_at(key, i)
+        if !(is_alnum_(c) == 1 || c == 95 || c == 45) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+absolute_(p: string) -> int {
+    if string.starts_with(p, "/") == 1 { return 1 }
+    if string.starts_with(p, "\\\\") == 1 { return 1 }
+    if string.length(p) >= 3 && is_alpha_(string.char_at(p, 0)) == 1 && string.char_at(p, 1) == 58 {
+        c = string.char_at(p, 2)
+        if c == 47 || c == 92 { return 1 }
+    }
+    return 0
+}
+
+expand_home_(h: string, p: string) -> string {
+    if p == "~" { return string.copy(h) }
+    if string.starts_with(p, "~/") == 1 { return join_(h, string.substring(p, 2, string.length(p))) }
+    return string.copy(p)
+}
+
+// "" for absent; otherwise the error name.
+read_text_(path: string) -> (string, string) {
+    if fs.exists(path) == 0 { return "", "" }
+    text, rerr = fs.read(path)
+    if rerr != "" {
+        if string.index_of(rerr, "Is a directory") >= 0 { return "", "IsDir" }
+        if string.index_of(rerr, "Permission denied") >= 0 { return "", "AccessDenied" }
+        return "", "Unexpected"
+    }
+    if string.length(text) > 1048576 { return "", "StreamTooLong" }
+    return text, ""
+}
+
+newline_of_(text: string) -> string {
+    if string.index_of(text, "\r\n") >= 0 { return "\r\n" }
+    return "\n"
+}
+
+// ---- home ---------------------------------------------------------------
+
+// NIB_HOME, else $HOME/.nib. (path, "") or ("", "MissingHome").
+home(envp: ptr) -> (string, string) {
+    if env.has(envp, "NIB_HOME") == 1 { return env.get(envp, "NIB_HOME"), "" }
+    if env.has(envp, "HOME") == 0 { return "", "MissingHome" }
+    return join_(env.get(envp, "HOME"), ".nib"), ""
+}
+
+// ---- value parsing ------------------------------------------------------
+
+val_new_() -> *Val {
+    v = heap.new(Val)
+    v.kind = 0
+    v.s = ""
+    v.n = 0 as long
+    v.b = 0
+    v.consumed = 0
+    return v
+}
+
+// A double-quoted one-line string; (decoded, consumed, message).
+parse_string_(input: string) -> (string, int, string) {
+    n = string.length(input)
+    if n == 0 || string.char_at(input, 0) != 34 { return "", 0, "expected a quoted string" }
+    out = ""
+    seg = 1
+    i = 1
+    while i < n {
+        c = string.char_at(input, i)
+        i = i + 1
+        if c == 34 {
+            out = "${out}${string.substring(input, seg, i - 1)}"
+            return out, i, ""
+        }
+        if (c < 32 && c != 9) || c == 127 { return "", 0, "control character in string" }
+        if c != 92 { continue }
+        out = "${out}${string.substring(input, seg, i - 1)}"
+        if i == n { return "", 0, "unterminated string escape" }
+        e = string.char_at(input, i)
+        i = i + 1
+        if e == 34 || e == 92 {
+            out = "${out}${string.from_char(e)}"
+        } else if e == 110 {
+            out = "${out}\n"
+        } else {
+            return "", 0, "unsupported string escape"
+        }
+        seg = i
+    }
+    return "", 0, "unterminated string"
+}
+
+token_end_(input: string) -> int {
+    n = string.length(input)
+    i = 0
+    while i < n {
+        c = string.char_at(input, i)
+        if c == 32 || c == 9 || c == 35 { return i }
+        i = i + 1
+    }
+    return n
+}
+
+// A signed decimal integer with _ grouping; (value, consumed, message).
+// Values past 2^63-1 saturate.
+parse_int_(input: string) -> (long, int, string) {
+    e = token_end_(input)
+    digits = string.substring(input, 0, e)
+    neg = 0
+    if string.starts_with(digits, "-") == 1 {
+        neg = 1
+        digits = string.substring(digits, 1, string.length(digits))
+    } else if string.starts_with(digits, "+") == 1 {
+        digits = string.substring(digits, 1, string.length(digits))
+    }
+    dl = string.length(digits)
+    if dl == 0 { return 0 as long, e, "expected a decimal integer" }
+    limit = 9223372036854775807 as long
+    val = 0 as long
+    clean = 0
+    first = 0
+    i = 0
+    while i < dl {
+        c = string.char_at(digits, i)
+        if c == 95 {
+            if i == 0 || i + 1 == dl || is_digit_(string.char_at(digits, i - 1)) == 0 || is_digit_(string.char_at(digits, i + 1)) == 0 {
+                return 0 as long, e, "invalid integer separator"
+            }
+        } else if is_digit_(c) == 1 {
+            clean = clean + 1
+            if clean == 1 { first = c }
+            d = (c - 48) as long
+            if val > (limit - d) / (10 as long) {
+                val = limit
+            } else {
+                val = val * (10 as long) + d
+            }
+        } else {
+            return 0 as long, e, "expected a decimal integer"
+        }
+        i = i + 1
+    }
+    if clean > 1 && first == 48 { return 0 as long, e, "leading zero in integer" }
+    if neg == 1 { val = (0 as long) - val }
+    return val, e, ""
+}
+
+// A single-line array of strings; (list, consumed, message).
+parse_string_array_(input: string) -> (ptr, int, string) {
+    n = string.length(input)
+    if n == 0 || string.char_at(input, 0) != 91 { return null, 0, "expected an array of strings on one line" }
+    items = list.list_new()
+    i = 1
+    while 1 == 1 {
+        while i < n && ws_(string.char_at(input, i), 0) == 1 { i = i + 1 }
+        if i == n { return null, 0, "unterminated array; arrays must fit on one line" }
+        if string.char_at(input, i) == 93 { break }
+        s, used, m = parse_string_(string.substring(input, i, n))
+        if m != "" { return null, 0, m }
+        list.list_add(items, s)
+        i = i + used
+        while i < n && ws_(string.char_at(input, i), 0) == 1 { i = i + 1 }
+        if i < n && string.char_at(input, i) == 44 {
+            i = i + 1
+        } else if i == n || string.char_at(input, i) != 93 {
+            return null, 0, "expected , or ] in array"
+        }
+    }
+    return items, i + 1, ""
+}
+
+// A string, boolean or integer; (*Val, message).
+parse_value(input: string) -> (ptr, string) {
+    v = val_new_()
+    if string.length(input) > 0 && string.char_at(input, 0) == 34 {
+        s, used, m = parse_string_(input)
+        if m != "" { return null, m }
+        v.kind = 0
+        v.s = s
+        v.consumed = used
+        return v as ptr, ""
+    }
+    e = token_end_(input)
+    token = string.substring(input, 0, e)
+    if token == "true" || token == "false" {
+        v.kind = 2
+        v.consumed = e
+        if token == "true" { v.b = 1 }
+        return v as ptr, ""
+    }
+    n, used2, m2 = parse_int_(input)
+    if m2 != "" { return null, m2 }
+    v.kind = 1
+    v.n = n
+    v.consumed = used2
+    return v as ptr, ""
+}
+
+// ---- URLs and ids -------------------------------------------------------
+
+// "" when `u` is an http(s) URL with a host and no credentials, else the message.
+mcp_url_problem_(u: string) -> string {
+    ix = string.index_of(u, "://")
+    if ix <= 0 { return "invalid MCP URL" }
+    i = 0
+    while i < string.length(u) {
+        c = string.char_at(u, i)
+        if c <= 32 || c == 127 || c == 34 || c == 60 || c == 62 || c == 92 || c == 94 || c == 96 || c == 123 || c == 124 || c == 125 { return "invalid MCP URL" }
+        i = i + 1
+    }
+    scheme = string.substring(u, 0, ix)
+    rest = string.substring(u, ix + 3, string.length(u))
+    stop = string.length(rest)
+    j = 0
+    while j < string.length(rest) {
+        c = string.char_at(rest, j)
+        if c == 47 || c == 63 || c == 35 {
+            stop = j
+            break
+        }
+        j = j + 1
+    }
+    auth = string.substring(rest, 0, stop)
+    if scheme != "http" && scheme != "https" { return "MCP URL must be http(s) without credentials" }
+    if string.index_of(auth, "@") >= 0 { return "MCP URL must be http(s) without credentials" }
+    host = auth
+    if string.starts_with(auth, "[") == 1 {
+        cb = string.index_of(auth, "]")
+        if cb < 0 { return "invalid MCP URL" }
+        host = string.substring(auth, 1, cb)
+    } else {
+        colon = string.index_of(auth, ":")
+        if colon >= 0 { host = string.substring(auth, 0, colon) }
+    }
+    if host == "" { return "MCP URL must be http(s) without credentials" }
+    return ""
+}
+
+// "" when `id` is a usable service name; otherwise why not. `existing` is a list of names.
+endpoint_id_problem(id: string, existing: ptr) -> string {
+    if string.length(id) == 0 { return "Name cannot be empty" }
+    if bare_key_ok_(id) == 0 { return "Use letters, digits, _ and - only" }
+    if types.known_id(id) == 1 || id == "custom" { return "Name is taken by a built-in service" }
+    i = 0
+    while existing != null && i < list.list_size(existing) {
+        s, _g = list.get_string(existing, i)
+        if s == id { return "Name is already used" }
+        i = i + 1
+    }
+    return ""
+}
+
+// ---- the parser -----------------------------------------------------------
+
+new_prov_(name: string, line: int, custom: int) -> *Prov {
+    p = heap.new(Prov)
+    p.name = name
+    p.line = line
+    p.custom = custom
+    p.model = ""
+    p.model_set = 0
+    p.model_line = 1
+    p.base_url = ""
+    p.base_set = 0
+    p.context_window = -1 as long
+    p.protocol = ""
+    p.api_key_env = ""
+    p.vision = -1
+    p.seen = 0
+    return p
+}
+
+new_file_() -> *File {
+    f = heap.new(File)
+    f.providers = list.list_new()
+    f.provider_name = ""
+    f.provider_set = 0
+    f.provider_is_custom = 0
+    f.provider_line = 1
+    f.skills = list.list_new()
+    f.skills_end = -1
+    f.mcp = list.list_new()
+    f.mcp_end = -1
+    f.mcp_servers = list.list_new()
+    f.top_end = 0
+    f.limits = types.new_limits()
+    f.sandbox_workspace = 0
+    f.sandbox_writable = list.list_new()
+    f.hooks_after_edit = list.list_new()
+    f.hooks_turn_end = list.list_new()
+    f.simple = 0
+    f.open = ""
+    f.open_set = 0
+    f.ui_start = -1
+    f.ui_end = -1
+    f.effort = ""
+    f.effort_set = 0
+    f.effort_start = -1
+    f.effort_end = -1
+    f.eline_start = -1
+    f.eline_end = -1
+    f.chat = new_prov_("chat_completions", 1, 0) as ptr
+    return f
+}
+
+detail_(path: string, line: int, msg: string) -> string {
+    return "${path}:${line}: ${msg}"
+}
+
+header_(s: *S, line: string, start: int) -> string {
+    f = s.f as *File
+    close = string.index_of(line, "]")
+    if close < 0 { return "unterminated section" }
+    name = trim_(string.substring(line, 1, close), 0)
+    if string.starts_with(name, "providers.") == 0 && string.starts_with(name, "mcp.") == 0 && secret_key_(name) == 1 { return SECRET_MSG }
+    if s.section == SEC_SKILLS { f.skills_end = start }
+    if s.section == SEC_MCP { f.mcp_end = start }
+    if s.section == SEC_TOP { f.top_end = start }
+    after_close = string.substring(line, close + 1, string.length(line))
+    if string.starts_with(name, "mcp.") == 1 {
+        id = string.substring(name, 4, string.length(name))
+        if endpoint_id_problem(id, null) != "" { return "invalid MCP server id '${id}'" }
+        i = 0
+        while i < list.list_size(f.mcp_servers) {
+            sv = list.list_get_raw(f.mcp_servers, i) as *types.McpServer
+            if sv.id == id { return "duplicate section '${name}'" }
+            i = i + 1
+        }
+        if trailing_bad_(after_close) == 1 { return "unexpected text after section" }
+        m = types.mcp_server_new(string.copy(id)) as *types.McpServer
+        m.line = s.line
+        list.list_add(f.mcp_servers, m as ptr)
+        s.mcp_seen = 0
+        s.section = SEC_MCP_SERVER
+        return ""
+    }
+    builtin_dyn = 0
+    if types.known_id(name) == 1 && name != "chat_completions" { builtin_dyn = 1 }
+    custom = string.starts_with(name, "providers.")
+    if custom == 1 || builtin_dyn == 1 {
+        id = name
+        if custom == 1 { id = string.substring(name, 10, string.length(name)) }
+        if string.length(id) == 0 { return "empty provider id" }
+        if bare_key_ok_(id) == 0 { return "invalid provider id" }
+        if custom == 1 && (types.known_id(id) == 1 || id == "custom") { return "provider id conflicts with built-in '${id}'" }
+        i = 0
+        while i < list.list_size(f.providers) {
+            pr = list.list_get_raw(f.providers, i) as *Prov
+            if pr.name == id { return "duplicate section '${name}'" }
+            i = i + 1
+        }
+        np = new_prov_(string.copy(id), s.line, custom)
+        s.cur = np as ptr
+        list.list_add(f.providers, np as ptr)
+        s.section = SEC_PROVIDER
+    } else {
+        sec = -1
+        match name {
+            "chat_completions" -> { sec = SEC_CHAT }
+            "limits" -> { sec = SEC_LIMITS }
+            "skills" -> { sec = SEC_SKILLS }
+            "sandbox" -> { sec = SEC_SANDBOX }
+            "hooks" -> { sec = SEC_HOOKS }
+            "mcp" -> { sec = SEC_MCP }
+            _ -> {}
+        }
+        if sec < 0 { return "unknown section '${name}'" }
+        s.section = sec
+    }
+    if trailing_bad_(after_close) == 1 { return "unexpected text after section" }
+    if s.section == SEC_PROVIDER { return "" }
+    bit = 1 << s.section
+    if (s.seen_sections & bit) != 0 { return "duplicate section '${name}'" }
+    s.seen_sections = s.seen_sections | bit
+    return ""
+}
+
+limit_index_(key: string) -> int {
+    names = ["llm_concurrency", "llm_calls_per_run", "llm_input_kib", "agent_concurrency", "max_steps", "stream_idle_timeout_s", "run_background_after_ms", "stream_content_timeout_s", "request_timeout_s", "run_output_bytes"]
+    i = 0
+    while i < 10 {
+        if names[i] == key { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+limit_max_(i: int) -> long {
+    maxima = [64, 10000, 65536, 64, 100000, 3600, 3600000, 3600, 3600, 16777216]
+    return maxima[i] as long
+}
+
+set_limit_(l: *types.Limits, i: int, n: int) {
+    match i {
+        0 -> { l.llm_concurrency = n }
+        1 -> { l.llm_calls_per_run = n }
+        2 -> { l.llm_input_kib = n }
+        3 -> { l.agent_concurrency = n }
+        4 -> { l.max_steps = n }
+        5 -> { l.stream_idle_timeout_s = n }
+        6 -> { l.run_background_after_ms = n }
+        7 -> { l.stream_content_timeout_s = n }
+        8 -> { l.request_timeout_s = n }
+        _ -> { l.run_output_bytes = n }
+    }
+}
+
+has_switch_(switches: ptr, name: string) -> int {
+    i = 0
+    while i < list.list_size(switches) {
+        w = list.list_get_raw(switches, i) as *Switch
+        if w.name == name { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// Parses the value after `=`; sets *out; returns the message ("" ok).
+switch_kv_(s: *S, key: string, value: string, voff: int, start: int) -> string {
+    f = s.f as *File
+    switches = f.skills
+    if s.section == SEC_MCP { switches = f.mcp }
+    if has_switch_(switches, key) == 1 { return "duplicate key '${key}'" }
+    pv, m = parse_value(value)
+    if m != "" { return m }
+    v = pv as *Val
+    if v.kind != 2 { return "enablement must be a boolean" }
+    if trailing_bad_(string.substring(value, v.consumed, string.length(value))) == 1 { return "unexpected text after value" }
+    w = heap.new(Switch)
+    w.name = string.copy(key)
+    w.enabled = v.b
+    w.start = start + voff
+    w.end = start + voff + v.consumed
+    list.list_add_raw(switches, w as ptr)
+    return ""
+}
+
+mcp_kv_(s: *S, key: string, value: string) -> string {
+    f = s.f as *File
+    which = -1
+    match key {
+        "command" -> { which = 0 }
+        "url" -> { which = 1 }
+        "args" -> { which = 2 }
+        "env" -> { which = 3 }
+        "header_env" -> { which = 4 }
+        _ -> {}
+    }
+    if which < 0 { return "unknown MCP key '${key}'" }
+    bit = 1 << which
+    if (s.mcp_seen & bit) != 0 { return "duplicate key '${key}'" }
+    s.mcp_seen = s.mcp_seen | bit
+    sv = list.list_get_raw(f.mcp_servers, list.list_size(f.mcp_servers) - 1) as *types.McpServer
+    consumed = 0
+    if which == 2 || which == 3 {
+        values, used, m = parse_string_array_(value)
+        if m != "" { return m }
+        consumed = used
+        if which == 2 {
+            sv.args = values
+        } else {
+            i = 0
+            while i < list.list_size(values) {
+                nm, _g = list.get_string(values, i)
+                if env_name_ok_(nm) == 0 { return "invalid environment variable name" }
+                i = i + 1
+            }
+            sv.env = values
+        }
+    } else {
+        pv, m2 = parse_value(value)
+        if m2 != "" { return m2 }
+        v = pv as *Val
+        consumed = v.consumed
+        if v.kind != 0 || string.length(v.s) == 0 { return "${key} must be a nonempty string" }
+        if which == 0 {
+            sv.command = v.s
+        } else if which == 1 {
+            um = mcp_url_problem_(v.s)
+            if um != "" { return um }
+            sv.url = v.s
+        } else {
+            if env_name_ok_(v.s) == 0 { return "invalid environment variable name" }
+            sv.header_env = v.s
+        }
+    }
+    if trailing_bad_(string.substring(value, consumed, string.length(value))) == 1 { return "unexpected text after value" }
+    return ""
+}
+
+hooks_kv_(s: *S, key: string, value: string) -> string {
+    f = s.f as *File
+    which = -1
+    if key == "after_edit" { which = 0 }
+    if key == "turn_end" { which = 1 }
+    if which < 0 { return "unknown hooks key '${key}'" }
+    bit = 1 << which
+    if (s.hooks_seen & bit) != 0 { return "duplicate key '${key}'" }
+    s.hooks_seen = s.hooks_seen | bit
+    commands, used, m = parse_string_array_(value)
+    if m != "" { return m }
+    if which == 0 {
+        f.hooks_after_edit = commands
+    } else {
+        f.hooks_turn_end = commands
+    }
+    if trailing_bad_(string.substring(value, used, string.length(value))) == 1 { return "unexpected text after value" }
+    return ""
+}
+
+sandbox_kv_(s: *S, key: string, value: string) -> string {
+    f = s.f as *File
+    which = -1
+    if key == "mode" { which = 0 }
+    if key == "writable" { which = 1 }
+    if which < 0 { return "unknown sandbox key '${key}'" }
+    bit = 1 << which
+    if (s.sandbox_seen & bit) != 0 { return "duplicate key '${key}'" }
+    s.sandbox_seen = s.sandbox_seen | bit
+    consumed = 0
+    if which == 0 {
+        pv, m = parse_value(value)
+        if m != "" { return m }
+        v = pv as *Val
+        consumed = v.consumed
+        if v.kind != 0 { return "mode must be a string" }
+        if v.s == "workspace" {
+            f.sandbox_workspace = 1
+        } else if v.s == "off" {
+            f.sandbox_workspace = 0
+        } else {
+            return "mode must be workspace or off"
+        }
+    } else {
+        paths, used, m2 = parse_string_array_(value)
+        if m2 != "" { return m2 }
+        consumed = used
+        i = 0
+        while i < list.list_size(paths) {
+            e, _g = list.get_string(paths, i)
+            if absolute_(e) == 0 && e != "~" && string.starts_with(e, "~/") == 0 { return "writable paths must be absolute or start with ~/" }
+            i = i + 1
+        }
+        f.sandbox_writable = paths
+    }
+    if trailing_bad_(string.substring(value, consumed, string.length(value))) == 1 { return "unexpected text after value" }
+    return ""
+}
+
+// A top-level key, a [limits] key or a provider key.
+generic_kv_(s: *S, key: string, value: string, voff: int, start: int, lstart: int, lend: int) -> string {
+    f = s.f as *File
+    sec = s.section
+    cur = s.cur as *Prov
+    index = -1
+    if sec == SEC_TOP {
+        match key {
+            "provider" -> { index = 0 }
+            "effort" -> { index = 1 }
+            "ui" -> { index = 2 }
+            "open" -> { index = 3 }
+            _ -> { return "unknown top-level key '${key}'" }
+        }
+    } else if sec == SEC_LIMITS {
+        index = limit_index_(key)
+        if index < 0 { return "unknown limits key '${key}'" }
+    } else {
+        pcustom = 0
+        if sec == SEC_PROVIDER && cur.custom == 1 { pcustom = 1 }
+        if key == "model" {
+            index = 0
+        } else if key == "base_url" {
+            index = 1
+        } else if key == "context_window" {
+            index = 2
+        } else if pcustom == 1 && key == "protocol" {
+            index = 6
+        } else if pcustom == 1 && key == "api_key_env" {
+            index = 7
+        } else if pcustom == 1 && key == "vision" {
+            index = 8
+        } else {
+            return "unknown provider key '${key}'"
+        }
+    }
+    bit = 1 << index
+    seen = 0
+    if sec == SEC_TOP { seen = s.top_seen }
+    if sec == SEC_LIMITS { seen = s.limits_seen }
+    if sec == SEC_PROVIDER { seen = cur.seen }
+    if sec == SEC_CHAT { seen = (f.chat as *Prov).seen }
+    if (seen & bit) != 0 { return "duplicate key '${key}'" }
+    seen = seen | bit
+    if sec == SEC_TOP { s.top_seen = seen }
+    if sec == SEC_LIMITS { s.limits_seen = seen }
+    if sec == SEC_PROVIDER { cur.seen = seen }
+    chat = f.chat as *Prov
+    if sec == SEC_CHAT { chat.seen = seen }
+    settings = chat
+    if sec == SEC_PROVIDER { settings = cur }
+    pv, m = parse_value(value)
+    if m != "" { return m }
+    v = pv as *Val
+    if sec == SEC_LIMITS {
+        if v.kind != 1 { return "${key} must be an integer" }
+        mx = limit_max_(index)
+        mn = 1 as long
+        if index == 9 { mn = 16384 as long }
+        if v.n < mn || v.n > mx { return "${key} must be between ${mn} and ${mx}" }
+        set_limit_(f.limits as *types.Limits, index, v.n as int)
+    } else if sec != SEC_TOP && index == 8 {
+        if v.kind != 2 { return "vision must be true or false" }
+        settings.vision = v.b
+    } else if sec != SEC_TOP && index == 2 {
+        if v.kind != 1 { return "context_window must be an integer" }
+        if v.n <= (0 as long) || v.n == (9223372036854775807 as long) { return "context_window must be a positive u64 integer" }
+        settings.context_window = v.n
+    } else {
+        if v.kind != 0 { return "${key} must be a string" }
+        decoded = v.s
+        if sec == SEC_TOP {
+            if index == 0 {
+                f.provider_name = decoded
+                f.provider_set = 1
+                f.provider_is_custom = 1
+                if types.known_id(decoded) == 1 { f.provider_is_custom = 0 }
+                f.provider_line = s.line
+            } else if index == 2 {
+                if decoded != "simple" && decoded != "normal" { return "ui must be simple or normal" }
+                f.simple = 0
+                if decoded == "simple" { f.simple = 1 }
+                f.ui_start = start + voff
+                f.ui_end = start + voff + v.consumed
+            } else if index == 3 {
+                if string.length(trim_(decoded, 0)) == 0 { return "open must not be empty" }
+                f.open = decoded
+                f.open_set = 1
+            } else {
+                if types.effort_known(decoded) == 0 { return "invalid effort; expected default|off|none|minimal|low|medium|high|xhigh|max" }
+                f.effort = decoded
+                f.effort_set = 1
+                f.effort_start = start + voff
+                f.effort_end = start + voff + v.consumed
+                f.eline_start = lstart
+                f.eline_end = lend
+            }
+        } else if index == 0 {
+            settings.model = decoded
+            settings.model_set = 1
+            settings.model_line = s.line
+        } else if index == 6 {
+            if types.known_protocol(decoded) == 0 { return "protocol must be responses, chat_completions or anthropic_messages" }
+            settings.protocol = decoded
+        } else if index == 7 {
+            if string.length(decoded) == 0 { return "api_key_env must name an environment variable" }
+            if env_name_ok_(decoded) == 0 { return "invalid api_key_env name" }
+            settings.api_key_env = decoded
+        } else {
+            settings.base_url = decoded
+            settings.base_set = 1
+        }
+    }
+    if trailing_bad_(string.substring(value, v.consumed, string.length(value))) == 1 { return "unexpected text after value" }
+    return ""
+}
+
+kv_(s: *S, raw: string, line: string, lead: int, start: int, lend: int) -> string {
+    eq = string.index_of(line, "=")
+    if eq < 0 { return "expected key = value" }
+    key = rtrim_(string.substring(line, 0, eq))
+    sec = s.section
+    if sec != SEC_SKILLS && sec != SEC_MCP && sec != SEC_MCP_SERVER && key != "api_key_env" && secret_key_(key) == 1 { return SECRET_MSG }
+    if string.length(key) == 0 { return "empty key" }
+    if bare_key_ok_(key) == 0 { return "expected a bare key (dotted and quoted keys are unsupported)" }
+    vrest = string.substring(line, eq + 1, string.length(line))
+    value = ltrim_(vrest)
+    voff = lead + eq + 1 + (string.length(vrest) - string.length(value))
+    if sec == SEC_SKILLS || sec == SEC_MCP { return switch_kv_(s, key, value, voff, start) }
+    if sec == SEC_MCP_SERVER { return mcp_kv_(s, key, value) }
+    if sec == SEC_HOOKS { return hooks_kv_(s, key, value) }
+    if sec == SEC_SANDBOX { return sandbox_kv_(s, key, value) }
+    return generic_kv_(s, key, value, voff, start, start, lend)
+}
+
+// The parsed file, or (null, "path:line: message").
+parse(text: string, path: string) -> (ptr, string) {
+    f = new_file_()
+    s = heap.new(S)
+    s.f = f as ptr
+    s.section = SEC_TOP
+    s.seen_sections = 0
+    s.hooks_seen = 0
+    s.sandbox_seen = 0
+    s.top_seen = 0
+    s.limits_seen = 0
+    s.mcp_seen = 0
+    s.cur = null
+    n = string.length(text)
+    offset = 0
+    ln = 1
+    while offset < n {
+        s.line = ln
+        ln = ln + 1
+        nl = string.index_of_from(text, "\n", offset)
+        e = n
+        if nl >= 0 { e = nl + 1 }
+        raw = string.substring(text, offset, e)
+        start = offset
+        offset = e
+        line = trim_(raw, 1)
+        if utf8_valid_(raw) == 0 { return null, detail_(path, s.line, "invalid UTF-8") }
+        cr = string.index_of(raw, "\r")
+        if cr >= 0 {
+            if cr + 2 != string.length(raw) || string.char_at(raw, cr + 1) != 10 { return null, detail_(path, s.line, "bare carriage return") }
+        }
+        k = 0
+        while k < string.length(line) {
+            c = string.char_at(line, k)
+            if (c < 32 && c != 9) || c == 127 { return null, detail_(path, s.line, "control character") }
+            k = k + 1
+        }
+        if string.length(line) == 0 || string.char_at(line, 0) == 35 { continue }
+        m = ""
+        if string.char_at(line, 0) == 91 {
+            m = header_(s, line, start)
+        } else {
+            lead = 0
+            while lead < string.length(raw) && ws_(string.char_at(raw, lead), 1) == 1 { lead = lead + 1 }
+            m = kv_(s, raw, line, lead, start, e)
+        }
+        if m != "" { return null, detail_(path, s.line, m) }
+    }
+    if s.section == SEC_SKILLS { f.skills_end = n }
+    if s.section == SEC_MCP { f.mcp_end = n }
+    i = 0
+    while i < list.list_size(f.mcp_servers) {
+        sv = list.list_get_raw(f.mcp_servers, i) as *types.McpServer
+        has_cmd = 0
+        has_url = 0
+        if sv.command != "" { has_cmd = 1 }
+        if sv.url != "" { has_url = 1 }
+        if has_cmd == has_url { return null, detail_(path, sv.line, "MCP server requires exactly one of command or url") }
+        if has_url == 1 && (list.list_size(sv.args) > 0 || list.list_size(sv.env) > 0) { return null, detail_(path, sv.line, "args and env require command") }
+        if has_cmd == 1 && sv.header_env != "" { return null, detail_(path, sv.line, "header_env requires url") }
+        sv.enabled = has_switch_enabled_(f.mcp, sv.id)
+        i = i + 1
+    }
+    if s.section == SEC_TOP { f.top_end = n }
+    i = 0
+    while i < list.list_size(f.providers) {
+        pr = list.list_get_raw(f.providers, i) as *Prov
+        if pr.custom == 1 {
+            if pr.protocol == "" || pr.base_set == 0 || pr.model_set == 0 || pr.context_window < (0 as long) {
+                return null, detail_(path, pr.line, "custom provider '${pr.name}' requires protocol, base_url, model and context_window")
+            }
+            if string.length(pr.base_url) == 0 || string.length(pr.model) == 0 { return null, detail_(path, pr.line, "provider base_url and model must not be empty") }
+        }
+        i = i + 1
+    }
+    if f.provider_set == 1 && f.provider_is_custom == 1 {
+        found = 0
+        j = 0
+        while j < list.list_size(f.providers) {
+            pr = list.list_get_raw(f.providers, j) as *Prov
+            if pr.custom == 1 && pr.name == f.provider_name { found = 1 }
+            j = j + 1
+        }
+        if found == 0 { return null, detail_(path, f.provider_line, "provider must be a built-in id or configured custom provider; unknown '${f.provider_name}'") }
+    }
+    return f as ptr, ""
+}
+
+has_switch_enabled_(switches: ptr, name: string) -> int {
+    i = 0
+    while i < list.list_size(switches) {
+        w = list.list_get_raw(switches, i) as *Switch
+        if w.name == name { return w.enabled }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- skills ---------------------------------------------------------------
+
+// Whether the switch named `name` exists and is on.
+skill_enabled(switches: ptr, name: string) -> int {
+    return has_switch_enabled_(switches, name)
+}
+
+// The names of the enabled switches, in file order.
+enabled_skills(switches: ptr) -> ptr {
+    out = list.list_new()
+    i = 0
+    while i < list.list_size(switches) {
+        w = list.list_get_raw(switches, i) as *Switch
+        if w.enabled == 1 { list.list_add(out, string.copy(w.name)) }
+        i = i + 1
+    }
+    return out
+}
+
+copy_strings_(l: ptr) -> ptr {
+    out = list.list_new()
+    i = 0
+    while i < list.list_size(l) {
+        x, _g = list.get_string(l, i)
+        list.list_add(out, string.copy(x))
+        i = i + 1
+    }
+    return out
+}
+
+// ---- resolve ----------------------------------------------------------------
+
+// Digits only (an optional leading +), saturating at 2^63-1; -1 when not a number.
+parse_uint_(text: string) -> long {
+    t = text
+    if string.starts_with(t, "+") == 1 { t = string.substring(t, 1, string.length(t)) }
+    n = string.length(t)
+    if n == 0 { return -1 as long }
+    limit = 9223372036854775807 as long
+    val = 0 as long
+    i = 0
+    while i < n {
+        c = string.char_at(t, i)
+        if is_digit_(c) == 0 { return -1 as long }
+        d = (c - 48) as long
+        if val > (limit - d) / (10 as long) {
+            val = limit
+        } else {
+            val = val * (10 as long) + d
+        }
+        i = i + 1
+    }
+    return val
+}
+
+// The configuration `text` (the content of the file at `path`) and the
+// environment select. (cfg, "", "") or (null, error name, detail).
+resolve(envp: ptr, text: string, path: string) -> (ptr, string, string) {
+    fp, d = parse(text, path)
+    if fp == null { return null, "InvalidConfig", d }
+    file = fp as *File
+    name = DEFAULT_PROVIDER
+    if env.has(envp, "NIB_PROVIDER") == 1 {
+        name = env.get(envp, "NIB_PROVIDER")
+    } else if file.provider_set == 1 {
+        name = file.provider_name
+    }
+    builtin = types.known_id(name)
+    settings = new_prov_(name, 1, 0)
+    if name == "chat_completions" { settings = file.chat as *Prov }
+    found = 0
+    i = 0
+    while i < list.list_size(file.providers) {
+        item = list.list_get_raw(file.providers, i) as *Prov
+        if item.name == name {
+            settings = item
+            found = 1
+            break
+        }
+        i = i + 1
+    }
+    if builtin == 0 && (found == 0 || name == "custom") { return null, "InvalidProvider", "NIB_PROVIDER: unknown provider '${name}'" }
+    e_base = settings.base_url
+    e_model = settings.model
+    e_envs = list.list_new()
+    if builtin == 1 {
+        e_base = types.definition_base_url(name)
+        e_model = types.definition_default_model(name)
+        e_envs = types.definition_key_envs(name)
+    }
+    model = e_model
+    if env.has(envp, "NIB_MODEL") == 1 {
+        model = env.get(envp, "NIB_MODEL")
+    } else if settings.model_set == 1 {
+        model = settings.model
+    }
+    window = 0 as long
+    if env.has(envp, "NIB_CONTEXT_WINDOW") == 1 {
+        n = parse_uint_(env.get(envp, "NIB_CONTEXT_WINDOW"))
+        if n < (0 as long) { return null, "InvalidContextWindow", "NIB_CONTEXT_WINDOW: expected a positive integer" }
+        if n == (0 as long) { return null, "InvalidContextWindow", "NIB_CONTEXT_WINDOW: must be greater than zero" }
+        window = n
+    } else if settings.context_window >= (0 as long) {
+        window = settings.context_window
+    } else {
+        cw = 0 as long
+        if builtin == 1 { cw = types.model_context_window(name, model) }
+        if cw > (0 as long) {
+            window = cw
+        } else if name == "chat_completions" {
+            window = 1000000 as long
+        } else {
+            return null, "InvalidConfig", detail_(path, settings.model_line, "unknown model context window; set context_window or NIB_CONTEXT_WINDOW")
+        }
+    }
+    base_url = e_base
+    if env.has(envp, "NIB_BASE_URL") == 1 {
+        base_url = env.get(envp, "NIB_BASE_URL")
+    } else if settings.base_set == 1 {
+        base_url = settings.base_url
+    }
+    provider_id = "custom"
+    if builtin == 1 { provider_id = name }
+    cp = types.new_config(string.copy(provider_id), string.copy(base_url), "", string.copy(model))
+    c = cp as *types.Config
+    c.context_window = window
+    c.limits = file.limits
+    if builtin == 0 {
+        c.custom_provider = string.copy(name)
+        c.custom_protocol = string.copy(settings.protocol)
+        c.custom_vision = settings.vision
+    }
+    if settings.api_key_env != "" {
+        c.api_key_env = string.copy(settings.api_key_env)
+    } else if list.list_size(e_envs) > 0 {
+        first, _g = list.get_string(e_envs, 0)
+        c.api_key_env = string.copy(first)
+    }
+    c.simple = file.simple
+    if file.open_set == 1 { c.open = string.copy(file.open) }
+    if env.has(envp, "NIB_REASONING_SUMMARY") == 1 {
+        v = env.get(envp, "NIB_REASONING_SUMMARY")
+        if v != "off" && v != "auto" { return null, "InvalidConfig", "NIB_REASONING_SUMMARY: expected off or auto" }
+        c.reasoning_summary = string.copy(v)
+    }
+    if env.has(envp, "NIB_RUN_OUTPUT_BYTES") == 1 {
+        n2 = parse_uint_(env.get(envp, "NIB_RUN_OUTPUT_BYTES"))
+        if n2 < (16384 as long) || n2 > (16777216 as long) { return null, "InvalidConfig", "NIB_RUN_OUTPUT_BYTES: expected 16384..16777216 bytes" }
+        lim = c.limits as *types.Limits
+        lim.run_output_bytes = n2 as int
+    }
+    if env.has(envp, "NIB_THINKING") == 0 && env.has(envp, "NIB_REASONING_EFFORT") == 0 {
+        if file.effort_set == 1 { types.set_effort(cp, file.effort) }
+    }
+    if env.has(envp, "NIB_THINKING") == 1 {
+        v2 = env.get(envp, "NIB_THINKING")
+        if v2 == "on" {
+            c.thinking = 1
+        } else if v2 == "off" {
+            c.thinking = 0
+        } else {
+            return null, "InvalidThinking", "NIB_THINKING: expected on or off"
+        }
+    }
+    if env.has(envp, "NIB_REASONING_EFFORT") == 1 {
+        v3 = env.get(envp, "NIB_REASONING_EFFORT")
+        if types.effort_known(v3) == 0 { return null, "InvalidReasoningEffort", "NIB_REASONING_EFFORT: expected default|off|none|minimal|low|medium|high|xhigh|max" }
+        if v3 == "off" {
+            c.thinking = 0
+        } else if v3 != "default" {
+            c.reasoning_effort = string.copy(v3)
+        }
+    }
+    key = ""
+    if settings.api_key_env != "" {
+        key = env.get(envp, settings.api_key_env)
+    } else {
+        k = 0
+        while k < list.list_size(e_envs) {
+            kn, _g2 = list.get_string(e_envs, k)
+            if env.has(envp, kn) == 1 {
+                c.api_key_env = string.copy(kn)
+                key = env.get(envp, kn)
+                break
+            }
+            k = k + 1
+        }
+    }
+    c.api_key = string.copy(key)
+    if string.length(key) > 0 { c.key_source = "env" }
+    h, herr = home(envp)
+    if herr == "" { c.nib_home = string.copy(h) }
+    c.enabled_skills = enabled_skills(file.skills)
+    c.hooks_after_edit = copy_strings_(file.hooks_after_edit)
+    c.hooks_turn_end = copy_strings_(file.hooks_turn_end)
+    j = 0
+    while j < list.list_size(file.mcp_servers) {
+        list.list_add(c.mcp_servers, types.mcp_server_copy(list.list_get_raw(file.mcp_servers, j)))
+        j = j + 1
+    }
+    c.sandbox_workspace = file.sandbox_workspace
+    if env.has(envp, "NIB_SANDBOX") == 1 {
+        v4 = env.get(envp, "NIB_SANDBOX")
+        if v4 == "workspace" {
+            c.sandbox_workspace = 1
+        } else if v4 == "off" {
+            c.sandbox_workspace = 0
+        } else {
+            return null, "InvalidConfig", "NIB_SANDBOX: expected workspace or off"
+        }
+    }
+    home_dir = env.get(envp, "HOME")
+    r = 0
+    while r < list.list_size(file.sandbox_writable) {
+        w, _g3 = list.get_string(file.sandbox_writable, r)
+        list.list_add(c.sandbox_writable, expand_home_(home_dir, w))
+        r = r + 1
+    }
+    return cp, "", ""
+}
+
+// ---- the stored key and startup choice --------------------------------------
+
+// Fills a missing key from nib's own store; environment keys win.
+apply_store(home_path: string, cp: ptr) {
+    c = cp as *types.Config
+    if string.length(c.api_key) > 0 { return }
+    file = store.path(home_path)
+    doc, err = store.load(file)
+    if err != "" { return }
+    k = store.key(doc, types.name(cp))
+    store.free(doc)
+    if k == "" { return }
+    c.api_key = k
+    c.key_source = "store"
+}
+
+// Whether requests can be sent: a key, or a service that needs none.
+credentialed(cp: ptr) -> int {
+    if types.missing_key(cp) == 1 { return 0 }
+    return 1
+}
+
+// The built-in services in startup order (upstream's, less codex).
+startup_order() -> ptr {
+    l = list.list_new()
+    list.list_add(l, "anthropic")
+    list.list_add(l, "openai")
+    list.list_add(l, "deepseek")
+    list.list_add(l, "xai")
+    return l
+}
+
+// First credentialed service: built-in keys, then custom services. Not persisted.
+pick_credentialed_(envp: ptr, home_path: string, text: string, path: string) -> ptr {
+    fp, _d = parse(text, path)
+    if fp == null { return null }
+    file = fp as *File
+    names = startup_order()
+    i = 0
+    while i < list.list_size(file.providers) {
+        item = list.list_get_raw(file.providers, i) as *Prov
+        if item.custom == 1 { list.list_add(names, string.copy(item.name)) }
+        i = i + 1
+    }
+    picked = env.clone(envp)
+    env.remove(picked, "NIB_MODEL")
+    env.remove(picked, "NIB_BASE_URL")
+    env.remove(picked, "NIB_CONTEXT_WINDOW")
+    j = 0
+    while j < list.list_size(names) {
+        nm, _g = list.get_string(names, j)
+        j = j + 1
+        env.set(picked, "NIB_PROVIDER", nm)
+        cp, err, _d2 = resolve(picked, text, path)
+        if err != "" { continue }
+        apply_store(home_path, cp)
+        if credentialed(cp) == 1 { return cp }
+    }
+    return null
+}
+
+// The configuration the launch uses. (cfg, "", "") or (null, error name, detail).
+load(envp: ptr, home_path: string) -> (ptr, string, string) {
+    path = join_(home_path, "config.toml")
+    text, rerr = read_text_(path)
+    if rerr != "" { return null, rerr, "${path}:1: cannot read configuration: ${rerr}" }
+    cp, err, detail = resolve(envp, text, path)
+    if err != "" { return null, err, detail }
+    apply_store(home_path, cp)
+    if env.has(envp, "NIB_PROVIDER") == 0 && credentialed(cp) == 0 {
+        picked = pick_credentialed_(envp, home_path, text, path)
+        if picked != null { cp = picked }
+    }
+    return cp, "", ""
+}
+
+// ---- custom providers -----------------------------------------------------
+
+// Custom `[providers.<id>]` services in file order: (list of *Custom, error name).
+custom_providers(home_path: string) -> (ptr, string) {
+    path = join_(home_path, "config.toml")
+    text, rerr = read_text_(path)
+    if rerr != "" { return null, rerr }
+    fp, _d = parse(text, path)
+    if fp == null { return null, "InvalidConfig" }
+    file = fp as *File
+    out = list.list_new()
+    i = 0
+    while i < list.list_size(file.providers) {
+        item = list.list_get_raw(file.providers, i) as *Prov
+        i = i + 1
+        if item.custom == 0 { continue }
+        cu = heap.new(Custom)
+        cu.id = string.copy(item.name)
+        cu.protocol = string.copy(item.protocol)
+        cu.base_url = string.copy(item.base_url)
+        cu.model = string.copy(item.model)
+        cu.context_window = item.context_window
+        cu.api_key_env = string.copy(item.api_key_env)
+        list.list_add_raw(out, cu as ptr)
+    }
+    return out, ""
+}
+
+// Appends a `[providers.<id>]` section; the key is never written here.
+add_endpoint(home_path: string, id: string, protocol: string, base_url: string, model: string, context_window: long) -> string {
+    path = join_(home_path, "config.toml")
+    text, rerr = read_text_(path)
+    if rerr != "" { return rerr }
+    nl = newline_of_(text)
+    out = text
+    if string.length(out) > 0 && !string.ends_with(out, "\n") { out = "${out}${nl}" }
+    if string.length(out) > 0 { out = "${out}${nl}" }
+    out = "${out}[providers.${id}]${nl}protocol = \"${protocol}\"${nl}base_url = ${jsonx.quote(base_url)}${nl}model = ${jsonx.quote(model)}${nl}context_window = ${context_window}${nl}"
+    fp, _d = parse(out, path)
+    if fp == null { return "InvalidConfig" }
+    return write_file_(home_path, path, out)
+}
+
+write_file_(home_path: string, path: string, data: string) -> string {
+    mk = fs.mkdir_p(home_path)
+    if mk != "" { return "Unexpected" }
+    return atomic_file.replace(path, data, 384, 0, 1, null)
+}
+
+// ---- model selection --------------------------------------------------------
+
+// "openai/gpt-x", "openai gpt-x" or "openai": (provider, model or "", error name).
+parse_model(arg: string) -> (string, string, string) {
+    words = list.list_new()
+    cur = ""
+    i = 0
+    n = string.length(arg)
+    while i <= n {
+        c = 32
+        if i < n { c = string.char_at(arg, i) }
+        if c == 32 || c == 9 || c == 10 {
+            if cur != "" { list.list_add(words, cur) }
+            cur = ""
+        } else {
+            cur = "${cur}${string.from_char(c)}"
+        }
+        i = i + 1
+    }
+    if list.list_size(words) == 0 { return "", "", "InvalidModelArgument" }
+    first, _g = list.get_string(words, 0)
+    slash = string.index_of(first, "/")
+    if slash >= 0 {
+        if slash == 0 || slash + 1 == string.length(first) || list.list_size(words) > 1 { return "", "", "InvalidModelArgument" }
+        return string.substring(first, 0, slash), string.substring(first, slash + 1, string.length(first)), ""
+    }
+    if list.list_size(words) > 2 { return "", "", "InvalidModelArgument" }
+    model = ""
+    if list.list_size(words) == 2 {
+        m, _g2 = list.get_string(words, 1)
+        model = string.copy(m)
+    }
+    return string.copy(first), model, ""
+}
+
+// Sets `key = "value"` inside [section] ("" is the top level), keeping the
+// rest of the bytes: (new text, error name).
+rewrite_value(text: string, section: string, key: string, value: string) -> (string, string) {
+    out = ""
+    current = ""
+    found_section = 0
+    if section == "" { found_section = 1 }
+    inserted = 0
+    offset = 0
+    n = string.length(text)
+    nl = newline_of_(text)
+    quoted = jsonx.quote(value)
+    while offset < n {
+        nx = string.index_of_from(text, "\n", offset)
+        e = n
+        if nx >= 0 { e = nx + 1 }
+        raw = string.substring(text, offset, e)
+        line = trim_(raw, 1)
+        offset = e
+        if string.starts_with(line, "[") == 1 {
+            if current == section && inserted == 0 {
+                out = "${out}${key} = ${quoted}${nl}"
+                inserted = 1
+            }
+            close = string.index_of(line, "]")
+            current = string.substring(line, 1, close)
+            if current == section { found_section = 1 }
+        }
+        if current == section {
+            eq = string.index_of(line, "=")
+            if eq >= 0 {
+                if trim_(string.substring(line, 0, eq), 0) == key {
+                    rest_at = string.index_of(raw, "=") + 1
+                    rest = string.substring(raw, rest_at, string.length(raw))
+                    vstart = rest_at + (string.length(rest) - string.length(ltrim_(rest)))
+                    pv, m = parse_value(string.substring(raw, vstart, string.length(raw)))
+                    if m != "" { return "", "InvalidConfig" }
+                    used = (pv as *Val).consumed
+                    out = "${out}${string.substring(raw, 0, vstart)}${quoted}${string.substring(raw, vstart + used, string.length(raw))}"
+                    inserted = 1
+                    continue
+                }
+            }
+        }
+        out = "${out}${raw}"
+    }
+    if inserted == 0 {
+        if string.length(out) > 0 && !string.ends_with(out, "\n") { out = "${out}${nl}" }
+        if found_section == 0 { out = "${out}[${section}]${nl}" }
+        out = "${out}${key} = ${quoted}${nl}"
+    }
+    return out, ""
+}
+
+// The text with provider (and, when model is not "", its model) selected.
+model_text(text: string, provider_id: string, model: string) -> (string, string) {
+    fp, _d = parse(text, "config.toml")
+    if fp == null { return "", "InvalidConfig" }
+    top, err = rewrite_value(text, "", "provider", provider_id)
+    if err != "" { return "", err }
+    if model == "" { return top, "" }
+    section = "providers.${provider_id}"
+    if types.known_id(provider_id) == 1 || provider_id == "custom" { section = provider_id }
+    return rewrite_value(top, section, "model", model)
+}
+
+// Selects provider (and model) in the file and returns the resulting
+// configuration. (cfg, "", "") or (null, error name, detail).
+save_model(envp: ptr, home_path: string, provider_id: string, model: string) -> (ptr, string, string) {
+    path = join_(home_path, "config.toml")
+    text, rerr = read_text_(path)
+    if rerr != "" { return null, rerr, "" }
+    selected = env.clone(envp)
+    env.remove(selected, "NIB_MODEL")
+    env.set(selected, "NIB_PROVIDER", provider_id)
+    if model != "" { env.set(selected, "NIB_MODEL", model) }
+    cp, err, detail = resolve(selected, text, path)
+    if err != "" { return null, err, detail }
+    apply_store(home_path, cp)
+    c = cp as *types.Config
+    if c.provider == "chat_completions" && c.model != types.definition_default_model("chat_completions") && env.has(envp, "NIB_CONTEXT_WINDOW") == 0 {
+        fp, d = parse(text, path)
+        if fp == null { return null, "InvalidConfig", d }
+        if ((fp as *File).chat as *Prov).context_window < (0 as long) { return null, "UnknownModelContextWindow", "" }
+    }
+    updated, uerr = model_text(text, provider_id, c.model)
+    if uerr != "" { return null, uerr, "" }
+    werr = write_file_(home_path, path, updated)
+    if werr != "" { return null, werr, "" }
+    return cp, "", ""
+}
+
+// The models of the service `cp` selects: its catalog, or a custom service's
+// configured model, plus the current one if it is not listed.
+// (list of *ModelEntry, error name).
+model_entries(home_path: string, cp: ptr) -> (ptr, string) {
+    c = cp as *types.Config
+    out = list.list_new()
+    nm = types.name(cp)
+    if c.provider == "custom" {
+        items, err = custom_providers(home_path)
+        if err != "" { return null, err }
+        i = 0
+        while i < list.list_size(items) {
+            cu = list.list_get_raw(items, i) as *Custom
+            if cu.id == nm { push_entry_(out, nm, cu.model) }
+            i = i + 1
+        }
+    } else {
+        models = types.definition_models(c.provider)
+        if list.list_size(models) == 0 { push_entry_(out, c.provider, types.definition_default_model(c.provider)) }
+        i = 0
+        while i < list.list_size(models) {
+            m, _g = list.get_string(models, i)
+            push_entry_(out, c.provider, m)
+            i = i + 1
+        }
+    }
+    j = 0
+    while j < list.list_size(out) {
+        en = list.list_get_raw(out, j) as *ModelEntry
+        if en.model == c.model { return out, "" }
+        j = j + 1
+    }
+    push_entry_(out, nm, c.model)
+    return out, ""
+}
+
+push_entry_(l: ptr, provider_id: string, model: string) {
+    en = heap.new(ModelEntry)
+    en.provider = string.copy(provider_id)
+    en.model = string.copy(model)
+    list.list_add_raw(l, en as ptr)
+}
+
+// ---- writebacks -----------------------------------------------------------
+
+// Sets the top-level `effort` ("default" removes it), preserving every other byte.
+save_effort(home_path: string, value: string) -> string {
+    if types.effort_known(value) == 0 { return "InvalidReasoningEffort" }
+    path = join_(home_path, "config.toml")
+    text, rerr = read_text_(path)
+    if rerr != "" { return rerr }
+    fp, _d = parse(text, path)
+    if fp == null { return "InvalidConfig" }
+    file = fp as *File
+    reset = 0
+    if value == "default" { reset = 1 }
+    if reset == 1 && file.effort_set == 0 { return "" }
+    tl = string.length(text)
+    out = ""
+    if file.effort_set == 1 {
+        if reset == 1 {
+            suffix = string.substring(text, file.effort_end, file.eline_end)
+            hash = string.index_of(suffix, "#")
+            if hash >= 0 {
+                prefix = string.substring(text, file.eline_start, file.effort_start)
+                indent = string.length(prefix) - string.length(ltrim_(prefix))
+                out = "${string.substring(text, 0, file.eline_start + indent)}${string.substring(suffix, hash, string.length(suffix))}"
+            } else {
+                out = string.substring(text, 0, file.eline_start)
+            }
+            out = "${out}${string.substring(text, file.eline_end, tl)}"
+        } else {
+            out = "${string.substring(text, 0, file.effort_start)}\"${value}\"${string.substring(text, file.effort_end, tl)}"
+        }
+    } else {
+        nl = newline_of_(text)
+        out = string.substring(text, 0, file.top_end)
+        if file.top_end > 0 && string.char_at(text, file.top_end - 1) != 10 { out = "${out}${nl}" }
+        out = "${out}effort = \"${value}\"${nl}${string.substring(text, file.top_end, tl)}"
+    }
+    if out == text { return "" }
+    return write_file_(home_path, path, out)
+}
+
+// Sets `ui = "simple"|"normal"`, adding it at the top when absent.
+save_simple(home_path: string, simple: int) -> string {
+    path = join_(home_path, "config.toml")
+    text, rerr = read_text_(path)
+    if rerr != "" { return rerr }
+    fp, _d = parse(text, path)
+    if fp == null { return "InvalidConfig" }
+    file = fp as *File
+    v = "normal"
+    if simple == 1 { v = "simple" }
+    out = ""
+    if file.ui_start >= 0 {
+        out = "${string.substring(text, 0, file.ui_start)}\"${v}\"${string.substring(text, file.ui_end, string.length(text))}"
+    } else {
+        out = "ui = \"${v}\"\n${text}"
+    }
+    return write_file_(home_path, path, out)
+}
+
+// The [skills] switches in file order: (list of *Switch, error name).
+load_skills(home_path: string) -> (ptr, string) {
+    path = join_(home_path, "config.toml")
+    text, rerr = read_text_(path)
+    if rerr != "" { return null, rerr }
+    fp, _d = parse(text, path)
+    if fp == null { return null, "InvalidConfig" }
+    return (fp as *File).skills, ""
+}
+
+// The [mcp.<id>] servers in file order: (list of *types.McpServer, error name).
+load_mcp(home_path: string) -> (ptr, string) {
+    path = join_(home_path, "config.toml")
+    text, rerr = read_text_(path)
+    if rerr != "" { return null, rerr }
+    fp, _d = parse(text, path)
+    if fp == null { return null, "InvalidConfig" }
+    return (fp as *File).mcp_servers, ""
+}
+
+save_mcp(home_path: string, name: string, enabled: int) -> string {
+    return save_switch_(home_path, name, enabled, 1)
+}
+
+save_skill(home_path: string, name: string, enabled: int) -> string {
+    return save_switch_(home_path, name, enabled, 0)
+}
+
+save_switch_(home_path: string, name: string, enabled: int, mcp: int) -> string {
+    if string.length(name) == 0 { return "InvalidSkillName" }
+    if bare_key_ok_(name) == 0 { return "InvalidSkillName" }
+    path = join_(home_path, "config.toml")
+    text, rerr = read_text_(path)
+    if rerr != "" { return rerr }
+    fp, _d = parse(text, path)
+    if fp == null { return "InvalidConfig" }
+    file = fp as *File
+    value = "false"
+    if enabled == 1 { value = "true" }
+    nl = newline_of_(text)
+    switches = file.skills
+    section_end = file.skills_end
+    header = "skills"
+    if mcp == 1 {
+        switches = file.mcp
+        section_end = file.mcp_end
+        header = "mcp"
+    }
+    tl = string.length(text)
+    out = ""
+    span = -1
+    i = 0
+    while i < list.list_size(switches) {
+        w = list.list_get_raw(switches, i) as *Switch
+        if w.name == name { span = i }
+        i = i + 1
+    }
+    if span >= 0 {
+        sw = list.list_get_raw(switches, span) as *Switch
+        out = "${string.substring(text, 0, sw.start)}${value}${string.substring(text, sw.end, tl)}"
+    } else {
+        at = tl
+        if section_end >= 0 { at = section_end }
+        out = string.substring(text, 0, at)
+        if at > 0 && string.char_at(text, at - 1) != 10 { out = "${out}${nl}" }
+        if section_end < 0 { out = "${out}[${header}]${nl}" }
+        out = "${out}${name} = ${value}${nl}${string.substring(text, at, tl)}"
+    }
+    if out == text { return "" }
+    return write_file_(home_path, path, out)
+}

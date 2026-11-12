@@ -1,0 +1,465 @@
+// Ports the tests of upstream src/session/output.zig, under their names.
+// Where upstream builds a sandbox.Outcome by hand, so does this; where it
+// runs JS, this runs it through nib.sandbox.eval.
+import std.spec
+import std.string
+import std.strbuilder
+import std.list
+import nib.sandbox
+import nib.sandbox.console
+import nib.session.output
+
+const MAX = 16384
+
+repeat_(s: string, n: int) -> string {
+    b = strbuilder.new(n * string.length(s) + 16)
+    i = 0
+    while i < n {
+        strbuilder.append(b, s)
+        i = i + 1
+    }
+    return strbuilder.finish(b)
+}
+
+count_(s: string, part: string) -> int {
+    n = 0
+    at = 0
+    while true {
+        i = string.index_of_from(s, part, at)
+        if i < 0 { break }
+        n = n + 1
+        at = i + string.length(part)
+    }
+    return n
+}
+
+has_(s: string, part: string) -> int {
+    if string.index_of(s, part) >= 0 { return 1 }
+    return 0
+}
+
+ends_(s: string, suffix: string) -> int { return string.ends_with(s, suffix) }
+
+// Valid UTF-8 (no overlongs checked; enough to catch cut sequences).
+utf8_ok_(s: string) -> int {
+    n = string.length(s)
+    i = 0
+    while i < n {
+        b = string.char_at(s, i)
+        len = 0
+        if b < 128 { len = 1 }
+        else if (b & 224) == 192 { len = 2 }
+        else if (b & 240) == 224 { len = 3 }
+        else if (b & 248) == 240 { len = 4 }
+        if len == 0 || i + len > n { return 0 }
+        j = 1
+        while j < len {
+            if (string.char_at(s, i + j) & 192) != 128 { return 0 }
+            j = j + 1
+        }
+        i = i + len
+    }
+    return 1
+}
+
+plain_(ok: int, text: string, logs: string) -> *sandbox.Outcome {
+    o = heap.new(sandbox.Outcome)
+    o.ok = ok
+    o.text = text
+    o.logs = logs
+    o.log_entries = list.list_new()
+    o.log_bytes = 0
+    o.log_head_bytes = 0
+    o.log_tail_start = 0
+    o.log_truncated = 0
+    o.tool_bytes = 0
+    o.stopped = ""
+    return o
+}
+
+evaluate_(code: string, max_log: long) -> *sandbox.Outcome {
+    l = sandbox.limits() as *sandbox.Limits
+    if max_log >= 0 { l.max_log_bytes = max_log }
+    return sandbox.eval(code, l as ptr, null, null) as *sandbox.Outcome
+}
+
+ev_(code: string) -> *sandbox.Outcome { return evaluate_(code, -1) }
+
+fmt_(o: *sandbox.Outcome) -> string { return output.format(o as ptr, MAX as long) }
+
+entry_(o: *sandbox.Outcome, i: int) -> *console.Entry {
+    return list.list_get_raw(o.log_entries, i) as *console.Entry
+}
+
+nentries_(o: *sandbox.Outcome) -> int { return list.list_size(o.log_entries) }
+
+// Digits of s starting at i.
+int_at_(s: string, i: int) -> int {
+    v = 0
+    while i < string.length(s) {
+        c = string.char_at(s, i)
+        if c < 48 || c > 57 { break }
+        v = v * 10 + (c - 48)
+        i = i + 1
+    }
+    return v
+}
+
+// The text between " bytes omitted" and the closing bracket; -1 when absent.
+marker_tail_(out: string) -> string {
+    at = string.index_of(out, " bytes omitted")
+    if at < 0 { return "<none>" }
+    end = string.index_of_from(out, "]", at)
+    return string.substring(out, at, end)
+}
+
+expect_marker_(out: string, lines: string) {
+    tail = marker_tail_(out)
+    spec.assert_true(has_(tail, "bytes omitted"), "a marker exists")
+    if lines != "" {
+        spec.assert_true(has_(tail, lines), "marker names lines")
+    } else {
+        spec.assert_false(has_(tail, "lines"), "marker names no lines")
+    }
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "session.output") {
+        spec.it("configured display budget leaves JS data intact") callback {
+            text = repeat_("x", 24 * 1024)
+            o = plain_(1, text, "")
+            small = output.format(o as ptr, MAX as long)
+            large = output.format(o as ptr, 32768 as long)
+            spec.assert_true(string.length(small) <= MAX, "small fits")
+            spec.assert_true(has_(small, "bytes omitted"), "small is cut")
+            spec.assert_str_eq(string.substring(large, 8, string.length(large)), text, "large is whole")
+            spec.assert_eq(string.length(o.text), 24 * 1024, "outcome untouched")
+            msg = output.format_message("[background bash b1 finished]\n", text, 32768 as long)
+            spec.assert_true(ends_(msg, text), "message ends with the data")
+        }
+        spec.it("three console entries retain labels and exact omission bytes") callback {
+            o = ev_("console.log('first'); console.log('middle:' + 'z'.repeat(40000) + ':middle-end'); console.log('last');")
+            out = fmt_(o)
+            spec.assert_true(string.length(out) <= MAX, "fits")
+            spec.assert_eq(nentries_(o), 3, "three entries")
+            spec.assert_true(string.starts_with(out, "[entry 1 of 3 (console)]\nfirst\n"), "first")
+            spec.assert_true(has_(out, "[entry 2 of 3 (console)]\nmiddle:"), "middle")
+            spec.assert_true(ends_(out, ":middle-end\n[entry 3 of 3 (console)]\nlast\n"), "last")
+            total = (entry_(o, 1).end - entry_(o, 1).start) as int
+            shown = count_(out, "z") + string.length("middle::middle-end\n")
+            marker = "[${total - shown} of ${total} bytes omitted]"
+            spec.assert_true(has_(out, marker), "exact marker ${marker}")
+        }
+        spec.it("console capture limit preserves later entries and exact omission counts") callback {
+            o = ev_("console.log('first'); console.log('middle:' + 'z'.repeat(90000)); console.log('last');")
+            out = fmt_(o)
+            spec.assert_true(string.length(out) <= MAX, "fits")
+            spec.assert_eq(o.log_truncated, 1, "capture truncated")
+            spec.assert_eq_long(entry_(o, 1).end - entry_(o, 1).start, 90008 as long, "entry bytes")
+            shown = count_(out, "z") + string.length("middle:\n")
+            marker = "[${90008 - shown} of 90008 bytes omitted]"
+            spec.assert_true(has_(out, marker), "exact marker ${marker}")
+            spec.assert_true(ends_(out, "[entry 3 of 3 (console)]\nlast\n"), "last kept")
+            spec.assert_false(has_(out, "[console output truncated]"), "no capture notice")
+        }
+        spec.it("many console entries have bounded metadata and a numbered omission range") callback {
+            o = ev_("for (let i = 0; i < 10000; i++) console.log('x');")
+            out = fmt_(o)
+            spec.assert_true(string.length(out) <= MAX, "fits")
+            spec.assert_eq(nentries_(o), console.MAX_ENTRIES + 1, "bounded entries")
+            spec.assert_true(has_(out, "[entries 33-9968 of 10000 (console)]"), "range")
+            spec.assert_true(ends_(out, "[entry 10000 of 10000 (console)]\nx\n"), "last")
+        }
+        spec.it("small outputs remain unchanged even with more than 64 console calls") callback {
+            o = ev_("for (let i = 0; i < 100; i++) console.log('x');")
+            out = fmt_(o)
+            want = o.logs
+            while string.ends_with(want, "\n") == 1 { want = string.substring(want, 0, string.length(want) - 1) }
+            spec.assert_str_eq(out, want, "unchanged")
+        }
+        spec.it("UTF-8 cuts count all omitted bytes including capture loss") callback {
+            caps = [65536, 16385, 1, 0]
+            k = 0
+            while k < 4 {
+                o = evaluate_("console.log('你'.repeat(30000));", caps[k] as long)
+                out = fmt_(o)
+                spec.assert_true(string.length(out) <= MAX, "fits")
+                spec.assert_true(utf8_ok_(out), "valid UTF-8")
+                shown = count_(out, "你") * 3
+                if caps[k] >= 2 { shown = shown + 1 }
+                spec.assert_true(has_(out, "[${90001 - shown} of 90001 bytes omitted"), "marker for capture ${caps[k]}")
+                k = k + 1
+            }
+        }
+        spec.it("completion and errors have their own entry and cannot be crowded out by logs") callback {
+            codes = ["console.log('z'.repeat(40000)); 'result-' + 'y'.repeat(40000) + '-end'",
+                     "console.log('z'.repeat(90000)); throw new Error('failure-marker');",
+                     "'result-' + 'y'.repeat(40000) + '-end'",
+                     "throw new Error('failure-' + 'y'.repeat(40000));"]
+            i = 0
+            while i < 4 {
+                o = ev_(codes[i])
+                out = fmt_(o)
+                spec.assert_true(string.length(out) <= MAX, "fits")
+                if o.ok == 1 {
+                    spec.assert_true(has_(out, "(result)"), "result entry")
+                    spec.assert_true(has_(out, "result-"), "result text")
+                    spec.assert_true(has_(out, "-end\""), "result end")
+                } else {
+                    spec.assert_true(has_(out, "(error)"), "error entry")
+                    spec.assert_true(has_(out, "failure-"), "error text")
+                }
+                if i == 1 { spec.assert_true(has_(out, "Error: failure-marker"), "error line") }
+                i = i + 1
+            }
+        }
+        spec.it("UTF-8 cut points") callback {
+            spec.assert_str_eq(console.trim_end_utf8("ab\xe4\xbd"), "ab", "incomplete tail dropped")
+            spec.assert_str_eq(console.trim_end_utf8("ab你"), "ab你", "whole char kept")
+            spec.assert_str_eq(console.trim_start_utf8("\xbd\xa0cd"), "cd", "stray continuation dropped")
+            spec.assert_str_eq(console.trim_end_utf8("\xbd\xa0"), "", "only continuation")
+        }
+        spec.it("exact output budget boundaries for console and completion") callback {
+            kind = 0
+            while kind < 2 {
+                sizes = [MAX - 1, MAX, MAX + 1]
+                s = 0
+                while s < 3 {
+                    size = sizes[s]
+                    n = size
+                    if kind == 1 { n = size - string.length("result: \"\"") }
+                    code = "console.log('z'.repeat(${n}));"
+                    if kind == 1 { code = "'z'.repeat(${n});" }
+                    o = ev_(code)
+                    out = fmt_(o)
+                    spec.assert_true(string.length(out) <= MAX, "fits")
+                    if size <= MAX {
+                        spec.assert_eq(string.length(out), size, "exact size")
+                        spec.assert_false(has_(out, "bytes omitted"), "no marker")
+                    } else {
+                        spec.assert_true(has_(out, "bytes omitted"), "marker")
+                    }
+                    s = s + 1
+                }
+                kind = kind + 1
+            }
+        }
+        spec.it("four-byte UTF-8 capture boundaries") callback {
+            cap = 0
+            while cap < 8 {
+                o = evaluate_("console.log('😀'.repeat(30000));", cap as long)
+                out = fmt_(o)
+                spec.assert_true(string.length(out) <= MAX, "fits")
+                spec.assert_true(utf8_ok_(out), "valid UTF-8")
+                shown = count_(out, "😀") * 4
+                if cap >= 2 { shown = shown + 1 }
+                spec.assert_true(has_(out, "[${120001 - shown} of 120001 bytes omitted"), "marker for capture ${cap}")
+                cap = cap + 1
+            }
+        }
+        spec.it("console entry boundaries are calls rather than arguments or lines") callback {
+            o = ev_("console.log('left', {n: 1}, 'a\\nb'); console.warn('z'.repeat(40000)); console.error('right');")
+            out = fmt_(o)
+            spec.assert_true(string.starts_with(out, "[entry 1 of 3 (console)]\nleft {\"n\":1} a\nb\n[entry 2 of 3 (console)]\n"), "start")
+            spec.assert_true(ends_(out, "[entry 3 of 3 (console)]\nright\n"), "end")
+        }
+        spec.it("oversized single call and cumulative calls preserve real head and tail") callback {
+            codes = ["console.log('BEGIN-' + '你😀'.repeat(30000) + '-FINAL-SENTINEL');",
+                     "console.log('BEGIN-'); for (let i = 0; i < 10000; i++) console.log('你😀'.repeat(10)); console.log('-FINAL-SENTINEL');"]
+            i = 0
+            while i < 2 {
+                o = ev_(codes[i])
+                spec.assert_eq(o.log_truncated, 1, "truncated")
+                spec.assert_true(utf8_ok_(o.logs), "logs valid UTF-8")
+                spec.assert_true(string.starts_with(o.logs, "BEGIN-"), "logs begin")
+                spec.assert_true(ends_(o.logs, "-FINAL-SENTINEL\n"), "logs end")
+                spec.assert_true(o.log_head_bytes + string.length(o.logs) - o.log_tail_start <= 65536, "captured bytes bounded")
+                spec.assert_true(nentries_(o) <= console.MAX_ENTRIES + 1, "entries bounded")
+                out = fmt_(o)
+                spec.assert_true(string.length(out) <= MAX, "fits")
+                spec.assert_true(utf8_ok_(out), "valid UTF-8")
+                spec.assert_true(has_(out, "BEGIN-"), "begin shown")
+                spec.assert_true(has_(out, "bytes omitted]"), "marker")
+                spec.assert_true(ends_(out, "-FINAL-SENTINEL\n"), "end shown")
+                i = i + 1
+            }
+        }
+        spec.it("bounded call metadata plus completion preserves original numbering") callback {
+            callss = [64, 65, 66]
+            k = 0
+            while k < 3 {
+                calls = callss[k]
+                o = ev_("for (let i = 0; i < ${calls}; i++) console.log('call-' + i + ':' + '😀'.repeat(600 + i)); 'RESULT-SENTINEL'")
+                out = fmt_(o)
+                spec.assert_true(string.length(out) <= MAX, "fits")
+                spec.assert_true(utf8_ok_(out), "valid UTF-8")
+                spec.assert_true(has_(out, "call-0:"), "first call")
+                spec.assert_true(has_(out, "call-${calls - 1}:"), "last call")
+                result = "[entry ${calls + 1} of ${calls + 1} (result)]\n\"RESULT-SENTINEL\"\n"
+                spec.assert_true(ends_(out, result), "result numbering")
+                k = k + 1
+            }
+        }
+        spec.it("stopped line follows small output without changing the body") callback {
+            stopped = "[stopped before completion: bash #0, agent #2]"
+            codes = ["", "console.log('hello');", "console.log('hello'); 42", "throw 'failure'"]
+            wants = ["(no output)", "hello", "hello\nresult: 42", "failure"]
+            i = 0
+            while i < 4 {
+                o = ev_(codes[i])
+                o.stopped = stopped
+                spec.assert_str_eq(fmt_(o), "${wants[i]}\n${stopped}", "case ${i}")
+                i = i + 1
+            }
+        }
+        spec.it("stopped line reserves budget at exact body boundaries") callback {
+            stopped = "[stopped before completion: bash #0, agent #2]"
+            budget = MAX - string.length(stopped) - 1
+            sizes = [budget - 1, budget, budget + 1]
+            i = 0
+            while i < 3 {
+                size = sizes[i]
+                logs = repeat_("x", size)
+                o = plain_(1, "undefined", logs)
+                o.stopped = stopped
+                out = fmt_(o)
+                spec.assert_true(string.length(out) <= MAX, "fits")
+                spec.assert_true(ends_(out, "\n${stopped}"), "stopped line kept")
+                if size <= budget {
+                    spec.assert_eq(string.length(out), size + 1 + string.length(stopped), "exact size")
+                    spec.assert_str_eq(string.substring(out, 0, size), logs, "body whole")
+                } else {
+                    spec.assert_true(has_(out, "bytes omitted"), "marker")
+                }
+                i = i + 1
+            }
+        }
+        spec.it("maximum stopped line survives huge console errors and many entries") callback {
+            prefix = "[stopped before completion: "
+            suffix = ", ..., 9000 more]"
+            stopped = "${prefix}${repeat_("x", sandbox.MAX_STOPPED_BYTES - string.length(prefix) - string.length(suffix))}${suffix}"
+            spec.assert_eq(string.length(stopped), sandbox.MAX_STOPPED_BYTES, "max length")
+            codes = ["console.log('你😀'.repeat(30000));",
+                     "throw new Error('failure-' + '你😀'.repeat(30000));",
+                     "for (let i = 0; i < 10000; i++) console.log('你😀'.repeat(10)); throw new Error('failure-' + '你😀'.repeat(30000));"]
+            i = 0
+            while i < 3 {
+                o = ev_(codes[i])
+                o.stopped = stopped
+                out = fmt_(o)
+                spec.assert_true(string.length(out) <= MAX, "fits")
+                spec.assert_true(ends_(out, stopped), "stopped kept")
+                spec.assert_eq(string.char_at(out, string.length(out) - string.length(stopped) - 1), 10, "newline before")
+                spec.assert_true(utf8_ok_(out), "valid UTF-8")
+                spec.assert_true(has_(out, "bytes omitted"), "marker")
+                if o.ok == 1 {
+                    spec.assert_true(has_(out, "(console)"), "console entry")
+                } else {
+                    spec.assert_true(has_(out, "(error)"), "error entry")
+                }
+                i = i + 1
+            }
+        }
+        spec.it("Step budget metadata leaves unlimited output unchanged and appends after the output budget") callback {
+            spec.assert_str_eq(output.step_limit_output("output", -1 as long), "output", "unlimited")
+            spec.assert_str_eq(output.step_limit_output("output", 4 as long), "output", "4 left")
+            spec.assert_str_eq(output.step_limit_output("output", 3 as long), "output\n[3 Steps left in this Turn]", "3 left")
+            spec.assert_str_eq(output.step_limit_output("output", 0 as long), "output\n[0 Steps left in this Turn]", "0 left")
+            full = repeat_("x", 16 * 1024)
+            out = output.step_limit_output(full, 2 as long)
+            spec.assert_str_eq(string.substring(out, 0, string.length(full)), full, "output untouched")
+            spec.assert_str_eq(string.substring(out, string.length(full), string.length(out)), "\n[2 Steps left in this Turn]", "hint after")
+        }
+        spec.it("formatOutcome") callback {
+            ok = output.format(plain_(1, "1", "a\nb\n") as ptr, MAX as long)
+            spec.assert_str_eq(ok, "a\nb\nresult: 1", "ok")
+            bad = output.format(plain_(0, "Error: x", "") as ptr, MAX as long)
+            spec.assert_true(string.starts_with(bad, "Error: x\n"), "error first")
+            spec.assert_true(has_(bad, "Correct the script and continue the task"), "notice")
+            logged = output.format(plain_(1, "undefined", "a\nb\n") as ptr, MAX as long)
+            spec.assert_str_eq(logged, "a\nb", "undefined hidden")
+            silent = output.format(plain_(1, "undefined", "") as ptr, MAX as long)
+            spec.assert_str_eq(silent, "(no output)", "silent")
+        }
+        spec.it("omittedLines counts real and escaped newlines") callback {
+            a, b = output.omitted_lines("a\nbb\ncc\nd", 3 as long, 7 as long)
+            spec.assert_eq_long(a, 2 as long, "real newlines first")
+            spec.assert_eq_long(b, 3 as long, "real newlines last")
+            a, b = output.omitted_lines("\"a\\nbb\\ncc\\nd\"", 5 as long, 12 as long)
+            spec.assert_eq_long(a, 2 as long, "escaped first")
+            spec.assert_eq_long(b, 3 as long, "escaped last")
+            a, b = output.omitted_lines("\"a\\\\nbbbbb\"", 3 as long, 8 as long)
+            spec.assert_eq_long(a, 0 as long, "escaped backslash is no newline")
+            a, b = output.omitted_lines("a\\nb\\nc\\nd", 2 as long, 8 as long)
+            spec.assert_eq_long(a, 0 as long, "escapes need JSON-looking text")
+            a, b = output.omitted_lines("abc\ndef", 4 as long, 6 as long)
+            spec.assert_eq_long(a, 0 as long, "one line")
+            a, b = output.omitted_lines("abc\ndef", 1 as long, 5 as long)
+            spec.assert_eq_long(a, 1 as long, "two lines first")
+            spec.assert_eq_long(b, 2 as long, "two lines last")
+            a, b = output.omitted_lines("a\nb\nc", 2 as long, 5 as long)
+            spec.assert_eq_long(a, 2 as long, "tail first")
+            spec.assert_eq_long(b, 3 as long, "tail last")
+        }
+        spec.it("marker names omitted lines of a logged read object") callback {
+            o = ev_("let t = ''; for (let i = 1; i <= 3000; i++) t += 'line ' + i + '\\n'; console.log({ text: t, next_offset: 3001 });")
+            out = fmt_(o)
+            spec.assert_true(string.length(out) <= MAX, "fits")
+            at = string.index_of(out, "lines ")
+            spec.assert_true(at >= 0, "lines range present")
+            dash = string.index_of_from(out, "–", at)
+            a = int_at_(out, at + 6)
+            b = int_at_(out, dash + string.length("–"))
+            spec.assert_true(a > 1 && b < 3000 && a < b, "range ${a}-${b} is inside")
+            shown_lines = count_(out, "line ")
+            spec.assert_eq(shown_lines, 3000 - (b - a + 1), "every line outside the range is shown whole")
+        }
+        spec.it("marker names omitted lines of raw text and ignores escaped backslash before n") callback {
+            raw = ev_("let t = ''; for (let i = 1; i <= 3000; i++) t += 'line ' + i + '\\n'; console.log(t);")
+            expect_marker_(fmt_(raw), " · lines ")
+            nochange = ev_("console.log('a\\\\n'.repeat(20000));")
+            out2 = fmt_(nochange)
+            spec.assert_true(has_(out2, "bytes omitted"), "marker")
+            expect_marker_(out2, "")
+        }
+        spec.it("marker omits lines when capture lost bytes or the region has no newline") callback {
+            lost = ev_("let t = ''; for (let i = 1; i <= 20000; i++) t += 'line ' + i + '\\n'; console.log(t);")
+            spec.assert_eq(lost.log_truncated, 1, "capture truncated")
+            expect_marker_(fmt_(lost), "")
+            flat = ev_("console.log('x'.repeat(40000));")
+            expect_marker_(fmt_(flat), "")
+        }
+        spec.it("line ranges apply to results and background messages within budget") callback {
+            o = ev_("let t = ''; for (let i = 1; i <= 3000; i++) t += 'row ' + i + '\\n'; t")
+            out = fmt_(o)
+            spec.assert_true(string.length(out) <= MAX, "fits")
+            expect_marker_(out, " · lines ")
+            b = strbuilder.new(64)
+            i = 0
+            while i < 4000 {
+                strbuilder.append(b, "row ${i}\n")
+                i = i + 1
+            }
+            msg = output.format_message("[background bash b1 finished]\n", strbuilder.finish(b), MAX as long)
+            spec.assert_true(string.length(msg) <= MAX, "message fits")
+            expect_marker_(msg, " · lines ")
+        }
+        spec.it("budget holds for every size around the marker with line ranges") callback {
+            size = MAX - 40
+            while size < MAX + 200 {
+                b = strbuilder.new(size + 8)
+                i = 0
+                while i < size {
+                    if i % 9 == 8 { strbuilder.append(b, "\n") } else { strbuilder.append(b, "x") }
+                    i = i + 1
+                }
+                o = plain_(1, "undefined", strbuilder.finish(b))
+                out = fmt_(o)
+                spec.assert_true(string.length(out) <= MAX, "size ${size} fits")
+                size = size + 7
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

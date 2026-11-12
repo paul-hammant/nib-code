@@ -1,0 +1,98 @@
+// config.env: an environment as a value (upstream std.process.Environ.Map).
+// Nothing here is module state: main builds one with from_process() and
+// passes it to every function that reads the environment; tests build their
+// own with new()/set(). A name present with an empty value is present
+// (has() == 1), as upstream's get() returns "" for it.
+
+import std.list
+import std.string
+import nib.sysgap
+
+exports(Env, new, set, get, has, remove, clone, from_process)
+
+struct Env {
+    names: ptr     // list of strings
+    values: ptr    // list of strings, parallel
+}
+
+new() -> ptr {
+    e = heap.new(Env)
+    e.names = list.list_new()
+    e.values = list.list_new()
+    return e as ptr
+}
+
+index_of_(ep: ptr, name: string) -> int {
+    e = ep as *Env
+    i = 0
+    n = list.list_size(e.names)
+    while i < n {
+        s, _g = list.get_string(e.names, i)
+        if s == name { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// 1 when `name` is set (even to "").
+has(ep: ptr, name: string) -> int {
+    if index_of_(ep, name) >= 0 { return 1 }
+    return 0
+}
+
+// The value of `name`, or "" when it is not set.
+get(ep: ptr, name: string) -> string {
+    e = ep as *Env
+    i = index_of_(ep, name)
+    if i < 0 { return "" }
+    v, _g = list.get_string(e.values, i)
+    return string.copy(v)
+}
+
+set(ep: ptr, name: string, value: string) {
+    e = ep as *Env
+    i = index_of_(ep, name)
+    if i >= 0 {
+        list.list_set(e.values, i, string.copy(value))
+        return
+    }
+    list.list_add(e.names, string.copy(name))
+    list.list_add(e.values, string.copy(value))
+}
+
+remove(ep: ptr, name: string) {
+    e = ep as *Env
+    i = index_of_(ep, name)
+    if i < 0 { return }
+    list.list_remove(e.names, i)
+    list.list_remove(e.values, i)
+}
+
+clone(ep: ptr) -> ptr {
+    e = ep as *Env
+    out = new()
+    i = 0
+    n = list.list_size(e.names)
+    while i < n {
+        k, _g = list.get_string(e.names, i)
+        v, _g2 = list.get_string(e.values, i)
+        set(out, k, v)
+        i = i + 1
+    }
+    return out
+}
+
+// This process's whole environment.
+from_process() -> ptr {
+    out = new()
+    all = sysgap.environ()
+    i = 0
+    n = list.list_size(all)
+    while i < n {
+        line, _g = list.get_string(all, i)
+        eq = string.index_of(line, "=")
+        if eq > 0 { set(out, string.substring(line, 0, eq), string.substring(line, eq + 1, string.length(line))) }
+        i = i + 1
+    }
+    return out
+}

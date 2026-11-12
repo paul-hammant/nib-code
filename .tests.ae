@@ -92,6 +92,26 @@ aeb(cap) {
             source("ae/tests/background_test.ae")
             lib("ae")
         }
+        aether.program_test() {
+            source("ae/tests/config_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/auth_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/session_output_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tool_summary_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/prompt_test.ae")
+            lib("ae")
+        }
         // Workspace mode end to end, through the built binary.
         dep(".build.ae")
         bash.test() {

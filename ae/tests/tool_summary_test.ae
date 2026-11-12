@@ -1,0 +1,141 @@
+// Ports the tests of upstream src/session/tool_summary.zig under their names,
+// plus the summary half of events.zig's "run_end JSON includes actual tool
+// summary including empty counts". Not ported: "summary allocation failures
+// release counts and names" (Zig allocator testing), "annotateViews labels
+// viewed images with their dimensions" (images are not ported).
+import std.spec
+import std.string
+import std.list
+import nib.sandbox.timing
+import nib.session.tool_summary
+
+count_at_(s: *tool_summary.Summary, i: int) -> *tool_summary.Count {
+    return list.list_get_raw(s.counts, i) as *tool_summary.Count
+}
+
+file_at_(s: *tool_summary.Summary, i: int) -> *tool_summary.File {
+    return list.list_get_raw(s.files, i) as *tool_summary.File
+}
+
+nc_(s: *tool_summary.Summary) -> int { return list.list_size(s.counts) }
+nf_(s: *tool_summary.Summary) -> int { return list.list_size(s.files) }
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "session.tool_summary") {
+        spec.it("summary filters rejected llm and other Runs in first dispatch order") callback {
+            r = timing.new()
+            timing.reserve(r, "write")
+            timing.set_run_index(r, 1)
+            rejected = timing.reserve_entry(r, "llm")
+            (timing.entry(r, rejected) as *timing.Call).dispatched = 0
+            timing.reserve(r, "read")
+            timing.reserve(r, "bash")
+            timing.reserve(r, "read")
+            llm = timing.reserve(r, "llm")
+            timing.complete(r, llm, 0 as long, 1 as long, 0)
+            s = tool_summary.init(r, 1, 0 as long)
+            spec.assert_eq(nc_(s), 3, "three names")
+            spec.assert_str_eq(count_at_(s, 0).name, "read", "read first")
+            spec.assert_eq_long(count_at_(s, 0).count, 2 as long, "read twice")
+            spec.assert_str_eq(count_at_(s, 1).name, "bash", "bash second")
+            spec.assert_eq_long(count_at_(s, 1).count, 1 as long, "bash once")
+            spec.assert_str_eq(count_at_(s, 2).name, "llm", "llm third")
+            spec.assert_eq_long(count_at_(s, 2).count, 1 as long, "llm once")
+            previous = tool_summary.init(r, 0, 0 as long)
+            spec.assert_eq(nc_(previous), 1, "previous Run has one")
+            spec.assert_str_eq(count_at_(previous, 0).name, "write", "write")
+            spec.assert_eq_long(count_at_(previous, 0).count, 1 as long, "write once")
+        }
+        spec.it("summary reports overflow delta even when Run has no retained calls") callback {
+            r = timing.new()
+            i = 0
+            while i < 202 {
+                timing.reserve(r, "read")
+                i = i + 1
+            }
+            first = tool_summary.init(r, 0, timing.omitted(r))
+            spec.assert_eq(nc_(first), 1, "one name")
+            spec.assert_eq_long(count_at_(first, 0).count, 200 as long, "200 retained")
+            spec.assert_eq_long(first.omitted, 2 as long, "2 omitted")
+            timing.set_run_index(r, 1)
+            before = timing.omitted(r)
+            i = 0
+            while i < 3 {
+                timing.reserve(r, "bash")
+                i = i + 1
+            }
+            second = tool_summary.init(r, 1, timing.omitted(r) - before)
+            spec.assert_eq(nc_(second), 0, "no retained calls")
+            spec.assert_eq_long(second.omitted, 3 as long, "3 omitted")
+        }
+        spec.it("summary and clone own names and counts") callback {
+            r = timing.new()
+            timing.reserve(r, "read")
+            s = tool_summary.init(r, 0, 7 as long)
+            copy = tool_summary.clone(s)
+            spec.assert_str_eq(count_at_(s, 0).name, "read", "name")
+            spec.assert_eq_long(s.omitted, 7 as long, "omitted")
+            spec.assert_str_eq(tool_summary.to_json(s), tool_summary.to_json(copy), "equal")
+            count_at_(copy, 0).count = 9 as long
+            spec.assert_eq_long(count_at_(s, 0).count, 1 as long, "clone is independent")
+            spec.assert_true(count_at_(s, 0) != count_at_(copy, 0), "distinct entries")
+        }
+        spec.it("empty summary can be cloned and freed") callback {
+            s = tool_summary.init(timing.new(), 0, 0 as long)
+            copy = tool_summary.clone(s)
+            spec.assert_str_eq(tool_summary.to_json(copy), tool_summary.to_json(tool_summary.empty()), "equals empty")
+            spec.assert_eq(nc_(copy), 0, "no counts")
+            spec.assert_eq(nf_(copy), 0, "no files")
+        }
+        spec.it("summary owns unique dispatched file facts") callback {
+            r = timing.new()
+            timing.set_detail(r, 1)
+            timing.set_run_index(r, 1)
+            i = timing.reserve(r, "read")
+            timing.describe(r, i, "read", "{\"path\":\"a.zig\"}")
+            i = timing.reserve(r, "read")
+            timing.describe(r, i, "read", "{\"path\":\"a.zig\"}")
+            i = timing.reserve(r, "grep")
+            timing.describe(r, i, "grep", "{\"pattern\":\"x\"}")
+            i = timing.reserve(r, "read")
+            timing.describe(r, i, "read", "{\"path\":\"b.zig\"}")
+            s = tool_summary.init(r, 1, 0 as long)
+            copy = tool_summary.clone(s)
+            spec.assert_eq(nf_(copy), 3, "three unique files")
+            spec.assert_str_eq(file_at_(copy, 0).tool, "read", "tool 0")
+            spec.assert_str_eq(file_at_(copy, 0).path, "a.zig", "path 0")
+            spec.assert_eq_long(file_at_(copy, 0).duration_ms, -1 as long, "no duration")
+            spec.assert_str_eq(file_at_(copy, 1).tool, "grep", "tool 1")
+            spec.assert_str_eq(file_at_(copy, 1).path, ".", "path 1")
+            spec.assert_str_eq(tool_summary.to_json(copy), "{\"counts\":[{\"name\":\"read\",\"count\":3},{\"name\":\"grep\",\"count\":1}],\"omitted\":0,\"files\":[{\"tool\":\"read\",\"path\":\"a.zig\"},{\"tool\":\"grep\",\"path\":\".\"},{\"tool\":\"read\",\"path\":\"b.zig\"}]}", "json")
+        }
+        spec.it("mcp files are never deduplicated and carry duration and failure") callback {
+            r = timing.new()
+            timing.set_detail(r, 1)
+            i = timing.reserve(r, "mcp")
+            timing.describe(r, i, "mcp", "{\"name\":\"srv.tool\"}")
+            timing.complete(r, i, 5 as long, 12 as long, 0)
+            i = timing.reserve(r, "mcp")
+            timing.describe(r, i, "mcp", "{\"name\":\"srv.tool\"}")
+            timing.complete(r, i, 20 as long, 21 as long, 1)
+            s = tool_summary.init(r, 0, 0 as long)
+            spec.assert_str_eq(tool_summary.to_json(s), "{\"counts\":[{\"name\":\"mcp\",\"count\":2}],\"omitted\":0,\"files\":[{\"tool\":\"mcp\",\"path\":\"srv.tool\",\"duration_ms\":7,\"failed\":true},{\"tool\":\"mcp\",\"path\":\"srv.tool\",\"duration_ms\":1,\"failed\":false}]}", "json")
+        }
+        spec.it("run_end JSON includes actual tool summary including empty counts") callback {
+            s = tool_summary.empty()
+            c1 = heap.new(tool_summary.Count)
+            c1.name = "bash"
+            c1.count = 2 as long
+            list.list_add(s.counts, c1 as ptr)
+            c2 = heap.new(tool_summary.Count)
+            c2.name = "read"
+            c2.count = 1 as long
+            list.list_add(s.counts, c2 as ptr)
+            s.omitted = 3 as long
+            spec.assert_str_eq(tool_summary.to_json(s), "{\"counts\":[{\"name\":\"bash\",\"count\":2},{\"name\":\"read\",\"count\":1}],\"omitted\":3,\"files\":[]}", "populated")
+            spec.assert_str_eq(tool_summary.to_json(tool_summary.empty()), "{\"counts\":[],\"omitted\":0,\"files\":[]}", "empty")
+        }
+    }
+    return spec.run_summary(fw)
+}

@@ -1,0 +1,414 @@
+// Ports the tests of upstream src/session/prompt.zig, profile.zig,
+// instructions.zig and compact.zig under their names.
+//
+// Not ported (unported parts): prompt.zig "MCP API descriptions enter context
+// only with enabled servers" (MCP); compact.zig "compaction replaces images
+// with placeholders and budgets them" (images; estimate_tokens' image budget
+// is covered by "estimate_tokens budgets an images array" below);
+// profile.zig "a custom provider resolves by its model" keeps only its
+// assertion, for_model on the custom provider's model.
+import std.spec
+import std.string
+import std.list
+import std.fs
+import std.json
+import nib.jsonx
+import nib.msg
+import nib.sandbox
+import nib.tools
+import nib.provider.types
+import nib.session.prompt
+import nib.session.profile
+import nib.session.instructions
+import nib.session.compact
+
+has_(s: string, part: string) -> int {
+    if string.index_of(s, part) >= 0 { return 1 }
+    return 0
+}
+
+tmp_() -> string {
+    d, _e = fs.make_temp_dir("", "nib-prompt")
+    real, _k, _m = fs.realpath(d)
+    return real
+}
+
+host_docs_() -> string {
+    t = tools.new("/unused")
+    return tools.docs(t)
+}
+
+render_(model: string) -> string {
+    return prompt.render_system("/work", host_docs_(), 16384 as long, "", model)
+}
+
+string_at_(l: ptr, i: int) -> string {
+    s, _e = list.get_string(l, i)
+    return s
+}
+
+call_(id: string) -> ptr {
+    l = list.list_new()
+    list.list_add(l, types.tool_call_new(id, "run", "{}"))
+    list.list_add(l, types.tool_call_new(id, "run", "{}"))
+    return l
+}
+
+one_call_(id: string) -> ptr {
+    l = list.list_new()
+    list.list_add(l, types.tool_call_new(id, "run", "{}"))
+    return l
+}
+
+// The upstream cut-test conversation (ten messages).
+messages_() -> ptr {
+    m = list.list_new()
+    list.list_add(m, msg.system("system"))
+    list.list_add(m, msg.user("first"))
+    list.list_add(m, msg.assistant("done", null, "", "", 0, "", -1, ""))
+    list.list_add(m, msg.user("second"))
+    list.list_add(m, msg.assistant("", call_("c"), "", "", 0, "", -1, ""))
+    list.list_add(m, msg.tool("c", "one", ""))
+    list.list_add(m, msg.tool("c", "two", ""))
+    list.list_add(m, msg.assistant("done", null, "", "", 0, "", -1, ""))
+    list.list_add(m, msg.user("third"))
+    list.list_add(m, msg.assistant("done", null, "", "", 0, "", -1, ""))
+    return m
+}
+
+pick_(m: ptr, order: int[], n: int) -> ptr {
+    out = list.list_new()
+    i = 0
+    while i < n {
+        list.list_add(out, string_at_(m, order[i]))
+        i = i + 1
+    }
+    return out
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "session.prompt") {
+        spec.it("system prompt documents every tool in JavaScript") callback {
+            prompt_text = render_("gpt-6.1-sol")
+            spec.assert_true(has_(prompt_text, "```js\n"), "js fence")
+            spec.assert_false(has_(prompt_text, "{{llm_options}}"), "no llm placeholder")
+            spec.assert_false(has_(prompt_text, "TypeScript"), "no TypeScript")
+            spec.assert_true(has_(prompt_text, "backticks, \${ or backslashes"), "json-escape patch")
+            spec.assert_true(has_(prompt_text, "last expression and console.log output share 16 KiB per Run"), "budget")
+            spec.assert_true(has_(prompt_text, "tool results inside JS remain complete"), "complete results")
+            spec.assert_true(has_(prompt_text, "failures).\n- Tool calls started without awaiting each one (e.g. Promise.all) run concurrently, up to 8 at a time;"), "concurrency line")
+            parts = ["Background Run/bash/agent results arrive automatically as messages", "ps, cat/tail logs, sleep, empty Runs or timeout reruns", "Do not read their redirected logs before completion", "Session waits locally, delivers the result and continues the Turn", "independent read-only investigations", "Keep serial edits, builds, tests and reviews in the main loop"]
+            i = 0
+            while i < 6 {
+                spec.assert_true(has_(prompt_text, parts[i]), "contains ${parts[i]}")
+                i = i + 1
+            }
+            spec.assert_true(has_(prompt_text, "{superseded_by}"), "format escape rendered")
+            spec.assert_false(has_(prompt_text, "{s}"), "no marker left")
+            spec.assert_false(has_(prompt_text, "{d}"), "no marker left")
+            spec.assert_true(has_(prompt_text, "You are nib, a coding agent working in /work.\n"), "cwd")
+            // Upstream-complete documentation: llm and agent are not ported, so
+            // their text is checked against tools.all_docs().
+            full = prompt.render_system("/work", tools.all_docs(), 16384 as long, "", "gpt-6.1-sol")
+            spec.assert_true(has_(full, "1800000 (30 min)"), "bash timeout")
+            spec.assert_true(has_(full, "resume:a1 after completion; busy:wait, don't retry/replace"), "agent resume")
+            names = tools.tool_names()
+            i = 0
+            while i < list.list_size(names) {
+                n = string_at_(names, i)
+                if string.starts_with(n, "mcp") == 0 {
+                    spec.assert_true(has_(full, "async ${n}("), "documents ${n}")
+                }
+                i = i + 1
+            }
+        }
+        spec.it("system prompt renders configured Run display budget") callback {
+            system = prompt.render_system("/work", host_docs_(), 32768 as long, "", "m")
+            spec.assert_true(has_(system, "share 32 KiB per Run"), "KiB")
+            spec.assert_true(has_(system, "known regression tests, expected results/fixtures and formatting"), "validation line")
+            odd = prompt.render_system("/work", host_docs_(), 1000 as long, "", "m")
+            spec.assert_true(has_(odd, "share 1000 bytes per Run"), "bytes when not a KiB multiple")
+        }
+        spec.it("system prompt never mentions run effort") callback {
+            system = render_("gpt-6.1-sol")
+            spec.assert_false(has_(system, "run's effort"), "no run's effort")
+            spec.assert_false(has_(system, "effort-specific"), "no effort-specific")
+        }
+        spec.it("prompt patches can be disabled individually or all at once") callback {
+            all_on = prompt.patch_lines("", profile.DEFAULT)
+            ps = prompt.patches()
+            i = 0
+            while i < list.list_size(ps) {
+                p = list.list_get_raw(ps, i) as *prompt.Patch
+                spec.assert_true(has_(all_on, p.text), "on: ${p.id}")
+                i = i + 1
+            }
+            d = 0
+            while d < list.list_size(ps) {
+                disabled = list.list_get_raw(ps, d) as *prompt.Patch
+                one_off = prompt.patch_lines(disabled.id, profile.DEFAULT)
+                i = 0
+                while i < list.list_size(ps) {
+                    p = list.list_get_raw(ps, i) as *prompt.Patch
+                    shown = has_(one_off, p.text)
+                    if disabled.id == p.id {
+                        spec.assert_eq(shown, 0, "${p.id} is off")
+                    } else {
+                        spec.assert_eq(shown, 1, "${p.id} stays on")
+                    }
+                    i = i + 1
+                }
+                d = d + 1
+            }
+            spec.assert_str_eq(prompt.patch_lines("no-shell-search, all", profile.DEFAULT), "", "all")
+        }
+        spec.it("patches apply only to their profiles") callback {
+            l = list.list_new()
+            a = heap.new(prompt.Patch)
+            a.id = "everywhere"
+            a.text = "A"
+            a.applies_to = profile.ALL
+            list.list_add(l, a as ptr)
+            b = heap.new(prompt.Patch)
+            b.id = "codex-only"
+            b.text = "B"
+            b.applies_to = profile.set_of(profile.CODEX)
+            list.list_add(l, b as ptr)
+            c = heap.new(prompt.Patch)
+            c.id = "not-claude"
+            c.text = "C"
+            c.applies_to = profile.set_without(profile.ALL, profile.CLAUDE)
+            list.list_add(l, c as ptr)
+            spec.assert_str_eq(prompt.render_patches(l, "", profile.CODEX), "- A\n- B\n- C\n", "codex")
+            spec.assert_str_eq(prompt.render_patches(l, "", profile.DEEPSEEK), "- A\n- C\n", "deepseek")
+            spec.assert_str_eq(prompt.render_patches(l, "", profile.CLAUDE), "- A\n", "claude")
+            spec.assert_str_eq(prompt.render_patches(l, "", profile.DEFAULT), "- A\n- C\n", "default")
+            spec.assert_str_eq(prompt.render_patches(l, "codex-only", profile.CODEX), "- A\n- C\n", "switched off")
+        }
+        spec.it("every shipped patch applies to every profile") callback {
+            ps = prompt.patches()
+            i = 0
+            while i < list.list_size(ps) {
+                p = list.list_get_raw(ps, i) as *prompt.Patch
+                spec.assert_eq(p.applies_to, profile.ALL, "${p.id} applies everywhere")
+                i = i + 1
+            }
+        }
+        spec.it("experiment labels hash exact base text and normalize actual disabled patches") callback {
+            spec.assert_str_eq(prompt.system_sha("base"), "cae662172fd4", "known digest")
+            spec.assert_true(prompt.system_sha("base") != prompt.system_sha("base changed"), "text changes the label")
+            spec.assert_eq(list.list_size(prompt.disabled_patches("")), 0, "none off")
+            norm = prompt.disabled_patches("unknown, no-shell-search, expected-continuation, json-escape, expected-continuation, json-escape")
+            spec.assert_eq(list.list_size(norm), 3, "three unique")
+            spec.assert_str_eq(string_at_(norm, 0), "expected-continuation", "sorted 0")
+            spec.assert_str_eq(string_at_(norm, 1), "json-escape", "sorted 1")
+            spec.assert_str_eq(string_at_(norm, 2), "no-shell-search", "sorted 2")
+            all = prompt.disabled_patches("all")
+            spec.assert_eq(list.list_size(all), list.list_size(prompt.patches()), "all patches")
+            spec.assert_eq(list.list_size(prompt.disabled_patches("unknown")), 0, "unknown ignored")
+        }
+        spec.it("json-escape patch example survives JS parsing verbatim") callback {
+            d = tmp_()
+            t = tools.new(d)
+            ps = prompt.patches()
+            text = (list.list_get_raw(ps, 0) as *prompt.Patch).text
+            marker = "e.g. content: "
+            example = string.substring(text, string.index_of(text, marker) + string.length(marker), string.length(text))
+            code = "await tools.write({path: '${d}/f', content: ${example}})"
+            s = tools.new_scope(t, 1)
+            r = sandbox.eval(code, sandbox.limits(), tools.host(s), null) as *sandbox.Outcome
+            spec.assert_eq(r.ok, 1, "script ran: ${r.text}")
+            got, _e = fs.read("${d}/f")
+            spec.assert_str_eq(got, "` \${x} \\path \"quoted\"\n", "content verbatim")
+        }
+        spec.it("run schema takes only code") callback {
+            v = jsonx.parse(prompt.TOOLS_JSON)
+            spec.assert_true(v != null, "valid JSON")
+            fn0 = json.json_array_get_raw(v, 0)
+            parameters = jsonx.field(jsonx.field(fn0, "function"), "parameters")
+            required = jsonx.field(parameters, "required")
+            spec.assert_eq(json.json_array_size(required), 1, "one required")
+            spec.assert_str_eq(jsonx.str_field(json.json_array_get_raw(required, 0)), "code", "code")
+            spec.assert_eq(json.object_size(jsonx.field(parameters, "properties")), 1, "one property")
+        }
+        spec.it("Step budget facts leave unlimited prompts unchanged") callback {
+            base = "unchanged system prompt"
+            unlimited = prompt.step_limit_prompt(base, -1 as long)
+            spec.assert_str_eq(unlimited, base, "unchanged")
+            spec.assert_str_eq(prompt.system_sha(base), prompt.system_sha(unlimited), "same label")
+            limited = prompt.step_limit_prompt(base, 5 as long)
+            spec.assert_str_eq(limited, "unchanged system prompt\nThis Turn may use at most 5 Steps; when they run out, the Turn stops without another model request.", "limited")
+        }
+        spec.it("resumed Turns expose budget changes without rewriting the original system") callback {
+            system = prompt.step_limit_prompt("base", 5 as long)
+            spec.assert_str_eq(prompt.turn_budget_text(system, 5 as long, "prompt"), "prompt", "same limit")
+            spec.assert_str_eq(prompt.turn_budget_text("base", -1 as long, "prompt"), "prompt", "still unlimited")
+            enabled = prompt.turn_budget_text("base", 1 as long, "prompt")
+            spec.assert_true(has_(enabled, "at most 1 Steps"), "newly limited")
+            changed = prompt.turn_budget_text(system, 7 as long, "prompt")
+            spec.assert_true(has_(changed, "at most 7 Steps"), "changed limit")
+            zero = prompt.turn_budget_text("base", 0 as long, "prompt")
+            spec.assert_true(has_(zero, "at most 0 Steps"), "a zero limit is a limit")
+            disabled = prompt.turn_budget_text(system, -1 as long, "prompt")
+            spec.assert_true(has_(disabled, "no Step limit"), "limit removed")
+            spec.assert_true(string.ends_with(disabled, "\n\nprompt"), "prompt last")
+            spec.assert_str_eq(enabled, "[Current Turn budget; configuration changed since the system prompt was recorded]\nThis Turn may use at most 1 Steps; when they run out, the Turn stops without another model request.\n\nprompt", "exact text")
+        }
+    }
+    spec.describe(fw, "session.profile") {
+        spec.it("profiles follow the model name, not the provider") callback {
+            models = ["gpt-6.1-sol", "gpt-6-luna", "GPT-6.1-Terra", "codex-mini", "openai/gpt-6.1-sol", "deepseek-flash", "deepseek-pro", "deepseek/deepseek-flash", "claude-sonnet-5-5", "anthropic/claude-haiku-5-5", "mock-model", "qwen3-coder", "", "my-gpt-wrapper", "deepseek"]
+            want = [0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 3, 3, 3, 3, 3]
+            i = 0
+            while i < 15 {
+                spec.assert_eq(profile.for_model(models[i]), want[i], "model '${models[i]}'")
+                i = i + 1
+            }
+            spec.assert_eq(profile.for_model("claude"), profile.DEFAULT, "a prefix needs its dash")
+            spec.assert_eq(profile.for_model("gpt"), profile.DEFAULT, "gpt needs its dash")
+        }
+        spec.it("a custom provider resolves by its model") callback {
+            spec.assert_eq(profile.for_model("deepseek-flash"), profile.DEEPSEEK, "deepseek")
+        }
+        spec.it("the full set holds every profile") callback {
+            p = 0
+            while p < 4 {
+                spec.assert_eq(profile.set_contains(profile.ALL, p), 1, "has ${profile.name(p)}")
+                p = p + 1
+            }
+        }
+    }
+    spec.describe(fw, "session.instructions") {
+        spec.it("AGENTS order and git worktree root") callback {
+            root = tmp_()
+            fs.write("${root}/.git", "gitdir: /elsewhere")
+            fs.mkdir_p("${root}/sub/deep")
+            spec.assert_str_eq(instructions.project_root("${root}/sub/deep"), root, "root found above")
+            spec.assert_str_eq(instructions.project_root("${root}"), root, "root itself")
+            fs.write("${root}/global", "GLOBAL")
+            fs.write("${root}/AGENTS.md", "PROJECT")
+            out, err = instructions.append("BASE", "${root}/global", "${root}/AGENTS.md")
+            spec.assert_str_eq(err, "", "no error")
+            spec.assert_true(string.index_of(out, "BASE") < string.index_of(out, "GLOBAL"), "base before global")
+            spec.assert_true(string.index_of(out, "GLOBAL") < string.index_of(out, "PROJECT"), "global before project")
+            spec.assert_str_eq(out, "BASE\n\nInstructions below apply in order; later instructions take priority.\n\n--- ${root}/global ---\nGLOBAL\n\n--- ${root}/AGENTS.md ---\nPROJECT\n", "exact text")
+            missing, err2 = instructions.append("BASE", "${root}/nope", "${root}/AGENTS.md")
+            spec.assert_str_eq(err2, "", "missing is skipped")
+            spec.assert_false(has_(missing, "nope"), "missing file not listed")
+            bare = tmp_()
+            spec.assert_str_eq(instructions.project_root(bare), bare, "no .git: cwd")
+        }
+    }
+    spec.describe(fw, "session.compact") {
+        spec.it("compaction cuts preserve recent turns and complete tool groups") callback {
+            m = messages_()
+            spec.assert_eq(compact.compaction_cut(m, 10, 128000 as long), 3, "recent turns")
+            spec.assert_eq(compact.compaction_cut(m, 10, 64 as long), 7, "tool group")
+            spec.assert_eq(compact.compaction_cut(m, 7, 64 as long), 1, "too few")
+            e = compact.estimate_tokens(m, 3, 10)
+            spec.assert_eq(compact.compaction_cut(m, 10, e * 4 as long), 3, "kept turns fit a quarter of the window")
+            spec.assert_eq(compact.compaction_cut(m, 10, e * 3 as long), 7, "kept turns over a quarter fall back to Steps")
+            order = [0, 1, 4, 5, 6, 4, 5, 6, 4, 5, 6]
+            long_turn = pick_(m, order, 11)
+            spec.assert_eq(compact.compaction_cut(long_turn, 11, 128000 as long), 5, "long turn")
+        }
+        spec.it("estimate_tokens budgets an images array") callback {
+            plain = list.list_new()
+            list.list_add(plain, msg.user("look"))
+            withimg = list.list_new()
+            list.list_add(withimg, msg.set_raw(msg.user("look"), "images", "[{\"name\":\"shot.png\"}]"))
+            spec.assert_eq_long(compact.estimate_tokens(withimg, 0, 1), compact.estimate_tokens(plain, 0, 1) + 1500, "one image")
+        }
+        spec.it("estimate_tokens counts content, reasoning and tool calls") callback {
+            l = list.list_new()
+            list.list_add(l, msg.user("123456"))
+            spec.assert_eq_long(compact.estimate_tokens(l, 0, 1), 10 as long, "8 + 6/3")
+            l2 = list.list_new()
+            list.list_add(l2, msg.assistant("123456", one_call_("c1"), "openai", "123456789", 0, "", -1, ""))
+            // 8 + 6/3 + 9/3 + (8 + (2 + 3 + 2)/3)
+            spec.assert_eq_long(compact.estimate_tokens(l2, 0, 1), 8 + 2 + 3 + 8 + 2 as long, "assistant")
+            l3 = list.list_new()
+            list.list_add(l3, msg.assistant("123456", null, "openai", "123456789", 1, "", -1, ""))
+            spec.assert_eq_long(compact.estimate_tokens(l3, 0, 1), 8 + 3 as long, "reasoning includes output replaces content")
+        }
+        spec.it("compact rewrites history through the model call") callback {
+            m = messages_()
+            seen = list.list_new()
+            r = compact.compact(m, 128000 as long, 500 as long, |request: ptr, out: ptr| {
+                list.list_add(seen, string.copy("n=${list.list_size(request)}"))
+                last, _e = list.get_string(request, list.list_size(request) - 1)
+                list.list_add(seen, string.copy(msg.content(last)))
+                o = out as *compact.ModelReply
+                o.text = "S"
+                o.err = ""
+            }) as *compact.Result
+            // compaction_cut is 3 here: request is history[0..3) + instruction. The summary
+            // must be smaller than the two messages it replaces (18 tokens) to be effective.
+            spec.assert_str_eq(r.err, "", "no error")
+            spec.assert_eq(r.status, compact.COMPACTED, "compacted")
+            spec.assert_str_eq(string_at_(seen, 0), "n=4", "request length")
+            spec.assert_str_eq(string_at_(seen, 1), compact.SUMMARY_PROMPT, "instruction last")
+            rep = r.replacement
+            spec.assert_eq(list.list_size(rep), 8, "summary + history[3..]")
+            spec.assert_str_eq(msg.content(string_at_(rep, 0)), "Earlier session summary:\nS", "summary message")
+            spec.assert_str_eq(msg.role(string_at_(rep, 0)), "user", "as user")
+            spec.assert_true(has_(r.notice, "compacted context: 10 → 9 messages, ~500 → ~"), "notice: ${r.notice}")
+        }
+        spec.it("compact skips with too few steps, bad summaries and ineffective rewrites") callback {
+            m = messages_()
+            short = list.list_new()
+            i = 0
+            while i < 7 {
+                list.list_add(short, string_at_(m, i))
+                i = i + 1
+            }
+            r1 = compact.compact(short, 64 as long, 0 as long, |request: ptr, out: ptr| {
+                o = out as *compact.ModelReply
+                o.text = "x"
+            }) as *compact.Result
+            spec.assert_eq(r1.status, compact.TOO_FEW_STEPS, "too few")
+            spec.assert_str_eq(r1.notice, "compaction skipped: fewer than three complete Steps", "notice")
+            r2 = compact.compact(m, 128000 as long, 0 as long, |request: ptr, out: ptr| {
+                o = out as *compact.ModelReply
+                o.text = ""
+            }) as *compact.Result
+            spec.assert_str_eq(r2.err, "InvalidSummary", "empty summary")
+            r3 = compact.compact(m, 128000 as long, 0 as long, |request: ptr, out: ptr| {
+                o = out as *compact.ModelReply
+                o.err = "Canceled"
+            }) as *compact.Result
+            spec.assert_str_eq(r3.err, "Canceled", "model error passes through")
+            r4 = compact.compact(m, 128000 as long, 0 as long, |request: ptr, out: ptr| {
+                o = out as *compact.ModelReply
+                o.text = string.copy("x")
+                big = ""
+                k = 0
+                while k < 10 {
+                    big = "${big}0123456789012345678901234567890123456789012345678901234567890123456789"
+                    k = k + 1
+                }
+                o.text = big
+            }) as *compact.Result
+            // A 700-byte summary is larger than the 11 bytes it replaces: ineffective.
+            spec.assert_eq(r4.status, compact.INEFFECTIVE, "ineffective")
+            spec.assert_true(has_(r4.notice, "would not bring context below half the window"), "notice")
+            // Equal size is not smaller: a 7-byte summary costs 18 tokens, as the two messages it replaces.
+            r5 = compact.compact(m, 128000 as long, 0 as long, |request: ptr, out: ptr| {
+                o = out as *compact.ModelReply
+                o.text = "SUMMARY"
+            }) as *compact.Result
+            spec.assert_eq(r5.status, compact.INEFFECTIVE, "no gain is ineffective")
+            // Smaller than the history but not below half the window.
+            r6 = compact.compact(m, 64 as long, 0 as long, |request: ptr, out: ptr| {
+                o = out as *compact.ModelReply
+                o.text = "S"
+            }) as *compact.Result
+            spec.assert_eq(r6.status, compact.INEFFECTIVE, "over half the window is ineffective")
+            spec.assert_eq(compact.summary_max_tokens(128000 as long), 2048 as long, "cap")
+            spec.assert_eq(compact.summary_max_tokens(100 as long), 32 as long, "floor")
+            spec.assert_eq(compact.summary_max_tokens(8000 as long), 1000 as long, "window/8")
+        }
+    }
+    return spec.run_summary(fw)
+}
