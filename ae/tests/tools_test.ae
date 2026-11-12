@@ -6,8 +6,8 @@
 //    conflicting parameters even when fork is false": the agent tool is not
 //    ported.
 //  - "llm map documentation example ...", "llm admission rejects call 101 ...",
-//    "generated llm options ...", "configured default model ...": llm is not
-//    ported.
+//    "generated llm options ...", "configured default model ...": these live in
+//    ae/tests/llm_test.ae with the llm port.
 //  - "search is documented only for providers that support it": web search
 //    is not ported (providers/config slice).
 // Upstream's "tool descriptions stay concise ..." walks the tool table; here
