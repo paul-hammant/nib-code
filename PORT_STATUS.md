@@ -6,6 +6,8 @@ It tracks upstream: `main` in this repository is a mirror of `upstream/main`
 and is never committed to; the port follows it.
 
 Ported through upstream commit: **a2dd439** (Release 0.13.0) for the files listed with it below.
+`main` was fast-forwarded to upstream **7788541** on 2026-11-12; that delta touches only
+`src/tui/view.zig` and docs (TUI slice), so every row here is current with it.
 
 ## How the tracking works
 
@@ -62,7 +64,7 @@ pins                     AE_PIN / AEB_REF the port is verified against
 | Upstream | Lines | Aether | Ported through | Notes |
 |---|---|---|---|---|
 | `src/sandbox.zig` | 799 | `ae/nib/sandbox/module.ae` | a2dd439 | eval, Limits, prelude, syntax context; record/replay hooks not yet |
-| `src/sandbox/scheduler.zig` | 296 | `ae/nib/sandbox/module.ae` | a2dd439 | concurrency 8, completion order, timers, drain, stopped calls; no Host.poll/waiting yet (session) |
+| `src/sandbox/scheduler.zig` | 296 | `ae/nib/sandbox/module.ae` | a2dd439 | concurrency 8, completion order, timers, drain, stopped calls; Host.poll's role is a 20 ms Session ticker (session) |
 | `src/sandbox/native.zig` | 163 | `ae/nib/sandbox/module.ae` | a2dd439 | __log/__host as contrib.quickjs host functions with a `hide` veto line; installVirtual not yet |
 | `src/sandbox/timer.zig` | 18 | `ae/nib/sandbox/module.ae` | a2dd439 |  |
 | `src/sandbox/console.zig` | 181 | `ae/nib/sandbox/console/module.ae` | a2dd439 |  |
@@ -71,8 +73,8 @@ pins                     AE_PIN / AEB_REF the port is verified against
 | `src/sandbox/record.zig` | 510 | not yet |  | next: record/replay slice |
 | `src/sandbox/replay.zig` | 303 | not yet |  | next: record/replay slice |
 | `src/sandbox/virtual.zig` | 19 | not yet |  | next: record/replay slice |
-| `src/tools.zig` | 813 | `ae/nib/tools/module.ae` | a2dd439 | table verbatim; only ported tools enter a Run's API; RunScope replaces the threadlocal; documentation() (llm/search options) waits for config/provider |
-| `src/tools/files.zig` | 587 | `ae/nib/tools/files/module.ae` | a2dd439 | undo hooks not yet |
+| `src/tools.zig` | 813 | `ae/nib/tools/module.ae` | a2dd439 | table verbatim; only ported tools enter a Run's API; RunScope replaces the threadlocal; docs fill {{llm_limits}}/{{llm_options}}; search options wait for web search |
+| `src/tools/files.zig` | 587 | `ae/nib/tools/files/module.ae` | a2dd439 | undo snapshots in edit/write |
 | `src/tools/atomic_file.zig` | 243 | `ae/nib/tools/atomic_file/module.ae` | a2dd439 | on nib.sysgap (stand-in) |
 | `src/tools/file_state.zig` | 247 | `ae/nib/tools/file_state/module.ae` | a2dd439 | flock path locks on nib.sysgap (stand-in) |
 | `src/tools/changes.zig` | 253 | `ae/nib/tools/changes/module.ae` | a2dd439 | Tracker per Run scope; Recovery |
@@ -83,30 +85,54 @@ pins                     AE_PIN / AEB_REF the port is verified against
 | `src/tools/walk.zig` | 385 | `ae/nib/tools/walk/module.ae` | a2dd439 |  |
 | `src/tools/policy.zig` | 698 | `ae/nib/tools/policy/module.ae` | a2dd439 | rule for rule, same texts |
 | `src/tools/secrets.zig` | 16 | `ae/nib/tools/secrets/module.ae` | a2dd439 |  |
-| `src/tools/process.zig` | 358 | `ae/nib/tools/process/module.ae` | a2dd439 | output to a file, not a pipe; no stdin input, line observer or tick hook yet (agent/progress slices); a signal reads as 128+n |
-| `src/tools/bash.zig` | 433 | `ae/nib/tools/bash/module.ae` | a2dd439 | progress events (Tracker) not yet |
-| `src/tools/bash/registry.zig` | 146 | `ae/nib/tools/registry/module.ae` | a2dd439 | supersession; start/finish log events not yet (session log) |
+| `src/tools/process.zig` | 358 | `ae/nib/tools/process/module.ae` | a2dd439 | output to a file, not a pipe; a 20 ms tick with the output byte count (progress); no stdin input or line observer yet (agent slice); a signal reads as 128+n |
+| `src/tools/bash.zig` | 433 | `ae/nib/tools/bash/module.ae` | a2dd439 | progress Tracker; ids reserved at start, snapshot after 3 s |
+| `src/tools/bash/registry.zig` | 146 | `ae/nib/tools/registry/module.ae` | a2dd439 | supersession; started/superseded/finished log records |
 | `src/tools/bash/jail.zig` | 304 | `ae/nib/tools/jail/module.ae` | a2dd439 | Landlock in jail/landlock.c (stand-in); probe cached per Tools, not per process |
-| `src/tools/background.zig` | 866 | `ae/nib/tools/background/module.ae` | a2dd439 | bash only; messages unformatted (session output.zig); agents and background Runs not yet |
+| `src/tools/background.zig` | 866 | `ae/nib/tools/background/module.ae` | a2dd439 | bash only: typed inbox, started record, lost on resume, detached across Turns; agents and background Runs not yet |
 | `src/tools/stop.zig` | 29 | `ae/nib/tools/module.ae` | a2dd439 | userStop (TUI) not yet |
-| `src/tools/undo.zig` | 606 | not yet |  | next: needs the TUI Turn lifecycle; file tools have no undo hook yet |
+| `src/tools/undo.zig` | 606 | `ae/nib/tools/undo/module.ae` | a2dd439 | Session wires begin/finish/undo; off for `nib ask` as upstream; /undo itself is the TUI's |
 | `src/tools/view.zig` | 92 | not yet |  | needs src/image.zig and the Session image store |
-| `src/tools/progress.zig` | 249 | not yet |  | session/TUI slice |
+| `src/tools/progress.zig` | 249 | `ae/nib/tools/progress/module.ae` | a2dd439 | agent kinds wait for tools.agent |
 | `src/tools/web.zig` | 161 | not yet |  | fetch: a later slice |
 | `src/tools/html.zig` | 504 | not yet |  | with fetch |
 | `src/tools/web_search.zig` | 404 | not yet |  | needs providers |
-| `src/tools/llm.zig` | 246 | not yet |  | needs providers |
+| `src/tools/llm.zig` | 246 | `ae/nib/tools/llm_call/module.ae` | a2dd439 | the gate is per Tools (subagents will share it) |
 | `src/tools/agent.zig` | 497 | not yet |  | needs the session |
 | `src/tools/agent/input.zig` | 90 | not yet |  |  |
 | `src/tools/agent/sessions.zig` | 119 | not yet |  |  |
 | `src/tools/mcp.zig` | 101 | not yet |  | with src/mcp* |
-| `src/session*` | 5,300 | | | |
-| `src/provider*` | 3,900 | | | less `codex_ws`, `websocket` |
-| `src/config.zig` | 1,700 | | | |
+| `src/session.zig` | 999 | `ae/nib/session/module.ae` | a2dd439 | Turn/Step loop, resume/continue, interrupted commits, auto compaction, Step-limit wait, undo wiring; no fork, reopen/switchConfig (TUI), skills, MCP, images |
+| `src/session/run.zig` | 236 | `ae/nib/session/module.ae` | a2dd439 | execute; no automatic Run backgrounding |
+| `src/session/run_job.zig` | 116 | not yet |  | automatic Run backgrounding (rN): next |
+| `src/session/log.zig` | 1402 | `ae/nib/session/log/module.ae` | a2dd439 | records are JSON text; tool summaries/bash replacements not restored onto replayed messages (the TUI needs them) |
+| `src/session/output.zig` | 596 | `ae/nib/session/output/module.ae` | a2dd439 |  |
+| `src/session/prompt.zig` | 322 | `ae/nib/session/prompt/module.ae` | a2dd439 |  |
+| `src/session/profile.zig` | 58 | `ae/nib/session/profile/module.ae` | a2dd439 |  |
+| `src/session/instructions.zig` | 49 | `ae/nib/session/instructions/module.ae` | a2dd439 |  |
+| `src/session/compact.zig` | 175 | `ae/nib/session/compact/module.ae` | a2dd439 | no image placeholders |
+| `src/session/tool_summary.zig` | 249 | `ae/nib/session/tool_summary/module.ae` | a2dd439 | no annotateViews (images) |
+| `src/session/events.zig` | 182 | `ae/nib/session/module.ae` | a2dd439 | events are the NDJSON text they print as |
+| `src/session/inbox.zig` | 278 | `ae/nib/tools/background/module.ae` | a2dd439 | bash results, FIFO, detached kept; user interjections (TUI) not yet |
+| `src/session/history.zig` | 130 | not yet |  | fork (subagents): next |
+| `src/session/hooks.zig`, `skills.zig` | 538 | not yet |  | next slice |
+| `src/provider.zig` | 395 | `ae/nib/provider/types/module.ae`, `ae/nib/provider/module.ae` | a2dd439 | less Codex |
+| `src/provider/retry.zig` | 331 | `ae/nib/provider/module.ae` | a2dd439 | no Codex Retry-After or stale-socket paths |
+| `src/provider/anthropic.zig` | 444 | `ae/nib/provider/anthropic/module.ae` | a2dd439 | no images |
+| `src/provider/responses.zig` | 1033 | `ae/nib/provider/responses/module.ae` | a2dd439 | SSE only; no Codex auth/WebSocket, images or web search |
+| `src/provider/openai.zig` | 428 | `ae/nib/provider/openai/module.ae` | a2dd439 | no images; HTTP errors never echo the body |
+| `src/provider/sse.zig` | 52 | `ae/nib/provider/sse/module.ae` | a2dd439 | plus fixed/live line sources |
+| `src/provider/timing.zig` | 319 | `ae/nib/provider/model_timing/module.ae` | a2dd439 | renamed: asks/aether-module-basename-collision.md |
+| `src/provider/body.zig`, `cancel.zig`, `idle.zig` | 393 | `ae/nib/provider/http/module.ae` | a2dd439 | a request thread plus a polling reader on std.http.client |
+| `src/provider/codex_ws.zig`, `websocket.zig` | 523 | not ported |  | policy: API keys only |
+| `src/config.zig` | 1680 | `ae/nib/config/module.ae`, `ae/nib/config/env/module.ae` | a2dd439 | no Codex provider ([codex] validated and ignored); default service anthropic |
 | `src/mcp*` | 700 | | | |
-| `src/replay.zig`, `src/image.zig`, `src/main.zig` | 1,200 | | | main: `nib js`, `nib __jail` only |
+| `src/main.zig` | 311 | `ae/main.ae` | a2dd439 | ask, js, login/logout, help, version, __jail; no TUI, replay, update, --agent-input |
+| `src/replay.zig`, `src/image.zig` | 900 | not yet | | |
 | `src/tui*` | 12,600 | | | needs the terminal layer (upstream uses libvaxis) |
-| `src/auth*` | 1,500 | | | the API-key store only |
+| `src/auth.zig`, `src/auth/store.zig`, `src/auth/cli.zig` | 601 | `ae/nib/auth/module.ae`, `ae/nib/auth/store/module.ae` | a2dd439 | API keys only: no tokens, no Codex login |
+| `src/auth/oauth.zig`, `login.zig`, `codex.zig` | 798 | not ported | | policy |
+| `src/auth/models.zig` | 92 | not yet | | `/models` listing (TUI /model) |
 | `src/update*` | 140 | not ported | | |
 
 `tools/upstream-diff.sh` lists, per row with a commit, what upstream changed
@@ -164,3 +190,73 @@ stopped) for session/output.zig's formatter; `tools.take_changes(scope)`;
 lifecycle; and the hooks still missing here: Host.poll and waiting,
 progress events, session-log records (bash start/supersede, background,
 sandbox_unavailable), undo snapshots in edit/write.
+
+## Session, provider and config slice (2026-11-12)
+
+**What runs.** `nib ask [--json] [-c|--continue|--resume <id>] [--effort <level>]
+<prompt|->` over Anthropic Messages, OpenAI Responses (openai, xai, custom
+`responses` endpoints) and Chat Completions (deepseek, chat_completions,
+custom), API keys only, streaming SSE on std.http.client; the append-only
+Session log with resume, torn-tail repair and the session lock; automatic and
+model-driven compaction; interrupted Turns (SIGINT/SIGTERM) committed with
+their partial text; background bash across Steps and Turns with progress and
+log records; tools.llm; undo snapshots (wired, off for `ask` as upstream);
+`nib login`/`logout` storing keys in `$NIB_HOME/auth.json` (0600, atomic,
+unknown fields kept); `--help` with the active provider.
+
+**Unit tests.** `aeb .tests.ae`: 35 std.spec suites (about 430 tests) plus
+workspace.sh and check_layers.sh. Every upstream inline test of a ported file
+is ported under its upstream name, except those listed in each suite's
+header (Codex, images, MCP, allocation failures, the Zig Record type). Each
+module was mutation-checked.
+
+**Upstream e2e (`ae/tests/upstream-e2e.sh`, tests unchanged).**
+
+| Test | Result | Why not all of it |
+|---|---|---|
+| test_cli.py | pass | |
+| test_files.py | pass | |
+| test_providers.py | every protocol and provider passes round trip, cache usage, resume, provider mismatch, 401 without the key; fails at its `delegate` step | tools.agent (subagents) |
+| test_sandbox.py | all but `test_subagent_inherits_the_sandbox` | tools.agent |
+| test_session.py | every section passes except subagents, tools.fetch and `nib_version` | one script: it stops at the first (subagent stats); `nib_version` is `0.13.0-ae`, upstream's is the build.zig.zon version plus the git commit |
+| test_stream_idle.py | Chat cases pass except two | tools.agent, tools.llm in a child; Codex classes excluded |
+| test_background_bash.py | 30 of 38 non-TUI Chat cases (Linux; on macOS its `/proc` helper needs a stand-in) | tools.agent ids, the TUI; Codex classes excluded |
+| test_llm.py | Chat cases pass except the child one, with one assertion set aside | its docs check requires `async agent(` in the prompt |
+| test_limits.py | max-steps cases pass; LLM limits pass with the same assertion set aside | agent limits, `nib replay`, Codex classes |
+| test_effort.py | the chat_completions half passes | its second half is Codex |
+| test_model.py, test_undo.py, test_tui_*.py, test_at_files.py, test_images.py | not yet | the TUI |
+| test_agent*.py, test_background_agent.py, test_background_run.py, test_interjections.py, test_hooks.py, test_skills.py, test_skill_mentions.py, test_mcp.py, test_replay.py, test_web_search.py, test_prediction.py, test_stats.py | not yet | their slices (agents, Run backgrounding, TUI, hooks/skills, MCP, replay, web search) |
+| test_codex.py, test_codex_websocket.py, test_provider_login.py | excluded | policy: no Codex sign-in or WebSocket |
+
+**Stand-ins (marked, each with an ask).** `ae/nib/sysgap` grows pwrite
+(asks/aether-fs-stat-flock-exclusive.md item 6), SIGINT/SIGTERM as a polled
+flag and stdin echo (asks/aether-signal-flag-and-tty-echo.md).
+`nib.provider.model_timing` is named to dodge
+asks/aether-module-basename-collision.md.
+
+**Differences kept on purpose or by gap.** No Codex provider: with nothing
+configured the default service is anthropic (upstream: codex), a `[codex]`
+section is validated and ignored. HTTP error bodies are never echoed, for
+every protocol. The request runs on its own thread and an abandoned one ends
+at the server's close or the client's whole-exchange timeout. No `Expect:
+100-continue` is ever sent (std.http.client returns an interim 100 as the
+final response). Header `nib_version` is `0.13.0-ae`.
+
+**What the TUI slice (src/tui*, on ae/term) needs from this one.**
+`session.init(cfg, options)` (set `options.undo_enabled = 1` for the TUI),
+`session.turn(s, text, sink, cancel)` with the Sink receiving every event as
+the NDJSON text `ask --json` prints (step, delta, run_start, run_end with
+changes and tool_summary, retry, notice, usage, progress, background),
+`session.compact_now` for /compact, `session.undo` for /undo,
+`config.load/save_model/save_effort/save_simple/model_entries`,
+`auth.services/describe/set_key/sign_out` for /provider. Still to build for
+it: Session `reopen`/`switchConfig`, user interjections (inbox users),
+replayed tool summaries and bash replacements on restored messages (the log
+keeps the records), activity callbacks (model started/data/script/waiting),
+`/models` listing (src/auth/models.zig), and `Ctrl+C` routing to the cancel
+cell instead of the process flag.
+
+**Next after that.** Subagents (tools.agent, agent/input, agent/sessions,
+session/history fork, `--agent-input`), automatic Run backgrounding
+(run_job), hooks and skills, MCP, tools.fetch/web_search, images and
+tools.view, record/replay.
