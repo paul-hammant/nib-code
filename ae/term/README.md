@@ -125,6 +125,12 @@ terminal works on Windows today.
   keys, mouse and a resize, and the terminal comes back cooked with the
   modes off after `q`, SIGTERM, SIGHUP, SIGINT and a panic.
 
+- `tests/mutations.py`: twenty deliberate breakages (renderer skip cells
+  and repositioning, SGR, kitty modifiers, mouse origin, the ESC wait,
+  word-wrap quirks, clipping, VS16 width, restore on a signal, ISIG,
+  SIGWINCH, the leave sequence, query replies, the fake clock, snapshot row
+  counts, the screen diff); each must make its tests fail, and all do.
+
 `screen.py` reads neither colon-separated SGR (`38:5:200`, `4:3`) nor
 `CSI Ps SP q`, so the fidelity frames use legacy SGR for 256/RGB colours,
 single underlines and no cursor shapes; the renderer's other forms are
