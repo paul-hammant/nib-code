@@ -19,7 +19,11 @@ import std.sync
 import std.worker
 import std.os
 import nib.jsonx
+import nib.provider
 import nib.provider.types
+import nib.provider.sink as psink
+import nib.msg
+import nib.tui.prediction
 import nib.session
 import nib.session.log
 import nib.tools
@@ -133,6 +137,10 @@ new(sp: @keep ptr, cfg: @keep ptr, op: @keep ptr, home: string) -> *port.Port {
                 detail = d2
             }
             s = sess_(lw)
+            if compact == 0 {
+                hs = if err == "" { "completed" } else if sync.atomic_load(cancel) != 0 { "cancelled" } else { "failed" }
+                session.turn_end_hooks(lw.sp, hs)
+            }
             if compact == 0 {
                 app_queue.post(q, "{\"turn_end\":{\"status\":${jsonx.quote(s.status)},\"steps\":${s.steps},\"usage\":${types.usage_json(s.usage)},\"timing\":${session.timing_json(lw.sp)}}}")
             }
@@ -280,8 +288,35 @@ new(sp: @keep ptr, cfg: @keep ptr, op: @keep ptr, home: string) -> *port.Port {
         ptr out = list.list_new()
         return out
     }
-    p.predict = |ctx: ptr, instruction: string, input_text: string, cancel: ptr| { return "" }
+    p.predict = |ctx: ptr, instruction: string, input_text: string, cancel: ptr| {
+        string out = predict_(ctx as *Live, instruction, input_text, cancel)
+        return out
+    }
     return p
+}
+
+// Upstream prediction's Worker: the service's small model (when it has one),
+// effort off, no output schema, [system instruction, user input].
+predict_(l: *Live, instruction: string, input_text: string, cancel: ptr) -> string {
+    cp = types.copy(l.cfg)
+    c = cp as *types.Config
+    small = types.small_model(c.provider)
+    if small != "" {
+        c.model = small
+        c.thinking = -1
+        c.reasoning_effort = ""
+    }
+    types.set_effort(cp, "off")
+    c.output_schema = ""
+    msgs = list.list_new()
+    list.list_add(msgs, msg.system(instruction))
+    list.list_add(msgs, msg.user(input_text))
+    quiet = psink.new(null)
+    rep, err, _d, _a = provider.complete(cp, "${sess_(l).id}:predict", msgs, "[]", prediction.MAX_TOKENS, quiet, cancel, 1, null)
+    if err != "" {
+        return ""
+    }
+    return (rep as *types.Reply).text
 }
 
 // Opens Session `id` ("" a new one) with `cfg` in place of the current one.
