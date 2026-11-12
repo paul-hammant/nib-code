@@ -8,8 +8,9 @@ import std.string
 import std.sync
 import std.os
 import nib.lock
+import nib.jsonx
 
-exports(Registry, Command, new, new_command, changed, revision, replaces, start, finish)
+exports(Registry, Command, new, new_command, changed, revision, replaces, start, finish, set_log)
 
 struct Command {
     id: string
@@ -27,6 +28,9 @@ struct Registry {
     guard: ptr
     revision: long
     active: ptr          // list of *Command
+    has_log: int
+    log_ctx: ptr
+    log_fn: fn           // |ctx: ptr, members: string|: a session-log record's members
 }
 
 new() -> ptr {
@@ -34,7 +38,25 @@ new() -> ptr {
     r.guard = lock.new()
     r.revision = 0
     r.active = list.list_new()
+    r.has_log = 0
+    r.log_ctx = null
+    r.log_fn = |ctx: ptr, members: string| {}
     return r as ptr
+}
+
+// Bash start/supersede/finish events go to the session log through fn.
+set_log(rp: ptr, ctx: @keep ptr, f: @keep fn) {
+    r = rp as *Registry
+    r.log_ctx = ctx
+    r.log_fn = f
+    r.has_log = 1
+}
+
+elapsed_(c: *Command) -> long { return os.now_monotonic_ms() - c.started_ms }
+
+log_(r: *Registry, event: string) {
+    if r.has_log == 0 { return }
+    call(r.log_fn, r.log_ctx, ",\"bash\":${event}")
 }
 
 new_command(id: string, run: int, command: string, cwd: string, detached: int) -> ptr {
@@ -74,12 +96,16 @@ start(rp: ptr, cp: @keep ptr) {
     r = rp as *Registry
     c = cp as *Command
     lock.acquire(r.guard)
+    detached = "false"
+    if c.detached == 1 { detached = "true" }
+    log_(r, "{\"id\":${jsonx.quote(c.id)},\"run\":${c.run},\"state\":\"started\",\"command\":${jsonx.quote(c.command)},\"cwd\":${jsonx.quote(c.cwd)},\"detached\":${detached}}")
     c.revision = r.revision
     n = list.list_size(r.active)
     i = 0
     while i < n {
         old = list.list_get_raw(r.active, i) as *Command
         if replaces(old, c) == 1 {
+            log_(r, "{\"id\":${jsonx.quote(old.id)},\"run\":${old.run},\"state\":\"superseded\",\"superseded_by\":${jsonx.quote(c.id)},\"elapsed_ms\":${elapsed_(old)}}")
             old.superseded_by = c.id
             sync.atomic_store(old.cancel, 1)
         }
@@ -104,6 +130,7 @@ finish(rp: ptr, cp: ptr) -> string {
         i = i + 1
     }
     s = c.superseded_by
+    log_(r, "{\"id\":${jsonx.quote(c.id)},\"run\":${c.run},\"state\":\"finished\",\"elapsed_ms\":${elapsed_(c)}}")
     lock.release(r.guard)
     return s
 }

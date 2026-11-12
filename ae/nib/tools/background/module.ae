@@ -1,11 +1,13 @@
 // tools.background: Session-owned background bash (upstream
-// src/tools/background.zig, the bash half; ADR 0014). A start returns
-// {"id":"bN"} at once; the command runs on its own thread with its own
-// cancel; its completion is queued once in the inbox as
-// "[background bash bN finished]\n<result JSON>" (the Session slice formats
-// it to the Run display budget and delivers it before the next Step).
-// tools.stop cancels and joins one by id. Agents and background Runs come
-// with their slices.
+// src/tools/background.zig, the bash half; ADR 0014). A start logs `started`
+// synchronously, returns {"id":"bN"} at once and runs the command on its own
+// thread with its own cancel; its completion is queued once in the inbox as
+// "[background bash bN finished]\n<result JSON>" (the Session formats it to
+// the Run display budget and delivers it before the next Step, marking the
+// job delivered). A detached job is not waited for: it survives its Turn and
+// its completion is delivered at the next Step of any later Turn. tools.stop
+// cancels and joins one by id. Agents and background Runs come with their
+// slices.
 
 import std.list
 import std.string
@@ -14,8 +16,9 @@ import std.worker
 import nib.lock
 import nib.jsonx
 
-exports(Background, Job, BASH_LIMIT, new, start, stop_task, finish_turn, stop_all, take_inbox,
-        inbox_size, active_bash, set_result)
+exports(Background, Job, Item, BASH_LIMIT, new, set_log, set_turn_step, begin_turn, start, stop_task,
+        finish_turn, stop_all, take_inbox, take_items, inbox_size, active_bash, set_result, poll,
+        pending, any_pending, pending_names, delivered, enqueue_lost, enqueue_finished)
 
 const BASH_LIMIT = 8
 
@@ -29,13 +32,33 @@ struct Job {
     text: string
     state: string    // working, done, failed, canceled, superseded
     run: fn
+    announced: int
+    delivered: int
+    exec_start: long // epoch ms before spawn, 0: it never spawned
+    exec_end: long
+}
+
+// One queued message: a finished or lost task.
+struct Item {
+    id: string
+    kind: string
+    state: string    // finished, lost
+    ok: int          // -1: none (lost), 0, 1
+    text: string     // head line, newline, result body
+    detached: int
+    exec_start: long
+    exec_end: long
 }
 
 struct Background {
     guard: ptr
     jobs: ptr        // list of *Job
-    inbox: ptr       // list of finished messages (strings)
-    stopping: ptr    // std.sync cell: set once the Session tears down
+    inbox: ptr       // list of *Item
+    stopping: ptr    // std.sync cell: set while the Session tears jobs down
+    turn_step: int
+    has_log: int
+    log_ctx: ptr
+    log_fn: fn       // |ctx: ptr, event_json: string, step: int|: the synchronous `started` record
 }
 
 new() -> ptr {
@@ -44,7 +67,30 @@ new() -> ptr {
     b.jobs = list.list_new()
     b.inbox = list.list_new()
     b.stopping = sync.atomic_new(0)
+    b.turn_step = 0
+    b.has_log = 0
+    b.log_ctx = null
+    b.log_fn = |ctx: ptr, ev: string, step: int| {}
     return b as ptr
+}
+
+set_log(bp: ptr, ctx: @keep ptr, f: @keep fn) {
+    b = bp as *Background
+    b.log_ctx = ctx
+    b.log_fn = f
+    b.has_log = 1
+}
+
+set_turn_step(bp: ptr, step: int) {
+    b = bp as *Background
+    lock.acquire(b.guard)
+    b.turn_step = step
+    lock.release(b.guard)
+}
+
+// A new Turn may start jobs again (a previous abort set the stop flag).
+begin_turn(bp: ptr) {
+    sync.atomic_store((bp as *Background).stopping, 0)
 }
 
 active_bash(bp: ptr) -> int {
@@ -61,12 +107,102 @@ active_bash(bp: ptr) -> int {
     return n
 }
 
+// 1 while a job the Turn waits for (not detached) has not been delivered.
+pending(bp: ptr) -> int {
+    b = bp as *Background
+    n = 0
+    lock.acquire(b.guard)
+    i = 0
+    while i < list.list_size(b.jobs) {
+        j = list.list_get_raw(b.jobs, i) as *Job
+        if j.detached == 0 && j.delivered == 0 { n = 1 }
+        i = i + 1
+    }
+    lock.release(b.guard)
+    return n
+}
+
+// 1 while any job's result has not been delivered, detached included.
+any_pending(bp: ptr) -> int {
+    b = bp as *Background
+    n = 0
+    lock.acquire(b.guard)
+    i = 0
+    while i < list.list_size(b.jobs) {
+        j = list.list_get_raw(b.jobs, i) as *Job
+        if j.delivered == 0 { n = 1 }
+        i = i + 1
+    }
+    lock.release(b.guard)
+    return n
+}
+
+// "bash b1, bash b2": the jobs a Turn waits for.
+pending_names(bp: ptr) -> string {
+    b = bp as *Background
+    names = ""
+    lock.acquire(b.guard)
+    i = 0
+    while i < list.list_size(b.jobs) {
+        j = list.list_get_raw(b.jobs, i) as *Job
+        if j.detached == 0 && j.delivered == 0 {
+            if names != "" { names = "${names}, " }
+            names = "${names}bash ${j.id}"
+        }
+        i = i + 1
+    }
+    lock.release(b.guard)
+    return names
+}
+
+// The task `id` reached the model: its job no longer holds a Turn open.
+delivered(bp: ptr, id: string) {
+    b = bp as *Background
+    lock.acquire(b.guard)
+    i = 0
+    while i < list.list_size(b.jobs) {
+        j = list.list_get_raw(b.jobs, i) as *Job
+        if j.id == id && j.delivered == 0 {
+            j.delivered = 1
+            break
+        }
+        i = i + 1
+    }
+    lock.release(b.guard)
+}
+
+// The ids of jobs not yet announced (a list of strings), now announced.
+poll(bp: ptr) -> ptr {
+    b = bp as *Background
+    out = list.list_new()
+    lock.acquire(b.guard)
+    i = 0
+    while i < list.list_size(b.jobs) {
+        j = list.list_get_raw(b.jobs, i) as *Job
+        if j.announced == 0 {
+            j.announced = 1
+            list.list_add(out, string.copy(j.id))
+        }
+        i = i + 1
+    }
+    lock.release(b.guard)
+    return out
+}
+
 state_of_(ok: int, text: string, canceled: int) -> string {
     if canceled == 1 { return "canceled" }
     if ok == 0 { return "failed" }
     if string.index_of(text, "\"superseded_by\"") >= 0 { return "superseded" }
     if string.starts_with(text, "{\"exit_code\":0,") == 1 { return "done" }
     return "failed"
+}
+
+// Whether a finished result counts as ok: exit 0, or superseded (neutral).
+ok_of_(ok: int, text: string) -> int {
+    if ok == 0 { return 0 }
+    if string.starts_with(text, "{\"exit_code\":0,") == 1 { return 1 }
+    if string.index_of(text, "\"superseded_by\"") >= 0 { return 1 }
+    return 0
 }
 
 // Starts `run` (|cancel: ptr, out: ptr| filling out with ok/text through
@@ -87,6 +223,12 @@ start(bp: @keep ptr, id: string, command: string, detached: int, run: @keep fn) 
     j.text = ""
     j.state = "working"
     j.run = run
+    j.announced = 0
+    j.delivered = 0
+    j.exec_start = 0 as long
+    j.exec_end = 0 as long
+    // The lifecycle record is on disk before the job runs.
+    if b.has_log == 1 { call(b.log_fn, b.log_ctx, "{\"id\":${jsonx.quote(id)},\"kind\":\"bash\",\"state\":\"started\"}", b.turn_step) }
     lock.acquire(b.guard)
     list.list_add(b.jobs, j as ptr)
     lock.release(b.guard)
@@ -98,9 +240,7 @@ start(bp: @keep ptr, id: string, command: string, detached: int, run: @keep fn) 
         if sync.atomic_load(b.stopping) == 0 {
             body = jj.text
             if jj.ok == 0 { body = "{\"error\":${jsonx.quote(jj.text)}}" }
-            lock.acquire(b.guard)
-            list.list_add(b.inbox, "[background bash ${jj.id} finished]\n${body}")
-            lock.release(b.guard)
+            enqueue_finished(bp, jj.id, ok_of_(jj.ok, jj.text), "[background bash ${jj.id} finished]\n${body}", jj.detached, jj.exec_start, jj.exec_end)
         }
         sync.atomic_store(jj.done, 1)
         return null
@@ -133,7 +273,7 @@ stop_task(bp: ptr, id: string) -> (int, string) {
     stopped = 1
     if sync.atomic_load(j.done) != 0 { stopped = 0 }
     sync.atomic_store(j.cancel, 1)
-    while sync.atomic_load(j.done) == 0 { sleep(20) }
+    while sync.atomic_load(j.done) == 0 { sleep(5) }
     return stopped, ""
 }
 
@@ -151,7 +291,7 @@ finish_turn(bp: ptr) {
         lock.release(b.guard)
         if j.detached == 0 {
             sync.atomic_store(j.cancel, 1)
-            while sync.atomic_load(j.done) == 0 { sleep(20) }
+            while sync.atomic_load(j.done) == 0 { sleep(5) }
         }
         i = i + 1
     }
@@ -170,9 +310,12 @@ stop_all(bp: ptr) {
         j = list.list_get_raw(b.jobs, i) as *Job
         lock.release(b.guard)
         sync.atomic_store(j.cancel, 1)
-        while sync.atomic_load(j.done) == 0 { sleep(20) }
+        while sync.atomic_load(j.done) == 0 { sleep(5) }
         i = i + 1
     }
+    lock.acquire(b.guard)
+    list.list_clear(b.jobs)
+    lock.release(b.guard)
 }
 
 inbox_size(bp: ptr) -> int {
@@ -183,18 +326,79 @@ inbox_size(bp: ptr) -> int {
     return n
 }
 
-// The queued completion messages (a list of strings), emptied.
-take_inbox(bp: ptr) -> ptr {
+// A finished task's message (text: head line, newline, result body), after its
+// job ran; FIFO with the others.
+enqueue_finished(bp: ptr, id: string, ok: int, text: string, detached: int, exec_start: long, exec_end: long) {
     b = bp as *Background
+    it = heap.new(Item)
+    it.id = id
+    it.kind = "bash"
+    it.state = "finished"
+    it.ok = ok
+    it.text = text
+    it.detached = detached
+    it.exec_start = exec_start
+    it.exec_end = exec_end
     lock.acquire(b.guard)
-    l = b.inbox
-    b.inbox = list.list_new()
+    list.list_add(b.inbox, it as ptr)
     lock.release(b.guard)
-    return l
 }
 
-set_result(jp: ptr, ok: int, text: string) {
+// A task the previous process left unfinished ("lost: process ended").
+enqueue_lost(bp: ptr, id: string, kind: string) {
+    b = bp as *Background
+    it = heap.new(Item)
+    it.id = id
+    it.kind = kind
+    it.state = "lost"
+    it.ok = -1
+    it.text = "[background ${kind} ${id} lost: process ended]"
+    it.detached = 0
+    it.exec_start = 0 as long
+    it.exec_end = 0 as long
+    lock.acquire(b.guard)
+    list.list_add(b.inbox, it as ptr)
+    lock.release(b.guard)
+}
+
+// The queued items in arrival order, removed: all of them, or (include_detached
+// 0) only those of jobs a Turn waits for, leaving detached ones queued.
+take_items(bp: ptr, include_detached: int) -> ptr {
+    b = bp as *Background
+    taken = list.list_new()
+    lock.acquire(b.guard)
+    kept = list.list_new()
+    i = 0
+    while i < list.list_size(b.inbox) {
+        it = list.list_get_raw(b.inbox, i) as *Item
+        if include_detached == 0 && it.detached == 1 {
+            list.list_add(kept, it as ptr)
+        } else {
+            list.list_add(taken, it as ptr)
+        }
+        i = i + 1
+    }
+    b.inbox = kept
+    lock.release(b.guard)
+    return taken
+}
+
+// The queued completion messages (a list of strings), emptied.
+take_inbox(bp: ptr) -> ptr {
+    items = take_items(bp, 1)
+    out = list.list_new()
+    i = 0
+    while i < list.list_size(items) {
+        list.list_add(out, string.copy((list.list_get_raw(items, i) as *Item).text))
+        i = i + 1
+    }
+    return out
+}
+
+set_result(jp: ptr, ok: int, text: string, exec_start: long, exec_end: long) {
     j = jp as *Job
     j.ok = ok
     j.text = text
+    j.exec_start = exec_start
+    j.exec_end = exec_end
 }

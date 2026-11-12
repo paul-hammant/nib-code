@@ -1,0 +1,361 @@
+// tools.progress: task progress snapshots (upstream src/tools/progress.zig).
+// A Queue keeps the latest snapshot of every task (bash, agent, Run) of one
+// Session, hands out the per-kind task ids (a1.., b1.., r1.. that never
+// reset across Runs and Turns) and delivers snapshots to a sink as the
+// {"progress":{…}} events of docs/ask-json.md: working updates are coalesced
+// to one a second per task, terminal states and the first one at once.
+// Tool threads only replace snapshots; whoever polls (the Session) drains.
+
+import std.list
+import std.string
+import std.os
+import nib.lock
+import nib.jsonx
+
+exports(Progress, Queue, Slot, new, new_value, clone, to_json, set_sink, clear_sink,
+        reserve_bash, show, add, add_agent, restart, update, current_invocation,
+        drain, drain_at, set_counters, high_agent, high_bash, high_run, task_ids_json, clear,
+        slot_count, slot_at, KIND_AGENT, KIND_BASH, KIND_RUN, ZERO_USAGE)
+
+const KIND_AGENT = "agent"
+const KIND_BASH = "bash"
+const KIND_RUN = "run"
+const ZERO_USAGE = "{\"prompt_tokens\":0,\"completion_tokens\":0,\"prompt_cache_hit_tokens\":0}"
+
+// state: queued, working, done, failed, canceled, timed_out.
+struct Progress {
+    id: string
+    run: int
+    invocation: int
+    kind: string
+    exit_code: int           // -1: none
+    output_bytes: long
+    elapsed_ms: long
+    superseded_by: string    // "": none
+    background: int
+    detached: int
+    fork: int
+    prompt: string
+    state: string
+    step: int
+    tools: ptr               // list of strings
+    files: ptr               // list of strings
+    usage: string            // usage JSON
+}
+
+struct Slot {
+    value: ptr               // *Progress, owned
+    dirty: int
+    sent: long               // monotonic ms of the last delivery, -1 never
+}
+
+struct Queue {
+    guard: ptr
+    slots: ptr               // list of *Slot
+    next_agent_id: long
+    next_invocation: int
+    next_bash_id: long
+    next_run_id: long
+    has_sink: int
+    sink_ctx: ptr
+    sink_emit: fn            // |ctx: ptr, progress_json: string|
+}
+
+// A snapshot with upstream's defaults (state working).
+new_value(id: string, kind: string, prompt: string, run: int) -> ptr {
+    p = heap.new(Progress)
+    p.id = string.copy(id)
+    p.run = run
+    p.invocation = 0
+    p.kind = kind
+    p.exit_code = -1
+    p.output_bytes = 0 as long
+    p.elapsed_ms = 0 as long
+    p.superseded_by = ""
+    p.background = 0
+    p.detached = 0
+    p.fork = 0
+    p.prompt = string.copy(prompt)
+    p.state = "working"
+    p.step = 0
+    p.tools = list.list_new()
+    p.files = list.list_new()
+    p.usage = ZERO_USAGE
+    return p as ptr
+}
+
+copy_strings_(src: ptr) -> ptr {
+    out = list.list_new()
+    i = 0
+    while i < list.list_size(src) {
+        s, _g = list.get_string(src, i)
+        list.list_add(out, string.copy(s))
+        i = i + 1
+    }
+    return out
+}
+
+clone(vp: ptr) -> ptr {
+    v = vp as *Progress
+    p = new_value(v.id, v.kind, v.prompt, v.run) as *Progress
+    p.invocation = v.invocation
+    p.exit_code = v.exit_code
+    p.output_bytes = v.output_bytes
+    p.elapsed_ms = v.elapsed_ms
+    p.superseded_by = string.copy(v.superseded_by)
+    p.background = v.background
+    p.detached = v.detached
+    p.fork = v.fork
+    p.state = string.copy(v.state)
+    p.step = v.step
+    p.tools = copy_strings_(v.tools)
+    p.files = copy_strings_(v.files)
+    p.usage = string.copy(v.usage)
+    return p as ptr
+}
+
+json_list_(l: ptr) -> string {
+    out = "["
+    i = 0
+    while i < list.list_size(l) {
+        s, _g = list.get_string(l, i)
+        if i > 0 { out = "${out}," }
+        out = "${out}${jsonx.quote(s)}"
+        i = i + 1
+    }
+    return "${out}]"
+}
+
+bool_(n: int) -> string {
+    if n != 0 { return "true" }
+    return "false"
+}
+
+// The object inside {"progress":…}: upstream's field order, null fields left out.
+to_json(vp: ptr) -> string {
+    v = vp as *Progress
+    out = "{\"id\":${jsonx.quote(v.id)},\"run\":${v.run},\"invocation\":${v.invocation},\"kind\":${jsonx.quote(v.kind)}"
+    if v.exit_code >= 0 { out = "${out},\"exit_code\":${v.exit_code}" }
+    out = "${out},\"output_bytes\":${v.output_bytes},\"elapsed_ms\":${v.elapsed_ms}"
+    if v.superseded_by != "" { out = "${out},\"superseded_by\":${jsonx.quote(v.superseded_by)}" }
+    out = "${out},\"background\":${bool_(v.background)},\"detached\":${bool_(v.detached)},\"fork\":${bool_(v.fork)},\"prompt\":${jsonx.quote(v.prompt)},\"state\":${jsonx.quote(v.state)},\"step\":${v.step},\"tools\":${json_list_(v.tools)},\"files\":${json_list_(v.files)},\"usage\":${v.usage}}"
+    return out
+}
+
+new() -> ptr {
+    q = heap.new(Queue)
+    q.guard = lock.new()
+    q.slots = list.list_new()
+    q.next_agent_id = 1 as long
+    q.next_invocation = 1
+    q.next_bash_id = 1 as long
+    q.next_run_id = 1 as long
+    q.has_sink = 0
+    q.sink_ctx = null
+    q.sink_emit = |ctx: ptr, json: string| {}
+    return q as ptr
+}
+
+set_sink(qp: ptr, ctx: @keep ptr, emit: @keep fn) {
+    q = qp as *Queue
+    lock.acquire(q.guard)
+    q.sink_ctx = ctx
+    q.sink_emit = emit
+    q.has_sink = 1
+    lock.release(q.guard)
+}
+
+clear_sink(qp: ptr) {
+    q = qp as *Queue
+    lock.acquire(q.guard)
+    q.has_sink = 0
+    q.sink_ctx = null
+    lock.release(q.guard)
+}
+
+new_slot_(vp: ptr) -> ptr {
+    s = heap.new(Slot)
+    s.value = clone(vp)
+    s.dirty = 1
+    s.sent = -1 as long
+    return s as ptr
+}
+
+// The next bash id ("b1"…), for a call that shows progress only if it is slow.
+reserve_bash(qp: ptr) -> string {
+    q = qp as *Queue
+    lock.acquire(q.guard)
+    id = "b${q.next_bash_id}"
+    q.next_bash_id = q.next_bash_id + 1
+    lock.release(q.guard)
+    return id
+}
+
+// A new snapshot for an id already handed out.
+show(qp: ptr, vp: ptr) {
+    q = qp as *Queue
+    lock.acquire(q.guard)
+    list.list_add(q.slots, new_slot_(vp))
+    lock.release(q.guard)
+}
+
+// Hands out the next id of `kind` and queues its first (queued) snapshot.
+add_(qp: ptr, kind: string, prompt: string, run: int, background: int, fork: int) -> string {
+    q = qp as *Queue
+    lock.acquire(q.guard)
+    id = ""
+    if kind == KIND_AGENT {
+        id = "a${q.next_agent_id}"
+        q.next_agent_id = q.next_agent_id + 1
+    } else if kind == KIND_BASH {
+        id = "b${q.next_bash_id}"
+        q.next_bash_id = q.next_bash_id + 1
+    } else {
+        id = "r${q.next_run_id}"
+        q.next_run_id = q.next_run_id + 1
+    }
+    v = new_value(id, kind, prompt, run) as *Progress
+    v.background = background
+    v.fork = fork
+    v.state = "queued"
+    if kind == KIND_AGENT {
+        v.invocation = q.next_invocation
+        q.next_invocation = q.next_invocation + 1
+    }
+    list.list_add(q.slots, new_slot_(v as ptr))
+    lock.release(q.guard)
+    return id
+}
+
+add(qp: ptr, kind: string, prompt: string, run: int, background: int) -> string {
+    return add_(qp, kind, prompt, run, background, 0)
+}
+
+add_agent(qp: ptr, prompt: string, run: int, background: int, fork: int) -> string {
+    return add_(qp, KIND_AGENT, prompt, run, background, fork)
+}
+
+// A further invocation of an id (agent resume): its own slot.
+restart(qp: ptr, vp: ptr) {
+    q = qp as *Queue
+    lock.acquire(q.guard)
+    s = new_slot_(vp) as *Slot
+    (s.value as *Progress).invocation = q.next_invocation
+    q.next_invocation = q.next_invocation + 1
+    list.list_add(q.slots, s as ptr)
+    lock.release(q.guard)
+}
+
+// Replaces the newest snapshot of value.id (matching its invocation unless 0),
+// keeping the slot's invocation. "" or "UnknownProgressId".
+update(qp: ptr, vp: ptr) -> string {
+    q = qp as *Queue
+    v = vp as *Progress
+    lock.acquire(q.guard)
+    i = list.list_size(q.slots) - 1
+    while i >= 0 {
+        s = list.list_get_raw(q.slots, i) as *Slot
+        old = s.value as *Progress
+        if old.id == v.id && (v.invocation == 0 || old.invocation == v.invocation) {
+            c = clone(vp) as *Progress
+            c.invocation = old.invocation
+            s.value = c as ptr
+            s.dirty = 1
+            lock.release(q.guard)
+            return ""
+        }
+        i = i - 1
+    }
+    lock.release(q.guard)
+    return "UnknownProgressId"
+}
+
+current_invocation(qp: ptr, id: string) -> int {
+    q = qp as *Queue
+    lock.acquire(q.guard)
+    n = 0
+    i = list.list_size(q.slots) - 1
+    while i >= 0 {
+        s = list.list_get_raw(q.slots, i) as *Slot
+        v = s.value as *Progress
+        if v.id == id {
+            n = v.invocation
+            break
+        }
+        i = i - 1
+    }
+    lock.release(q.guard)
+    return n
+}
+
+// Delivers the dirty snapshots at the current time.
+drain(qp: ptr) { drain_at(qp, os.now_monotonic_ms()) }
+
+drain_at(qp: ptr, now: long) {
+    q = qp as *Queue
+    lock.acquire(q.guard)
+    if q.has_sink == 0 {
+        lock.release(q.guard)
+        return
+    }
+    i = 0
+    while i < list.list_size(q.slots) {
+        s = list.list_get_raw(q.slots, i) as *Slot
+        i = i + 1
+        if s.dirty == 0 { continue }
+        v = s.value as *Progress
+        if (v.state == "queued" || v.state == "working") && s.sent >= 0 && now - s.sent < 1000 { continue }
+        call(q.sink_emit, q.sink_ctx, to_json(s.value))
+        s.sent = now
+        s.dirty = 0
+    }
+    lock.release(q.guard)
+}
+
+// Resume: the next ids come after the log's.
+set_counters(qp: ptr, next_agent: long, next_bash: long, next_run: long) {
+    q = qp as *Queue
+    lock.acquire(q.guard)
+    q.next_agent_id = next_agent
+    q.next_bash_id = next_bash
+    q.next_run_id = next_run
+    lock.release(q.guard)
+}
+
+high_agent(qp: ptr) -> long { return (qp as *Queue).next_agent_id - 1 }
+high_bash(qp: ptr) -> long {
+    q = qp as *Queue
+    lock.acquire(q.guard)
+    n = q.next_bash_id - 1
+    lock.release(q.guard)
+    return n
+}
+high_run(qp: ptr) -> long { return (qp as *Queue).next_run_id - 1 }
+
+// The "task_ids" object a Step record carries.
+task_ids_json(qp: ptr) -> string {
+    return "{\"agent\":${high_agent(qp)},\"bash\":${high_bash(qp)},\"run\":${high_run(qp)}}"
+}
+
+// Drops every snapshot (counters stay): after tool joins, or once every
+// background result has reached the inbox.
+clear(qp: ptr) {
+    q = qp as *Queue
+    lock.acquire(q.guard)
+    list.list_clear(q.slots)
+    lock.release(q.guard)
+}
+
+slot_count(qp: ptr) -> int {
+    q = qp as *Queue
+    lock.acquire(q.guard)
+    n = list.list_size(q.slots)
+    lock.release(q.guard)
+    return n
+}
+
+// The snapshot of slot i (not a copy: the caller serializes with the tools).
+slot_at(qp: ptr, i: int) -> ptr {
+    q = qp as *Queue
+    return (list.list_get_raw(q.slots, i) as *Slot).value
+}

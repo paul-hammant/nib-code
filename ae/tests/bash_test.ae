@@ -2,9 +2,9 @@
 //
 // Not ported (outside this slice):
 //  - "foreground bash allocates only at the visibility threshold and advances
-//    once per second": the progress Tracker (progress ids/elapsed events).
-//  - "foreground bash reports terminal command facts even for short
-//    commands": the progress Tracker and sandbox RunTiming entries for it.
+//    once per second" is ported with one change: every bash reserves its id
+//    at its start (docs/ask-json.md), so the threshold only gates the
+//    snapshot, not the id counter.
 //  - the second half of "bash has a finite 30 minute default ...": the
 //    executeBackground call (background bash); its Args half is ported.
 import std.spec
@@ -17,6 +17,8 @@ import std.os
 import std.worker
 import nib.jsonx
 import nib.sandbox
+import nib.sandbox.timing
+import nib.tools.progress
 import nib.tools
 import nib.tools.bash
 import nib.tools.policy
@@ -191,6 +193,58 @@ main() {
                 i = i + 1
             }
             os.exec("pkill -f 'sleep 29.137' >/dev/null 2>&1; true")
+        }
+        spec.it("foreground bash allocates only at the visibility threshold and advances once per second") callback {
+            q = progress.new()
+            c = bash.new_ctx("/unused", sync.atomic_new(0), null, null) as *bash.Ctx
+            c.progress = q
+            c.run_id = 3
+            id = progress.reserve_bash(q)
+            tr = bash.new_tracker(c, "slow", id, 0)
+            bash.tick_at(tr as *bash.Tracker, 2999 as long)
+            spec.assert_eq(progress.slot_count(q), 0, "no snapshot below the threshold")
+            bash.tick_at(tr as *bash.Tracker, 3000 as long)
+            v = progress.slot_at(q, 0) as *progress.Progress
+            spec.assert_str_eq(v.id, "b1", "id")
+            spec.assert_str_eq(v.kind, "bash", "kind")
+            spec.assert_eq(v.background, 0, "foreground")
+            spec.assert_eq(v.run, 3, "run")
+            spec.assert_eq_long(v.elapsed_ms, 3000, "shown at the threshold")
+            bash.tick_at(tr as *bash.Tracker, 3999 as long)
+            spec.assert_eq_long((progress.slot_at(q, 0) as *progress.Progress).elapsed_ms, 3000, "not within the second")
+            bash.tick_at(tr as *bash.Tracker, 4000 as long)
+            spec.assert_eq_long((progress.slot_at(q, 0) as *progress.Progress).elapsed_ms, 4000, "next second")
+            spec.assert_eq_long(progress.high_bash(q), 1, "one id")
+            bash.finish_tracker(tr as *bash.Tracker, "done")
+            spec.assert_str_eq((progress.slot_at(q, 0) as *progress.Progress).state, "done", "terminal")
+        }
+        spec.it("foreground bash reports terminal command facts even for short commands") callback {
+            d = tmp_()
+            t = new_tools_(d)
+            s = tools.new_scope(t, 1)
+            h = tools.host(s)
+            run = timing.new()
+            sandbox.host_set_timing(h, run)
+            o = sandbox.eval("await tools.bash({command: 'true'}); await tools.bash({command: 'sleep 3.2; exit 7'})", sandbox.limits(), h, null) as *sandbox.Outcome
+            spec.assert_eq(o.ok, 1, "ok: ${o.text}")
+            spec.assert_str_eq(o.text, "{\"exit_code\":7,\"output\":\"\"}", "result")
+            spec.assert_eq(timing.count(run), 2, "two calls")
+            e0 = timing.entry(run, 0) as *timing.Call
+            e1 = timing.entry(run, 1) as *timing.Call
+            spec.assert_str_eq(e0.id, "b1", "first id")
+            spec.assert_str_eq(e1.id, "b2", "second id")
+            spec.assert_eq(e1.background, 0, "foreground")
+            q = (t as *tools.Tools).progress
+            spec.assert_eq(progress.slot_count(q), 2, "both have a snapshot")
+            v0 = progress.slot_at(q, 0) as *progress.Progress
+            v1 = progress.slot_at(q, 1) as *progress.Progress
+            spec.assert_eq(v0.exit_code, 0, "short command exit code")
+            spec.assert_str_eq(v1.state, "failed", "nonzero exit is failed")
+            spec.assert_eq(v1.exit_code, 7, "exit code")
+            spec.assert_true(v1.elapsed_ms >= 3000, "elapsed")
+            progress.clear(q)
+            spec.assert_str_eq(e1.id, "b2", "ids outlive cleared snapshots")
+            fs.remove_tree(d)
         }
         spec.it("bash validates detached and zero timeout before starting") callback {
             args = ["{\"command\":\"true\",\"detached\":true}", "{\"command\":\"true\",\"timeout_ms\":0}", "{\"command\":\"true\",\"background\":true,\"timeout_ms\":0}", "{\"command\":\"true\",\"background\":true,\"detached\":true,\"timeout_ms\":-1}"]

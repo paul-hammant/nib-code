@@ -1,0 +1,74 @@
+// Ports the bash-relevant tests of upstream src/session/inbox.zig (a2dd439).
+// The Aether inbox holds only background results (the TUI's queued user
+// messages come with the TUI slice), so the user-message halves of the Zig
+// tests are not ported; what is held: FIFO order, one insertion per result,
+// detached results kept for a later Step, `delivered` marking, lost tasks.
+import std.spec
+import std.list
+import std.string
+import nib.tools.background
+
+item_(items: ptr, i: int) -> *background.Item { return list.list_get_raw(items, i) as *background.Item }
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "session.inbox") {
+        spec.it("insert drains an owned FIFO batch after tool results") callback {
+            bg = background.new()
+            background.enqueue_finished(bg, "b1", 1, "[background bash b1 finished]\none", 0, 0 as long, 0 as long)
+            background.enqueue_finished(bg, "b2", 1, "[background bash b2 finished]\ntwo", 0, 0 as long, 0 as long)
+            batch = background.take_items(bg, 1)
+            spec.assert_eq(background.inbox_size(bg), 0, "drained")
+            spec.assert_eq(list.list_size(batch), 2, "both taken")
+            spec.assert_str_eq(item_(batch, 0).id, "b1", "first")
+            spec.assert_str_eq(item_(batch, 1).id, "b2", "second")
+            background.enqueue_finished(bg, "b3", 1, "[background bash b3 finished]\nlater", 0, 0 as long, 0 as long)
+            leftover = background.take_items(bg, 1)
+            spec.assert_eq(list.list_size(leftover), 1, "a later result is a later batch")
+        }
+        spec.it("limit wait inserts background results and preserves queued user messages") callback {
+            bg = background.new()
+            background.enqueue_finished(bg, "b1", 1, "[background bash b1 finished]\nbackground result", 0, 0 as long, 0 as long)
+            background.enqueue_finished(bg, "b2", 1, "[background bash b2 finished]\ndetached result", 1, 0 as long, 0 as long)
+            inserted = background.take_items(bg, 0)
+            spec.assert_eq(list.list_size(inserted), 1, "only the job the Turn waits for")
+            spec.assert_str_eq(item_(inserted, 0).id, "b1", "b1")
+            spec.assert_eq(background.inbox_size(bg), 1, "the detached result stays queued")
+            next_step = background.take_items(bg, 1)
+            spec.assert_eq(list.list_size(next_step), 1, "the next Step takes it")
+            spec.assert_str_eq(item_(next_step, 0).id, "b2", "b2")
+            spec.assert_eq(background.inbox_size(bg), 0, "empty")
+        }
+        spec.it("lost tasks are queued as messages and carry no ok") callback {
+            bg = background.new()
+            background.enqueue_lost(bg, "b1", "bash")
+            items = background.take_items(bg, 1)
+            spec.assert_str_eq(item_(items, 0).text, "[background bash b1 lost: process ended]", "text")
+            spec.assert_str_eq(item_(items, 0).state, "lost", "state")
+            spec.assert_eq(item_(items, 0).ok, -1, "no ok")
+        }
+        spec.it("a Turn waits only for undelivered ordinary jobs") callback {
+            bg = background.new()
+            _started, err = background.start(bg, "b1", "true", 0, |cancel: ptr, job: ptr| {
+                background.set_result(job, 1, "{\"exit_code\":0,\"output\":\"\"}", 1 as long, 2 as long)
+            })
+            spec.assert_str_eq(err, "", "started")
+            _s2, _e2 = background.start(bg, "b2", "true", 1, |cancel: ptr, job: ptr| {
+                background.set_result(job, 1, "{\"exit_code\":0,\"output\":\"\"}", 1 as long, 2 as long)
+            })
+            while background.active_bash(bg) > 0 { sleep(5) }
+            spec.assert_eq(background.pending(bg), 1, "b1 is not delivered")
+            spec.assert_str_eq(background.pending_names(bg), "bash b1", "names")
+            spec.assert_eq(background.any_pending(bg), 1, "any")
+            background.delivered(bg, "b1")
+            spec.assert_eq(background.pending(bg), 0, "detached b2 is not waited for")
+            spec.assert_eq(background.any_pending(bg), 1, "b2 undelivered")
+            background.delivered(bg, "b2")
+            spec.assert_eq(background.any_pending(bg), 0, "all delivered")
+            items = background.take_items(bg, 1)
+            spec.assert_eq(item_(items, 0).ok, 1, "exit 0 is ok")
+            spec.assert_eq(item_(items, 0).exec_end, 2, "execution carried")
+        }
+    }
+    return spec.run_summary(fw)
+}

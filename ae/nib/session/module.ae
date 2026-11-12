@@ -11,8 +11,13 @@
 //
 // Not yet ported here (next slices, PORT_STATUS.md): automatic Run
 // backgrounding (run_job), subagents and fork, MCP, skills, hooks, images,
-// record/replay, the progress tree, user interjections (inbox users), the
-// Codex transport. Undo snapshots (tools/undo.zig) wait for the TUI's /undo.
+// record/replay, user interjections (inbox users), the Codex transport.
+//
+// Background bash: a ticker thread polls the tools while a Turn runs (the
+// upstream Tools.poll on the Session thread and in its 20 ms waiting loops):
+// it emits `started` events and the task progress snapshots, also while the
+// model stream or a Run is busy. Events of the Session and the ticker are
+// serialized by the Sink's own lock. Undo snapshots (tools/undo.zig) wait for the TUI's /undo.
 
 import std.json
 import std.list
@@ -20,14 +25,17 @@ import std.os
 import std.fs
 import std.string
 import std.sync
+import std.worker
 import std.cryptography
 import nib.jsonx
+import nib.lock
 import nib.msg
 import nib.sandbox
 import nib.sandbox.timing
 import nib.tools
 import nib.tools.atomic_file
 import nib.tools.background
+import nib.tools.progress
 import nib.tools.diff
 import nib.provider
 import nib.provider.types
@@ -62,6 +70,7 @@ struct Options {
 struct Sink {
     ctx: ptr
     emit: fn                 // |ctx: ptr, event_json: string|
+    guard: ptr               // events are written one at a time
 }
 
 struct Session {
@@ -90,6 +99,9 @@ struct Session {
     partial_text: string
     partial_reasoning: string
     final_text: string
+    poll_guard: ptr          // one poll (events + progress) at a time
+    ticker_stop: ptr         // std.sync cells of the poll thread
+    ticker_done: ptr
 }
 
 new_options(home: string, user_home: string) -> ptr {
@@ -111,13 +123,16 @@ new_sink(ctx: @keep ptr, emit: @keep fn) -> ptr {
     s = heap.new(Sink)
     s.ctx = ctx
     s.emit = emit
+    s.guard = lock.new()
     return s as ptr
 }
 
 emit_(sp: ptr, ev: string) {
     if sp == null { return }
     s = sp as *Sink
+    lock.acquire(s.guard)
     call(s.emit, s.ctx, ev)
+    lock.release(s.guard)
 }
 
 // main's errorMessage: the user-facing text of an error name.
@@ -194,6 +209,9 @@ init(cp: @keep ptr, op: @keep ptr) -> (ptr, string, string) {
     s.partial_text = ""
     s.partial_reasoning = ""
     s.final_text = ""
+    s.poll_guard = lock.new()
+    s.ticker_stop = sync.atomic_new(0)
+    s.ticker_done = sync.atomic_new(1)
     reset_timing_(s)
     directory = atomic_file.join(o.home, "sessions")
     fs.mkdir_p(directory)
@@ -235,7 +253,34 @@ init(cp: @keep ptr, op: @keep ptr) -> (ptr, string, string) {
         if ierr != "" { return null, ierr, "" }
     }
     if o.undo_enabled == 1 && s.parent_session_id == "" { tools.enable_undo(s.tools, "${directory}/${s.id}.undo") }
+    attach_log_(s as ptr)
     return s as ptr, "", ""
+}
+
+// Wires the Session log into the tools: bash/task_stop records and the
+// synchronous `started` record of a background job; on resume, the task ids
+// continue after the log's and unfinished jobs come back as lost.
+attach_log_(sp: @keep ptr) {
+    s = sp as *Session
+    t = s.tools as *tools.Tools
+    tools.set_log(s.tools, sp, |ctx: ptr, members: string| {
+        ss = ctx as *Session
+        log.event(ss.log, members, 0)
+    })
+    background.set_log(t.background, sp, |ctx: ptr, ev: string, step: int| {
+        ss = ctx as *Session
+        log.background(ss.log, ev, step)
+    })
+    l = s.log as *log.Log
+    progress.set_counters(t.progress, l.next_agent_id, l.next_bash_id, l.next_run_id)
+    i = 0
+    while i < list.list_size(l.lost_background) {
+        ev, _g = list.get_string(l.lost_background, i)
+        v = jsonx.parse(ev)
+        if v != null { background.enqueue_lost(t.background, string.copy(jsonx.str_or(v, "id", "")), string.copy(jsonx.str_or(v, "kind", "bash"))) }
+        jsonx.free(v)
+        i = i + 1
+    }
 }
 
 json_list_(l: ptr) -> string {
@@ -279,9 +324,53 @@ initialize_history_(s: *Session, cwd: string) -> string {
 
 close(sp: ptr) {
     s = sp as *Session
+    stop_ticker_(s)
     background.stop_all((s.tools as *tools.Tools).background)
     tools.close_undo(s.tools)
     log.close(s.log)
+}
+
+// One poll of the tools (upstream Tools.poll): the sandbox notice, `started`
+// events of new background jobs, the progress snapshots that are due.
+poll_(s: *Session, sk: ptr) {
+    lock.acquire(s.poll_guard)
+    t = s.tools as *tools.Tools
+    reason = tools.take_jail_notice(s.tools)
+    if reason != "" {
+        emit_(sk, "{\"notice\":${jsonx.quote("Sandbox unavailable · ${reason} · bash runs without it")}}")
+        log.event(s.log, ",\"sandbox_unavailable\":${jsonx.quote(reason)}", 0)
+    }
+    ids = background.poll(t.background)
+    i = 0
+    while i < list.list_size(ids) {
+        id, _g = list.get_string(ids, i)
+        emit_(sk, "{\"background\":{\"id\":${jsonx.quote(id)},\"kind\":\"bash\",\"state\":\"started\"}}")
+        i = i + 1
+    }
+    progress.drain(t.progress)
+    lock.release(s.poll_guard)
+}
+
+// Polls every 20 ms on its own thread until stop_ticker_ (the model stream
+// or a Run may keep the Session thread busy for long).
+start_ticker_(s: *Session, sk: @keep ptr) {
+    sync.atomic_store(s.ticker_stop, 0)
+    sync.atomic_store(s.ticker_done, 0)
+    sp = s as ptr
+    worker.run_detached(|| {
+        ss = sp as *Session
+        while sync.atomic_load(ss.ticker_stop) == 0 {
+            poll_(ss, sk)
+            sleep(20)
+        }
+        sync.atomic_store(ss.ticker_done, 1)
+        return null
+    })
+}
+
+stop_ticker_(s: *Session) {
+    sync.atomic_store(s.ticker_stop, 1)
+    while sync.atomic_load(s.ticker_done) == 0 { sleep(2) }
 }
 
 reset_timing_(s: *Session) {
@@ -384,6 +473,8 @@ execute_(s: *Session, tc: *types.ToolCall, sk: ptr, cancel: @keep ptr, run: @kee
     code = string.copy(jsonx.str_or(args, "code", ""))
     jsonx.free(args)
     emit_(sk, "{\"run_start\":${jsonx.quote(code)}}")
+    t = s.tools as *tools.Tools
+    if background.any_pending(t.background) == 0 { progress.clear(t.progress) }
     before_omitted = timing.omitted(run)
     before_bytes = timing.tool_bytes(run)
     timing.set_run_index(run, run_index)
@@ -394,6 +485,8 @@ execute_(s: *Session, tc: *types.ToolCall, sk: ptr, cancel: @keep ptr, run: @kee
     started = os.now_monotonic_ms()
     o = sandbox.eval(code, sandbox.limits(), h, cancel) as *sandbox.Outcome
     run_ms = os.now_monotonic_ms() - started
+    // Terminal snapshots of the Run's tasks precede its run_end.
+    poll_(s, sk)
     changes = tools.take_changes(scope)
     out_text = output.step_limit_output(output.format(o as ptr, l.run_output_bytes as long), remaining_steps_(s))
     summary = tool_summary.init(run, run_index, timing.omitted(run) - before_omitted)
@@ -420,43 +513,47 @@ struct Fwd {
     model: ptr            // the Step's provider timing model
 }
 
-// Delivers finished background bash results as user messages before the
-// next request (upstream inbox insertBackground, bash only).
-insert_background_(s: *Session, pending: ptr, sk: ptr) -> string {
+// Delivers finished (or lost) background bash results as user messages before
+// the next request (upstream inbox insert / insertBackground, bash only).
+// include_detached 0: only jobs a Turn waits for (the step-limit wait).
+insert_background_(s: *Session, pending: ptr, sk: ptr, include_detached: int) -> string {
     t = s.tools as *tools.Tools
-    items = background.take_inbox(t.background)
+    items = background.take_items(t.background, include_detached)
     n = list.list_size(items)
     if n == 0 { return "" }
     l = (s.cfg as *types.Config).limits as *types.Limits
     added = list.list_new()
     i = 0
     while i < n {
-        text, _g = list.get_string(items, i)
-        nl = string.index_of(text, "\n")
-        head = text
-        body = ""
-        if nl >= 0 {
-            head = string.substring(text, 0, nl + 1)
-            body = string.substring(text, nl + 1, string.length(text))
+        it = list.list_get_raw(items, i) as *background.Item
+        content = it.text
+        if it.state == "finished" {
+            nl = string.index_of(it.text, "\n")
+            head = it.text
+            body = ""
+            if nl >= 0 {
+                head = string.substring(it.text, 0, nl + 1)
+                body = string.substring(it.text, nl + 1, string.length(it.text))
+            }
+            content = output.format_message(head, body, l.run_output_bytes as long)
         }
-        // "[background bash bN finished]\n"
-        id = ""
-        parts = string.split(head, " ")
-        if string.array_size(parts) >= 3 { id = string.copy(string.array_get(parts, 2)) }
-        string.string_array_free(parts)
-        content = output.format_message(head, body, l.run_output_bytes as long)
-        ok = 0
-        if string.starts_with(body, "{\"exit_code\":0,") == 1 { ok = 1 }
-        okt = "false"
-        if ok == 1 { okt = "true" }
+        event = "{\"id\":${jsonx.quote(it.id)},\"kind\":${jsonx.quote(it.kind)},\"state\":${jsonx.quote(it.state)}"
         m = msg.user_from(content, "background")
-        m = msg.set_raw(m, "background_id", jsonx.quote(id))
-        m = msg.set_raw(m, "background_ok", okt)
-        m = msg.set_raw(m, "background_kind", "\"bash\"")
+        m = msg.set_raw(m, "background_id", jsonx.quote(it.id))
+        if it.ok >= 0 {
+            okt = "false"
+            if it.ok == 1 { okt = "true" }
+            m = msg.set_raw(m, "background_ok", okt)
+            event = "${event},\"ok\":${okt}"
+        }
+        m = msg.set_raw(m, "background_kind", jsonx.quote(it.kind))
+        if it.exec_end > 0 { event = "${event},\"execution\":{\"start_ms_epoch\":${it.exec_start},\"end_ms_epoch\":${it.exec_end}}" }
+        event = "${event}}"
         list.list_add(pending, m)
-        list.list_add(added, "{\"id\":${jsonx.quote(id)},\"kind\":\"bash\",\"state\":\"finished\",\"ok\":${okt}}")
+        list.list_add(added, event)
+        background.delivered(t.background, it.id)
         s.pending_background_bytes = s.pending_background_bytes + (string.length(content) as long)
-        emit_(sk, "{\"background\":{\"id\":${jsonx.quote(id)},\"kind\":\"bash\",\"state\":\"finished\",\"ok\":${okt}}}")
+        emit_(sk, "{\"background\":${event}}")
         i = i + 1
     }
     tokens = (s.log as *log.Log).context_tokens + compact.estimate_tokens(pending, 0, list.list_size(pending))
@@ -600,6 +697,7 @@ compact_now(sp: @keep ptr, sk: ptr, cancel: ptr, automatic: int) -> (string, str
 turn(sp: @keep ptr, user_text: string, sk: @keep ptr, cancel: @keep ptr) -> (string, string) {
     s = sp as *Session
     c = s.cfg as *types.Config
+    t = s.tools as *tools.Tools
     reset_timing_(s)
     s.status = "completed"
     started = os.now_monotonic_ms()
@@ -611,9 +709,18 @@ turn(sp: @keep ptr, user_text: string, sk: @keep ptr, cancel: @keep ptr) -> (str
     list.list_add(pending, msg.user(prompt.turn_budget_text(msg.content(first), lim.max_steps as long, user_text)))
     emit_(sk, usage_event_(s))
     tools.begin_turn_undo(s.tools)
+    background.begin_turn(t.background)
+    progress.set_sink(t.progress, sk, |ctx: ptr, json: string| {
+        emit_(ctx, "{\"progress\":${json}}")
+    })
+    start_ticker_(s, sk)
     err, detail = run_steps_(s, pending, sk, cancel)
+    // An aborted Turn stops every job; a finished one (or one that hit the
+    // step limit) only joins the jobs it waited for and leaves detached ones.
     stop_background = 1
-    if err != "" {
+    if err == "" {
+        stop_background = canceled_(cancel)
+    } else {
         if err == "Canceled" || canceled_(cancel) == 1 {
             s.status = "canceled"
             commit_interrupted_(s, pending)
@@ -623,9 +730,15 @@ turn(sp: @keep ptr, user_text: string, sk: @keep ptr, cancel: @keep ptr) -> (str
         }
         if err == "TooManySteps" && canceled_(cancel) == 0 { stop_background = 0 }
     }
-    if stop_background == 1 || canceled_(cancel) == 1 {
-        background.finish_turn((s.tools as *tools.Tools).background)
+    if stop_background == 1 {
+        background.stop_all(t.background)
+    } else {
+        background.finish_turn(t.background)
     }
+    poll_(s, sk)
+    stop_ticker_(s)
+    progress.clear_sink(t.progress)
+    if background.any_pending(t.background) == 0 { progress.clear(t.progress) }
     undo_notice = tools.finish_turn_undo(s.tools)
     if undo_notice != "" { emit_(sk, "{\"notice\":${jsonx.quote(undo_notice)}}") }
     s.wall_ms = os.now_monotonic_ms() - started
@@ -640,7 +753,7 @@ run_steps_(s: *Session, pending: ptr, sk: @keep ptr, cancel: @keep ptr) -> (stri
     while true {
         if canceled_(cancel) == 1 { return "Canceled", "" }
         if lim.max_steps >= 0 && step_index >= lim.max_steps {
-            return "TooManySteps", step_limit_detail_(s, sk, cancel, lim.max_steps)
+            return finish_step_limit_(s, pending, sk, cancel, lim.max_steps)
         }
         size = (s.log as *log.Log).context_tokens + compact.estimate_tokens(pending, 0, list.list_size(pending))
         if size >= c.context_window - c.context_window / 4 && size >= s.compact_backoff {
@@ -648,8 +761,11 @@ run_steps_(s: *Session, pending: ptr, sk: @keep ptr, cancel: @keep ptr) -> (stri
             if cerr != "" { return cerr, cdetail }
         }
         if canceled_(cancel) == 1 { return "Canceled", "" }
-        berr = insert_background_(s, pending, sk)
+        poll_(s, sk)
+        berr = insert_background_(s, pending, sk, 1)
         if berr != "" { return berr, "" }
+        poll_(s, sk)
+        background.set_turn_step(t.background, s.steps + 1)
         background_output_bytes = s.pending_background_bytes
         request = list.list_new()
         i = 0
@@ -668,7 +784,7 @@ run_steps_(s: *Session, pending: ptr, sk: @keep ptr, cancel: @keep ptr) -> (stri
         emit_(sk, "{\"step\":{\"n\":${s.steps + 1},\"effort\":${jsonx.quote(effort)}}}")
         step_started = os.now_monotonic_ms()
         buffer_text = 0
-        if background.active_bash(t.background) > 0 { buffer_text = 1 }
+        if background.pending(t.background) == 1 { buffer_text = 1 }
         fwd = heap.new(Fwd)
         fwd.session = s as ptr
         fwd.sink = sk
@@ -686,7 +802,7 @@ run_steps_(s: *Session, pending: ptr, sk: @keep ptr, cancel: @keep ptr) -> (stri
         r = rep as *types.Reply
         ncalls = list.list_size(r.tool_calls)
         waiting = 0
-        if ncalls == 0 && background.active_bash(t.background) > 0 { waiting = 1 }
+        if ncalls == 0 && background.pending(t.background) == 1 { waiting = 1 }
         if waiting == 1 {
             note = r.text
             if string.length(note) == 0 { note = "Waiting for background results." }
@@ -736,7 +852,7 @@ run_steps_(s: *Session, pending: ptr, sk: @keep ptr, cancel: @keep ptr) -> (stri
             k = k + 1
         }
         run_results = "${run_results}]"
-        if empty_runs == 1 && background.active_bash(t.background) > 0 {
+        if empty_runs == 1 && background.pending(t.background) == 1 {
             waiting = 1
             am, _g3 = list.get_string(pending, assistant_index)
             list.list_set(pending, assistant_index, msg.set_raw(am, "waiting", "true"))
@@ -753,11 +869,9 @@ run_steps_(s: *Session, pending: ptr, sk: @keep ptr, cancel: @keep ptr) -> (stri
         if mt.max_gap_ms >= 0 { members = "${members},\"max_gap_ms\":${mt.max_gap_ms}" }
         members = "${members},\"code\":${modeltiming.code_json(modeltiming.finish(fwd.model, r.tool_calls))}"
         modeltiming.release(fwd.model)
-        if ncalls > 0 {
-            members = "${members},\"run_ms\":${run_ms},\"calls\":${calls_json_(run)},\"calls_omitted\":${timing.omitted(run)}"
-        }
-        members = "${members},\"task_ids\":{\"agent\":0,\"bash\":${sync.atomic_load(t.bash_ids)},\"run\":0},\"tool_bytes\":${timing.tool_bytes(run)},\"output_bytes\":${output_bytes + background_output_bytes}"
-        if ncalls > 0 { members = "${members},\"run_results\":${run_results}" }
+        members = "${members},\"run_ms\":${run_ms},\"calls\":${calls_json_(run)},\"calls_omitted\":${timing.omitted(run)}"
+        members = "${members},\"task_ids\":${progress.task_ids_json(t.progress)},\"tool_bytes\":${timing.tool_bytes(run)},\"output_bytes\":${output_bytes + background_output_bytes}"
+        members = "${members},\"run_results\":${run_results}"
         members = ",\"model\":${jsonx.quote(c.model)}${members}"
         e = log.commit(s.log, s.history, list.list_size(s.history), pending, tokens, members, 0)
         if e != "" { return e, "" }
@@ -772,10 +886,11 @@ run_steps_(s: *Session, pending: ptr, sk: @keep ptr, cancel: @keep ptr) -> (stri
         list.list_clear(pending)
         emit_(sk, usage_event_(s))
         if ncalls == 0 || waiting == 1 {
-            if background.active_bash(t.background) == 0 && background.inbox_size(t.background) == 0 { return "", "" }
+            if background.pending(t.background) == 0 { return "", "" }
             if lim.max_steps < 0 || s.steps < lim.max_steps {
-                while background.inbox_size(t.background) == 0 && background.active_bash(t.background) > 0 {
+                while background.inbox_size(t.background) == 0 && background.pending(t.background) == 1 {
                     if canceled_(cancel) == 1 { return "Canceled", "" }
+                    poll_(s, sk)
                     sleep(20)
                 }
                 if background.inbox_size(t.background) == 0 { return "", "" }
@@ -786,20 +901,25 @@ run_steps_(s: *Session, pending: ptr, sk: @keep ptr, cancel: @keep ptr) -> (stri
     }
 }
 
-step_limit_detail_(s: *Session, sk: ptr, cancel: ptr, max_steps: int) -> string {
+// The Step limit is reached: wait for the background jobs the Turn waits for
+// (detached ones are not waited for), deliver their results into the log for
+// the next Turn, then stop. (err, detail).
+finish_step_limit_(s: *Session, pending: ptr, sk: ptr, cancel: ptr, max_steps: int) -> (string, string) {
     t = s.tools as *tools.Tools
-    waited = background.active_bash(t.background)
+    waited = background.pending_names(t.background)
     plural = "s"
     if max_steps == 1 { plural = "" }
-    if waited > 0 {
-        emit_(sk, "{\"notice\":\"Step limit reached; waiting for background tasks\"}")
-        while background.active_bash(t.background) > 0 {
-            if canceled_(cancel) == 1 { return "" }
-            sleep(20)
-        }
-        return "stopped after ${max_steps} step${plural} (waited for background tasks)"
+    if waited != "" { emit_(sk, "{\"notice\":${jsonx.quote("Step limit reached; waiting for background tasks: ${waited}")}}") }
+    while background.pending(t.background) == 1 {
+        if canceled_(cancel) == 1 { return "Canceled", "" }
+        poll_(s, sk)
+        berr = insert_background_(s, pending, sk, 0)
+        if berr != "" { return berr, "" }
+        if background.pending(t.background) == 1 { sleep(20) }
     }
-    return "stopped after ${max_steps} step${plural}"
+    if canceled_(cancel) == 1 { return "Canceled", "" }
+    if waited != "" { return "TooManySteps", "stopped after ${max_steps} step${plural} (waited for background tasks: ${waited})" }
+    return "TooManySteps", "stopped after ${max_steps} step${plural}"
 }
 
 // /undo (upstream Session.undo): the intent, then the restoration result,

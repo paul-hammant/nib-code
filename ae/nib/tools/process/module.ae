@@ -14,7 +14,7 @@ import std.worker
 import std.cryptography
 import nib.sysgap
 
-exports(Result, run, STOP_NONE, STOP_CANCELED, STOP_TIMED_OUT)
+exports(Result, run, run_ticking, STOP_NONE, STOP_CANCELED, STOP_TIMED_OUT)
 
 const STOP_NONE = ""
 const STOP_CANCELED = "Canceled"
@@ -50,6 +50,12 @@ output_size_(path: string) -> long {
 // argv: program first. env: "NAME=value" list or null (inherit). cancels: up
 // to two std.sync cells (either set cancels; may be null). timeout_ms 0: none.
 run(argv: ptr, env: ptr, cancel_a: ptr, cancel_b: ptr, timeout_ms: long, max_output: long) -> ptr {
+    return run_ticking(argv, env, cancel_a, cancel_b, timeout_ms, max_output, null, |ctx: ptr, bytes: long| {}, 0)
+}
+
+// run, calling tick(tick_ctx, output_bytes_so_far) every ~20 ms while the
+// child runs (the progress tracker's clock and byte count). has_tick 0: never.
+run_ticking(argv: ptr, env: ptr, cancel_a: ptr, cancel_b: ptr, timeout_ms: long, max_output: long, tick_ctx: @keep ptr, tick: @keep fn, has_tick: int) -> ptr {
     r = heap.new(Result)
     r.exit_code = -1
     r.stop = ""
@@ -88,21 +94,25 @@ run(argv: ptr, env: ptr, cancel_a: ptr, cancel_b: ptr, timeout_ms: long, max_out
     deadline = 0 as long
     if timeout_ms > 0 { deadline = os.now_monotonic_ms() + timeout_ms }
     killed = 0
+    beat = 0
     while sync.atomic_load(w.done) == 0 {
-        if killed == 0 {
+        if killed == 0 && beat % 4 == 0 {
+            size = output_size_(out_path)
             if set_(cancel_a) == 1 || set_(cancel_b) == 1 {
                 r.stop = STOP_CANCELED
             } else if deadline != 0 && os.now_monotonic_ms() >= deadline {
                 r.stop = STOP_TIMED_OUT
-            } else if output_size_(out_path) > max_output {
+            } else if size > max_output {
                 r.error = "OutputLimit"
             }
             if r.stop != "" || r.error != "" {
                 os.kill(0 - token, 9)
                 killed = 1
             }
+            if has_tick == 1 { call(tick, tick_ctx, size) }
         }
-        sleep(20)
+        beat = beat + 1
+        sleep(5)
     }
     r.end_ms_epoch = os.now_unix_ms()
     // The shell is gone: end whatever it left in its group.

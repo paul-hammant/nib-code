@@ -48,6 +48,9 @@ read_stdin_() -> string {
 
 eprint_(text: string) { io.fd_write(2, string.bytes(text)) }
 
+// One NDJSON line, written at once (not buffered until exit): events are live.
+jline_(text: string) { io.stdout_write("${text}\n") }
+
 // What the CLI parsed.
 struct Args {
     ask: int
@@ -136,7 +139,7 @@ fail_(json: int, err: string, detail: string, usage_json: string, steps: int, ti
     if json == 1 {
         t = ""
         if timing != "" { t = ",\"timing\":${timing}" }
-        println("{\"error\":{\"message\":${jsonx.quote(text)},\"usage\":${usage_json},\"steps\":${steps}${t}}}")
+        jline_("{\"error\":{\"message\":${jsonx.quote(text)},\"usage\":${usage_json},\"steps\":${steps}${t}}}")
     } else {
         eprint_("nib: ${text}\n")
     }
@@ -309,7 +312,7 @@ main() {
     s = sp as *session.Session
     prompt_text = a.prompt
     if prompt_text == "-" { prompt_text = read_stdin_() }
-    if a.json == 1 { println("{\"start\":{\"session_id\":${jsonx.quote(s.id)}}}") }
+    if a.json == 1 { jline_("{\"start\":{\"session_id\":${jsonx.quote(s.id)}}}") }
     cancel = sync.atomic_new(0)
     sysgap.watch_signals()
     sig_cell = s.signal
@@ -322,7 +325,7 @@ main() {
     json = a.json
     sink = session.new_sink(null, |ctx: ptr, ev: string| {
         if json == 1 {
-            println(ev)
+            jline_(ev)
         } else {
             print_event_(ev)
         }
@@ -331,7 +334,7 @@ main() {
     session.close(sp)
     if err != "" { fail_(a.json, err, detail, types.usage_json(s.usage), s.steps, session.timing_json(sp)) }
     if a.json == 1 {
-        println("{\"end\":{\"text\":${jsonx.quote(s.final_text)},\"usage\":${types.usage_json(s.usage)},\"steps\":${s.steps},\"timing\":${session.timing_json(sp)}}}")
+        jline_("{\"end\":{\"text\":${jsonx.quote(s.final_text)},\"usage\":${types.usage_json(s.usage)},\"steps\":${s.steps},\"timing\":${session.timing_json(sp)}}}")
         return
     }
     println("")

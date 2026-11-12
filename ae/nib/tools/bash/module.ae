@@ -12,14 +12,16 @@ import nib.tools.policy
 import nib.tools.secrets
 import nib.tools.process
 import nib.tools.registry
+import nib.tools.progress
 import nib.tools.jail
 import nib.sysgap
 
-exports(Ctx, Args, new_ctx, parse_args, validation_error, timeout_ms_of, check, execute, MAX_OUTPUT,
+exports(Ctx, Args, Tracker, new_tracker, tick_at, finish_tracker, new_ctx, parse_args, validation_error, timeout_ms_of, check, execute, MAX_OUTPUT,
         DEFAULT_TIMEOUT_MS, child_env)
 
 const MAX_OUTPUT = 16 * 1024 * 1024
 const DEFAULT_TIMEOUT_MS = 1800000
+const FOREGROUND_PROGRESS_THRESHOLD_MS = 3000
 
 struct Ctx {
     home: string
@@ -33,6 +35,10 @@ struct Ctx {
     self_exe: string
     env: ptr              // "NAME=value" list the child starts from (null: this process's)
     strip_env: string     // one more variable to remove (the provider key's), or ""
+    progress: ptr         // *progress.Queue, or null: no snapshots
+    background: int       // 1: a background task, its snapshot exists from the start
+    exec_start: long      // epoch ms before spawn / after the wait; 0: it never spawned
+    exec_end: long
 }
 
 struct Args {
@@ -56,6 +62,10 @@ new_ctx(home: string, cancel: @keep ptr, registry: @keep ptr, ids: @keep ptr) ->
     c.self_exe = ""
     c.env = null
     c.strip_env = ""
+    c.progress = null
+    c.background = 0
+    c.exec_start = 0 as long
+    c.exec_end = 0 as long
     return c as ptr
 }
 
@@ -132,6 +142,86 @@ child_env(cp: ptr) -> ptr {
 
 sysenv_() -> ptr { return sysgap.environ() }
 
+// Live progress of one command (upstream's Tracker): a snapshot a second
+// once it has run 3 s (a background task's from the start), a terminal one
+// at the end of every command.
+struct Tracker {
+    queue: ptr            // *progress.Queue, or null
+    command: string
+    id: string
+    run: int
+    background: int
+    detached: int
+    started: long
+    last_second: long
+    output_bytes: long
+    exit_code: int        // -1: none
+    has_value: int
+    value: ptr            // *progress.Progress
+}
+
+new_tracker(c: *Ctx, command: string, id: string, detached: int) -> ptr {
+    t = heap.new(Tracker)
+    t.queue = c.progress
+    t.command = command
+    t.id = id
+    t.run = c.run_id
+    t.background = c.background
+    t.detached = detached
+    t.started = os.now_monotonic_ms()
+    t.last_second = -1 as long
+    t.output_bytes = 0 as long
+    t.exit_code = -1
+    t.has_value = 0
+    t.value = null
+    if c.background == 1 && c.progress != null {
+        v = progress.new_value(id, progress.KIND_BASH, command, c.run_id) as *progress.Progress
+        v.background = 1
+        v.detached = detached
+        t.value = v as ptr
+        t.has_value = 1
+    }
+    return t as ptr
+}
+
+tick_at(t: *Tracker, elapsed: long) {
+    if t.queue == null { return }
+    if t.has_value == 0 {
+        if elapsed < FOREGROUND_PROGRESS_THRESHOLD_MS { return }
+        v0 = progress.new_value(t.id, progress.KIND_BASH, t.command, t.run)
+        progress.show(t.queue, v0)
+        t.value = v0
+        t.has_value = 1
+    }
+    v = t.value as *progress.Progress
+    v.elapsed_ms = elapsed
+    v.output_bytes = t.output_bytes
+    second = elapsed / 1000
+    if t.last_second == second { return }
+    t.last_second = second
+    v.state = "working"
+    progress.update(t.queue, t.value)
+}
+
+tick_(t: *Tracker) { tick_at(t, os.now_monotonic_ms() - t.started) }
+
+replaced_(t: *Tracker, id: string) {
+    if t.has_value == 0 { tick_at(t, FOREGROUND_PROGRESS_THRESHOLD_MS) }
+    if t.has_value == 1 { (t.value as *progress.Progress).superseded_by = id }
+}
+
+finish_tracker(t: *Tracker, state: string) {
+    if t.queue == null { return }
+    if t.has_value == 0 { tick_at(t, FOREGROUND_PROGRESS_THRESHOLD_MS) }
+    if t.has_value == 0 { return }
+    v = t.value as *progress.Progress
+    v.elapsed_ms = os.now_monotonic_ms() - t.started
+    v.output_bytes = t.output_bytes
+    v.state = state
+    v.exit_code = t.exit_code
+    progress.update(t.queue, t.value)
+}
+
 // Runs one command; (1, result JSON) or (0, error text). The id it ran
 // under is stored in *id_out (a one-element list) for the call's identity.
 // task_cancel: a background task's own cancel cell, or null.
@@ -140,6 +230,9 @@ execute(cp: ptr, command: string, timeout_ms: long, detached: int, id: string, t
     cwd = os.getcwd()
     cmd = registry.new_command(id, c.run_id, command, cwd, detached)
     registry.start(c.registry, cmd)
+    trp = new_tracker(c, command, id, detached)
+    tr = trp as *Tracker
+    tick_(tr)
     script = "exec 2>&1\n${command}"
     inner = list.list_new()
     list.list_add(inner, "bash")
@@ -151,12 +244,42 @@ execute(cp: ptr, command: string, timeout_ms: long, detached: int, id: string, t
     first = c.cancel
     if task_cancel != null { first = task_cancel }
     // Either the Run's/task's cancel or this command's own (supersession) stops it.
-    r = process.run(argv, child_env(cp), first, cancel_b, timeout_ms, MAX_OUTPUT) as *process.Result
+    r = process.run_ticking(argv, child_env(cp), first, cancel_b, timeout_ms, MAX_OUTPUT, trp, |ctx: ptr, bytes: long| {
+        tt = ctx as *Tracker
+        tt.output_bytes = bytes
+        tick_(tt)
+    }, 1) as *process.Result
+    c.exec_start = 0 as long
+    c.exec_end = 0 as long
+    if r.error == "" || r.error == "OutputLimit" {
+        c.exec_start = r.start_ms_epoch
+        c.exec_end = r.end_ms_epoch
+    }
     superseded = registry.finish(c.registry, cmd)
-    if superseded != "" { return 1, "{\"superseded_by\":${jsonx.quote(superseded)}}" }
-    if r.error == "OutputLimit" { return 0, "output exceeds 16 MiB; redirect output to a file" }
-    if r.error != "" { return 0, r.error }
-    if r.stop == process.STOP_TIMED_OUT { return 0, "timed out after ${timeout_ms} ms" }
-    if r.stop == process.STOP_CANCELED { return 0, "canceled" }
+    if superseded != "" {
+        replaced_(tr, superseded)
+        finish_tracker(tr, "done")
+        return 1, "{\"superseded_by\":${jsonx.quote(superseded)}}"
+    }
+    if r.error == "OutputLimit" {
+        finish_tracker(tr, "failed")
+        return 0, "output exceeds 16 MiB; redirect output to a file"
+    }
+    if r.error != "" {
+        finish_tracker(tr, "failed")
+        return 0, r.error
+    }
+    if r.stop == process.STOP_TIMED_OUT {
+        finish_tracker(tr, "timed_out")
+        return 0, "timed out after ${timeout_ms} ms"
+    }
+    if r.stop == process.STOP_CANCELED {
+        finish_tracker(tr, "canceled")
+        return 0, "canceled"
+    }
+    tr.exit_code = r.exit_code
+    state = "failed"
+    if r.exit_code == 0 { state = "done" }
+    finish_tracker(tr, state)
     return 1, "{\"exit_code\":${r.exit_code},\"output\":${jsonx.quote(r.output)}}"
 }

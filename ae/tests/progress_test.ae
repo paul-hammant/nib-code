@@ -1,0 +1,157 @@
+// Ports the tests of upstream src/tools/progress.zig (a2dd439). Snapshots
+// reach the sink as the JSON text of {"progress":…}; the Zig tests' field
+// reads are checks on that text and on the Queue's slots.
+import std.spec
+import std.list
+import std.string
+import nib.jsonx
+import nib.tools.progress
+
+struct Capture {
+    json: ptr       // list of the emitted snapshot JSON texts
+}
+
+capture_new_() -> *Capture {
+    c = heap.new(Capture)
+    c.json = list.list_new()
+    return c
+}
+
+attach_(q: ptr, c: @keep *Capture) {
+    progress.set_sink(q, c as ptr, |ctx: ptr, json: string| {
+        cc = ctx as *Capture
+        list.list_add(cc.json, string.copy(json))
+    })
+}
+
+last_(c: *Capture) -> string {
+    s, _g = list.get_string(c.json, list.list_size(c.json) - 1)
+    return s
+}
+
+value_(id: string, kind: string, prompt: string, run: int) -> *progress.Progress {
+    return progress.new_value(id, kind, prompt, run) as *progress.Progress
+}
+
+slot_(q: ptr, i: int) -> *progress.Progress { return progress.slot_at(q, i) as *progress.Progress }
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tools.progress") {
+        spec.it("progress IDs have independent session counters and updates preserve creation order") callback {
+            q = progress.new()
+            a1 = progress.add(q, "agent", "first", 1, 0)
+            b1 = progress.add(q, "bash", "second", 1, 1)
+            a2 = progress.add(q, "agent", "third", 2, 1)
+            spec.assert_str_eq(a1, "a1", "a1")
+            spec.assert_str_eq(b1, "b1", "b1")
+            spec.assert_str_eq(a2, "a2", "a2")
+            u = value_(a2, "agent", "updated", 2)
+            u.background = 1
+            u.state = "done"
+            spec.assert_str_eq(progress.update(q, u as ptr), "", "update a2")
+            w = value_(b1, "bash", "second", 0)
+            w.background = 1
+            w.detached = 1
+            w.elapsed_ms = 1000 as long
+            spec.assert_str_eq(progress.update(q, w as ptr), "", "update b1")
+            spec.assert_str_eq(slot_(q, 0).id, a1, "order 0")
+            spec.assert_str_eq(slot_(q, 1).id, b1, "order 1")
+            spec.assert_eq(slot_(q, 1).detached, 1, "detached")
+            spec.assert_str_eq(slot_(q, 2).id, a2, "order 2")
+            spec.assert_str_eq(slot_(q, 2).prompt, "updated", "prompt")
+            spec.assert_eq(slot_(q, 2).background, 1, "background")
+            spec.assert_eq(slot_(q, 2).run, 2, "run")
+            spec.assert_str_eq(progress.update(q, value_("a99", "agent", "missing", 0) as ptr), "UnknownProgressId", "unknown id")
+            progress.clear(q)
+            spec.assert_str_eq(progress.add(q, "agent", "next turn", 1, 0), "a3", "a3 after clear")
+            spec.assert_str_eq(progress.add(q, "bash", "next run", 1, 0), "b2", "b2 after clear")
+        }
+        spec.it("progress coalesces working updates per second but delivers terminal snapshots immediately") callback {
+            c = capture_new_()
+            q = progress.new()
+            attach_(q, c)
+            id = progress.add(q, "agent", "one", 1, 0)
+            progress.drain_at(q, 0 as long)
+            spec.assert_eq(list.list_size(c.json), 1, "first snapshot at once")
+            u2 = value_(id, "agent", "one", 0)
+            u2.step = 2
+            progress.update(q, u2 as ptr)
+            u3 = value_(id, "agent", "one", 0)
+            u3.step = 3
+            progress.update(q, u3 as ptr)
+            progress.drain_at(q, 999 as long)
+            spec.assert_eq(list.list_size(c.json), 1, "held within a second")
+            progress.drain_at(q, 1000 as long)
+            spec.assert_eq(list.list_size(c.json), 2, "due after a second")
+            spec.assert_true(string.contains(last_(c), "\"step\":3"), "the latest step")
+            u4 = value_(id, "agent", "one", 0)
+            u4.step = 4
+            u4.state = "done"
+            progress.update(q, u4 as ptr)
+            progress.drain_at(q, 1000 as long)
+            spec.assert_eq(list.list_size(c.json), 3, "terminal state unthrottled")
+            spec.assert_true(string.contains(last_(c), "\"state\":\"done\""), "done")
+            progress.drain_at(q, 2000 as long)
+            spec.assert_eq(list.list_size(c.json), 3, "nothing new")
+        }
+        spec.it("restarts retain every invocation through one drain and late updates stay isolated") callback {
+            c = capture_new_()
+            q = progress.new()
+            attach_(q, c)
+            id = progress.add_agent(q, "first", 1, 1, 0)
+            first = progress.current_invocation(q, id)
+            spec.assert_true(first != 0, "first invocation assigned")
+            d1 = value_(id, "agent", "first", 1)
+            d1.invocation = first
+            d1.background = 1
+            d1.state = "done"
+            progress.update(q, d1 as ptr)
+            r = value_(id, "agent", "second", 1)
+            r.background = 1
+            progress.restart(q, r as ptr)
+            second = progress.current_invocation(q, id)
+            spec.assert_true(second > first, "restart assigns a later invocation")
+            f2 = value_(id, "agent", "second", 1)
+            f2.invocation = second
+            f2.background = 1
+            f2.state = "failed"
+            progress.update(q, f2 as ptr)
+            late = value_(id, "agent", "first", 1)
+            late.invocation = first
+            late.background = 1
+            late.state = "done"
+            late.step = 3
+            progress.update(q, late as ptr)
+            progress.drain_at(q, 0 as long)
+            spec.assert_eq(list.list_size(c.json), 2, "both invocations delivered")
+            j0, _g0 = list.get_string(c.json, 0)
+            j1, _g1 = list.get_string(c.json, 1)
+            v0 = jsonx.parse(j0)
+            v1 = jsonx.parse(j1)
+            spec.assert_eq(jsonx.int_or(v0, "invocation", 0), first, "invocation 0")
+            spec.assert_eq(jsonx.int_or(v1, "invocation", 0), second, "invocation 1")
+            spec.assert_str_eq(jsonx.str_or(v0, "id", ""), "a1", "id 0")
+            spec.assert_str_eq(jsonx.str_or(v1, "id", ""), "a1", "id 1")
+            spec.assert_str_eq(jsonx.str_or(v0, "state", ""), "done", "state 0")
+            spec.assert_str_eq(jsonx.str_or(v1, "state", ""), "failed", "state 1")
+            spec.assert_eq(jsonx.int_or(v0, "step", 0), 3, "step 0")
+            spec.assert_eq(jsonx.int_or(v1, "step", 0), 0, "step 1")
+            unknown = value_(id, "agent", "unknown", 0)
+            unknown.invocation = second + 1
+            spec.assert_str_eq(progress.update(q, unknown as ptr), "UnknownProgressId", "unknown invocation")
+            progress.clear(q)
+            spec.assert_eq(progress.current_invocation(q, id), 0, "cleared")
+            progress.restart(q, value_(id, "agent", "third", 0) as ptr)
+            spec.assert_true(progress.current_invocation(q, id) > second, "later still after clear")
+        }
+        spec.it("resume continues each id prefix and the Step record carries the high water marks") callback {
+            q = progress.new()
+            progress.set_counters(q, 5 as long, 3 as long, 1 as long)
+            spec.assert_str_eq(progress.task_ids_json(q), "{\"agent\":4,\"bash\":2,\"run\":0}", "high water")
+            spec.assert_str_eq(progress.reserve_bash(q), "b3", "next bash id")
+            spec.assert_str_eq(progress.task_ids_json(q), "{\"agent\":4,\"bash\":3,\"run\":0}", "advanced")
+        }
+    }
+    return spec.run_summary(fw)
+}
