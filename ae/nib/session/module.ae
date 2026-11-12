@@ -821,6 +821,7 @@ run_steps_(s: *Session, pending: ptr, sk: @keep ptr, cancel: @keep ptr) -> (stri
         if waiting == 1 { wflag = 1 }
         list.list_add(pending, msg.assistant(r.text, r.tool_calls, r.reasoning_provider, r.reasoning_data, r.reasoning_includes_output, r.phase, wflag, effort))
         run = timing.new()
+        timing.set_detail(run, 1)
         run_results = "["
         run_ms = 0 as long
         output_bytes = 0 as long

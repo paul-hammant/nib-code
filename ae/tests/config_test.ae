@@ -143,15 +143,15 @@ main() {
                      "provider = \"invalid\"", "effort \"high\"", "[chat_completions", "[chat_completions] trailing", "effort = \"high",
                      "effort = \"high\" extra", "effort = \"hi\\q\"", "effort = \"high\"\neffort = \"low\"", "[chat_completions]\n[chat_completions]",
                      "\napi_key = \"no\"", "[chat_completions]\naccess_token = \"no\"", "[chat_completions]\napi-key = \"no\"", "[credentials]",
-                     "effort = \"high\"\r", "# \xff", "[codex]\nmodel = \"x\"", "provider = \"codex\""]
-            lines = [2, 2, 2, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1]
+                     "effort = \"high\"\r", "# \xff", "[codex]\neffort = \"high\"\n", "provider = \"codex\""]
+            lines = [2, 2, 2, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 1, 1, 1, 2, 1]
             msgs = ["unknown section", "unknown top-level key", "unknown provider key", "must be a string", "must be a string",
                     "must be a string", "must be a string", "must be an integer", "must be an integer", "positive u64", "positive u64",
                     "positive u64", "decimal integer", "leading zero", "separator", "invalid effort", "provider must be", "expected key = value",
                     "unterminated section", "after section", "unterminated string", "after value", "unsupported string escape", "duplicate key",
                     "duplicate section", "use NIB_API_KEY", "use NIB_API_KEY", "use NIB_API_KEY", "use NIB_API_KEY", "carriage return",
-                    "invalid UTF-8", "unknown section 'codex'", "unknown 'codex'"]
-            // dropped with Codex: the [codex] cases became [openai] / [chat_completions]; the last two pin the drop
+                    "invalid UTF-8", "unknown provider key", "unknown 'codex'"]
+            // dropped with Codex: the [codex] cases became [openai] / [chat_completions]; [codex] keys are still checked, provider = "codex" is refused
             i = 0
             while i < 33 {
                 expect_parse_error_(texts[i], lines[i], msgs[i])
@@ -760,13 +760,21 @@ main() {
         }
     }
     spec.describe(fw, "config (port additions)") {
-        spec.it("the Codex surface is gone") callback {
+        spec.it("the Codex provider is gone but a [codex] section still loads") callback {
             e = env.new()
             env.set(e, "NIB_CODEX_TRANSPORT", "bogus")
             env.set(e, "NIB_CODEX_RUN_TOOL", "bogus")
             spec.assert_str_eq(err_(e, ""), "", "codex variables are ignored")
             spec.assert_eq(types.known_id("codex"), 0, "codex is not an id")
-            expect_parse_error_("[codex]\ntransport = \"sse\"\n", 1, "unknown section 'codex'")
+            expect_parse_error_("[codex]\ntransport = \"tcp\"\n", 2, "transport must be websocket or sse")
+            expect_parse_error_("[codex]\nrun_tool = \"x\"\n", 2, "run_tool must be custom or function")
+            expect_parse_error_("[codex]\nprotocol = \"responses\"\n", 2, "unknown provider key 'protocol'")
+            e2 = env.new()
+            env.set(e2, "NIB_PROVIDER", "openai")
+            env.set(e2, "OPENAI_API_KEY", "k")
+            cfg, rerr, rdetail = config.resolve(e2, "[codex]\nmodel = \"gpt-6.1-sol\"\ntransport = \"sse\"\nreasoning_summary = \"auto\"\nrun_tool = \"function\"\n", "/c.toml")
+            spec.assert_str_eq(rerr, "", "a [codex] section loads: ${rdetail}")
+            spec.assert_str_eq(types.name(cfg), "openai", "and is ignored")
         }
         spec.it("home joins HOME and .nib and rejects nothing else") callback {
             e = env.new()

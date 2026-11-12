@@ -7,8 +7,9 @@
 // "NIB_X: expected ...") in the last slot.
 //
 // Not ported, by policy (API keys only): the Codex provider. `codex` is not a
-// known id, so `provider = "codex"` and a `[codex]` section are configuration
-// errors, and the [codex] keys transport / reasoning_summary / run_tool, the
+// known id, so `provider = "codex"` is a configuration error; a `[codex]`
+// section is validated as upstream (so files written for upstream load) and
+// ignored, and with it the keys transport / reasoning_summary / run_tool, the
 // NIB_CODEX_TRANSPORT / NIB_CODEX_RUN_TOOL / NIB_AUTH_ISSUER / CODEX_HOME
 // variables and the Codex login in credentialed() are gone. The service a
 // config without a provider selects is the first of startup_order() (anthropic),
@@ -608,6 +609,8 @@ header_(s: *S, line: string, start: int) -> string {
     }
     builtin_dyn = 0
     if types.known_id(name) == 1 && name != "chat_completions" { builtin_dyn = 1 }
+    // [codex] is validated as upstream and ignored: the Codex provider is not ported.
+    if name == "codex" { builtin_dyn = 1 }
     custom = string.starts_with(name, "providers.")
     if custom == 1 || builtin_dyn == 1 {
         id = name
@@ -839,12 +842,20 @@ generic_kv_(s: *S, key: string, value: string, voff: int, start: int, lstart: in
     } else {
         pcustom = 0
         if sec == SEC_PROVIDER && cur.custom == 1 { pcustom = 1 }
+        pcodex = 0
+        if sec == SEC_PROVIDER && cur.name == "codex" { pcodex = 1 }
         if key == "model" {
             index = 0
         } else if key == "base_url" {
             index = 1
         } else if key == "context_window" {
             index = 2
+        } else if pcodex == 1 && key == "transport" {
+            index = 3
+        } else if pcodex == 1 && key == "reasoning_summary" {
+            index = 4
+        } else if pcodex == 1 && key == "run_tool" {
+            index = 5
         } else if pcustom == 1 && key == "protocol" {
             index = 6
         } else if pcustom == 1 && key == "api_key_env" {
@@ -920,6 +931,12 @@ generic_kv_(s: *S, key: string, value: string, voff: int, start: int, lstart: in
             settings.model = decoded
             settings.model_set = 1
             settings.model_line = s.line
+        } else if index == 3 {
+            if decoded != "websocket" && decoded != "sse" { return "transport must be websocket or sse" }
+        } else if index == 4 {
+            if decoded != "off" && decoded != "auto" { return "reasoning_summary must be off or auto" }
+        } else if index == 5 {
+            if decoded != "custom" && decoded != "function" { return "run_tool must be custom or function" }
         } else if index == 6 {
             if types.known_protocol(decoded) == 0 { return "protocol must be responses, chat_completions or anthropic_messages" }
             settings.protocol = decoded
