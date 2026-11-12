@@ -1,0 +1,184 @@
+// mcp.mcp_index: the compact tool index appended to the system prompt
+// (upstream src/mcp/index.zig): per tool one line `server.tool(sig) — first
+// sentence`, at most 40 tools per server, nested objects collapsed to {…},
+// signatures and descriptions clipped. Pure: JSON text in, text out.
+
+import std.json
+import std.list
+import std.string
+import std.strbuilder
+import nib.jsonx
+
+exports(MAX_TOOLS, MAX_DESCRIPTION, signature, compact, append)
+
+const MAX_TOOLS = 40
+const MAX_DESCRIPTION = 120
+
+byte_(s: string, i: int) -> int { return string.char_at(s, i) & 255 }
+
+is_space_(c: int) -> int {
+    if c == 32 || (c >= 9 && c <= 13) { return 1 }
+    return 0
+}
+
+cont_(s: string, i: int, n: int, lo: int, hi: int) -> int {
+    if i >= n { return 0 }
+    c = byte_(s, i)
+    if c < lo || c > hi { return 0 }
+    return 1
+}
+
+// 1 when the first n bytes of s are well-formed UTF-8 (std.unicode.utf8ValidateSlice).
+utf8_valid_(s: string, n: int) -> int {
+    i = 0
+    while i < n {
+        c = byte_(s, i)
+        if c < 128 {
+            i = i + 1
+        } else if c >= 194 && c <= 223 {
+            if cont_(s, i + 1, n, 128, 191) == 0 { return 0 }
+            i = i + 2
+        } else if c >= 224 && c <= 239 {
+            lo = 128
+            hi = 191
+            if c == 224 { lo = 160 }
+            if c == 237 { hi = 159 }
+            if cont_(s, i + 1, n, lo, hi) == 0 { return 0 }
+            if cont_(s, i + 2, n, 128, 191) == 0 { return 0 }
+            i = i + 3
+        } else if c >= 240 && c <= 244 {
+            lo = 128
+            hi = 191
+            if c == 240 { lo = 144 }
+            if c == 244 { hi = 143 }
+            if cont_(s, i + 1, n, lo, hi) == 0 { return 0 }
+            if cont_(s, i + 2, n, 128, 191) == 0 { return 0 }
+            if cont_(s, i + 3, n, 128, 191) == 0 { return 0 }
+            i = i + 4
+        } else {
+            return 0
+        }
+    }
+    return 1
+}
+
+// The first `max` bytes of `text` with whitespace and control bytes as
+// spaces, cut back to whole UTF-8 characters.
+compact(text: string, max: int) -> string {
+    n = string.length(text)
+    if n > max { n = max }
+    b = strbuilder.new(n + 8)
+    i = 0
+    while i < n {
+        c = byte_(text, i)
+        if is_space_(c) == 1 || c < 32 || c == 127 {
+            strbuilder.append_byte(b, 32)
+        } else {
+            strbuilder.append_byte(b, c)
+        }
+        i = i + 1
+    }
+    out = strbuilder.finish(b)
+    while n > 0 && utf8_valid_(out, n) == 0 { n = n - 1 }
+    return string.substring(out, 0, n)
+}
+
+kind_(schema: ptr) -> string {
+    values = jsonx.field(schema, "enum")
+    size = jsonx.array_size(values)
+    if size > 0 && size <= 8 && string.length(jsonx.encode(values)) <= 120 {
+        out = ""
+        i = 0
+        while i < size {
+            if i > 0 { out = "${out}|" }
+            out = "${out}${jsonx.encode(jsonx.array_at(values, i))}"
+            i = i + 1
+        }
+        return out
+    }
+    t = jsonx.str_or(schema, "type", "unknown")
+    if t == "object" { return "{…}" }
+    if t == "array" { return "${kind_(jsonx.field(schema, "items"))}[]" }
+    if t == "string" || t == "boolean" || t == "number" || t == "null" { return string.copy(t) }
+    if t == "integer" { return "number" }
+    return "unknown"
+}
+
+signature_of_(schema: ptr) -> string {
+    props = jsonx.field(schema, "properties")
+    if props == null { return "" }
+    if json.json_type(props) != json.JSON_OBJECT { return "" }
+    required = jsonx.field(schema, "required")
+    out = ""
+    n = json.object_size(props)
+    i = 0
+    while i < n {
+        k, fv, _e = json.object_entry(props, i)
+        if string.length(out) > 0 { out = "${out}, " }
+        mandatory = 0
+        rs = jsonx.array_size(required)
+        j = 0
+        while j < rs {
+            item = jsonx.array_at(required, j)
+            if json.json_type(item) == json.JSON_STRING && jsonx.str_field(item) == k { mandatory = 1 }
+            j = j + 1
+        }
+        mark = "?"
+        if mandatory == 1 { mark = "" }
+        out = "${out}${compact(k, 40)}${mark}: ${kind_(fv)}"
+        if string.length(out) >= 200 {
+            out = "${out}, …"
+            return out
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// The signature of the JSON Schema text `schema`: `q: string, limit?: number`.
+signature(schema: string) -> string {
+    doc = jsonx.parse(schema)
+    if doc == null { return "" }
+    out = signature_of_(doc)
+    jsonx.free(doc)
+    return out
+}
+
+// The index lines of server `id`'s tools (a list of tool JSON texts): at
+// most 40, then the count omitted.
+append(id: string, tools: ptr) -> string {
+    total = list.list_size(tools)
+    shown = total
+    if shown > MAX_TOOLS { shown = MAX_TOOLS }
+    out = ""
+    i = 0
+    while i < shown {
+        text, _e = list.get_string(tools, i)
+        tool = jsonx.parse(text)
+        if tool != null {
+            if jsonx.kind(tool, "name") == json.JSON_STRING {
+                name = jsonx.str_or(tool, "name", "")
+                description = jsonx.str_or(tool, "description", "")
+                dn = string.length(description)
+                end = dn
+                k = 0
+                while k < dn {
+                    c = byte_(description, k)
+                    if (c == 46 || c == 33 || c == 63) && (k + 1 == dn || is_space_(byte_(description, k + 1)) == 1) {
+                        end = k + 1
+                        break
+                    }
+                    k = k + 1
+                }
+                line = "${id}.${compact(name, string.length(name))}(${signature_of_(jsonx.field(tool, "inputSchema"))}) — ${compact(string.substring(description, 0, end), MAX_DESCRIPTION)}\n"
+                out = "${out}${line}"
+            }
+            jsonx.free(tool)
+        }
+        i = i + 1
+    }
+    if total > MAX_TOOLS {
+        out = "${out}${id}: ${total - MAX_TOOLS} tools omitted; use tools.mcp_schema(\"server.tool\") for full schemas.\n"
+    }
+    return out
+}

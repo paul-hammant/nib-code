@@ -1,0 +1,116 @@
+// tools.mcp_tool: the Run API's tools.mcp and tools.mcp_schema (upstream
+// src/tools/mcp.zig). Server and transport failures are data
+// ({ok:false, content:"", error}); a malformed call is a rejection.
+// Text content items are joined with newlines; structuredContent rides
+// along.
+//
+// STAND-IN: images are not ported. An image item reads "[image omitted]"
+// when the model has no vision and "[image omitted: images not ported]"
+// otherwise, where upstream stores it in the Session image store (subject
+// to the four-per-Run limit) and writes "[image attached]".
+
+import std.json
+import std.string
+import nib.jsonx
+import nib.mcp
+
+exports(execute, map_content)
+
+failure_(message_text: string) -> string {
+    return "{\"ok\":false,\"content\":\"\",\"error\":${jsonx.quote(message_text)}}"
+}
+
+image_status_(vision: int) -> string {
+    // STAND-IN for upstream attach(): see the module comment.
+    if vision == 0 { return "[image omitted]" }
+    return "[image omitted: images not ported]"
+}
+
+// The text of a tool result's `content` array (JSON text): items joined
+// with newlines, each as upstream mapContent.
+map_content(content_json: string, vision: int) -> string {
+    doc = jsonx.parse(content_json)
+    n = jsonx.array_size(doc)
+    out = ""
+    i = 0
+    while i < n {
+        if i > 0 { out = "${out}\n" }
+        item = jsonx.array_at(doc, i)
+        kind = jsonx.str_or(item, "type", "unknown")
+        if kind == "text" {
+            out = "${out}${jsonx.str_or(item, "text", "")}"
+        } else if kind == "image" {
+            out = "${out}${image_status_(vision)}"
+        } else if kind == "resource_link" {
+            out = "${out}[resource link: ${jsonx.str_or(item, "uri", "")}]"
+        } else if kind == "resource" {
+            out = "${out}[resource: ${jsonx.str_or(jsonx.field(item, "resource"), "uri", "")}]"
+        } else if kind == "audio" {
+            out = "${out}[audio omitted]"
+        } else {
+            out = "${out}[unsupported content omitted]"
+        }
+        i = i + 1
+    }
+    jsonx.free(doc)
+    return out
+}
+
+// args: {"name": "server.tool", "arguments": {...}}. schema 1: the tool's
+// input schema (mcp_schema), else a call (mcp). client: an mcp.Client or
+// null. (1, JSON text) is the call's result, data even when it failed;
+// (0, text) rejects the call with `text`. vision: 1 when the model takes images.
+execute(client: ptr, args: string, schema: int, cancel: @keep ptr, vision: int) -> (int, string) {
+    input = jsonx.parse(args)
+    if input == null { return 0, "expected a server.tool name and argument object" }
+    if jsonx.kind(input, "name") != json.JSON_STRING {
+        jsonx.free(input)
+        return 0, "expected a server.tool name"
+    }
+    name = string.copy(jsonx.str_or(input, "name", ""))
+    _s, _t, serr = mcp.split(name)
+    if serr != "" {
+        jsonx.free(input)
+        return 0, "expected server.tool"
+    }
+    arguments = jsonx.field(input, "arguments")
+    if schema == 0 && (arguments == null || json.json_type(arguments) != json.JSON_OBJECT) {
+        jsonx.free(input)
+        return 0, "arguments must be an object"
+    }
+    if client == null {
+        jsonx.free(input)
+        return 1, failure_("MCP is unavailable")
+    }
+    if schema == 1 {
+        jsonx.free(input)
+        out, err = mcp.schema(client, name, cancel)
+        if err != "" { return 1, failure_(err) }
+        return 1, out
+    }
+    args_json = jsonx.encode(arguments)
+    jsonx.free(input)
+    result, cerr, last = mcp.call(client, name, args_json, cancel)
+    if cerr != "" {
+        text = cerr
+        if cerr == "ServerError" && last != "" { text = last }
+        return 1, failure_(text)
+    }
+    doc = jsonx.parse(result)
+    content = ""
+    cj = jsonx.field(doc, "content")
+    if cj != null { content = map_content(jsonx.encode(cj), vision) }
+    ok = 1
+    if jsonx.bool_or(doc, "isError", 0) == 1 { ok = 0 }
+    structured = "null"
+    sc = jsonx.field(doc, "structuredContent")
+    if sc != null { structured = jsonx.encode(sc) }
+    jsonx.free(doc)
+    ok_text = "true"
+    err_text = "null"
+    if ok == 0 {
+        ok_text = "false"
+        if string.length(content) > 0 { err_text = jsonx.quote(content) } else { err_text = jsonx.quote("MCP tool failed") }
+    }
+    return 1, "{\"ok\":${ok_text},\"content\":${jsonx.quote(content)},\"structured\":${structured},\"error\":${err_text}}"
+}

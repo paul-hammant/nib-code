@@ -1,0 +1,155 @@
+// mcp.mcp_headers: `x-mcp-header` schema annotations mirrored into
+// Mcp-Param-* request headers (upstream src/mcp/headers.zig).
+
+import std.json
+import std.list
+import std.string
+import std.encoding
+import nib.jsonx
+
+exports(encode, valid, append)
+
+byte_(s: string, i: int) -> int { return string.char_at(s, i) & 255 }
+
+// The header value for `text`: itself when plain printable ASCII without
+// edge blanks, else =?base64?<padded base64>?=.
+encode(text: string) -> string {
+    n = string.length(text)
+    safe = 1
+    if n > 0 {
+        first = byte_(text, 0)
+        last = byte_(text, n - 1)
+        if first == 32 || first == 9 || last == 32 || last == 9 { safe = 0 }
+    }
+    if string.starts_with(text, "=?base64?") == 1 && string.ends_with(text, "?=") == 1 { safe = 0 }
+    i = 0
+    while i < n {
+        c = byte_(text, i)
+        if c < 32 || c > 126 { safe = 0 }
+        i = i + 1
+    }
+    if safe == 1 { return text }
+    return "=?base64?${encoding.base64_encode_padded(string.bytes(text))}?="
+}
+
+token_char_(c: int) -> int {
+    if (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) { return 1 }
+    if string.index_of("!#$%&'*+-.^_`|~", string.from_char(c)) >= 0 { return 1 }
+    return 0
+}
+
+validate_(schema: ptr, reachable: int, names: ptr) -> int {
+    if schema == null { return 1 }
+    t = json.json_type(schema)
+    if t == json.JSON_ARRAY {
+        n = json.json_array_size(schema)
+        i = 0
+        while i < n {
+            if validate_(json.json_array_get_raw(schema, i), 0, names) == 0 { return 0 }
+            i = i + 1
+        }
+    }
+    if t != json.JSON_OBJECT { return 1 }
+    annotation = jsonx.field(schema, "x-mcp-header")
+    if annotation != null && json.json_type(annotation) != json.JSON_NULL {
+        if json.json_type(annotation) != json.JSON_STRING { return 0 }
+        name = jsonx.str_field(annotation)
+        if reachable == 0 || string.length(name) == 0 { return 0 }
+        i = 0
+        while i < string.length(name) {
+            if token_char_(byte_(name, i)) == 0 { return 0 }
+            i = i + 1
+        }
+        if jsonx.kind(schema, "type") != json.JSON_STRING { return 0 }
+        kind = jsonx.str_or(schema, "type", "")
+        if kind != "string" && kind != "integer" && kind != "boolean" { return 0 }
+        lower = string.to_lower(name)
+        j = 0
+        while j < list.list_size(names) {
+            seen, _e = list.get_string(names, j)
+            if seen == lower { return 0 }
+            j = j + 1
+        }
+        list.list_add(names, lower)
+    }
+    n = json.object_size(schema)
+    i = 0
+    while i < n {
+        k, v, _e2 = json.object_entry(schema, i)
+        if k == "properties" && json.json_type(v) == json.JSON_OBJECT {
+            m = json.object_size(v)
+            p = 0
+            while p < m {
+                _pk, pv, _e3 = json.object_entry(v, p)
+                if validate_(pv, reachable, names) == 0 { return 0 }
+                p = p + 1
+            }
+        } else if validate_(v, 0, names) == 0 {
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+// 1 when every x-mcp-header annotation in the schema JSON text is allowed:
+// a unique token name on a reachable string/integer/boolean property.
+valid(schema: string) -> int {
+    doc = jsonx.parse(schema)
+    if doc == null { return 0 }
+    names = list.list_new()
+    ok = validate_(doc, 1, names)
+    jsonx.free(doc)
+    return ok
+}
+
+is_null_(v: ptr) -> int {
+    if v == null { return 1 }
+    if json.json_type(v) == json.JSON_NULL { return 1 }
+    return 0
+}
+
+append_(names: ptr, values: ptr, schema: ptr, args: ptr) -> string {
+    if schema == null { return "" }
+    ann = jsonx.field(schema, "x-mcp-header")
+    if ann != null && json.json_type(ann) == json.JSON_STRING && is_null_(args) == 0 {
+        if jsonx.kind(schema, "type") != json.JSON_STRING { return "InvalidHeaderParameter" }
+        kind = jsonx.str_or(schema, "type", "")
+        at = json.json_type(args)
+        if kind == "string" && at != json.JSON_STRING { return "InvalidHeaderParameter" }
+        if kind == "boolean" && at != json.JSON_BOOL { return "InvalidHeaderParameter" }
+        if kind == "integer" {
+            if jsonx.is_integer(args) == 0 { return "InvalidHeaderParameter" }
+            n = json.json_get_long(args)
+            if n < -9007199254740991 || n > 9007199254740991 { return "InvalidHeaderParameter" }
+        }
+        text = ""
+        if at == json.JSON_STRING { text = jsonx.str_field(args) } else { text = jsonx.encode(args) }
+        list.list_add(names, "Mcp-Param-${jsonx.str_field(ann)}")
+        list.list_add(values, encode(text))
+    }
+    props = jsonx.field(schema, "properties")
+    if props != null && json.json_type(props) == json.JSON_OBJECT && args != null && json.json_type(args) == json.JSON_OBJECT {
+        n = json.object_size(props)
+        i = 0
+        while i < n {
+            k, pv, _e = json.object_entry(props, i)
+            e = append_(names, values, pv, jsonx.field(args, k))
+            if e != "" { return e }
+            i = i + 1
+        }
+    }
+    return ""
+}
+
+// Adds the Mcp-Param-* headers for `args` (JSON text) against `schema`
+// (JSON text) to the parallel lists names/values. "" or the error name.
+append(names: ptr, values: ptr, schema: string, args: string) -> string {
+    s = jsonx.parse(schema)
+    if s == null { return "" }
+    a = jsonx.parse(args)
+    e = append_(names, values, s, a)
+    jsonx.free(s)
+    jsonx.free(a)
+    return e
+}

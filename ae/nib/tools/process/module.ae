@@ -16,7 +16,7 @@ import std.ipc
 import std.io
 import nib.sysgap
 
-exports(Result, run, run_ticking, run_lines, environ, STOP_NONE, STOP_CANCELED, STOP_TIMED_OUT)
+exports(Result, run, run_ticking, run_lines, open_stdio, kill_child, close_fd, environ, STOP_NONE, STOP_CANCELED, STOP_TIMED_OUT)
 
 const STOP_NONE = ""
 const STOP_CANCELED = "Canceled"
@@ -280,4 +280,37 @@ run_lines(argv: ptr, env: ptr, input: string, cancel: ptr, timeout_ms: long, gra
     r.exit_code = w.code
     r.output = total
     return r as ptr
+}
+
+// ---- a long-lived child with stdin/stdout pipes (tools.mcp_transport) ----
+
+// Starts argv (program first) in directory `cwd` with the pipes the caller
+// keeps: (to_child_fd, from_child_fd, pid, ""), or (-1, -1, -1, reason).
+// stderr is discarded (upstream's .stderr = .ignore) and the working
+// directory is set by the shell, since os.run_stdio has neither a cwd nor a
+// stderr choice (asks/aether-run-stdio-stderr.md); exec keeps the pid. The
+// caller reads and writes the fds with std.ipc, and ends the child with
+// kill_child and close_fd.
+open_stdio(argv: ptr, env: ptr, cwd: string) -> (int, int, int, string) {
+    rest = list.list_new()
+    list.list_add(rest, "-c")
+    list.list_add(rest, "cd \"$1\" && shift && exec \"$@\" 2>/dev/null")
+    list.list_add(rest, "sh")
+    list.list_add(rest, cwd)
+    i = 0
+    while i < list.list_size(argv) {
+        a, _e = list.get_string(argv, i)
+        list.list_add(rest, a)
+        i = i + 1
+    }
+    sysgap.ignore_sigpipe()
+    return os.run_stdio("/bin/sh", rest, env)
+}
+
+close_fd(fd: int) { io.fd_close(fd) }
+
+// KILL the child and reap it (upstream Transport.close's kill).
+kill_child(pid: int) {
+    os.kill(pid, 9)
+    os.wait_pid(pid)
 }

@@ -1,0 +1,303 @@
+// mcp: the MCP client over a list of configured servers (upstream
+// src/mcp.zig). Only enabled servers are discovered; the prompt carries a
+// compact index of their tools, full schemas stay out of it. A call lists
+// tools again only after notifications/tools/list_changed arrived on the
+// connection, or once when the named tool is missing from the cached list.
+// A per-Client lock serializes prompt, schema and call (upstream's mutex).
+// Failures are error names, as upstream's @errorName.
+//
+// Not wired into the Session or the tools table yet.
+
+import std.json
+import std.list
+import std.string
+import std.sync
+import nib.jsonx
+import nib.lock
+import nib.mcp.mcp_headers
+import nib.mcp.mcp_index
+import nib.mcp.mcp_transport
+import nib.provider.types
+
+exports(Client, new, close, prompt, schema, call, enabled_any, split, checked,
+        PROTOCOL_VERSION, LEGACY_VERSION, TIMEOUT_MS, MAX_MESSAGE)
+
+const PROTOCOL_VERSION = "2026-07-28"
+const LEGACY_VERSION = "2025-11-25"
+const TIMEOUT_MS = 60000
+const MAX_MESSAGE = 16777216
+
+struct State {
+    config: ptr          // *types.McpServer (a copy)
+    transport: ptr       // *mcp_transport.Transport
+    tools: ptr           // list of tool JSON texts
+    failure: string      // "" none
+    listed: int
+}
+
+struct Client {
+    servers: ptr         // list of *State
+    guard: ptr
+}
+
+// servers: list of *types.McpServer (copied). env: "NAME=value" list for
+// stdio children and header_env, or null (this process's). home: $NIB_HOME
+// (each stdio server runs in <home>/mcp/<id>). writable: extra sandbox
+// roots (list of paths, or null). self_exe: this nib binary.
+new(servers: ptr, env: @keep ptr, home: string, user_home: string, writable: @keep ptr, sandboxed: int, self_exe: string) -> ptr {
+    c = heap.new(Client)
+    c.servers = list.list_new()
+    c.guard = lock.new()
+    n = list.list_size(servers)
+    i = 0
+    while i < n {
+        cfg = types.mcp_server_copy(list.list_get_raw(servers, i))
+        st = heap.new(State)
+        st.config = cfg
+        st.transport = mcp_transport.new(cfg, env, home, user_home, writable, sandboxed, self_exe)
+        st.tools = list.list_new()
+        st.failure = ""
+        st.listed = 0
+        list.list_add_raw(c.servers, st as ptr)
+        i = i + 1
+    }
+    return c as ptr
+}
+
+// Stops every connection (stdio children are killed).
+close(cp: ptr) {
+    c = cp as *Client
+    lock.acquire(c.guard)
+    i = 0
+    while i < list.list_size(c.servers) {
+        st = list.list_get_raw(c.servers, i) as *State
+        mcp_transport.close(st.transport)
+        i = i + 1
+    }
+    lock.release(c.guard)
+}
+
+// 1 when any server of the list (of *types.McpServer) is enabled.
+enabled_any(servers: ptr) -> int {
+    i = 0
+    while i < list.list_size(servers) {
+        m = list.list_get_raw(servers, i) as *types.McpServer
+        if m.enabled == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// "server.tool" -> (server, tool, ""), or "InvalidToolName".
+split(target: string) -> (string, string, string) {
+    dot = string.index_of(target, ".")
+    if dot <= 0 { return "", "", "InvalidToolName" }
+    if dot + 1 >= string.length(target) { return "", "", "InvalidToolName" }
+    return string.substring(target, 0, dot), string.substring(target, dot + 1, string.length(target)), ""
+}
+
+// (result object JSON text, ""), "ServerError" for an error rep,
+// "InvalidResponse" without a result object.
+checked(rep: string) -> (string, string) { return mcp_transport.checked(rep) }
+
+state_(c: *Client, id: string) -> ptr {
+    i = 0
+    while i < list.list_size(c.servers) {
+        st = list.list_get_raw(c.servers, i) as *State
+        cfg = st.config as *types.McpServer
+        if cfg.id == id { return st as ptr }
+        i = i + 1
+    }
+    return null
+}
+
+// Lists the server's tools again, all pages: "" or the error name.
+refresh_(s: *State, cancel: @keep ptr) -> string {
+    cfg = s.config as *types.McpServer
+    t = s.transport as *mcp_transport.Transport
+    s.tools = list.list_new()
+    s.listed = 0
+    t.dirty = 0
+    seen = list.list_new()
+    cursor = ""
+    has_cursor = 0
+    while true {
+        params = "{}"
+        if has_cursor == 1 { params = "{\"cursor\":${jsonx.quote(cursor)}}" }
+        rep, err = mcp_transport.rpc(s.transport, "tools/list", params, cancel)
+        if err != "" { return err }
+        result, cerr = checked(rep)
+        if cerr != "" { return cerr }
+        doc = jsonx.parse(result)
+        tools = jsonx.field(doc, "tools")
+        if tools == null || json.json_type(tools) != json.JSON_ARRAY {
+            jsonx.free(doc)
+            return "InvalidToolList"
+        }
+        n = jsonx.array_size(tools)
+        i = 0
+        while i < n {
+            tool = jsonx.array_at(tools, i)
+            if json.json_type(tool) != json.JSON_OBJECT || jsonx.kind(tool, "name") != json.JSON_STRING {
+                jsonx.free(doc)
+                return "InvalidToolList"
+            }
+            name = jsonx.str_or(tool, "name", "")
+            schema = jsonx.field(tool, "inputSchema")
+            if string.length(name) == 0 || schema == null || json.json_type(schema) != json.JSON_OBJECT {
+                jsonx.free(doc)
+                return "InvalidToolList"
+            }
+            keep = 1
+            if cfg.url != "" && mcp_headers.valid(jsonx.encode(schema)) == 0 { keep = 0 }
+            if keep == 1 { list.list_add(s.tools, jsonx.encode(tool)) }
+            i = i + 1
+        }
+        has_cursor = 0
+        if jsonx.kind(doc, "nextCursor") == json.JSON_STRING {
+            has_cursor = 1
+            cursor = string.copy(jsonx.str_or(doc, "nextCursor", ""))
+        }
+        jsonx.free(doc)
+        if has_cursor == 0 { break }
+        j = 0
+        while j < list.list_size(seen) {
+            old, _e = list.get_string(seen, j)
+            if old == cursor { return "RepeatedCursor" }
+            j = j + 1
+        }
+        list.list_add(seen, cursor)
+    }
+    s.listed = 1
+    return ""
+}
+
+// The input schema JSON of the cached tool `name`, "" when absent.
+find_(s: *State, name: string) -> (string, int) {
+    i = 0
+    while i < list.list_size(s.tools) {
+        text, _e = list.get_string(s.tools, i)
+        tool = jsonx.parse(text)
+        if jsonx.str_or(tool, "name", "") == name {
+            out = jsonx.encode(jsonx.field(tool, "inputSchema"))
+            jsonx.free(tool)
+            return out, 1
+        }
+        jsonx.free(tool)
+        i = i + 1
+    }
+    return "", 0
+}
+
+// base plus, for each enabled server, its tool index (or its failure) inside
+// <mcp_tools>; base unchanged when no server is enabled. Each server is
+// discovered with a short-lived connection.
+prompt(cp: ptr, base: string) -> string {
+    c = cp as *Client
+    lock.acquire(c.guard)
+    cancel = sync.atomic_new(0)
+    out = ""
+    i = 0
+    while i < list.list_size(c.servers) {
+        s = list.list_get_raw(c.servers, i) as *State
+        cfg = s.config as *types.McpServer
+        if cfg.enabled == 1 {
+            if string.length(out) == 0 { out = "\n<mcp_tools>\n" }
+            err = refresh_(s, cancel)
+            if err != "" { s.failure = err }
+            mcp_transport.close(s.transport)
+            if s.failure != "" {
+                out = "${out}${cfg.id}: failed: ${s.failure}\n"
+            } else {
+                out = "${out}${mcp_index.append(cfg.id, s.tools)}"
+            }
+        }
+        i = i + 1
+    }
+    sync.atomic_free(cancel)
+    lock.release(c.guard)
+    if string.length(out) == 0 { return base }
+    return "${base}${out}</mcp_tools>\n"
+}
+
+schema_(c: *Client, target: string, cancel: @keep ptr) -> (string, string) {
+    server, tool, serr = split(target)
+    if serr != "" { return "", serr }
+    sp = state_(c, server)
+    if sp == null { return "", "UnknownServer" }
+    s = sp as *State
+    cfg = s.config as *types.McpServer
+    if cfg.enabled == 0 { return "", "DisabledServer" }
+    t = s.transport as *mcp_transport.Transport
+    eerr = mcp_transport.ensure(s.transport, cancel)
+    if eerr != "" { return "", eerr }
+    cached = 0
+    if s.listed == 1 && t.dirty == 0 { cached = 1 }
+    if cached == 0 {
+        rerr = refresh_(s, cancel)
+        if rerr != "" { return "", rerr }
+    }
+    found, ok = find_(s, tool)
+    if ok == 1 { return found, "" }
+    if cached == 0 { return "", "UnknownTool" }
+    rerr2 = refresh_(s, cancel)
+    if rerr2 != "" { return "", rerr2 }
+    found2, ok2 = find_(s, tool)
+    if ok2 == 1 { return found2, "" }
+    return "", "UnknownTool"
+}
+
+// The full input JSON Schema of "server.tool": (schema JSON, "") or (_, error name).
+schema(cp: ptr, target: string, cancel: @keep ptr) -> (string, string) {
+    c = cp as *Client
+    lock.acquire(c.guard)
+    out, err = schema_(c, target, cancel)
+    lock.release(c.guard)
+    return out, err
+}
+
+// Calls "server.tool" with args_json (a JSON object text): (the result
+// object JSON, "", "") or ("", error name, the server's last error message
+// or ""). The failure is remembered for the server (a later prompt shows it).
+call(cp: ptr, target: string, args_json: string, cancel: @keep ptr) -> (string, string, string) {
+    c = cp as *Client
+    lock.acquire(c.guard)
+    out, err, message_text = call_(c, target, args_json, cancel)
+    lock.release(c.guard)
+    return out, err, message_text
+}
+
+call_(c: *Client, target: string, args_json: string, cancel: @keep ptr) -> (string, string, string) {
+    sch, serr = schema_(c, target, cancel)
+    server, tool, _e = split(target)
+    s = state_(c, server) as *State
+    if serr != "" {
+        if s != null { s.failure = serr }
+        return "", serr, ""
+    }
+    t = s.transport as *mcp_transport.Transport
+    t.schema = sch
+    params = "{\"name\":${jsonx.quote(tool)},\"arguments\":${args_json}}"
+    rep, rerr = mcp_transport.rpc(s.transport, "tools/call", params, cancel)
+    t.schema = ""
+    if rerr != "" {
+        s.failure = rerr
+        return "", rerr, ""
+    }
+    result, cerr = checked(rep)
+    if cerr != "" {
+        s.failure = cerr
+        if cerr == "ServerError" { return "", cerr, string.copy(t.last_error) }
+        return "", cerr, ""
+    }
+    doc = jsonx.parse(result)
+    kind = jsonx.str_or(doc, "resultType", "complete")
+    needs_input = 0
+    if kind == "input_required" { needs_input = 1 }
+    jsonx.free(doc)
+    if needs_input == 1 {
+        s.failure = "UnsupportedServerInput"
+        return "", "UnsupportedServerInput", ""
+    }
+    return result, "", ""
+}

@@ -87,6 +87,13 @@ expect_imports ae/nib/session/skills/module.ae "nib.jsonx|std.dir|std.fs|std.lis
 expect_imports ae/nib/session/prompt/module.ae "nib.sandbox|nib.session.output|nib.session.profile|std.cryptography|std.list|std.strbuilder|std.string"
 expect_imports ae/nib/session/tool_summary/module.ae "nib.jsonx|nib.sandbox.timing|std.list|std.strbuilder|std.string"
 
+# The MCP client (not yet in the Session): pure index/header logic, then the transport (the only reach to MCP servers: a child through tools/process, or HTTP).
+expect_imports ae/nib/mcp/mcp_index/module.ae "nib.jsonx|std.json|std.list|std.strbuilder|std.string"
+expect_imports ae/nib/mcp/mcp_headers/module.ae "nib.jsonx|std.encoding|std.json|std.list|std.string"
+expect_imports ae/nib/mcp/mcp_transport/module.ae "nib.build_info|nib.jsonx|nib.lock|nib.mcp.mcp_headers|nib.provider.sse|nib.provider.types|nib.tools.jail|nib.tools.process|nib.tools.secrets|std.fs|std.http.client|std.ipc|std.json|std.list|std.os|std.string|std.sync|std.worker"
+expect_imports ae/nib/mcp/module.ae "nib.jsonx|nib.lock|nib.mcp.mcp_headers|nib.mcp.mcp_index|nib.mcp.mcp_transport|nib.provider.types|std.json|std.list|std.string|std.sync"
+expect_imports $T/mcp_tool/module.ae "nib.jsonx|nib.mcp|std.json|std.string"
+
 rule() {   # rule "what" "pattern" "allowed path regex"
     hits=$(grep -rnE "$2" --include='*.ae' ae/nib ae/main.ae 2>/dev/null \
           | grep -vE "^($3)" | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
@@ -108,8 +115,8 @@ rule "the file stand-in is used only by the file, undo and process tools, the Se
     '^import nib\.sysgap' "$T/atomic_file/|$T/file_state/|$T/files/|$T/undo/|$T/process/|$T/bash/|ae/nib/session/log/|ae/nib/config/env/|ae/main.ae|ae/nib/tui/reflect/"
 rule "the QuickJS stand-in is used only by the sandbox" \
     '^import nib\.qjsgap' "ae/nib/sandbox/module.ae"
-rule "only provider/http (the model request) and auth/models (the /model listing) reach the network" \
-    '^import std\.(http|net|tcp|udp)' "ae/nib/provider/http/|ae/nib/auth/models/"
+rule "only provider/http (the model request), auth/models (the /model listing) and mcp_transport (Streamable HTTP MCP servers) reach the network" \
+    '^import std\.(http|net|tcp|udp)' "ae/nib/provider/http/|ae/nib/auth/models/|ae/nib/mcp/mcp_transport/"
 rule "the TUI reaches the Session only through its live port" \
     '^import nib\.session$' "ae/nib/tui/live/|ae/main.ae|ae/nib/tools/agent/|ae/nib/session/"
 

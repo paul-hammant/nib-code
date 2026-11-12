@@ -300,6 +300,10 @@ aeb(cap) {
             lib("ae")
         }
         aether.program_test() {
+            source("ae/tests/mcp_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
             source("ae/tests/agent_test.ae")
             lib("ae")
         }

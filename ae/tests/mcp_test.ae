@@ -1,0 +1,376 @@
+// Ports the inline tests of upstream src/mcp/index.zig, src/mcp/headers.zig,
+// src/mcp/transport.zig and src/tools/mcp.zig under their upstream names,
+// then drives nib.mcp over tests/mock_mcp.py (python3 on PATH) on stdio
+// (modern and --legacy) and Streamable HTTP (tests/mock_mcp_http.py: JSON and
+// SSE replies, modern and legacy). Run from the repository root.
+//
+// Differences from the Zig tests: values are JSON text, the readLine test
+// reads a fixed Source, watch takes a std.sync cell, and mapContent takes a
+// vision flag instead of a Tools config.
+import std.spec
+import std.fs
+import std.list
+import std.os
+import std.string
+import std.strbuilder
+import std.sync
+import nib.jsonx
+import nib.mcp
+import nib.mcp.mcp_headers
+import nib.mcp.mcp_index
+import nib.mcp.mcp_transport
+import nib.provider.sse
+import nib.provider.types
+import nib.tools.mcp_tool
+
+has_(s: string, part: string) -> int {
+    if string.index_of(s, part) >= 0 { return 1 }
+    return 0
+}
+
+tmp_() -> string {
+    d, _e = fs.make_temp_dir("", "nib-mcp")
+    real, _k, _m = fs.realpath(d)
+    return real
+}
+
+// A Client over one stdio server "local" running tests/mock_mcp.py.
+stdio_client_(home: string, legacy: int, enabled: int, env: @keep ptr) -> ptr {
+    m = types.mcp_server_new("local") as *types.McpServer
+    m.command = "python3"
+    list.list_add(m.args, "${os.getcwd()}/tests/mock_mcp.py")
+    if legacy == 1 { list.list_add(m.args, "--legacy") }
+    list.list_add(m.env, "MCP_TEST_TOKEN")
+    m.enabled = enabled
+    servers = list.list_new()
+    list.list_add_raw(servers, m as ptr)
+    return mcp.new(servers, env, home, home, null, 0, "")
+}
+
+call_text_(c: ptr, target: string, args: string) -> string {
+    out, err, _m = mcp.call(c, target, args, null)
+    if err != "" { return "ERR:${err}" }
+    return out
+}
+
+content_of_(result: string) -> string {
+    doc = jsonx.parse(result)
+    out = string.copy(mcp_tool.map_content(jsonx.encode(jsonx.field(doc, "content")), 0))
+    jsonx.free(doc)
+    return out
+}
+
+// The behaviours every server flavour shares.
+check_flavour_(c: ptr, base: string) {
+    p = mcp.prompt(c, base)
+    spec.assert_true(has_(p, "<mcp_tools>\n") == 1, "index opens")
+    spec.assert_true(has_(p, "local.echo(text: string) — Echo the input.\n") == 1, "echo line")
+    spec.assert_true(has_(p, "local.second() — Second page.\n") == 1, "second page listed")
+    spec.assert_true(has_(p, "</mcp_tools>\n") == 1, "index closes")
+    spec.assert_true(string.starts_with(p, base) == 1, "base kept")
+    sch, serr = mcp.schema(c, "local.echo", null)
+    spec.assert_str_eq(serr, "", "schema err")
+    spec.assert_true(has_(sch, "\"x-mcp-header\":\"Text\"") == 1, "schema carries the annotation")
+    res = call_text_(c, "local.echo", "{\"text\":\"hi\"}")
+    spec.assert_str_eq(content_of_(res), "hi", "echo content")
+    doc = jsonx.parse(res)
+    sc = jsonx.field(doc, "structuredContent")
+    spec.assert_str_eq(jsonx.str_or(sc, "echo", ""), "hi", "structured")
+    jsonx.free(doc)
+    // a server error rep carries its message
+    out, err, msg = mcp.call(c, "local.rpc_error", "{\"text\":\"x\"}", null)
+    spec.assert_str_eq(err, "ServerError", "rpc error")
+    spec.assert_str_eq(msg, "mock RPC failure", "rpc error message")
+    // the connection survived (it is reopened if it did not)
+    spec.assert_str_eq(content_of_(call_text_(c, "local.echo", "{\"text\":\"again\"}")), "again", "after an error")
+    // image item, vision off
+    img = call_text_(c, "local.image", "{\"text\":\"pic\"}")
+    spec.assert_str_eq(content_of_(img), "pic\n[image omitted]", "image content")
+    // a tool the server adds without notifying is found by one relist
+    spec.assert_str_eq(content_of_(call_text_(c, "local.change", "{\"text\":\"c\"}")), "c", "change call")
+    sch2, err2 = mcp.schema(c, "local.added", null)
+    spec.assert_str_eq(err2, "", "added tool found after list_changed")
+    spec.assert_true(has_(sch2, "\"type\":\"object\"") == 1, "added schema")
+    sch3, err3 = mcp.schema(c, "local.nothere", null)
+    spec.assert_str_eq(err3, "UnknownTool", "unknown tool")
+    sch4, err4 = mcp.schema(c, "nobody.echo", null)
+    spec.assert_str_eq(err4, "UnknownServer", "unknown server")
+    sch5, err5 = mcp.schema(c, "echo", null)
+    spec.assert_str_eq(err5, "InvalidToolName", "bad name")
+}
+
+wait_file_(path: string) -> string {
+    i = 0
+    while i < 300 {
+        if fs.exists(path) == 1 {
+            text, e = fs.read(path)
+            if e == "" && string.length(text) > 0 { return text }
+        }
+        sleep(50)
+        i = i + 1
+    }
+    return ""
+}
+
+// Starts tests/mock_mcp_http.py; (url, token for os.kill).
+start_http_(dir: string, flags: string) -> (string, int) {
+    urlfile = "${dir}/url"
+    argv = list.list_new()
+    list.list_add(argv, "${os.getcwd()}/tests/mock_mcp_http.py")
+    list.list_add(argv, urlfile)
+    if flags != "" { list.list_add(argv, flags) }
+    token, err = os.spawn_proc_to("python3", argv, null, "${dir}/http.out")
+    if err != "" { return "", -1 }
+    return wait_file_(urlfile), token
+}
+
+http_client_(home: string, url: string) -> ptr {
+    m = types.mcp_server_new("remote") as *types.McpServer
+    m.url = url
+    m.header_env = "MCP_HTTP_TOKEN"
+    m.enabled = 1
+    servers = list.list_new()
+    list.list_add_raw(servers, m as ptr)
+    env = list.list_new()
+    list.list_add(env, "MCP_HTTP_TOKEN=fake-mcp-token")
+    return mcp.new(servers, env, home, home, null, 0, "")
+}
+
+check_http_(flags: string) {
+    dir = tmp_()
+    url, token = start_http_(dir, flags)
+    spec.assert_true(string.length(url) > 0, "mock http server started")
+    c = http_client_(dir, url)
+    p = mcp.prompt(c, "B")
+    spec.assert_true(has_(p, "remote.echo(text: string) — Echo the input.\n") == 1, "http index: ${p}")
+    r = call_text_(c, "remote.echo", "{\"text\":\"héllo wörld\"}")
+    spec.assert_str_eq(content_of_(r), "héllo wörld", "http echo (non-ASCII header is base64)")
+    r2 = call_text_(c, "remote.echo", "{\"text\":\"plain\"}")
+    spec.assert_str_eq(content_of_(r2), "plain", "http echo")
+    out, err, msg = mcp.call(c, "remote.rpc_error", "{\"text\":\"x\"}", null)
+    spec.assert_str_eq(err, "ServerError", "http rpc error")
+    spec.assert_str_eq(msg, "mock RPC failure", "http rpc error message")
+    mcp.close(c)
+    os.kill(0 - token, 9)
+    os.wait(token)
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "mcp.index") {
+        spec.it("compact schema signature preserves required, enums and nested objects") callback {
+            schema = "{\"properties\":{\"q\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"},\"state\":{\"enum\":[\"open\",\"closed\"]},\"filter\":{\"type\":\"object\"}},\"required\":[\"q\"]}"
+            spec.assert_str_eq(mcp_index.signature(schema), "q: string, limit?: number, state?: \"open\"|\"closed\", filter?: {…}", "signature")
+        }
+        spec.it("index caps tools and descriptions") callback {
+            tool = "{\"name\":\"search\",\"description\":\"First sentence. Second sentence.\",\"inputSchema\":{}}"
+            tools = list.list_new()
+            i = 0
+            while i < 43 {
+                list.list_add(tools, tool)
+                i = i + 1
+            }
+            out = mcp_index.append("docs", tools)
+            spec.assert_true(has_(out, "3 tools omitted") == 1, "omitted count")
+            spec.assert_true(has_(out, "Second sentence") == 0, "first sentence only")
+            spec.assert_true(has_(out, "docs.search() — First sentence.\n") == 1, "line shape")
+            long_name = "search_search_search_search_search_search_search_search_search_search_search_search_search_search_search_search_"
+            named = list.list_new()
+            list.list_add(named, "{\"name\":\"${long_name}\",\"inputSchema\":{}}")
+            out2 = mcp_index.append("docs", named)
+            spec.assert_true(has_(out2, long_name) == 1, "a long name is kept whole")
+        }
+    }
+    spec.describe(fw, "mcp.headers") {
+        spec.it("header encoding and annotation validation") callback {
+            spec.assert_str_eq(mcp_headers.encode("hello"), "hello", "plain")
+            spec.assert_str_eq(mcp_headers.encode("x\n"), "=?base64?eAo=?=", "control byte")
+            good = "{\"properties\":{\"q\":{\"type\":\"string\",\"x-mcp-header\":\"Query\"}}}"
+            spec.assert_eq(mcp_headers.valid(good), 1, "annotated property")
+            bad = "{\"items\":{\"type\":\"string\",\"x-mcp-header\":\"Q\"}}"
+            spec.assert_eq(mcp_headers.valid(bad), 0, "annotation outside properties")
+        }
+        spec.it("mirrors annotated arguments into Mcp-Param headers") callback {
+            schema = "{\"properties\":{\"q\":{\"type\":\"string\",\"x-mcp-header\":\"Query\"},\"n\":{\"type\":\"integer\",\"x-mcp-header\":\"N\"}}}"
+            names = list.list_new()
+            values = list.list_new()
+            e = mcp_headers.append(names, values, schema, "{\"q\":\" a\",\"n\":42}")
+            spec.assert_str_eq(e, "", "no error")
+            spec.assert_eq(list.list_size(names), 2, "two headers")
+            n0, _a = list.get_string(names, 0)
+            v0, _b = list.get_string(values, 0)
+            v1, _c = list.get_string(values, 1)
+            spec.assert_str_eq(n0, "Mcp-Param-Query", "name")
+            spec.assert_str_eq(v0, "=?base64?IGE=?=", "leading blank encodes")
+            spec.assert_str_eq(v1, "42", "integer")
+            e2 = mcp_headers.append(names, values, schema, "{\"n\":\"x\"}")
+            spec.assert_str_eq(e2, "InvalidHeaderParameter", "wrong type")
+        }
+    }
+    spec.describe(fw, "mcp.transport") {
+        spec.it("stdio newline framing retains escaped newlines and next messages") callback {
+            src = mcp_transport.source_fixed("{\"text\":\"a\\nb\"}\n{\"id\":2}\n")
+            l1, e1 = mcp_transport.read_line(src, null, 0)
+            spec.assert_str_eq(e1, "", "first ok")
+            spec.assert_str_eq(l1, "{\"text\":\"a\\nb\"}", "first line")
+            l2, e2 = mcp_transport.read_line(src, null, 0)
+            spec.assert_str_eq(l2, "{\"id\":2}", "second line")
+            l3, e3 = mcp_transport.read_line(src, null, 0)
+            spec.assert_str_eq(e3, "EndOfStream", "end")
+        }
+        spec.it("timeout and cancellation watches") callback {
+            cancel = sync.atomic_new(0)
+            spec.assert_str_eq(mcp_transport.watch(cancel, 1 as long), "Timeout", "timeout")
+            sync.atomic_store(cancel, 1)
+            spec.assert_str_eq(mcp_transport.watch(cancel, 1000 as long), "Canceled", "canceled")
+        }
+        spec.it("SSE messages correlate replies and mark tool lists dirty") callback {
+            t = mcp_transport.new(types.mcp_server_new("test"), null, "", "", null, 0, "")
+            parser = sse.parser()
+            stream = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\r\n\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{}}\n\n"
+            lines = sse.fixed(stream)
+            got_reply = ""
+            matched_any = 0
+            while true {
+                line, lerr = sse.next(lines, null)
+                event, ev = sse.feed(parser, line)
+                if ev == 1 {
+                    rep, matched, merr = mcp_transport.incoming(t, event, 7 as long)
+                    spec.assert_str_eq(merr, "", "message ok")
+                    if matched == 1 {
+                        got_reply = rep
+                        matched_any = 1
+                    }
+                }
+                if lerr != "" { break }
+            }
+            spec.assert_eq((t as *mcp_transport.Transport).dirty, 1, "dirty")
+            spec.assert_eq(matched_any, 1, "rep found")
+            spec.assert_true(has_(got_reply, "\"id\":7") == 1, "id 7")
+            other, m2, e2 = mcp_transport.incoming(t, "{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{}}", 7 as long)
+            spec.assert_eq(m2, 0, "another id is not the rep")
+        }
+        spec.it("a server request over HTTP-shaped transport is refused as unsupported") callback {
+            t = mcp_transport.new(types.mcp_server_new("test"), null, "", "", null, 0, "")
+            r, m, e = mcp_transport.incoming(t, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"sampling/createMessage\"}", 9 as long)
+            spec.assert_str_eq(e, "UnsupportedServerRequest", "no child to answer on")
+            r2, m2, e2 = mcp_transport.incoming(t, "not json", 9 as long)
+            spec.assert_str_eq(e2, "InvalidJsonRpc", "bad json")
+        }
+    }
+    spec.describe(fw, "tools/mcp") {
+        spec.it("MCP content text and nonvision images keep full text") callback {
+            content = "[{\"type\":\"text\",\"text\":\"hello\"},{\"type\":\"image\",\"data\":\"fake\"},{\"type\":\"audio\"}]"
+            spec.assert_str_eq(mcp_tool.map_content(content, 0), "hello\n[image omitted]\n[audio omitted]", "mixed")
+            empty = "[{\"type\":\"text\",\"text\":\"\"},{\"type\":\"text\",\"text\":\"next\"},{\"type\":\"text\",\"text\":\"\"}]"
+            spec.assert_str_eq(mcp_tool.map_content(empty, 0), "\nnext\n", "empty items keep their separators")
+        }
+        spec.it("images are a stand-in with vision, other items get summaries") callback {
+            content = "[{\"type\":\"image\"},{\"type\":\"resource_link\",\"uri\":\"u:1\"},{\"type\":\"resource\",\"resource\":{\"uri\":\"u:2\"}},{\"type\":\"weird\"}]"
+            spec.assert_str_eq(mcp_tool.map_content(content, 1), "[image omitted: images not ported]\n[resource link: u:1]\n[resource: u:2]\n[unsupported content omitted]", "summaries")
+        }
+        spec.it("argument errors reject, an absent client is data") callback {
+            ok, text = mcp_tool.execute(null, "{", 0, null, 0)
+            spec.assert_eq(ok, 0, "bad json rejects")
+            spec.assert_str_eq(text, "expected a server.tool name and argument object", "bad json text")
+            ok2, t2 = mcp_tool.execute(null, "{\"arguments\":{}}", 0, null, 0)
+            spec.assert_str_eq(t2, "expected a server.tool name", "no name")
+            ok3, t3 = mcp_tool.execute(null, "{\"name\":\"echo\",\"arguments\":{}}", 0, null, 0)
+            spec.assert_str_eq(t3, "expected server.tool", "no dot")
+            ok4, t4 = mcp_tool.execute(null, "{\"name\":\"a.b\",\"arguments\":3}", 0, null, 0)
+            spec.assert_str_eq(t4, "arguments must be an object", "args object")
+            ok5, t5 = mcp_tool.execute(null, "{\"name\":\"a.b\",\"arguments\":{}}", 0, null, 0)
+            spec.assert_eq(ok5, 1, "data")
+            spec.assert_str_eq(t5, "{\"ok\":false,\"content\":\"\",\"error\":\"MCP is unavailable\"}", "unavailable")
+            ok6, t6 = mcp_tool.execute(null, "{\"name\":\"a.b\"}", 1, null, 0)
+            spec.assert_eq(ok6, 1, "schema needs no arguments")
+        }
+    }
+    spec.describe(fw, "mcp client over mock_mcp.py") {
+        spec.it("stdio, modern protocol") callback {
+            home = tmp_()
+            c = stdio_client_(home, 0, 1, null)
+            check_flavour_(c, "BASE")
+            mcp.close(c)
+        }
+        spec.it("stdio, legacy initialize") callback {
+            home = tmp_()
+            c = stdio_client_(home, 1, 1, null)
+            check_flavour_(c, "BASE")
+            mcp.close(c)
+        }
+        spec.it("a disabled server adds nothing and is not started") callback {
+            home = tmp_()
+            c = stdio_client_(home, 0, 0, null)
+            spec.assert_str_eq(mcp.prompt(c, "BASE"), "BASE", "base unchanged")
+            spec.assert_eq(fs.exists("${home}/mcp"), 0, "no state directory")
+            sch, err = mcp.schema(c, "local.echo", null)
+            spec.assert_str_eq(err, "DisabledServer", "disabled")
+            mcp.close(c)
+        }
+        spec.it("a server that cannot start is a failure line, not an error") callback {
+            m = types.mcp_server_new("gone") as *types.McpServer
+            m.command = "/nonexistent/mcp-server"
+            m.enabled = 1
+            servers = list.list_new()
+            list.list_add_raw(servers, m as ptr)
+            c = mcp.new(servers, null, tmp_(), "", null, 0, "")
+            spec.assert_eq(mcp.enabled_any(servers), 1, "enabled")
+            p = mcp.prompt(c, "BASE")
+            spec.assert_true(has_(p, "gone: failed: ") == 1, "failure line: ${p}")
+            mcp.close(c)
+        }
+        spec.it("cancellation interrupts a call") callback {
+            home = tmp_()
+            c = stdio_client_(home, 0, 1, null)
+            cancel = sync.atomic_new(1)
+            out, err, m = mcp.call(c, "local.echo", "{\"text\":\"x\"}", cancel)
+            spec.assert_str_eq(err, "Canceled", "canceled")
+            mcp.close(c)
+        }
+        spec.it("only allowlisted environment reaches the server, in its state directory") callback {
+            home = tmp_()
+            env = list.list_new()
+            list.list_add(env, "PATH=${os.getenv("PATH")}")
+            list.list_add(env, "HOME=${os.getenv("HOME")}")
+            list.list_add(env, "MCP_TEST_TOKEN=listed-value")
+            list.list_add(env, "GITHUB_TOKEN=leak1")
+            list.list_add(env, "NIB_API_KEY=leak2")
+            list.list_add(env, "MCP_UNLISTED=leak3")
+            c = stdio_client_(home, 0, 1, env)
+            res = call_text_(c, "local.env", "{\"text\":\"\"}")
+            seen = jsonx.parse(content_of_(res))
+            spec.assert_str_eq(jsonx.str_or(seen, "allowed", "?"), "listed-value", "named variable passes")
+            spec.assert_eq(jsonx.kind(seen, "github"), 0, "provider token stripped")
+            spec.assert_eq(jsonx.kind(seen, "key"), 0, "nib key stripped")
+            spec.assert_eq(jsonx.kind(seen, "unlisted"), 0, "unlisted dropped")
+            spec.assert_str_eq(jsonx.str_or(seen, "home", "?"), os.getenv("HOME"), "HOME unchanged")
+            spec.assert_true(string.ends_with(jsonx.str_or(seen, "cwd", "?"), "/mcp/local") == 1, "cwd is the state directory")
+            jsonx.free(seen)
+            mcp.close(c)
+        }
+        spec.it("mcp_tool.execute maps results, failures and schemas") callback {
+            home = tmp_()
+            c = stdio_client_(home, 0, 1, null)
+            ok, text = mcp_tool.execute(c, "{\"name\":\"local.echo\",\"arguments\":{\"text\":\"hey\"}}", 0, null, 0)
+            spec.assert_eq(ok, 1, "result")
+            spec.assert_str_eq(text, "{\"ok\":true,\"content\":\"hey\",\"structured\":{\"echo\":\"hey\"},\"error\":null}", "ok result")
+            ok2, t2 = mcp_tool.execute(c, "{\"name\":\"local.fail\",\"arguments\":{}}", 0, null, 0)
+            spec.assert_str_eq(t2, "{\"ok\":false,\"content\":\"\",\"structured\":{\"echo\":\"\"},\"error\":\"MCP tool failed\"}", "isError")
+            ok3, t3 = mcp_tool.execute(c, "{\"name\":\"local.rpc_error\",\"arguments\":{}}", 0, null, 0)
+            spec.assert_str_eq(t3, "{\"ok\":false,\"content\":\"\",\"error\":\"mock RPC failure\"}", "rpc error is data")
+            ok4, t4 = mcp_tool.execute(c, "{\"name\":\"local.echo\"}", 1, null, 0)
+            spec.assert_eq(ok4, 1, "schema")
+            spec.assert_true(has_(t4, "\"required\":[\"text\"]") == 1, "schema text")
+            ok5, t5 = mcp_tool.execute(c, "{\"name\":\"local.zip\"}", 1, null, 0)
+            spec.assert_str_eq(t5, "{\"ok\":false,\"content\":\"\",\"error\":\"UnknownTool\"}", "unknown tool is data")
+            mcp.close(c)
+        }
+    }
+    spec.describe(fw, "mcp client over mock_mcp_http.py") {
+        spec.it("streamable HTTP, modern, JSON") callback { check_http_("") }
+        spec.it("streamable HTTP, modern, SSE") callback { check_http_("--sse") }
+        spec.it("streamable HTTP, legacy, JSON") callback { check_http_("--legacy") }
+    }
+    return spec.run_summary(fw)
+}

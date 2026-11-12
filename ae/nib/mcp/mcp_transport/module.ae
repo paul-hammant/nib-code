@@ -1,0 +1,779 @@
+// mcp.mcp_transport: one MCP server connection, stdio or Streamable HTTP
+// (upstream src/mcp/transport.zig). Discovery tries the modern protocol
+// (server/discover) and falls back to the legacy initialize handshake;
+// stdio frames are newline-delimited JSON-RPC (not length-prefixed); server
+// requests are answered -32601; notifications/tools/list_changed marks the
+// catalog dirty. Every exchange has a deadline and watches the cancel cell
+// (a std.sync cell, 0/1, may be null); a message is capped at 16 MiB.
+//
+// Upstream runs the exchange and a watcher concurrently under std.Io.Select.
+// Here one thread polls both: reads wait_readable 20 ms at a time, writes
+// use wait_writable/write_some (not ipc.write, which could block past the
+// deadline), and an HTTP request runs on a worker thread the caller polls.
+// The environment passed through is only PATH HOME LANG LC_ALL LC_CTYPE
+// TMPDIR TZ SYSTEMROOT, secrets removed, then the server's named `env`.
+//
+// Not ported: std.http.Client's proxy setup from the environment
+// (initDefaultProxies); std.http.client's own proxy defaults apply.
+
+import std.http.client
+import std.ipc
+import std.json
+import std.list
+import std.os
+import std.fs
+import std.string
+import std.sync
+import std.worker
+import nib.build_info
+import nib.jsonx
+import nib.lock
+import nib.mcp.mcp_headers
+import nib.provider.sse
+import nib.provider.types
+import nib.tools.jail
+import nib.tools.process
+import nib.tools.secrets
+
+exports(Transport, Source, new, close, ensure, rpc, incoming, checked, watch, source_fixed, read_line,
+        PROTOCOL_VERSION, LEGACY_VERSION, TIMEOUT_MS, MAX_MESSAGE)
+
+const PROTOCOL_VERSION = "2026-07-28"
+const LEGACY_VERSION = "2025-11-25"
+const TIMEOUT_MS = 60000
+const MAX_MESSAGE = 16777216
+
+struct Transport {
+    config: ptr          // *types.McpServer
+    env: ptr             // "NAME=value" list
+    home: string
+    user_home: string
+    writable: ptr
+    sandboxed: int
+    self_exe: string
+    to_fd: int
+    pid: int             // 0: no child
+    src: ptr             // *Source over the child's stdout
+    next_id: long
+    ready: int
+    modern: int
+    version: string
+    session: string
+    dirty: int
+    schema: string       // the tool's input schema while a tools/call is made, "" none
+    last_error: string
+    http_status: int
+    cancel: ptr          // the running exchange's cancel cell and deadline
+    deadline: long
+}
+
+struct Source {
+    buf: string
+    fd: int              // -1: fixed text
+}
+
+struct Http {
+    guard: ptr
+    buf: string
+    status: int
+    ctype: string
+    session: string
+    err: string
+    done: ptr
+    stop: ptr
+}
+
+cfg_(t: *Transport) -> *types.McpServer { return t.config as *types.McpServer }
+
+// A transport for `config` (a *types.McpServer). env: "NAME=value" list or
+// null (this process's); writable: extra sandbox roots; self_exe: this nib
+// binary (the Linux sandbox helper).
+new(config: @keep ptr, env: @keep ptr, home: string, user_home: string, writable: @keep ptr, sandboxed: int, self_exe: string) -> ptr {
+    t = heap.new(Transport)
+    t.config = config
+    t.env = env
+    if env == null { t.env = process.environ() }
+    t.home = home
+    t.user_home = user_home
+    t.writable = writable
+    if writable == null { t.writable = list.list_new() }
+    t.sandboxed = sandboxed
+    t.self_exe = self_exe
+    t.to_fd = -1
+    t.pid = 0
+    t.src = source_fixed("")
+    t.next_id = 1 as long
+    t.ready = 0
+    t.modern = 1
+    t.version = PROTOCOL_VERSION
+    t.session = ""
+    t.dirty = 0
+    t.schema = ""
+    t.last_error = ""
+    t.http_status = 0
+    t.cancel = null
+    t.deadline = 0 as long
+    return t as ptr
+}
+
+// ---- lines, deadlines ----
+
+source_fixed(text: string) -> ptr {
+    s = heap.new(Source)
+    s.buf = text
+    s.fd = -1
+    return s as ptr
+}
+
+// "" or "Canceled" / "Timeout".
+stop_(cancel: ptr, deadline: long) -> string {
+    if cancel != null && sync.atomic_load(cancel) != 0 { return "Canceled" }
+    if deadline > 0 && os.now_monotonic_ms() >= deadline { return "Timeout" }
+    return ""
+}
+
+// Blocks ms (20 ms steps) or until cancel is set: "Timeout" or "Canceled".
+watch(cancel: ptr, ms: long) -> string {
+    elapsed = 0 as long
+    while elapsed < ms {
+        if cancel != null && sync.atomic_load(cancel) != 0 { return "Canceled" }
+        sleep(20)
+        elapsed = elapsed + 20
+    }
+    return "Timeout"
+}
+
+// The next line of the source without its newline: (line, err), err "" or
+// "EndOfStream", "MessageTooLarge", "Canceled", "Timeout", "ReadFailed".
+// deadline: os.now_monotonic_ms() value, 0 none.
+read_line(sp: ptr, cancel: ptr, deadline: long) -> (string, string) {
+    s = sp as *Source
+    while true {
+        nl = string.index_of(s.buf, "\n")
+        if nl >= 0 {
+            if nl > MAX_MESSAGE { return "", "MessageTooLarge" }
+            line = string.substring(s.buf, 0, nl)
+            s.buf = string.substring(s.buf, nl + 1, string.length(s.buf))
+            return line, ""
+        }
+        if string.length(s.buf) > MAX_MESSAGE { return "", "MessageTooLarge" }
+        if s.fd < 0 { return "", "EndOfStream" }
+        e = stop_(cancel, deadline)
+        if e != "" { return "", e }
+        ready, rerr = ipc.wait_readable(s.fd, 20)
+        if rerr != "" { return "", "ReadFailed" }
+        if ready == 1 {
+            data, derr = ipc.read(s.fd, 65536)
+            if derr != "" { return "", "ReadFailed" }
+            if string.length(data) == 0 { return "", "EndOfStream" }
+            s.buf = "${s.buf}${data}"
+        }
+    }
+    return "", "EndOfStream"
+}
+
+// ---- environment ----
+
+env_get_(env: ptr, name: string) -> (string, int) {
+    prefix = "${name}="
+    n = list.list_size(env)
+    i = 0
+    while i < n {
+        e, _x = list.get_string(env, i)
+        if string.starts_with(e, prefix) == 1 { return string.substring(e, string.length(prefix), string.length(e)), 1 }
+        i = i + 1
+    }
+    return "", 0
+}
+
+// A copy of env with NAME set (replacing an entry of that name).
+env_set_(env: ptr, name: string, value: string) -> ptr {
+    out = list.list_new()
+    prefix = "${name}="
+    n = list.list_size(env)
+    i = 0
+    while i < n {
+        e, _x = list.get_string(env, i)
+        if string.starts_with(e, prefix) == 0 { list.list_add(out, e) }
+        i = i + 1
+    }
+    list.list_add(out, "${prefix}${value}")
+    return out
+}
+
+child_env_(t: *Transport) -> ptr {
+    env = list.list_new()
+    names = ["PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TZ", "SYSTEMROOT"]
+    i = 0
+    while i < 8 {
+        v, found = env_get_(t.env, names[i])
+        if found == 1 { list.list_add(env, "${names[i]}=${v}") }
+        i = i + 1
+    }
+    env = secrets.remove_from(env)
+    // Explicitly allowlisted server credentials are intentionally passed through.
+    cfg = cfg_(t)
+    j = 0
+    while j < list.list_size(cfg.env) {
+        name, _e = list.get_string(cfg.env, j)
+        v2, found2 = env_get_(t.env, name)
+        if found2 == 1 { env = env_set_(env, name, v2) }
+        j = j + 1
+    }
+    return env
+}
+
+// ---- stdio ----
+
+spawn_(t: *Transport) -> string {
+    cfg = cfg_(t)
+    env = child_env_(t)
+    directory = "${t.home}/mcp/${cfg.id}"
+    if fs.mkdir_p(directory) != "" { return "CreateDirFailed" }
+    argv = list.list_new()
+    list.list_add(argv, cfg.command)
+    i = 0
+    while i < list.list_size(cfg.args) {
+        a, _e = list.get_string(cfg.args, i)
+        list.list_add(argv, a)
+        i = i + 1
+    }
+    wrapped = argv
+    if t.sandboxed == 1 {
+        if jail.unavailable() != "" { return "SandboxUnavailable" }
+        extras = list.list_new()
+        j = 0
+        while j < list.list_size(t.writable) {
+            w, _e2 = list.get_string(t.writable, j)
+            list.list_add(extras, w)
+            j = j + 1
+        }
+        list.list_add(extras, directory)
+        roots = jail.roots(os.getcwd(), t.user_home, t.env, extras)
+        wrapped = jail.wrap(roots, argv, t.self_exe)
+    }
+    to_fd, from_fd, pid, err = process.open_stdio(wrapped, env, directory)
+    if err != "" { return err }
+    t.to_fd = to_fd
+    t.pid = pid
+    s = t.src as *Source
+    s.buf = ""
+    s.fd = from_fd
+    return ""
+}
+
+// Ends the connection: the child is killed, the session forgotten.
+close(tp: ptr) {
+    t = tp as *Transport
+    if t.pid > 0 {
+        process.close_fd(t.to_fd)
+        s = t.src as *Source
+        process.close_fd(s.fd)
+        s.fd = -1
+        s.buf = ""
+        process.kill_child(t.pid)
+        t.pid = 0
+        t.to_fd = -1
+    }
+    t.session = ""
+    t.ready = 0
+    t.version = PROTOCOL_VERSION
+    t.modern = 1
+}
+
+write_line_(t: *Transport, text: string) -> string {
+    data = "${text}\n"
+    n = string.length(data)
+    off = 0
+    while off < n {
+        e = stop_(t.cancel, t.deadline)
+        if e != "" { return e }
+        ok, werr = ipc.wait_writable(t.to_fd, 20)
+        if werr != "" { return "WriteFailed" }
+        if ok == 1 {
+            wrote, werr2 = ipc.write_some(t.to_fd, data, off)
+            if werr2 != "" { return "WriteFailed" }
+            off = off + wrote
+        }
+    }
+    return ""
+}
+
+// ---- messages ----
+
+is_null_(v: ptr) -> int {
+    if v == null { return 1 }
+    if json.json_type(v) == json.JSON_NULL { return 1 }
+    return 0
+}
+
+// One JSON-RPC message from the server while waiting for rep `id`:
+// (rep text, 1, "") when it is that rep (or an id-less error), (_, 0, "")
+// when it is something else (a notification, a server request refused with
+// -32601, another id), or an error: "InvalidJsonRpc", "UnsupportedServerRequest".
+incoming(tp: ptr, text: string, id: long) -> (string, int, string) {
+    t = tp as *Transport
+    v = jsonx.parse(text)
+    if v == null { return "", 0, "InvalidJsonRpc" }
+    if json.json_type(v) != json.JSON_OBJECT {
+        jsonx.free(v)
+        return "", 0, "InvalidJsonRpc"
+    }
+    if jsonx.str_or(v, "jsonrpc", "") != "2.0" {
+        jsonx.free(v)
+        return "", 0, "InvalidJsonRpc"
+    }
+    if jsonx.kind(v, "method") == json.JSON_STRING {
+        method = jsonx.str_or(v, "method", "")
+        if method == "notifications/tools/list_changed" { t.dirty = 1 }
+        rid = jsonx.field(v, "id")
+        if is_null_(rid) == 0 {
+            if t.pid > 0 {
+                rep = "{\"jsonrpc\":\"2.0\",\"id\":${jsonx.encode(rid)},\"error\":{\"code\":-32601,\"message\":\"Client method not supported\"}}"
+                werr = write_line_(t, rep)
+                if werr != "" {
+                    jsonx.free(v)
+                    return "", 0, werr
+                }
+            } else {
+                jsonx.free(v)
+                return "", 0, "UnsupportedServerRequest"
+            }
+        }
+        jsonx.free(v)
+        return "", 0, ""
+    }
+    rid2 = jsonx.field(v, "id")
+    if is_null_(rid2) == 1 && jsonx.kind(v, "error") == json.JSON_OBJECT {
+        jsonx.free(v)
+        return text, 1, ""
+    }
+    matches = 0
+    if rid2 != null && jsonx.is_integer(rid2) == 1 && json.json_get_long(rid2) == id { matches = 1 }
+    jsonx.free(v)
+    if matches == 0 { return "", 0, "" }
+    return text, 1, ""
+}
+
+// (result JSON text, "") of a rep, "ServerError" for an error rep,
+// "InvalidResponse" when there is no result object.
+checked(rep: string) -> (string, string) {
+    v = jsonx.parse(rep)
+    if v == null { return "", "InvalidResponse" }
+    e = jsonx.field(v, "error")
+    if is_null_(e) == 0 {
+        jsonx.free(v)
+        return "", "ServerError"
+    }
+    r = jsonx.field(v, "result")
+    if r == null || json.json_type(r) != json.JSON_OBJECT {
+        jsonx.free(v)
+        return "", "InvalidResponse"
+    }
+    out = jsonx.encode(r)
+    jsonx.free(v)
+    return out, ""
+}
+
+// ---- exchange ----
+
+// Sends one request (or notification) and waits for its rep: (rep
+// JSON text, ""), ("", "") for a notification or an ignorable 4xx body,
+// else the error name. params: a JSON object text.
+exchange_(t: *Transport, method: string, params_in: string, notification: int, cancel: @keep ptr, ms: long) -> (string, string) {
+    params = params_in
+    if t.modern == 1 {
+        meta = "{\"io.modelcontextprotocol/protocolVersion\":${jsonx.quote(t.version)},\"io.modelcontextprotocol/clientCapabilities\":{},\"io.modelcontextprotocol/clientInfo\":{\"name\":\"nib\",\"version\":${jsonx.quote(build_info.nib_version())}}}"
+        params = jsonx.with_member(params, "_meta", meta)
+    }
+    id = t.next_id
+    t.next_id = t.next_id + 1
+    body = ""
+    if notification == 1 {
+        body = "{\"jsonrpc\":\"2.0\",\"method\":${jsonx.quote(method)},\"params\":${params}}"
+    } else {
+        body = "{\"jsonrpc\":\"2.0\",\"id\":${id},\"method\":${jsonx.quote(method)},\"params\":${params}}"
+    }
+    if string.length(body) > MAX_MESSAGE { return "", "MessageTooLarge" }
+    t.cancel = cancel
+    t.deadline = os.now_monotonic_ms() + ms
+    cfg = cfg_(t)
+    if cfg.url != "" { return http_(t, method, params, body, id, notification) }
+    werr = write_line_(t, body)
+    if werr != "" { return "", werr }
+    if notification == 1 { return "", "" }
+    while true {
+        line, rerr = read_line(t.src, cancel, t.deadline)
+        if rerr != "" { return "", rerr }
+        rep, matched, merr = incoming(t as ptr, line, id)
+        if merr != "" { return "", merr }
+        if matched == 1 { return rep, "" }
+    }
+    return "", "EndOfStream"
+}
+
+// ---- HTTP ----
+
+http_open_(url: string, names: @keep ptr, values: @keep ptr, body: string, request_s: int) -> ptr {
+    h = heap.new(Http)
+    h.guard = lock.new()
+    h.buf = ""
+    h.status = 0
+    h.ctype = ""
+    h.session = ""
+    h.err = ""
+    h.done = sync.atomic_new(0)
+    h.stop = sync.atomic_new(0)
+    hp = h as ptr
+    u = string.copy(url)
+    b = string.copy(body)
+    hn = names
+    hv = values
+    limit = request_s
+    worker.run_detached(|| {
+        s = hp as *Http
+        req = client.request("POST", u)
+        if req == null {
+            lock.acquire(s.guard)
+            s.err = "InvalidUri"
+            lock.release(s.guard)
+            sync.atomic_store(s.done, 1)
+            return null
+        }
+        i = 0
+        while i < list.list_size(hn) {
+            n, _a = list.get_string(hn, i)
+            v, _b = list.get_string(hv, i)
+            client.set_header(req, n, v)
+            i = i + 1
+        }
+        client.set_body(req, string.bytes(b), "application/json")
+        client.set_follow_redirects(req, 0)
+        client.set_timeout(req, (limit as long) * 1s)
+        resp, err = client.send_stream(req)
+        if err != "" {
+            lock.acquire(s.guard)
+            s.err = err
+            lock.release(s.guard)
+            sync.atomic_store(s.done, 1)
+            return null
+        }
+        ctype = client.response_header(resp, "content-type")
+        session = client.response_header(resp, "Mcp-Session-Id")
+        lock.acquire(s.guard)
+        s.ctype = ctype
+        s.session = session
+        s.status = client.response_status(resp)
+        lock.release(s.guard)
+        total = 0 as long
+        while sync.atomic_load(s.stop) == 0 {
+            chunk = client.response_read(resp, 65536)
+            if string.length(chunk) == 0 { break }
+            total = total + (string.length(chunk) as long)
+            lock.acquire(s.guard)
+            s.buf = "${s.buf}${chunk}"
+            lock.release(s.guard)
+            if total > (MAX_MESSAGE as long) + 1 { break }
+        }
+        e = client.response_error(resp)
+        if e != "" {
+            lock.acquire(s.guard)
+            s.err = e
+            lock.release(s.guard)
+        }
+        client.response_free(resp)
+        sync.atomic_store(s.done, 1)
+        return null
+    })
+    return hp
+}
+
+bad_char_(token: string) -> int {
+    i = 0
+    while i < string.length(token) {
+        c = string.char_at(token, i) & 255
+        if c < 32 || c == 127 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+http_(t: *Transport, method: string, params: string, body: string, id: long, notification: int) -> (string, string) {
+    cfg = cfg_(t)
+    names = list.list_new()
+    values = list.list_new()
+    list.list_add(names, "accept")
+    list.list_add(values, "application/json, text/event-stream")
+    list.list_add(names, "MCP-Protocol-Version")
+    list.list_add(values, t.version)
+    if t.modern == 1 {
+        list.list_add(names, "Mcp-Method")
+        list.list_add(values, method)
+        pdoc = jsonx.parse(params)
+        pname = jsonx.str_or(pdoc, "name", "")
+        if jsonx.kind(pdoc, "name") == json.JSON_STRING {
+            list.list_add(names, "Mcp-Name")
+            list.list_add(values, mcp_headers.encode(pname))
+        }
+        if t.schema != "" {
+            args = jsonx.field(pdoc, "arguments")
+            text = "null"
+            if args != null { text = jsonx.encode(args) }
+            herr = mcp_headers.append(names, values, t.schema, text)
+            if herr != "" {
+                jsonx.free(pdoc)
+                return "", herr
+            }
+        }
+        jsonx.free(pdoc)
+    } else if t.session != "" {
+        list.list_add(names, "Mcp-Session-Id")
+        list.list_add(values, t.session)
+    }
+    if cfg.header_env != "" {
+        token, found = env_get_(t.env, cfg.header_env)
+        if found == 0 { return "", "MissingHeaderEnvironment" }
+        if bad_char_(token) == 1 { return "", "InvalidAuthorization" }
+        list.list_add(names, "authorization")
+        list.list_add(values, "Bearer ${token}")
+    }
+    h = http_open_(cfg.url, names, values, body, TIMEOUT_MS / 1000) as *Http
+    rep, err = http_run_(t, h, id, notification)
+    sync.atomic_store(h.stop, 1)
+    return rep, err
+}
+
+// Takes what the worker has received: (bytes, done).
+pull_(h: *Http) -> (string, int) {
+    done = sync.atomic_load(h.done) as int
+    lock.acquire(h.guard)
+    got = h.buf
+    h.buf = ""
+    lock.release(h.guard)
+    return got, done
+}
+
+http_run_(t: *Transport, h: *Http, id: long, notification: int) -> (string, string) {
+    status = 0
+    ctype = ""
+    session = ""
+    err = ""
+    while status == 0 {
+        lock.acquire(h.guard)
+        status = h.status
+        ctype = string.copy(h.ctype)
+        session = string.copy(h.session)
+        err = string.copy(h.err)
+        lock.release(h.guard)
+        if status == 0 {
+            if err != "" { return "", "Transport: ${err}" }
+            if sync.atomic_load(h.done) != 0 { return "", "Transport: connection closed before the response head" }
+            e = stop_(t.cancel, t.deadline)
+            if e != "" { return "", e }
+            sleep(5)
+        }
+    }
+    t.http_status = status
+    if t.modern == 0 && session != "" {
+        n = string.length(session)
+        if n > 1024 { return "", "InvalidSessionId" }
+        i = 0
+        while i < n {
+            c = string.char_at(session, i) & 255
+            if c < 33 || c > 126 { return "", "InvalidSessionId" }
+            i = i + 1
+        }
+        t.session = session
+    }
+    if notification == 1 && status == 202 { return "", "" }
+    media = string.to_lower(ctype)
+    client4xx = 0
+    if t.modern == 1 && status >= 400 && status < 500 { client4xx = 1 }
+    if string.starts_with(media, "text/event-stream") == 1 {
+        parser = sse.parser()
+        pending = ""
+        total = 0
+        while true {
+            nl = string.index_of(pending, "\n")
+            if nl >= 0 {
+                line = string.substring(pending, 0, nl)
+                pending = string.substring(pending, nl + 1, string.length(pending))
+                total = total + string.length(line) + 1
+                if total > MAX_MESSAGE { return "", "MessageTooLarge" }
+                event, got = sse.feed(parser, line)
+                if got == 1 {
+                    rep, matched, merr = incoming(t as ptr, event, id)
+                    if merr != "" { return "", merr }
+                    if matched == 1 { return rep, "" }
+                }
+            } else {
+                more, done = pull_(h)
+                if string.length(more) > 0 {
+                    pending = "${pending}${more}"
+                } else if done == 1 {
+                    // Bytes may land between the load of done and the pull.
+                    more2, _d = pull_(h)
+                    if string.length(more2) == 0 { return "", "EndOfStream" }
+                    pending = "${pending}${more2}"
+                } else {
+                    e2 = stop_(t.cancel, t.deadline)
+                    if e2 != "" { return "", e2 }
+                    sleep(2)
+                }
+                if string.length(pending) > MAX_MESSAGE { return "", "MessageTooLarge" }
+            }
+        }
+    }
+    data = ""
+    while true {
+        more3, done3 = pull_(h)
+        data = "${data}${more3}"
+        if string.length(data) > MAX_MESSAGE { return "", "MessageTooLarge" }
+        if done3 == 1 {
+            more4, _d4 = pull_(h)
+            data = "${data}${more4}"
+            break
+        }
+        if string.length(more3) == 0 {
+            e3 = stop_(t.cancel, t.deadline)
+            if e3 != "" { return "", e3 }
+            sleep(2)
+        }
+    }
+    lock.acquire(h.guard)
+    terr = string.copy(h.err)
+    lock.release(h.guard)
+    if terr != "" { return "", "Transport: ${terr}" }
+    if string.starts_with(media, "application/json") == 0 {
+        if client4xx == 1 { return "", "" }
+        return "", "InvalidContentType"
+    }
+    rep2, matched2, merr2 = incoming(t as ptr, data, id)
+    if merr2 != "" {
+        if client4xx == 1 { return "", "" }
+        return "", merr2
+    }
+    if matched2 == 1 { return rep2, "" }
+    if client4xx == 1 { return "", "" }
+    return "", "InvalidResponse"
+}
+
+// ---- discovery ----
+
+// "" the modern protocol is confirmed, "legacy" try the initialize
+// handshake, else the error name.
+classify_(t: *Transport, doc: ptr) -> string {
+    cfg = cfg_(t)
+    rpc_error = jsonx.field(doc, "error")
+    code = jsonx.field(rpc_error, "code")
+    has_code = 0
+    code_int = 0
+    if code != null && jsonx.is_integer(code) == 1 {
+        has_code = 1
+        code_int = json.json_get_int(code)
+    }
+    if is_null_(rpc_error) == 0 && has_code == 1 && code_int == -32022 { return "UnsupportedProtocolVersion" }
+    result = jsonx.field(doc, "result")
+    if result != null && json.json_type(result) == json.JSON_OBJECT {
+        versions = jsonx.field(result, "supportedVersions")
+        if versions == null || json.json_type(versions) != json.JSON_ARRAY { return "InvalidDiscovery" }
+        n = jsonx.array_size(versions)
+        i = 0
+        while i < n {
+            v = jsonx.array_at(versions, i)
+            if json.json_type(v) == json.JSON_STRING && jsonx.str_field(v) == PROTOCOL_VERSION { return "" }
+            i = i + 1
+        }
+        return "UnsupportedProtocolVersion"
+    }
+    // Modern errors identify a modern endpoint even if the RPC itself failed.
+    if has_code == 1 && (code_int == -32020 || code_int == -32021) { return "ModernProtocolError" }
+    if cfg.url != "" && (t.http_status < 400 || t.http_status >= 500) { return "DiscoveryFailed" }
+    return "legacy"
+}
+
+ensure_(t: *Transport, cancel: @keep ptr) -> string {
+    cfg = cfg_(t)
+    if cfg.command != "" && t.pid <= 0 {
+        se = spawn_(t)
+        if se != "" { return se }
+    }
+    t.last_error = ""
+    ms = 2000 as long
+    if cfg.url != "" { ms = TIMEOUT_MS as long }
+    probe, err = exchange_(t, "server/discover", "{}", 0, cancel, ms)
+    if err != "" {
+        if err == "Canceled" { return err }
+        if err != "Timeout" || cfg.url != "" { return err }
+        // A silent probe: a fresh process before the legacy handshake.
+        close(t as ptr)
+        se2 = spawn_(t)
+        if se2 != "" { return se2 }
+        probe = ""
+    }
+    doc = null
+    if probe != "" { doc = jsonx.parse(probe) }
+    verdict = classify_(t, doc)
+    jsonx.free(doc)
+    if verdict == "" {
+        t.ready = 1
+        return ""
+    }
+    if verdict != "legacy" { return verdict }
+    t.modern = 0
+    t.version = LEGACY_VERSION
+    init = "{\"protocolVersion\":${jsonx.quote(LEGACY_VERSION)},\"capabilities\":{},\"clientInfo\":{\"name\":\"nib\",\"version\":${jsonx.quote(build_info.nib_version())}}}"
+    rep, ierr = exchange_(t, "initialize", init, 0, cancel, TIMEOUT_MS as long)
+    if ierr != "" { return ierr }
+    result, cerr = checked(rep)
+    if cerr != "" { return cerr }
+    rdoc = jsonx.parse(result)
+    version = ""
+    if jsonx.kind(rdoc, "protocolVersion") == json.JSON_STRING { version = string.copy(jsonx.str_or(rdoc, "protocolVersion", "")) }
+    jsonx.free(rdoc)
+    if version == "" { return "InvalidInitialization" }
+    accepted = ""
+    known = [LEGACY_VERSION, "2025-06-18", "2025-03-26", "2024-11-05"]
+    k = 0
+    while k < 4 {
+        if known[k] == version { accepted = known[k] }
+        k = k + 1
+    }
+    if accepted == "" { return "UnsupportedProtocolVersion" }
+    t.version = accepted
+    _n, nerr = exchange_(t, "notifications/initialized", "{}", 1, cancel, TIMEOUT_MS as long)
+    if nerr != "" { return nerr }
+    t.ready = 1
+    return ""
+}
+
+// Connects (starting the child, discovering the protocol) unless already
+// connected. "" or the error name; a failure closes the connection.
+ensure(tp: ptr, cancel: @keep ptr) -> string {
+    t = tp as *Transport
+    if t.ready == 1 { return "" }
+    e = ensure_(t, cancel)
+    if e != "" { close(tp) }
+    return e
+}
+
+// One request: (rep JSON text, ""), or the error name (the connection is
+// closed). t.last_error holds the rep's error message, "" none.
+rpc(tp: ptr, method: string, params: string, cancel: @keep ptr) -> (string, string) {
+    t = tp as *Transport
+    e = ensure(tp, cancel)
+    if e != "" { return "", e }
+    rep, err = exchange_(t, method, params, 0, cancel, TIMEOUT_MS as long)
+    if err != "" {
+        close(tp)
+        return "", err
+    }
+    t.last_error = ""
+    doc = jsonx.parse(rep)
+    if doc != null {
+        ed = jsonx.field(doc, "error")
+        if ed != null { t.last_error = string.copy(jsonx.str_or(ed, "message", "")) }
+        jsonx.free(doc)
+    }
+    return rep, ""
+}
