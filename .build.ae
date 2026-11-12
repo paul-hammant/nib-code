@@ -4,8 +4,31 @@
 import bldr
 import aether
 import aether (source, output, lib)
+import std.os
+import std.fs
+import std.list
+import std.string
+
+// The Session header's nib_version carries the commit, as upstream's
+// build.zig does: written to a gitignored header the build_info module's C
+// side includes when present.
+write_commit_() {
+    argv = list.list_new()
+    list.list_add(argv, "rev-parse")
+    list.list_add(argv, "--short")
+    list.list_add(argv, "HEAD")
+    out, code, err = os.run_capture("git", argv, null)
+    c = string.trim(out)
+    text = "#define NIB_COMMIT \"${c}\"\n"
+    if err != "" || code != 0 { text = "" }
+    path = "ae/nib/build_info/commit.h"
+    old, rerr = fs.read(path)
+    if rerr == "" && old == text { return }
+    fs.write(path, text)
+}
 
 aeb(cap) {
+    write_commit_()
     bldr.build() {
         aether.program() {
             source("ae/main.ae")

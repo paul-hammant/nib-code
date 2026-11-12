@@ -49,13 +49,14 @@ import nib.session.instructions
 import nib.session.compact
 import nib.session.tool_summary
 import nib.session.fork_history
+import nib.build_info
 import nib.tools.agent_input
 import nib.tools.agent_sessions
 
 exports(Session, Options, Sink, new_options, new_sink, init, turn, compact_now, close, error_message, timing_json, undo,
         VERSION)
 
-const VERSION = "0.13.0-ae"
+const VERSION = "0.13.0-ae"   // `nib --version`; Session headers record build_info.nib_version()
 
 struct Options {
     home: string             // $NIB_HOME
@@ -330,7 +331,7 @@ initialize_fork_(s: *Session, fp: ptr, cwd: string) -> string {
     members = ",\"cwd\":${jsonx.quote(cwd)},\"provider\":${jsonx.quote(c.provider)}"
     if c.custom_provider != "" { members = "${members},\"custom_provider\":${jsonx.quote(c.custom_provider)}" }
     members = "${members},\"model\":${jsonx.quote(c.model)},\"parent_session_id\":${jsonx.quote(s.parent_session_id)},\"cache_key\":${jsonx.quote(s.cache_key)}"
-    members = "${members},\"forked_from\":{\"session\":${jsonx.quote(f.session)},\"message_count\":${f.message_count}},\"nib_version\":${jsonx.quote(VERSION)}"
+    members = "${members},\"forked_from\":{\"session\":${jsonx.quote(f.session)},\"message_count\":${f.message_count}},\"nib_version\":${jsonx.quote(build_info.nib_version())}"
     tokens = compact.estimate_tokens(msgs, 0, list.list_size(msgs))
     return log.commit(s.log, s.history, 0, msgs, tokens, members, 1)
 }
@@ -380,7 +381,7 @@ initialize_history_(s: *Session, cwd: string) -> string {
     if c.custom_provider != "" { members = "${members},\"custom_provider\":${jsonx.quote(c.custom_provider)}" }
     members = "${members},\"model\":${jsonx.quote(c.model)}"
     if s.parent_session_id != "" { members = "${members},\"parent_session_id\":${jsonx.quote(s.parent_session_id)}" }
-    members = "${members},\"cache_key\":${jsonx.quote(s.cache_key)},\"nib_version\":${jsonx.quote(VERSION)},\"system_sha\":${jsonx.quote(prompt.system_sha(base))}"
+    members = "${members},\"cache_key\":${jsonx.quote(s.cache_key)},\"nib_version\":${jsonx.quote(build_info.nib_version())},\"system_sha\":${jsonx.quote(prompt.system_sha(base))}"
     off = prompt.disabled_patches(o.patches_off)
     if list.list_size(off) > 0 { members = "${members},\"patches_off\":${json_list_(off)}" }
     members = "${members},\"profile\":${jsonx.quote(profile.name(profile.for_model(c.model)))}"
