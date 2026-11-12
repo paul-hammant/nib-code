@@ -90,7 +90,7 @@ pins                     AE_PIN / AEB_REF the port is verified against
 | `src/tools/bash/registry.zig` | 146 | `ae/nib/tools/registry/module.ae` | a2dd439 | supersession; started/superseded/finished log records |
 | `src/tools/bash/jail.zig` | 304 | `ae/nib/tools/jail/module.ae` | a2dd439 | Landlock in jail/landlock.c (stand-in); probe cached per Tools, not per process |
 | `src/tools/background.zig` | 866 | `ae/nib/tools/background/module.ae` | a2dd439 | bash only: typed inbox, started record, lost on resume, detached across Turns; agents and background Runs not yet |
-| `src/tools/stop.zig` | 29 | `ae/nib/tools/module.ae` | a2dd439 | userStop (TUI) not yet |
+| `src/tools/stop.zig` | 29 | `ae/nib/tools/module.ae`, `ae/nib/tui/live/module.ae` | a2dd439 | userStop is the TUI port's `user_stop_`; a stop requested during a Turn runs on a worker, not in Tools.poll |
 | `src/tools/undo.zig` | 606 | `ae/nib/tools/undo/module.ae` | a2dd439 | Session wires begin/finish/undo; off for `nib ask` as upstream; /undo itself is the TUI's |
 | `src/tools/view.zig` | 92 | not yet |  | needs src/image.zig and the Session image store |
 | `src/tools/progress.zig` | 249 | `ae/nib/tools/progress/module.ae` | a2dd439 | agent kinds wait for tools.agent |
@@ -113,7 +113,7 @@ pins                     AE_PIN / AEB_REF the port is verified against
 | `src/session/compact.zig` | 175 | `ae/nib/session/compact/module.ae` | a2dd439 | no image placeholders |
 | `src/session/tool_summary.zig` | 249 | `ae/nib/session/tool_summary/module.ae` | a2dd439 | no annotateViews (images) |
 | `src/session/events.zig` | 182 | `ae/nib/session/module.ae` | a2dd439 | events are the NDJSON text they print as |
-| `src/session/inbox.zig` | 278 | `ae/nib/tools/background/module.ae` | a2dd439 | bash results, FIFO, detached kept; user interjections (TUI) not yet |
+| `src/session/inbox.zig` | 278 | `ae/nib/tools/background/module.ae` | a2dd439 | bash results, FIFO, detached kept; user interjections (`enqueue_user`/`take_users`, kind "user") inserted before the next Step |
 | `src/session/history.zig` | 130 | not yet |  | fork (subagents): next |
 | `src/session/hooks.zig`, `skills.zig` | 538 | not yet |  | next slice |
 | `src/provider.zig` | 395 | `ae/nib/provider/types/module.ae`, `ae/nib/provider/module.ae` | a2dd439 | less Codex |
@@ -127,12 +127,23 @@ pins                     AE_PIN / AEB_REF the port is verified against
 | `src/provider/codex_ws.zig`, `websocket.zig` | 523 | not ported |  | policy: API keys only |
 | `src/config.zig` | 1680 | `ae/nib/config/module.ae`, `ae/nib/config/env/module.ae` | a2dd439 | no Codex provider ([codex] validated and ignored); default service anthropic |
 | `src/mcp*` | 700 | | | |
-| `src/main.zig` | 311 | `ae/main.ae` | a2dd439 | ask, js, login/logout, help, version, __jail; no TUI, replay, update, --agent-input |
+| `src/main.zig` | 311 | `ae/main.ae` | a2dd439 | ask, js, login/logout, help, version, __jail; bare `nib` opens the TUI (`run_tui_`); no replay, update |
 | `src/replay.zig`, `src/image.zig` | 900 | not yet | | |
-| `src/tui*` | 12,600 | | | needs the terminal layer (upstream uses libvaxis) |
+| `src/tui.zig` | 1911 | `ae/nib/tui/module.ae` | 7788541 | the App; takes term, Session port and clock; app events through `nib.tui.app_queue`; the Ticker is the poll timeout; images are a marked stand-in |
+| `src/tui/view.zig` | 744 | `ae/nib/tui/tui_view/module.ae` | 7788541 | renamed (basename `view`); both snapshot files match cell for cell |
+| `src/tui/transcript.zig`, `transcript/entry.zig`, `transcript/changes.zig`, `transcript/intraline.zig`, `transcript/label.zig` | 2634 | `ae/nib/tui/transcript`, `entry`, `turn_changes` (renamed), `intraline`, `label` | 7788541 | replayed tool summaries are read from the messages' `tool_summary` members |
+| `src/tui/editor.zig` | 657 | `ae/nib/tui/editor/module.ae` | 7788541 | image blocks over an editor-local Image (stand-in for nib.image) |
+| `src/tui/markdown.zig`, `syntax.zig` | 1472 | `ae/nib/tui/markdown`, `syntax` | 7788541 | |
+| `src/tui/viewport.zig`, `selection.zig`, `selection/history.zig` | 595 | `ae/nib/tui/viewport`, `selection`, `sel_history` (renamed) | 7788541 | the local clipboard tool is a closure the app supplies |
+| `src/tui/status.zig`, `bill.zig`, `title.zig`, `format.zig`, `frames.zig`, `smooth.zig`, `long_text.zig`, `mode.zig` | 1076 | `ae/nib/tui/<same>`, `turn_summary` | 7788541 | times are ms from the app's clock |
+| `src/tui/commands.zig`, `menu.zig`, `providers.zig` | 1133 | `ae/nib/tui/commands`, `menu`, `module.ae` | 7788541 | execute/select/providers live in the app; `/provider` is key entry only |
+| `src/tui/provider_flow.zig` | 658 | `ae/nib/tui/provider_flow/module.ae` | 7788541 | API keys only: the Codex sign-in steps are not ported |
+| `src/tui/prediction.zig`, `reflect.zig` | 798 | `ae/nib/tui/prediction`, `reflect` | 7788541 | the model call and gh are closures (specs replace them) |
+| `src/tui/paths.zig`, `open.zig`, `clipboard.zig`, `agent_tree.zig`, `tasks.zig`, `turn.zig` | 1306 | `ae/nib/tui/<same>` | 7788541 | turn.zig's thread is the port's (`nib.tui.live`); clipboard's image check is a stand-in for nib.image |
+| (new) | | `ae/nib/tui/port`, `live`, `clock`, `app_queue` | | the Session interface with its scripted (specs) and live (nib.session) implementations, the clock instance, the app event queue |
 | `src/auth.zig`, `src/auth/store.zig`, `src/auth/cli.zig` | 601 | `ae/nib/auth/module.ae`, `ae/nib/auth/store/module.ae` | a2dd439 | API keys only: no tokens, no Codex login |
 | `src/auth/oauth.zig`, `login.zig`, `codex.zig` | 798 | not ported | | policy |
-| `src/auth/models.zig` | 92 | not yet | | `/models` listing (TUI /model) |
+| `src/auth/models.zig` | 92 | `ae/nib/auth/models/module.ae` | 7788541 | API keys only |
 | `src/update*` | 140 | not ported | | |
 
 `tools/upstream-diff.sh` lists, per row with a commit, what upstream changed
@@ -224,8 +235,9 @@ module was mutation-checked.
 | test_llm.py | Chat cases pass except the child one, with one assertion set aside | its docs check requires `async agent(` in the prompt |
 | test_limits.py | max-steps cases pass; LLM limits pass with the same assertion set aside | agent limits, `nib replay`, Codex classes |
 | test_effort.py | the chat_completions half passes | its second half is Codex |
-| test_model.py, test_undo.py, test_tui_*.py, test_at_files.py, test_images.py | not yet | the TUI |
-| test_agent*.py, test_background_agent.py, test_background_run.py, test_interjections.py, test_hooks.py, test_skills.py, test_skill_mentions.py, test_mcp.py, test_replay.py, test_web_search.py, test_prediction.py, test_stats.py | not yet | their slices (agents, Run backgrounding, TUI, hooks/skills, MCP, replay, web search) |
+| test_model.py, test_undo.py, test_tui_*.py, test_at_files.py, test_interjections.py, test_prediction.py | pass (TUI slice) | |
+| test_images.py | not yet | images and tools.view (not TUI-driven) |
+| test_mcp.py, test_replay.py, test_web_search.py, test_stats.py | not yet | their slices (agents, Run backgrounding, TUI, hooks/skills, MCP, replay, web search) |
 | test_codex.py, test_codex_websocket.py, test_provider_login.py | excluded | policy: no Codex sign-in or WebSocket |
 
 **Lanes.** macOS arm64, ae-x64 (Ubuntu 22.04) and cachyos: unit suites green on all
@@ -266,3 +278,78 @@ cell instead of the process flag.
 session/history fork, `--agent-input`), automatic Run backgrounding
 (run_job), hooks and skills, MCP, tools.fetch/web_search, images and
 tools.view, record/replay.
+
+## TUI slice (2026-11-12)
+
+**What runs.** Bare `nib` opens the TUI on the controlling terminal
+(`ae/term`), over the real Session with undo on (`-c`/`--resume` reopen
+one): streaming with the Thinking / Generating response / Running states,
+Run blocks with tool summaries, background tasks and the agent tree,
+interjections, Esc cancel with queued text returned to the input, the `/`
+menu and every command (`/provider` with API keys only, `/model` with the
+listed models, `/effort`, `/undo`, `/tasks`, `/stop`, `/skills`, `/status`,
+`/simple`, `/new`, `/resume`, `/copy`, `/js`, `/compact`, `/reflect` with
+NIB_ISSUE_REPO, `/mcp`), `@` path and `$` skill completion, input history,
+paste blocks, input prediction, mouse selection with OSC 52 copy, hover,
+clickable paths with `open`, Simple mode, resize.
+
+**Design (Paul's requirement).** `nib.tui.new(terminal, port, clock, env)`:
+the terminal is `term.open()` or `term.memory(cols, rows)`; the Session is a
+`nib.tui.port.Port` (closures: the real one is `nib.tui.live` over
+`nib.session`, specs use `port.scripted(cfg, home)`, which records Turns
+and lets the spec emit events: "reasoning, then text, then a Run with these
+results"); the clock is `nib.tui.clock` (`of_terminal`, so an in-memory
+terminal's fake clock drives it). No module-level state. Specs drive the
+app in-process (`term.driver` keys and mouse, `tui.step`, `tui.settle`): no
+pty, no sleeps.
+
+**Session-side hooks added for it** (small, in `nib.session` and
+`nib.tools.background`): `Sink.on_activity` (model
+started/data/script/waiting/finished, user_inserted; `nib ask` sets none),
+`session.enqueue`/`take_queued` (user items in the background inbox,
+FIFO, committed with the Step), `session.switch_config` (in place before
+the first Step, else the port reopens), `turn_end_hooks` returning its
+notice, `background.snapshot_json`/`waiting_json` for `/tasks` and the
+waiting line.
+
+**Unit tests.** 31 TUI std.spec suites (`tools/tui_tests.sh`, also in
+`.tests.ae`): every upstream inline test of `src/tui*` and
+`src/auth/models.zig` is ported under its name, except those listed in a
+suite's header (allocation-failure and thread-ownership tests; the Codex
+sign-in reply of provider_flow; `tui.zig`'s two queue-shutdown leak tests,
+covered by "closed queues refuse events"). `tui_view_test.ae` compares
+against upstream's `src/tui/layout_snapshots.txt` and
+`simple_snapshots.txt`, whole text, headers included: **both match cell
+for cell**. `tui_app_test.ae` adds in-process flow specs: streaming states,
+a Run block opened by a click, interjection, Esc cancel, the `/` menu,
+undo, Simple mode, mouse selection and copy, resize, and the app's first
+frame against the upstream "normal" snapshot. Every module was
+mutation-checked (`tools/mutate.py` for the app).
+
+**Upstream e2e, unchanged (`ae/tests/upstream-e2e.sh`).**
+
+| Test | macOS | ae-x64 | cachyos |
+|---|---|---|---|
+| test_tui_stream.py, test_tui_mouse.py, test_model.py, test_undo.py, test_interjections.py, test_at_files.py, test_prediction.py | pass | pass | pass |
+| test_hooks.py, test_skills.py, test_skill_mentions.py (TUI parts included) | pass | pass except `test_sandbox_denies_external_write` (kernel 5.15: no Landlock ABI 2) | pass |
+| TUI cases of test_background_agent/bash/run (escape, interjection, `/tasks`, `/stop`, step-limit result in the next TUI Turn) | their `/proc` helper needs Linux | pass | pass |
+| test_images.py | not TUI-driven: images and tools.view are not ported | | |
+| test_replay.py, test_codex_websocket.py, test_provider_login.py | excluded: replay not ported; Codex by policy | | |
+
+**Stand-ins and stubs (marked).** Images: Ctrl+V and an empty paste say
+"No image in clipboard", pasted image paths are pasted as text, the
+editor's Image and clipboard's PNG check stand in for `nib.image`. MCP:
+`/mcp` reads no servers. Tool activity names (upstream onToolActivity) are
+not emitted; the Running line uses the Run's progress. Hooks run after a
+TUI Turn on the Turn's worker, not a thread of their own.
+
+**Differences kept.** Terminal input and app events are two queues (term
+and `app_queue`); upstream has one libvaxis loop. A stop requested during a
+Turn runs at once on a worker (upstream: the Session's next poll). A model
+switch before the first Step re-initializes the same log in place, as
+upstream; after it the port opens a new Session.
+
+**Asks.** `asks/aether-push-call-result-string.md` (`xs.push(f())` loses
+the struct's strings), `asks/aether-qualified-slice-local.md` (`m.P[] xs =
+[]` does not parse), `asks/aether-ptr-passed-as-string.md` (a `ptr` is
+accepted for a `string` parameter), plus ae/term's.

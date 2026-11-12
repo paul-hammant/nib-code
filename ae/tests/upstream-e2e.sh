@@ -26,7 +26,6 @@ ln -sf ../../target/build/bin/nib zig-out/bin/nib
 # (substrings of Class.method, run through ae/tests/run_upstream.py) and
 # why. A file with nothing left out runs as upstream runs it.
 #   Codex*/codex: policy (API keys only, no Codex sign-in or WebSocket)
-#   tui/escape/interjection: the TUI slice
 APPLY="tests/test_cli.py
 tests/test_providers.py
 tests/test_session.py
@@ -39,9 +38,19 @@ tests/test_limits.py|Codex
 tests/test_agent.py|CodexTests
 tests/test_agent_fork.py|CodexForkTests
 tests/test_agent_reuse.py|CodexTests
-tests/test_background_agent.py|CodexTests escape interjection tui
-tests/test_background_bash.py|CodexTests escape interjection tui
-tests/test_background_run.py|codex escape tui"
+tests/test_background_agent.py|CodexTests
+tests/test_background_bash.py|CodexTests
+tests/test_background_run.py|codex
+tests/test_tui_stream.py
+tests/test_tui_mouse.py
+tests/test_model.py
+tests/test_undo.py
+tests/test_interjections.py
+tests/test_at_files.py
+tests/test_prediction.py
+tests/test_hooks.py
+tests/test_skills.py
+tests/test_skill_mentions.py"
 
 files=$(printf '%s\n' "$@")
 [ $# -gt 0 ] || files=$APPLY
