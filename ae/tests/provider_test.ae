@@ -1,0 +1,421 @@
+// Ports the inline tests of upstream src/provider.zig, src/provider/sse.zig
+// and src/provider/retry.zig under their names, on fakes (a `request` fn and
+// sse.fixed), never a network.
+//
+// Codex is not ported (policy), so:
+//  - tests that iterate Codex ids run the openai provider (Responses
+//    protocol, the nearest stand-in) where the assertion is provider
+//    independent, and are marked "(adapted)";
+//  - Codex-only retry behaviour is skipped: "shared retry only replays
+//    emitted deltas for Codex" keeps its non-Codex arm and asserts it for
+//    every provider (the port has no Codex replay exception); the Codex
+//    Retry-After delay ("try again in 0.25s" -> 250 ms) and the Codex
+//    stale-socket immediate reconnect have no equivalent, so a RateLimited
+//    failure keeps the plain 1000 ms backoff here;
+//  - "idle timeout retries ..." asserts the non-Codex rule for every
+//    provider, for the same reason;
+//  - `setEffort` copying its argument ("stable names") has no equivalent:
+//    Aether strings are values.
+// Extra (not upstream): "shared retry backoff doubles up to the attempt
+// limit" and the direct transient() table.
+import std.spec
+import std.string
+import std.list
+import std.sync
+import nib.provider.types
+import nib.provider.sink
+import nib.provider.sse
+import nib.provider
+import nib.provider.http
+
+// ---- provider.zig -------------------------------------------------------
+
+has_id_(l: ptr, id: string) -> int {
+    n = 0
+    i = 0
+    while i < list.list_size(l) {
+        s, _e = list.get_string(l, i)
+        if s == id { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// ---- retry.zig fixture --------------------------------------------------
+
+struct St {
+    calls: int
+    failures: int
+    failure: string
+    note: string
+    emit_delta: int
+    deltas: int
+    received: int
+    retries: int
+    delays: string       // "1000,2000"
+    failed: string       // the error name carried by the failed event, "" none
+    events: string       // "started finished retry ..."
+    cancel: ptr
+    cancel_on_retry: int
+    replay_safe: int
+}
+
+new_st_() -> ptr {
+    s = heap.new(St)
+    s.calls = 0
+    s.failures = 1
+    s.failure = "HttpTransient"
+    s.note = "temporary failure"
+    s.emit_delta = 0
+    s.deltas = 0
+    s.received = 0
+    s.retries = 0
+    s.delays = ""
+    s.failed = ""
+    s.events = ""
+    s.cancel = sync.atomic_new(0)
+    s.cancel_on_retry = 0
+    s.replay_safe = 0
+    return s as ptr
+}
+
+last_event_(s: ptr) -> string {
+    st = s as *St
+    parts = string.split(st.events, " ")
+    n = string.array_size(parts)
+    if n < 2 { return "" }
+    // the string ends with a separator, so the last part is empty
+    return string.array_get(parts, n - 2)
+}
+
+observer_(sp: @keep ptr, quiet: int, wait: int) -> ptr {
+    rp = provider.retry_new(sp)
+    r = rp as *provider.Retry
+    r.wait = wait
+    if quiet == 1 { return rp }
+    r.on_event = |ctx: ptr, kind: string, attempt: int, delay_ms: long, reason: string| {
+        s = ctx as *St
+        if kind == "retry" {
+            spec.assert_str_eq(last_event_(ctx), "finished", "retry follows finished")
+            spec.assert_eq(attempt, s.calls, "retry attempt")
+            spec.assert_str_eq(reason, s.note, "retry reason")
+            if s.retries > 0 { s.delays = "${s.delays}," }
+            s.delays = "${s.delays}${delay_ms}"
+            s.retries = s.retries + 1
+            if s.cancel_on_retry == 1 { sync.atomic_store(s.cancel, 1) }
+        } else if kind == "failed" {
+            spec.assert_str_eq(last_event_(ctx), "finished", "failed follows finished")
+            spec.assert_eq(attempt, s.calls, "failed attempt")
+            spec.assert_str_eq(reason, "${s.failure}\t${s.note}", "failed reason")
+            s.failed = s.failure
+        }
+        s.events = "${s.events}${kind} "
+    }
+    r.has_event = 1
+    return rp
+}
+
+sink_(sp: @keep ptr) -> ptr {
+    k = sink.new(sp)
+    kp = k as *sink.Sink
+    kp.on_delta = |ctx: ptr, kind: string, text: string| {
+        s = ctx as *St
+        s.deltas = s.deltas + 1
+    }
+    kp.has_delta = 1
+    kp.on_data = |ctx: ptr| {
+        s = ctx as *St
+        s.received = s.received + 1
+    }
+    kp.has_data = 1
+    return k
+}
+
+// (reply, err, detail, attempts) from provider.complete_with over the fake.
+run_(sp: @keep ptr, id: string, quiet: int, wait: int) -> (ptr, string, string, int) {
+    st = sp as *St
+    cp = types.new_config(id, "", "", "m")
+    msgs = list.list_new()
+    return provider.complete_with(|c2: ptr, key: string, m: ptr, tools: string, mt: int, s2: @keep ptr, cl: ptr, out: ptr| {
+        k = (s2 as *sink.Sink).ctx as *St
+        o = out as *types.Reply
+        k.calls = k.calls + 1
+        spec.assert_str_eq(tools, "[]", "tools json forwarded")
+        sink.received(s2)
+        if k.emit_delta == 1 { sink.delta(s2, "text", "delta") }
+        if k.calls <= k.failures {
+            o.phase = k.failure
+            o.text = k.note
+            o.tool_calls = null
+        } else {
+            r = types.reply_new() as *types.Reply
+            r.text = "done"
+            (r.usage as *types.Usage).completion_tokens = 7 as long
+            o.tool_calls = r as ptr
+        }
+    }, cp, "key", msgs, "[]", -1, sink_(sp), st.cancel, st.replay_safe, observer_(sp, quiet, wait))
+}
+
+const STARTED_FINISHED_RETRY_3 = "started finished retry started finished retry started finished "
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "provider") {
+        spec.it("explicit effort overrides thinking and stores stable names (adapted: openai for codex)") callback {
+            cp = types.new_config("openai", "", "", "gpt-6.1-sol")
+            c = cp as *types.Config
+            c.thinking = 0
+            spec.assert_str_eq(types.set_effort(cp, "high"), "", "set high")
+            spec.assert_str_eq(provider.effective_effort(cp), "high", "high")
+            spec.assert_eq(c.thinking, 1, "thinking true")
+            spec.assert_str_eq(types.set_effort(cp, "off"), "", "set off")
+            spec.assert_str_eq(provider.effective_effort(cp), "low", "off is low on a model that cannot disable")
+            spec.assert_str_eq(types.set_effort(cp, "default"), "", "set default")
+            spec.assert_str_eq(provider.effective_effort(cp), "server default", "default")
+            spec.assert_str_eq(provider.logged_effort(cp), "default", "logged default")
+            spec.assert_eq(c.thinking, -1, "thinking none")
+            spec.assert_str_eq(types.set_effort(cp, "hgh"), "InvalidReasoningEffort", "invalid")
+            spec.assert_str_eq(provider.effective_effort(cp), "server default", "unchanged after invalid")
+            c.provider = "chat_completions"
+            types.set_effort(cp, "max")
+            spec.assert_str_eq(provider.effective_effort(cp), "max", "chat max")
+            spec.assert_str_eq(provider.logged_effort(cp), "max", "logged max")
+            types.set_effort(cp, "off")
+            spec.assert_str_eq(provider.effective_effort(cp), "off", "chat off")
+            c.thinking = 1
+            c.reasoning_effort = ""
+            spec.assert_str_eq(provider.effective_effort(cp), "on (server default effort)", "chat on")
+            spec.assert_str_eq(provider.logged_effort(cp), "default", "logged on")
+            // the Anthropic protocol maps through anthropic.effort
+            c.provider = "anthropic"
+            c.model = "claude-sonnet-5-5"
+            types.set_effort(cp, "minimal")
+            spec.assert_str_eq(provider.effective_effort(cp), "low", "anthropic minimal")
+        }
+
+        spec.it("provider definitions cover every identity exactly once (codex excluded by policy)") callback {
+            ids = types.builtin_ids()
+            spec.assert_eq(list.list_size(ids), 5, "five built-ins")
+            want = string.split("chat_completions openai anthropic deepseek xai", " ")
+            i = 0
+            while i < string.array_size(want) {
+                id = string.array_get(want, i)
+                spec.assert_eq(has_id_(ids, id), 1, "exactly once: ${id}")
+                spec.assert_eq(types.known_id(id), 1, "known: ${id}")
+                spec.assert_true(string.length(types.definition_base_url(id)) > 0, "base_url ${id}")
+                spec.assert_true(string.length(types.definition_default_model(id)) > 0, "default model ${id}")
+                spec.assert_true(string.length(types.definition_name(id)) > 0, "name ${id}")
+                spec.assert_eq(types.known_protocol(types.definition_protocol(id)), 1, "protocol ${id}")
+                i = i + 1
+            }
+            spec.assert_eq(types.known_id("codex"), 0, "codex is not a provider")
+            spec.assert_eq(has_id_(ids, "codex"), 0, "codex absent")
+        }
+
+        spec.it("vision follows provider tables and custom declarations (adapted: openai for codex)") callback {
+            spec.assert_eq(types.vision(types.new_config("openai", "", "", "gpt-6.1-sol")), 1, "openai")
+            spec.assert_eq(types.vision(types.new_config("anthropic", "", "", "claude-sonnet-5-5")), 1, "anthropic")
+            spec.assert_eq(types.vision(types.new_config("deepseek", "", "", "deepseek-flash")), 0, "deepseek")
+            spec.assert_eq(types.vision(types.new_config("chat_completions", "", "", "deepseek-flash")), 0, "chat")
+            cp = types.new_config("custom", "", "", "m")
+            c = cp as *types.Config
+            c.custom_provider = "site"
+            spec.assert_eq(types.vision(cp), 0, "custom chat undeclared")
+            c.custom_vision = 1
+            spec.assert_eq(types.vision(cp), 1, "custom chat declared")
+            c.custom_protocol = "anthropic_messages"
+            c.custom_vision = -1
+            spec.assert_eq(types.vision(cp), 1, "custom anthropic undeclared")
+            c.custom_vision = 0
+            spec.assert_eq(types.vision(cp), 0, "custom anthropic declared off")
+        }
+    }
+
+    spec.describe(fw, "provider.sse") {
+        spec.it("sse joins data lines and skips comments") callback {
+            p = sse.parser()
+            d, ok = sse.feed(p, ": keep-alive")
+            spec.assert_eq(ok, 0, "comment skipped")
+            d, ok = sse.feed(p, "event: x")
+            spec.assert_eq(ok, 0, "other field ignored")
+            d, ok = sse.feed(p, "data: {\"a\":1}")
+            spec.assert_eq(ok, 0, "data pending")
+            d, ok = sse.feed(p, "data:2\r")
+            spec.assert_eq(ok, 0, "data pending 2")
+            d, ok = sse.feed(p, "")
+            spec.assert_eq(ok, 1, "event ends")
+            spec.assert_str_eq(d, "{\"a\":1}\n2", "joined")
+            d, ok = sse.feed(p, "")
+            spec.assert_eq(ok, 0, "empty blank line")
+            d, ok = sse.feed(p, "data: [DONE]")
+            spec.assert_eq(ok, 0, "pending done")
+            d, ok = sse.feed(p, "")
+            spec.assert_eq(ok, 1, "done ends")
+            spec.assert_str_eq(d, "[DONE]", "done")
+        }
+    }
+
+    spec.describe(fw, "provider.retry") {
+        spec.it("shared retry forwards data and orders activity before exponential retry notices (adapted)") callback {
+            ids = string.split("chat_completions openai", " ")
+            i = 0
+            while i < 2 {
+                sp = new_st_()
+                st = sp as *St
+                st.failures = 2
+                rep, e, d, attempts = run_(sp, string.array_get(ids, i), 0, 0)
+                spec.assert_str_eq(e, "", "no error")
+                spec.assert_str_eq((rep as *types.Reply).text, "done", "text")
+                spec.assert_eq(((rep as *types.Reply).usage as *types.Usage).completion_tokens, 7, "usage")
+                spec.assert_eq(st.calls, 3, "calls")
+                spec.assert_eq(attempts, 3, "attempts")
+                spec.assert_eq(st.received, 3, "data forwarded")
+                spec.assert_eq(st.retries, 2, "retries")
+                spec.assert_str_eq(st.delays, "1000,2000", "delays")
+                spec.assert_str_eq(st.events, STARTED_FINISHED_RETRY_3, "events")
+                i = i + 1
+            }
+        }
+
+        spec.it("shared retry only replays emitted deltas for Codex (adapted: no replay for any provider)") callback {
+            ids = string.split("chat_completions openai", " ")
+            i = 0
+            while i < 2 {
+                sp = new_st_()
+                st = sp as *St
+                st.emit_delta = 1
+                rep, e, d, attempts = run_(sp, string.array_get(ids, i), 0, 0)
+                spec.assert_str_eq(e, "HttpTransient", "fails")
+                spec.assert_true(rep == null, "no reply")
+                spec.assert_eq(st.calls, 1, "calls")
+                spec.assert_eq(st.deltas, 1, "deltas")
+                spec.assert_str_eq(st.failed, "HttpTransient", "failed event")
+                i = i + 1
+            }
+        }
+
+        spec.it("shared retry limits attempts and preserves terminal errors and detail (adapted)") callback {
+            errs = string.split("HttpTransient HttpStatus InvalidCredentials ProviderFailed OutOfMemory TooManyToolCalls Canceled", " ")
+            i = 0
+            while i < 7 {
+                err = string.array_get(errs, i)
+                sp = new_st_()
+                st = sp as *St
+                st.failures = provider.MAX_ATTEMPTS
+                st.failure = string.copy(err)
+                rep, e, d, attempts = run_(sp, "chat_completions", 0, 0)
+                spec.assert_str_eq(e, err, "error ${err}")
+                spec.assert_true(rep == null, "no reply ${err}")
+                want = 1
+                if err == "HttpTransient" { want = provider.MAX_ATTEMPTS }
+                spec.assert_eq(st.calls, want, "calls ${err}")
+                spec.assert_eq(attempts, want, "attempts ${err}")
+                spec.assert_str_eq(d, st.note, "detail ${err}")
+                if err == "Canceled" {
+                    spec.assert_str_eq(st.failed, "", "no failed event for Canceled")
+                } else {
+                    spec.assert_str_eq(st.failed, err, "failed event ${err}")
+                }
+                i = i + 1
+            }
+        }
+
+        spec.it("shared retry backoff doubles up to the attempt limit") callback {
+            sp = new_st_()
+            st = sp as *St
+            st.failures = provider.MAX_ATTEMPTS
+            rep, e, d, attempts = run_(sp, "chat_completions", 0, 0)
+            spec.assert_str_eq(e, "HttpTransient", "gives up")
+            spec.assert_eq(attempts, 5, "attempts")
+            spec.assert_str_eq(st.delays, "1000,2000,4000,8000", "delays")
+            spec.assert_str_eq(st.failed, "HttpTransient", "failed event")
+        }
+
+        spec.it("transient classifies terminal and retryable errors") callback {
+            nope = string.split("HttpStatus InvalidCredentials ProviderFailed Canceled OutOfMemory TooManyToolCalls", " ")
+            i = 0
+            while i < 6 {
+                spec.assert_eq(provider.transient(string.array_get(nope, i)), 0, "terminal ${string.array_get(nope, i)}")
+                i = i + 1
+            }
+            yes = string.split("HttpTransient ProviderTransient RateLimited IncompleteResponse InvalidResponse StreamIdleTimeout Transport", " ")
+            i = 0
+            while i < 7 {
+                spec.assert_eq(provider.transient(string.array_get(yes, i)), 1, "retryable ${string.array_get(yes, i)}")
+                i = i + 1
+            }
+        }
+
+        spec.it("shared retry accepts Codex Retry-After detail and supports a silent caller (adapted: silent caller only)") callback {
+            sp = new_st_()
+            st = sp as *St
+            st.failure = "RateLimited"
+            st.note = "try again in 0.25s"
+            rep, e, d, attempts = run_(sp, "openai", 0, 0)
+            spec.assert_str_eq(e, "", "recovers")
+            spec.assert_str_eq(st.delays, "1000", "no Codex Retry-After: plain backoff")
+            qp = new_st_()
+            q = qp as *St
+            q.emit_delta = 1
+            q.replay_safe = 1
+            _r2, e2, _d2, _a2 = run_(qp, "chat_completions", 1, 0)
+            spec.assert_str_eq(e2, "", "silent recovers")
+            spec.assert_eq(q.calls, 2, "silent calls")
+            spec.assert_eq(q.received, 2, "silent data")
+            spec.assert_str_eq(q.events, "", "silent: no events")
+        }
+
+        spec.it("shared retry cancellation interrupts backoff after the retry notice") callback {
+            sp = new_st_()
+            st = sp as *St
+            st.cancel_on_retry = 1
+            rep, e, d, attempts = run_(sp, "openai", 0, 1)
+            spec.assert_str_eq(e, "Canceled", "canceled")
+            spec.assert_true(rep == null, "no reply")
+            spec.assert_str_eq(d, "", "no detail")
+            spec.assert_eq(st.calls, 1, "one call")
+            spec.assert_str_eq(st.events, "started finished retry ", "events")
+        }
+
+        spec.it("buffered model callers can retry Chat deltas without weakening visible streaming") callback {
+            sp = new_st_()
+            st = sp as *St
+            st.emit_delta = 1
+            st.replay_safe = 1
+            rep, e, d, attempts = run_(sp, "chat_completions", 1, 0)
+            spec.assert_str_eq(e, "", "recovers")
+            spec.assert_eq(st.calls, 2, "calls")
+            spec.assert_eq(st.deltas, 2, "deltas")
+        }
+
+        spec.it("idle timeout retries preserve visible streaming and replay-safe rules (adapted: non-Codex rule for every provider)") callback {
+            ids = string.split("chat_completions openai", " ")
+            i = 0
+            while i < 2 {
+                emitted = 0
+                while emitted < 2 {
+                    safe = 0
+                    while safe < 2 {
+                        sp = new_st_()
+                        st = sp as *St
+                        st.failure = http.TIMEOUT_BYTES
+                        st.emit_delta = emitted
+                        st.replay_safe = safe
+                        rep, e, d, attempts = run_(sp, string.array_get(ids, i), 0, 0)
+                        if emitted == 1 && safe == 0 {
+                            spec.assert_str_eq(e, "StreamIdleTimeout", "visible stream not replayed")
+                            spec.assert_eq(st.calls, 1, "one call")
+                        } else {
+                            spec.assert_str_eq(e, "", "retried: emitted ${emitted} safe ${safe}")
+                            spec.assert_eq(st.calls, 2, "two calls")
+                        }
+                        safe = safe + 1
+                    }
+                    emitted = emitted + 1
+                }
+                i = i + 1
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

@@ -38,3 +38,14 @@ Also seen, not blocking: `os.wait` reports a signalled child as 128+signo, the
 same as `exit 128+n`; upstream nib reports `exit_code: null` for a signal.
 A `(code, signal)` form would let it. And `os.spawn_proc_to` has no cwd
 (nib does not need one: children inherit its cwd).
+
+## Added by the Session slice (2026-11-12)
+
+6. **Positional writes on a locked fd.** The Session log
+   (`ae/nib/session/log`) holds `$NIB_HOME/sessions/<id>.jsonl` under
+   `flock(LOCK_EX)` for the Session's life and writes every record at its own
+   offset with `pwrite`, so a torn last line left by a crash is overwritten
+   by the repair record instead of being appended after. `fs.pwrite` exists for
+   `fs.open` handles, but a handle cannot be flocked and an fd from (2) cannot
+   be pwritten. Proposed: `fs.fd_pwrite_all(fd, data, offset) -> err` (and
+   `fs.fd_fsync(fd)`). Stand-in: `sysgap.pwrite_all`.

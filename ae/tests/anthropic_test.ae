@@ -1,0 +1,170 @@
+// Ports the inline tests of upstream src/provider/anthropic.zig under their
+// names, on fixtures (sse.fixed), never a network.
+//
+// Not ported (images): "Anthropic images ride in user blocks and tool
+// results with the cache breakpoint last" needs the Session image store and
+// image blocks. The part that applies without images (the cache breakpoint
+// rides on the last user block / last tool result) is the adapted test
+// "Anthropic cache breakpoint rides the last user block (text only)".
+import std.spec
+import std.string
+import std.list
+import std.json
+import nib.jsonx
+import nib.msg
+import nib.provider.types
+import nib.provider.sink
+import nib.provider.sse
+import nib.provider.anthropic
+
+cfg_(model: string) -> ptr {
+    return types.new_config("anthropic", "", "", model)
+}
+
+doc_(text: string) -> ptr {
+    v = jsonx.parse(text)
+    spec.assert_not_null(v, "valid JSON: ${text}")
+    return v
+}
+
+has_(s: string, part: string) -> int {
+    if string.index_of(s, part) >= 0 { return 1 }
+    return 0
+}
+
+// messages[i] of a request body.
+wire_(root: ptr, i: int) -> ptr {
+    return jsonx.array_at(jsonx.field(root, "messages"), i)
+}
+
+// content[j] of messages[i].
+block_(root: ptr, i: int, j: int) -> ptr {
+    return jsonx.array_at(jsonx.field(wire_(root, i), "content"), j)
+}
+
+user_msgs_() -> ptr {
+    l = list.list_new()
+    list.list_add(l, msg.user("task"))
+    return l
+}
+
+const PREFIX = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call\",\"name\":\"run\",\"input\":{}}}\n\n"
+const STOP_REASON_TOOL = "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n"
+const STOP_REASON_MAX = "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n"
+
+const STREAM = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":1,\"cache_read_input_tokens\":20,\"cache_creation_input_tokens\":30}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"think\"}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"signed\"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":8}}\n\ndata: {\"type\":\"message_stop\"}\n\n"
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "provider.anthropic") {
+        spec.it("Anthropic request caching paired results adaptive effort and signed continuation") callback {
+            cp = cfg_("claude-sonnet-5-5")
+            c = cp as *types.Config
+            spec.assert_str_eq(types.set_effort(cp, "off"), "", "set off")
+            spec.assert_str_eq(anthropic.effort(cp), "low", "off is low on a model that cannot disable")
+            blocks = "[{\"type\":\"thinking\",\"thinking\":\"private\",\"signature\":\"opaque-signature\"},{\"type\":\"tool_use\",\"id\":\"call\",\"name\":\"run\",\"input\":{\"code\":\"1\"}}]"
+            ms = list.list_new()
+            list.list_add(ms, msg.system("instructions"))
+            list.list_add(ms, msg.user("task"))
+            list.list_add(ms, msg.assistant("", list.list_new(), "anthropic", blocks, 1, "", -1, ""))
+            list.list_add(ms, msg.tool("call", "result", ""))
+            body, err = anthropic.request_body(cp, ms, "[]", -1)
+            spec.assert_str_eq(err, "", "body")
+            root = doc_(body)
+            spec.assert_str_eq(jsonx.str_or(jsonx.field(root, "thinking"), "type", ""), "adaptive", "adaptive thinking")
+            spec.assert_str_eq(jsonx.str_or(block_(root, 2, 0), "signature", ""), "opaque-signature", "signature kept")
+            spec.assert_eq(has_(body, "cache_control"), 1, "cache_control")
+            spec.assert_eq(has_(body, "tool_result"), 1, "tool_result")
+            c.model = "claude-haiku-5-5"
+            spec.assert_str_eq(anthropic.effort(cp), "off", "haiku can be disabled")
+            c.model = "claude-3-7-sonnet"
+            types.set_effort(cp, "medium")
+            lb, e2 = anthropic.request_body(cp, user_msgs_(), "[]", 32)
+            spec.assert_str_eq(e2, "", "legacy body")
+            spec.assert_eq(has_(lb, "\"budget_tokens\":8192"), 1, "medium budget")
+            spec.assert_eq(has_(lb, "\"max_tokens\":9216"), 1, "max raised to budget + 1024")
+            types.set_effort(cp, "minimal")
+            mb, e3 = anthropic.request_body(cp, user_msgs_(), "[]", 32)
+            spec.assert_str_eq(e3, "", "minimal body")
+            spec.assert_eq(has_(mb, "\"budget_tokens\":1024"), 1, "minimal budget")
+            spec.assert_eq(anthropic.adaptive("claude-fable-5-1"), 1, "fable adaptive")
+            spec.assert_eq(anthropic.adaptive("claude-opus-5-5-20261106"), 1, "dated family")
+            spec.assert_eq(anthropic.adaptive("claude-opus-5-50"), 0, "not a dated family")
+        }
+
+        spec.it("Anthropic cache breakpoint rides the last user block (text only)") callback {
+            cp = cfg_("claude-sonnet-4-6")
+            calls = list.list_new()
+            list.list_add(calls, types.tool_call_new("call", "run", "{\"code\":\"1\"}"))
+            ms = list.list_new()
+            list.list_add(ms, msg.system("instructions"))
+            list.list_add(ms, msg.user("look"))
+            list.list_add(ms, msg.assistant("", calls, "", "", 0, "", -1, ""))
+            list.list_add(ms, msg.tool("call", "viewed", ""))
+            body, err = anthropic.request_body(cp, ms, "[]", -1)
+            spec.assert_str_eq(err, "", "body")
+            root = doc_(body)
+            spec.assert_str_eq(jsonx.str_or(block_(root, 0, 0), "type", ""), "text", "user text")
+            spec.assert_eq(jsonx.has(block_(root, 0, 0), "cache_control"), 0, "earlier user block uncached")
+            result = block_(root, 2, 0)
+            spec.assert_str_eq(jsonx.str_or(result, "type", ""), "tool_result", "tool result")
+            spec.assert_eq(jsonx.has(result, "cache_control"), 1, "last tool result cached")
+            spec.assert_eq(jsonx.has(jsonx.array_at(jsonx.field(root, "system"), 0), "cache_control"), 1, "system cached")
+            last, e2 = anthropic.request_body(cp, user_msgs_(), "[]", -1)
+            spec.assert_str_eq(e2, "", "last body")
+            lroot = doc_(last)
+            spec.assert_eq(jsonx.has(block_(lroot, 0, 0), "cache_control"), 1, "final user block cached")
+        }
+
+        spec.it("Anthropic stream preserves signature deltas and merges cache usage") callback {
+            cp = cfg_("claude-sonnet-5-5")
+            rep, e, detail = anthropic.read_stream(sse.fixed(STREAM), cp, sink.new(null), null)
+            spec.assert_str_eq(e, "", "no error: ${detail}")
+            if rep == null { return }
+            r = rep as *types.Reply
+            spec.assert_str_eq(r.text, "hello", "text")
+            u = r.usage as *types.Usage
+            spec.assert_eq(u.prompt_tokens, 62, "prompt tokens")
+            spec.assert_eq(u.completion_tokens, 8, "completion tokens")
+            spec.assert_eq(u.prompt_cache_hit_tokens, 20, "cache hits")
+            spec.assert_eq(u.prompt_cache_write_tokens, 30, "cache writes")
+            spec.assert_eq(has_(r.reasoning_data, "signed"), 1, "signature kept")
+            spec.assert_eq(r.reasoning_includes_output, 1, "includes output")
+        }
+
+        spec.it("Anthropic incomplete tool input is never returned for execution") callback {
+            cp = cfg_("claude-sonnet-5-5")
+            rep, e, detail = anthropic.read_stream(sse.fixed(PREFIX), cp, sink.new(null), null)
+            spec.assert_str_eq(e, "IncompleteResponse", "truncated")
+            spec.assert_true(rep == null, "no reply")
+            rep2, e2, _d2 = anthropic.read_stream(sse.fixed("${PREFIX}${STOP_REASON_TOOL}"), cp, sink.new(null), null)
+            spec.assert_str_eq(e2, "IncompleteResponse", "unfinished block")
+            spec.assert_true(rep2 == null, "no reply")
+            rep3, e3, _d3 = anthropic.read_stream(sse.fixed("${PREFIX}${STOP_REASON_MAX}"), cp, sink.new(null), null)
+            spec.assert_str_eq(e3, "ProviderFailed", "max_tokens")
+            spec.assert_true(rep3 == null, "no reply")
+        }
+
+        spec.it("Anthropic cache breakpoint rides the last tool definition") callback {
+            cp = cfg_("claude-sonnet-4-6")
+            tools = "[{\"type\":\"function\",\"function\":{\"name\":\"a\",\"description\":\"x\",\"parameters\":{\"type\":\"object\"}}},{\"type\":\"function\",\"function\":{\"name\":\"b\",\"description\":\"y\",\"parameters\":{\"type\":\"object\"}}}]"
+            body, err = anthropic.request_body(cp, user_msgs_(), tools, -1)
+            spec.assert_str_eq(err, "", "body")
+            root = doc_(body)
+            ts = jsonx.field(root, "tools")
+            spec.assert_eq(jsonx.array_size(ts), 2, "two tools")
+            spec.assert_eq(jsonx.has(jsonx.array_at(ts, 0), "cache_control"), 0, "first tool uncached")
+            spec.assert_eq(jsonx.has(jsonx.array_at(ts, 1), "cache_control"), 1, "last tool cached")
+            spec.assert_str_eq(jsonx.str_or(jsonx.array_at(ts, 1), "name", ""), "b", "name")
+        }
+
+        spec.it("Anthropic thinking blocks without a signature are rejected") callback {
+            cp = cfg_("claude-sonnet-5-5")
+            text = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n"
+            rep, e, _d = anthropic.read_stream(sse.fixed(text), cp, sink.new(null), null)
+            spec.assert_str_eq(e, "InvalidResponse", "unsigned thinking")
+            spec.assert_true(rep == null, "no reply")
+        }
+    }
+    return spec.run_summary(fw)
+}
