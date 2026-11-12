@@ -51,8 +51,13 @@ expect_imports $T/search/module.ae "nib.jsonx|nib.tools.grep|nib.tools.walk|std.
 expect_imports $T/process/module.ae "nib.sysgap|std.cryptography|std.fs|std.io|std.ipc|std.list|std.os|std.string|std.sync|std.worker"
 expect_imports $T/bash/module.ae "nib.jsonx|nib.sysgap|nib.tools.jail|nib.tools.policy|nib.tools.process|nib.tools.progress|nib.tools.registry|nib.tools.secrets|std.list|std.os|std.string|std.sync"
 expect_imports $T/jail/module.ae "nib.tools.atomic_file|std.fs|std.list|std.os|std.string"
+expect_imports $T/agent_sessions/module.ae "nib.lock|std.list|std.string"
+expect_imports $T/agent_input/module.ae "nib.jsonx|nib.provider.types|std.json|std.list|std.strbuilder|std.string"
+# A subagent is a child nib started through tools/process.
+expect_imports $T/agent/module.ae "nib.jsonx|nib.lock|nib.provider.types|nib.tools.agent_input|nib.tools.agent_sessions|nib.tools.process|nib.tools.progress|nib.tools.secrets|std.json|std.list|std.os|std.strbuilder|std.string|std.sync"
+expect_imports ae/nib/session/fork_history/module.ae "nib.msg|nib.provider.types|std.list|std.string"
 expect_imports $T/llm_call/module.ae "nib.jsonx|nib.lock|nib.msg|nib.provider|nib.provider.sink|nib.provider.types|std.json|std.list|std.strbuilder|std.string|std.sync"
-expect_imports $T/module.ae "nib.jsonx|nib.lock|nib.provider.types|nib.sandbox|nib.tools.atomic_file|nib.tools.background|nib.tools.bash|nib.tools.changes|nib.tools.file_state|nib.tools.files|nib.tools.jail|nib.tools.llm_call|nib.tools.progress|nib.tools.registry|nib.tools.search|nib.tools.undo|std.list|std.os|std.strbuilder|std.string|std.sync"
+expect_imports $T/module.ae "nib.jsonx|nib.lock|nib.provider.types|nib.sandbox|nib.tools.agent|nib.tools.agent_input|nib.tools.agent_sessions|nib.tools.atomic_file|nib.tools.background|nib.tools.bash|nib.tools.changes|nib.tools.file_state|nib.tools.files|nib.tools.jail|nib.tools.llm_call|nib.tools.progress|nib.tools.registry|nib.tools.search|nib.tools.undo|std.list|std.os|std.strbuilder|std.string|std.sync"
 
 # The Session + provider slice.
 expect_imports ae/nib/auth/module.ae "nib.auth.store|nib.config|nib.config.env|nib.provider.types|std.list|std.string"
@@ -72,7 +77,7 @@ expect_imports ae/nib/provider/types/module.ae "nib.jsonx|std.list|std.string"
 expect_imports ae/nib/session/compact/module.ae "nib.jsonx|nib.msg|nib.provider.types|std.json|std.list|std.string"
 expect_imports ae/nib/session/instructions/module.ae "std.fs|std.strbuilder|std.string"
 expect_imports ae/nib/session/log/module.ae "nib.jsonx|nib.lock|nib.msg|nib.provider.types|nib.sysgap|std.dir|std.fs|std.json|std.list|std.string|std.time"
-expect_imports ae/nib/session/module.ae "nib.jsonx|nib.lock|nib.msg|nib.provider|nib.provider.model_timing as modeltiming|nib.provider.sink|nib.provider.types|nib.sandbox|nib.sandbox.timing|nib.session.compact|nib.session.instructions|nib.session.log|nib.session.output|nib.session.profile|nib.session.prompt|nib.session.tool_summary|nib.tools|nib.tools.atomic_file|nib.tools.background|nib.tools.diff|nib.tools.progress|std.cryptography|std.fs|std.json|std.list|std.os|std.string|std.sync|std.worker"
+expect_imports ae/nib/session/module.ae "nib.jsonx|nib.lock|nib.msg|nib.provider|nib.provider.model_timing as modeltiming|nib.provider.sink|nib.provider.types|nib.sandbox|nib.sandbox.timing|nib.session.compact|nib.session.fork_history|nib.session.instructions|nib.session.log|nib.session.output|nib.session.profile|nib.session.prompt|nib.session.tool_summary|nib.tools|nib.tools.agent_input|nib.tools.agent_sessions|nib.tools.atomic_file|nib.tools.background|nib.tools.diff|nib.tools.progress|std.cryptography|std.fs|std.json|std.list|std.os|std.string|std.sync|std.worker"
 expect_imports ae/nib/session/output/module.ae "nib.sandbox|nib.sandbox.console|std.list|std.strbuilder|std.string"
 expect_imports ae/nib/session/profile/module.ae "std.string"
 expect_imports ae/nib/session/prompt/module.ae "nib.sandbox|nib.session.output|nib.session.profile|std.cryptography|std.list|std.strbuilder|std.string"
