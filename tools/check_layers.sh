@@ -99,17 +99,22 @@ rule() {   # rule "what" "pattern" "allowed path regex"
     fi
 }
 
-rule "a program is started only in tools/process (and the jail's probe and exec helper)" \
+rule "a program is started only in tools/process (and the jail's probe and exec helper, and the TUI's open launcher for a clicked path)" \
     'os\.(run|run_capture|run_full|run_stdio|run_socket|run_pipe|spawn_proc|spawn_proc_to|exec|os_execv|run_supervised)[[:space:]]*\(' \
-    "$T/process/|$T/jail/"
+    "$T/process/|$T/jail/|ae/nib/tui/open/"
 rule "QuickJS is embedded only by the sandbox and grep's private matcher" \
     '^import contrib\.quickjs' "ae/nib/sandbox/module.ae|$T/grep/"
 rule "the file stand-in is used only by the file, undo and process tools, the Session log, the environment and main (signals, echo)" \
-    '^import nib\.sysgap' "$T/atomic_file/|$T/file_state/|$T/files/|$T/undo/|$T/process/|$T/bash/|ae/nib/session/log/|ae/nib/config/env/|ae/main.ae"
+    '^import nib\.sysgap' "$T/atomic_file/|$T/file_state/|$T/files/|$T/undo/|$T/process/|$T/bash/|ae/nib/session/log/|ae/nib/config/env/|ae/main.ae|ae/nib/tui/reflect/"
 rule "the QuickJS stand-in is used only by the sandbox" \
     '^import nib\.qjsgap' "ae/nib/sandbox/module.ae"
-rule "only provider/http reaches the network (the model request)" \
-    '^import std\.(http|net|tcp|udp)' "ae/nib/provider/http/"
+rule "only provider/http (the model request) and auth/models (the /model listing) reach the network" \
+    '^import std\.(http|net|tcp|udp)' "ae/nib/provider/http/|ae/nib/auth/models/"
+rule "the TUI reaches the Session only through its live port" \
+    '^import nib\.session$' "ae/nib/tui/live/|ae/main.ae|ae/nib/tools/agent/|ae/nib/session/"
+
+# ae/term stands alone: nothing of nib.
+if grep -rnE '^import nib\.' ae/term >/dev/null 2>&1; then echo "FAIL ae/term imports nib"; fail=1; else echo "ok   ae/term imports nothing of nib"; fi
 
 # The sandbox's host functions open with the veto line.
 n=$(grep -c 'hide os, worker, dispatch_, work_' ae/nib/sandbox/module.ae || true)
