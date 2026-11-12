@@ -72,6 +72,8 @@ api_key_env = "MYSITE_API_KEY"
 
 Put the key in environment `MYSITE_API_KEY`; configuration stores its name only. protocol/base_url/model/context_window are required; unauthenticated local services omit api_key_env. It is an environment name, not a key. Endpoints added with `/provider` omit api_key_env and keep the key in `auth.json` under the endpoint id; an environment variable named by api_key_env still wins. Ids use ASCII letters/digits/underscore/hyphen; collisions with built-ins or custom error.
 
+`max_output = <positive integer>` (custom services only) sends that value as the output token limit (`max_tokens`, or `max_output_tokens` for `responses`) on every Session model request; some gateways default to a low limit, while official DeepSeek already defaults to its maximum. Omitted, no limit is sent. Compaction, prediction, `tools.llm` and web search keep their own limits.
+
 `vision = true|false` (custom services only) declares whether the model accepts image input. Omitted, it follows the protocol: true for `responses` and `anthropic_messages`, false for `chat_completions`, where endpoints differ. Built-in rows carry it in the provider/model table: false for `chat_completions` and DeepSeek, true elsewhere. Without vision, attaching an image in the TUI is refused with a notice and `tools.view` returns `{ ok: false, error }`; images already in a resumed Session history become text placeholders.
 
 Chat Completions appends `/chat/completions` to `base_url`; Responses appends `/responses`; Anthropic Messages appends `/v1/messages`, so use a service-root Messages URL. All accept trailing /. Custom Responses uses function Run for endpoints lacking custom tools.

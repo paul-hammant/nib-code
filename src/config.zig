@@ -146,6 +146,7 @@ const Settings = struct {
     protocol: ?provider.Protocol = null,
     api_key_env: ?[]const u8 = null,
     vision: ?bool = null,
+    max_output: ?u32 = null,
     transport: provider.Transport = .websocket,
     run_tool: @FieldType(provider.Config, "codex_run_tool") = .custom,
     reasoning_summary: @FieldType(provider.Config, "reasoning_summary") = .off,
@@ -159,7 +160,7 @@ pub fn skillEnabled(settings: []const SkillSetting, name: []const u8) bool {
 }
 
 const Span = struct { start: usize, end: usize };
-const ProviderSetting = struct { name: []const u8, settings: Settings = .{}, line: usize, seen: [10]bool = @splat(false), custom: bool };
+const ProviderSetting = struct { name: []const u8, settings: Settings = .{}, line: usize, seen: [11]bool = @splat(false), custom: bool };
 
 const File = struct {
     providers: std.ArrayList(ProviderSetting) = .empty,
@@ -306,7 +307,7 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
     var seen_sections: [9]bool = @splat(false);
     var hooks_seen: [2]bool = @splat(false);
     var sandbox_seen: [2]bool = @splat(false);
-    var seen: [10][10]bool = @splat(@splat(false));
+    var seen: [10][11]bool = @splat(@splat(false));
     var current_provider: usize = 0;
     var mcp_seen: [5]bool = @splat(false);
     var offset: usize = 0;
@@ -455,7 +456,7 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
                 if (std.mem.eql(u8, key, name)) break :blk i;
             }
             return p.bad("unknown limits key '{s}'", .{key});
-        } else if (std.mem.eql(u8, key, "model")) 0 else if (std.mem.eql(u8, key, "base_url")) 1 else if (std.mem.eql(u8, key, "context_window")) 2 else if (section == .codex and std.mem.eql(u8, key, "transport")) 3 else if (section == .codex and std.mem.eql(u8, key, "reasoning_summary")) 4 else if (section == .codex and std.mem.eql(u8, key, "run_tool")) 5 else if (section == .provider_dynamic and file.providers.items[current_provider].custom and std.mem.eql(u8, key, "protocol")) 6 else if (section == .provider_dynamic and file.providers.items[current_provider].custom and std.mem.eql(u8, key, "api_key_env")) 7 else if (section == .provider_dynamic and file.providers.items[current_provider].custom and std.mem.eql(u8, key, "vision")) 8 else return p.bad("unknown provider key '{s}'", .{key});
+        } else if (std.mem.eql(u8, key, "model")) 0 else if (std.mem.eql(u8, key, "base_url")) 1 else if (std.mem.eql(u8, key, "context_window")) 2 else if (section == .codex and std.mem.eql(u8, key, "transport")) 3 else if (section == .codex and std.mem.eql(u8, key, "reasoning_summary")) 4 else if (section == .codex and std.mem.eql(u8, key, "run_tool")) 5 else if (section == .provider_dynamic and file.providers.items[current_provider].custom and std.mem.eql(u8, key, "protocol")) 6 else if (section == .provider_dynamic and file.providers.items[current_provider].custom and std.mem.eql(u8, key, "api_key_env")) 7 else if (section == .provider_dynamic and file.providers.items[current_provider].custom and std.mem.eql(u8, key, "vision")) 8 else if (section == .provider_dynamic and file.providers.items[current_provider].custom and std.mem.eql(u8, key, "max_output")) 10 else return p.bad("unknown provider key '{s}'", .{key});
         const group: usize = if (section) |id| @as(usize, @backingInt(id)) + 1 else 0;
         const keys = if (section == .provider_dynamic) &file.providers.items[current_provider].seen else &seen[group];
         if (keys[index]) return p.bad("duplicate key '{s}'", .{key});
@@ -486,6 +487,10 @@ fn parse(a: Allocator, diagnostics: Allocator, text: []const u8, path: []const u
         } else if (section != null and index == 8) {
             if (parsed != .boolean) return p.bad("vision must be true or false", .{});
             settings.vision = parsed.boolean;
+        } else if (section != null and index == 10) {
+            if (parsed != .integer) return p.bad("max_output must be an integer", .{});
+            if (parsed.integer <= 0 or parsed.integer > std.math.maxInt(u32)) return p.bad("max_output must be a positive u32 integer", .{});
+            settings.max_output = @intCast(parsed.integer);
         } else if (section != null and index == 2) {
             if (parsed != .integer) return p.bad("context_window must be an integer", .{});
             if (parsed.integer <= 0 or parsed.integer > std.math.maxInt(u64)) return p.bad("context_window must be a positive u64 integer", .{});
@@ -600,6 +605,7 @@ pub fn resolve(a: Allocator, env: *const Env, text: []const u8, path: []const u8
         cfg.custom_provider = try a.dupe(u8, name);
         cfg.custom_protocol = settings.protocol.?;
         cfg.custom_vision = settings.vision;
+        cfg.custom_max_output = settings.max_output;
     }
     cfg.api_key_env = if (settings.api_key_env) |value| try a.dupe(u8, value) else if (entry.api_key_env.len > 0) try a.dupe(u8, entry.api_key_env[0]) else null;
     cfg.codex_transport = if (env.get("NIB_CODEX_TRANSPORT")) |v| std.meta.stringToEnum(provider.Transport, v) orelse {
@@ -1382,6 +1388,26 @@ test "built-in catalogs custom providers and environment selection" {
     cfg = try resolve(a, &env, text, "config.toml", &detail);
     try t.expectEqualStrings("override", cfg.model);
     try t.expectEqual(@as(u64, 9876), cfg.context_window);
+}
+
+test "custom max_output is an optional positive integer" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: Env = .init(t.allocator);
+    defer env.deinit();
+    var detail: ?[]u8 = null;
+    const head = "provider = \"site\"\n[providers.site]\nprotocol = \"chat_completions\"\nbase_url = \"http://localhost:1/v1\"\nmodel = \"m\"\ncontext_window = 1000\n";
+    try t.expectEqual(@as(?u32, null), (try resolve(a, &env, head, "config.toml", &detail)).custom_max_output);
+    const set = try std.fmt.allocPrint(a, "{s}max_output = 8_192\n", .{head});
+    try t.expectEqual(@as(?u32, 8192), (try resolve(a, &env, set, "config.toml", &detail)).custom_max_output);
+    for ([_][]const u8{ "max_output = 0\n", "max_output = -5\n", "max_output = \"8\"\n", "max_output = true\n", "max_output = 5000000000\n" }) |line| {
+        const text = try std.fmt.allocPrint(a, "{s}{s}", .{ head, line });
+        try t.expectError(error.InvalidConfig, resolve(a, &env, text, "config.toml", &detail));
+        try t.expect(std.mem.indexOf(u8, detail.?, "max_output must be") != null);
+    }
+    try t.expectError(error.InvalidConfig, resolve(a, &env, "[openai]\nmax_output = 5\n", "config.toml", &detail));
 }
 
 test "custom configuration rejects incomplete duplicate conflicting and secret fields" {

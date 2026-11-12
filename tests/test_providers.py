@@ -95,6 +95,30 @@ class Providers(unittest.TestCase):
             with self.subTest(protocol=protocol):
                 self.exercise("mysite", protocol, "SITE_KEY", custom=True)
 
+    def test_custom_max_output(self):
+        for protocol, field in (("responses", "max_output_tokens"), ("chat_completions", "max_tokens"), ("anthropic_messages", "max_tokens")):
+            for limit in (None, 4096):
+                with self.subTest(protocol=protocol, limit=limit), tempfile.TemporaryDirectory(prefix="nib-provider-limit-") as tmp:
+                    mock = Mock(protocol, key="")
+                    self.addCleanup(mock.close)
+                    home = Path(tmp) / "nib"
+                    home.mkdir()
+                    extra = f"max_output = {limit}\n" if limit else ""
+                    (home / "config.toml").write_text(f'provider = "site"\n[providers.site]\nprotocol = "{protocol}"\nbase_url = "{mock.url}"\nmodel = "m"\ncontext_window = 128000\n{extra}')
+                    env = {k: v for k, v in os.environ.items() if not k.startswith("NIB_")}
+                    env.update(HOME=tmp, NIB_HOME=str(home))
+                    result = subprocess.run([str(BIN), "ask", "--json", "round trip"], cwd=tmp, env=env, capture_output=True, text=True, timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    bodies = [json.loads(body) if isinstance(body, (str, bytes)) else body for _, _, body in mock.requests]
+                    self.assertTrue(bodies)
+                    for body in bodies:
+                        if protocol == "anthropic_messages" and limit is None:
+                            self.assertEqual(body["max_tokens"], 128000)
+                        elif limit is None:
+                            self.assertNotIn(field, body)
+                        else:
+                            self.assertEqual(body[field], limit)
+
 
 if __name__ == "__main__":
     unittest.main()

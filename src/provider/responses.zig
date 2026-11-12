@@ -338,7 +338,7 @@ fn requestBody(gpa: std.mem.Allocator, io: std.Io, cfg: p.Config, cache_key: []c
             try w.print("{s}{f}", .{ separator, std.json.fmt(.{ .role = m.role, .content = list.items, .phase = m.phase }, .{ .emit_null_optional_fields = false }) });
             separator = ",";
         } else if (m.content) |text| if (text.len > 0) {
-            const content = if (max_tokens != null and std.mem.eql(u8, m.role, "user") and index == messages.len - 1)
+            const content = if (max_tokens != null and !cfg.mainLimit(max_tokens) and std.mem.eql(u8, m.role, "user") and index == messages.len - 1)
                 try std.fmt.allocPrint(a, "{s}\nKeep the summary within {d} tokens.", .{ text, max_tokens.? })
             else
                 text;
@@ -374,9 +374,10 @@ fn requestBody(gpa: std.mem.Allocator, io: std.Io, cfg: p.Config, cache_key: []c
         try std.fmt.allocPrint(a, ",\"text\":{f}", .{std.json.fmt(.{ .format = .{ .type = "json_schema", .name = "result", .strict = true, .schema = schema } }, .{})})
     else
         "";
+    const limit = if (cfg.mainLimit(max_tokens)) try std.fmt.allocPrint(a, ",\"max_output_tokens\":{d}", .{max_tokens.?}) else "";
     return std.fmt.allocPrint(gpa,
-        \\{{"model":{f},"prompt_cache_key":{f},"store":false,"stream":true,"instructions":{f},"input":{s},"include":["reasoning.encrypted_content"]{s}{s}{s}}}
-    , .{ std.json.fmt(cfg.model, .{}), std.json.fmt(cache_key, .{}), std.json.fmt(instructions, .{}), input.written(), if (tools.len == 0) "" else try std.fmt.allocPrint(a, ",\"tools\":{s}", .{tool_writer.written()}), reasoning, format });
+        \\{{"model":{f},"prompt_cache_key":{f},"store":false,"stream":true,"instructions":{f},"input":{s},"include":["reasoning.encrypted_content"]{s}{s}{s}{s}}}
+    , .{ std.json.fmt(cfg.model, .{}), std.json.fmt(cache_key, .{}), std.json.fmt(instructions, .{}), input.written(), if (tools.len == 0) "" else try std.fmt.allocPrint(a, ",\"tools\":{s}", .{tool_writer.written()}), reasoning, format, limit });
 }
 
 const custom_run_description = "Run JavaScript in a fresh sandbox using the tools API described in the system prompt. Send raw JavaScript, not JSON, a quoted string or markdown fences. Top-level await is allowed; the last expression's value is returned.";

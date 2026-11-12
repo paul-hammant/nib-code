@@ -107,6 +107,7 @@ pub const Config = struct {
     custom_provider: ?[]const u8 = null,
     custom_protocol: Protocol = .chat_completions,
     custom_vision: ?bool = null,
+    custom_max_output: ?u32 = null,
     api_key_env: ?[]const u8 = null,
     key_source: KeySource = .none,
     /// Where nib's own `auth.json` lives; null in tests that never sign in.
@@ -135,6 +136,10 @@ pub const Config = struct {
 
     pub fn protocol(cfg: Config) Protocol {
         return if (cfg.provider == .custom) cfg.custom_protocol else definition(cfg.provider).protocol;
+    }
+
+    pub fn mainLimit(cfg: Config, max_tokens: ?u32) bool {
+        return cfg.custom_max_output != null and max_tokens == cfg.custom_max_output;
     }
 
     /// Whether the model accepts image input; custom providers declare it, defaulting to the protocol.
