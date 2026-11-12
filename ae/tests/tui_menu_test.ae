@@ -1,0 +1,49 @@
+// Ports the tests of upstream src/tui/menu.zig under their names. "moving
+// straight from an @ mention to a $ mention loads skills" is ported as far as
+// its backing exists: skills (src/session/skills.zig) are not ported, so it
+// checks the move to the skill mention state, and that the skill list is
+// empty (marked stand-in in nib.tui.menu).
+import std.spec
+import nib.tui.menu
+import nib.tui.editor
+
+label_(m: *menu.Menu, input: string) -> string {
+    c, ok = menu.selected(m, input)
+    if !ok { return "<none>" }
+    return c.label
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.menu") {
+        spec.it("selection wraps, closing hides the list and editing reopens it") callback {
+            m = menu.new()
+            spec.assert_str_eq(label_(m, "/co"), "/copy", "first")
+            menu.move(m, "/co", true)
+            spec.assert_str_eq(label_(m, "/co"), "/compact", "down")
+            menu.move(m, "/co", true)
+            spec.assert_str_eq(label_(m, "/co"), "/copy", "wraps")
+            menu.move(m, "/co", false)
+            spec.assert_str_eq(label_(m, "/co"), "/compact", "up wraps")
+            m.closed = 1
+            spec.assert_str_eq(label_(m, "/co"), "<none>", "closed")
+            menu.input_changed(m, "/c")
+            spec.assert_str_eq(label_(m, "/c"), "/copy", "reopened")
+        }
+        spec.it("reflection is hidden unless enabled") callback {
+            m = menu.new()
+            spec.assert_eq(menu.items(m, "/ref").len, 0, "hidden")
+            m.reflect_enabled = 1
+            spec.assert_str_eq(menu.items(m, "/ref")[0].label, "/reflect", "shown")
+        }
+        spec.it("moving straight from an @ mention to a $ mention loads skills") callback {
+            m = menu.new()
+            m.mention = menu.MENTION_FILE
+            e = editor.new()
+            editor.replace(e, "$re")
+            menu.sync(m, e)
+            spec.assert_eq(m.mention, menu.MENTION_SKILL, "skill mention")
+            spec.assert_eq(menu.items(m, "$re").len, 0, "skills are not ported: none listed")
+        }
+    }
+}

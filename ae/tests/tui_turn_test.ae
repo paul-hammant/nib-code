@@ -1,0 +1,72 @@
+// Ports the Turn tests of upstream src/tui.zig that concern turn.zig:
+// "Turn throttles model data events but sends request boundaries immediately"
+// and "insertion notifications reach the queued user entry" (its Turn half;
+// the transcript half is in tui_app_test.ae). Timestamps are milliseconds.
+import std.spec
+import std.string
+import nib.tui.turn
+import nib.tui.app_queue
+
+next_(q: *app_queue.Queue) -> string {
+    it, ok = app_queue.take(q)
+    if !ok { return "" }
+    return it.json
+}
+
+state_(json: string) -> string {
+    i = string.index_of(json, "\"state\":\"")
+    if i < 0 { return "" }
+    rest = string.substring(json, i + 9, string.length(json))
+    return string.substring(rest, 0, string.index_of(rest, "\""))
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.turn") {
+        spec.it("Turn throttles model data events but sends request boundaries immediately") callback {
+            q = app_queue.new()
+            t = turn.new("", 0, q as ptr)
+            start = 1000000 as long
+            for i in 0..100 {
+                turn.model_activity_at(t, 1, start + (i * 10) as long)
+            }
+            first = next_(q)
+            spec.assert_str_eq(state_(first), "data", "first data")
+            spec.assert_contains(first, "\"at\":${start}", "first at")
+            spec.assert_str_eq(next_(q), "", "throttled")
+            turn.model_activity_at(t, 1, start + 999 as long)
+            spec.assert_str_eq(next_(q), "", "before a second")
+            nxt = start + 1000 as long
+            turn.model_activity_at(t, 1, nxt)
+            second = next_(q)
+            spec.assert_contains(second, "\"at\":${nxt}", "second at")
+            spec.assert_str_eq(next_(q), "", "one")
+            turn.model_activity_at(t, 0, nxt)
+            for i in 0..100 {
+                turn.model_activity_at(t, 1, nxt + 999 as long)
+            }
+            spec.assert_str_eq(state_(next_(q)), "started", "started at once")
+            spec.assert_str_eq(next_(q), "", "data throttled after start")
+            after = nxt + 1000 as long
+            turn.model_activity_at(t, 1, after)
+            turn.model_activity_at(t, 4, after)
+            turn.model_activity_at(t, 0, after)
+            turn.model_activity_at(t, 1, after)
+            spec.assert_str_eq(state_(next_(q)), "data", "data")
+            spec.assert_str_eq(state_(next_(q)), "finished", "finished")
+            spec.assert_str_eq(state_(next_(q)), "started", "started")
+            spec.assert_str_eq(next_(q), "", "data after start throttled")
+            silence = after + 30000 as long
+            turn.model_activity_at(t, 1, silence)
+            resumed = next_(q)
+            spec.assert_contains(resumed, "\"at\":${silence}", "resumed")
+            spec.assert_str_eq(next_(q), "", "none")
+        }
+        spec.it("insertion notifications reach the queued user entry") callback {
+            q = app_queue.new()
+            t = turn.new("", 0, q as ptr)
+            turn.user_inserted(t, 42 as long)
+            spec.assert_str_eq(next_(q), "{\"user_inserted\":42}", "posted")
+        }
+    }
+}

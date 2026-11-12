@@ -1,0 +1,257 @@
+// port: what the TUI needs from a Session, as an instance of closures, so the
+// app runs on the real Session (nib.tui.live) or on a scripted one a spec
+// drives ("emit reasoning, then text, then a Run with these results").
+// Upstream's App holds a *Session and calls into it; every such call is one
+// field here. Each closure takes `ctx` first and is called with `call`.
+//
+// Turn events reach the app through its queue (nib.tui.app_queue) as the JSON
+// text `nib ask --json` prints for them, plus the app-side events upstream's
+// Turn posts: {"model_activity":{"state":..,"at":ms}}, {"tool_activity":name},
+// {"user_inserted":id}, {"turn_end":{status,steps,usage,timing}}, and last
+// {"done":{}} or {"failed":{"message":..,"reason":..}} (reason: model, tool,
+// timeout, canceled, limit).
+//
+// Not here, because the app reads them itself from $NIB_HOME and the
+// environment as upstream does: config writes (simple, effort, model),
+// stored keys, the service list.
+
+import std.list
+import std.string
+import std.sync
+import nib.jsonx
+import nib.provider.types
+import nib.tui.app_queue
+
+exports(Port, Script, scripted, script_of, emit, end_turn, fail_turn, play_next, turn_text,
+        turn_count, canceled, set_stats, add_history_message, set_reply, queue_events)
+
+// Signatures (all called with `call(p.f, p.ctx, ...)`):
+//   start_turn(ctx, text: string, compact: int, q: *app_queue.Queue, cancel: std.sync cell)
+//       starts a Turn (or /compact) and returns; its events go to q.
+//   finish_turn(ctx)                  joins the finished Turn's thread
+//   enqueue(ctx, text) -> string      a user interjection while a Turn runs: its id
+//   take_queued(ctx) -> ptr           std.list of the interjections not yet sent
+//   history(ctx) -> ptr               std.list of the Session's message JSON texts
+//   stats(ctx) -> string              {"usage":{...},"steps":n,"context":n}
+//   cfg(ctx) -> ptr                   the Session's *types.Config
+//   home(ctx) -> string               $NIB_HOME
+//   session_id(ctx) -> string
+//   undo(ctx) -> string               {"text":..} or {"error":..}
+//   reopen(ctx, id) -> string         "" or an error name; id "" opens a new Session
+//   switch_config(ctx, cfg) -> string "updated", "new_session" or "open_failed:<e>"/"update_failed:<e>"
+//   sessions(ctx) -> string           [{"id":..,"modified_ms":..,"preview":..}] of this directory
+//   tasks(ctx) -> string              [{"id","kind","description","state","elapsed_ms","deadline_ms"?,"detached"}]
+//   request_stop(ctx, id)             stop a task after the running Turn
+//   user_stop(ctx, id) -> string      stop it now: the notice
+//   take_stop(ctx) -> string          the next id whose stop waits, "" none
+//   any_pending(ctx) -> int           background work still running
+//   waiting_task(ctx) -> string       {"id":..,"elapsed_ms":..} the Turn waits for, "" none
+//   recovery_hint(ctx, reason) -> string
+//   recovery_files(ctx) -> ptr        std.list of *changes.File this Turn changed
+//   run_js(ctx, code) -> string       {"ok":bool,"text":..,"logs":..,"diff":..}
+//   sandbox_status(ctx) -> string
+//   drain_progress(ctx) -> ptr        std.list of progress JSON objects due while idle
+//   predict(ctx, instruction, input, cancel) -> string   the model's reply, "" on failure
+struct Port {
+    ctx: ptr
+    start_turn: fn
+    finish_turn: fn
+    enqueue: fn
+    take_queued: fn
+    history: fn
+    stats: fn
+    cfg: fn
+    home: fn
+    session_id: fn
+    undo: fn
+    reopen: fn
+    switch_config: fn
+    sessions: fn
+    tasks: fn
+    request_stop: fn
+    user_stop: fn
+    take_stop: fn
+    any_pending: fn
+    waiting_task: fn
+    recovery_hint: fn
+    recovery_files: fn
+    run_js: fn
+    sandbox_status: fn
+    drain_progress: fn
+    predict: fn
+}
+
+// ---------------------------------------------------------------- scripted
+
+// The scripted Session's state, for specs.
+struct Script {
+    cfg: ptr
+    home: string
+    id: string
+    q: ptr                  // the running Turn's queue
+    cancel: ptr
+    running: int
+    turns: string[]         // every text a Turn was started with
+    compacts: int
+    next: ptr[]             // queued scripts: each a *Events to play at a Turn's start
+    queued: ptr             // std.list of interjections
+    next_id: long
+    history: ptr            // std.list of message JSON
+    stats: string
+    undo_reply: string
+    reopened: string[]
+    js_reply: string
+    prediction: string
+    predictions: int
+    hint: string
+    stops: string[]
+}
+
+struct Events {
+    items: string[]
+}
+
+script_of(p: *Port) -> *Script { return p.ctx as *Script }
+
+// A Port over a fresh Script. `cfg` is a *types.Config; home is $NIB_HOME.
+scripted(cfg: @keep ptr, home: string) -> *Port {
+    s = heap.new(Script)
+    s.cfg = cfg
+    s.home = home
+    s.id = "0123456789abcdef0123456789abcdef"
+    s.queued = list.list_new()
+    s.history = list.list_new()
+    s.next_id = 1 as long
+    s.stats = "{\"usage\":{},\"steps\":0,\"context\":0}"
+    s.undo_reply = "{\"text\":\"Nothing to undo.\"}"
+    s.js_reply = "{\"ok\":true,\"text\":\"undefined\",\"logs\":\"\",\"diff\":\"\"}"
+    s.hint = ""
+    p = heap.new(Port)
+    p.ctx = s as ptr
+    p.start_turn = |ctx: ptr, text: string, compact: int, q: @keep ptr, cancel: @keep ptr| {
+        sc = ctx as *Script
+        sc.q = q
+        sc.cancel = cancel
+        sc.running = 1
+        if compact != 0 {
+            sc.compacts = sc.compacts + 1
+        } else {
+            sc.turns.push(string.copy(text))
+        }
+        play_next(sc)
+    }
+    p.finish_turn = |ctx: ptr| { }
+    p.enqueue = |ctx: ptr, text: string| {
+        sc = ctx as *Script
+        id = sc.next_id
+        sc.next_id = sc.next_id + 1
+        list.list_add(sc.queued, string.copy(text))
+        return "${id}"
+    }
+    p.take_queued = |ctx: ptr| {
+        sc = ctx as *Script
+        out = sc.queued
+        sc.queued = list.list_new()
+        return out
+    }
+    p.history = |ctx: ptr| { return (ctx as *Script).history }
+    p.stats = |ctx: ptr| { return (ctx as *Script).stats }
+    p.cfg = |ctx: ptr| { return (ctx as *Script).cfg }
+    p.home = |ctx: ptr| { return (ctx as *Script).home }
+    p.session_id = |ctx: ptr| { return (ctx as *Script).id }
+    p.undo = |ctx: ptr| { return (ctx as *Script).undo_reply }
+    p.reopen = |ctx: ptr, id: string| {
+        sc = ctx as *Script
+        sc.reopened.push(string.copy(id))
+        sc.history = list.list_new()
+        sc.id = if string.length(id) > 0 { string.copy(id) } else { "fedcba9876543210fedcba9876543210" }
+        return ""
+    }
+    p.switch_config = |ctx: ptr, cfg: @keep ptr| {
+        sc = ctx as *Script
+        sc.cfg = cfg
+        return "updated"
+    }
+    p.sessions = |ctx: ptr| { return "[]" }
+    p.tasks = |ctx: ptr| { return "[]" }
+    p.request_stop = |ctx: ptr, id: string| {
+        sc = ctx as *Script
+        sc.stops.push(string.copy(id))
+    }
+    p.user_stop = |ctx: ptr, id: string| { return "${id}: not running" }
+    p.take_stop = |ctx: ptr| { return "" }
+    p.any_pending = |ctx: ptr| { return 0 }
+    p.waiting_task = |ctx: ptr| { return "" }
+    p.recovery_hint = |ctx: ptr, reason: string| { return (ctx as *Script).hint }
+    p.recovery_files = |ctx: ptr| { return list.list_new() }
+    p.run_js = |ctx: ptr, code: string| { return (ctx as *Script).js_reply }
+    p.sandbox_status = |ctx: ptr| { return "off (scripted)" }
+    p.drain_progress = |ctx: ptr| { return list.list_new() }
+    p.predict = |ctx: ptr, instruction: string, input: string, cancel: ptr| {
+        sc = ctx as *Script
+        sc.predictions = sc.predictions + 1
+        return sc.prediction
+    }
+    return p
+}
+
+// The events the next Turn emits as soon as it starts (then it waits for
+// end_turn/fail_turn, unless the list itself ends with {"done":..}).
+queue_events(s: *Script, events: string[]) {
+    ev = heap.new(Events)
+    for i in 0..events.len {
+        ev.items.push(string.copy(events[i]))
+    }
+    s.next.push(ev as ptr)
+}
+
+play_next(s: *Script) {
+    if s.next.len == 0 {
+        return
+    }
+    ev = s.next[0] as *Events
+    rest = make([]ptr, 0)
+    for i in 1..s.next.len {
+        rest.push(s.next[i])
+    }
+    s.next = rest
+    for i in 0..ev.items.len {
+        emit(s, ev.items[i])
+    }
+}
+
+// Posts one event of the running Turn.
+emit(s: *Script, json: string) {
+    if s.q == null {
+        return
+    }
+    app_queue.post(s.q as *app_queue.Queue, json)
+    if string.starts_with(json, "{\"done\"") != 0 || string.starts_with(json, "{\"failed\"") != 0 {
+        s.running = 0
+    }
+}
+
+// Ends the Turn: its summary, then done.
+end_turn(s: *Script, steps: int) {
+    emit(s, "{\"turn_end\":{\"status\":\"completed\",\"steps\":${steps},\"usage\":{},\"timing\":{}}}")
+    emit(s, "{\"done\":{}}")
+}
+
+// Fails it: canceled turns say so in the summary.
+fail_turn(s: *Script, text: string, reason: string) {
+    st = if reason == "canceled" { "canceled" } else { "failed" }
+    emit(s, "{\"turn_end\":{\"status\":\"${st}\",\"steps\":0,\"usage\":{},\"timing\":{}}}")
+    emit(s, "{\"failed\":{\"message\":${jsonx.quote(text)},\"reason\":${jsonx.quote(reason)}}}")
+}
+
+turn_text(s: *Script, i: int) -> string { return s.turns[i] }
+turn_count(s: *Script) -> int { return s.turns.len }
+
+// The app's cancel cell for the running Turn is set (Esc).
+canceled(s: *Script) -> bool {
+    return s.cancel != null && sync.atomic_load(s.cancel) != 0
+}
+
+set_stats(s: *Script, json: string) { s.stats = json }
+add_history_message(s: *Script, json: string) { list.list_add(s.history, string.copy(json)) }
+set_reply(s: *Script, prediction: string) { s.prediction = prediction }

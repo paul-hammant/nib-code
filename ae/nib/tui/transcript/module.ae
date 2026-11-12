@@ -56,7 +56,7 @@ exports(DELTA_TEXT, DELTA_REASONING, PendingResult, Transcript,
         retry_attempt, failure, start_run, start_run_with_effort, progress_changed,
         activity_detail, progress, hook_notice, end_run, end_run_with_summary,
         background_hook_notice, update_background_run, background_run, add_history,
-        run_result_text)
+        run_result_text, summary_from_json)
 
 // provider.Kind of a streamed delta.
 const DELTA_TEXT = 0
@@ -842,6 +842,8 @@ last_running_(t: *Transcript) -> int {
 
 // A Summary from the JSON of a message's `tool_summary` member:
 // {"counts":[{"name","count"}],"omitted":N,"files":[{"tool","path","duration_ms"?,"failed"?}]}.
+summary_from_json(v: ptr) -> *tool_summary.Summary { return summary_from_json_(v) }
+
 summary_from_json_(v: ptr) -> *tool_summary.Summary {
     s = tool_summary.empty()
     s.omitted = jsonx.long_or(v, "omitted", 0 as long)

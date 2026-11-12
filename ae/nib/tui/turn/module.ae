@@ -1,0 +1,75 @@
+// turn: the app's side of a running Turn or /compact (upstream
+// src/tui/turn.zig). Upstream's Turn owns the thread that runs the Session;
+// here the port runs it (nib.tui.live on a worker, a scripted port inline)
+// and this keeps what upstream's Turn keeps for the app: the cancel cell Esc
+// sets, whether it is a compaction, the failure stage, and the model-activity
+// throttle (data events at most once a second, request boundaries at once).
+//
+// Upstream's Ticker (a thread posting .tick every 16 ms while busy) is the
+// app loop's poll timeout instead: an empty poll while busy is a tick.
+
+import std.sync
+import nib.jsonx
+import nib.tui.app_queue
+
+exports(Turn, new, model_activity_at, tool_activity, user_inserted, cancel, is_canceled, STATES)
+
+const STATES[] = ["started", "data", "script", "waiting", "finished"]
+
+struct Turn {
+    cancel: ptr              // std.sync cell: 1 once canceled
+    compact: int
+    text: string
+    failure_stage: string    // model or tool (Recovery.Reason of a failure)
+    has_last_script: int
+    last_script_ms: long
+    has_last_model: int
+    last_model_ms: long
+    q: ptr                   // *app_queue.Queue the events go to
+}
+
+new(text: string, compact: int, q: @keep ptr) -> *Turn {
+    t = heap.new(Turn)
+    t.cancel = sync.atomic_new(0)
+    t.compact = compact
+    t.text = text
+    t.failure_stage = "model"
+    t.q = q
+    return t
+}
+
+cancel(t: *Turn) { sync.atomic_store(t.cancel, 1) }
+is_canceled(t: *Turn) -> bool { return sync.atomic_load(t.cancel) != 0 }
+
+// state is an index of STATES (status.MA_*); at the time it happened.
+model_activity_at(t: *Turn, state: int, at: long) {
+    if state == 0 {
+        t.failure_stage = "model"
+        t.has_last_script = 0
+    }
+    if state == 2 {
+        if t.has_last_script != 0 && at - t.last_script_ms < 1000 {
+            return
+        }
+        t.has_last_script = 1
+        t.last_script_ms = at
+    }
+    if state == 1 && t.has_last_model != 0 && at - t.last_model_ms < 1000 {
+        return
+    }
+    app_queue.post(t.q as *app_queue.Queue, "{\"model_activity\":{\"state\":\"${STATES[state]}\",\"at\":${at}}}")
+    if state == 4 {
+        t.has_last_model = 0
+    } else {
+        t.has_last_model = 1
+        t.last_model_ms = at
+    }
+}
+
+tool_activity(t: *Turn, name: string) {
+    app_queue.post(t.q as *app_queue.Queue, "{\"tool_activity\":${jsonx.quote(name)}}")
+}
+
+user_inserted(t: *Turn, id: long) {
+    app_queue.post(t.q as *app_queue.Queue, "{\"user_inserted\":${id}}")
+}

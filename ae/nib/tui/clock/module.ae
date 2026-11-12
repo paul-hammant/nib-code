@@ -1,0 +1,40 @@
+// clock: the TUI's clock, an instance passed to the app (never a global
+// read): milliseconds on a monotonic scale. `of_terminal` reads the
+// terminal's (a real terminal's monotonic clock, an in-memory terminal's fake
+// one that specs move with term.advance), `manual` is a clock a spec sets.
+
+import term
+
+exports(Clock, of_terminal, manual, now, set)
+
+struct Clock {
+    ctx: ptr
+    now_fn: fn
+    fixed: long
+}
+
+of_terminal(t: @keep ptr) -> *Clock {
+    c = heap.new(Clock)
+    c.ctx = t
+    c.now_fn = |ctx: ptr| {
+        long ms = term.now_ms(ctx as *term.Terminal)
+        return ms
+    }
+    return c
+}
+
+manual(start: long) -> *Clock {
+    c = heap.new(Clock)
+    c.fixed = start
+    return c
+}
+
+now(c: *Clock) -> long {
+    if c.ctx == null {
+        return c.fixed
+    }
+    long ms = call(c.now_fn, c.ctx)
+    return ms
+}
+
+set(c: *Clock, ms: long) { c.fixed = ms }

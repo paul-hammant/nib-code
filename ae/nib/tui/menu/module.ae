@@ -1,0 +1,347 @@
+// menu: the `/` candidate list above the input (upstream src/tui/menu.zig):
+// selection, dismissal, argument choices (models, services, tasks, sessions),
+// a pinned list that replaces it (the /provider service menu and pickers),
+// and the `@` path completions from the paths index.
+//
+// Differences: the Session is a nib.tui.port.Port; the index is created by
+// the app with its clock and wake (paths.new(root, now)) and handed in with
+// set_index. Skills (`$` mentions) are not ported (src/session/skills.zig):
+// sync lists none for a `$` mention, marked; the mention state machine is kept.
+// Choices that upstream reads from the Session (tasks, sessions) come from the
+// port as JSON.
+
+import std.list
+import std.string
+import nib.jsonx
+import nib.config
+import nib.provider.types
+import nib.tui.commands
+import nib.tui.editor
+import nib.tui.paths
+import nib.tui.port
+
+exports(Menu, MENTION_NONE, MENTION_FILE, MENTION_SKILL, new, free, is_pinned, pin, unpin, items,
+        sync, selected, move, input_changed, forget_sessions, load, resolve_session, set_index,
+        session_choices)
+
+const MENTION_NONE = 0
+const MENTION_FILE = 1
+const MENTION_SKILL = 2
+const BUF = 128
+
+struct Menu {
+    sel: int
+    closed: int
+    sessions: commands.Choice[]
+    sessions_loaded: int
+    tasks: commands.Choice[]
+    models: commands.Choice[]
+    services: commands.Choice[]
+    pinned: commands.Candidate[]
+    mention: int
+    index: ptr               // *paths.Index or null
+    file_buf: commands.Candidate[]
+    file_query: string
+    file_generation: int
+    file_fresh: int
+    reflect_enabled: int
+    services_fn: fn          // |input_arg: string| -> commands.Choice[] (the app's providers.service_choices)
+    has_services_fn: int
+}
+
+new() -> *Menu {
+    m = heap.new(Menu)
+    m.sessions = commands.no_choices()
+    m.tasks = commands.no_choices()
+    m.models = commands.no_choices()
+    m.services = commands.no_choices()
+    m.pinned = make([]commands.Candidate, 0)
+    m.file_buf = make([]commands.Candidate, 0)
+    m.file_query = ""
+    return m
+}
+
+free(m: *Menu) {
+    if m.index != null {
+        paths.free(m.index as *paths.Index)
+        m.index = null
+    }
+}
+
+set_index(m: *Menu, ix: @keep ptr) { m.index = ix }
+
+is_pinned(m: *Menu) -> bool { return m.pinned.len > 0 }
+
+pin(m: *Menu, rows: commands.Candidate[]) {
+    unpin(m)
+    out = make([]commands.Candidate, 0)
+    for i in 0..rows.len {
+        r = rows[i]
+        c = commands.Candidate { command: r.command, has_value: r.has_value, value: string.copy(r.value), label: string.copy(r.label), detail: string.copy(r.detail), is_path: r.is_path }
+        out.push(c)
+    }
+    m.pinned = out
+    m.sel = 0
+}
+
+unpin(m: *Menu) {
+    m.pinned = make([]commands.Candidate, 0)
+    m.sel = 0
+}
+
+items(m: *Menu, input: string) -> commands.Candidate[] {
+    if m.pinned.len > 0 {
+        return m.pinned
+    }
+    if m.closed != 0 {
+        return make([]commands.Candidate, 0)
+    }
+    slash = commands.candidates(input, m.sessions, m.tasks, m.models, m.services, BUF)
+    if m.reflect_enabled == 0 {
+        kept = make([]commands.Candidate, 0)
+        for i in 0..slash.len {
+            if slash[i].command == commands.CMD_REFLECT {
+                continue
+            }
+            c = slash[i]
+            kept.push(c)
+        }
+        slash = kept
+    }
+    if slash.len > 0 || m.mention == MENTION_NONE {
+        return slash
+    }
+    return m.file_buf
+}
+
+struct RankCtx {
+    m: ptr
+    query: string
+    same: int
+    generation: int
+}
+
+// Follows the editor's `@` mention: starts or refreshes the path listing and
+// ranks it.
+sync(m: *Menu, e: *editor.Editor) {
+    start, query = editor.file_mention(e)
+    if start < 0 {
+        sstart, squery = editor.skill_mention(e)
+        if sstart >= 0 {
+            sync_skills_(m, squery)
+            return
+        }
+        m.mention = MENTION_NONE
+        m.file_fresh = 0
+        m.file_buf = make([]commands.Candidate, 0)
+        return
+    }
+    if m.index == null {
+        return
+    }
+    ix = m.index as *paths.Index
+    if m.mention != MENTION_FILE {
+        m.mention = MENTION_FILE
+        m.file_fresh = 0
+        paths.refresh(ix, null)
+    }
+    q = if string.length(query) > 256 { string.substring(query, 0, 256) } else { query }
+    same = m.file_fresh != 0 && q == m.file_query
+    r = heap.new(RankCtx)
+    r.m = m as ptr
+    r.query = q
+    r.same = if same { 1 } else { 0 }
+    r.generation = paths.generation(ix)
+    paths.with_entries(ix, r as ptr, |ctx: ptr, entries: ptr[]| {
+        rank_(ctx as *RankCtx, entries)
+    })
+}
+
+rank_(r: *RankCtx, entries: ptr[]) {
+    m = r.m as *Menu
+    if r.same != 0 && m.file_generation == r.generation {
+        return
+    }
+    m.file_generation = r.generation
+    m.file_fresh = 1
+    m.file_query = r.query
+    out = make([]commands.Candidate, 0)
+    hits = paths.top(entries, r.query)
+    for i in 0..hits.len {
+        en = entries[hits[i].index] as *paths.Entry
+        value = paths.insertion(en.path, en.dir)
+        label = if en.dir != 0 { "${en.path}/" } else { en.path }
+        c = commands.Candidate { command: commands.CMD_HELP, has_value: 1, value: value, label: label, detail: "", is_path: 1 }
+        out.push(c)
+    }
+    m.file_buf = out
+    if m.sel >= m.file_buf.len {
+        m.sel = 0
+    }
+}
+
+// Skills are not ported: a `$` mention lists nothing yet (marked stand-in).
+sync_skills_(m: *Menu, query: string) {
+    if m.mention != MENTION_SKILL {
+        m.mention = MENTION_SKILL
+    }
+    m.file_fresh = 0
+    m.file_buf = make([]commands.Candidate, 0)
+    if m.sel >= m.file_buf.len {
+        m.sel = 0
+    }
+}
+
+// The selected candidate, or (empty, false).
+selected(m: *Menu, input: string) -> (commands.Candidate, bool) {
+    list_ = items(m, input)
+    if list_.len == 0 {
+        return commands.Candidate { command: 0, has_value: 0, value: "", label: "", detail: "", is_path: 0 }, false
+    }
+    i = if m.sel < list_.len - 1 { m.sel } else { list_.len - 1 }
+    c = list_[i]
+    return c, true
+}
+
+move(m: *Menu, input: string, down: bool) {
+    n = items(m, input).len
+    if n == 0 {
+        return
+    }
+    current = if m.sel < n - 1 { m.sel } else { n - 1 }
+    m.sel = if down { (current + 1) % n } else { (current + n - 1) % n }
+}
+
+input_changed(m: *Menu, input: string) {
+    m.sel = 0
+    m.closed = 0
+    if string.starts_with(input, "/resume ") == 0 {
+        m.sessions_loaded = 0
+    }
+}
+
+forget_sessions(m: *Menu) { m.sessions_loaded = 0 }
+
+// Loads the argument choices the input asks for. `services` is the app's
+// service lister: |arg: string| -> commands.Choice[] boxed in a ptr list.
+load(m: *Menu, input: string, p: *port.Port, home: string, cfg: ptr, services: fn) {
+    if string.starts_with(input, "/model ") != 0 {
+        entries, err = config.model_entries(home, cfg)
+        out = commands.no_choices()
+        if err == "" {
+            n = list.list_size(entries)
+            for i in 0..n {
+                en = list.list_get_raw(entries, i) as *config.ModelEntry
+                active = en.model == model_of_(cfg)
+                c = commands.choice(en.model, en.model, if active { "current" } else { "" })
+                out.push(c)
+            }
+        }
+        m.models = out
+        return
+    }
+    if string.starts_with(input, "/provider ") != 0 {
+        ptr boxed = call(services, string.substring(input, 10, string.length(input)))
+        m.services = unbox_choices_(boxed)
+        return
+    }
+    if string.starts_with(input, "/stop ") != 0 {
+        string tasks_json = call(p.tasks, p.ctx)
+        out = commands.no_choices()
+        doc = jsonx.parse(tasks_json)
+        n = jsonx.array_size(doc)
+        for i in 0..n {
+            t = jsonx.array_at(doc, i)
+            st = jsonx.str_or(t, "state", "")
+            if st != "queued" && st != "working" {
+                continue
+            }
+            id = string.copy(jsonx.str_or(t, "id", ""))
+            c = commands.choice(id, id, string.copy(jsonx.str_or(t, "description", "")))
+            out.push(c)
+        }
+        jsonx.free(doc)
+        m.tasks = out
+        return
+    }
+    if m.sessions_loaded != 0 || string.starts_with(input, "/resume ") == 0 {
+        return
+    }
+    m.sessions = session_choices(p, 0 as long)
+    m.sessions_loaded = 1
+}
+
+model_of_(cfg: ptr) -> string {
+    return (cfg as *types.Config).model
+}
+
+// A list of *commands.Choice boxes back to a slice.
+unbox_choices_(boxed: ptr) -> commands.Choice[] {
+    out = commands.no_choices()
+    if boxed == null {
+        return out
+    }
+    n = list.list_size(boxed)
+    for i in 0..n {
+        b = list.list_get_raw(boxed, i) as *commands.Choice
+        c = commands.choice(b.value, b.label, b.detail)
+        out.push(c)
+    }
+    return out
+}
+
+// Rows for /resume: this directory's sessions, newest first (the port's
+// order). `now_ms` 0 takes the port's own ages ("modified_ms" is then the age).
+session_choices(p: *port.Port, now_ms: long) -> commands.Choice[] {
+    string text = call(p.sessions, p.ctx)
+    string current = call(p.session_id, p.ctx)
+    out = commands.no_choices()
+    doc = jsonx.parse(text)
+    n = jsonx.array_size(doc)
+    for i in 0..n {
+        f = jsonx.array_at(doc, i)
+        id = string.copy(jsonx.str_or(f, "id", ""))
+        age_ms = jsonx.long_or(f, "age_ms", 0 as long)
+        seconds = age_ms / 1000
+        ago = "now"
+        if seconds >= 86400 {
+            ago = "${seconds / 86400}d ago"
+        } else if seconds >= 3600 {
+            ago = "${seconds / 3600}h ago"
+        } else if seconds >= 60 {
+            ago = "${seconds / 60}m ago"
+        }
+        preview = string.copy(jsonx.str_or(f, "preview", ""))
+        mark = if id == current { " (current)" } else { "" }
+        label = if string.length(id) > 8 { string.substring(id, 0, 8) } else { id }
+        c = commands.choice(id, label, "${ago}${mark} · ${if string.length(preview) > 0 { preview } else { "(no messages)" }}")
+        out.push(c)
+    }
+    jsonx.free(doc)
+    return out
+}
+
+// A full id, or the one session here whose id starts with `arg`: (id, error name).
+resolve_session(m: *Menu, p: *port.Port, arg: string) -> (string, string) {
+    if string.length(arg) == 0 {
+        return "", "MissingSessionId"
+    }
+    if string.length(arg) == 32 {
+        return arg, ""
+    }
+    found = ""
+    choices = session_choices(p, 0 as long)
+    for i in 0..choices.len {
+        if string.starts_with(choices[i].value, arg) == 0 {
+            continue
+        }
+        if found != "" {
+            return "", "AmbiguousSession"
+        }
+        found = choices[i].value
+    }
+    if found == "" {
+        return "", "UnknownSession"
+    }
+    return found, ""
+}

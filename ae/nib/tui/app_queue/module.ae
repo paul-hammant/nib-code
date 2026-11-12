@@ -1,0 +1,84 @@
+// app_queue: the TUI's own event queue (upstream posts app events into the
+// libvaxis Loop's queue next to terminal input; ae/term keeps terminal input
+// to itself, so app events wait here). Producers are the Turn's thread, the
+// path index, prediction and provider jobs; the app loop takes them in order.
+// An event is its JSON text (session events exactly as `ask --json` prints
+// them) plus an optional pointer payload (a provider flow result). Closed
+// queues refuse posts, as upstream's closed loop queue does at shutdown.
+
+import nib.lock
+
+exports(Item, Queue, new, post, post_ptr, take, len, close, is_closed)
+
+struct Item {
+    json: string
+    data: ptr
+}
+
+struct Queue {
+    guard: ptr
+    items: ptr[]
+    head: int
+    closed: int
+}
+
+new() -> *Queue {
+    q = heap.new(Queue)
+    q.guard = lock.new()
+    return q
+}
+
+// False when the queue is closed.
+post(q: *Queue, json: string) -> bool {
+    return post_ptr(q, json, null)
+}
+
+post_ptr(q: *Queue, json: string, data: @keep ptr) -> bool {
+    lock.acquire(q.guard)
+    if q.closed != 0 {
+        lock.release(q.guard)
+        return false
+    }
+    it = heap.new(Item)
+    it.json = json
+    it.data = data
+    q.items.push(it as ptr)
+    lock.release(q.guard)
+    return true
+}
+
+// The oldest item, or (empty item, false).
+take(q: *Queue) -> (Item, bool) {
+    lock.acquire(q.guard)
+    if q.head >= q.items.len {
+        lock.release(q.guard)
+        return Item { json: "", data: null }, false
+    }
+    it = q.items[q.head] as *Item
+    q.head = q.head + 1
+    out = Item { json: it.json, data: it.data }
+    if q.head >= q.items.len {
+        q.items = make([]ptr, 0)
+        q.head = 0
+    }
+    lock.release(q.guard)
+    return out, true
+}
+
+len(q: *Queue) -> int {
+    lock.acquire(q.guard)
+    n = q.items.len - q.head
+    lock.release(q.guard)
+    return n
+}
+
+// Refuses further posts and drops what is queued.
+close(q: *Queue) {
+    lock.acquire(q.guard)
+    q.closed = 1
+    q.items = make([]ptr, 0)
+    q.head = 0
+    lock.release(q.guard)
+}
+
+is_closed(q: *Queue) -> bool { return q.closed != 0 }

@@ -154,6 +154,18 @@ aeb(cap) {
         }
         // The TUI (ae/nib/tui), upstream src/tui*.
         aether.program_test() {
+            source("ae/tests/tui_app_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tui_menu_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tui_turn_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
             source("ae/tests/tui_view_test.ae")
             lib("ae")
         }

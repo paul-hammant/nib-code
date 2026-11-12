@@ -1,0 +1,695 @@
+// The TUI app driven in-process: an in-memory terminal (term.memory), a
+// scripted Session (nib.tui.port.scripted) and the terminal's fake clock.
+// No pty, no sleeps: keys and mouse events go in through term.driver, Session
+// events through the scripted port, `tui.step` handles them and the specs read
+// what the terminal shows.
+//
+// Part one ports the tests of upstream src/tui.zig under their names (those
+// about the App; the Turn ones are in tui_turn_test.ae). Not ported: "quit
+// drains owned events and closed queues reject Turn payloads without leaks"
+// and "shutdown closes a full queue before joining the canceled Turn" (Zig
+// allocator/thread ownership; the queue's close is covered by "closed queues
+// refuse events"), "empty or whitespace-only paste reads the clipboard image
+// like Ctrl+V" (images are not ported; ported as the notice that stands in),
+// "file paths are links only when open is configured..." runs with a recording
+// launcher instead of /usr/bin/env.
+//
+// Part two: specs for the main flows (streaming states, a Run block,
+// interjection, Esc cancel, the / menu, @ completion, undo, simple mode,
+// mouse selection, resize).
+import std.spec
+import std.string
+import std.list
+import std.fs
+import std.sync
+import term
+import term.screen
+import term.input
+import term.driver
+import nib.provider.types
+import nib.config.env
+import nib.tui
+import nib.tui.port
+import nib.tui.clock
+import nib.tui.app_queue
+import nib.tui.entry
+import nib.tui.transcript
+import nib.tui.editor
+import nib.tui.selection
+import nib.tui.viewport
+import nib.tui.status
+import nib.tui.commands
+import nib.tui.menu
+import nib.tui.paths
+import nib.tui.frames
+import nib.tui.provider_flow
+
+struct Rig {
+    t: *term.Terminal
+    a: *tui.App
+    s: *port.Script
+    home: string
+}
+
+home_() -> string {
+    d, err = fs.make_temp_dir("", "nibtui")
+    if err != "" { spec.fail("temp dir: ${err}") }
+    return d
+}
+
+rig_(cols: int, rows: int) -> *Rig {
+    r = heap.new(Rig)
+    r.home = home_()
+    r.t = term.memory(cols, rows)
+    cfg = types.new_config("custom", "http://127.0.0.1:9", "test-key", "mock")
+    p = port.scripted(cfg, r.home)
+    r.s = port.script_of(p)
+    ep = env.new()
+    env.set(ep, "HOME", r.home)
+    r.a = tui.new(r.t as ptr, p as ptr, clock.of_terminal(r.t as ptr) as ptr, ep)
+    tui.start(r.a)
+    tui.step(r.a)
+    tui.render(r.a)
+    return r
+}
+
+key_(r: *Rig, spec_text: string) {
+    driver.press(r.t, spec_text)
+    tui.step(r.a)
+}
+
+type_(r: *Rig, text: string) {
+    driver.type_text(r.t, text)
+    tui.step(r.a)
+}
+
+emit_(r: *Rig, json: string) {
+    port.emit(r.s, json)
+    tui.step(r.a)
+}
+
+text_(r: *Rig) -> string { return editor.text(r.a.input) }
+
+entries_(r: *Rig) -> int { return transcript.count(r.a.transcript) }
+
+kind_at_(r: *Rig, i: int) -> int { return transcript.at(r.a.transcript, i).kind }
+
+mouse_(r: *Rig, col: int, row: int, kind: int, button: int) {
+    driver.mouse(r.t, button, col, row, kind)
+    tui.step(r.a)
+}
+
+shown_contains_(r: *Rig, text: string) -> bool { return driver.find_row(r.t, text) >= 0 }
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui (upstream src/tui.zig tests)") {
+        spec.it("stream events are paced while interaction and completion refresh immediately") callback {
+            spec.assert_eq(tui.refresh_of("tick"), frames.REFRESH_ANIMATION, "tick")
+            spec.assert_eq(tui.refresh_of("delta"), frames.REFRESH_CONTENT, "delta")
+            spec.assert_eq(tui.refresh_of("done"), frames.REFRESH_IMMEDIATE, "done")
+            spec.assert_eq(tui.refresh_of("key"), frames.REFRESH_IMMEDIATE, "key")
+            spec.assert_eq(tui.refresh_of("paste_end"), frames.REFRESH_IMMEDIATE, "paste end")
+        }
+        spec.it("code tint is a neutral shade subtler than the user tint") callback {
+            spec.assert_eq(tui.code_background(0, 0, 0), screen.color_rgb(10, 10, 10), "dark")
+            spec.assert_eq(tui.code_background(255, 255, 255), screen.color_rgb(245, 245, 245), "light")
+        }
+        spec.it("user message tint preserves dark and light terminal contrast") callback {
+            d = tui.user_background(0, 0, 0)
+            l = tui.user_background(255, 255, 255)
+            spec.assert_true(screen.color_r(d) < 32 && screen.color_g(d) < 32 && screen.color_b(d) < 32, "dark stays dark")
+            spec.assert_true(screen.color_r(l) > 220 && screen.color_g(l) > 220 && screen.color_b(l) > 220, "light stays light")
+            spec.assert_true(screen.color_b(d) > screen.color_r(d), "dark blue tint")
+            spec.assert_true(screen.color_b(l) > screen.color_r(l), "light blue tint")
+        }
+        spec.it("wheel scrolls during history selection and ignores non-press wheel events") callback {
+            r = rig_(8, 3)
+            transcript.add(r.a.transcript, entry.KIND_INFO, "one\ntwo\nthree\nfour")
+            a = r.a
+            a.has_body = 1
+            a.body.top = viewport.Anchor { entry: 0, row: 0 }
+            a.body.window = screen.child(term.window(r.t), width: 8, height: 3)
+            buttons = [input.WHEEL_UP, input.WHEEL_DOWN]
+            for b in 0..2 {
+                button = buttons[b]
+                tui.handle_input(a, input.Mouse { col: 0, row: 0, button: input.BUTTON_LEFT, mods: 0, kind: input.MOUSE_PRESS })
+                was_active = a.selection.active
+                was_history = a.selection.has_history
+                tui.handle_input(a, input.Mouse { col: 2, row: 0, button: button, mods: 0, kind: input.MOUSE_PRESS })
+                spec.assert_eq(a.selection.active, was_active, "selection kept")
+                spec.assert_eq(a.selection.has_history, was_history, "history kept")
+                spec.assert_eq_long(a.scroll.pending, if button == input.WHEEL_UP { -3 as long } else { 3 as long }, "scrolled")
+                a.scroll.pending = 0 as long
+                kinds = [input.MOUSE_RELEASE, input.MOUSE_DRAG, input.MOUSE_MOTION]
+                for k in 0..3 {
+                    tui.handle_input(a, input.Mouse { col: 7, row: 2, button: button, mods: 0, kind: kinds[k] })
+                    spec.assert_eq(a.selection.active, was_active, "non-press keeps selection")
+                    spec.assert_eq_long(a.scroll.pending, 0 as long, "non-press does not scroll")
+                }
+                a.selection.active = 0
+                tui.handle_input(a, input.Mouse { col: 2, row: 0, button: button, mods: 0, kind: input.MOUSE_PRESS })
+                spec.assert_eq(a.selection.has_anchor + a.selection.active + a.selection.has_history, 0, "cleared")
+                a.scroll.pending = 0 as long
+            }
+        }
+        spec.it("key entry stays out of the editor, its history and drafts") callback {
+            r = rig_(80, 24)
+            a = r.a
+            editor.insert(a.input, "draft message")
+            provider_flow.flow_start_key(a.flow, "openai", "OpenAI")
+            type_(r, "sk-secret")
+            spec.assert_str_eq(a.flow.text, "sk-secret", "secret in the flow")
+            tui.handle_input(a, input.PasteStart {})
+            tui.on_key(a, input.key(90, text: "Z"))
+            tui.handle_input(a, input.PasteEnd {})
+            spec.assert_str_eq(a.flow.text, "sk-secretZ", "pasted into the flow")
+            spec.assert_str_eq(text_(r), "draft message", "draft untouched")
+            spec.assert_eq(a.input.history.len, 0, "no history")
+            spec.assert_true(a.input.draft == null && a.input.blocks.len == 0, "no draft or blocks")
+            tui.on_key(a, input.key(input.ESCAPE))
+            spec.assert_eq(provider_flow.flow_active(a.flow), 0, "flow closed")
+            spec.assert_eq(string.length(a.flow.text), 0, "secret wiped")
+            spec.assert_str_eq(text_(r), "draft message", "draft still there")
+        }
+        spec.it("bracketed paste buffers newline and slash keys without executing them") callback {
+            r = rig_(80, 24)
+            a = r.a
+            tui.handle_input(a, input.PasteStart {})
+            tui.on_key(a, input.key(47, text: "/help"))
+            for i in 0..5 {
+                tui.on_key(a, input.key(106, mods: input.CTRL))
+                tui.on_key(a, input.key(120, text: "x"))
+            }
+            spec.assert_str_eq(text_(r), "", "nothing typed yet")
+            tui.handle_input(a, input.PasteEnd {})
+            spec.assert_str_eq(text_(r), "[Pasted #1 · 6 lines · /help]", "one block")
+            spec.assert_str_eq(editor.expanded(a.input), "/help\nx\nx\nx\nx\nx", "expanded")
+        }
+        spec.it("ctrl+c quits only on a second consecutive press") callback {
+            r = rig_(8, 3)
+            a = r.a
+            cc = input.key(99, mods: input.CTRL)
+            spec.assert_true(tui.on_key(a, cc), "first keeps running")
+            spec.assert_eq(a.quit_armed, 1, "armed")
+            spec.assert_str_eq(a.notice, "press ctrl+c again to quit", "notice")
+            spec.assert_true(tui.on_key(a, input.key(120, text: "x")), "x")
+            spec.assert_eq(a.quit_armed, 0, "disarmed")
+            spec.assert_true(tui.on_key(a, cc), "armed again")
+            spec.assert_false(tui.on_key(a, cc), "second quits")
+        }
+        spec.it("empty or whitespace-only paste reads the clipboard image like Ctrl+V") callback {
+            r = rig_(80, 24)
+            a = r.a
+            (a.cfg as *types.Config).custom_vision = 1
+            tui.handle_input(a, input.PasteStart {})
+            tui.handle_input(a, input.PasteEnd {})
+            spec.assert_str_eq(a.notice, "No image in clipboard", "empty paste")
+            tui.handle_input(a, input.PasteStart {})
+            a.paste_buf = "text"
+            tui.handle_input(a, input.PasteEnd {})
+            spec.assert_str_eq(text_(r), "text", "text pasted")
+        }
+        spec.it("usage snapshots refresh the footer without reading the running Session") callback {
+            r = rig_(80, 24)
+            a = r.a
+            port.set_stats(r.s, "{\"usage\":{\"prompt_tokens\":99999},\"steps\":9,\"context\":800}")
+            tui.handle_app(a, "{\"usage\":{},\"context\":800,\"steps\":0}", null)
+            spec.assert_eq_long(a.usage.prompt_tokens, 0 as long, "usage from the event")
+            spec.assert_eq(a.steps, 0, "steps from the event")
+            tui.handle_app(a, "{\"usage\":{\"prompt_tokens\":1200,\"completion_tokens\":50,\"prompt_cache_hit_tokens\":600},\"context\":1250,\"steps\":1}", null)
+            spec.assert_eq_long(a.usage.prompt_tokens, 1200 as long, "prompt")
+            spec.assert_eq_long(a.usage.prompt_cache_hit_tokens, 600 as long, "cache")
+            spec.assert_eq_long(a.context, 1250 as long, "context")
+            spec.assert_eq(a.steps, 1, "steps")
+            tui.handle_app(a, "{\"usage\":{\"prompt_tokens\":1200},\"context\":200,\"steps\":1}", null)
+            spec.assert_eq_long(a.context, 200 as long, "context drops")
+        }
+        spec.it("turn_end forwards by value and defers bills until terminal content") callback {
+            r = rig_(80, 24)
+            a = r.a
+            statuses = ["completed", "canceled", "failed"]
+            for k in 0..3 {
+                transcript.add(a.transcript, entry.KIND_ASSISTANT, "answer")
+                before = entries_(r)
+                tui.handle_app(a, "{\"turn_end\":{\"status\":\"${statuses[k]}\",\"steps\":2,\"usage\":{},\"timing\":{\"wall_ms\":1000}}}", null)
+                spec.assert_eq(entries_(r), before, "no entry yet")
+                spec.assert_eq(a.has_pending_bill, 1, "pending")
+                spec.assert_str_eq(a.pending_bill.status, statuses[k], "summary status")
+                if k != 0 {
+                    transcript.add(a.transcript, entry.KIND_ERR, statuses[k])
+                }
+                tui.append_bill(a)
+                n = entries_(r)
+                spec.assert_eq(kind_at_(r, n - 1), entry.KIND_BILL, "bill last")
+                spec.assert_str_eq(transcript.at(a.transcript, n - 2).text, if k == 0 { "answer" } else { statuses[k] }, "after terminal content")
+                spec.assert_eq(a.has_pending_bill, 0, "consumed")
+                tui.append_bill(a)
+                spec.assert_eq(entries_(r), n, "once")
+            }
+        }
+        spec.it("insertion notifications reach the queued user entry") callback {
+            r = rig_(80, 24)
+            transcript.add(r.a.transcript, entry.KIND_USER, "interjection")
+            transcript.at(r.a.transcript, 0).queued = 42 as long
+            tui.handle_app(r.a, "{\"user_inserted\":42}", null)
+            spec.assert_eq_long(transcript.at(r.a.transcript, 0).queued, -1 as long, "inserted")
+        }
+        spec.it("background events own their payload and maintain running count") callback {
+            r = rig_(80, 24)
+            a = r.a
+            tui.handle_app(a, "{\"background\":{\"id\":\"a1\",\"kind\":\"agent\",\"state\":\"started\"}}", null)
+            spec.assert_eq(a.background_count, 1, "started")
+            spec.assert_eq(entries_(r), 0, "no entry")
+            tui.handle_app(a, "{\"background\":{\"id\":\"a1\",\"kind\":\"agent\",\"state\":\"finished\",\"ok\":true,\"result\":\"{\\\"ok\\\":true,\\\"text\\\":\\\"done\\\"}\"}}", null)
+            spec.assert_eq(a.background_count, 0, "finished")
+            spec.assert_eq(kind_at_(r, 0), entry.KIND_BACKGROUND, "background entry")
+            spec.assert_str_eq(transcript.at(a.transcript, 0).label, "a1 agent · completed", "label")
+        }
+        spec.it("Step events own effort and Runs keep their generating Step metadata") callback {
+            r = rig_(80, 24)
+            a = r.a
+            tui.handle_app(a, "{\"step\":{\"n\":3,\"effort\":\"high\"}}", null)
+            spec.assert_eq(a.live_steps, 3, "live steps")
+            a.turn_runs = 0
+            tui.handle_app(a, "{\"run_start\":\"tools.read({})\",\"step\":3}", null)
+            tui.handle_app(a, "{\"run_end\":{\"ok\":true,\"output\":\"out\",\"changes\":[]}}", null)
+            tui.handle_app(a, "{\"step\":{\"n\":4,\"effort\":\"low\"}}", null)
+            e = transcript.at(a.transcript, 0)
+            spec.assert_str_eq(e.step_effort, "high", "Run keeps its Step's effort")
+            spec.assert_str_eq(a.step_effort, "low", "next Step")
+            spec.assert_str_eq(e.label, "Run", "label")
+        }
+        spec.it("Run summary survives event queue and original summary destruction") callback {
+            r = rig_(80, 24)
+            a = r.a
+            a.activity = status.activity_start(0 as long, status.PHASE_RUNNING)
+            transcript.start_run(a.transcript, "// tools.llm(")
+            tui.post(a, "{\"run_end\":{\"ok\":true,\"output\":\"done\",\"changes\":[],\"tool_summary\":{\"counts\":[{\"name\":\"edit\",\"count\":2}],\"omitted\":3,\"files\":[]}}}")
+            tui.step(a)
+            e = transcript.at(a.transcript, 0)
+            spec.assert_eq(e.has_tool_summary, 1, "summary kept")
+            spec.assert_true(string.starts_with(e.label, "Run · edit ×2 · +3") != 0, "label: ${e.label}")
+        }
+        spec.it("cancel returns queued messages alongside an existing draft") callback {
+            r = rig_(80, 24)
+            a = r.a
+            p = a.p
+            string id = call(p.enqueue, p.ctx, "queued request")
+            transcript.add(a.transcript, entry.KIND_USER, "queued request")
+            transcript.at(a.transcript, 0).queued = 1 as long
+            editor.insert(a.input, "draft")
+            tui.finish_queued(a, false)
+            spec.assert_str_eq(text_(r), "queued request\n\ndraft", "restored")
+            spec.assert_str_eq(transcript.at(a.transcript, 0).text, "1 queued message returned to input", "notice")
+        }
+        spec.it("stream events distinguish reasoning text and Run arguments through retry") callback {
+            r = rig_(80, 24)
+            a = r.a
+            a.activity = status.activity_start(0 as long, status.PHASE_THINKING)
+            a.activity.last_progress = -45000 as long
+            tui.handle_app(a, "{\"delta\":{\"kind\":\"reasoning\",\"text\":\"hidden\",\"step\":1}}", null)
+            spec.assert_eq(a.activity.phase, status.PHASE_REASONING, "reasoning")
+            spec.assert_true(status.activity_label(a.activity, term.now_ms(r.t)).quiet_ms < (1000 as long), "progressed")
+            spec.assert_eq(entries_(r), 0, "reasoning hidden")
+            tui.handle_app(a, "{\"delta\":{\"kind\":\"text\",\"text\":\"draft\",\"step\":1}}", null)
+            spec.assert_eq(a.activity.phase, status.PHASE_WRITING, "writing")
+            tui.handle_app(a, "{\"retry\":{\"attempt\":1,\"delay_ms\":0,\"reason\":\"server_error\"}}", null)
+            spec.assert_eq(transcript.at(a.transcript, 0).retry_placeholder, 1, "placeholder")
+            tui.handle_app(a, "{\"model_activity\":{\"state\":\"script\",\"at\":0}}", null)
+            spec.assert_eq(a.activity.phase, status.PHASE_SCRIPTING, "scripting")
+            tui.handle_app(a, "{\"delta\":{\"kind\":\"text\",\"text\":\"answer\",\"step\":1}}", null)
+            transcript.flush_visible(a.transcript)
+            spec.assert_eq(entries_(r), 1, "one entry")
+            ans, ok = transcript.last_answer(a.transcript)
+            spec.assert_str_eq(ans, "answer", "replaced")
+        }
+        spec.it("terminal, interaction and Run boundaries flush visible backlog") callback {
+            kinds = ["done", "failed", "retry", "run_start", "key", "mouse"]
+            for i in 0..6 {
+                spec.assert_true(tui.flushes_visible(kinds[i]), kinds[i])
+            }
+            spec.assert_false(tui.flushes_visible("tick"), "tick")
+            spec.assert_false(tui.flushes_visible("delta"), "delta")
+        }
+        spec.it("@ completion: Enter and Tab accept instead of sending, directories keep completing, Esc only closes") callback {
+            r = rig_(80, 24)
+            a = r.a
+            paths.set_entries(a.menu.index as *paths.Index, ["src/", "src/main.zig", "src/tui.zig", "my dir/", "my dir/a b.txt", "README.md"])
+            type_(r, "see @sr")
+            menu.sync(a.menu, a.input)
+            spec.assert_true(menu.items(a.menu, text_(r)).len > 0, "listed")
+            key_(r, "enter")
+            spec.assert_str_eq(text_(r), "see @src/", "dir accepted")
+            menu.sync(a.menu, a.input)
+            spec.assert_str_eq(menu.items(a.menu, text_(r))[0].label, "src/tui.zig", "keeps completing")
+            type_(r, "ma")
+            key_(r, "tab")
+            spec.assert_str_eq(text_(r), "see @src/main.zig ", "file accepted")
+            menu.sync(a.menu, a.input)
+            spec.assert_eq(menu.items(a.menu, text_(r)).len, 0, "closed after a file")
+            type_(r, "@RE")
+            key_(r, "escape")
+            menu.sync(a.menu, a.input)
+            spec.assert_eq(menu.items(a.menu, text_(r)).len, 0, "esc closes")
+            spec.assert_str_eq(text_(r), "see @src/main.zig @RE", "text kept")
+            type_(r, "A")
+            key_(r, "down")
+            key_(r, "enter")
+            spec.assert_str_eq(text_(r), "see @src/main.zig @README.md ", "reopened by typing")
+            editor.replace(a.input, "")
+            type_(r, "@my")
+            key_(r, "tab")
+            spec.assert_str_eq(text_(r), "@\"my dir/", "quoted dir")
+            type_(r, "a")
+            key_(r, "tab")
+            spec.assert_str_eq(text_(r), "@\"my dir/a b.txt\" ", "quoted file")
+        }
+        spec.it("@ completion ignores emails and pasted mentions") callback {
+            r = rig_(80, 24)
+            a = r.a
+            paths.set_entries(a.menu.index as *paths.Index, ["src/", "bob.txt"])
+            type_(r, "mail a@b")
+            menu.sync(a.menu, a.input)
+            spec.assert_eq(menu.items(a.menu, text_(r)).len, 0, "email")
+            editor.replace(a.input, "")
+            driver.paste(r.t, "@sr")
+            tui.step(a)
+            menu.sync(a.menu, a.input)
+            spec.assert_str_eq(text_(r), "@sr", "pasted")
+            spec.assert_eq(menu.items(a.menu, text_(r)).len, 0, "pasted mention closed")
+            type_(r, "c")
+            menu.sync(a.menu, a.input)
+            spec.assert_eq(menu.items(a.menu, text_(r)).len, 1, "typing reopens")
+        }
+        spec.it("click toggles only the Run title row under the pointer across wrapped lines and scroll offsets") callback {
+            r = rig_(8, 8)
+            a = r.a
+            transcript.add(a.transcript, entry.KIND_INFO, "aaaa bbbb cccc")
+            transcript.start_run(a.transcript, "tools.read({})")
+            transcript.start_run(a.transcript, "tools.read({})")
+            a.has_body = 1
+            a.body.top = viewport.Anchor { entry: 0, row: 0 }
+            a.body.window = screen.child(term.window(r.t), width: 8, height: 8)
+            win = a.body.window
+            e0 = transcript.at(a.transcript, 0)
+            e1 = transcript.at(a.transcript, 1)
+            e2 = transcript.at(a.transcript, 2)
+            first_run = entry.height(e0, win) + 1
+            second_run = first_run + entry.height(e1, win) + 1
+            spec.assert_true(entry.height(e0, win) > 1, "wraps")
+            tui.handle_input(a, input.Mouse { col: 3, row: first_run + 1, button: input.BUTTON_LEFT, mods: 0, kind: input.MOUSE_PRESS })
+            tui.handle_input(a, input.Mouse { col: 3, row: first_run + 1, button: input.BUTTON_NONE, mods: 0, kind: input.MOUSE_RELEASE })
+            spec.assert_true(e1.open == 0 && e2.open == 0, "below the title: nothing")
+            tui.handle_input(a, input.Mouse { col: 3, row: first_run, button: input.BUTTON_LEFT, mods: 0, kind: input.MOUSE_PRESS })
+            tui.handle_input(a, input.Mouse { col: 3, row: first_run, button: input.BUTTON_NONE, mods: 0, kind: input.MOUSE_RELEASE })
+            spec.assert_true(e1.open != 0 && e2.open == 0, "title toggles")
+            tui.handle_input(a, input.Mouse { col: 0, row: 0, button: input.BUTTON_LEFT, mods: 0, kind: input.MOUSE_PRESS })
+            tui.handle_input(a, input.Mouse { col: 0, row: 0, button: input.BUTTON_NONE, mods: 0, kind: input.MOUSE_RELEASE })
+            spec.assert_true(e1.open != 0 && e2.open == 0, "info is not toggled")
+            transcript.toggle(a.transcript, 1)
+            a.body.top = viewport.Anchor { entry: 1, row: 0 }
+            shifted = second_run - first_run
+            tui.handle_input(a, input.Mouse { col: 2, row: shifted, button: input.BUTTON_LEFT, mods: 0, kind: input.MOUSE_PRESS })
+            tui.handle_input(a, input.Mouse { col: 2, row: shifted, button: input.BUTTON_NONE, mods: 0, kind: input.MOUSE_RELEASE })
+            spec.assert_true(e1.open == 0 && e2.open != 0, "scrolled title toggles")
+        }
+        spec.it("a drag across a Run title selects instead of toggling") callback {
+            r = rig_(8, 8)
+            a = r.a
+            transcript.start_run(a.transcript, "tools.read({})")
+            a.has_body = 1
+            a.body.top = viewport.Anchor { entry: 0, row: 0 }
+            a.body.window = screen.child(term.window(r.t), width: 8, height: 8)
+            tui.handle_input(a, input.Mouse { col: 0, row: 0, button: input.BUTTON_LEFT, mods: 0, kind: input.MOUSE_PRESS })
+            tui.handle_input(a, input.Mouse { col: 4, row: 0, button: input.BUTTON_LEFT, mods: 0, kind: input.MOUSE_DRAG })
+            spec.assert_eq(a.selection.dragged, 1, "dragged")
+            a.selection.active = 0
+            spec.assert_eq(transcript.at(a.transcript, 0).open, 0, "not toggled")
+            _p, has_click = selection.take_click(a.selection)
+            spec.assert_false(has_click, "no click")
+        }
+        spec.it("toggling pins the view unless following the latest details entry") callback {
+            r = rig_(8, 8)
+            a = r.a
+            transcript.start_run(a.transcript, "a")
+            transcript.start_run(a.transcript, "b")
+            transcript.add(a.transcript, entry.KIND_ASSISTANT, "done")
+            a.has_body = 1
+            a.body.top = viewport.Anchor { entry: 1, row: 2 }
+            a.body.window = screen.child(term.window(r.t), width: 8, height: 8)
+            a.scroll.has_top = 1
+            a.scroll.top_entry = 1
+            a.scroll.top_row = 2
+            tui.toggle_entry(a, 1)
+            spec.assert_true(a.scroll.has_top == 1 && a.scroll.top_entry == 1 && a.scroll.top_row == 2, "pinned stays")
+            transcript.toggle(a.transcript, 1)
+            a.scroll.has_top = 0
+            tui.toggle_entry(a, 0)
+            spec.assert_true(a.scroll.has_top == 1 && a.scroll.top_entry == 1 && a.scroll.top_row == 2, "pins to the frame top")
+            a.scroll.has_top = 0
+            spec.assert_eq(transcript.latest_details(a.transcript), 1, "latest details")
+            tui.toggle_entry(a, 1)
+            spec.assert_eq(a.scroll.has_top, 0, "following")
+            spec.assert_true(transcript.at(a.transcript, 1).open != 0, "opened")
+        }
+        spec.it("hover changes only between toggleable entries and summary clicks exclude details") callback {
+            r = rig_(8, 8)
+            a = r.a
+            transcript.start_run(a.transcript, "console.log('details')")
+            transcript.at(a.transcript, 0).files = "read x"
+            a.has_body = 1
+            a.body.top = viewport.Anchor { entry: 0, row: 0 }
+            a.body.window = screen.child(term.window(r.t), width: 8, height: 8)
+            motion = input.Mouse { col: 3, row: 0, button: input.BUTTON_NONE, mods: 0, kind: input.MOUSE_MOTION }
+            tui.handle_input(a, motion)
+            spec.assert_eq(a.hovered, 0, "hovered")
+            tui.handle_input(a, motion)
+            spec.assert_eq(a.hovered, 0, "still")
+            a.selection.dragged = 1
+            tui.handle_input(a, motion)
+            spec.assert_eq(a.hovered, -1, "dragging: none")
+            selection.clear(a.selection)
+            rows = entry.toggle_rows(transcript.at(a.transcript, 0), a.body.window)
+            tui.click_entry(a, 0, rows - 1)
+            spec.assert_true(transcript.at(a.transcript, 0).open != 0, "summary click opens")
+            tui.click_entry(a, 0, rows)
+            spec.assert_true(transcript.at(a.transcript, 0).open != 0, "details click does not close")
+            tui.handle_input(a, input.Mouse { col: 3, row: 7, button: input.BUTTON_NONE, mods: 0, kind: input.MOUSE_MOTION })
+            spec.assert_eq(a.hovered, -1, "below: none")
+        }
+        spec.it("hover uses neutral eighteen-level contrast and scheme fallback") callback {
+            spec.assert_eq(tui.hover_background(0, 0, 0), screen.color_rgb(18, 18, 18), "dark")
+            spec.assert_eq(tui.hover_background(255, 255, 255), screen.color_rgb(237, 237, 237), "light")
+            spec.assert_eq(tui.hover_fallback(1), tui.hover_background(0, 0, 0), "dark scheme")
+            spec.assert_eq(tui.hover_fallback(2), tui.hover_background(255, 255, 255), "light scheme")
+            spec.assert_eq(tui.hover_fallback(0), screen.DEFAULT, "unknown")
+        }
+        spec.it("Simple key variants and command toggle silently and persist") callback {
+            r = rig_(80, 24)
+            a = r.a
+            shifts = [0, input.SHIFT]
+            for i in 0..2 {
+                tui.on_key(a, input.key(115, mods: input.CTRL | shifts[i]))
+                spec.assert_eq((a.cfg as *types.Config).simple, if i == 0 { 1 } else { 0 }, "toggled")
+                spec.assert_eq(a.has_notice, 0, "silent")
+            }
+            tui.execute(a, commands.CMD_SIMPLE, "", "/simple")
+            spec.assert_eq((a.cfg as *types.Config).simple, 1, "command")
+            saved, _e = fs.read("${r.home}/config.toml")
+            spec.assert_contains(saved, "simple", "persisted")
+        }
+        spec.it("file paths are links only when open is configured; a click runs the command and reports a failed start") callback {
+            r = rig_(40, 8)
+            a = r.a
+            fs.write("${a.cwd}/nib-open-probe.txt", "x")
+            line = "see nib-open-probe.txt:12 and nope.zig now"
+            transcript.add(a.transcript, entry.KIND_ASSISTANT, line)
+            a.has_body = 1
+            a.body.top = viewport.Anchor { entry: 0, row: 0 }
+            a.body.window = screen.child(term.window(r.t), width: 40, height: 8)
+            screen.draw_segment(a.body.window, screen.seg(line), wrap: screen.WRAP_NONE)
+            launched = list.list_new()
+            a.launcher = |argv: ptr, ep: ptr| {
+                w, _g = list.get_string(argv, 0)
+                list.list_add(launched, string.copy(w))
+                return if w == "/nonexistent/open-tool" { "FileNotFound" } else { "" }
+            }
+            hover = input.Mouse { col: 6, row: 0, button: input.BUTTON_NONE, mods: 0, kind: input.MOUSE_MOTION }
+            tui.handle_input(a, hover)
+            spec.assert_eq(a.has_link, 0, "no link without open")
+            (a.cfg as *types.Config).open = "/usr/bin/env true {path}:{line}"
+            tui.handle_input(a, hover)
+            spec.assert_eq(a.has_link, 1, "link")
+            spec.assert_eq(a.link_x0, 4, "x0")
+            spec.assert_eq(a.link_x1, 24, "x1")
+            tui.handle_input(a, input.Mouse { col: 32, row: 0, button: input.BUTTON_NONE, mods: 0, kind: input.MOUSE_MOTION })
+            spec.assert_eq(a.has_link, 0, "missing file: no link")
+            tui.handle_input(a, input.Mouse { col: 0, row: 0, button: input.BUTTON_NONE, mods: 0, kind: input.MOUSE_MOTION })
+            spec.assert_eq(a.has_link, 0, "plain word: no link")
+            tui.handle_input(a, input.Mouse { col: 6, row: 0, button: input.BUTTON_LEFT, mods: 0, kind: input.MOUSE_PRESS })
+            tui.handle_input(a, input.Mouse { col: 6, row: 0, button: input.BUTTON_NONE, mods: 0, kind: input.MOUSE_RELEASE })
+            spec.assert_eq(a.has_notice, 0, "started")
+            spec.assert_eq(list.list_size(launched), 1, "launched once")
+            (a.cfg as *types.Config).open = "/nonexistent/open-tool {path}"
+            tui.handle_input(a, input.Mouse { col: 6, row: 0, button: input.BUTTON_LEFT, mods: 0, kind: input.MOUSE_PRESS })
+            tui.handle_input(a, input.Mouse { col: 6, row: 0, button: input.BUTTON_NONE, mods: 0, kind: input.MOUSE_RELEASE })
+            spec.assert_str_eq(a.notice, "Could not run open-tool", "failed start")
+            fs.delete("${a.cwd}/nib-open-probe.txt")
+        }
+    }
+
+    spec.describe(fw, "tui flows (in-process, scripted Session)") {
+        spec.it("streaming: Waiting for model, Thinking, Generating response, then the answer and a bill") callback {
+            r = rig_(80, 24)
+            type_(r, "hello")
+            key_(r, "enter")
+            spec.assert_eq(port.turn_count(r.s), 1, "a Turn started")
+            spec.assert_str_eq(port.turn_text(r.s, 0), "hello", "with the text")
+            driver.expect_row_contains(r.t, "Waiting for model")
+            driver.expect_row_contains(r.t, "hello")
+            emit_(r, "{\"model_activity\":{\"state\":\"started\",\"at\":0}}")
+            emit_(r, "{\"delta\":{\"kind\":\"reasoning\",\"text\":\"pondering\",\"step\":1}}")
+            tui.settle(r.a)
+            driver.expect_row_contains(r.t, "Thinking")
+            driver.expect_no_row_contains(r.t, "pondering")
+            emit_(r, "{\"delta\":{\"kind\":\"text\",\"text\":\"The answer \",\"step\":1}}")
+            emit_(r, "{\"delta\":{\"kind\":\"text\",\"text\":\"is 42.\",\"step\":1}}")
+            tui.settle(r.a)
+            driver.expect_row_contains(r.t, "Generating response")
+            driver.expect_row_contains(r.t, "The answer is 42.")
+            port.emit(r.s, "{\"turn_end\":{\"status\":\"completed\",\"steps\":1,\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":200},\"timing\":{\"wall_ms\":2000}}}")
+            port.emit(r.s, "{\"done\":{}}")
+            tui.settle(r.a)
+            driver.expect_no_row_contains(r.t, "Generating response")
+            driver.expect_row_contains(r.t, "1 step · 2s · 1.2k tokens")
+            spec.assert_eq(r.a.has_turn, 0, "Turn over")
+        }
+        spec.it("a Run block: running, then its result folded into a summary that a click opens") callback {
+            r = rig_(80, 24)
+            type_(r, "edit it")
+            key_(r, "enter")
+            emit_(r, "{\"step\":{\"n\":1,\"effort\":\"\"}}")
+            emit_(r, "{\"run_start\":\"await tools.read({path: 'a.txt'})\",\"step\":1}")
+            tui.settle(r.a)
+            driver.expect_row_contains(r.t, "Running")
+            emit_(r, "{\"run_end\":{\"ok\":true,\"output\":\"file contents\",\"changes\":[],\"tool_summary\":{\"counts\":[{\"name\":\"read\",\"count\":1}],\"omitted\":0,\"files\":[{\"tool\":\"read\",\"path\":\"a.txt\"}]}}}")
+            port.end_turn(r.s, 1)
+            tui.settle(r.a)
+            row = driver.find_row(r.t, "Run")
+            spec.assert_true(row >= 0, "Run summary shown")
+            driver.expect_no_row_contains(r.t, "file contents")
+            driver.click(r.t, 4, row)
+            tui.settle(r.a)
+            driver.expect_row_contains(r.t, "file contents")
+        }
+        spec.it("interjection: a message typed during a Turn is queued, then marked inserted") callback {
+            r = rig_(80, 24)
+            type_(r, "first")
+            key_(r, "enter")
+            type_(r, "also this")
+            key_(r, "enter")
+            spec.assert_eq(port.turn_count(r.s), 1, "no second Turn")
+            n = entries_(r)
+            last = transcript.at(r.a.transcript, n - 1)
+            spec.assert_str_eq(last.text, "also this", "shown")
+            spec.assert_eq_long(last.queued, 1 as long, "queued as id 1")
+            emit_(r, "{\"user_inserted\":1}")
+            spec.assert_eq_long(last.queued, -1 as long, "inserted")
+        }
+        spec.it("Esc cancels the running Turn: the cell is set, queued text returns to the input") callback {
+            r = rig_(80, 24)
+            type_(r, "long job")
+            key_(r, "enter")
+            type_(r, "follow-up")
+            key_(r, "enter")
+            key_(r, "escape")
+            spec.assert_true(port.canceled(r.s), "cancel cell set")
+            port.fail_turn(r.s, "canceled", "canceled")
+            tui.settle(r.a)
+            spec.assert_eq(r.a.has_turn, 0, "Turn over")
+            spec.assert_str_eq(text_(r), "follow-up", "returned to input")
+            driver.expect_row_contains(r.t, "1 queued message returned to input")
+        }
+        spec.it("the / menu lists commands, filters as you type, Enter runs /help") callback {
+            r = rig_(80, 24)
+            type_(r, "/")
+            driver.expect_row_contains(r.t, "/help")
+            type_(r, "he")
+            driver.expect_row_contains(r.t, "/help")
+            driver.expect_no_row_contains(r.t, "/compact")
+            key_(r, "enter")
+            tui.settle(r.a)
+            spec.assert_str_eq(text_(r), "", "sent")
+            driver.expect_row_contains(r.t, "Enter send")
+        }
+        spec.it("undo: /undo shows the Session's reply; refused while a Turn runs") callback {
+            r = rig_(80, 24)
+            r.s.undo_reply = "{\"text\":\"Restored 1 file.\"}"
+            type_(r, "/undo")
+            key_(r, "enter")
+            tui.settle(r.a)
+            driver.expect_row_contains(r.t, "Restored 1 file.")
+            type_(r, "go")
+            key_(r, "enter")
+            tui.execute(r.a, commands.CMD_UNDO, "", "/undo")
+            tui.render(r.a)
+            driver.expect_row_contains(r.t, "Turn running · retry command when it ends")
+        }
+        spec.it("simple mode: Ctrl+S hides bills and the footer model, and comes back") callback {
+            r = rig_(80, 24)
+            transcript.add(r.a.transcript, entry.KIND_USER, "Check")
+            transcript.add(r.a.transcript, entry.KIND_ASSISTANT, "Done.")
+            transcript.add(r.a.transcript, entry.KIND_BILL, "1 Run · 2 steps · 41s · 6.6k tokens")
+            tui.render(r.a)
+            driver.expect_row_contains(r.t, "6.6k tokens")
+            driver.expect_row_contains(r.t, "mock")
+            key_(r, "ctrl+s")
+            driver.expect_no_row_contains(r.t, "6.6k tokens")
+            driver.expect_no_row_contains(r.t, "╰─ mock")
+            key_(r, "ctrl+s")
+            driver.expect_row_contains(r.t, "6.6k tokens")
+        }
+        spec.it("mouse selection: a drag over the transcript copies the text through OSC 52") callback {
+            r = rig_(40, 12)
+            transcript.add(r.a.transcript, entry.KIND_ASSISTANT, "copy this line")
+            tui.render(r.a)
+            row = driver.find_row(r.t, "copy this line")
+            spec.assert_true(row >= 0, "shown")
+            driver.mouse(r.t, input.BUTTON_LEFT, 1, row, input.MOUSE_PRESS)
+            driver.mouse(r.t, input.BUTTON_LEFT, 14, row, input.MOUSE_DRAG)
+            driver.mouse(r.t, input.BUTTON_LEFT, 14, row, input.MOUSE_RELEASE)
+            tui.step(r.a)
+            driver.expect_clipboard(r.t, "copy this line")
+            driver.expect_row_contains(r.t, "copied 14 chars")
+        }
+        spec.it("resize: the frame is redrawn at the new size with the input box at the bottom") callback {
+            r = rig_(80, 24)
+            transcript.add(r.a.transcript, entry.KIND_ASSISTANT, "Answer")
+            tui.render(r.a)
+            driver.resize(r.t, 60, 16)
+            tui.step(r.a)
+            tui.render(r.a)
+            spec.assert_eq(term.cols(r.t), 60, "cols")
+            spec.assert_eq(term.rows(r.t), 16, "rows")
+            driver.expect_cell(r.t, 0, 15, "╰")
+            driver.expect_cell(r.t, 59, 15, "╯")
+            driver.expect_cursor(r.t, 2, 14)
+        }
+        spec.it("upstream snapshot: the app's first frame on 80x12 is layout_snapshots.txt's \"normal\"") callback {
+            r = rig_(80, 12)
+            transcript.add(r.a.transcript, entry.KIND_ASSISTANT, "Answer")
+            tui.render(r.a)
+            text, _e = fs.read("src/tui/layout_snapshots.txt")
+            start = string.index_of(text, "--- normal 80x12 ---\n") + 21
+            end = string.index_of(text, "--- standard")
+            driver.expect_screen(r.t, string.substring(text, start, end))
+        }
+        spec.it("closed queues refuse events") callback {
+            q = app_queue.new()
+            app_queue.close(q)
+            spec.assert_false(app_queue.post(q, "{\"tick\":{}}"), "refused")
+            spec.assert_eq(app_queue.len(q), 0, "empty")
+        }
+    }
+}

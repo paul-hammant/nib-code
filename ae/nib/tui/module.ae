@@ -1,0 +1,2175 @@
+// tui: nib's terminal UI, the app (upstream src/tui.zig, with the App-taking
+// parts of src/tui/commands.zig (execute, select, modelSelection),
+// providers.zig and reflect.zig (saveReflection, issueRepo, fileIssues,
+// stopReflecting)).
+//
+// The app takes its terminal (term: a real tty or an in-memory one), its
+// Session (a nib.tui.port.Port: the real Session through nib.tui.live, or a
+// scripted one in specs) and its clock (nib.tui.clock) as explicit
+// instances, plus the environment (nib.config.env) it reads NIB_* from.
+// Nothing is module-level state. Specs drive it in-process: push keys and
+// mouse events into an in-memory terminal, post Session events through the
+// scripted port, call `step`, and read the screen the last render showed.
+//
+// Differences from upstream: terminal input comes from term.poll and app
+// events from the app's own queue (nib.tui.app_queue) as JSON text; the
+// ticker thread is the poll timeout (an empty poll while busy is a tick);
+// events are handled one at a time with the same frame pacing (frames.due).
+// Images (src/image.zig) are not ported: Ctrl+V, an empty paste and pasted
+// image paths say images are not available yet (marked stand-in). Skills,
+// MCP and hooks have their commands with the data source stubbed (marked).
+
+import std.string
+import std.strbuilder
+import std.list
+import std.json
+import std.os
+import std.sync
+import std.fs
+import term
+import term.screen
+import term.input
+import nib.jsonx
+import nib.provider.types
+import nib.config
+import nib.config.env
+import nib.auth
+import nib.auth.models
+import nib.tools.changes
+import nib.tools.diff
+import nib.session.tool_summary
+import nib.tui.app_queue
+import nib.tui.port
+import nib.tui.clock
+import nib.tui.turn
+import nib.tui.frames
+import nib.tui.format
+import nib.tui.mode
+import nib.tui.bill
+import nib.tui.turn_summary
+import nib.tui.entry
+import nib.tui.transcript
+import nib.tui.turn_changes
+import nib.tui.agent_tree
+import nib.tui.editor
+import nib.tui.viewport
+import nib.tui.sel_history
+import nib.tui.selection
+import nib.tui.status
+import nib.tui.commands
+import nib.tui.menu
+import nib.tui.paths
+import nib.tui.tui_view
+import nib.tui.title
+import nib.tui.open
+import nib.tui.tasks
+import nib.tui.prediction
+import nib.tui.provider_flow
+import nib.tui.reflect
+import nib.tui.long_text
+
+exports(App, new, free, start, run, step, settle, handle_input, handle_app, on_key, submit, render,
+        report, toggle_simple, toggle_entry, click_entry, append_bill, finish_queued, execute,
+        refresh_credentials, credentialed, user_background, code_background, hover_background,
+        hover_fallback, is_newline, flushes_visible, refresh_of, post, busy, quit_requested,
+        ADD_VALUE, ADD_LABEL, service_choices, open_provider_menu, provider_command, provider_key,
+        provider_result, select_model)
+
+const ADD_VALUE = "+"
+const ADD_LABEL = "Add endpoint…"
+const OPEN_BUF_LEN = 1536
+
+struct App {
+    t: *term.Terminal
+    p: *port.Port
+    clk: *clock.Clock
+    envp: ptr
+    q: *app_queue.Queue
+    cfg: ptr                       // *types.Config, the Session's
+    home: string
+    selection: *selection.Selection
+    body: sel_history.Frame
+    has_body: int
+    user_bg: int
+    code_bg: int
+    hover_bg: int
+    has_terminal_bg: int
+    terminal_bg_r: int
+    terminal_bg_g: int
+    terminal_bg_b: int
+    hovered: int                   // -1: none
+    has_link: int
+    link_row: int
+    link_x0: int
+    link_x1: int
+    files: *open.Files
+    files_revision: long
+    project: string                // "": not known yet
+    work_dir: string
+    title_loaded: int
+    title_project: string
+    title_branch: string
+    notice: string
+    has_notice: int
+    quit_armed: int
+    reflecting: string
+    has_reflecting: int
+    issues: ptr
+    transcript: *transcript.Transcript
+    input: *editor.Editor
+    pasting: int
+    paste_buf: string
+    live_steps: int
+    background_count: int
+    step_effort: string
+    has_step_effort: int
+    scroll: *viewport.Viewport
+    menu: *menu.Menu
+    activity: status.Activity
+    usage: turn_summary.Usage
+    steps: int
+    context: long
+    turn: *turn.Turn
+    has_turn: int
+    pending_bill: turn_summary.TurnSummary
+    has_pending_bill: int
+    last_summary: turn_summary.TurnSummary
+    has_last_summary: int
+    turn_runs: int
+    flow: *provider_flow.Flow
+    prediction: *prediction.State
+    signed_out: int
+    prompt_view: *editor.Editor
+    retry_detail: string
+    frames: *frames.Frames
+    quit: int
+    // replaceable for specs: launching `open`, the local clipboard copier,
+    // the gh runner, the model lister
+    launcher: fn                   // |argv: ptr (std.list), envp: ptr| -> string error
+    local_copy: fn                 // |text: string|
+    gh: fn                         // reflect.gh_run's shape
+    list_models: fn                // provider_flow Launch.list_models
+    cwd: string
+}
+
+// ---------------------------------------------------------------- colours
+
+luma_light_(r: int, g: int, b: int) -> bool { return r * 299 + g * 587 + b * 114 > 128000 }
+
+sat_sub_(a: int, b: int) -> int { return if a - b < 0 { 0 } else { a - b } }
+sat_add_(a: int, b: int) -> int { return if a + b > 255 { 255 } else { a + b } }
+
+hover_background(r: int, g: int, b: int) -> int {
+    if luma_light_(r, g, b) {
+        return screen.color_rgb(sat_sub_(r, 18), sat_sub_(g, 18), sat_sub_(b, 18))
+    }
+    return screen.color_rgb(sat_add_(r, 18), sat_add_(g, 18), sat_add_(b, 18))
+}
+
+// scheme: 0 unknown (null), 1 dark, 2 light.
+hover_fallback(scheme: int) -> int {
+    if scheme == 2 { return screen.color_rgb(237, 237, 237) }
+    if scheme == 1 { return screen.color_rgb(18, 18, 18) }
+    return screen.DEFAULT
+}
+
+code_background(r: int, g: int, b: int) -> int {
+    if luma_light_(r, g, b) {
+        return screen.color_rgb(sat_sub_(r, 10), sat_sub_(g, 10), sat_sub_(b, 10))
+    }
+    return screen.color_rgb(sat_add_(r, 10), sat_add_(g, 10), sat_add_(b, 10))
+}
+
+user_background(r: int, g: int, b: int) -> int {
+    light = luma_light_(r, g, b)
+    tr = if light { 40 } else { 120 }
+    tg = if light { 80 } else { 160 }
+    tb = if light { 150 } else { 230 }
+    return screen.color_rgb((r * 7 + tr) / 8, (g * 7 + tg) / 8, (b * 7 + tb) / 8)
+}
+
+// ---------------------------------------------------------------- events
+
+// The kind of an app event: its first JSON member's name.
+kind_of_(json: string) -> string {
+    if string.length(json) < 3 || json[0] != 123 || json[1] != 34 {
+        return ""
+    }
+    end = string.index_of_from(json, "\"", 2)
+    if end < 0 {
+        return ""
+    }
+    return string.substring(json, 2, end)
+}
+
+// Event.flushesVisible: false for stream content and ticks.
+flushes_visible(kind: string) -> bool {
+    match kind {
+        "delta" -> { return false }
+        "tick" -> { return false }
+        "model_activity" -> { return false }
+        "usage" -> { return false }
+        "progress" -> { return false }
+        "tool_activity" -> { return false }
+        _ -> { return true }
+    }
+}
+
+// Event.refresh. Terminal input is "key", "paste_end", "mouse", "winsize",
+// "color_report", "color_scheme".
+refresh_of(kind: string) -> int {
+    match kind {
+        "tick" -> { return frames.REFRESH_ANIMATION }
+        "key" -> { return frames.REFRESH_IMMEDIATE }
+        "paste_end" -> { return frames.REFRESH_IMMEDIATE }
+        "mouse" -> { return frames.REFRESH_IMMEDIATE }
+        "winsize" -> { return frames.REFRESH_IMMEDIATE }
+        "color_report" -> { return frames.REFRESH_IMMEDIATE }
+        "color_scheme" -> { return frames.REFRESH_IMMEDIATE }
+        "done" -> { return frames.REFRESH_IMMEDIATE }
+        "failed" -> { return frames.REFRESH_IMMEDIATE }
+        "issues_done" -> { return frames.REFRESH_IMMEDIATE }
+        "flow" -> { return frames.REFRESH_IMMEDIATE }
+        "prediction" -> { return frames.REFRESH_IMMEDIATE }
+        _ -> { return frames.REFRESH_CONTENT }
+    }
+}
+
+input_kind_(e: input.Event) -> string {
+    return match e {
+        Key -> "key"
+        Mouse -> "mouse"
+        Winsize -> "winsize"
+        PasteStart -> "paste_start"
+        PasteEnd -> "paste_end"
+        Paste -> "paste"
+        FocusIn -> "focus"
+        FocusOut -> "focus"
+        ColorReport -> "color_report"
+        ColorScheme -> "color_scheme"
+        Capability -> "capability"
+        NoEvent -> ""
+    }
+}
+
+// Posts an app event (as the Session's Turn, the index and the jobs do).
+post(a: *App, json: string) -> bool { return app_queue.post(a.q, json) }
+
+// ---------------------------------------------------------------- lifecycle
+
+// An app over a terminal, a Session port and a clock. `envp` is the
+// environment (nib.config.env). `cwd` is the working directory ("" reads it).
+new(t: @keep ptr, p: @keep ptr, clk: @keep ptr, envp: @keep ptr) -> *App {
+    a = heap.new(App)
+    a.t = t as *term.Terminal
+    a.p = p as *port.Port
+    a.clk = clk as *clock.Clock
+    a.envp = envp
+    a.q = app_queue.new()
+    pp = a.p
+    ptr cfg0 = call(pp.cfg, pp.ctx)
+    a.cfg = cfg0
+    string home0 = call(pp.home, pp.ctx)
+    a.home = home0
+    a.selection = selection.new()
+    a.hovered = -1
+    a.files = open.files_new()
+    a.transcript = transcript.new()
+    a.input = editor.new()
+    a.paste_buf = ""
+    a.step_effort = ""
+    a.scroll = viewport.new()
+    a.menu = menu.new()
+    a.activity = status.activity_start(clock.now(a.clk), status.PHASE_THINKING)
+    a.usage = turn_summary.usage()
+    a.pending_bill = turn_summary.new()
+    a.last_summary = turn_summary.new()
+    a.flow = provider_flow.flow_new()
+    a.prediction = prediction.new()
+    a.prompt_view = editor.new(placeholder: "")
+    a.retry_detail = ""
+    a.frames = frames.new()
+    a.notice = ""
+    a.reflecting = ""
+    a.project = ""
+    a.work_dir = ""
+    a.title_project = ""
+    a.title_branch = ""
+    a.user_bg = screen.DEFAULT
+    a.code_bg = screen.DEFAULT
+    a.hover_bg = screen.DEFAULT
+    a.cwd = os.getcwd()
+    a.launcher = |argv: ptr, ep: ptr| {
+        string err = open.launch(argv, ep)
+        return err
+    }
+    a.local_copy = |text: string| { }
+    a.gh = |argv: ptr, input_text: string, out: ptr| {
+        int code = reflect.gh_run(argv, input_text, out)
+        return code
+    }
+    a.list_models = |base: string, protocol: string, key: string, out: ptr| {
+        lst, err = models.fetch(base, protocol, key)
+        if err != "" {
+            return 0
+        }
+        for i in 0..list.list_size(lst) {
+            list.list_add(out, list.list_get_raw(lst, i))
+        }
+        return 1
+    }
+    a.menu.reflect_enabled = if issue_repo_(a) != "" { 1 } else { 0 }
+    a.context = stats_context_(a)
+    ix = paths.new(".", |c: ptr| { return 0 as long })
+    clk2 = a.clk
+    ix.now = || {
+        long ms = clock.now(clk2)
+        return ms
+    }
+    qq = a.q
+    paths.set_wake(ix, || {
+        app_queue.post(qq, "{\"paths_ready\":{}}")
+    })
+    menu.set_index(a.menu, ix as ptr)
+    refresh_credentials(a)
+    return a
+}
+
+stats_context_(a: *App) -> long {
+    string js = call(a.p.stats, a.p.ctx)
+    v = jsonx.parse(js)
+    n = jsonx.long_or(v, "context", 0 as long)
+    jsonx.free(v)
+    return n
+}
+
+// Shows the Session's history first (a resumed Session) and remembers its
+// user messages in the input history.
+start(a: *App) {
+    ptr h = call(a.p.history, a.p.ctx)
+    transcript.add_history(a.transcript, h)
+    n = list.list_size(h)
+    for i in 0..n {
+        text, _g = list.get_string(h, i)
+        v = jsonx.parse(text)
+        if jsonx.str_or(v, "role", "") == "user" && jsonx.str_or(v, "source", "") != "undo" {
+            editor.remember(a.input, string.copy(jsonx.str_or(v, "content", "")))
+        }
+        jsonx.free(v)
+    }
+}
+
+free(a: *App) {
+    // Close before joining producers: a full queue must not block shutdown.
+    app_queue.close(a.q)
+    if a.has_turn != 0 {
+        turn.cancel(a.turn)
+        call(a.p.finish_turn, a.p.ctx)
+    }
+    prediction.invalidate(a.prediction)
+    open.files_free(a.files)
+    menu.free(a.menu)
+}
+
+quit_requested(a: *App) -> bool { return a.quit != 0 }
+
+busy(a: *App) -> bool {
+    int pending = call(a.p.any_pending, a.p.ctx)
+    return a.frames.pending != 0 || transcript.has_backlog(a.transcript) || a.has_turn != 0 || pending != 0
+}
+
+// One loop iteration (upstream run's body): the next terminal event, waiting
+// up to `timeout_ms`, else the next app event; handled, then painted when the
+// frame is due. With `ticks`, a wait that ends with nothing while busy is a
+// tick (upstream's Ticker). 1: handled one, 0: nothing to do, -1: quit.
+step_once_(a: *App, timeout_ms: int, ticks: bool) -> int {
+    e = term.poll(a.t, 0)
+    kind = input_kind_(e)
+    ev = ""
+    data = null
+    from_queue = false
+    if kind == "" {
+        it, ok = app_queue.take(a.q)
+        if ok {
+            ev = it.json
+            data = it.data
+            kind = kind_of_(ev)
+            from_queue = true
+        } else {
+            if timeout_ms > 0 {
+                e = term.poll(a.t, timeout_ms)
+                kind = input_kind_(e)
+            }
+            if kind == "" {
+                if !ticks || !busy(a) {
+                    return 0
+                }
+                kind = "tick"
+                ev = "{\"tick\":{}}"
+                from_queue = true
+            }
+        }
+    }
+    if kind == "capability" || kind == "paste" || kind == "focus" {
+        return 1
+    }
+    refresh = refresh_of(kind)
+    old_hover = a.hovered
+    old_link = link_key_(a)
+    motion = false
+    if !from_queue {
+        motion = match e {
+            Mouse -> e.kind == input.MOUSE_MOTION && a.selection.active == 0
+            _ -> false
+        }
+    }
+    if !motion && flushes_visible(kind) {
+        transcript.flush_visible(a.transcript)
+    }
+    keep = if from_queue { handle_app(a, ev, data) } else { handle_input(a, e) }
+    if !keep {
+        a.quit = 1
+        return -1
+    }
+    if motion && old_hover == a.hovered && old_link == link_key_(a) {
+        return 1
+    }
+    now = clock.now(a.clk)
+    r = if refresh != frames.REFRESH_IMMEDIATE && transcript.has_backlog(a.transcript) { frames.REFRESH_CONTENT } else { refresh }
+    if frames.due(a.frames, now, r) != 0 {
+        transcript.advance_visible(a.transcript, now)
+        render(a)
+        frames.painted(a.frames, now)
+    }
+    return 1
+}
+
+link_key_(a: *App) -> string {
+    if a.has_link == 0 {
+        return ""
+    }
+    return "${a.link_row}:${a.link_x0}:${a.link_x1}"
+}
+
+// Handles everything pending now (terminal input and app events) without
+// waiting or ticking. Specs call it after pushing input or posting events.
+// False once the app quit.
+step(a: *App) -> bool {
+    for guard in 0..100000 {
+        r = step_once_(a, 0, false)
+        if r < 0 {
+            return false
+        }
+        if r == 0 {
+            return true
+        }
+    }
+    return a.quit == 0
+}
+
+// Lets paced frames and the smoothed stream catch up: ticks at the frame
+// interval (moving an in-memory terminal's clock) until nothing waits to be
+// painted. Specs call it to see the settled screen.
+settle(a: *App) {
+    step(a)
+    for i in 0..400 {
+        if !(a.frames.pending != 0 || transcript.has_backlog(a.transcript)) {
+            break
+        }
+        if term.is_memory(a.t) {
+            term.advance(a.t, frames.INTERVAL_MS)
+        }
+        tick_(a)
+        step(a)
+    }
+}
+
+tick_(a: *App) {
+    if a.quit != 0 {
+        return
+    }
+    handle_app(a, "{\"tick\":{}}", null)
+    now = clock.now(a.clk)
+    if frames.due(a.frames, now, frames.REFRESH_ANIMATION) != 0 {
+        transcript.advance_visible(a.transcript, now)
+        render(a)
+        frames.painted(a.frames, now)
+    }
+}
+
+// The loop on a real terminal until the user quits.
+run(a: *App) {
+    start(a)
+    render(a)
+    while true {
+        timeout = if busy(a) { frames.INTERVAL_MS } else { 100 }
+        if step_once_(a, timeout, true) < 0 {
+            return
+        }
+    }
+}
+
+// ---------------------------------------------------------------- credentials
+
+refresh_credentials(a: *App) {
+    a.signed_out = if config.credentialed(a.cfg) == 1 { 0 } else { 1 }
+}
+
+credentialed(a: *App) -> bool {
+    refresh_credentials(a)
+    return a.signed_out == 0
+}
+
+report(a: *App, kind: int, text: string) {
+    transcript.add(a.transcript, kind, text)
+}
+
+set_notice_(a: *App, text: string) {
+    a.notice = text
+    a.has_notice = 1
+}
+
+clear_notice_(a: *App) {
+    a.notice = ""
+    a.has_notice = 0
+}
+
+env_get_(a: *App, name: string) -> string {
+    if a.envp == null {
+        return ""
+    }
+    return env.get(a.envp, name)
+}
+
+issue_repo_(a: *App) -> string {
+    repo = env_get_(a, "NIB_ISSUE_REPO")
+    if repo == "" {
+        return ""
+    }
+    return reflect.repository(repo)
+}
+
+// ---------------------------------------------------------------- terminal input
+
+// False to quit.
+handle_input(a: *App, e: input.Event) -> bool {
+    match e {
+        Key -> {
+            a.hovered = -1
+            a.has_link = 0
+            return on_key(a, e)
+        }
+        PasteStart -> {
+            a.pasting = 1
+            a.paste_buf = ""
+        }
+        PasteEnd -> {
+            a.pasting = 0
+            if provider_flow.flow_takes_text(a.flow) != 0 {
+                provider_pasted(a, a.paste_buf)
+            } else if string.length(string.trim(a.paste_buf)) == 0 {
+                attach_clipboard_image_(a)
+            } else {
+                if !attach_pasted_file_(a, a.paste_buf) {
+                    editor.paste(a.input, a.paste_buf)
+                }
+                menu.input_changed(a.menu, editor.text(a.input))
+                a.menu.closed = 1
+            }
+            a.paste_buf = ""
+        }
+        Mouse -> { on_mouse_(a, e) }
+        ColorReport -> {
+            if e.kind == input.REPORT_BG {
+                a.has_terminal_bg = 1
+                a.terminal_bg_r = e.r
+                a.terminal_bg_g = e.g
+                a.terminal_bg_b = e.b
+                a.user_bg = user_background(e.r, e.g, e.b)
+                a.code_bg = code_background(e.r, e.g, e.b)
+                a.hover_bg = hover_background(e.r, e.g, e.b)
+            }
+        }
+        ColorScheme -> {
+            a.hover_bg = if a.has_terminal_bg != 0 { hover_background(a.terminal_bg_r, a.terminal_bg_g, a.terminal_bg_b) } else { hover_fallback(if e.dark { 1 } else { 2 }) }
+            term.query_color(a.t, input.REPORT_BG)
+        }
+        Winsize -> {
+            selection.clear(a.selection)
+            term.resize(a.t, e.cols, e.rows)
+        }
+        _ -> {}
+    }
+    return true
+}
+
+on_mouse_(a: *App, m: input.Mouse) {
+    if m.kind == input.MOUSE_MOTION && a.selection.active == 0 {
+        a.hovered = -1
+        a.has_link = 0
+        if a.selection.dragged != 0 {
+            return
+        }
+        if a.has_body != 0 {
+            w = a.body.window
+            if m.col >= w.x_off && m.col < w.x_off + w.width && m.row >= 0 && m.row < w.height {
+                pos, ok = sel_history.position(a.body, a.transcript.entries, m.col, m.row)
+                if ok {
+                    en = transcript.at(a.transcript, pos.entry)
+                    if pos.row < entry.toggle_rows(en, w) {
+                        a.hovered = pos.entry
+                    }
+                    hit, hok = hit_at_(a, pos.entry, pos.row, m.col, m.row)
+                    if hok {
+                        a.has_link = 1
+                        a.link_row = m.row
+                        a.link_x0 = hit.found.x0
+                        a.link_x1 = hit.found.x1
+                    }
+                }
+            }
+        }
+        return
+    }
+    a.hovered = -1
+    a.has_link = 0
+    if m.kind == input.MOUSE_PRESS {
+        clear_notice_(a)
+        a.quit_armed = 0
+    }
+    surf = term.surface(a.t)
+    if m.button == input.WHEEL_UP || m.button == input.WHEEL_DOWN {
+        if m.kind == input.MOUSE_PRESS {
+            if a.selection.active == 0 || a.selection.has_history == 0 {
+                selection.clear(a.selection)
+            }
+            a.scroll.pending = a.scroll.pending + (if m.button == input.WHEEL_UP { -3 as long } else { 3 as long })
+        }
+    } else if selection.mouse_in_history(a.selection, m, surf, a.body, a.has_body != 0, a.transcript.entries) {
+        text = selection.text_in_history(a.selection, surf, a.body, a.has_body != 0, a.transcript.entries)
+        if string.length(trim_space_nl_(text)) == 0 {
+            selection.clear(a.selection)
+        } else {
+            selection.copy(a.t, text, a.local_copy)
+            set_notice_(a, "copied ${long_text.chars(text)} chars")
+        }
+    }
+    click, cok = selection.take_click(a.selection)
+    if cok {
+        if !open_click_(a, click.entry, click.row, m) {
+            click_entry(a, click.entry, click.row)
+        }
+    }
+    if a.selection.active != 0 && a.selection.has_history != 0 && a.has_body != 0 {
+        a.scroll.has_top = 1
+        a.scroll.top_entry = a.body.top.entry
+        a.scroll.top_row = a.body.top.row
+    }
+}
+
+trim_space_nl_(s: string) -> string {
+    n = string.length(s)
+    i = 0
+    while i < n && (s[i] == 32 || s[i] == 10) { i = i + 1 }
+    j = n
+    while j > i && (s[j - 1] == 32 || s[j - 1] == 10) { j = j - 1 }
+    return string.substring(s, i, j)
+}
+
+page_(a: *App) -> long {
+    h = term.rows(a.t) / 2
+    return (if h > 1 { h } else { 1 }) as long
+}
+
+is_newline(k: input.Key, pasting: bool) -> bool {
+    return (pasting && input.matches(k, input.ENTER, 0)) || input.matches(k, input.ENTER, input.SHIFT) || input.matches(k, input.ENTER, input.ALT) || input.matches(k, 106, input.CTRL)
+}
+
+on_key(a: *App, k: input.Key) -> bool {
+    clear_notice_(a)
+    selection.clear(a.selection)
+    if a.pasting != 0 {
+        if string.length(k.text) > 0 {
+            a.paste_buf = "${a.paste_buf}${k.text}"
+        } else if is_newline(k, true) {
+            a.paste_buf = "${a.paste_buf}\n"
+        } else if input.matches(k, input.TAB, 0) {
+            a.paste_buf = "${a.paste_buf}\t"
+        }
+        return true
+    }
+    ed = a.input
+    armed = a.quit_armed != 0
+    a.quit_armed = 0
+    if input.matches(k, mode.KEY, input.CTRL) || input.matches(k, mode.KEY, input.CTRL | input.SHIFT) {
+        toggle_simple(a)
+        return true
+    }
+    if input.matches(k, 99, input.CTRL) {
+        if armed {
+            return false
+        }
+        a.quit_armed = 1
+        set_notice_(a, "press ctrl+c again to quit")
+        return true
+    }
+    if input.matches(k, 100, input.CTRL) && string.length(editor.text(ed)) == 0 {
+        return false
+    }
+    if provider_flow.flow_active(a.flow) != 0 || menu.is_pinned(a.menu) {
+        provider_key(a, k)
+        return true
+    }
+    menu.sync(a.menu, ed)
+    sel, has_sel = menu.selected(a.menu, editor.text(ed))
+    before = editor.text(ed)
+    submitted = ""
+    has_submitted = false
+
+    if !has_sel && input.matches(k, input.TAB, 0) && a.has_turn == 0 && prediction.accept(a.prediction, ed) != 0 {
+        // Accepted into the editor; Enter sends it.
+    } else if has_sel && input.matches(k, input.ESCAPE, 0) {
+        a.menu.closed = 1
+    } else if has_sel && input.matches(k, input.UP, 0) {
+        menu.move(a.menu, editor.text(ed), false)
+    } else if has_sel && input.matches(k, input.DOWN, 0) {
+        menu.move(a.menu, editor.text(ed), true)
+    } else if has_sel && sel.is_path != 0 && (input.matches(k, input.TAB, 0) || input.matches(k, input.ENTER, 0)) {
+        start, _q = editor.file_mention(ed)
+        if start < 0 {
+            start, _q2 = editor.skill_mention(ed)
+        }
+        if start >= 0 {
+            editor.complete_mention(ed, start, sel.value)
+        }
+    } else if has_sel && (input.matches(k, input.TAB, 0) || (input.matches(k, input.ENTER, 0) && a.pasting == 0 && !commands.candidate_runs(sel))) {
+        editor.replace(ed, commands.candidate_completion(sel))
+    } else if has_sel && input.matches(k, input.ENTER, 0) && a.pasting == 0 {
+        line = commands.candidate_line(sel)
+        editor.replace(ed, line)
+        if a.has_turn == 0 || commands.allowed_while_busy(line) {
+            submitted = editor.take(ed)
+            has_submitted = true
+        } else {
+            set_notice_(a, "Turn running · retry command when it ends")
+        }
+    } else if input.matches(k, input.ESCAPE, 0) {
+        if a.has_turn != 0 {
+            turn.cancel(a.turn)
+        }
+    } else if input.matches(k, input.PAGE_UP, 0) {
+        a.scroll.pending = a.scroll.pending - page_(a)
+    } else if input.matches(k, input.PAGE_DOWN, 0) {
+        a.scroll.pending = if a.scroll.has_top != 0 { 2147483647 as long } else { page_(a) }
+    } else if input.matches(k, 111, input.CTRL) {
+        i = transcript.latest_details(a.transcript)
+        if i >= 0 {
+            toggle_entry(a, i)
+        }
+    } else if input.matches(k, 118, input.CTRL) {
+        attach_clipboard_image_(a)
+    } else if input.matches(k, input.UP, input.SHIFT) {
+        a.scroll.pending = a.scroll.pending - 3
+    } else if input.matches(k, input.DOWN, input.SHIFT) {
+        a.scroll.pending = a.scroll.pending + 3
+    } else if is_newline(k, a.pasting != 0) {
+        editor.insert(ed, "\n")
+    } else if input.matches(k, input.ENTER, 0) {
+        text = editor.text(ed)
+        parsed = commands.parse(text)
+        is_command = parsed.kind != commands.PARSE_NONE
+        if string.length(text) > 0 && !is_command && !credentialed(a) {
+            open_provider_menu(a)
+        } else if editor.image_count(ed) > 0 && types.vision(a.cfg) == 0 {
+            set_notice_(a, "${(a.cfg as *types.Config).model} has no image input · remove the [Image] blocks")
+        } else if editor.image_count(ed) > 0 && a.has_turn != 0 {
+            set_notice_(a, "Turn running · images send with the next message")
+        } else if a.has_turn == 0 || !is_command || commands.allowed_while_busy(text) {
+            submitted = editor.take(ed)
+            has_submitted = true
+        } else {
+            set_notice_(a, "Turn running · retry command when it ends")
+        }
+    } else {
+        editor.key(ed, k)
+    }
+    if editor.text(ed) != before {
+        menu.input_changed(a.menu, editor.text(ed))
+    }
+    if has_submitted {
+        submit(a, submitted)
+    }
+    return true
+}
+
+// Images (src/image.zig) are not ported: a marked stand-in.
+attach_clipboard_image_(a: *App) {
+    if types.vision(a.cfg) == 0 {
+        set_notice_(a, "${(a.cfg as *types.Config).model} has no image input")
+        return
+    }
+    set_notice_(a, "No image in clipboard")
+}
+
+attach_pasted_file_(a: *App, pasted: string) -> bool {
+    return false
+}
+
+// ---------------------------------------------------------------- submitting
+
+submit(a: *App, line: string) {
+    a.scroll = viewport.new()
+    menu.forget_sessions(a.menu)
+    if string.length(line) == 0 {
+        return
+    }
+    parsed = commands.parse(line)
+    if parsed.kind == commands.PARSE_UNKNOWN {
+        report(a, entry.KIND_ERR, "unknown command /${parsed.unknown_name} · /help lists commands")
+        return
+    }
+    if parsed.kind == commands.PARSE_KNOWN {
+        execute(a, parsed.command, parsed.arg, line)
+        return
+    }
+    if !credentialed(a) {
+        transcript.add(a.transcript, entry.KIND_ERR, "No provider · /provider to sign in")
+        return
+    }
+    if a.has_turn != 0 {
+        string id = call(a.p.enqueue, a.p.ctx, line)
+        transcript.add(a.transcript, entry.KIND_USER, line)
+        last = transcript.at(a.transcript, transcript.count(a.transcript) - 1)
+        n, _e = string.to_long(id)
+        last.queued = n
+        return
+    }
+    start_turn_(a, line, 0)
+}
+
+start_turn_(a: *App, text: string, compact: int) {
+    drop_prediction_(a)
+    if compact == 0 {
+        transcript.add(a.transcript, entry.KIND_USER, text)
+    }
+    begin_turn_(a, text, compact, if compact != 0 { status.PHASE_COMPACTING } else { status.PHASE_THINKING })
+}
+
+begin_turn_(a: *App, text: string, compact: int, phase: int) {
+    a.turn = turn.new(text, compact, a.q as ptr)
+    a.has_turn = 1
+    a.live_steps = 0
+    a.turn_runs = 0
+    a.activity = status.activity_start(clock.now(a.clk), phase)
+    call(a.p.start_turn, a.p.ctx, text, compact, a.q as ptr, a.turn.cancel)
+}
+
+drop_prediction_(a: *App) { prediction.invalidate(a.prediction) }
+
+predict_next_(a: *App) {
+    if a.has_turn != 0 || provider_flow.flow_active(a.flow) != 0 || menu.is_pinned(a.menu) || !credentialed(a) {
+        return
+    }
+    ptr h = call(a.p.history, a.p.ctx)
+    reply_text = ""
+    i = list.list_size(h)
+    while i > 0 {
+        text, _g = list.get_string(h, i - 1)
+        v = jsonx.parse(text)
+        content = jsonx.str_or(v, "content", "")
+        role = jsonx.str_or(v, "role", "")
+        if string.length(content) != 0 && role == "assistant" {
+            reply_text = string.copy(content)
+            jsonx.free(v)
+            break
+        }
+        jsonx.free(v)
+        i = i - 1
+    }
+    recent = prediction.recent_user_messages(h)
+    if list.list_size(recent) == 0 || reply_text == "" {
+        return
+    }
+    pp = a.p
+    qq = a.q
+    prediction.start(a.prediction, |instruction: string, input_text: string, cancel: ptr| {
+        string r = call(pp.predict, pp.ctx, instruction, input_text, cancel)
+        return r
+    }, |generation: long, text: string| {
+        app_queue.post(qq, "{\"prediction\":{\"generation\":${generation},\"text\":${jsonx.quote(text)}}}")
+    }, recent, reply_text, prediction.TIMEOUT_MS)
+}
+
+// ---------------------------------------------------------------- app events
+
+// False to quit.
+handle_app(a: *App, ev: string, data: ptr) -> bool {
+    kind = kind_of_(ev)
+    v = jsonx.parse(ev)
+    body = jsonx.field(v, kind)
+    match kind {
+        "tick" -> {
+            if a.has_turn == 0 {
+                ptr due = call(a.p.drain_progress, a.p.ctx)
+                for i in 0..list.list_size(due) {
+                    pj, _g = list.get_string(due, i)
+                    transcript.progress(a.transcript, agent_tree.from_json(pj))
+                }
+            }
+        }
+        "paths_ready" -> {}
+        "prediction" -> {
+            prediction.arrive(a.prediction, jsonx.long_or(body, "generation", 0 as long), string.copy(jsonx.str_or(body, "text", "")))
+        }
+        "flow" -> { provider_result(a, data) }
+        "tool_activity" -> {
+            a.activity.tool = string.copy(jsonx.str_field(body))
+            status.progress(&a.activity, clock.now(a.clk))
+        }
+        "model_activity" -> {
+            st = state_index_(jsonx.str_or(body, "state", ""))
+            at = jsonx.long_or(body, "at", clock.now(a.clk))
+            now = clock.now(a.clk)
+            if st == status.MA_STARTED {
+                transcript.begin_attempt(a.transcript)
+                if a.activity.phase != status.PHASE_COMPACTING && a.activity.phase != status.PHASE_RETRYING {
+                    status.activity_set(&a.activity, now, status.PHASE_THINKING)
+                }
+            }
+            if st == status.MA_SCRIPT {
+                status.activity_set(&a.activity, now, status.PHASE_SCRIPTING)
+            }
+            if st == status.MA_WAITING {
+                status.activity_set(&a.activity, now, status.PHASE_WAITING)
+            }
+            status.model_activity(&a.activity, st, at)
+        }
+        "step" -> {
+            a.step_effort = string.copy(jsonx.str_or(body, "effort", ""))
+            a.has_step_effort = 1
+            a.live_steps = jsonx.int_or(body, "n", 0)
+        }
+        "delta" -> {
+            dkind = jsonx.str_or(body, "kind", "text")
+            text = string.copy(jsonx.str_or(body, "text", ""))
+            a.live_steps = jsonx.int_or(body, "step", a.live_steps)
+            now = clock.now(a.clk)
+            if string.length(text) > 0 {
+                status.progress(&a.activity, now)
+            }
+            if string.length(text) > 0 && a.activity.phase != status.PHASE_COMPACTING {
+                status.activity_set(&a.activity, now, status.delta_phase(if dkind == "reasoning" { 1 } else { 0 }))
+            }
+            if dkind == "text" && string.length(text) > 0 {
+                transcript.clear_retry(a.transcript, a.scroll)
+            }
+            if dkind == "text" {
+                transcript.smooth_delta(a.transcript, text, now)
+            }
+        }
+        "run_start" -> {
+            transcript.clear_retry(a.transcript, a.scroll)
+            a.live_steps = jsonx.int_or(v, "step", a.live_steps)
+            a.turn_runs = a.turn_runs + 1
+            a.activity.tool = ""
+            status.activity_set(&a.activity, clock.now(a.clk), status.PHASE_RUNNING)
+            if a.has_turn != 0 {
+                a.turn.failure_stage = "tool"
+            }
+            transcript.start_run_with_effort(a.transcript, string.copy(jsonx.str_field(body)), if a.has_step_effort != 0 { a.step_effort } else { "" })
+        }
+        "run_end" -> {
+            now = clock.now(a.clk)
+            elapsed = status.activity_label(a.activity, now).ms
+            status.activity_set(&a.activity, now, status.PHASE_THINKING)
+            bid = jsonx.str_or(body, "background_id", "")
+            if bid != "" {
+                transcript.background_run(a.transcript, string.copy(bid))
+            }
+            ct = change_text_of_(jsonx.field(body, "changes"))
+            sv = jsonx.field(body, "tool_summary")
+            summary = if sv != null && json.json_type(sv) == json.JSON_OBJECT { transcript.summary_from_json(sv) as ptr } else { null }
+            transcript.end_run_with_summary(a.transcript, jsonx.bool_or(body, "ok", 0) != 0, string.copy(jsonx.str_or(body, "output", "")), elapsed, ct, summary)
+        }
+        "retry" -> {
+            transcript.retry_attempt(a.transcript, a.scroll)
+            status.activity_set(&a.activity, clock.now(a.clk), status.PHASE_RETRYING)
+            if json.json_type(body) == json.JSON_STRING {
+                a.retry_detail = string.copy(jsonx.str_field(body))
+            } else {
+                attempt = jsonx.int_or(body, "attempt", 0)
+                a.retry_detail = "attempt ${attempt + 1}/5 · ${status.retry_reason(jsonx.str_or(body, "reason", ""))}"
+            }
+        }
+        "notice" -> {
+            msg = string.copy(jsonx.str_field(body))
+            if string.starts_with(msg, "hook ") != 0 && string.starts_with(msg, "hook turn_end ") == 0 {
+                transcript.hook_notice(a.transcript, msg)
+            } else {
+                transcript.add(a.transcript, entry.KIND_INFO, msg)
+            }
+        }
+        "usage" -> {
+            a.usage = usage_of_(body)
+            a.context = jsonx.long_or(v, "context", a.context)
+            a.steps = jsonx.int_or(v, "steps", a.steps)
+        }
+        "progress" -> {
+            p = agent_tree.from_json(jsonx.encode(body))
+            if transcript.progress_changed(a.transcript, p) {
+                status.progress(&a.activity, clock.now(a.clk))
+            }
+            transcript.progress(a.transcript, p)
+        }
+        "background" -> { on_background_(a, body) }
+        "turn_end" -> {
+            a.pending_bill = turn_summary.from_json(jsonx.encode(body))
+            a.has_pending_bill = 1
+        }
+        "user_inserted" -> {
+            transcript.user_inserted(a.transcript, jsonx.long_or(v, "user_inserted", -1 as long))
+        }
+        "done" -> {
+            transcript.clear_retry(a.transcript, a.scroll)
+            canceled = a.has_turn != 0 && turn.is_canceled(a.turn)
+            predict = !canceled && a.has_turn != 0 && a.turn.compact == 0 && a.has_reflecting == 0
+            finish_turn_(a)
+            save_reflection_(a)
+            append_bill(a)
+            if canceled {
+                recovery_hint_(a, "canceled")
+            } else {
+                append_changes_(a)
+            }
+            finish_queued(a, !canceled)
+            if predict {
+                predict_next_(a)
+            }
+        }
+        "issue" -> { transcript.add(a.transcript, entry.KIND_INFO, string.copy(jsonx.str_field(body))) }
+        "issues_done" -> {
+            if a.issues != null {
+                reflect.issues_finish(a.issues as *reflect.Issues)
+            }
+            a.issues = null
+        }
+        "failed" -> {
+            transcript.clear_retry(a.transcript, a.scroll)
+            msg = string.copy(jsonx.str_or(body, "message", ""))
+            reason = string.copy(jsonx.str_or(body, "reason", "model"))
+            stop_reflecting_(a)
+            canceled = a.has_turn != 0 && turn.is_canceled(a.turn)
+            if !canceled {
+                transcript.discard_attempt(a.transcript)
+                transcript.failure(a.transcript, msg, reason_index_(reason))
+            }
+            finish_turn_(a)
+            append_bill(a)
+            recovery_hint_(a, reason)
+            finish_queued(a, false)
+        }
+        _ -> {}
+    }
+    jsonx.free(v)
+    return true
+}
+
+state_index_(name: string) -> int {
+    for i in 0..5 {
+        if turn.STATES[i] == name {
+            return i
+        }
+    }
+    return status.MA_DATA
+}
+
+reason_index_(reason: string) -> int {
+    match reason {
+        "tool" -> { return changes.REASON_TOOL }
+        "timeout" -> { return changes.REASON_TIMEOUT }
+        "canceled" -> { return changes.REASON_CANCELED }
+        "limit" -> { return changes.REASON_LIMIT }
+        _ -> { return changes.REASON_MODEL }
+    }
+}
+
+usage_of_(u: ptr) -> turn_summary.Usage {
+    return turn_summary.usage(jsonx.long_or(u, "prompt_tokens", 0 as long), jsonx.long_or(u, "completion_tokens", 0 as long), jsonx.long_or(u, "prompt_cache_hit_tokens", 0 as long), jsonx.long_or(u, "prompt_cache_write_tokens", 0 as long))
+}
+
+// A run_end's or completion's "changes" array as the transcript's ChangeText.
+change_text_of_(cv: ptr) -> *turn_changes.ChangeText {
+    lst = list.list_new()
+    if cv != null && json.json_type(cv) == json.JSON_ARRAY {
+        for i in 0..json.json_array_size(cv) {
+            o = json.json_array_get_raw(cv, i)
+            c = heap.new(diff.Change)
+            c.path = string.copy(jsonx.str_or(o, "path", ""))
+            c.added = jsonx.int_or(o, "added", 0)
+            c.removed = jsonx.int_or(o, "removed", 0)
+            c.created = jsonx.bool_or(o, "created", 0)
+            c.diff = string.copy(jsonx.str_or(o, "diff", ""))
+            list.list_add(lst, c as ptr)
+        }
+    }
+    return turn_changes.change_text_new(lst)
+}
+
+bkind_(name: string) -> int {
+    if name == "bash" { return agent_tree.BK_BASH }
+    if name == "run" { return agent_tree.BK_RUN }
+    return agent_tree.BK_AGENT
+}
+
+on_background_(a: *App, b: ptr) {
+    id = string.copy(jsonx.str_or(b, "id", ""))
+    kind = bkind_(jsonx.str_or(b, "kind", "agent"))
+    st = jsonx.str_or(b, "state", "")
+    completion = jsonx.field(b, "completion")
+    has_completion = completion != null && json.json_type(completion) == json.JSON_OBJECT
+    hook = if has_completion { jsonx.str_or(completion, "hook_notice", "") } else { "" }
+    if hook != "" {
+        transcript.background_hook_notice(a.transcript, id, string.copy(hook))
+    }
+    result = jsonx.str_or(b, "result", "")
+    has_result = jsonx.has(b, "result") != 0
+    if has_completion {
+        result = jsonx.str_or(completion, "output", "")
+        has_result = true
+    }
+    if kind == agent_tree.BK_RUN && has_completion {
+        sv = jsonx.field(completion, "tool_summary")
+        if sv != null && json.json_type(sv) == json.JSON_OBJECT {
+            transcript.update_background_run(a.transcript, id, string.copy(result), change_text_of_(jsonx.field(completion, "changes")), transcript.summary_from_json(sv))
+        }
+    }
+    if st == "started" {
+        a.background_count = a.background_count + 1
+    } else if st == "finished" {
+        a.background_count = if a.background_count > 0 { a.background_count - 1 } else { 0 }
+        ok = if jsonx.has(b, "ok") != 0 { jsonx.bool_or(b, "ok", 0) != 0 } else { false }
+        transcript.background_result(a.transcript, kind, id, ok, string.copy(if has_result { result } else { "{}" }))
+    } else if st == "lost" {
+        a.background_count = if a.background_count > 0 { a.background_count - 1 } else { 0 }
+        transcript.lost_background(a.transcript, kind, id, string.copy(if has_result { result } else { "background task was lost" }))
+    }
+}
+
+recovery_hint_(a: *App, reason: string) {
+    string hint = call(a.p.recovery_hint, a.p.ctx, reason)
+    if string.length(hint) > 0 {
+        transcript.add(a.transcript, entry.KIND_INFO, hint)
+    }
+}
+
+// The footer of the finished Turn, once its terminal content is in.
+append_bill(a: *App) {
+    if a.has_pending_bill == 0 {
+        return
+    }
+    footer = bill.format_footer(a.pending_bill, a.turn_runs, 65535)
+    if string.length(footer) > 0 {
+        transcript.add(a.transcript, entry.KIND_BILL, footer)
+    }
+    a.last_summary = a.pending_bill
+    a.has_last_summary = 1
+    a.has_pending_bill = 0
+}
+
+append_changes_(a: *App) {
+    ptr files = call(a.p.recovery_files, a.p.ctx)
+    tc, ok = turn_changes.turn_changes(files)
+    if ok {
+        transcript.add_changes(a.transcript, tc)
+    }
+}
+
+finish_turn_(a: *App) {
+    a.has_step_effort = 0
+    a.step_effort = ""
+    call(a.p.finish_turn, a.p.ctx)
+    a.has_turn = 0
+    while true {
+        string id = call(a.p.take_stop, a.p.ctx)
+        if id == "" {
+            break
+        }
+        string text = call(a.p.user_stop, a.p.ctx, id)
+        transcript.add(a.transcript, entry.KIND_INFO, text)
+    }
+    int pending = call(a.p.any_pending, a.p.ctx)
+    if pending == 0 {
+        a.background_count = 0
+        transcript.clear_background_progress(a.transcript)
+    }
+    string js = call(a.p.stats, a.p.ctx)
+    v = jsonx.parse(js)
+    a.usage = usage_of_(jsonx.field(v, "usage"))
+    a.steps = jsonx.int_or(v, "steps", 0)
+    a.context = jsonx.long_or(v, "context", 0 as long)
+    jsonx.free(v)
+}
+
+// Sends the interjections that did not make it into the Turn, or (canceled,
+// failed) puts them back into the input.
+finish_queued(a: *App, send_now: bool) {
+    ptr batch = call(a.p.take_queued, a.p.ctx)
+    n = list.list_size(batch)
+    if n == 0 {
+        return
+    }
+    parts = make([]string, 0)
+    for i in 0..n {
+        s, _g = list.get_string(batch, i)
+        parts.push(string.copy(s))
+    }
+    text = string.join_strings(parts, "\n\n")
+    if string.length(text) == 0 {
+        return
+    }
+    selection.clear(a.selection)
+    transcript.remove_queued(a.transcript)
+    if send_now {
+        start_turn_(a, text, 0)
+        return
+    }
+    draft = editor.expanded(a.input)
+    restored = if string.length(draft) == 0 { text } else { "${text}\n\n${draft}" }
+    editor.replace(a.input, restored)
+    menu.input_changed(a.menu, editor.text(a.input))
+    report(a, entry.KIND_INFO, "${n} queued message${if n == 1 { "" } else { "s" }} returned to input")
+}
+
+activity_detail_(a: *App) -> string {
+    if a.activity.phase == status.PHASE_RETRYING {
+        return a.retry_detail
+    }
+    if a.activity.phase == status.PHASE_RUNNING {
+        return transcript.activity_detail(a.transcript, a.activity.tool)
+    }
+    if a.activity.phase == status.PHASE_WAITING {
+        string w = call(a.p.waiting_task, a.p.ctx)
+        if w == "" {
+            return ""
+        }
+        v = jsonx.parse(w)
+        out = "${jsonx.str_or(v, "id", "")} · ${format.duration(jsonx.long_or(v, "elapsed_ms", 0 as long))}"
+        jsonx.free(v)
+        return out
+    }
+    return ""
+}
+
+// ---------------------------------------------------------------- clicks and links
+
+work_dirs_(a: *App) -> bool {
+    if a.work_dir == "" || a.project == "" {
+        a.work_dir = a.cwd
+        a.project = project_root_(a.cwd)
+    }
+    return a.work_dir != ""
+}
+
+// The nearest directory upward holding .git, else cwd (session/instructions'
+// projectRoot).
+project_root_(cwd: string) -> string {
+    dir = cwd
+    while string.length(dir) > 0 {
+        if fs.exists("${dir}/.git") != 0 {
+            return dir
+        }
+        slash = last_slash_(dir)
+        if slash <= 0 {
+            break
+        }
+        dir = string.substring(dir, 0, slash)
+    }
+    return cwd
+}
+
+last_slash_(s: string) -> int {
+    i = string.length(s) - 1
+    while i >= 0 {
+        if s[i] == 47 {
+            return i
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+struct Hit {
+    found: open.Found
+    path: string
+}
+
+// A clickable file path at screen cell (col, row) inside `index`; only when
+// `open` is configured.
+hit_at_(a: *App, index: int, entry_row: int, col: int, row: int) -> (Hit, bool) {
+    none_hit = Hit { found: open.Found { x0: 0, x1: 0, token: open.Token { path: "", line: 0 } }, path: "" }
+    c = a.cfg as *types.Config
+    if c.open == "" || col < 0 || row < 0 || a.has_body == 0 {
+        return none_hit, false
+    }
+    w = a.body.window
+    if col < w.x_off || col >= w.x_off + w.width || row >= w.height || index >= transcript.count(a.transcript) {
+        return none_hit, false
+    }
+    if a.files_revision != a.transcript.revision {
+        open.files_clear(a.files)
+        a.files_revision = a.transcript.revision
+    }
+    e = transcript.at(a.transcript, index)
+    rows_only = false
+    if e.kind == entry.KIND_ASSISTANT {
+        rows_only = false
+    } else if e.kind == entry.KIND_CHANGES {
+        if !(e.open != 0 && entry_row >= 1) {
+            return none_hit, false
+        }
+        rows_only = true
+    } else if e.kind == entry.KIND_RUN {
+        if e.open == 0 {
+            return none_hit, false
+        }
+        rows_only = true
+    } else {
+        return none_hit, false
+    }
+    surf = term.surface(a.t)
+    grs = make([]open.Gr, 0)
+    cc = w.x_off
+    while cc < w.x_off + w.width && grs.len < 512 {
+        cell, ok = screen.read_cell(surf, cc, row)
+        if !ok {
+            break
+        }
+        width = if cell.width > 1 { cell.width } else { 1 }
+        g = open.Gr { col: cc, width: width, text: cell.grapheme }
+        grs.push(g)
+        cc = cc + width
+    }
+    found, fok = if rows_only { open.change_row_at(grs, col) } else { open.token_at(grs, col) }
+    if !fok {
+        return none_hit, false
+    }
+    if !work_dirs_(a) {
+        return none_hit, false
+    }
+    path, pok = open.files_find(a.files, a.work_dir, a.project, found.token.path)
+    if !pok {
+        return none_hit, false
+    }
+    return Hit { found: found, path: path }, true
+}
+
+open_click_(a: *App, index: int, entry_row: int, m: input.Mouse) -> bool {
+    hit, ok = hit_at_(a, index, entry_row, m.col, m.row)
+    if !ok {
+        return false
+    }
+    words, err = open.argv((a.cfg as *types.Config).open, hit.path, hit.found.token.line)
+    if err != "" {
+        return true
+    }
+    argv = list.list_new()
+    for i in 0..words.len {
+        list.list_add(argv, words[i])
+    }
+    string failed = call(a.launcher, argv, a.envp)
+    if failed != "" {
+        set_notice_(a, "Could not run ${basename_(words[0])}")
+    }
+    return true
+}
+
+basename_(path: string) -> string {
+    s = last_slash_(path)
+    if s < 0 {
+        return path
+    }
+    return string.substring(path, s + 1, string.length(path))
+}
+
+title_line_(a: *App) -> string {
+    if a.title_loaded == 0 {
+        a.title_project = ""
+        a.title_branch = ""
+        if work_dirs_(a) {
+            name = basename_(a.project)
+            a.title_project = if string.length(name) == 0 { a.project } else { name }
+            branch, ok = title.read_branch(a.project)
+            a.title_branch = if ok { branch } else { "" }
+        }
+        a.title_loaded = 1
+    }
+    if a.title_project == "" {
+        return ""
+    }
+    c = a.cfg as *types.Config
+    return title.compose(a.title_project, a.title_branch, c.model, effective_effort_(a))
+}
+
+effective_effort_(a: *App) -> string {
+    c = a.cfg as *types.Config
+    if c.reasoning_effort != "" {
+        return c.reasoning_effort
+    }
+    if c.thinking == 0 {
+        return "off"
+    }
+    return "default"
+}
+
+click_entry(a: *App, index: int, row: int) {
+    if a.has_body == 0 {
+        return
+    }
+    if index < transcript.count(a.transcript) && row < entry.toggle_rows(transcript.at(a.transcript, index), a.body.window) {
+        toggle_entry(a, index)
+    }
+}
+
+toggle_simple(a: *App) {
+    c = a.cfg as *types.Config
+    simple = if c.simple != 0 { 0 } else { 1 }
+    err = config.save_simple(a.home, simple)
+    if err != "" {
+        report(a, entry.KIND_ERR, "could not save simple mode: ${err}")
+        return
+    }
+    c.simple = simple
+    selection.clear(a.selection)
+    a.hovered = -1
+}
+
+toggle_entry(a: *App, index: int) {
+    transcript.toggle(a.transcript, index)
+    if a.has_body == 0 {
+        return
+    }
+    viewport.toggled(a.scroll, a.body.top, transcript.latest_details(a.transcript) == index)
+}
+
+// ---------------------------------------------------------------- render
+
+render(a: *App) {
+    menu.load(a.menu, editor.text(a.input), a.p, a.home, a.cfg, service_lister_(a))
+    menu.sync(a.menu, a.input)
+    visible = a.input
+    if provider_flow.flow_takes_text(a.flow) != 0 {
+        editor.replace(a.prompt_view, provider_flow.flow_display(a.flow))
+        visible = a.prompt_view
+    }
+    a.input.ghost = if a.has_turn == 0 && provider_flow.flow_active(a.flow) == 0 && !menu.is_pinned(a.menu) { prediction.visible(a.prediction, a.input) } else { "" }
+    items = menu.items(a.menu, editor.text(a.input))
+    for i in 0..items.len {
+        if items[i].command == commands.CMD_REFLECT && items[i].has_value == 0 {
+            items[i].detail = commands.reflect_help(issue_repo_(a))
+        }
+    }
+    if a.scroll.pending != 0 && (a.selection.active == 0 || a.selection.has_history == 0) {
+        selection.clear(a.selection)
+    }
+    if a.scroll.pending != 0 || a.selection.dragged != 0 {
+        a.hovered = -1
+        a.has_link = 0
+    }
+    empty = transcript.count(a.transcript) == 0
+    if !empty {
+        a.title_loaded = 0
+    }
+    heading = if empty && a.signed_out == 0 { title_line_(a) } else { "" }
+    s = status.new(a.cfg)
+    s.user_bg = a.user_bg
+    s.code_bg = a.code_bg
+    s.hovered = a.hovered
+    s.hover_bg = a.hover_bg
+    s.usage = a.usage
+    s.steps = a.steps
+    s.background_count = a.background_count
+    s.context = a.context
+    if a.has_turn != 0 {
+        s.has_busy = 1
+        s.busy = status.activity_label(a.activity, clock.now(a.clk))
+    }
+    if a.has_notice != 0 {
+        s.has_notice = 1
+        s.notice = a.notice
+    }
+    s.detail = activity_detail_(a)
+    s.hint = if provider_flow.flow_active(a.flow) != 0 { provider_flow.flow_hint(a.flow) } else if menu.is_pinned(a.menu) { "Choose a service" } else { "" }
+    s.signed_out = a.signed_out
+    s.title = heading
+    s.revision = a.transcript.revision as int
+    sel = if items.len == 0 { 0 } else if a.menu.sel < items.len - 1 { a.menu.sel } else { items.len - 1 }
+    frame, ok = tui_view.draw_frame(term.window(a.t), a.transcript.entries, visible, a.scroll, items, sel, s)
+    a.body = frame
+    a.has_body = if ok { 1 } else { 0 }
+    surf = term.surface(a.t)
+    if a.has_link != 0 && a.link_row < surf.height {
+        end = if a.link_x1 + 1 < surf.width { a.link_x1 + 1 } else { surf.width }
+        for col in a.link_x0..end {
+            ci = a.link_row * surf.width + col
+            surf.cells[ci].style.ul_style = screen.UL_SINGLE
+            surf.cells[ci].is_default = false
+        }
+    }
+    if a.selection.active != 0 && a.selection.has_history != 0 && a.has_body != 0 {
+        a.scroll.has_top = 1
+        a.scroll.top_entry = a.body.top.entry
+        a.scroll.top_row = a.body.top.row
+    }
+    selection.update_history(a.selection, a.body, a.has_body != 0, a.transcript.entries)
+    selection.highlight_history(a.selection, surf, a.body, a.has_body != 0, a.transcript.entries)
+    term.render(a.t)
+}
+
+// ---------------------------------------------------------------- reflect
+
+save_reflection_(a: *App) {
+    if a.has_reflecting == 0 {
+        return
+    }
+    focus = a.reflecting
+    ptr h = call(a.p.history, a.p.ctx)
+    n = list.list_size(h)
+    if n == 0 {
+        stop_reflecting_(a)
+        return
+    }
+    last, _g = list.get_string(h, n - 1)
+    v = jsonx.parse(last)
+    answer = if jsonx.str_or(v, "role", "") == "assistant" { string.copy(jsonx.str_or(v, "content", "")) } else { "" }
+    jsonx.free(v)
+    stop_reflecting_(a)
+    if string.length(answer) == 0 {
+        return
+    }
+    path = "${a.home}/reflections.md"
+    string sid = call(a.p.session_id, a.p.ctx)
+    en = reflect.Entry { unix_seconds: os.os_wall_seconds_raw(), session_id: sid, cwd: a.cwd, model: (a.cfg as *types.Config).model, effort: effective_effort_(a), focus: focus, answer: answer }
+    err = reflect.append(path, en)
+    if err != "" {
+        set_notice_(a, "could not save reflection to ${path}: ${err}")
+        return
+    }
+    set_notice_(a, "reflection saved to ${path}")
+    file_issues_(a, answer, path)
+}
+
+file_issues_(a: *App, answer: string, reflections_path: string) {
+    repo = issue_repo_(a)
+    if repo == "" || a.issues != null {
+        return
+    }
+    ds = reflect.drafts(answer)
+    if list.list_size(ds) == 0 {
+        return
+    }
+    string sid = call(a.p.session_id, a.p.ctx)
+    short = if string.length(sid) > 8 { string.substring(sid, 0, 8) } else { sid }
+    job = reflect.issues_new(ds, repo, reflections_path, short, env_get_(a, "HOME"), a.cwd, "_Filed automatically by nib /reflect · nib 0.13.0-ae · ${(a.cfg as *types.Config).model} · effort ${effective_effort_(a)} · session ${short}_")
+    qq = a.q
+    reflect.issues_start(job, a.gh, |text: string| {
+        app_queue.post(qq, "{\"issue\":${jsonx.quote(text)}}")
+    }, || {
+        app_queue.post(qq, "{\"issues_done\":{}}")
+    })
+    a.issues = job as ptr
+    n = list.list_size(ds)
+    report(a, entry.KIND_INFO, "filing ${n} issue draft${if n == 1 { "" } else { "s" }} to ${repo}")
+}
+
+stop_reflecting_(a: *App) {
+    a.reflecting = ""
+    a.has_reflecting = 0
+}
+
+// ---------------------------------------------------------------- commands
+
+// A bare word is a model of the current service; `service/model` and
+// `service model` still select a service too: (provider, model, error).
+model_selection_(a: *App, arg: string) -> (string, string, string) {
+    words = words_(arg)
+    if words.len == 0 {
+        return "", "", "InvalidModelArgument"
+    }
+    if words.len > 1 {
+        return config.parse_model(arg)
+    }
+    first = words[0]
+    slash = string.index_of(first, "/")
+    if slash >= 0 {
+        lst, _e = auth.services(a.envp, a.home)
+        if slash > 0 && slash + 1 < string.length(first) && lst != null && auth.find(lst, string.substring(first, 0, slash)) != null {
+            return config.parse_model(arg)
+        }
+    }
+    return types.name(a.cfg), first, ""
+}
+
+words_(s: string) -> string[] {
+    out = make([]string, 0)
+    n = string.length(s)
+    i = 0
+    while i < n {
+        while i < n && (s[i] == 32 || s[i] == 9 || s[i] == 10) { i = i + 1 }
+        j = i
+        while j < n && !(s[j] == 32 || s[j] == 9 || s[j] == 10) { j = j + 1 }
+        if j > i {
+            out.push(string.substring(s, i, j))
+        }
+        i = j
+    }
+    return out
+}
+
+// Saves and applies a service/model choice; a new Session starts when Steps
+// already exist. `note` replaces the confirmation's service/model text.
+select_model(a: *App, provider_id: string, model: string, note: string) {
+    cp, err, _d = config.save_model(a.envp, a.home, provider_id, model)
+    if err != "" {
+        report(a, entry.KIND_ERR, "could not select model: ${err} · check provider and context_window")
+        return
+    }
+    c = cp as *types.Config
+    old = a.cfg as *types.Config
+    c.thinking = old.thinking
+    c.reasoning_effort = old.reasoning_effort
+    drop_prediction_(a)
+    string outcome = call(a.p.switch_config, a.p.ctx, cp)
+    fresh = false
+    if outcome == "new_session" {
+        fresh = true
+    } else if string.starts_with(outcome, "open_failed:") != 0 {
+        report(a, entry.KIND_ERR, "could not open session: ${string.substring(outcome, 12, string.length(outcome))}")
+        return
+    } else if string.starts_with(outcome, "update_failed:") != 0 {
+        report(a, entry.KIND_ERR, "model saved, but could not update session: ${string.substring(outcome, 14, string.length(outcome))}")
+        return
+    }
+    if fresh {
+        transcript.clear(a.transcript)
+        a.background_count = 0
+        a.usage = turn_summary.usage()
+        a.steps = 0
+        a.has_last_summary = 0
+    }
+    ptr fresh_cfg = call(a.p.cfg, a.p.ctx)
+    a.cfg = fresh_cfg
+    a.context = stats_context_(a)
+    refresh_credentials(a)
+    has_p = env_get_(a, "NIB_PROVIDER") != ""
+    has_m = env_get_(a, "NIB_MODEL") != ""
+    override = if has_p && has_m { " · NIB_PROVIDER/NIB_MODEL override at startup" } else if has_p { " · NIB_PROVIDER overrides at startup" } else if has_m { " · NIB_MODEL overrides at startup" } else { "" }
+    fresh_note = if fresh { " · new session" } else { "" }
+    if note != "" {
+        report(a, entry.KIND_INFO, "${note}${fresh_note}${override}")
+    } else {
+        report(a, entry.KIND_INFO, "${types.name(cp)} · ${c.model}${fresh_note}${override}")
+    }
+}
+
+execute(a: *App, c: int, arg: string, line: string) {
+    if c == commands.CMD_REFLECT && issue_repo_(a) == "" {
+        report(a, entry.KIND_ERR, "unknown command /reflect · /help lists commands")
+        return
+    }
+    if c == commands.CMD_SIMPLE {
+        toggle_simple(a)
+    } else if c == commands.CMD_STATUS {
+        // Skills and hooks are not ported: their lines read the stubs.
+        report(a, entry.KIND_INFO, "Skills: 0 on · 0 found")
+        string sandbox_status = call(a.p.sandbox_status, a.p.ctx)
+        report(a, entry.KIND_INFO, "Sandbox: ${sandbox_status}")
+        cc = a.cfg as *types.Config
+        window = if cc.context_window > (1 as long) { cc.context_window } else { 1 as long }
+        details = if a.has_last_summary != 0 { bill.details(a.last_summary) } else { "No completed turn yet." }
+        report(a, entry.KIND_INFO, "Provider ${types.name(a.cfg)} · ${cc.model} · ${auth.describe(a.cfg)} · effort ${effective_effort_(a)} · context ${a.context * 100 / window}%\n${details}")
+    } else if c == commands.CMD_MCP {
+        // MCP (src/mcp*) is not ported: the listing reads config only (stub).
+        transcript.add(a.transcript, entry.KIND_INFO, "No MCP servers configured.\nApplies to new sessions.")
+    } else if c == commands.CMD_SKILLS {
+        // Skills (src/session/skills.zig) are not ported (stub).
+        transcript.add(a.transcript, entry.KIND_INFO, "No skills found.\nApplies to new sessions.")
+    } else if c == commands.CMD_TASKS {
+        string tj = call(a.p.tasks, a.p.ctx)
+        transcript.add(a.transcript, entry.KIND_INFO, tasks.format(tasks_of_(tj), clock.now(a.clk)))
+    } else if c == commands.CMD_STOP {
+        if string.length(arg) == 0 || string.index_of(arg, " ") >= 0 || string.index_of(arg, "\t") >= 0 || string.index_of(arg, "\n") >= 0 {
+            transcript.add(a.transcript, entry.KIND_ERR, "usage: /stop <id>")
+            return
+        }
+        if a.has_turn != 0 {
+            call(a.p.request_stop, a.p.ctx, arg)
+            report(a, entry.KIND_INFO, "${arg}: user stop requested")
+        } else {
+            string text = call(a.p.user_stop, a.p.ctx, arg)
+            transcript.add(a.transcript, entry.KIND_INFO, text)
+        }
+    } else if c == commands.CMD_UNDO {
+        if a.has_turn != 0 {
+            transcript.add(a.transcript, entry.KIND_ERR, "Turn running · retry command when it ends")
+            return
+        }
+        if string.length(arg) != 0 {
+            transcript.add(a.transcript, entry.KIND_ERR, "usage: /undo")
+            return
+        }
+        string r = call(a.p.undo, a.p.ctx)
+        v = jsonx.parse(r)
+        err = jsonx.str_or(v, "error", "")
+        text = string.copy(jsonx.str_or(v, "text", ""))
+        jsonx.free(v)
+        if err != "" {
+            report(a, entry.KIND_ERR, "undo failed: ${err}; re-read files before continuing")
+            return
+        }
+        a.context = stats_context_(a)
+        transcript.add(a.transcript, entry.KIND_INFO, text)
+    } else if c == commands.CMD_HELP {
+        transcript.add(a.transcript, entry.KIND_INFO, commands.help_text(issue_repo_(a)))
+    } else if c == commands.CMD_NEW || c == commands.CMD_RESUME {
+        id = ""
+        if c == commands.CMD_RESUME {
+            rid, rerr = menu.resolve_session(a.menu, a.p, arg)
+            if rerr != "" {
+                msg = rerr
+                if rerr == "MissingSessionId" { msg = "usage: /resume <id> · type /resume and a space to pick one" }
+                if rerr == "UnknownSession" { msg = "no session here starts with that id" }
+                if rerr == "AmbiguousSession" { msg = "several sessions start with that id; type more of it" }
+                transcript.add(a.transcript, entry.KIND_ERR, msg)
+                return
+            }
+            id = rid
+            string current = call(a.p.session_id, a.p.ctx)
+            if id == current {
+                transcript.add(a.transcript, entry.KIND_INFO, "already in this session")
+                return
+            }
+        }
+        string oerr = call(a.p.reopen, a.p.ctx, id)
+        if oerr != "" {
+            report(a, entry.KIND_ERR, "could not open session: ${oerr}")
+            return
+        }
+        drop_prediction_(a)
+        transcript.clear(a.transcript)
+        a.background_count = 0
+        ptr h = call(a.p.history, a.p.ctx)
+        transcript.add_history(a.transcript, h)
+        a.usage = turn_summary.usage()
+        a.steps = 0
+        a.has_last_summary = 0
+        a.context = stats_context_(a)
+        string sid = call(a.p.session_id, a.p.ctx)
+        short = if string.length(sid) > 8 { string.substring(sid, 0, 8) } else { sid }
+        report(a, entry.KIND_INFO, "${if c == commands.CMD_NEW { "new" } else { "resumed" }} session ${short}")
+    } else if c == commands.CMD_COPY {
+        answer, ok = transcript.last_answer(a.transcript)
+        if !ok {
+            transcript.add(a.transcript, entry.KIND_ERR, "no answer to copy yet")
+            return
+        }
+        term.copy_to_clipboard(a.t, answer)
+        report(a, entry.KIND_INFO, "copied ${string.length(answer)} bytes (needs a terminal with OSC 52 clipboard support)")
+    } else if c == commands.CMD_PROVIDER {
+        provider_command(a, arg)
+    } else if c == commands.CMD_MODEL {
+        if string.length(arg) == 0 {
+            transcript.add(a.transcript, entry.KIND_ERR, "usage: /model <model> · type /model and a space to pick one")
+            return
+        }
+        pid, model, err = model_selection_(a, arg)
+        if err != "" {
+            transcript.add(a.transcript, entry.KIND_ERR, "usage: /model <model>")
+            return
+        }
+        select_model(a, pid, model, "")
+    } else if c == commands.CMD_EFFORT {
+        cc = a.cfg as *types.Config
+        if string.length(arg) > 0 {
+            if types.set_effort(a.cfg, arg) != "" {
+                transcript.add(a.transcript, entry.KIND_ERR, "usage: /effort [default|off|none|minimal|low|medium|high|xhigh|max]")
+                return
+            }
+            serr = config.save_effort(a.home, arg)
+            if serr != "" {
+                report(a, entry.KIND_ERR, "effort applied, but could not save ${a.home}/config.toml: ${serr}")
+                return
+            }
+            report(a, entry.KIND_INFO, "effort: ${effective_effort_(a)} · saved to ${a.home}/config.toml (environment and --effort override saved preferences)")
+            return
+        }
+        thinking = if cc.thinking < 0 { "default" } else if cc.thinking != 0 { "on" } else { "off" }
+        configured = if cc.reasoning_effort == "" { "default" } else { cc.reasoning_effort }
+        report(a, entry.KIND_INFO, "effort: ${effective_effort_(a)} · thinking: ${thinking} · configured: ${configured} (model support varies)")
+    } else if c == commands.CMD_JS {
+        if string.length(arg) == 0 {
+            transcript.add(a.transcript, entry.KIND_ERR, "usage: /js <code>")
+            return
+        }
+        transcript.add(a.transcript, entry.KIND_USER, line)
+        string r = call(a.p.run_js, a.p.ctx, arg)
+        v = jsonx.parse(r)
+        logs = string.copy(jsonx.str_or(v, "logs", ""))
+        if string.length(logs) > 0 {
+            transcript.add(a.transcript, entry.KIND_INFO, trim_end_nl_(logs))
+        }
+        transcript.add(a.transcript, if jsonx.bool_or(v, "ok", 0) != 0 { entry.KIND_INFO } else { entry.KIND_ERR }, string.copy(jsonx.str_or(v, "text", "")))
+        d = string.copy(jsonx.str_or(v, "diff", ""))
+        if string.length(d) > 0 {
+            transcript.add(a.transcript, entry.KIND_INFO, trim_end_nl_(d))
+        }
+        jsonx.free(v)
+    } else if c == commands.CMD_COMPACT {
+        drop_prediction_(a)
+        begin_turn_(a, line, 1, status.PHASE_COMPACTING)
+    } else if c == commands.CMD_REFLECT {
+        if !credentialed(a) {
+            transcript.add(a.transcript, entry.KIND_ERR, "No provider · /provider to sign in")
+            return
+        }
+        string sid = call(a.p.session_id, a.p.ctx)
+        log_path = "${a.home}/sessions/${sid}.jsonl"
+        text = reflect.prompt(sid, log_path, issue_repo_(a), arg)
+        transcript.add(a.transcript, entry.KIND_USER, line)
+        drop_prediction_(a)
+        begin_turn_(a, text, 0, status.PHASE_THINKING)
+        a.reflecting = arg
+        a.has_reflecting = 1
+    }
+}
+
+trim_end_nl_(s: string) -> string {
+    j = string.length(s)
+    while j > 0 && s[j - 1] == 10 { j = j - 1 }
+    return string.substring(s, 0, j)
+}
+
+tasks_of_(text: string) -> ptr[] {
+    out = make([]ptr, 0)
+    v = jsonx.parse(text)
+    n = jsonx.array_size(v)
+    for i in 0..n {
+        o = jsonx.array_at(v, i)
+        has_deadline = if jsonx.has(o, "deadline_ms") != 0 { 1 } else { 0 }
+        t = tasks.new_task(string.copy(jsonx.str_or(o, "id", "")), bkind_(jsonx.str_or(o, "kind", "agent")), string.copy(jsonx.str_or(o, "description", "")), string.copy(jsonx.str_or(o, "state", "")), jsonx.long_or(o, "elapsed_ms", 0 as long), has_deadline, jsonx.long_or(o, "deadline_ms", 0 as long), if jsonx.bool_or(o, "detached", 0) != 0 { 1 } else { 0 })
+        out.push(t as ptr)
+    }
+    jsonx.free(v)
+    return out
+}
+
+// ---------------------------------------------------------------- /provider
+
+service_lister_(a: *App) -> fn {
+    ep = a.envp
+    home = a.home
+    cfg = a.cfg
+    return |arg: string| {
+        boxed = list.list_new()
+        rows = service_choices(ep, home, types.name(cfg), arg)
+        for i in 0..rows.len {
+            b = heap.new(commands.Choice)
+            b.value = rows[i].value
+            b.label = rows[i].label
+            b.detail = rows[i].detail
+            list.list_add(boxed, b as ptr)
+        }
+        return boxed
+    }
+}
+
+// Rows of the service menu; `current` is marked, `arg` decides whether
+// sign-out rows appear.
+service_choices(envp: ptr, home: string, current: string, arg: string) -> commands.Choice[] {
+    out = commands.no_choices()
+    lst, err = auth.services(envp, home)
+    if err != "" || lst == null {
+        return out
+    }
+    n = list.list_size(lst)
+    for i in 0..n {
+        svc = list.list_get_raw(lst, i) as *auth.Service
+        mark = svc.id == current
+        c = commands.choice(svc.id, svc.name, if mark { "${svc.status} · current" } else { svc.status })
+        out.push(c)
+    }
+    add = commands.choice(ADD_VALUE, ADD_LABEL, "")
+    out.push(add)
+    if string.length(arg) > 0 && (string.starts_with("logout ", arg) != 0 || string.starts_with(arg, "logout ") != 0) {
+        for i in 0..n {
+            svc = list.list_get_raw(lst, i) as *auth.Service
+            if svc.stored != 0 {
+                so = commands.choice("logout ${svc.id}", "Sign out ${svc.name}", "")
+                out.push(so)
+            }
+        }
+    }
+    return out
+}
+
+// Opens the service menu over the editor without touching the draft.
+open_provider_menu(a: *App) {
+    choices = service_choices(a.envp, a.home, types.name(a.cfg), "")
+    rows = make([]commands.Candidate, 0)
+    for i in 0..choices.len {
+        r = commands.Candidate { command: commands.CMD_PROVIDER, has_value: 1, value: choices[i].value, label: choices[i].label, detail: choices[i].detail, is_path: 0 }
+        rows.push(r)
+    }
+    menu.pin(a.menu, rows)
+}
+
+provider_command(a: *App, arg: string) {
+    lst, _e = auth.services(a.envp, a.home)
+    words = words_(arg)
+    if words.len == 0 {
+        open_provider_menu(a)
+        return
+    }
+    first = words[0]
+    if first == "logout" {
+        if words.len < 2 {
+            transcript.add(a.transcript, entry.KIND_ERR, "usage: /provider logout <service>")
+            return
+        }
+        svc = if lst == null { null } else { auth.find(lst, words[1]) }
+        if svc == null {
+            report(a, entry.KIND_ERR, "unknown service ${words[1]} · /provider lists services")
+            return
+        }
+        logout_(a, svc as *auth.Service)
+        return
+    }
+    if words.len > 1 {
+        transcript.add(a.transcript, entry.KIND_ERR, "usage: /provider [service] · /provider + adds an endpoint · /provider logout <service>")
+        return
+    }
+    if first == ADD_VALUE {
+        ids = list.list_new()
+        if lst != null {
+            for i in 0..list.list_size(lst) {
+                list.list_add(ids, (list.list_get_raw(lst, i) as *auth.Service).id)
+            }
+        }
+        provider_flow.flow_start_form(a.flow, ids)
+        return
+    }
+    svc = if lst == null { null } else { auth.find(lst, first) }
+    if svc == null {
+        report(a, entry.KIND_ERR, "unknown service ${first} · /provider lists services")
+        return
+    }
+    s = svc as *auth.Service
+    if s.signed_in != 0 {
+        select_model(a, s.id, "", "")
+        return
+    }
+    // API keys only: every service signs in with a key (no Codex login).
+    provider_flow.flow_start_key(a.flow, s.id, s.name)
+}
+
+logout_(a: *App, svc: *auth.Service) {
+    out, err = auth.sign_out(a.envp, a.home, svc.id)
+    if err != "" {
+        report(a, entry.KIND_ERR, "could not sign out: ${err}")
+        return
+    }
+    text = auth.sign_out_text(svc.name, out)
+    o = out as *auth.SignOut
+    c = a.cfg as *types.Config
+    if o.removed != 0 && svc.id == types.name(a.cfg) && o.env_name == "" && c.key_source == "store" {
+        c.api_key = ""
+        c.key_source = "none"
+    }
+    refresh_credentials(a)
+    transcript.add(a.transcript, entry.KIND_INFO, text)
+}
+
+launch_(a: *App) -> provider_flow.Launch {
+    qq = a.q
+    return provider_flow.Launch { home: a.home, post: |r: @keep ptr| {
+        app_queue.post_ptr(qq, "{\"flow\":{}}", r)
+    }, list_models: a.list_models }
+}
+
+// A key press while a flow is open or the service menu is pinned.
+provider_key(a: *App, k: input.Key) {
+    f = a.flow
+    if input.matches(k, input.ESCAPE, 0) {
+        provider_cancel_(a)
+        return
+    }
+    if provider_flow.flow_takes_text(f) != 0 {
+        text_key_(a, k)
+        return
+    }
+    if f.kind == provider_flow.KIND_WAITING {
+        return
+    }
+    if input.matches(k, input.UP, 0) {
+        menu.move(a.menu, "", false)
+        return
+    }
+    if input.matches(k, input.DOWN, 0) {
+        menu.move(a.menu, "", true)
+        return
+    }
+    if !input.matches(k, input.ENTER, 0) {
+        return
+    }
+    chosen, ok = menu.selected(a.menu, "")
+    if !ok || chosen.has_value == 0 {
+        return
+    }
+    value = chosen.value
+    if f.kind == provider_flow.KIND_PROTOCOL {
+        menu.unpin(a.menu)
+        advance_(a, provider_flow.flow_choose_protocol(f, value, launch_(a)))
+        return
+    }
+    if f.kind == provider_flow.KIND_PICK {
+        outcome, has = provider_flow.flow_choose_model(f, value, launch_(a))
+        if has == 0 {
+            return
+        }
+        menu.unpin(a.menu)
+        advance_(a, outcome)
+        return
+    }
+    menu.unpin(a.menu)
+    provider_command(a, value)
+}
+
+provider_cancel_(a: *App) {
+    menu.unpin(a.menu)
+    provider_flow.flow_reset(a.flow)
+}
+
+text_key_(a: *App, k: input.Key) {
+    f = a.flow
+    if input.matches(k, input.ENTER, 0) {
+        provider_submit_(a)
+        return
+    }
+    if input.matches(k, input.BACKSPACE, 0) {
+        provider_flow.flow_backspace(f)
+        return
+    }
+    if input.matches(k, 117, input.CTRL) {
+        provider_flow.flow_wipe(f)
+        return
+    }
+    if (k.mods & (input.CTRL | input.ALT)) != 0 {
+        return
+    }
+    if string.length(k.text) > 0 {
+        provider_flow.flow_insert(f, k.text)
+    }
+}
+
+provider_pasted(a: *App, text: string) {
+    if provider_flow.flow_takes_text(a.flow) != 0 {
+        provider_flow.flow_insert(a.flow, trim_crlf_(text))
+    }
+}
+
+trim_crlf_(s: string) -> string {
+    n = string.length(s)
+    i = 0
+    while i < n && (s[i] == 13 || s[i] == 10) { i = i + 1 }
+    j = n
+    while j > i && (s[j - 1] == 13 || s[j - 1] == 10) { j = j - 1 }
+    return string.substring(s, i, j)
+}
+
+provider_submit_(a: *App) {
+    f = a.flow
+    if f.kind == provider_flow.KIND_KEY {
+        if string.length(f.text) == 0 {
+            transcript.add(a.transcript, entry.KIND_ERR, "API key cannot be empty")
+            return
+        }
+        id = string.copy(f.service_id)
+        err = auth.set_key(a.home, id, f.text)
+        if err != "" {
+            report(a, entry.KIND_ERR, "could not store key: ${err}")
+            return
+        }
+        provider_flow.flow_reset(f)
+        select_model(a, id, "", "")
+        return
+    }
+    outcome = provider_flow.flow_submit_entry(f, launch_(a))
+    if outcome.kind == provider_flow.OUT_INVALID {
+        transcript.add(a.transcript, entry.KIND_ERR, outcome.problem)
+        return
+    }
+    advance_(a, outcome)
+}
+
+advance_(a: *App, outcome: provider_flow.Outcome) {
+    if outcome.kind == provider_flow.OUT_NEXT {
+        if a.flow.kind == provider_flow.KIND_PROTOCOL {
+            rows = make([]commands.Candidate, 0)
+            r1 = commands.Candidate { command: commands.CMD_PROVIDER, has_value: 1, value: "1", label: "OpenAI-compatible", detail: "", is_path: 0 }
+            rows.push(r1)
+            r2 = commands.Candidate { command: commands.CMD_PROVIDER, has_value: 1, value: "2", label: "Responses", detail: "", is_path: 0 }
+            rows.push(r2)
+            r3 = commands.Candidate { command: commands.CMD_PROVIDER, has_value: 1, value: "3", label: "Anthropic Messages", detail: "", is_path: 0 }
+            rows.push(r3)
+            menu.pin(a.menu, rows)
+        }
+    } else if outcome.kind == provider_flow.OUT_READY {
+        finish_endpoint_(a)
+    }
+}
+
+finish_endpoint_(a: *App) {
+    f = a.flow
+    form = provider_flow.flow_form(f)
+    ep = provider_flow.form_endpoint(form)
+    id = string.copy(ep.id)
+    if string.length(form.key) > 0 {
+        err = auth.set_key(a.home, id, form.key)
+        if err != "" {
+            report(a, entry.KIND_ERR, "could not store key: ${err}")
+            return
+        }
+    }
+    err = config.add_endpoint(a.home, id, ep.protocol, ep.base_url, ep.model, ep.context_window)
+    if err != "" {
+        if string.length(form.key) > 0 {
+            auth.sign_out(a.envp, a.home, id)
+        }
+        provider_flow.flow_reset(f)
+        report(a, entry.KIND_ERR, "could not save endpoint: ${err}")
+        return
+    }
+    provider_flow.flow_reset(f)
+    select_model(a, id, "", "")
+}
+
+// A background job (a model listing) finished.
+provider_result(a: *App, r: ptr) {
+    if r == null {
+        return
+    }
+    f = a.flow
+    settled = provider_flow.flow_settle_result(f, r as *provider_flow.Result)
+    if settled == provider_flow.SETTLED_LISTED {
+        rows = make([]commands.Candidate, 0)
+        n = list.list_size(f.listed)
+        for i in 0..n {
+            item = list.list_get_raw(f.listed, i) as *models.Listed
+            detail = if item.context_window >= (0 as long) { "${format.number(item.context_window)} tokens" } else { "" }
+            row = commands.Candidate { command: commands.CMD_MODEL, has_value: 1, value: item.id, label: item.id, detail: detail, is_path: 0 }
+            rows.push(row)
+        }
+        menu.pin(a.menu, rows)
+    } else if settled == provider_flow.SETTLED_LISTING_FAILED {
+        transcript.add(a.transcript, entry.KIND_INFO, "Could not list models · type the model id")
+    }
+}
