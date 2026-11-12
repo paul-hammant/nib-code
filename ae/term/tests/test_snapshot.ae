@@ -1,0 +1,51 @@
+// Upstream's snapshot files, read and written. Run from the repository root.
+import std.spec
+import std.string
+import term.screen
+import term.snapshot
+
+main() {
+    fw = spec.init()
+
+    spec.describe(fw, "snapshot files") {
+        spec.it("reads every block of upstream's layout snapshots") callback {
+            snaps, err = snapshot.load("src/tui/layout_snapshots.txt")
+            spec.assert_str_eq(err, "", "parses")
+            spec.assert_eq(snaps.len, 12, "twelve layouts")
+            normal, ok = snapshot.find(snaps, "normal")
+            spec.assert_true(ok, "normal")
+            spec.assert_eq(normal.cols, 80, "cols")
+            spec.assert_eq(normal.rows, 12, "rows")
+            spec.assert_true(string.starts_with(normal.body, " Answer\n"), "first row")
+            _last, ok2 = snapshot.find(snaps, "notice")
+            spec.assert_true(ok2, "the last block")
+            _x, missing = snapshot.find(snaps, "nope")
+            spec.assert_false(missing, "absent")
+        }
+        spec.it("reads headers with words after the size") callback {
+            snaps, err = snapshot.load("src/tui/simple_snapshots.txt")
+            spec.assert_str_eq(err, "", "parses")
+            spec.assert_gt(snaps.len, 0, "blocks")
+            spec.assert_str_eq(snaps[0].name, "normal", "name")
+            spec.assert_str_eq(snaps[0].extra, "context 0%", "extra")
+            spec.assert_eq(snaps[0].rows, 24, "rows")
+        }
+        spec.it("refuses a block whose rows do not match its header") callback {
+            _s, err = snapshot.parse("--- a 4x2 ---\nab\n\n--- b 4x1 ---\ncd\nef\n")
+            spec.assert_contains(err, "snapshot 'b' has 2 rows, its header says 1", "names the block")
+            _s2, err2 = snapshot.parse("junk\n")
+            spec.assert_contains(err2, "header", "no header")
+        }
+        spec.it("writes a surface as a block that reads back the same") callback {
+            s = screen.surface(6, 3)
+            screen.draw(screen.window(s), [screen.seg("ab 你\nx")])
+            text = snapshot.block("mine", s, extra: "x1")
+            spec.assert_str_eq(text, "--- mine 6x3 x1 ---\nab 你\nx\n\n", "block")
+            snaps, err = snapshot.parse(text)
+            spec.assert_str_eq(err, "", "reads back")
+            spec.assert_str_eq(snaps[0].body, screen.text(s), "same body")
+        }
+    }
+
+    return spec.run_summary(fw)
+}

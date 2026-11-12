@@ -1,0 +1,126 @@
+// The diffing renderer: minimal bytes per frame, inside synchronized output.
+import std.spec
+import std.string
+import std.strbuilder
+import term.screen
+import term.render
+
+const START = "\x1b[?2026h\x1b[?25l\x1b[H\x1b[m"
+const END = "\x1b[?2026l"
+
+put(s: *screen.Surface, col: int, row: int, text: string, st: screen.Style) {
+    screen.draw(screen.child(screen.window(s), x_off: col, y_off: row), [screen.seg(text, st)], wrap: screen.WRAP_NONE)
+}
+
+plain() -> screen.Style { return screen.style() }
+
+sgr(cur: screen.Style, want: screen.Style, mode: int) -> string {
+    sb = strbuilder.new(32)
+    render.sgr_for(sb, cur, want, mode, false)
+    return strbuilder.finish(sb)
+}
+
+main() {
+    fw = spec.init()
+
+    spec.describe(fw, "frames") {
+        spec.it("a blank frame on a cleared terminal writes nothing") callback {
+            s = screen.surface(10, 3)
+            r = render.renderer(10, 3)
+            spec.assert_str_eq(render.render(r, s), "", "nothing")
+        }
+        spec.it("writes the changed cells in one synchronized update") callback {
+            s = screen.surface(10, 3)
+            r = render.renderer(10, 3)
+            put(s, 0, 0, "hi", plain())
+            spec.assert_str_eq(render.render(r, s), "${START}\x1b[1;1Hhi${END}", "first frame")
+            spec.assert_str_eq(render.render(r, s), "", "unchanged frame")
+        }
+        spec.it("repositions only where it skipped cells") callback {
+            s = screen.surface(10, 3)
+            r = render.renderer(10, 3)
+            put(s, 0, 0, "hello", plain())
+            render.render(r, s)
+            put(s, 1, 0, "a", plain())
+            put(s, 5, 2, "z", plain())
+            spec.assert_str_eq(render.render(r, s), "${START}\x1b[1;2Ha\x1b[3;6Hz${END}", "two cells")
+            put(s, 3, 1, "xyz", plain())
+            spec.assert_str_eq(render.render(r, s), "${START}\x1b[2;4Hxyz${END}", "a run is one move")
+        }
+        spec.it("redraws the half of a wide grapheme it replaced") callback {
+            s = screen.surface(4, 1)
+            r = render.renderer(4, 1)
+            put(s, 0, 0, "你", plain())
+            spec.assert_str_eq(render.render(r, s), "${START}\x1b[1;1H你${END}", "wide")
+            screen.surface_clear(s)
+            put(s, 0, 0, "a", plain())
+            spec.assert_str_eq(render.render(r, s), "${START}\x1b[1;1Ha ${END}", "the covered cell is drawn again")
+        }
+        spec.it("redraws everything after a refresh, nothing after a reset of a blank screen") callback {
+            s = screen.surface(3, 1)
+            r = render.renderer(3, 1)
+            put(s, 0, 0, "abc", plain())
+            render.render(r, s)
+            render.invalidate(r)
+            spec.assert_str_eq(render.render(r, s), "${START}\x1b[1;1Habc${END}", "refresh")
+            render.reset(r, 3, 1)
+            spec.assert_str_eq(render.render(r, s), "${START}\x1b[1;1Habc${END}", "reset: the terminal was cleared")
+        }
+        spec.it("places and shows the cursor, and moves it alone when only it moved") callback {
+            s = screen.surface(5, 2)
+            r = render.renderer(5, 2)
+            put(s, 0, 0, "ab", plain())
+            screen.show_cursor(screen.window(s), 2, 1)
+            spec.assert_str_eq(render.render(r, s), "${START}\x1b[1;1Hab\x1b[2;3H\x1b[?25h${END}", "with cursor")
+            spec.assert_str_eq(render.render(r, s), "", "still")
+            screen.show_cursor(screen.window(s), 0, 1)
+            spec.assert_str_eq(render.render(r, s), "${START}\x1b[2;1H\x1b[?25h${END}", "cursor only")
+            screen.set_cursor_shape(screen.window(s), screen.CURSOR_BEAM)
+            spec.assert_str_eq(render.render(r, s), "${START}\x1b[2;1H\x1b[?25h\x1b[6 q${END}", "shape")
+        }
+        spec.it("styles each changed cell from the one before it") callback {
+            s = screen.surface(6, 1)
+            r = render.renderer(6, 1)
+            put(s, 0, 0, "ab", screen.style(fg: screen.color_index(1), attrs: screen.BOLD))
+            put(s, 2, 0, "c", plain())
+            spec.assert_str_eq(render.render(r, s), "${START}\x1b[1;1H\x1b[31m\x1b[1mab\x1b[39m\x1b[22mc${END}", "red bold then plain")
+        }
+        spec.it("wraps links in OSC 8") callback {
+            s = screen.surface(4, 1)
+            r = render.renderer(4, 1)
+            screen.draw(screen.window(s), [screen.seg("go", plain(), link: "https://x.test"), screen.seg("!")])
+            spec.assert_str_eq(render.render(r, s), "${START}\x1b[1;1H\x1b]8;;https://x.test\x1b\\go\x1b]8;;\x1b\\!${END}", "link")
+        }
+    }
+
+    spec.describe(fw, "SGR") {
+        spec.it("picks the short forms for the 16 colours") callback {
+            spec.assert_str_eq(sgr(plain(), screen.style(fg: screen.color_index(2)), render.SGR_STANDARD), "\x1b[32m", "fg 2")
+            spec.assert_str_eq(sgr(plain(), screen.style(fg: screen.color_index(9)), render.SGR_STANDARD), "\x1b[91m", "fg 9")
+            spec.assert_str_eq(sgr(plain(), screen.style(bg: screen.color_index(4)), render.SGR_STANDARD), "\x1b[44m", "bg 4")
+            spec.assert_str_eq(sgr(plain(), screen.style(bg: screen.color_index(12)), render.SGR_STANDARD), "\x1b[104m", "bg 12")
+            spec.assert_str_eq(sgr(screen.style(fg: screen.color_index(2)), plain(), render.SGR_STANDARD), "\x1b[39m", "back to default")
+        }
+        spec.it("uses colons or semicolons for 256 and direct colours") callback {
+            p = screen.style(fg: screen.color_index(200), bg: screen.color_rgb(1, 2, 3))
+            spec.assert_str_eq(sgr(plain(), p, render.SGR_STANDARD), "\x1b[38:5:200m\x1b[48:2:1:2:3m", "standard")
+            spec.assert_str_eq(sgr(plain(), p, render.SGR_LEGACY), "\x1b[38;5;200m\x1b[48;2;1;2;3m", "legacy")
+            u = screen.style(ul: screen.color_index(5), ul_style: screen.UL_CURLY)
+            spec.assert_str_eq(sgr(plain(), u, render.SGR_STANDARD), "\x1b[58:5:5m\x1b[4:3m", "underline colour and style")
+        }
+        spec.it("re-sets bold or dim after the reset that clears both, as libvaxis does") callback {
+            b = screen.style(attrs: screen.BOLD)
+            d = screen.style(attrs: screen.DIM)
+            bd = screen.style(attrs: screen.BOLD | screen.DIM)
+            spec.assert_str_eq(sgr(b, d, render.SGR_STANDARD), "\x1b[22m\x1b[2m\x1b[2m", "bold to dim")
+            spec.assert_str_eq(sgr(bd, b, render.SGR_STANDARD), "\x1b[22m\x1b[1m", "bold+dim to bold")
+        }
+        spec.it("turns each attribute on and off") callback {
+            all = screen.style(attrs: screen.ITALIC | screen.BLINK | screen.REVERSE | screen.INVISIBLE | screen.STRIKETHROUGH)
+            spec.assert_str_eq(sgr(plain(), all, render.SGR_STANDARD), "\x1b[3m\x1b[5m\x1b[7m\x1b[8m\x1b[9m", "on")
+            spec.assert_str_eq(sgr(all, plain(), render.SGR_STANDARD), "\x1b[23m\x1b[25m\x1b[27m\x1b[28m\x1b[29m", "off")
+        }
+    }
+
+    return spec.run_summary(fw)
+}

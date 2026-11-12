@@ -1,0 +1,286 @@
+// term.render: the diffing renderer. It keeps the frame the terminal last
+// showed and writes only the cells that changed, inside a synchronized-output
+// bracket (mode 2026), so a frame is drawn in one piece and an unchanged
+// frame writes nothing at all.
+//
+// The algorithm is libvaxis's Vaxis.render for the alternate screen: walk
+// the cells in order, skip the ones that match the last frame (and the
+// cells a wide grapheme covers), reposition with CUP after a skip, and emit
+// only the SGR attributes that differ from the previous cell written. The
+// escape sequences are libvaxis's ctlseqs.zig. Not ported: kitty graphics,
+// scaled text (OSC 66), explicit width, secondary cursors, mouse shapes and
+// rendering on the primary screen (upstream nib always uses the alternate
+// one). libvaxis also starts a render on every frame while the cursor is
+// shown (its secondary-cursor check is inverted); this one does not.
+
+import std.string
+import std.strbuilder
+import term.screen
+
+exports(
+    Renderer, renderer, render, reset, invalidate, SGR_STANDARD, SGR_LEGACY,
+    SYNC_SET, SYNC_RESET, HIDE_CURSOR, SHOW_CURSOR, HOME, ERASE_BELOW, SGR_RESET,
+    sgr_for
+)
+
+const SYNC_SET = "\x1b[?2026h"
+const SYNC_RESET = "\x1b[?2026l"
+const HIDE_CURSOR = "\x1b[?25l"
+const SHOW_CURSOR = "\x1b[?25h"
+const HOME = "\x1b[H"
+const ERASE_BELOW = "\x1b[J"
+const SGR_RESET = "\x1b[m"
+
+// Colon-separated sub-parameters (ITU T.416, what modern terminals expect)
+// or semicolons (what older ones, Windows conhost and VS Code's terminal
+// read).
+const SGR_STANDARD = 0
+const SGR_LEGACY = 1
+
+struct Renderer {
+    // what the terminal shows now
+    last: *screen.Surface
+    // per cell: covered by the wide grapheme before it in the last frame
+    skipped: int[]
+    // the next render rewrites every cell
+    refresh: bool
+    cursor_row: int
+    cursor_col: int
+    last_cursor_vis: bool
+    last_cursor_shape: int
+    sgr: int
+    no_color: bool
+}
+
+renderer(cols: int, rows: int, sgr: int = 0) -> *Renderer {
+    r = heap.new(Renderer)
+    r.last = screen.surface(cols, rows)
+    r.sgr = sgr
+    reset(r, cols, rows)
+    return r
+}
+
+// The terminal was cleared (and maybe resized): the last frame is blank.
+reset(r: *Renderer, cols: int, rows: int) {
+    screen.surface_resize(r.last, cols, rows)
+    for i in 0..r.last.cells.len {
+        r.last.cells[i] = _default_cell()
+    }
+    r.skipped = make([]int, cols * rows)
+    r.cursor_row = 0
+    r.cursor_col = 0
+    r.last_cursor_vis = false
+    r.refresh = false
+}
+
+_default_cell() -> screen.Cell {
+    c = screen.blank_cell()
+    c.is_default = true
+    return c
+}
+
+// The next render redraws everything (after the screen was disturbed).
+invalidate(r: *Renderer) {
+    r.refresh = true
+}
+
+_same(last: screen.Cell, cell: screen.Cell) -> bool {
+    if last.is_default && cell.is_default {
+        return true
+    }
+    return last.grapheme == cell.grapheme && screen.style_eq(last.style, cell.style) && last.link == cell.link && last.link_params == cell.link_params
+}
+
+// The SGR sequences that move the terminal from style `cur` to `want`.
+sgr_for(sb: ptr, cur: screen.Style, want: screen.Style, sgr: int, no_color: bool) {
+    sep = if sgr == SGR_LEGACY { ";" } else { ":" }
+    if !no_color && cur.fg != want.fg {
+        _color(sb, want.fg, 30, 90, "38", "39", sep)
+    }
+    if !no_color && cur.bg != want.bg {
+        _color(sb, want.bg, 40, 100, "48", "49", sep)
+    }
+    if !no_color && cur.ul != want.ul {
+        c = want.ul
+        if screen.color_is_default(c) {
+            strbuilder.append(sb, "\x1b[59m")
+        } else if screen.color_is_index(c) {
+            strbuilder.append(sb, "\x1b[58${sep}5${sep}${screen.color_value(c)}m")
+        } else {
+            strbuilder.append(sb, "\x1b[58${sep}2${sep}${screen.color_r(c)}${sep}${screen.color_g(c)}${sep}${screen.color_b(c)}m")
+        }
+    }
+    if cur.ul_style != want.ul_style {
+        u = match want.ul_style {
+            1 -> "\x1b[4m"
+            2 -> "\x1b[4:2m"
+            3 -> "\x1b[4:3m"
+            4 -> "\x1b[4:4m"
+            5 -> "\x1b[4:5m"
+            _ -> "\x1b[24m"
+        }
+        strbuilder.append(sb, u)
+    }
+    cb = (cur.attrs & screen.BOLD) != 0
+    wb = (want.attrs & screen.BOLD) != 0
+    cd = (cur.attrs & screen.DIM) != 0
+    wd = (want.attrs & screen.DIM) != 0
+    // 22 clears bold and dim together, so each re-sets the other
+    if cb != wb {
+        strbuilder.append(sb, if wb { "\x1b[1m" } else { "\x1b[22m" })
+        if wd {
+            strbuilder.append(sb, "\x1b[2m")
+        }
+    }
+    if cd != wd {
+        strbuilder.append(sb, if wd { "\x1b[2m" } else { "\x1b[22m" })
+        if wb {
+            strbuilder.append(sb, "\x1b[1m")
+        }
+    }
+    _flag(sb, cur, want, screen.ITALIC, "\x1b[3m", "\x1b[23m")
+    _flag(sb, cur, want, screen.BLINK, "\x1b[5m", "\x1b[25m")
+    _flag(sb, cur, want, screen.REVERSE, "\x1b[7m", "\x1b[27m")
+    _flag(sb, cur, want, screen.INVISIBLE, "\x1b[8m", "\x1b[28m")
+    _flag(sb, cur, want, screen.STRIKETHROUGH, "\x1b[9m", "\x1b[29m")
+}
+
+_flag(sb: ptr, cur: screen.Style, want: screen.Style, bit: int, on: string, off: string) {
+    c = (cur.attrs & bit) != 0
+    w = (want.attrs & bit) != 0
+    if c != w {
+        strbuilder.append(sb, if w { on } else { off })
+    }
+}
+
+_color(sb: ptr, c: int, base: int, bright: int, ext: string, reset: string, sep: string) {
+    if screen.color_is_default(c) {
+        strbuilder.append(sb, "\x1b[${reset}m")
+        return
+    }
+    v = screen.color_value(c)
+    if screen.color_is_index(c) {
+        if v < 8 {
+            strbuilder.append(sb, "\x1b[${base + v}m")
+        } else if v < 16 {
+            strbuilder.append(sb, "\x1b[${bright + v - 8}m")
+        } else {
+            strbuilder.append(sb, "\x1b[${ext}${sep}5${sep}${v}m")
+        }
+        return
+    }
+    strbuilder.append(sb, "\x1b[${ext}${sep}2${sep}${screen.color_r(c)}${sep}${screen.color_g(c)}${sep}${screen.color_b(c)}m")
+}
+
+_start(sb: ptr) {
+    strbuilder.append(sb, SYNC_SET)
+    strbuilder.append(sb, HIDE_CURSOR)
+    strbuilder.append(sb, HOME)
+    strbuilder.append(sb, SGR_RESET)
+}
+
+// The bytes that bring the terminal from the last frame to `s`; "" when
+// nothing changed. `s` must be the renderer's size (reset it on resize).
+render(r: *Renderer, s: *screen.Surface) -> string {
+    last = r.last
+    if last.width != s.width || last.height != s.height {
+        reset(r, s.width, s.height)
+        r.refresh = true
+    }
+    sb = strbuilder.new(256)
+    started = false
+    cursor_moved = s.cursor_vis && (s.cursor_row != r.cursor_row || s.cursor_col != r.cursor_col)
+    if r.refresh || s.cursor_vis != r.last_cursor_vis || s.cursor_shape != r.last_cursor_shape || cursor_moved {
+        _start(sb)
+        started = true
+    }
+    reposition = true
+    row = 0
+    col = 0
+    cur_style = screen.style()
+    cur_link = ""
+    pos_row = 0
+    pos_col = 0
+    total = s.cells.len
+    i = 0
+    while i < total {
+        cell = s.cells[i]
+        w = cell.width
+        if w == 0 {
+            w = screen.gwidth_method(cell.grapheme, s.width_method)
+            if w < 1 {
+                w = 1
+            }
+        }
+        if col >= s.width {
+            row = row + 1
+            col = 0
+            if !cell.wrapped {
+                reposition = true
+            }
+        }
+        lastc = last.cells[i]
+        unchanged = !r.refresh && _same(lastc, cell) && (r.skipped[i] & 1) == 0
+        if unchanged {
+            reposition = true
+            if string.length(cur_link) > 0 {
+                strbuilder.append(sb, "\x1b]8;;\x1b\\")
+                cur_link = ""
+            }
+        } else {
+            if !started {
+                _start(sb)
+                started = true
+            }
+            r.skipped[i] = 0
+            last.cells[i] = cell
+            if reposition {
+                reposition = false
+                cur_link = ""
+                strbuilder.append(sb, "\x1b[${row + 1};${col + 1}H")
+            }
+            sgr_for(sb, cur_style, cell.style, r.sgr, r.no_color)
+            cur_style = cell.style
+            if cell.link != cur_link {
+                params = if string.length(cell.link) == 0 { "" } else { cell.link_params }
+                strbuilder.append(sb, "\x1b]8;${params};${cell.link}\x1b\\")
+                cur_link = cell.link
+            }
+            strbuilder.append(sb, cell.grapheme)
+            pos_row = row
+            pos_col = col + w
+        }
+        // the cells this grapheme covers are not drawn
+        j = i + 1
+        while j < i + w && j < total {
+            r.skipped[j] = 1
+            j = j + 1
+        }
+        col = col + w
+        i = i + w
+    }
+    if !started {
+        r.refresh = false
+        return ""
+    }
+    if string.length(cur_link) > 0 {
+        strbuilder.append(sb, "\x1b]8;;\x1b\\")
+    }
+    if s.cursor_vis {
+        strbuilder.append(sb, "\x1b[${s.cursor_row + 1};${s.cursor_col + 1}H")
+        r.cursor_row = s.cursor_row
+        r.cursor_col = s.cursor_col
+        strbuilder.append(sb, SHOW_CURSOR)
+    } else {
+        r.cursor_row = pos_row
+        r.cursor_col = pos_col
+    }
+    r.last_cursor_vis = s.cursor_vis
+    if s.cursor_shape != r.last_cursor_shape {
+        strbuilder.append(sb, "\x1b[${s.cursor_shape} q")
+        r.last_cursor_shape = s.cursor_shape
+    }
+    strbuilder.append(sb, SYNC_RESET)
+    r.refresh = false
+    return strbuilder.finish(sb)
+}

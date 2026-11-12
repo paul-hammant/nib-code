@@ -1,0 +1,160 @@
+// The in-memory terminal driven the way a spec drives a TUI: events in,
+// a program step, the shown screen out.
+import std.spec
+import std.string
+import term
+import term.screen
+import term.input
+import term.driver
+import term.snapshot
+
+// A tiny program: handles every pending event (a resize resizes, a key or a
+// mouse event is listed), draws the last few in a box, renders.
+step(t: *term.Terminal, log: string[]) -> string[] {
+    out = log
+    while true {
+        e = term.poll(t, 0)
+        if !input.is_event(e) {
+            break
+        }
+        match e {
+            Winsize -> { term.resize(t, e.cols, e.rows) }
+            _ -> { out.push(input.describe(e)) }
+        }
+    }
+    w = term.window(t)
+    screen.clear(w)
+    inner = screen.child_bordered(w, screen.BORDER_ALL)
+    start = if out.len > inner.height { out.len - inner.height } else { 0 }
+    for i in start..out.len {
+        screen.draw(screen.child(inner, y_off: i - start), [screen.seg(out[i])], wrap: screen.WRAP_NONE)
+    }
+    screen.show_cursor(inner, 0, 0)
+    term.render(t)
+    return out
+}
+
+main() {
+    fw = spec.init()
+
+    spec.describe(fw, "the in-memory terminal") {
+        spec.it("starts with a Winsize event, then has nothing, and its clock moves only when told") callback {
+            t = term.memory(20, 5)
+            e = term.poll(t, 0)
+            spec.assert_str_eq(input.describe(e), "winsize 20x5", "first event")
+            spec.assert_false(input.is_event(term.poll(t, 100)), "then nothing")
+            spec.assert_eq_long(term.now_ms(t), 100, "the empty poll took its timeout")
+            term.advance(t, 16)
+            spec.assert_eq_long(term.now_ms(t), 116, "advanced")
+        }
+        spec.it("returns pushed events and fed bytes in order") callback {
+            t = term.memory(20, 5)
+            term.poll(t, 0)
+            term.push_event(t, input.FocusIn {})
+            driver.press(t, "ctrl+s")
+            driver.type_text(t, "hi")
+            spec.assert_str_eq(input.describe(term.poll(t, 0)), "focus_in", "pushed")
+            spec.assert_str_eq(input.describe(term.poll(t, 0)), "key ctrl+s", "pressed")
+            spec.assert_str_eq(input.describe(term.poll(t, 0)), "key h text=\"h\"", "typed")
+            spec.assert_str_eq(input.describe(term.poll(t, 0)), "key i text=\"i\"", "typed")
+            spec.assert_false(input.is_event(term.poll(t, 0)), "drained")
+        }
+        spec.it("shows what was rendered, not what is being drawn") callback {
+            t = term.memory(10, 2)
+            screen.draw(term.window(t), [screen.seg("hello")])
+            driver.expect_row(t, 0, "")
+            term.render(t)
+            driver.expect_row(t, 0, "hello")
+            spec.assert_eq(term.frames(t), 1, "one frame")
+            spec.assert_contains(term.written(t), "hello", "the frame's bytes were written")
+        }
+        spec.it("records clipboard copies, titles and notifications") callback {
+            t = term.memory(10, 2)
+            term.copy_to_clipboard(t, "copied text")
+            driver.expect_clipboard(t, "copied text")
+            spec.assert_contains(term.written(t), "\x1b]52;c;Y29waWVkIHRleHQ=\x1b\\", "OSC 52")
+            term.set_title(t, "nib")
+            spec.assert_str_eq(term.title(t), "nib", "title")
+            term.notify(t, "nib", "done")
+            spec.assert_eq(term.notifications(t).len, 1, "one notification")
+            spec.assert_contains(term.written(t), "\x1b]777;notify;nib;done\x1b\\", "OSC 777")
+        }
+        spec.it("turns on what query_terminal finds and turns it all off on close") callback {
+            t = term.memory(10, 2)
+            term.enter_alt_screen(t)
+            term.query_terminal(t, 100)
+            term.set_bracketed_paste(t, true)
+            term.set_mouse_mode(t, true)
+            spec.assert_eq(term.surface(t).width_method, screen.WIDTH_UNICODE, "mode 2027 widths")
+            on = term.take_written(t)
+            spec.assert_contains(on, "\x1b[>29u", "kitty flags pushed")
+            spec.assert_contains(on, "\x1b[?2004h", "paste")
+            spec.assert_contains(on, "\x1b[?1002;1003;1004;1006h", "mouse")
+            term.close(t)
+            off = term.take_written(t)
+            spec.assert_contains(off, "\x1b[<u", "kitty popped")
+            spec.assert_contains(off, "\x1b[?2004l", "paste off")
+            spec.assert_contains(off, "\x1b[?1002;1003;1004;1006;1016l", "mouse off")
+            spec.assert_contains(off, "\x1b[H\x1b[J\x1b[?1049l", "cleared, then the alternate screen left")
+        }
+    }
+
+    spec.describe(fw, "driving a program") {
+        spec.it("keys, typing, paste and mouse reach it and its screen shows them") callback {
+            t = term.memory(40, 8)
+            log = make([]string, 0)
+            log = step(t, log)
+            driver.press(t, "ctrl+s")
+            driver.type_text(t, "a")
+            driver.click(t, 3, 4)
+            driver.wheel(t, -1)
+            log = step(t, log)
+            driver.expect_row_contains(t, "key ctrl+s")
+            driver.expect_row_contains(t, "mouse press button=0 at 3,4")
+            driver.expect_row_contains(t, "mouse release button=0 at 3,4")
+            driver.expect_row_contains(t, "mouse press button=65 at 0,0")
+            driver.expect_no_row_contains(t, "paste")
+            driver.expect_cursor(t, 1, 1)
+            driver.expect_cell(t, 0, 0, "╭")
+            spec.assert_eq(driver.find_row(t, "key a"), 2, "the typed key's row")
+        }
+        spec.it("resizes when the terminal does") callback {
+            t = term.memory(30, 6)
+            log = make([]string, 0)
+            log = step(t, log)
+            driver.resize(t, 24, 4)
+            log = step(t, log)
+            spec.assert_eq(term.cols(t), 24, "cols")
+            spec.assert_eq(term.shown(t).height, 4, "shown rows")
+            driver.expect_row(t, 3, "╰──────────────────────╯")
+        }
+        spec.it("compares the whole screen with a snapshot") callback {
+            t = term.memory(12, 4)
+            log = make([]string, 0)
+            log = step(t, log)
+            driver.press(t, "enter")
+            log = step(t, log)
+            body = "╭──────────╮\n│key enter │\n│          │\n╰──────────╯\n"
+            spec.assert_str_eq(driver.screen_diff(t, body), "", "same")
+            driver.expect_screen(t, body)
+            spec.assert_contains(driver.screen_diff(t, "╭──────────╮\n│key escape│\n│          │\n╰──────────╯\n"), "! 1:", "a different row is named")
+        }
+        spec.it("draws a snapshot of upstream's layout cell for cell") callback {
+            snaps, err = snapshot.load("src/tui/layout_snapshots.txt")
+            spec.assert_str_eq(err, "", "loads")
+            narrow, found = snapshot.find(snaps, "narrow")
+            spec.assert_true(found, "narrow is there")
+            t = term.memory(narrow.cols, narrow.rows)
+            term.poll(t, 0)
+            w = term.window(t)
+            screen.draw(screen.child(w, x_off: 1), [screen.seg("Answer")], wrap: screen.WRAP_NONE)
+            box = screen.child_bordered(screen.child(w, y_off: narrow.rows - 3), screen.BORDER_ALL)
+            screen.draw(screen.child(box, x_off: 1), [screen.seg("Ask about this project")], wrap: screen.WRAP_NONE)
+            screen.draw(screen.child(w, x_off: 2, y_off: narrow.rows - 1), [screen.seg(" mock ")], wrap: screen.WRAP_NONE)
+            term.render(t)
+            driver.expect_screen(t, narrow.body)
+        }
+    }
+
+    return spec.run_summary(fw)
+}

@@ -1,0 +1,242 @@
+// Input decoding and encoding: what terminals send, as events, and back.
+import std.spec
+import std.string
+import std.strbuilder
+import term.input
+
+// The events in the bytes, described and joined with "; ".
+decoded(bytes: string) -> string {
+    evs = input.decode_all(bytes)
+    sb = strbuilder.new(64)
+    for i in 0..evs.len {
+        if i > 0 {
+            strbuilder.append(sb, "; ")
+        }
+        strbuilder.append(sb, input.describe(evs[i]))
+    }
+    return strbuilder.finish(sb)
+}
+
+// The same bytes fed one at a time, as a slow link delivers them.
+decoded_bytewise(bytes: string) -> string {
+    d = input.decoder()
+    sb = strbuilder.new(64)
+    first = true
+    n = string.length(bytes)
+    for i in 0..n {
+        input.feed(d, string.substring(bytes, i, i + 1))
+        while true {
+            e = input.next_event(d, false)
+            if !input.is_event(e) {
+                break
+            }
+            if !first {
+                strbuilder.append(sb, "; ")
+            }
+            strbuilder.append(sb, input.describe(e))
+            first = false
+        }
+    }
+    while true {
+        e = input.next_event(d, true)
+        if !input.is_event(e) {
+            break
+        }
+        if !first {
+            strbuilder.append(sb, "; ")
+        }
+        strbuilder.append(sb, input.describe(e))
+        first = false
+    }
+    return strbuilder.finish(sb)
+}
+
+roundtrip(spec_text: string, kitty: bool) -> string {
+    k, err = input.key_from_spec(spec_text)
+    if err != "" {
+        return "error: ${err}"
+    }
+    return decoded(input.encode_key(k, kitty))
+}
+
+main() {
+    fw = spec.init()
+
+    spec.describe(fw, "legacy keys") {
+        spec.it("printable text is a key with its text") callback {
+            spec.assert_str_eq(decoded("aZ"), "key a text=\"a\"; key Z text=\"Z\"", "ascii")
+            spec.assert_str_eq(decoded("你é"), "key 你 text=\"你\"; key é text=\"é\"", "utf-8")
+        }
+        spec.it("a grapheme cluster is one key") callback {
+            spec.assert_str_eq(decoded("e\xcc\x81"), "key multicodepoint text=\"e\xcc\x81\"", "e + combining acute")
+            spec.assert_str_eq(decoded("👩‍🚀"), "key multicodepoint text=\"👩‍🚀\"", "zwj sequence")
+        }
+        spec.it("control bytes are ctrl + a letter, as libvaxis maps them") callback {
+            spec.assert_str_eq(decoded("\x03\x13\x00"), "key ctrl+c; key ctrl+s; key ctrl+@", "ctrl")
+            spec.assert_str_eq(decoded("\r\t\x7f\x08\n"), "key enter; key tab; key backspace; key backspace; key ctrl+j", "named controls")
+        }
+        spec.it("ESC then a byte is alt + that byte") callback {
+            spec.assert_str_eq(decoded("\x1bx\x1b\x1b"), "key alt+x; key alt+escape", "alt")
+        }
+        spec.it("a lone ESC is the Escape key once no more bytes come") callback {
+            spec.assert_str_eq(decoded("\x1b"), "key escape", "escape")
+            d = input.decoder()
+            input.feed(d, "\x1b")
+            spec.assert_false(input.is_event(input.next_event(d, false)), "waits while more may come")
+            spec.assert_str_eq(input.describe(input.next_event(d, true)), "key escape", "then escape")
+        }
+        spec.it("cursor and function keys, with modifiers") callback {
+            spec.assert_str_eq(decoded("\x1b[A\x1b[B\x1b[C\x1b[D\x1b[H\x1b[F"), "key up; key down; key right; key left; key home; key end", "arrows")
+            spec.assert_str_eq(decoded("\x1bOA\x1bOP\x1bOS"), "key up; key f1; key f4", "ss3")
+            spec.assert_str_eq(decoded("\x1b[1;5A\x1b[1;2B\x1b[1;3C"), "key ctrl+up; key shift+down; key alt+right", "mods")
+            spec.assert_str_eq(decoded("\x1b[5~\x1b[6~\x1b[3~\x1b[2~\x1b[15~\x1b[24;5~"), "key page_up; key page_down; key delete; key insert; key f5; key ctrl+f12", "tilde")
+            spec.assert_str_eq(decoded("\x1b[Z"), "key shift+tab", "backtab")
+        }
+        spec.it("arrive split across reads and still decode") callback {
+            b = "\x1b[1;5A你\x1b[<0;3;4M\x1b[200~x\x1b[201~"
+            spec.assert_str_eq(decoded_bytewise(b), decoded(b), "bytewise == whole")
+        }
+    }
+
+    spec.describe(fw, "kitty keyboard protocol") {
+        spec.it("CSI u keys with modifiers, shifted and base-layout code points") callback {
+            spec.assert_str_eq(decoded("\x1b[97u"), "key a", "bare")
+            spec.assert_str_eq(decoded("\x1b[97;5u"), "key ctrl+a", "ctrl")
+            spec.assert_str_eq(decoded("\x1b[97:65;2;65u"), "key shift+a text=\"A\" shifted=65", "shift")
+            spec.assert_str_eq(decoded("\x1b[13u\x1b[27u\x1b[57399u"), "key enter; key escape; key \xee\x80\xb7", "functional")
+        }
+        spec.it("shift + a printable key with no text gets libvaxis's text") callback {
+            spec.assert_str_eq(decoded("\x1b[32;2u"), "key shift+space text=\" \" shifted=32", "shift+space")
+        }
+        spec.it("releases are dropped") callback {
+            spec.assert_str_eq(decoded("\x1b[97;1:3u\x1b[97u"), "key a", "release")
+        }
+        spec.it("the capability reply is a Capability") callback {
+            spec.assert_str_eq(decoded("\x1b[?1u"), "capability 2", "kitty reply")
+        }
+    }
+
+    spec.describe(fw, "mouse") {
+        spec.it("SGR press, release, drag, motion and wheel") callback {
+            spec.assert_str_eq(decoded("\x1b[<0;1;1M\x1b[<0;1;1m"), "mouse press button=0 at 0,0; mouse release button=0 at 0,0", "click")
+            spec.assert_str_eq(decoded("\x1b[<32;5;6M\x1b[<35;7;8M"), "mouse drag button=0 at 4,5; mouse motion button=3 at 6,7", "motion")
+            spec.assert_str_eq(decoded("\x1b[<64;2;3M\x1b[<65;2;3M"), "mouse press button=64 at 1,2; mouse press button=65 at 1,2", "wheel")
+            spec.assert_str_eq(decoded("\x1b[<20;1;1M"), "mouse press button=0 at 0,0 mods=5", "shift+ctrl")
+        }
+        spec.it("X10 reports") callback {
+            spec.assert_str_eq(decoded("\x1b[M !\""), "mouse press button=0 at 0,1", "x10")
+        }
+    }
+
+    spec.describe(fw, "paste, focus, colours, size, capabilities") {
+        spec.it("bracketed paste is start, the keys, end") callback {
+            spec.assert_str_eq(decoded("\x1b[200~a\nb\x1b[201~"), "paste_start; key a text=\"a\"; key ctrl+j; key b text=\"b\"; paste_end", "paste")
+        }
+        spec.it("OSC 52 clipboard replies are a Paste") callback {
+            spec.assert_str_eq(decoded("\x1b]52;c;aGVsbG8=\x1b\\"), "paste \"hello\"", "osc52")
+        }
+        spec.it("focus in and out") callback {
+            spec.assert_str_eq(decoded("\x1b[I\x1b[O"), "focus_in; focus_out", "focus")
+        }
+        spec.it("OSC 10/11/4 colour reports, ST or BEL ended") callback {
+            spec.assert_str_eq(decoded("\x1b]11;rgb:0000/ffff/8080\x1b\\"), "color_report 11/0 0,255,128", "bg")
+            spec.assert_str_eq(decoded("\x1b]10;rgb:1111/2222/3333\x07"), "color_report 10/0 17,34,51", "fg bel")
+            spec.assert_str_eq(decoded("\x1b]4;5;rgb:aaaa/bbbb/cccc\x1b\\"), "color_report 4/5 170,187,204", "palette")
+        }
+        spec.it("colour scheme notifications") callback {
+            spec.assert_str_eq(decoded("\x1b[?997;1n\x1b[?997;2n"), "color_scheme dark; color_scheme light", "scheme")
+        }
+        spec.it("in-band resize") callback {
+            spec.assert_str_eq(decoded("\x1b[48;24;80;480;640t"), "winsize 80x24", "2048")
+        }
+        spec.it("DA1 and DECRQM replies") callback {
+            spec.assert_str_eq(decoded("\x1b[?62;22c\x1b[?2027;2$y\x1b[?2031;1$y\x1b[?2026;0$y"), "capability 1; capability 3; capability 4", "caps")
+        }
+        spec.it("unknown sequences are swallowed whole") callback {
+            spec.assert_str_eq(decoded("\x1bP+q544e\x1b\\\x1b[?1;2;3zq"), "key q text=\"q\"", "dcs and unknown csi")
+        }
+    }
+
+    spec.describe(fw, "encode then decode") {
+        spec.it("every named key and chord survives the kitty encoding") callback {
+            const CHORDS[] = ["a", "A", "ctrl+s", "ctrl+shift+s", "alt+x", "enter", "shift+enter", "tab",
+                "shift+tab", "escape", "backspace", "ctrl+backspace", "up", "ctrl+up", "shift+down", "left", "right",
+                "home", "end", "page_up", "page_down", "insert", "delete", "f1", "f4", "shift+f5", "f12", "space",
+                "ctrl+space", "super+k", "你", "ctrl+alt+shift+right"]
+            for i in 0..CHORDS.len {
+                k, err = input.key_from_spec(CHORDS[i])
+                spec.assert_str_eq(err, "", CHORDS[i])
+                back = input.decode_all(input.encode_key(k, true))
+                spec.assert_eq(back.len, 1, "one event for ${CHORDS[i]}")
+                spec.assert_str_eq(input.describe(back[0]), input.describe(k), "kitty ${CHORDS[i]}")
+            }
+        }
+        spec.it("legacy encodings decode to what xterm users get") callback {
+            spec.assert_str_eq(roundtrip("ctrl+s", false), "key ctrl+s", "ctrl+s")
+            spec.assert_str_eq(roundtrip("alt+x", false), "key alt+x", "alt+x")
+            spec.assert_str_eq(roundtrip("A", false), "key A text=\"A\"", "upper case is the text")
+            spec.assert_str_eq(roundtrip("ctrl+up", false), "key ctrl+up", "ctrl+up")
+            spec.assert_str_eq(roundtrip("f2", false), "key f2", "f2")
+            spec.assert_str_eq(roundtrip("shift+tab", false), "key shift+tab", "backtab")
+            spec.assert_str_eq(roundtrip("enter", false), "key enter", "enter")
+            spec.assert_str_eq(roundtrip("f7", false), "key f7", "f7")
+        }
+        spec.it("mouse events survive SGR encoding") callback {
+            kinds = [input.MOUSE_PRESS, input.MOUSE_RELEASE, input.MOUSE_DRAG, input.MOUSE_PRESS]
+            buttons = [input.BUTTON_LEFT, input.BUTTON_RIGHT, input.BUTTON_MIDDLE, input.WHEEL_DOWN]
+            for i in 0..4 {
+                m = input.Mouse { col: 10 + i, row: 200 + i, button: buttons[i], mods: input.MOUSE_CTRL, kind: kinds[i] }
+                back = input.decode_all(input.encode_mouse(m))
+                spec.assert_eq(back.len, 1, "one event")
+                spec.assert_str_eq(input.describe(back[0]), input.describe(m), "mouse ${i}")
+            }
+            mv = input.Mouse { col: 3, row: 4, button: input.BUTTON_NONE, mods: 0, kind: input.MOUSE_MOTION }
+            spec.assert_str_eq(decoded(input.encode_mouse(mv)), input.describe(mv), "motion")
+        }
+        spec.it("paste and focus survive") callback {
+            spec.assert_str_eq(decoded(input.encode_paste("x")), "paste_start; key x text=\"x\"; paste_end", "paste")
+            spec.assert_str_eq(decoded(input.encode_focus(true)), "focus_in", "focus")
+        }
+    }
+
+    spec.describe(fw, "key specs and matching") {
+        spec.it("parses chords and refuses nonsense") callback {
+            k, err = input.key_from_spec("Ctrl+Shift+Page_Up")
+            spec.assert_str_eq(err, "", "ok")
+            spec.assert_eq(k.codepoint, input.PAGE_UP, "page up")
+            spec.assert_eq(k.mods, input.CTRL | input.SHIFT, "mods")
+            _k2, e2 = input.key_from_spec("ctrl+nonsense")
+            spec.assert_contains(e2, "unknown key", "bad key")
+            _k3, e3 = input.key_from_spec("hyperduper+a")
+            spec.assert_contains(e3, "unknown modifier", "bad modifier")
+            k4, e4 = input.key_from_spec("ctrl++")
+            spec.assert_str_eq(e4, "", "plus key")
+            spec.assert_eq(k4.codepoint, 43, "+")
+        }
+        spec.it("matches as libvaxis does: exact, by text, by shifted code point") callback {
+            legacy_a = input.decode_all("A")[0]
+            kitty_a = input.decode_all("\x1b[97:65;2;65u")[0]
+            match legacy_a {
+                Key -> {
+                    spec.assert_true(input.matches(legacy_a, 65), "legacy A is 'A'")
+                    spec.assert_true(input.matches(legacy_a, 97, input.SHIFT), "legacy A is shift+a by text")
+                    spec.assert_false(input.matches(legacy_a, 97), "legacy A is not a")
+                }
+                _ -> { spec.fail("not a key") }
+            }
+            match kitty_a {
+                Key -> {
+                    spec.assert_true(input.matches(kitty_a, 97, input.SHIFT), "kitty shift+a exact")
+                    spec.assert_true(input.matches(kitty_a, 65), "kitty shift+a is 'A' by shifted code point")
+                    spec.assert_false(input.matches(kitty_a, 97), "kitty shift+a is not a")
+                }
+                _ -> { spec.fail("not a key") }
+            }
+            caps = input.key(97, mods: input.CAPS_LOCK | input.CTRL)
+            spec.assert_true(input.matches(caps, 97, input.CTRL), "locks are ignored")
+            spec.assert_false(input.matches(caps, 97), "ctrl is not")
+        }
+    }
+
+    return spec.run_summary(fw)
+}

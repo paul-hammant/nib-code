@@ -1,0 +1,670 @@
+// term: a terminal, passed explicitly. There are two: a real one over a tty
+// (raw mode, alternate screen, mouse, bracketed paste, the kitty keyboard
+// protocol, a diffing renderer, SIGWINCH) and an in-memory one that specs
+// drive (events pushed in, the shown grid read out, a fake clock). Both are
+// a *Terminal and answer the same calls, so code written against one runs on
+// the other. Nothing here is module-level state: every call takes the
+// terminal it acts on. (The C shim's restore table is process-wide because
+// signals are; see tty.c.)
+//
+// The calls mirror libvaxis's Vaxis + Loop + Tty, which upstream nib uses:
+// open/close (Tty.init, deinit), enter_alt_screen, query_terminal,
+// set_bracketed_paste, set_mouse_mode, query_color,
+// subscribe_color_scheme, window (vx.window()), resize (vx.resize), render
+// (vx.render), poll (loop.nextEvent/tryEvent with a timeout),
+// copy_to_clipboard, notify, set_title.
+
+@source("tty.c")
+
+import std.string
+import std.strbuilder
+import std.bytes
+import std.encoding
+import std.os(os_getenv)
+import term.screen
+import term.input
+import term.render
+
+exports(
+    Terminal, open, open_fd, memory, close, is_memory,
+    enter_alt_screen, exit_alt_screen, set_mouse_mode, set_bracketed_paste,
+    set_kitty_keyboard, query_terminal, query_color, subscribe_color_scheme,
+    set_title, notify, copy_to_clipboard, write_raw,
+    window, surface, resize, render, refresh, size, cols, rows,
+    poll, now_ms, KITTY_DEFAULT_FLAGS,
+    // in-memory
+    push_event, push_bytes, advance, set_size, shown, shown_row, shown_text, shown_cell,
+    written, take_written, clipboard, title, notifications, frames, pending_events,
+    // C shim, for tests
+    aeterm_openpty, aeterm_pty_slave, aeterm_set_size, aeterm_read, aeterm_wait,
+    aeterm_close_fd, aeterm_write, aeterm_slot_count, aeterm_raise, aeterm_is_raw
+)
+
+extern aeterm_open_tty() -> int
+extern aeterm_close_fd(fd: int) -> int
+extern aeterm_is_tty(fd: int) -> int
+extern aeterm_raw_enter(fd: int) -> int
+extern aeterm_set_leave(slot: int, b: string, n: int) -> int
+extern aeterm_raw_leave(slot: int) -> int
+extern aeterm_cols(fd: int) -> int
+extern aeterm_rows(fd: int) -> int
+extern aeterm_set_size(fd: int, cols: int, rows: int) -> int
+extern aeterm_wait(fd: int, timeout_ms: int) -> int
+extern aeterm_take_winch() -> int
+extern aeterm_read(fd: int, buf: ptr, cap: int) -> int
+extern aeterm_write(fd: int, data: string, n: int) -> int
+extern aeterm_monotonic_ms() -> long
+extern aeterm_openpty() -> int
+extern aeterm_pty_slave(master: int) -> int
+extern aeterm_slot_count() -> int
+extern aeterm_raise(sig: int) -> int
+extern aeterm_is_raw(fd: int) -> int
+
+const KIND_REAL = 0
+const KIND_MEMORY = 1
+
+// libvaxis's default kitty flags: disambiguate, alternate keys, every key
+// as an escape code, associated text.
+const KITTY_DEFAULT_FLAGS = 29
+
+// How long the bytes of a sequence may straggle before a lone ESC is taken
+// for the Escape key.
+const ESC_WAIT_MS = 10
+
+const READ_CAP = 4096
+
+struct Terminal {
+    kind: int
+    // what the program draws into; render sends its changes
+    screen: *screen.Surface
+    renderer: *render.Renderer
+    decoder: *input.Decoder
+    pending: input.Event[]
+    phead: int
+    cols: int
+    rows: int
+    // modes turned on
+    alt_screen: bool
+    mouse: bool
+    bracketed_paste: bool
+    kitty_pushed: bool
+    color_scheme_sub: bool
+    in_band_resize: bool
+    unicode_mode: bool
+    // what the terminal said it can do (query_terminal)
+    cap_kitty_keyboard: bool
+    cap_unicode: bool
+    cap_color_scheme_updates: bool
+    cap_kitty_graphics: bool
+    kitty_flags: int
+    // real
+    fd_in: int
+    fd_out: int
+    owns_fd: bool
+    slot: int
+    readbuf: byte[]
+    closed: bool
+    // in-memory
+    shown_surf: *screen.Surface
+    out: ptr
+    clock: long
+    frame_count: int
+    clip: string
+    title_text: string
+    notes: string[]
+}
+
+_new(kind: int, cols: int, rows: int) -> *Terminal {
+    t = heap.new(Terminal)
+    t.kind = kind
+    t.cols = cols
+    t.rows = rows
+    t.screen = screen.surface(cols, rows)
+    t.renderer = render.renderer(cols, rows)
+    t.decoder = input.decoder()
+    t.slot = -1
+    t.fd_in = -1
+    t.fd_out = -1
+    t.kitty_flags = KITTY_DEFAULT_FLAGS
+    t.clip = ""
+    t.title_text = ""
+    return t
+}
+
+// The controlling terminal (/dev/tty), in raw mode. An initial Winsize event
+// is queued, as libvaxis's loop posts one.
+open() -> (*Terminal, string) {
+    fd = aeterm_open_tty()
+    if fd < 0 {
+        return null, "no terminal: cannot open /dev/tty"
+    }
+    t, err = open_fd(fd, fd)
+    if err != "" {
+        aeterm_close_fd(fd)
+        return null, err
+    }
+    t.owns_fd = true
+    return t, ""
+}
+
+// A terminal over descriptors already open (a pty in tests). fd_in must be
+// a terminal; it is put in raw mode until close.
+open_fd(fd_in: int, fd_out: int) -> (*Terminal, string) {
+    if aeterm_is_tty(fd_in) == 0 {
+        return null, "fd ${fd_in} is not a terminal"
+    }
+    slot = aeterm_raw_enter(fd_in)
+    if slot < 0 {
+        return null, "cannot put fd ${fd_in} in raw mode"
+    }
+    c = aeterm_cols(fd_in)
+    r = aeterm_rows(fd_in)
+    t = _new(KIND_REAL, if c > 0 { c } else { 80 }, if r > 0 { r } else { 24 })
+    t.fd_in = fd_in
+    t.fd_out = fd_out
+    t.slot = slot
+    t.readbuf = make([]byte, READ_CAP)
+    t.pending.push(input.Winsize { cols: t.cols, rows: t.rows, x_pixel: 0, y_pixel: 0 })
+    _arm(t)
+    return t, ""
+}
+
+// An in-memory terminal of the given size: specs push events into it and
+// read the grid it shows. Its clock starts at 0 and moves only by `advance`
+// and by poll timeouts that pass with nothing to read. An initial Winsize
+// event is queued, as for a real one.
+memory(cols: int, rows: int) -> *Terminal {
+    t = _new(KIND_MEMORY, cols, rows)
+    t.shown_surf = screen.surface(cols, rows)
+    t.out = strbuilder.new(1024)
+    t.cap_kitty_keyboard = true
+    t.pending.push(input.Winsize { cols: cols, rows: rows, x_pixel: 0, y_pixel: 0 })
+    return t
+}
+
+is_memory(t: *Terminal) -> bool { return t.kind == KIND_MEMORY }
+
+// The bytes that undo every mode that is on, in libvaxis's resetState
+// order. Kept in the C shim's restore table too, so a crash or a signal
+// leaves the terminal as clean as close does.
+_leave_bytes(t: *Terminal) -> string {
+    sb = strbuilder.new(128)
+    strbuilder.append(sb, render.SHOW_CURSOR)
+    strbuilder.append(sb, render.SGR_RESET)
+    if t.screen.cursor_shape != screen.CURSOR_DEFAULT {
+        strbuilder.append(sb, "\x1b[0 q")
+    }
+    if t.kitty_pushed {
+        strbuilder.append(sb, "\x1b[<u")
+    }
+    if t.mouse {
+        strbuilder.append(sb, "\x1b[?1002;1003;1004;1006;1016l")
+    }
+    if t.bracketed_paste {
+        strbuilder.append(sb, "\x1b[?2004l")
+    }
+    if t.alt_screen {
+        strbuilder.append(sb, render.HOME)
+        strbuilder.append(sb, render.ERASE_BELOW)
+        strbuilder.append(sb, "\x1b[?1049l")
+    }
+    if t.color_scheme_sub {
+        strbuilder.append(sb, "\x1b[?2031l")
+    }
+    if t.in_band_resize {
+        strbuilder.append(sb, "\x1b[?2048l")
+    }
+    if t.unicode_mode {
+        strbuilder.append(sb, "\x1b[?2027l")
+    }
+    return strbuilder.finish(sb)
+}
+
+_arm(t: *Terminal) {
+    if t.kind == KIND_REAL && t.slot >= 0 {
+        b = _leave_bytes(t)
+        aeterm_set_leave(t.slot, b, string.length(b))
+    }
+}
+
+_write(t: *Terminal, s: string) {
+    n = string.length(s)
+    if n == 0 {
+        return
+    }
+    if t.kind == KIND_MEMORY {
+        strbuilder.append(t.out, s)
+        return
+    }
+    if !t.closed {
+        aeterm_write(t.fd_out, s, n)
+    }
+}
+
+// Writes bytes to the terminal as they are.
+write_raw(t: *Terminal, s: string) {
+    _write(t, s)
+}
+
+// Turns every mode off, restores the terminal and frees it.
+close(t: *Terminal) {
+    if t.closed {
+        return
+    }
+    if t.kind == KIND_REAL {
+        // the restore table writes the leave bytes, then the termios
+        _arm(t)
+        aeterm_raw_leave(t.slot)
+        if t.owns_fd {
+            aeterm_close_fd(t.fd_in)
+        }
+    } else {
+        _write(t, _leave_bytes(t))
+    }
+    t.alt_screen = false
+    t.mouse = false
+    t.bracketed_paste = false
+    t.kitty_pushed = false
+    t.closed = true
+}
+
+enter_alt_screen(t: *Terminal) {
+    _write(t, "\x1b[?1049h")
+    t.alt_screen = true
+    _arm(t)
+}
+
+exit_alt_screen(t: *Terminal) {
+    _write(t, "\x1b[?1049l")
+    t.alt_screen = false
+    _arm(t)
+}
+
+// Button, drag and any-motion reports, SGR encoded, and focus events
+// (libvaxis setMouseMode without pixel coordinates).
+set_mouse_mode(t: *Terminal, on: bool) {
+    _write(t, if on { "\x1b[?1002;1003;1004;1006h" } else { "\x1b[?1002;1003;1004;1006;1016l" })
+    t.mouse = on
+    _arm(t)
+}
+
+set_bracketed_paste(t: *Terminal, on: bool) {
+    _write(t, if on { "\x1b[?2004h" } else { "\x1b[?2004l" })
+    t.bracketed_paste = on
+    _arm(t)
+}
+
+// Pushes kitty keyboard flags (KITTY_DEFAULT_FLAGS unless told otherwise).
+// query_terminal does this itself when the terminal speaks the protocol.
+set_kitty_keyboard(t: *Terminal, flags: int) {
+    if t.kitty_pushed {
+        _write(t, "\x1b[<u")
+    }
+    _write(t, "\x1b[>${flags}u")
+    t.kitty_pushed = true
+    t.kitty_flags = flags
+    _arm(t)
+}
+
+// Asks the terminal what it supports (kitty keyboard, mode 2027 grapheme
+// widths, colour-scheme reports, kitty graphics), waits up to timeout_ms for
+// the primary device attributes reply that ends the answers, then turns on
+// what it found, as libvaxis queryTerminal + enableDetectedFeatures do.
+// NO_COLOR is the caller's to read (pass it to `render`'s no_color).
+// Events that arrive meanwhile are kept for poll.
+query_terminal(t: *Terminal, timeout_ms: int) {
+    q = "\x1b[?1016$p\x1b[?2027$p\x1b[?2031$p\x1b[?2048h\x1b[?u\x1b_Gi=1,a=q\x1b\\\x1b[c"
+    _write(t, q)
+    t.in_band_resize = true
+    _arm(t)
+    if t.kind == KIND_REAL {
+        deadline = aeterm_monotonic_ms() + timeout_ms
+        done = false
+        while !done {
+            left = deadline - aeterm_monotonic_ms()
+            if left <= 0 {
+                break
+            }
+            r = aeterm_wait(t.fd_in, left as int)
+            if r <= 0 {
+                break
+            }
+            if (r & 2) != 0 {
+                _winch(t)
+            }
+            if (r & 1) != 0 {
+                if !_read_some(t) {
+                    break
+                }
+                while true {
+                    e = input.next_event(t.decoder, false)
+                    if !input.is_event(e) {
+                        break
+                    }
+                    match e {
+                        Capability -> {
+                            if e.what == input.CAP_DA1 {
+                                done = true
+                            } else {
+                                _cap(t, e.what)
+                            }
+                        }
+                        _ -> { t.pending.push(e) }
+                    }
+                }
+            }
+        }
+    } else {
+        // an in-memory terminal answers like a modern one
+        t.cap_kitty_keyboard = true
+        t.cap_unicode = true
+        t.cap_color_scheme_updates = true
+    }
+    if t.cap_kitty_keyboard {
+        set_kitty_keyboard(t, t.kitty_flags)
+    }
+    if t.cap_unicode {
+        _write(t, "\x1b[?2027h")
+        t.unicode_mode = true
+        t.screen.width_method = screen.WIDTH_UNICODE
+        _arm(t)
+    }
+}
+
+_cap(t: *Terminal, what: int) {
+    if what == input.CAP_KITTY_KEYBOARD {
+        t.cap_kitty_keyboard = true
+    } else if what == input.CAP_UNICODE {
+        t.cap_unicode = true
+    } else if what == input.CAP_COLOR_SCHEME_UPDATES {
+        t.cap_color_scheme_updates = true
+    } else if what == input.CAP_KITTY_GRAPHICS {
+        t.cap_kitty_graphics = true
+    }
+}
+
+// Asks for a colour (input.REPORT_FG, REPORT_BG or REPORT_CURSOR); the
+// answer arrives from poll as a ColorReport.
+query_color(t: *Terminal, kind: int) {
+    _write(t, "\x1b]${kind};?\x1b\\")
+}
+
+// Asks to be told when the terminal switches between dark and light (a
+// ColorScheme event), and for the current scheme now.
+subscribe_color_scheme(t: *Terminal) {
+    _write(t, "\x1b[?2031h\x1b[?996n")
+    t.color_scheme_sub = true
+    _arm(t)
+}
+
+set_title(t: *Terminal, text: string) {
+    _write(t, "\x1b]2;${text}\x1b\\")
+    t.title_text = text
+}
+
+// A desktop notification: OSC 777 with a title, OSC 9 without.
+notify(t: *Terminal, heading: string, body: string) {
+    if string.length(heading) > 0 {
+        _write(t, "\x1b]777;notify;${heading};${body}\x1b\\")
+    } else {
+        _write(t, "\x1b]9;${body}\x1b\\")
+    }
+    t.notes.push(if string.length(heading) > 0 { "${heading}: ${body}" } else { body })
+}
+
+// Puts text on the system clipboard through OSC 52.
+copy_to_clipboard(t: *Terminal, text: string) {
+    enc = encoding.base64_encode_padded(string.bytes(text))
+    _write(t, "\x1b]52;c;${enc}\x1b\\")
+    t.clip = text
+}
+
+// The whole screen as a window (vx.window()).
+window(t: *Terminal) -> screen.Window {
+    return screen.window(t.screen)
+}
+
+surface(t: *Terminal) -> *screen.Surface {
+    return t.screen
+}
+
+// Gives the screen the new size and clears the terminal, so the next
+// render draws every cell (vx.resize). Call it on a Winsize event.
+resize(t: *Terminal, new_cols: int, new_rows: int) {
+    method = t.screen.width_method
+    screen.surface_resize(t.screen, new_cols, new_rows)
+    t.screen.width_method = method
+    render.reset(t.renderer, new_cols, new_rows)
+    t.cols = new_cols
+    t.rows = new_rows
+    _write(t, "${render.HOME}${render.SGR_RESET}${render.ERASE_BELOW}${render.HIDE_CURSOR}")
+    if t.kind == KIND_MEMORY {
+        screen.surface_resize(t.shown_surf, new_cols, new_rows)
+        t.shown_surf.width_method = method
+    }
+}
+
+// The next render redraws every cell.
+refresh(t: *Terminal) {
+    render.invalidate(t.renderer)
+}
+
+// Sends what changed since the last render (vx.render).
+render(t: *Terminal) {
+    t.renderer.sgr = if t.kind == KIND_REAL && _legacy_sgr() { render.SGR_LEGACY } else { t.renderer.sgr }
+    frame = render.render(t.renderer, t.screen)
+    _write(t, frame)
+    if t.kind == KIND_MEMORY {
+        t.frame_count = t.frame_count + 1
+        sh = t.shown_surf
+        for i in 0..t.screen.cells.len {
+            sh.cells[i] = t.screen.cells[i]
+        }
+        sh.cursor_vis = t.screen.cursor_vis
+        sh.cursor_row = t.screen.cursor_row
+        sh.cursor_col = t.screen.cursor_col
+        sh.cursor_shape = t.screen.cursor_shape
+        sh.width_method = t.screen.width_method
+    }
+}
+
+_legacy_sgr() -> bool {
+    // libvaxis's environment overrides: VS Code's terminal and Termux read
+    // only semicolons
+    return os_getenv("TERM_PROGRAM") == "vscode" || os_getenv("TERMUX_VERSION") != "" || os_getenv("VAXIS_FORCE_LEGACY_SGR") != ""
+}
+
+size(t: *Terminal) -> (int, int) {
+    return t.cols, t.rows
+}
+
+cols(t: *Terminal) -> int { return t.cols }
+rows(t: *Terminal) -> int { return t.rows }
+
+// Milliseconds on the terminal's clock: monotonic for a real terminal, the
+// fake clock for an in-memory one.
+now_ms(t: *Terminal) -> long {
+    if t.kind == KIND_MEMORY {
+        return t.clock
+    }
+    return aeterm_monotonic_ms()
+}
+
+_pop(t: *Terminal) -> input.Event {
+    if t.phead >= t.pending.len {
+        return input.NoEvent {}
+    }
+    e = t.pending[t.phead]
+    t.phead = t.phead + 1
+    if t.phead >= t.pending.len {
+        t.pending = make([]input.Event, 0)
+        t.phead = 0
+    }
+    return e
+}
+
+_read_some(t: *Terminal) -> bool {
+    n = aeterm_read(t.fd_in, t.readbuf, READ_CAP)
+    if n <= 0 {
+        return false
+    }
+    input.feed(t.decoder, bytes.string_from_ptr(t.readbuf, n))
+    return true
+}
+
+_winch(t: *Terminal) {
+    aeterm_take_winch()
+    c = aeterm_cols(t.fd_in)
+    r = aeterm_rows(t.fd_in)
+    if c > 0 && r > 0 {
+        t.pending.push(input.Winsize { cols: c, rows: r, x_pixel: 0, y_pixel: 0 })
+    }
+}
+
+// Decoded events into pending, skipping capability replies.
+_drain(t: *Terminal, eof: bool) {
+    while true {
+        e = input.next_event(t.decoder, eof)
+        if !input.is_event(e) {
+            return
+        }
+        match e {
+            Capability -> { _cap(t, e.what) }
+            _ -> { t.pending.push(e) }
+        }
+    }
+}
+
+// The next event, waiting up to timeout_ms for one (0: just look; -1:
+// forever). NoEvent when the time passes with nothing. A real terminal
+// reports a resize as a Winsize event; an in-memory one returns what was
+// pushed, in order, and when there is nothing moves its clock on by the
+// timeout instead of waiting.
+poll(t: *Terminal, timeout_ms: int) -> input.Event {
+    if t.phead < t.pending.len {
+        return _pop(t)
+    }
+    if t.kind == KIND_MEMORY {
+        _drain(t, true)
+        if t.phead < t.pending.len {
+            return _pop(t)
+        }
+        if timeout_ms > 0 {
+            t.clock = t.clock + timeout_ms
+        }
+        return input.NoEvent {}
+    }
+    if t.closed {
+        return input.NoEvent {}
+    }
+    deadline = aeterm_monotonic_ms() + timeout_ms
+    while true {
+        _drain(t, false)
+        if t.phead < t.pending.len {
+            return _pop(t)
+        }
+        wait = timeout_ms
+        if timeout_ms >= 0 {
+            left = deadline - aeterm_monotonic_ms()
+            wait = if left < 0 { 0 } else { left as int }
+        }
+        straggling = input.pending_len(t.decoder) > 0
+        if straggling && (wait < 0 || wait > ESC_WAIT_MS) {
+            wait = ESC_WAIT_MS
+        }
+        r = aeterm_wait(t.fd_in, wait)
+        if r < 0 {
+            return input.NoEvent {}
+        }
+        if (r & 2) != 0 {
+            _winch(t)
+        }
+        if (r & 1) != 0 {
+            if !_read_some(t) {
+                // the other end went away
+                _drain(t, true)
+                if t.phead < t.pending.len {
+                    return _pop(t)
+                }
+                return input.NoEvent {}
+            }
+            continue
+        }
+        if straggling {
+            _drain(t, true)
+            if t.phead < t.pending.len {
+                return _pop(t)
+            }
+        }
+        if timeout_ms >= 0 && aeterm_monotonic_ms() >= deadline && r == 0 {
+            return input.NoEvent {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------- in-memory
+
+// Queues an event for poll.
+push_event(t: *Terminal, e: input.Event) {
+    t.pending.push(e)
+}
+
+// Feeds bytes as if the terminal had sent them; poll decodes them.
+push_bytes(t: *Terminal, data: string) {
+    input.feed(t.decoder, data)
+}
+
+// Moves the fake clock on.
+advance(t: *Terminal, ms: int) {
+    t.clock = t.clock + ms
+}
+
+// The in-memory terminal is now this size: a Winsize event is queued (the
+// program resizes its screen when it handles it, as on a real one).
+set_size(t: *Terminal, new_cols: int, new_rows: int) {
+    t.pending.push(input.Winsize { cols: new_cols, rows: new_rows, x_pixel: 0, y_pixel: 0 })
+}
+
+// What the terminal shows: the screen as of the last render.
+shown(t: *Terminal) -> *screen.Surface {
+    if t.kind == KIND_MEMORY {
+        return t.shown_surf
+    }
+    return t.screen
+}
+
+shown_row(t: *Terminal, row: int) -> string { return screen.row_text(shown(t), row) }
+
+shown_text(t: *Terminal) -> string { return screen.text(shown(t)) }
+
+shown_cell(t: *Terminal, col: int, row: int) -> screen.Cell {
+    c, _ok = screen.read_cell(shown(t), col, row)
+    return c
+}
+
+// Every byte the in-memory terminal was sent.
+written(t: *Terminal) -> string {
+    if t.kind != KIND_MEMORY {
+        return ""
+    }
+    s = strbuilder.finish(t.out)
+    t.out = strbuilder.new(string.length(s) + 1024)
+    strbuilder.append(t.out, s)
+    return s
+}
+
+// The bytes sent since the last take_written.
+take_written(t: *Terminal) -> string {
+    if t.kind != KIND_MEMORY {
+        return ""
+    }
+    s = strbuilder.finish(t.out)
+    t.out = strbuilder.new(1024)
+    return s
+}
+
+clipboard(t: *Terminal) -> string { return t.clip }
+title(t: *Terminal) -> string { return t.title_text }
+notifications(t: *Terminal) -> string[] { return t.notes }
+frames(t: *Terminal) -> int { return t.frame_count }
+pending_events(t: *Terminal) -> int { return t.pending.len - t.phead }

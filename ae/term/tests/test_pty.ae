@@ -1,0 +1,218 @@
+// The real terminal, over a pseudo-terminal this process holds both ends
+// of: raw mode, input decoding from real reads, query replies, SIGWINCH,
+// rendering, and restoring the terminal on close.
+//
+// With TERM_FIDELITY_DIR set, the frames rendered in "fidelity frames" are
+// left there as capture_<n>.bin (every byte the terminal received up to
+// frame n) and expected_<n>.txt (the grid's rows); tests/fidelity.py replays
+// the captures with upstream's scripts/screen.py and compares.
+import std.spec
+import std.string
+import std.strbuilder
+import std.bytes
+import std.fs
+import std.os(os_getenv)
+import term
+import term.screen
+import term.input
+import term.render
+
+const SIGWINCH = 28
+
+struct Pty {
+    master: int
+    slave: int
+}
+
+open_pty(cols: int, rows: int) -> Pty {
+    m = term.aeterm_openpty()
+    s = term.aeterm_pty_slave(m)
+    term.aeterm_set_size(s, cols, rows)
+    return Pty { master: m, slave: s }
+}
+
+// Everything the terminal has written so far.
+drain(m: int) -> string {
+    buf = make([]byte, 65536)
+    sb = strbuilder.new(1024)
+    while term.aeterm_wait(m, 100) > 0 {
+        n = term.aeterm_read(m, buf, 65536)
+        if n <= 0 {
+            break
+        }
+        strbuilder.append(sb, bytes.string_from_ptr(buf, n))
+    }
+    return strbuilder.finish(sb)
+}
+
+type_in(p: Pty, data: string) {
+    term.aeterm_write(p.master, data, string.length(data))
+}
+
+next_described(t: *term.Terminal) -> string {
+    return input.describe(term.poll(t, 2000))
+}
+
+put(t: *term.Terminal, col: int, row: int, text: string, st: screen.Style) {
+    screen.draw(screen.child(term.window(t), x_off: col, y_off: row), [screen.seg(text, st)], wrap: screen.WRAP_NONE)
+}
+
+// Writes capture_<n>.bin and expected_<n>.txt when asked to.
+keep_frame(dir: string, n: int, capture: string, t: *term.Terminal) {
+    if dir == "" {
+        return
+    }
+    fs.write("${dir}/capture_${n}.bin", capture)
+    fs.write("${dir}/expected_${n}.txt", "${term.cols(t)} ${term.rows(t)}\n${screen.text(term.surface(t))}")
+}
+
+main() {
+    fw = spec.init()
+
+    spec.describe(fw, "a real terminal on a pty") {
+        spec.it("is raw while open, decodes what is typed and is restored on close") callback {
+            p = open_pty(30, 8)
+            t, err = term.open_fd(p.slave, p.slave)
+            spec.assert_str_eq(err, "", "opens")
+            spec.assert_eq(term.aeterm_is_raw(p.slave), 1, "raw")
+            spec.assert_str_eq(next_described(t), "winsize 30x8", "initial size")
+            type_in(p, "\x1b[1;5Aq\x03")
+            spec.assert_str_eq(next_described(t), "key ctrl+up", "ctrl+up")
+            spec.assert_str_eq(next_described(t), "key q text=\"q\"", "q")
+            spec.assert_str_eq(next_described(t), "key ctrl+c", "ctrl+c is a key, not a signal")
+            type_in(p, "\x1b")
+            spec.assert_str_eq(next_described(t), "key escape", "a lone ESC")
+            type_in(p, "\x1b[<0;5;6M\x1b[200~pasted\x1b[201~")
+            spec.assert_str_eq(next_described(t), "mouse press button=0 at 4,5", "mouse")
+            spec.assert_str_eq(next_described(t), "paste_start", "paste")
+            started = term.now_ms(t)
+            e = term.poll(t, 0)
+            spec.assert_str_eq(input.describe(e), "key p text=\"p\"", "pasted text")
+            spec.assert_true(input.is_event(term.poll(t, 0)), "more pasted text, without waiting")
+            spec.assert_true(term.now_ms(t) - started < 1000, "promptly")
+            drain(p.master)
+            term.enter_alt_screen(t)
+            term.set_mouse_mode(t, true)
+            term.set_bracketed_paste(t, true)
+            spec.assert_eq(term.aeterm_slot_count(), 1, "registered for restoring")
+            term.close(t)
+            out = drain(p.master)
+            spec.assert_eq(term.aeterm_is_raw(p.slave), 0, "cooked again")
+            spec.assert_eq(term.aeterm_slot_count(), 0, "unregistered")
+            spec.assert_contains(out, "\x1b[?1002;1003;1004;1006;1016l", "mouse off")
+            spec.assert_contains(out, "\x1b[?2004l", "paste off")
+            spec.assert_contains(out, "\x1b[H\x1b[J\x1b[?1049l", "alternate screen left")
+            term.aeterm_close_fd(p.slave)
+            term.aeterm_close_fd(p.master)
+        }
+        spec.it("times out with nothing to read") callback {
+            p = open_pty(20, 5)
+            t, _err = term.open_fd(p.slave, p.slave)
+            term.poll(t, 0)
+            before = term.now_ms(t)
+            spec.assert_false(input.is_event(term.poll(t, 60)), "nothing")
+            waited = term.now_ms(t) - before
+            spec.assert_true(waited >= 55 && waited < 1000, "waited about the timeout (${waited} ms)")
+            term.close(t)
+            term.aeterm_close_fd(p.slave)
+            term.aeterm_close_fd(p.master)
+        }
+        spec.it("reports a resize when SIGWINCH arrives") callback {
+            p = open_pty(20, 5)
+            t, _err = term.open_fd(p.slave, p.slave)
+            term.poll(t, 0)
+            term.aeterm_set_size(p.slave, 44, 11)
+            term.aeterm_raise(SIGWINCH)
+            spec.assert_str_eq(next_described(t), "winsize 44x11", "new size")
+            term.close(t)
+            term.aeterm_close_fd(p.slave)
+            term.aeterm_close_fd(p.master)
+        }
+        spec.it("queries the terminal, keeps typed keys, and turns on what it has") callback {
+            p = open_pty(20, 5)
+            t, _err = term.open_fd(p.slave, p.slave)
+            term.poll(t, 0)
+            // the replies of a kitty-capable, mode-2027 terminal, a key typed
+            // in the middle, then the DA1 reply that ends the answers
+            type_in(p, "\x1b[?1u\x1b[?2027;2$yz\x1b[?62;22c")
+            term.query_terminal(t, 2000)
+            out = drain(p.master)
+            spec.assert_contains(out, "\x1b[?2027$p", "asked about mode 2027")
+            spec.assert_contains(out, "\x1b[c", "asked for DA1")
+            spec.assert_contains(out, "\x1b[>29u", "kitty flags pushed")
+            spec.assert_contains(out, "\x1b[?2027h", "grapheme widths on")
+            spec.assert_eq(term.surface(t).width_method, screen.WIDTH_UNICODE, "measured per grapheme")
+            spec.assert_str_eq(next_described(t), "key z text=\"z\"", "the typed key was kept")
+            type_in(p, "\x1b[115;5u")
+            spec.assert_str_eq(next_described(t), "key ctrl+s", "kitty keys")
+            term.close(t)
+            spec.assert_contains(drain(p.master), "\x1b[<u", "kitty flags popped")
+            term.aeterm_close_fd(p.slave)
+            term.aeterm_close_fd(p.master)
+        }
+        spec.it("renders frames whose bytes replay to the grid (fidelity frames)") callback {
+            dir = os_getenv("TERM_FIDELITY_DIR")
+            p = open_pty(24, 6)
+            t, _err = term.open_fd(p.slave, p.slave)
+            ev = term.poll(t, 0)
+            match ev {
+                Winsize -> { term.resize(t, ev.cols, ev.rows) }
+                _ -> { spec.fail("no initial size") }
+            }
+            term.enter_alt_screen(t)
+            capture = drain(p.master)
+            styles = [screen.style(fg: screen.color_index(1), attrs: screen.BOLD), screen.style(bg: screen.color_index(4), attrs: screen.ITALIC),
+                screen.style(fg: screen.color_index(10), attrs: screen.DIM | screen.REVERSE), screen.style(ul_style: screen.UL_SINGLE, attrs: screen.STRIKETHROUGH)]
+            // 1: styled text, wide graphemes, a box
+            w = term.window(t)
+            box = screen.child_bordered(w, screen.BORDER_ALL, height: 4)
+            screen.draw(box, [screen.seg("red", styles[0]), screen.seg(" 你好 ", styles[1]), screen.seg("dim", styles[2])])
+            screen.draw(screen.child(box, y_off: 1), [screen.seg("struck", styles[3]), screen.seg(" ok")])
+            put(t, 0, 4, "Thinking…", screen.style())
+            screen.show_cursor(w, 3, 5)
+            term.render(t)
+            f1 = drain(p.master)
+            capture = string.concat(capture, f1)
+            spec.assert_contains(f1, "\x1b[?2026h", "synchronized")
+            keep_frame(dir, 1, capture, t)
+            // 2: a few cells change; a wide grapheme is replaced by a narrow one
+            put(t, 1, 1, "R", styles[0])
+            put(t, 5, 1, "x", screen.style())
+            screen.clear(screen.child(w, x_off: 1, y_off: 2, width: 6, height: 1))
+            put(t, 10, 4, "done", screen.style())
+            term.render(t)
+            f2 = drain(p.master)
+            capture = string.concat(capture, f2)
+            spec.assert_true(string.length(f2) < string.length(f1), "a small change is a small frame (${string.length(f2)} < ${string.length(f1)} bytes)")
+            keep_frame(dir, 2, capture, t)
+            // 3: nothing changes: nothing is written
+            term.render(t)
+            spec.assert_str_eq(drain(p.master), "", "an unchanged frame writes nothing")
+            // 4: 256 and direct colours, with semicolons (screen.py reads no colons)
+            t.renderer.sgr = render.SGR_LEGACY
+            put(t, 0, 5, "rgb", screen.style(fg: screen.color_rgb(255, 128, 0), bg: screen.color_index(236)))
+            put(t, 4, 5, "ok", screen.style(fg: screen.color_index(196)))
+            term.render(t)
+            capture = string.concat(capture, drain(p.master))
+            keep_frame(dir, 3, capture, t)
+            // 5: a resize clears and redraws
+            term.aeterm_set_size(p.slave, 16, 4)
+            term.aeterm_raise(SIGWINCH)
+            rs = term.poll(t, 2000)
+            match rs {
+                Winsize -> { term.resize(t, rs.cols, rs.rows) }
+                _ -> { spec.fail("no resize: ${input.describe(rs)}") }
+            }
+            put(t, 0, 0, "after resize", screen.style())
+            put(t, 2, 3, "end", screen.style(attrs: screen.BOLD))
+            term.render(t)
+            capture = string.concat(capture, drain(p.master))
+            keep_frame(dir, 4, capture, t)
+            term.close(t)
+            term.aeterm_close_fd(p.slave)
+            term.aeterm_close_fd(p.master)
+        }
+    }
+
+    return spec.run_summary(fw)
+}

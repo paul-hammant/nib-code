@@ -1,0 +1,201 @@
+// term.driver: verbs for specs that drive a terminal, real or in-memory, in
+// the flavour of sae's saedriver: act on the terminal, then expect what it
+// shows. Failures go through std.spec, so they land in the enclosing `it`.
+//
+//     t = term.memory(80, 24)
+//     driver.press(t, "ctrl+s")
+//     driver.type_text(t, "hello")
+//     app_step(t)                       // the program polls and renders
+//     driver.expect_row_contains(t, "Thinking")
+//     driver.expect_screen(t, snap.body)
+//
+// Input verbs feed the bytes a terminal would send through the same decoder
+// a real terminal's input goes through: keys as the kitty protocol encodes
+// them when the terminal has it on (an in-memory terminal does), legacy
+// xterm bytes otherwise. `type` is a keyword, hence type_text.
+
+import std.string
+import std.strbuilder
+import std.spec
+import term
+import term.screen
+import term.input
+
+exports(
+    press, type_text, paste, send_bytes, click, mouse, wheel, resize, focus,
+    expect_row_contains, expect_no_row_contains, expect_row, expect_screen,
+    expect_cell, expect_style, expect_cursor, expect_clipboard, screen_diff,
+    find_row
+)
+
+// One key chord: "ctrl+s", "enter", "shift+tab", "alt+x", "A", "f5".
+press(t: *term.Terminal, spec_text: string) {
+    k, err = input.key_from_spec(spec_text)
+    if err != "" {
+        spec.fail("press: ${err}")
+        return
+    }
+    term.push_bytes(t, input.encode_key(k, t.cap_kitty_keyboard))
+}
+
+// Text as typed: each byte as the terminal sends it.
+type_text(t: *term.Terminal, text: string) {
+    term.push_bytes(t, text)
+}
+
+// Text pasted with bracketed paste on: start, the text, end.
+paste(t: *term.Terminal, text: string) {
+    term.push_bytes(t, input.encode_paste(text))
+}
+
+// Raw bytes, as upstream's pty tests write them.
+send_bytes(t: *term.Terminal, data: string) {
+    term.push_bytes(t, data)
+}
+
+mouse(t: *term.Terminal, button: int, col: int, row: int, kind: int, mods: int = 0) {
+    term.push_bytes(t, input.encode_mouse(input.Mouse { col: col, row: row, button: button, mods: mods, kind: kind }))
+}
+
+// Press and release.
+click(t: *term.Terminal, col: int, row: int, button: int = 0) {
+    mouse(t, button, col, row, input.MOUSE_PRESS)
+    mouse(t, button, col, row, input.MOUSE_RELEASE)
+}
+
+// A wheel notch, up (n > 0) or down (n < 0), n times.
+wheel(t: *term.Terminal, n: int, col: int = 0, row: int = 0) {
+    b = if n > 0 { input.WHEEL_UP } else { input.WHEEL_DOWN }
+    count = if n > 0 { n } else { 0 - n }
+    for i in 0..count {
+        mouse(t, b, col, row, input.MOUSE_PRESS)
+    }
+}
+
+// The terminal becomes this size (a Winsize event follows).
+resize(t: *term.Terminal, cols: int, rows: int) {
+    term.set_size(t, cols, rows)
+}
+
+focus(t: *term.Terminal, focused: bool) {
+    term.push_bytes(t, input.encode_focus(focused))
+}
+
+// The first row containing the text, -1 when none does.
+find_row(t: *term.Terminal, text: string) -> int {
+    s = term.shown(t)
+    for r in 0..s.height {
+        if string.contains(screen.row_text(s, r), text) != 0 {
+            return r
+        }
+    }
+    return -1
+}
+
+_screen_dump(t: *term.Terminal) -> string {
+    s = term.shown(t)
+    sb = strbuilder.new(s.width * s.height + 64)
+    for r in 0..s.height {
+        strbuilder.append(sb, "        |")
+        strbuilder.append(sb, screen.row_text(s, r))
+        strbuilder.append(sb, "\n")
+    }
+    return strbuilder.finish(sb)
+}
+
+expect_row_contains(t: *term.Terminal, text: string) {
+    if find_row(t, text) < 0 {
+        spec.fail("no row contains \"${text}\"; the screen:\n${_screen_dump(t)}")
+    }
+}
+
+expect_no_row_contains(t: *term.Terminal, text: string) {
+    r = find_row(t, text)
+    if r >= 0 {
+        spec.fail("row ${r} contains \"${text}\"; the screen:\n${_screen_dump(t)}")
+    }
+}
+
+// The row's text (trailing spaces trimmed) is exactly this.
+expect_row(t: *term.Terminal, row: int, text: string) {
+    got = screen.row_text(term.shown(t), row)
+    if got != text {
+        spec.fail("row ${row}: expected \"${text}\", got \"${got}\"")
+    }
+}
+
+_lines(text: string) -> string[] {
+    out = make([]string, 0)
+    n = string.length(text)
+    start = 0
+    for i in 0..n {
+        if text[i] == 10 {
+            out.push(string.substring(text, start, i))
+            start = i + 1
+        }
+    }
+    if start < n {
+        out.push(string.substring(text, start, n))
+    }
+    return out
+}
+
+// "" when the shown screen is the snapshot body; else the rows that differ.
+screen_diff(t: *term.Terminal, body: string) -> string {
+    got = term.shown_text(t)
+    if got == body {
+        return ""
+    }
+    want = _lines(body)
+    have = _lines(got)
+    n = if want.len > have.len { want.len } else { have.len }
+    sb = strbuilder.new(256)
+    for i in 0..n {
+        w = if i < want.len { want[i] } else { "<none>" }
+        h = if i < have.len { have[i] } else { "<none>" }
+        mark = if w == h { "  " } else { "! " }
+        strbuilder.append(sb, "      ${mark}${i}: expected |${w}|\n")
+        if w != h {
+            strbuilder.append(sb, "      ${mark}${i}:      got |${h}|\n")
+        }
+    }
+    return strbuilder.finish(sb)
+}
+
+// The whole screen is the snapshot body (rows, trailing spaces trimmed,
+// each ended by a newline), as term.snapshot reads it.
+expect_screen(t: *term.Terminal, body: string) {
+    d = screen_diff(t, body)
+    if d != "" {
+        spec.fail("the screen differs from the snapshot:\n${d}")
+    }
+}
+
+expect_cell(t: *term.Terminal, col: int, row: int, grapheme: string) {
+    c = term.shown_cell(t, col, row)
+    if c.grapheme != grapheme {
+        spec.fail("cell ${col},${row}: expected \"${grapheme}\", got \"${c.grapheme}\"")
+    }
+}
+
+expect_style(t: *term.Terminal, col: int, row: int, st: screen.Style) {
+    c = term.shown_cell(t, col, row)
+    if !screen.style_eq(c.style, st) {
+        spec.fail("cell ${col},${row} style: expected fg=${st.fg} bg=${st.bg} attrs=${st.attrs} ul=${st.ul_style}, got fg=${c.style.fg} bg=${c.style.bg} attrs=${c.style.attrs} ul=${c.style.ul_style}")
+    }
+}
+
+// The cursor is shown at (col, row).
+expect_cursor(t: *term.Terminal, col: int, row: int) {
+    s = term.shown(t)
+    if !s.cursor_vis || s.cursor_col != col || s.cursor_row != row {
+        spec.fail("cursor: expected shown at ${col},${row}, got ${if s.cursor_vis { "shown" } else { "hidden" }} at ${s.cursor_col},${s.cursor_row}")
+    }
+}
+
+expect_clipboard(t: *term.Terminal, text: string) {
+    got = term.clipboard(t)
+    if got != text {
+        spec.fail("clipboard: expected \"${text}\", got \"${got}\"")
+    }
+}

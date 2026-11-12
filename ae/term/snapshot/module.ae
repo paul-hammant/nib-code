@@ -1,0 +1,152 @@
+// term.snapshot: upstream nib's screen-snapshot files
+// (src/tui/layout_snapshots.txt, simple_snapshots.txt), read and written.
+//
+// A file is a run of blocks. Each starts with a header line
+//     --- <name> <cols>x<rows>[ <anything else>] ---
+// and is followed by the screen's rows, one line each, trailing spaces
+// trimmed, as `screen.text` writes them. `extra` keeps whatever followed the
+// size in the header ("context 0%").
+
+import std.string
+import std.strbuilder
+import std.fs
+import term.screen
+
+exports(Snapshot, parse, load, find, block, header)
+
+struct Snapshot {
+    name: string
+    cols: int
+    rows: int
+    extra: string
+    // the rows, each ended by a newline
+    body: string
+}
+
+_split_lines(text: string) -> string[] {
+    out = make([]string, 0)
+    n = string.length(text)
+    start = 0
+    for i in 0..n {
+        if text[i] == 10 {
+            out.push(string.substring(text, start, i))
+            start = i + 1
+        }
+    }
+    if start < n {
+        out.push(string.substring(text, start, n))
+    }
+    return out
+}
+
+_num(s: string) -> int {
+    n = string.length(s)
+    if n == 0 {
+        return -1
+    }
+    v = 0
+    for i in 0..n {
+        c = s[i]
+        if c < 48 || c > 57 {
+            return -1
+        }
+        v = v * 10 + c - 48
+    }
+    return v
+}
+
+// (snapshot, true) when the line is a header.
+_header(line: string) -> (Snapshot, bool) {
+    none_snap = Snapshot { name: "", cols: 0, rows: 0, extra: "", body: "" }
+    n = string.length(line)
+    if n < 9 || !string.starts_with(line, "--- ") || !string.ends_with(line, " ---") {
+        return none_snap, false
+    }
+    inner = string.substring(line, 4, n - 4)
+    sp = string.index_of(inner, " ")
+    if sp <= 0 {
+        return none_snap, false
+    }
+    name = string.substring(inner, 0, sp)
+    rest = string.substring(inner, sp + 1, string.length(inner))
+    sp2 = string.index_of(rest, " ")
+    size = if sp2 < 0 { rest } else { string.substring(rest, 0, sp2) }
+    extra = if sp2 < 0 { "" } else { string.substring(rest, sp2 + 1, string.length(rest)) }
+    x = string.index_of(size, "x")
+    if x <= 0 {
+        return none_snap, false
+    }
+    c = _num(string.substring(size, 0, x))
+    r = _num(string.substring(size, x + 1, string.length(size)))
+    if c < 0 || r < 0 {
+        return none_snap, false
+    }
+    return Snapshot { name: name, cols: c, rows: r, extra: extra, body: "" }, true
+}
+
+// Every block in the text. An error names the first block whose row count
+// does not match its header.
+parse(text: string) -> (Snapshot[], string) {
+    lines = _split_lines(text)
+    out = make([]Snapshot, 0)
+    i = 0
+    while i < lines.len {
+        h, ok = _header(lines[i])
+        if !ok {
+            if out.len == 0 {
+                return out, "line ${i + 1}: expected a '--- name WxH ---' header"
+            }
+            i = i + 1
+            continue
+        }
+        sb = strbuilder.new(h.cols * h.rows + h.rows)
+        j = i + 1
+        count = 0
+        while j < lines.len {
+            _h2, is_header = _header(lines[j])
+            if is_header {
+                break
+            }
+            strbuilder.append(sb, lines[j])
+            strbuilder.append(sb, "\n")
+            count = count + 1
+            j = j + 1
+        }
+        if count != h.rows {
+            return out, "snapshot '${h.name}' has ${count} rows, its header says ${h.rows}"
+        }
+        h.body = strbuilder.finish(sb)
+        out.push(h)
+        i = j
+    }
+    return out, ""
+}
+
+load(path: string) -> (Snapshot[], string) {
+    text, err = fs.read(path)
+    if err != "" {
+        return make([]Snapshot, 0), "${path}: ${err}"
+    }
+    return parse(text)
+}
+
+find(snaps: Snapshot[], name: string) -> (Snapshot, bool) {
+    for i in 0..snaps.len {
+        if snaps[i].name == name {
+            return snaps[i], true
+        }
+    }
+    return Snapshot { name: "", cols: 0, rows: 0, extra: "", body: "" }, false
+}
+
+header(name: string, cols: int, rows: int, extra: string = "") -> string {
+    if string.length(extra) > 0 {
+        return "--- ${name} ${cols}x${rows} ${extra} ---\n"
+    }
+    return "--- ${name} ${cols}x${rows} ---\n"
+}
+
+// A block for the surface, in the file's format.
+block(name: string, s: *screen.Surface, extra: string = "") -> string {
+    return "${header(name, s.width, s.height, extra)}${screen.text(s)}"
+}

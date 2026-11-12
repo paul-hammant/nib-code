@@ -1,0 +1,96 @@
+// A terminal to try by hand: a box, styled text, the keys and mouse events
+// that arrive, and the size, redrawn on resize. q or ctrl+c quits.
+//
+//     ae run --lib ae ae/term/demo/demo.ae
+//
+// --panic panics once the terminal is set up and --hang waits forever (for
+// tests: either way the terminal must come back as it was).
+import std.string
+import std.os
+import term
+import term.screen
+import term.input
+
+const KEEP = 200
+
+draw_frame(t: *term.Terminal, log: string[], mouse_col: int, mouse_row: int, pasting: bool) {
+    w = term.window(t)
+    screen.clear(w)
+    title = screen.style(fg: screen.color_index(4), attrs: screen.BOLD)
+    dim = screen.style(attrs: screen.DIM)
+    box = screen.child_bordered(w, screen.BORDER_ALL, st: screen.style(fg: screen.color_index(6)))
+    screen.draw(box, [screen.seg(" ae/term demo ", title), screen.seg("${term.cols(t)}x${term.rows(t)}", screen.style(fg: screen.color_index(3))),
+            screen.seg("  q or ctrl+c quits", dim)], wrap: screen.WRAP_NONE)
+    screen.draw(screen.child(box, y_off: 1), [screen.seg("styles: "), screen.seg("bold", screen.style(attrs: screen.BOLD)), screen.seg(" "),
+            screen.seg("italic", screen.style(attrs: screen.ITALIC)), screen.seg(" "),
+            screen.seg("under", screen.style(ul_style: screen.UL_CURLY, ul: screen.color_index(1))), screen.seg(" "),
+            screen.seg("rgb", screen.style(fg: screen.color_rgb(255, 128, 0))), screen.seg(" 你好 👋")], wrap: screen.WRAP_NONE)
+    if pasting {
+        screen.draw(screen.child(box, y_off: 2), [screen.seg("pasting…", screen.style(attrs: screen.REVERSE))], wrap: screen.WRAP_NONE)
+    }
+    events = screen.child(box, y_off: 3)
+    start = if log.len > events.height { log.len - events.height } else { 0 }
+    for i in start..log.len {
+        screen.draw(screen.child(events, y_off: i - start), [screen.seg(log[i])], wrap: screen.WRAP_NONE)
+    }
+    if mouse_col >= 0 {
+        c, ok = screen.read_cell(term.surface(t), mouse_col, mouse_row)
+        if ok {
+            c.style = screen.style(attrs: screen.REVERSE)
+            screen.write_cell(term.surface(t), mouse_col, mouse_row, c)
+        }
+    }
+    term.render(t)
+}
+
+main() {
+    mode = os.args_get(1)
+    t, err = term.open()
+    if err != "" {
+        println("demo: ${err}")
+        exit(1)
+    }
+    term.enter_alt_screen(t)
+    term.query_terminal(t, 500)
+    term.set_bracketed_paste(t, true)
+    term.set_mouse_mode(t, true)
+    log = make([]string, 0)
+    mouse_col = -1
+    mouse_row = -1
+    pasting = false
+    running = true
+    if mode == "--panic" {
+        draw_frame(t, log, -1, -1, false)
+        panic("demo: panicking with the terminal in raw mode")
+    }
+    while running {
+        e = term.poll(t, 100)
+        if !input.is_event(e) {
+            if mode == "--hang" {
+                draw_frame(t, log, mouse_col, mouse_row, pasting)
+            }
+            continue
+        }
+        match e {
+            Winsize -> { term.resize(t, e.cols, e.rows) }
+            Key -> {
+                if !pasting && (input.matches(e, 113) || input.matches(e, 99, input.CTRL)) && mode != "--hang" {
+                    running = false
+                }
+            }
+            Mouse -> {
+                mouse_col = e.col
+                mouse_row = e.row
+            }
+            PasteStart -> { pasting = true }
+            PasteEnd -> { pasting = false }
+            _ -> {}
+        }
+        log.push(input.describe(e))
+        if log.len > KEEP {
+            log = log[log.len - KEEP..]
+        }
+        draw_frame(t, log, mouse_col, mouse_row, pasting)
+    }
+    term.close(t)
+}

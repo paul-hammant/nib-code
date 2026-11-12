@@ -1,0 +1,182 @@
+// The cell model: surfaces, windows, printing, widths.
+import std.spec
+import std.string
+import term.screen
+
+seg(text: string) -> screen.Segment { return screen.seg(text) }
+
+main() {
+    fw = spec.init()
+
+    spec.describe(fw, "display width") {
+        // libvaxis gwidth.zig's own cases, both methods
+        spec.it("measures as libvaxis does, per grapheme and per code point") callback {
+            U = screen.WIDTH_UNICODE
+            W = screen.WIDTH_WCWIDTH
+            spec.assert_eq(screen.gwidth("a", U), 1, "a")
+            spec.assert_eq(screen.gwidth("你好", U), 4, "cjk")
+            spec.assert_eq(screen.gwidth("👩‍🚀", U), 2, "zwj unicode")
+            spec.assert_eq(screen.gwidth("👩‍🚀", W), 4, "zwj wcwidth")
+            spec.assert_eq(screen.gwidth("\xe2\x9d\xa4\xef\xb8\x8f", U), 2, "vs16 unicode")
+            spec.assert_eq(screen.gwidth("\xe2\x9d\xa4\xef\xb8\x8f", W), 1, "vs16 wcwidth")
+            spec.assert_eq(screen.gwidth("👋🏿", U), 2, "skin tone unicode")
+            spec.assert_eq(screen.gwidth("👋🏿", W), 4, "skin tone wcwidth")
+            spec.assert_eq(screen.gwidth("\xe2\x80\x8b", U), 0, "zero width space")
+            spec.assert_eq(screen.gwidth("\xe2\x80\x8c", W), 0, "zwnj")
+            spec.assert_eq(screen.gwidth("\xd6\xb0", U), 0, "hebrew mark")
+            spec.assert_eq(screen.gwidth("e\xcc\x81", U), 1, "e + combining")
+            spec.assert_eq(screen.gwidth("🇬🇧", U), 2, "flag")
+            spec.assert_eq(screen.gwidth("\x07", W), 0, "control")
+        }
+        spec.it("finds grapheme cluster ends") callback {
+            s = "ae\xcc\x81👩‍🚀z"
+            spec.assert_eq(screen.grapheme_end(s, 0), 1, "a")
+            spec.assert_eq(screen.grapheme_end(s, 1), 4, "e + mark")
+            spec.assert_eq(screen.grapheme_end(s, 4), 15, "zwj sequence")
+            spec.assert_eq(screen.grapheme_end(s, 15), 16, "z")
+            spec.assert_eq(screen.grapheme_end("\xff\xcc\x81", 0), 1, "an invalid byte is its own cluster")
+        }
+    }
+
+    spec.describe(fw, "printing") {
+        spec.it("wraps at grapheme boundaries") callback {
+            s = screen.surface(4, 3)
+            r = screen.draw(screen.window(s), [seg("abcdef")])
+            spec.assert_str_eq(screen.text(s), "abcd\nef\n\n", "rows")
+            spec.assert_eq(r.row, 1, "row")
+            spec.assert_eq(r.col, 2, "col")
+            spec.assert_false(r.overflow, "fits")
+        }
+        spec.it("overflows when the rows run out, and measures without writing") callback {
+            s = screen.surface(3, 2)
+            r = screen.draw(screen.window(s), [seg("abcdefgh")], commit: false)
+            spec.assert_true(r.overflow, "overflow")
+            spec.assert_str_eq(screen.text(s), "\n\n", "nothing written")
+        }
+        spec.it("puts each grapheme in one cell and a wide one across two") callback {
+            s = screen.surface(8, 1)
+            screen.draw(screen.window(s), [seg("e\xcc\x81你x")])
+            c0, _ok0 = screen.read_cell(s, 0, 0)
+            c1, _ok1 = screen.read_cell(s, 1, 0)
+            c3, _ok3 = screen.read_cell(s, 3, 0)
+            spec.assert_str_eq(c0.grapheme, "e\xcc\x81", "combining kept together")
+            spec.assert_str_eq(c1.grapheme, "你", "wide")
+            spec.assert_eq(c1.width, 2, "wide width")
+            spec.assert_str_eq(c3.grapheme, "x", "after the wide one")
+            spec.assert_str_eq(screen.row_text(s, 0), "e\xcc\x81你x", "row text steps over the covered cell")
+        }
+        spec.it("stops at the edge or a newline without wrapping") callback {
+            s = screen.surface(4, 2)
+            r = screen.draw(screen.window(s), [seg("abcdef")], wrap: screen.WRAP_NONE)
+            spec.assert_str_eq(screen.row_text(s, 0), "abcd", "cut")
+            spec.assert_true(r.overflow, "overflow")
+            s2 = screen.surface(6, 2)
+            r2 = screen.draw(screen.window(s2), [seg("ab\ncd")], wrap: screen.WRAP_NONE)
+            spec.assert_str_eq(screen.text(s2), "ab\n\n", "newline stops")
+            spec.assert_true(r2.overflow, "overflow at newline")
+        }
+        spec.it("wraps at word boundaries") callback {
+            s = screen.surface(8, 4)
+            r = screen.draw(screen.window(s), [seg("hello world foo")], wrap: screen.WRAP_WORD)
+            spec.assert_str_eq(screen.text(s), "hello\nworld\nfoo\n\n", "words")
+            spec.assert_eq(r.row, 2, "row")
+            spec.assert_eq(r.col, 3, "col")
+        }
+        spec.it("counts a row after the last line of a segment with a break, as libvaxis does") callback {
+            s = screen.surface(10, 4)
+            r = screen.draw(screen.window(s), [seg("one\ntwo")], wrap: screen.WRAP_WORD)
+            spec.assert_str_eq(screen.text(s), "one\ntwo\n\n\n", "lines")
+            spec.assert_eq(r.row, 2, "the row after 'two'")
+            spec.assert_eq(r.col, 0, "col")
+        }
+        spec.it("keeps each segment's style") callback {
+            s = screen.surface(6, 1)
+            red = screen.style(fg: screen.color_index(1), attrs: screen.BOLD)
+            screen.draw(screen.window(s), [screen.seg("ab", red), seg("c")])
+            a, _oka = screen.read_cell(s, 1, 0)
+            c, _okc = screen.read_cell(s, 2, 0)
+            spec.assert_true(screen.style_eq(a.style, red), "red bold")
+            spec.assert_true(screen.style_eq(c.style, screen.style()), "plain")
+        }
+    }
+
+    spec.describe(fw, "windows") {
+        spec.it("clip to their bounds") callback {
+            s = screen.surface(8, 2)
+            w = screen.child(screen.window(s), x_off: 2, width: 3)
+            screen.draw(w, [seg("abcdef")], wrap: screen.WRAP_NONE)
+            spec.assert_str_eq(screen.row_text(s, 0), "  abc", "clipped")
+        }
+        spec.it("clip a child scrolled above its parent") callback {
+            s = screen.surface(6, 3)
+            body = screen.child(screen.window(s), y_off: 1, height: 2)
+            scrolled = screen.child(body, y_off: -1, height: 3)
+            screen.draw(scrolled, [seg("one\ntwo\nsix")])
+            spec.assert_str_eq(screen.text(s), "\ntwo\nsix\n", "first line hidden")
+        }
+        spec.it("draw borders and give back the inside") callback {
+            s = screen.surface(6, 3)
+            inner = screen.child_bordered(screen.window(s), screen.BORDER_ALL)
+            spec.assert_eq(inner.width, 4, "inner width")
+            spec.assert_eq(inner.height, 1, "inner height")
+            screen.draw(inner, [seg("hi")])
+            spec.assert_str_eq(screen.text(s), "╭────╮\n│hi  │\n╰────╯\n", "rounded box")
+            sq = screen.surface(4, 2)
+            screen.child_bordered(screen.window(sq), screen.BORDER_TOP | screen.BORDER_LEFT, glyphs: screen.GLYPHS_SQUARE)
+            spec.assert_str_eq(screen.text(sq), "┌───\n│\n", "square, two sides")
+        }
+        spec.it("place the cursor in screen coordinates") callback {
+            s = screen.surface(10, 5)
+            w = screen.child(screen.window(s), x_off: 3, y_off: 2)
+            screen.show_cursor(w, 1, 1)
+            spec.assert_true(s.cursor_vis, "shown")
+            spec.assert_eq(s.cursor_col, 4, "col")
+            spec.assert_eq(s.cursor_row, 3, "row")
+            screen.show_cursor(w, 20, 1)
+            spec.assert_eq(s.cursor_col, 4, "out of the window: unchanged")
+            screen.hide_cursor(w)
+            spec.assert_false(s.cursor_vis, "hidden")
+        }
+        spec.it("fill and clear only their own cells") callback {
+            s = screen.surface(4, 2)
+            screen.draw(screen.window(s), [seg("abcdefgh")])
+            screen.clear(screen.child(screen.window(s), x_off: 1, y_off: 1, width: 2))
+            spec.assert_str_eq(screen.text(s), "abcd\ne  h\n", "cleared")
+            c, _ok = screen.read_cell(s, 1, 1)
+            spec.assert_true(c.is_default, "a cleared cell is a default cell")
+        }
+        spec.it("report mouse positions inside them") callback {
+            s = screen.surface(10, 5)
+            w = screen.child(screen.window(s), x_off: 2, y_off: 1, width: 3, height: 2)
+            spec.assert_true(screen.has_mouse(w, 2, 1), "corner")
+            spec.assert_false(screen.has_mouse(w, 5, 1), "right of it")
+        }
+    }
+
+    spec.describe(fw, "surfaces") {
+        spec.it("read outside is no cell") callback {
+            s = screen.surface(2, 2)
+            _c, ok = screen.read_cell(s, 2, 0)
+            spec.assert_false(ok, "outside")
+            _c2, ok2 = screen.read_cell(s, 1, 1)
+            spec.assert_true(ok2, "inside")
+        }
+        spec.it("resize clears") callback {
+            s = screen.surface(3, 1)
+            screen.draw(screen.window(s), [seg("abc")])
+            screen.surface_resize(s, 2, 2)
+            spec.assert_str_eq(screen.text(s), "\n\n", "blank")
+        }
+        spec.it("encode colours and compare styles") callback {
+            spec.assert_true(screen.color_is_index(screen.color_index(200)), "index")
+            spec.assert_eq(screen.color_value(screen.color_index(200)), 200, "index value")
+            c = screen.color_rgb(1, 2, 3)
+            spec.assert_true(screen.color_is_rgb(c), "rgb")
+            spec.assert_eq(screen.color_g(c), 2, "green")
+            spec.assert_false(screen.color_rgb(0, 0, 0) == screen.DEFAULT, "black is not default")
+            spec.assert_false(screen.style_eq(screen.style(attrs: screen.DIM), screen.style()), "dim differs")
+        }
+    }
+
+    return spec.run_summary(fw)
+}

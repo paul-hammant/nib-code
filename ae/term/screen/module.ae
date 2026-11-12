@@ -1,0 +1,696 @@
+// term.screen: the cell model. A Surface is a grid of Cells; a Window is a
+// clipped view onto one, offset from its parent. Printing Segments into a
+// Window wraps by grapheme or by word, measuring each grapheme's display width.
+//
+// The shapes and the arithmetic follow libvaxis (Cell.zig, Screen.zig,
+// Window.zig), the Zig library upstream nib draws with, so the TUI screens
+// port line for line and draw the same cells. Differences are noted inline.
+
+@source("unicode.c")
+
+import std.string
+import std.strbuilder
+
+exports(
+    // colours
+    DEFAULT, color_index, color_rgb, color_hex, color_is_default, color_is_index,
+    color_is_rgb, color_value, color_r, color_g, color_b,
+    // style
+    Style, BOLD, DIM, ITALIC, BLINK, REVERSE, INVISIBLE, STRIKETHROUGH,
+    UL_OFF, UL_SINGLE, UL_DOUBLE, UL_CURLY, UL_DOTTED, UL_DASHED,
+    style, style_eq, has_attr,
+    // cells
+    Cell, Segment, seg, blank_cell, cell_eq,
+    CURSOR_DEFAULT, CURSOR_BLOCK_BLINK, CURSOR_BLOCK, CURSOR_UNDERLINE_BLINK,
+    CURSOR_UNDERLINE, CURSOR_BEAM_BLINK, CURSOR_BEAM,
+    // unicode
+    WIDTH_UNICODE, WIDTH_WCWIDTH, gwidth, gwidth_method, grapheme_end,
+    codepoint_at, codepoint_len,
+    // surface
+    Surface, surface, surface_resize, surface_free, write_cell, read_cell,
+    surface_clear, row_text, text,
+    // window
+    Window, window, child, child_bordered, BORDER_TOP, BORDER_RIGHT, BORDER_BOTTOM,
+    BORDER_LEFT, BORDER_ALL, GLYPHS_ROUNDED, GLYPHS_SQUARE,
+    win_write, win_read, clear, fill, hide_cursor, show_cursor, set_cursor_shape,
+    win_gwidth, PrintResult, WRAP_GRAPHEME, WRAP_WORD, WRAP_NONE, draw,
+    draw_segment, scroll, has_mouse
+)
+
+extern aeterm_grapheme_end(s: string, len: int, off: int) -> int
+extern aeterm_gwidth(s: string, off: int, len: int, method: int) -> int
+extern aeterm_codepoint_at(s: string, len: int, off: int) -> int
+extern aeterm_codepoint_len(s: string, len: int, off: int) -> int
+
+// ---------------------------------------------------------------- colours
+//
+// A colour is an int: 0 is the terminal's default, 0x1000000|n is palette
+// entry n (0-255), 0x2000000|0xRRGGBB is a direct colour. Ints compare with
+// ==, which is all the renderer's diff needs.
+
+const DEFAULT = 0
+const KIND_INDEX = 0x1000000
+const KIND_RGB = 0x2000000
+
+color_index(n: int) -> int { return KIND_INDEX | (n & 0xFF) }
+color_rgb(r: int, g: int, b: int) -> int {
+    return KIND_RGB | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF)
+}
+color_hex(rgb: int) -> int { return KIND_RGB | (rgb & 0xFFFFFF) }
+color_is_default(c: int) -> bool { return c == DEFAULT }
+color_is_index(c: int) -> bool { return (c & 0x3000000) == KIND_INDEX }
+color_is_rgb(c: int) -> bool { return (c & 0x3000000) == KIND_RGB }
+// The palette index, or the 0xRRGGBB value.
+color_value(c: int) -> int { return c & 0xFFFFFF }
+color_r(c: int) -> int { return (c >> 16) & 0xFF }
+color_g(c: int) -> int { return (c >> 8) & 0xFF }
+color_b(c: int) -> int { return c & 0xFF }
+
+// ---------------------------------------------------------------- style
+
+const BOLD = 1
+const DIM = 2
+const ITALIC = 4
+const BLINK = 8
+const REVERSE = 16
+const INVISIBLE = 32
+const STRIKETHROUGH = 64
+
+const UL_OFF = 0
+const UL_SINGLE = 1
+const UL_DOUBLE = 2
+const UL_CURLY = 3
+const UL_DOTTED = 4
+const UL_DASHED = 5
+
+// fg, bg and ul (underline colour) are colours as above; attrs is a set of
+// the attribute bits; ul_style one of the UL_ values.
+struct Style {
+    fg: int
+    bg: int
+    ul: int
+    ul_style: int
+    attrs: int
+}
+
+style(fg: int = 0, bg: int = 0, attrs: int = 0, ul_style: int = 0, ul: int = 0) -> Style {
+    return Style { fg: fg, bg: bg, ul: ul, ul_style: ul_style, attrs: attrs }
+}
+
+style_eq(a: Style, b: Style) -> bool {
+    return a.fg == b.fg && a.bg == b.bg && a.ul == b.ul && a.ul_style == b.ul_style && a.attrs == b.attrs
+}
+
+has_attr(s: Style, bit: int) -> bool { return (s.attrs & bit) != 0 }
+
+// ---------------------------------------------------------------- cells
+
+const CURSOR_DEFAULT = 0
+const CURSOR_BLOCK_BLINK = 1
+const CURSOR_BLOCK = 2
+const CURSOR_UNDERLINE_BLINK = 3
+const CURSOR_UNDERLINE = 4
+const CURSOR_BEAM_BLINK = 5
+const CURSOR_BEAM = 6
+
+// One terminal cell. `width` is the grapheme's display width; a wide
+// grapheme occupies its cell and the next, whose content is not drawn.
+// width 0 asks the renderer to measure. `link`/`link_params` make an OSC 8
+// hyperlink. `is_default` marks a cell cleared rather than drawn (libvaxis's
+// `default`); `wrapped` marks the last cell printed on a row before a wrap.
+struct Cell {
+    grapheme: string
+    width: int
+    style: Style
+    link: string
+    link_params: string
+    is_default: bool
+    wrapped: bool
+}
+
+// A run of text in one style.
+struct Segment {
+    text: string
+    style: Style
+    link: string
+    link_params: string
+}
+
+seg(text: string, st: Style = Style { fg: 0, bg: 0, ul: 0, ul_style: 0, attrs: 0 }, link: string = "") -> Segment {
+    return Segment { text: text, style: st, link: link, link_params: "" }
+}
+
+blank_cell() -> Cell {
+    return Cell { grapheme: " ", width: 1, style: style(), link: "", link_params: "", is_default: false, wrapped: false }
+}
+
+cell_eq(a: Cell, b: Cell) -> bool {
+    return a.grapheme == b.grapheme && a.width == b.width && style_eq(a.style, b.style) && a.link == b.link && a.link_params == b.link_params && a.is_default == b.is_default
+}
+
+// ---------------------------------------------------------------- unicode
+
+// How widths are measured: per code point as wcwidth(3) does (the default,
+// as in libvaxis, for terminals that do not answer the mode 2027 query), or
+// per grapheme cluster, as a terminal in mode 2027 does. libvaxis's
+// `no_zwj` method is not ported (upstream never selects it).
+const WIDTH_WCWIDTH = 0
+const WIDTH_UNICODE = 1
+
+gwidth_method(s: string, method: int) -> int {
+    return aeterm_gwidth(s, 0, string.length(s), method)
+}
+
+gwidth(s: string, method: int = 0) -> int { return aeterm_gwidth(s, 0, string.length(s), method) }
+
+// The byte offset where the grapheme cluster starting at `off` ends.
+grapheme_end(s: string, off: int) -> int { return aeterm_grapheme_end(s, string.length(s), off) }
+
+// The code point at byte `off`, -1 for invalid UTF-8.
+codepoint_at(s: string, off: int) -> int { return aeterm_codepoint_at(s, string.length(s), off) }
+
+// The UTF-8 length of the code point at byte `off` (1 for an invalid byte).
+codepoint_len(s: string, off: int) -> int { return aeterm_codepoint_len(s, string.length(s), off) }
+
+// ---------------------------------------------------------------- surface
+
+// The grid a frame is drawn into (libvaxis's Screen). The cursor fields say
+// where the terminal cursor should be after a render.
+struct Surface {
+    width: int
+    height: int
+    cells: Cell[]
+    cursor_vis: bool
+    cursor_row: int
+    cursor_col: int
+    cursor_shape: int
+    width_method: int
+}
+
+surface(cols: int, rows: int) -> *Surface {
+    s = heap.new(Surface)
+    surface_resize(s, cols, rows)
+    return s
+}
+
+// Gives the surface a new size and clears every cell.
+surface_resize(s: *Surface, cols: int, rows: int) {
+    w = if cols < 0 { 0 } else { cols }
+    h = if rows < 0 { 0 } else { rows }
+    cells = make([]Cell, w * h)
+    // a fresh cell per store: a local stored in a loop is moved by the
+    // first store in Aether 0.909.0 (asks/loop-store-moves-local.md)
+    for i in 0..w * h {
+        cells[i] = blank_cell()
+    }
+    s.cells = cells
+    s.width = w
+    s.height = h
+    s.cursor_vis = false
+    s.cursor_row = 0
+    s.cursor_col = 0
+}
+
+surface_free(s: *Surface) {
+    heap.free(s)
+}
+
+write_cell(s: *Surface, col: int, row: int, c: Cell) {
+    if col < 0 || row < 0 || col >= s.width || row >= s.height {
+        return
+    }
+    s.cells[row * s.width + col] = c
+}
+
+// The cell, and whether (col, row) is on the surface at all (a blank cell
+// when not). libvaxis returns an optional; a local `Cell?` cannot be
+// returned safely in Aether 0.909.0 (asks/optional-return-frees-string.md).
+read_cell(s: *Surface, col: int, row: int) -> (Cell, bool) {
+    if col < 0 || row < 0 || col >= s.width || row >= s.height {
+        return blank_cell(), false
+    }
+    return s.cells[row * s.width + col], true
+}
+
+surface_clear(s: *Surface) {
+    for i in 0..s.cells.len {
+        s.cells[i] = blank_cell()
+    }
+}
+
+// A row as text: each cell's grapheme, stepping over the cell a wide
+// grapheme covers, trailing spaces trimmed. The same reading upstream's
+// layout snapshots are made with (view.zig `snapshot`).
+row_text(s: *Surface, row: int) -> string {
+    if row < 0 || row >= s.height {
+        return ""
+    }
+    parts = make([]string, 0)
+    col = 0
+    while col < s.width {
+        c = s.cells[row * s.width + col]
+        parts.push(c.grapheme)
+        w = gwidth_method(c.grapheme, s.width_method)
+        col = col + (if w < 1 { 1 } else { w })
+    }
+    line = _join(parts)
+    n = string.length(line)
+    while n > 0 && line[n - 1] == 32 {
+        n = n - 1
+    }
+    return string.substring(line, 0, n)
+}
+
+// Every row, each ended by a newline: the body of a snapshot.
+text(s: *Surface) -> string {
+    parts = make([]string, 0)
+    for r in 0..s.height {
+        parts.push(row_text(s, r))
+        parts.push("\n")
+    }
+    return _join(parts)
+}
+
+_join(parts: string[]) -> string {
+    sb = strbuilder.new(64)
+    for i in 0..parts.len {
+        strbuilder.append(sb, parts[i])
+    }
+    return strbuilder.finish(sb)
+}
+
+// ---------------------------------------------------------------- window
+
+// A view onto a Surface. x_off/y_off are absolute; parent_x_off and
+// parent_y_off accumulate only negative offsets, so a child scrolled above
+// its parent is clipped where the parent ends (libvaxis Window).
+struct Window {
+    surf: *Surface
+    x_off: int
+    y_off: int
+    parent_x_off: int
+    parent_y_off: int
+    width: int
+    height: int
+}
+
+window(s: *Surface) -> Window {
+    return Window { surf: s, x_off: 0, y_off: 0, parent_x_off: 0, parent_y_off: 0, width: s.width, height: s.height }
+}
+
+_init_child(w: Window, x_off: int, y_off: int, width: int, height: int) -> Window {
+    max_h = w.height - y_off
+    if max_h < 0 {
+        max_h = 0
+    }
+    max_w = w.width - x_off
+    if max_w < 0 {
+        max_w = 0
+    }
+    cw = if width < 0 { max_w } else { width }
+    ch = if height < 0 { max_h } else { height }
+    px = w.parent_x_off + x_off
+    py = w.parent_y_off + y_off
+    return Window {
+        surf: w.surf,
+        x_off: x_off + w.x_off,
+        y_off: y_off + w.y_off,
+        parent_x_off: if px < 0 { px } else { 0 },
+        parent_y_off: if py < 0 { py } else { 0 },
+        width: if cw < max_w { cw } else { max_w },
+        height: if ch < max_h { ch } else { max_h }
+    }
+}
+
+// A child window. width/height -1 take the rest of the parent; a size larger
+// than what remains is clamped to it. Offsets may be negative.
+child(w: Window, x_off: int = 0, y_off: int = 0, width: int = -1, height: int = -1) -> Window {
+    return _init_child(w, x_off, y_off, width, height)
+}
+
+const BORDER_TOP = 1
+const BORDER_RIGHT = 2
+const BORDER_BOTTOM = 4
+const BORDER_LEFT = 8
+const BORDER_ALL = 15
+
+const GLYPHS_ROUNDED = 0
+const GLYPHS_SQUARE = 1
+
+// A child window with a border drawn on the given sides; the window returned
+// is the inside of the border.
+child_bordered(w: Window, where: int, glyphs: int = 0, st: Style = Style { fg: 0, bg: 0, ul: 0, ul_style: 0, attrs: 0 }, x_off: int = 0, y_off: int = 0, width: int = -1, height: int = -1) -> Window {
+    r = _init_child(w, x_off, y_off, width, height)
+    tl = if glyphs == GLYPHS_SQUARE { "┌" } else { "╭" }
+    tr = if glyphs == GLYPHS_SQUARE { "┐" } else { "╮" }
+    br = if glyphs == GLYPHS_SQUARE { "┘" } else { "╯" }
+    bl = if glyphs == GLYPHS_SQUARE { "└" } else { "╰" }
+    h = r.height
+    wd = r.width
+    if (where & BORDER_TOP) != 0 {
+        for i in 0..wd {
+            win_write(r, i, 0, _glyph("─", st))
+        }
+    }
+    if (where & BORDER_BOTTOM) != 0 {
+        for i in 0..wd {
+            win_write(r, i, _sat(h - 1), _glyph("─", st))
+        }
+    }
+    if (where & BORDER_LEFT) != 0 {
+        for i in 0..h {
+            win_write(r, 0, i, _glyph("│", st))
+        }
+    }
+    if (where & BORDER_RIGHT) != 0 {
+        for i in 0..h {
+            win_write(r, _sat(wd - 1), i, _glyph("│", st))
+        }
+    }
+    if (where & BORDER_TOP) != 0 && (where & BORDER_LEFT) != 0 {
+        win_write(r, 0, 0, _glyph(tl, st))
+    }
+    if (where & BORDER_TOP) != 0 && (where & BORDER_RIGHT) != 0 {
+        win_write(r, _sat(wd - 1), 0, _glyph(tr, st))
+    }
+    if (where & BORDER_BOTTOM) != 0 && (where & BORDER_LEFT) != 0 {
+        win_write(r, 0, _sat(h - 1), _glyph(bl, st))
+    }
+    if (where & BORDER_BOTTOM) != 0 && (where & BORDER_RIGHT) != 0 {
+        win_write(r, _sat(wd - 1), _sat(h - 1), _glyph(br, st))
+    }
+    xo = if (where & BORDER_LEFT) != 0 { 1 } else { 0 }
+    yo = if (where & BORDER_TOP) != 0 { 1 } else { 0 }
+    hd = if (where & BORDER_BOTTOM) != 0 { 1 } else { 0 }
+    wdl = if (where & BORDER_RIGHT) != 0 { 1 } else { 0 }
+    return _init_child(r, xo, yo, _sat(wd - xo - wdl), _sat(h - yo - hd))
+}
+
+_sat(n: int) -> int { return if n < 0 { 0 } else { n } }
+
+_glyph(g: string, st: Style) -> Cell {
+    return Cell { grapheme: g, width: 1, style: st, link: "", link_params: "", is_default: false, wrapped: false }
+}
+
+_clipped(w: Window, col: int, row: int) -> bool {
+    return row >= w.height || col >= w.width || row < 0 || col < 0 || w.x_off + col < 0 || w.y_off + row < 0 || w.parent_x_off + col < 0 || w.parent_y_off + row < 0
+}
+
+win_write(w: Window, col: int, row: int, c: Cell) {
+    if _clipped(w, col, row) {
+        return
+    }
+    write_cell(w.surf, col + w.x_off, row + w.y_off, c)
+}
+
+win_read(w: Window, col: int, row: int) -> (Cell, bool) {
+    if _clipped(w, col, row) {
+        return blank_cell(), false
+    }
+    return read_cell(w.surf, col + w.x_off, row + w.y_off)
+}
+
+// Fills the window with cleared cells.
+clear(w: Window) {
+    c = blank_cell()
+    c.is_default = true
+    fill(w, c)
+}
+
+// Fills the visible part of the window with `c`.
+fill(w: Window, c: Cell) {
+    s = w.surf
+    top = if w.y_off > 0 { w.y_off } else { 0 }
+    bottom = w.y_off + w.height
+    if bottom > s.height {
+        bottom = s.height
+    }
+    left = if w.x_off > 0 { w.x_off } else { 0 }
+    right = w.x_off + w.width
+    if right > s.width {
+        right = s.width
+    }
+    row = top
+    while row < bottom {
+        col = left
+        while col < right {
+            s.cells[row * s.width + col] = c
+            col = col + 1
+        }
+        row = row + 1
+    }
+}
+
+hide_cursor(w: Window) {
+    w.surf.cursor_vis = false
+}
+
+show_cursor(w: Window, col: int, row: int) {
+    if w.x_off + col < 0 || w.y_off + row < 0 || row >= w.height || col >= w.width {
+        return
+    }
+    w.surf.cursor_vis = true
+    w.surf.cursor_row = row + w.y_off
+    w.surf.cursor_col = col + w.x_off
+}
+
+set_cursor_shape(w: Window, shape: int) {
+    w.surf.cursor_shape = shape
+}
+
+win_gwidth(w: Window, s: string) -> int { return gwidth_method(s, w.surf.width_method) }
+
+// ---------------------------------------------------------------- printing
+
+const WRAP_GRAPHEME = 0
+const WRAP_WORD = 1
+const WRAP_NONE = 2
+
+struct PrintResult {
+    col: int
+    row: int
+    overflow: bool
+}
+
+_print_cell(w: Window, col: int, row: int, g: string, width: int, sg: Segment, wrapped: bool) {
+    win_write(w, col, row, Cell { grapheme: g, width: width, style: sg.style, link: sg.link, link_params: sg.link_params, is_default: false, wrapped: wrapped })
+}
+
+// Prints segments into the window from (col_offset, row_offset). With commit
+// false nothing is written: the result only measures. libvaxis
+// Window.print, including its quirks (word wrap counts a row after the last
+// line of a segment that contained a line break).
+draw(w: Window, segments: Segment[], row_offset: int = 0, col_offset: int = 0, wrap: int = 0, commit: bool = true) -> PrintResult {
+    row = row_offset
+    col = col_offset
+    method = w.surf.width_method
+    if wrap == WRAP_GRAPHEME {
+        overflow = false
+        for si in 0..segments.len {
+            if overflow {
+                break
+            }
+            sg = segments[si]
+            t = sg.text
+            n = string.length(t)
+            i = 0
+            while i < n {
+                if col >= w.width {
+                    row = row + 1
+                    col = 0
+                }
+                if row >= w.height {
+                    overflow = true
+                    break
+                }
+                e = aeterm_grapheme_end(t, n, i)
+                if t[i] == 10 && e == i + 1 {
+                    row = row + 1
+                    col = 0
+                    i = e
+                    continue
+                }
+                g = string.substring(t, i, e)
+                gw = aeterm_gwidth(t, i, e - i, method)
+                i = e
+                if gw == 0 {
+                    continue
+                }
+                if commit {
+                    _print_cell(w, col, row, g, gw, sg, col + gw >= w.width)
+                }
+                col = col + gw
+            }
+        }
+        if col >= w.width {
+            row = row + 1
+            col = 0
+        }
+        return PrintResult { col: col, row: row, overflow: overflow }
+    }
+    if wrap == WRAP_NONE {
+        overflow = false
+        for si in 0..segments.len {
+            if overflow {
+                break
+            }
+            sg = segments[si]
+            t = sg.text
+            n = string.length(t)
+            i = 0
+            while i < n {
+                if col >= w.width {
+                    overflow = true
+                    break
+                }
+                e = aeterm_grapheme_end(t, n, i)
+                if t[i] == 10 && e == i + 1 {
+                    overflow = true
+                    break
+                }
+                gw = aeterm_gwidth(t, i, e - i, method)
+                if gw != 0 {
+                    if commit {
+                        _print_cell(w, col, row, string.substring(t, i, e), gw, sg, false)
+                    }
+                    col = col + gw
+                }
+                i = e
+            }
+        }
+        return PrintResult { col: col, row: row, overflow: overflow }
+    }
+    // WRAP_WORD
+    overflow = false
+    soft_wrapped = false
+    for si in 0..segments.len {
+        if overflow {
+            break
+        }
+        sg = segments[si]
+        t = sg.text
+        n = string.length(t)
+        pos = 0
+        has_break = true
+        while pos < n && !overflow {
+            // the next line: up to \r or \n, then consume one \r and one \n
+            start = pos
+            end = pos
+            while end < n && t[end] != 13 && t[end] != 10 {
+                end = end + 1
+            }
+            if end >= n {
+                if start == 0 {
+                    has_break = false
+                }
+                pos = n
+            } else {
+                pos = end
+                if pos < n && t[pos] == 13 {
+                    pos = pos + 1
+                }
+                if pos < n && t[pos] == 10 {
+                    pos = pos + 1
+                }
+            }
+            // tokens of the line
+            k = start
+            while k < end {
+                first = t[k]
+                if first == 32 || first == 9 {
+                    len = 0
+                    while k < end && (t[k] == 32 || t[k] == 9) {
+                        len = len + (if t[k] == 9 { 8 } else { 1 })
+                        k = k + 1
+                    }
+                    if soft_wrapped {
+                        continue
+                    }
+                    j = 0
+                    while j < len {
+                        if col >= w.width {
+                            col = 0
+                            row = row + 1
+                            break
+                        }
+                        if commit {
+                            _print_cell(w, col, row, " ", 1, sg, false)
+                        }
+                        col = col + 1
+                        j = j + 1
+                    }
+                } else {
+                    ws = k
+                    while k < end && t[k] != 32 && t[k] != 9 {
+                        k = k + 1
+                    }
+                    word_w = aeterm_gwidth(t, ws, k - ws, method)
+                    if word_w + col > w.width && word_w < w.width {
+                        row = row + 1
+                        col = 0
+                    }
+                    gi = ws
+                    while gi < k {
+                        soft_wrapped = false
+                        if row >= w.height {
+                            overflow = true
+                            break
+                        }
+                        ge = aeterm_grapheme_end(t, k, gi)
+                        gw = aeterm_gwidth(t, gi, ge - gi, method)
+                        if commit {
+                            _print_cell(w, col, row, string.substring(t, gi, ge), gw, sg, false)
+                        }
+                        gi = ge
+                        col = col + gw
+                        if col >= w.width {
+                            row = row + 1
+                            col = 0
+                            soft_wrapped = true
+                        }
+                    }
+                    if overflow {
+                        break
+                    }
+                }
+            }
+            // libvaxis advances in a defer, so a line that overflowed
+            // still counts its row
+            if has_break {
+                soft_wrapped = false
+                row = row + 1
+                col = 0
+            }
+            if overflow {
+                break
+            }
+        }
+    }
+    return PrintResult { col: col, row: row, overflow: overflow }
+}
+
+draw_segment(w: Window, sg: Segment, row_offset: int = 0, col_offset: int = 0, wrap: int = 0, commit: bool = true) -> PrintResult {
+    return draw(w, [sg], row_offset: row_offset, col_offset: col_offset, wrap: wrap, commit: commit)
+}
+
+// Scrolls the window's rows up by n, clearing the n rows left at the bottom.
+scroll(w: Window, n: int) {
+    if n > w.height {
+        return
+    }
+    s = w.surf
+    row = if w.y_off > 0 { w.y_off } else { 0 }
+    first_col = if w.x_off > 0 { w.x_off } else { 0 }
+    while row < w.height - n {
+        for c in 0..w.width {
+            s.cells[row * s.width + first_col + c] = s.cells[(row + n) * s.width + first_col + c]
+        }
+        row = row + 1
+    }
+    clear(child(w, y_off: w.height - n))
+}
+
+// True when the mouse position (screen coordinates) falls inside the window.
+has_mouse(w: Window, col: int, row: int) -> bool {
+    return col >= w.x_off && col < w.x_off + w.width && row >= w.y_off && row < w.y_off + w.height
+}

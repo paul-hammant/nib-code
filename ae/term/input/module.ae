@@ -1,0 +1,1218 @@
+// term.input: what a terminal sends, as events. Key presses (legacy xterm
+// encodings and the kitty keyboard protocol), SGR and X10 mouse reports,
+// bracketed paste, focus, colour reports, in-band resize and the replies to
+// capability queries.
+//
+// Key codes and matching follow libvaxis (Key.zig, Parser.zig): functional
+// keys carry the kitty protocol's private-use code points, modifiers are
+// kitty's bit set, and `matches` applies vaxis's three loose rules, so
+// upstream's key handling ports unchanged. The encoders go the other way, for
+// round-trip tests and for the in-memory terminal's `press`.
+
+import std.string
+import std.strbuilder
+import std.encoding
+import term.screen
+
+exports(
+    // modifiers
+    SHIFT, ALT, CTRL, SUPER, HYPER, META, CAPS_LOCK, NUM_LOCK,
+    // key codes
+    TAB, ENTER, ESCAPE, SPACE, BACKSPACE, MULTICODEPOINT,
+    INSERT, DELETE, LEFT, RIGHT, UP, DOWN, PAGE_UP, PAGE_DOWN, HOME, END,
+    CAPS_LOCK_KEY, SCROLL_LOCK, NUM_LOCK_KEY, PRINT_SCREEN, PAUSE, MENU,
+    F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, KP_BEGIN,
+    LEFT_SHIFT, LEFT_CONTROL, LEFT_ALT, LEFT_SUPER, RIGHT_SHIFT, RIGHT_CONTROL, RIGHT_ALT, RIGHT_SUPER,
+    // mouse
+    BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_NONE, WHEEL_UP, WHEEL_DOWN,
+    WHEEL_RIGHT, WHEEL_LEFT, MOUSE_SHIFT, MOUSE_ALT, MOUSE_CTRL,
+    MOUSE_PRESS, MOUSE_RELEASE, MOUSE_MOTION, MOUSE_DRAG,
+    // colour reports
+    REPORT_FG, REPORT_BG, REPORT_CURSOR, REPORT_INDEX,
+    // capabilities
+    CAP_DA1, CAP_KITTY_KEYBOARD, CAP_UNICODE, CAP_COLOR_SCHEME_UPDATES, CAP_SGR_PIXELS,
+    CAP_KITTY_GRAPHICS,
+    // events
+    Key, Mouse, Winsize, PasteStart, PasteEnd, Paste, FocusIn, FocusOut,
+    ColorReport, ColorScheme, Capability, NoEvent, Event, is_event,
+    key, matches, match_exact, match_text, match_shifted, match_shortcut,
+    is_modifier, describe,
+    // decoding
+    Decoder, decoder, feed, next_event, pending_len, decode_all,
+    // encoding
+    encode_key, encode_mouse, encode_paste, encode_focus, encode_event,
+    key_from_spec, key_name
+)
+
+// ---------------------------------------------------------------- modifiers
+// Kitty's modifier bits (the wire value is 1 + these).
+const SHIFT = 1
+const ALT = 2
+const CTRL = 4
+const SUPER = 8
+const HYPER = 16
+const META = 32
+const CAPS_LOCK = 64
+const NUM_LOCK = 128
+
+// ---------------------------------------------------------------- key codes
+const TAB = 9
+const ENTER = 13
+const ESCAPE = 27
+const SPACE = 32
+const BACKSPACE = 127
+// A key whose text is several code points (a grapheme cluster).
+const MULTICODEPOINT = 1114113
+
+const INSERT = 57348
+const DELETE = 57349
+const LEFT = 57350
+const RIGHT = 57351
+const UP = 57352
+const DOWN = 57353
+const PAGE_UP = 57354
+const PAGE_DOWN = 57355
+const HOME = 57356
+const END = 57357
+const CAPS_LOCK_KEY = 57358
+const SCROLL_LOCK = 57359
+const NUM_LOCK_KEY = 57360
+const PRINT_SCREEN = 57361
+const PAUSE = 57362
+const MENU = 57363
+const F1 = 57364
+const F2 = 57365
+const F3 = 57366
+const F4 = 57367
+const F5 = 57368
+const F6 = 57369
+const F7 = 57370
+const F8 = 57371
+const F9 = 57372
+const F10 = 57373
+const F11 = 57374
+const F12 = 57375
+const KP_BEGIN = 57427
+const LEFT_SHIFT = 57441
+const LEFT_CONTROL = 57442
+const LEFT_ALT = 57443
+const LEFT_SUPER = 57444
+const RIGHT_SHIFT = 57447
+const RIGHT_CONTROL = 57448
+const RIGHT_ALT = 57449
+const RIGHT_SUPER = 57450
+
+// ---------------------------------------------------------------- mouse
+const BUTTON_LEFT = 0
+const BUTTON_MIDDLE = 1
+const BUTTON_RIGHT = 2
+const BUTTON_NONE = 3
+const WHEEL_UP = 64
+const WHEEL_DOWN = 65
+const WHEEL_RIGHT = 66
+const WHEEL_LEFT = 67
+
+const MOUSE_SHIFT = 1
+const MOUSE_ALT = 2
+const MOUSE_CTRL = 4
+
+const MOUSE_PRESS = 0
+const MOUSE_RELEASE = 1
+const MOUSE_MOTION = 2
+const MOUSE_DRAG = 3
+
+const REPORT_FG = 10
+const REPORT_BG = 11
+const REPORT_CURSOR = 12
+const REPORT_INDEX = 4
+
+const CAP_DA1 = 1
+const CAP_KITTY_KEYBOARD = 2
+const CAP_UNICODE = 3
+const CAP_COLOR_SCHEME_UPDATES = 4
+const CAP_SGR_PIXELS = 5
+const CAP_KITTY_GRAPHICS = 6
+
+// ---------------------------------------------------------------- events
+
+// A key press. shifted_codepoint and base_layout_codepoint are -1 when the
+// terminal did not say (only the kitty protocol does). text is what the key
+// types, "" for none.
+struct Key {
+    codepoint: int
+    text: string
+    shifted_codepoint: int
+    base_layout_codepoint: int
+    mods: int
+}
+
+// col/row are 0-based cells; button a BUTTON_ or WHEEL_ value; mods
+// MOUSE_ bits; kind a MOUSE_ value.
+struct Mouse {
+    col: int
+    row: int
+    button: int
+    mods: int
+    kind: int
+}
+
+struct Winsize {
+    cols: int
+    rows: int
+    x_pixel: int
+    y_pixel: int
+}
+
+struct PasteStart {}
+struct PasteEnd {}
+
+// The system clipboard's contents, an OSC 52 reply.
+struct Paste {
+    text: string
+}
+
+struct FocusIn {}
+struct FocusOut {}
+
+// A reply to an OSC 4/10/11/12 query. kind is REPORT_FG, REPORT_BG,
+// REPORT_CURSOR or REPORT_INDEX (index then names the palette entry).
+struct ColorReport {
+    kind: int
+    index: int
+    r: int
+    g: int
+    b: int
+}
+
+struct ColorScheme {
+    dark: bool
+}
+
+// A reply to a capability query (CAP_ values). The terminal consumes these
+// while querying; poll never returns one.
+struct Capability {
+    what: int
+}
+
+// No event: what next_event and poll return when there is none. (An
+// optional would be the natural shape; returning a local `T?` whose T owns
+// a string frees the string in Aether 0.909.0, see asks/.)
+struct NoEvent {}
+
+type Event = NoEvent | Key | Mouse | Winsize | PasteStart | PasteEnd | Paste | FocusIn | FocusOut | ColorReport | ColorScheme | Capability
+
+is_event(e: Event) -> bool {
+    return match e {
+        NoEvent -> false
+        _ -> true
+    }
+}
+
+key(codepoint: int, mods: int = 0, text: string = "") -> Key {
+    return Key { codepoint: codepoint, text: text, shifted_codepoint: -1, base_layout_codepoint: -1, mods: mods }
+}
+
+// ---------------------------------------------------------------- matching
+
+_strip_locks(m: int) -> int { return m & ~(CAPS_LOCK | NUM_LOCK) }
+
+// The codepoint and modifiers are exactly these (lock keys ignored).
+match_exact(k: Key, cp: int, mods: int) -> bool {
+    return k.codepoint == cp && _strip_locks(k.mods) == _strip_locks(mods)
+}
+
+// The key's text is the code point (upper-cased for an ASCII letter when
+// mods has shift or caps lock), shift and locks ignored on both sides.
+match_text(k: Key, cp: int, mods: int) -> bool {
+    if string.length(k.text) == 0 {
+        return false
+    }
+    c = cp
+    if cp < 128 && (mods & (SHIFT | CAPS_LOCK)) != 0 && cp >= 97 && cp <= 122 {
+        c = cp - 32
+    }
+    sb = strbuilder.new(4)
+    strbuilder.append_codepoint(sb, c)
+    want = strbuilder.finish(sb)
+    strip = ~(SHIFT | CAPS_LOCK | NUM_LOCK)
+    return k.text == want && (k.mods & strip) == (mods & strip)
+}
+
+// shift + ; matches ':' (and ctrl+shift+; matches ctrl+':').
+match_shifted(k: Key, cp: int, mods: int) -> bool {
+    if k.shifted_codepoint < 0 || (k.mods & SHIFT) == 0 {
+        return false
+    }
+    self_mods = k.mods & ~(SHIFT | CAPS_LOCK | NUM_LOCK)
+    return cp == k.shifted_codepoint && self_mods == mods
+}
+
+// Matches on the base-layout key, for shortcuts under another layout.
+match_shortcut(k: Key, cp: int, mods: int) -> bool {
+    return k.base_layout_codepoint >= 0 && cp == k.base_layout_codepoint && k.mods == mods
+}
+
+// libvaxis Key.matches: exact, then text, then shifted code point.
+matches(k: Key, cp: int, mods: int = 0) -> bool {
+    return match_exact(k, cp, mods) || match_text(k, cp, mods) || match_shifted(k, cp, mods)
+}
+
+is_modifier(k: Key) -> bool {
+    c = k.codepoint
+    return c >= LEFT_SHIFT && c <= 57452
+}
+
+// ---------------------------------------------------------------- names
+
+const NAMES[] = ["tab", "enter", "escape", "esc", "space", "backspace", "insert", "delete",
+    "left", "right", "up", "down", "page_up", "pageup", "page_down", "pagedown", "home", "end",
+    "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
+    "return", "kp_begin", "menu", "pause", "print_screen"]
+const CODES[] = [9, 13, 27, 27, 32, 127, 57348, 57349,
+    57350, 57351, 57352, 57353, 57354, 57354, 57355, 57355, 57356, 57357,
+    57364, 57365, 57366, 57367, 57368, 57369, 57370, 57371, 57372, 57373, 57374, 57375,
+    13, 57427, 57363, 57362, 57361]
+
+_utf8(cp: int) -> string {
+    sb = strbuilder.new(4)
+    strbuilder.append_codepoint(sb, cp)
+    return strbuilder.finish(sb)
+}
+
+// The name of a key code ("enter", "f5", "a").
+key_name(cp: int) -> string {
+    for i in 0..NAMES.len {
+        if CODES[i] == cp && NAMES[i] != "esc" && NAMES[i] != "pageup" && NAMES[i] != "pagedown" && NAMES[i] != "return" {
+            return NAMES[i]
+        }
+    }
+    if cp == MULTICODEPOINT {
+        return "multicodepoint"
+    }
+    return _utf8(cp)
+}
+
+// "ctrl+shift+a", "Enter", "f5", "alt+x", "a", "A", "space": the key a
+// terminal that speaks the kitty protocol reports for that chord. An
+// upper-case letter is shift + the letter.
+key_from_spec(spec: string) -> (Key, string) {
+    parts = _split(spec, 43)
+    mods = 0
+    name = ""
+    n = parts.len
+    // a trailing "+" (the plus key itself): "ctrl++" splits to [ctrl, "", ""]
+    if n >= 2 && parts[n - 1] == "" {
+        name = "+"
+        n = n - 2
+    } else {
+        name = parts[n - 1]
+        n = n - 1
+    }
+    for i in 0..n {
+        m = string.to_lower(parts[i])
+        match m {
+            "ctrl" -> { mods = mods | CTRL }
+            "control" -> { mods = mods | CTRL }
+            "alt" -> { mods = mods | ALT }
+            "option" -> { mods = mods | ALT }
+            "shift" -> { mods = mods | SHIFT }
+            "super" -> { mods = mods | SUPER }
+            "cmd" -> { mods = mods | SUPER }
+            "hyper" -> { mods = mods | HYPER }
+            "meta" -> { mods = mods | META }
+            _ -> { return key(0), "unknown modifier '${parts[i]}' in '${spec}'" }
+        }
+    }
+    if string.length(name) == 0 {
+        return key(0), "no key in '${spec}'"
+    }
+    lower = string.to_lower(name)
+    for i in 0..NAMES.len {
+        if NAMES[i] == lower && string.length(name) > 1 {
+            return key(CODES[i], mods: mods), ""
+        }
+    }
+    cp = screen.codepoint_at(name, 0)
+    if cp < 0 || screen.codepoint_len(name, 0) != string.length(name) {
+        return key(0), "unknown key '${name}' in '${spec}'"
+    }
+    shifted = -1
+    if cp >= 65 && cp <= 90 {
+        mods = mods | SHIFT
+        shifted = cp
+        cp = cp + 32
+    } else if (mods & SHIFT) != 0 && cp >= 97 && cp <= 122 {
+        shifted = cp - 32
+    }
+    text = ""
+    if (mods & (CTRL | ALT | SUPER | HYPER | META)) == 0 {
+        text = _utf8(if shifted >= 0 { shifted } else { cp })
+    }
+    return Key { codepoint: cp, text: text, shifted_codepoint: shifted, base_layout_codepoint: -1, mods: mods }, ""
+}
+
+_mods_text(m: int) -> string {
+    s = ""
+    if (m & CTRL) != 0 { s = "${s}ctrl+" }
+    if (m & ALT) != 0 { s = "${s}alt+" }
+    if (m & SHIFT) != 0 { s = "${s}shift+" }
+    if (m & SUPER) != 0 { s = "${s}super+" }
+    if (m & HYPER) != 0 { s = "${s}hyper+" }
+    if (m & META) != 0 { s = "${s}meta+" }
+    return s
+}
+
+// A one-line description, for test failure messages and the demo.
+describe(e: Event) -> string {
+    return match e {
+        NoEvent -> "none"
+        Key -> _describe_key(e)
+        Mouse -> "mouse ${_mouse_kind(e.kind)} button=${e.button} at ${e.col},${e.row}${_opt("mods", e.mods != 0, string.from_int(e.mods))}"
+        Winsize -> "winsize ${e.cols}x${e.rows}"
+        PasteStart -> "paste_start"
+        PasteEnd -> "paste_end"
+        Paste -> "paste ${_quote(e.text)}"
+        FocusIn -> "focus_in"
+        FocusOut -> "focus_out"
+        ColorReport -> "color_report ${e.kind}/${e.index} ${e.r},${e.g},${e.b}"
+        ColorScheme -> "color_scheme ${if e.dark { "dark" } else { "light" }}"
+        Capability -> "capability ${e.what}"
+    }
+}
+
+_describe_key(e: Key) -> string {
+    t = _opt("text", string.length(e.text) > 0, _quote(e.text))
+    sh = _opt("shifted", e.shifted_codepoint >= 0, string.from_int(e.shifted_codepoint))
+    return "key ${_mods_text(e.mods)}${key_name(e.codepoint)}${t}${sh}"
+}
+
+_opt(name: string, present: bool, value: string) -> string {
+    if present {
+        return " ${name}=${value}"
+    }
+    return ""
+}
+
+_mouse_kind(k: int) -> string {
+    return match k {
+        0 -> "press"
+        1 -> "release"
+        2 -> "motion"
+        _ -> "drag"
+    }
+}
+
+_quote(s: string) -> string {
+    sb = strbuilder.new(string.length(s) + 2)
+    strbuilder.append(sb, "\"")
+    for i in 0..string.length(s) {
+        b = s[i]
+        if b < 32 || b == 127 {
+            strbuilder.append(sb, "\\x")
+            strbuilder.append(sb, _hex2(b))
+        } else {
+            strbuilder.append_byte(sb, b)
+        }
+    }
+    strbuilder.append(sb, "\"")
+    return strbuilder.finish(sb)
+}
+
+_hex2(b: int) -> string {
+    const HEX = "0123456789abcdef"
+    sb = strbuilder.new(2)
+    strbuilder.append_byte(sb, HEX[(b >> 4) & 15])
+    strbuilder.append_byte(sb, HEX[b & 15])
+    return strbuilder.finish(sb)
+}
+
+// ---------------------------------------------------------------- helpers
+
+// Splits on one byte; empty fields kept.
+_split(s: string, sep: int) -> string[] {
+    out = make([]string, 0)
+    n = string.length(s)
+    start = 0
+    for i in 0..n {
+        if s[i] == sep {
+            out.push(string.substring(s, start, i))
+            start = i + 1
+        }
+    }
+    out.push(string.substring(s, start, n))
+    return out
+}
+
+// A decimal parameter: `dflt` when empty, -1 when not a number.
+_param(s: string, dflt: int) -> int {
+    n = string.length(s)
+    if n == 0 {
+        return dflt
+    }
+    v = 0
+    for i in 0..n {
+        c = s[i]
+        if c < 48 || c > 57 || v > 100000000 {
+            return -1
+        }
+        v = v * 10 + (c - 48)
+    }
+    return v
+}
+
+// ---------------------------------------------------------------- decoder
+
+// Bytes in, events out. Bytes a sequence still needs stay pending until more
+// arrive, or until the caller says no more are coming (`eof`), when a lone
+// ESC is the Escape key and an unfinished sequence is dropped.
+struct Decoder {
+    buf: string
+    pos: int
+}
+
+decoder() -> *Decoder {
+    d = heap.new(Decoder)
+    d.buf = ""
+    d.pos = 0
+    return d
+}
+
+feed(d: *Decoder, data: string) {
+    if d.pos >= string.length(d.buf) {
+        d.buf = data
+    } else {
+        d.buf = string.concat(string.substring(d.buf, d.pos, string.length(d.buf)), data)
+    }
+    d.pos = 0
+}
+
+pending_len(d: *Decoder) -> int { return string.length(d.buf) - d.pos }
+
+// Every event in `data`, as a terminal would deliver it in one read.
+decode_all(data: string) -> Event[] {
+    d = decoder()
+    feed(d, data)
+    out = make([]Event, 0)
+    while true {
+        e = next_event(d, true)
+        if !is_event(e) {
+            break
+        }
+        out.push(e)
+    }
+    heap.free(d)
+    return out
+}
+
+// The next event, or NoEvent when the pending bytes hold no complete one.
+// Bytes that decode to nothing (an unknown sequence, a key release) are
+// consumed silently.
+next_event(d: *Decoder, eof: bool) -> Event {
+    while d.pos < string.length(d.buf) {
+        e, consumed = _parse(d.buf, d.pos, eof)
+        if consumed == 0 {
+            return NoEvent {}
+        }
+        d.pos = d.pos + consumed
+        if is_event(e) {
+            return e
+        }
+    }
+    return NoEvent {}
+}
+
+// Parses at s[p]: (event, bytes consumed). Consumed 0 means incomplete.
+_parse(s: string, p: int, eof: bool) -> (Event, int) {
+    n = string.length(s)
+    b = s[p]
+    if b == 27 {
+        if p + 1 >= n {
+            if eof {
+                return key(ESCAPE), 1
+            }
+            return NoEvent {}, 0
+        }
+        c = s[p + 1]
+        match c {
+            79 -> { return _ss3(s, p, eof) }
+            80 -> { return _skip_st(s, p, eof) }
+            88 -> { return _skip_st(s, p, eof) }
+            91 -> { return _csi(s, p, eof) }
+            93 -> { return _osc(s, p, eof) }
+            94 -> { return _skip_st(s, p, eof) }
+            95 -> { return _apc(s, p, eof) }
+            _ -> { return key(c, mods: ALT), 2 }
+        }
+    }
+    return _ground(s, p, eof)
+}
+
+_ground(s: string, p: int, eof: bool) -> (Event, int) {
+    b = s[p]
+    if b == 0 {
+        return key(64, mods: CTRL), 1
+    }
+    if b == 8 {
+        return key(BACKSPACE), 1
+    }
+    if b == 9 {
+        return key(TAB), 1
+    }
+    if b == 10 {
+        return key(106, mods: CTRL), 1
+    }
+    if b == 13 {
+        return key(ENTER), 1
+    }
+    if b == 127 {
+        return key(BACKSPACE), 1
+    }
+    if b < 32 {
+        return key(b + 96, mods: CTRL), 1
+    }
+    n = string.length(s)
+    // wait for the rest of a code point split across reads
+    if b >= 0xC0 && !eof {
+        need = if b >= 0xF0 { 4 } else { if b >= 0xE0 { 3 } else { 2 } }
+        if p + need > n {
+            return NoEvent {}, 0
+        }
+    }
+    e = screen.grapheme_end(s, p)
+    cp = screen.codepoint_at(s, p)
+    first = screen.codepoint_len(s, p)
+    if cp < 0 {
+        // an invalid byte: drop it
+        return NoEvent {}, 1
+    }
+    code = if e - p > first { MULTICODEPOINT } else { cp }
+    return Key { codepoint: code, text: string.substring(s, p, e), shifted_codepoint: -1, base_layout_codepoint: -1, mods: 0 }, e - p
+}
+
+_ss3(s: string, p: int, eof: bool) -> (Event, int) {
+    n = string.length(s)
+    if p + 2 >= n {
+        if eof {
+            return key(79, mods: ALT), 2
+        }
+        return NoEvent {}, 0
+    }
+    c = s[p + 2]
+    cp = match c {
+        65 -> UP
+        66 -> DOWN
+        67 -> RIGHT
+        68 -> LEFT
+        69 -> KP_BEGIN
+        70 -> END
+        72 -> HOME
+        80 -> F1
+        81 -> F2
+        82 -> F3
+        83 -> F4
+        _ -> -1
+    }
+    if c == 27 {
+        return NoEvent {}, 2
+    }
+    if cp < 0 {
+        return NoEvent {}, 3
+    }
+    return key(cp), 3
+}
+
+// Skips a DCS/SOS/PM string up to its ST.
+_skip_st(s: string, p: int, eof: bool) -> (Event, int) {
+    n = string.length(s)
+    i = p + 2
+    while i + 1 < n {
+        if s[i] == 27 && s[i + 1] == 92 {
+            return NoEvent {}, i + 2 - p
+        }
+        i = i + 1
+    }
+    if eof {
+        return NoEvent {}, n - p
+    }
+    return NoEvent {}, 0
+}
+
+// APC: the kitty graphics reply is the only one that means anything.
+_apc(s: string, p: int, eof: bool) -> (Event, int) {
+    n = string.length(s)
+    i = p + 2
+    while i + 1 < n {
+        if s[i] == 27 && s[i + 1] == 92 {
+            if p + 2 < n && s[p + 2] == 71 {
+                return Capability { what: CAP_KITTY_GRAPHICS }, i + 2 - p
+            }
+            return NoEvent {}, i + 2 - p
+        }
+        i = i + 1
+    }
+    if eof {
+        return NoEvent {}, n - p
+    }
+    return NoEvent {}, 0
+}
+
+_csi(s: string, p: int, eof: bool) -> (Event, int) {
+    n = string.length(s)
+    if p + 2 >= n {
+        if eof {
+            return key(91, mods: ALT), 2
+        }
+        return NoEvent {}, 0
+    }
+    // the final byte: the first in 0x40..0xFF after ESC [
+    i = p + 2
+    while i < n && (s[i] < 0x40) {
+        i = i + 1
+    }
+    if i >= n {
+        if eof {
+            return NoEvent {}, n - p
+        }
+        return NoEvent {}, 0
+    }
+    final = s[i]
+    len = i + 1 - p
+    body = string.substring(s, p + 2, i)
+    match final {
+        65 -> { return _legacy_letter(body, UP), len }
+        66 -> { return _legacy_letter(body, DOWN), len }
+        67 -> { return _legacy_letter(body, RIGHT), len }
+        68 -> { return _legacy_letter(body, LEFT), len }
+        69 -> { return _legacy_letter(body, KP_BEGIN), len }
+        70 -> { return _legacy_letter(body, END), len }
+        72 -> { return _legacy_letter(body, HOME), len }
+        80 -> { return _legacy_letter(body, F1), len }
+        81 -> { return _legacy_letter(body, F2), len }
+        82 -> { return _legacy_letter(body, F3), len }
+        83 -> { return _legacy_letter(body, F4), len }
+        90 -> { return key(TAB, mods: SHIFT), len }
+        126 -> { return _tilde(body), len }
+        73 -> { return FocusIn {}, len }
+        79 -> { return FocusOut {}, len }
+        77 -> { return _mouse(s, p, i, eof) }
+        109 -> { return _mouse(s, p, i, eof) }
+        99 -> {
+            if string.length(body) > 0 && body[0] == 63 {
+                return Capability { what: CAP_DA1 }, len
+            }
+            return NoEvent {}, len
+        }
+        110 -> { return _dsr(body), len }
+        116 -> { return _xtwinops(body), len }
+        117 -> { return _kitty(body), len }
+        121 -> { return _decrpm(body), len }
+        _ -> { return NoEvent {}, len }
+    }
+}
+
+// mods[:event] and text fields shared by the letter, ~ and u forms.
+// Returns (mods, release, text, ok).
+_mods_field(fields: string[], idx: int) -> (int, bool, bool) {
+    if idx >= fields.len {
+        return 0, false, true
+    }
+    sub = _split(fields[idx], 58)
+    m = _param(sub[0], 1)
+    if m < 0 {
+        return 0, false, false
+    }
+    release = sub.len > 1 && sub[1] == "3"
+    return (if m > 0 { m - 1 } else { 0 }), release, true
+}
+
+_text_field(fields: string[], idx: int) -> (string, bool) {
+    if idx >= fields.len {
+        return "", true
+    }
+    sub = _split(fields[idx], 58)
+    sb = strbuilder.new(8)
+    for j in 0..sub.len {
+        cp = _param(sub[j], -1)
+        if cp < 0 {
+            return "", false
+        }
+        strbuilder.append_codepoint(sb, cp)
+    }
+    return strbuilder.finish(sb), true
+}
+
+_legacy_letter(body: string, cp: int) -> Event {
+    fields = _split(body, 59)
+    mods, release, ok = _mods_field(fields, 1)
+    if !ok || release {
+        return NoEvent {}
+    }
+    text, tok = _text_field(fields, 2)
+    if !tok {
+        return NoEvent {}
+    }
+    return Key { codepoint: cp, text: text, shifted_codepoint: -1, base_layout_codepoint: -1, mods: mods }
+}
+
+_tilde(body: string) -> Event {
+    fields = _split(body, 59)
+    num = _param(fields[0], -1)
+    cp = match num {
+        1 -> HOME
+        7 -> HOME
+        2 -> INSERT
+        3 -> DELETE
+        4 -> END
+        8 -> END
+        5 -> PAGE_UP
+        6 -> PAGE_DOWN
+        11 -> F1
+        12 -> F2
+        13 -> F3
+        14 -> F4
+        15 -> F5
+        17 -> F6
+        18 -> F7
+        19 -> F8
+        20 -> F9
+        21 -> F10
+        23 -> F11
+        24 -> F12
+        57427 -> KP_BEGIN
+        _ -> -1
+    }
+    if num == 200 {
+        return PasteStart {}
+    }
+    if num == 201 {
+        return PasteEnd {}
+    }
+    if cp < 0 {
+        return NoEvent {}
+    }
+    mods, release, ok = _mods_field(fields, 1)
+    if !ok || release {
+        return NoEvent {}
+    }
+    text, tok = _text_field(fields, 2)
+    if !tok {
+        return NoEvent {}
+    }
+    return Key { codepoint: cp, text: text, shifted_codepoint: -1, base_layout_codepoint: -1, mods: mods }
+}
+
+// CSI unicode-key-code[:shifted[:base]] ; mods[:event] ; text u
+_kitty(body: string) -> Event {
+    if string.length(body) > 0 && body[0] == 63 {
+        return Capability { what: CAP_KITTY_KEYBOARD }
+    }
+    fields = _split(body, 59)
+    first = _split(fields[0], 58)
+    cp = _param(first[0], -1)
+    if cp < 0 {
+        return NoEvent {}
+    }
+    shifted = -1
+    base = -1
+    if first.len > 1 {
+        shifted = _param(first[1], -1)
+    }
+    if first.len > 2 {
+        base = _param(first[2], -1)
+    }
+    mods, release, ok = _mods_field(fields, 1)
+    if !ok || release {
+        return NoEvent {}
+    }
+    text, tok = _text_field(fields, 2)
+    if !tok {
+        return NoEvent {}
+    }
+    // shift + a printable ASCII key with no text: shift+space arrives as
+    // CSI 32;2u. libvaxis supplies the upper-cased text.
+    if string.length(text) == 0 && (mods & ~(CAPS_LOCK | NUM_LOCK)) == SHIFT && cp >= 32 && cp < 127 {
+        up = if cp >= 97 && cp <= 122 { cp - 32 } else { cp }
+        text = _utf8(up)
+        shifted = up
+    }
+    return Key { codepoint: cp, text: text, shifted_codepoint: shifted, base_layout_codepoint: base, mods: mods }
+}
+
+_dsr(body: string) -> Event {
+    // CSI ? 997 ; 1|2 n: colour scheme dark/light
+    if string.length(body) < 1 || body[0] != 63 {
+        return NoEvent {}
+    }
+    fields = _split(string.substring(body, 1, string.length(body)), 59)
+    if fields.len >= 2 && fields[0] == "997" {
+        if fields[1] == "1" {
+            return ColorScheme { dark: true }
+        }
+        if fields[1] == "2" {
+            return ColorScheme { dark: false }
+        }
+    }
+    return NoEvent {}
+}
+
+_xtwinops(body: string) -> Event {
+    fields = _split(body, 59)
+    if fields[0] != "48" || fields.len < 3 {
+        return NoEvent {}
+    }
+    rows = _param(fields[1], -1)
+    cols = _param(fields[2], -1)
+    hp = if fields.len > 3 { _param(fields[3], 0) } else { 0 }
+    wp = if fields.len > 4 { _param(fields[4], 0) } else { 0 }
+    if rows < 0 || cols < 0 || hp < 0 || wp < 0 {
+        return NoEvent {}
+    }
+    return Winsize { cols: cols, rows: rows, x_pixel: wp, y_pixel: hp }
+}
+
+// CSI ? Ps ; Pm $ y: a DECRQM reply.
+_decrpm(body: string) -> Event {
+    n = string.length(body)
+    if n < 4 || body[0] != 63 || body[n - 1] != 36 {
+        return NoEvent {}
+    }
+    fields = _split(string.substring(body, 1, n - 1), 59)
+    if fields.len < 2 {
+        return NoEvent {}
+    }
+    ps = _param(fields[0], -1)
+    pm = _param(fields[1], -1)
+    if pm <= 0 || pm == 4 {
+        return NoEvent {}
+    }
+    return match ps {
+        1016 -> Capability { what: CAP_SGR_PIXELS }
+        2027 -> Capability { what: CAP_UNICODE }
+        2031 -> Capability { what: CAP_COLOR_SCHEME_UPDATES }
+        _ -> NoEvent {}
+    }
+}
+
+_mouse(s: string, p: int, fin: int, eof: bool) -> (Event, int) {
+    n = string.length(s)
+    len = fin + 1 - p
+    // X10: CSI M then three bytes
+    if fin == p + 2 && s[fin] == 77 {
+        if p + 6 > n {
+            if eof {
+                return NoEvent {}, n - p
+            }
+            return NoEvent {}, 0
+        }
+        mask = s[p + 3] - 32
+        return _mouse_event(mask, s[p + 4] - 32, s[p + 5] - 32, true, false), 6
+    }
+    if fin - p < 3 || s[p + 2] != 60 {
+        return NoEvent {}, len
+    }
+    fields = _split(string.substring(s, p + 3, fin), 59)
+    if fields.len != 3 {
+        return NoEvent {}, len
+    }
+    mask = _param(fields[0], -1)
+    x = _param(fields[1], 1)
+    y = _param(fields[2], 1)
+    if mask < 0 || x < 0 || y < 0 {
+        return NoEvent {}, len
+    }
+    return _mouse_event(mask, x, y, false, s[fin] == 109), len
+}
+
+_mouse_event(mask: int, x: int, y: int, xterm: bool, released: bool) -> Event {
+    if (mask & 256) != 0 {
+        return NoEvent {}
+    }
+    button = mask & 0xC3
+    motion = (mask & 32) != 0
+    mods = 0
+    if (mask & 4) != 0 { mods = mods | MOUSE_SHIFT }
+    if (mask & 8) != 0 { mods = mods | MOUSE_ALT }
+    if (mask & 16) != 0 { mods = mods | MOUSE_CTRL }
+    kind = MOUSE_PRESS
+    if motion && button != BUTTON_NONE {
+        kind = MOUSE_DRAG
+    } else if motion {
+        kind = MOUSE_MOTION
+    } else if xterm {
+        kind = if button == BUTTON_NONE { MOUSE_RELEASE } else { MOUSE_PRESS }
+    } else if released {
+        kind = MOUSE_RELEASE
+    }
+    return Mouse { col: x - 1, row: y - 1, button: button, mods: mods, kind: kind }
+}
+
+_osc(s: string, p: int, eof: bool) -> (Event, int) {
+    n = string.length(s)
+    i = p + 2
+    end = -1
+    payload_end = -1
+    while i < n {
+        if s[i] == 7 {
+            end = i + 1
+            payload_end = i
+            break
+        }
+        if s[i] == 27 {
+            if i + 1 >= n {
+                if eof {
+                    return NoEvent {}, n - p
+                }
+                return NoEvent {}, 0
+            }
+            if s[i + 1] == 92 {
+                end = i + 2
+                payload_end = i
+                break
+            }
+            // never terminated: drop the prefix, keep the new ESC
+            return NoEvent {}, i - p
+        }
+        i = i + 1
+    }
+    if end < 0 {
+        if eof {
+            return NoEvent {}, n - p
+        }
+        return NoEvent {}, 0
+    }
+    len = end - p
+    payload = string.substring(s, p + 2, payload_end)
+    semi = string.index_of(payload, ";")
+    if semi < 0 {
+        return NoEvent {}, len
+    }
+    ps = _param(string.substring(payload, 0, semi), -1)
+    rest = string.substring(payload, semi + 1, string.length(payload))
+    if ps == 4 {
+        semi2 = string.index_of(rest, ";")
+        if semi2 < 0 {
+            return NoEvent {}, len
+        }
+        idx = _param(string.substring(rest, 0, semi2), -1)
+        return _color_report(REPORT_INDEX, idx, string.substring(rest, semi2 + 1, string.length(rest))), len
+    }
+    if ps == 10 || ps == 11 || ps == 12 {
+        return _color_report(ps, 0, rest), len
+    }
+    if ps == 52 {
+        if string.length(rest) < 2 || rest[0] != 99 || rest[1] != 59 {
+            return NoEvent {}, len
+        }
+        text, err = encoding.base64_decode(string.substring(rest, 2, string.length(rest)))
+        if err != "" {
+            return NoEvent {}, len
+        }
+        return Paste { text: text }, len
+    }
+    return NoEvent {}, len
+}
+
+// rgb:rrrr/gggg/bbbb, high byte of each.
+_color_report(kind: int, idx: int, spec: string) -> Event {
+    if !string.starts_with(spec, "rgb:") {
+        return NoEvent {}
+    }
+    parts = _split(string.substring(spec, 4, string.length(spec)), 47)
+    if parts.len != 3 {
+        return NoEvent {}
+    }
+    r = _hex_byte(parts[0])
+    g = _hex_byte(parts[1])
+    b = _hex_byte(parts[2])
+    if r < 0 || g < 0 || b < 0 {
+        return NoEvent {}
+    }
+    return ColorReport { kind: kind, index: idx, r: r, g: g, b: b }
+}
+
+_hexd(c: int) -> int {
+    if c >= 48 && c <= 57 { return c - 48 }
+    if c >= 97 && c <= 102 { return c - 87 }
+    if c >= 65 && c <= 70 { return c - 55 }
+    return -1
+}
+
+_hex_byte(s: string) -> int {
+    if string.length(s) != 4 {
+        return -1
+    }
+    // libvaxis parses the low two digits; xterm repeats the byte, so the
+    // two halves agree.
+    hi = _hexd(s[2])
+    lo = _hexd(s[3])
+    if hi < 0 || lo < 0 || _hexd(s[0]) < 0 || _hexd(s[1]) < 0 {
+        return -1
+    }
+    return hi * 16 + lo
+}
+
+// ---------------------------------------------------------------- encoding
+
+_letter_final(cp: int) -> int {
+    return match cp {
+        57352 -> 65
+        57353 -> 66
+        57351 -> 67
+        57350 -> 68
+        57427 -> 69
+        57357 -> 70
+        57356 -> 72
+        57364 -> 80
+        57365 -> 81
+        57366 -> 82
+        57367 -> 83
+        _ -> 0
+    }
+}
+
+_tilde_num(cp: int) -> int {
+    return match cp {
+        57348 -> 2
+        57349 -> 3
+        57354 -> 5
+        57355 -> 6
+        57368 -> 15
+        57369 -> 17
+        57370 -> 18
+        57371 -> 19
+        57372 -> 20
+        57373 -> 21
+        57374 -> 23
+        57375 -> 24
+        _ -> 0
+    }
+}
+
+// The bytes a terminal sends for the key: the kitty protocol's (flags
+// disambiguate|alternate keys|all keys as escapes|text, libvaxis's default)
+// when `kitty`, else the legacy xterm bytes. Legacy cannot say everything
+// (ctrl+shift+a is ctrl+a there); it says what xterm would.
+encode_key(k: Key, kitty: bool) -> string {
+    cp = k.codepoint
+    m = k.mods
+    fin = _letter_final(cp)
+    if fin != 0 {
+        if m == 0 {
+            if !kitty && cp >= F1 && cp <= F4 {
+                return "\x1bO${_utf8(fin)}"
+            }
+            return "\x1b[${_utf8(fin)}"
+        }
+        return "\x1b[1;${m + 1}${_utf8(fin)}"
+    }
+    tn = _tilde_num(cp)
+    if tn != 0 {
+        if m == 0 {
+            return "\x1b[${tn}~"
+        }
+        return "\x1b[${tn};${m + 1}~"
+    }
+    if kitty {
+        sb = strbuilder.new(24)
+        strbuilder.append(sb, "\x1b[")
+        strbuilder.append_int(sb, cp)
+        if k.shifted_codepoint >= 0 || k.base_layout_codepoint >= 0 {
+            strbuilder.append(sb, ":")
+            if k.shifted_codepoint >= 0 {
+                strbuilder.append_int(sb, k.shifted_codepoint)
+            }
+            if k.base_layout_codepoint >= 0 {
+                strbuilder.append(sb, ":")
+                strbuilder.append_int(sb, k.base_layout_codepoint)
+            }
+        }
+        tl = string.length(k.text)
+        if m != 0 || tl > 0 {
+            strbuilder.append(sb, ";")
+            if m != 0 || tl > 0 {
+                strbuilder.append_int(sb, m + 1)
+            }
+        }
+        if tl > 0 {
+            strbuilder.append(sb, ";")
+            i = 0
+            first = true
+            while i < tl {
+                if !first {
+                    strbuilder.append(sb, ":")
+                }
+                strbuilder.append_int(sb, screen.codepoint_at(k.text, i))
+                i = i + screen.codepoint_len(k.text, i)
+                first = false
+            }
+        }
+        strbuilder.append(sb, "u")
+        return strbuilder.finish(sb)
+    }
+    // legacy
+    prefix = if (m & ALT) != 0 { "\x1b" } else { "" }
+    if cp == TAB && (m & SHIFT) != 0 {
+        return "${prefix}\x1b[Z"
+    }
+    if cp == ENTER || cp == TAB || cp == ESCAPE || cp == BACKSPACE {
+        return "${prefix}${_utf8(cp)}"
+    }
+    if (m & CTRL) != 0 {
+        if cp == 64 || cp == 32 {
+            return "${prefix}\x00"
+        }
+        if cp >= 97 && cp <= 122 {
+            return "${prefix}${_utf8(cp - 96)}"
+        }
+        if cp >= 91 && cp <= 95 {
+            return "${prefix}${_utf8(cp - 64)}"
+        }
+    }
+    if string.length(k.text) > 0 {
+        return "${prefix}${k.text}"
+    }
+    if (m & SHIFT) != 0 && cp >= 97 && cp <= 122 {
+        return "${prefix}${_utf8(cp - 32)}"
+    }
+    return "${prefix}${_utf8(cp)}"
+}
+
+// The SGR (mode 1006) report for a mouse event.
+encode_mouse(e: Mouse) -> string {
+    mask = e.button
+    if (e.mods & MOUSE_SHIFT) != 0 { mask = mask | 4 }
+    if (e.mods & MOUSE_ALT) != 0 { mask = mask | 8 }
+    if (e.mods & MOUSE_CTRL) != 0 { mask = mask | 16 }
+    if e.kind == MOUSE_MOTION || e.kind == MOUSE_DRAG {
+        mask = mask | 32
+    }
+    fin = if e.kind == MOUSE_RELEASE { "m" } else { "M" }
+    return "\x1b[<${mask};${e.col + 1};${e.row + 1}${fin}"
+}
+
+encode_paste(text: string) -> string {
+    return "\x1b[200~${text}\x1b[201~"
+}
+
+encode_focus(focused: bool) -> string {
+    return if focused { "\x1b[I" } else { "\x1b[O" }
+}
+
+// What a terminal would send for the event; "" for events a terminal does
+// not send as input bytes.
+encode_event(e: Event, kitty: bool) -> string {
+    return match e {
+        NoEvent -> ""
+        Key -> encode_key(e, kitty)
+        Mouse -> encode_mouse(e)
+        Winsize -> "\x1b[48;${e.rows};${e.cols};${e.y_pixel};${e.x_pixel}t"
+        PasteStart -> "\x1b[200~"
+        PasteEnd -> "\x1b[201~"
+        Paste -> ""
+        FocusIn -> "\x1b[I"
+        FocusOut -> "\x1b[O"
+        ColorReport -> ""
+        ColorScheme -> if e.dark { "\x1b[?997;1n" } else { "\x1b[?997;2n" }
+        Capability -> ""
+    }
+}

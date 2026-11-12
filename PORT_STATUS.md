@@ -71,3 +71,25 @@ pins                     AE_PIN / AEB_REF the port is verified against
 | `src/tui*` | 12,600 | | | needs the terminal layer (upstream uses libvaxis) |
 | `src/auth*` | 1,500 | | | the API-key store only |
 | `src/update*` | 140 | not ported | | |
+
+## Terminal layer (`ae/term`)
+
+What the TUI screens will sit on, in place of libvaxis: `term` (a `Terminal`
+passed explicitly, real on a tty or in-memory for specs), `term.screen`
+(cells, windows, printing, widths), `term.input` (events, kitty and legacy
+key decoding, mouse, paste), `term.render` (the diffing renderer),
+`term.driver` (spec verbs) and `term.snapshot` (upstream's
+`layout_snapshots.txt` format). Standalone: it imports only `std`, so it can
+leave for its own repository. `ae/term/README.md` has the API and what of
+libvaxis's used surface it covers.
+
+- Tests: `ae/term/run-tests.sh` (specs; the real renderer's frames replayed
+  through upstream's `scripts/screen.py` unchanged; the demo under a pty,
+  restoring the terminal on quit, SIGTERM, SIGHUP, SIGINT and a panic).
+- POSIX only so far (macOS, Linux, FreeBSD); a Windows console backend is
+  the next step (README, "Windows"). The in-memory terminal runs anywhere.
+- Asks: `ae/term/asks/` (two compiler bugs worked around; terminal control
+  and grapheme width for `std`, which would retire the two C shims).
+- The TUI-screens slice ports `src/tui.zig` and `src/tui/*` onto it; the
+  layout snapshots load with `term.snapshot` and compare with
+  `driver.expect_screen`.
