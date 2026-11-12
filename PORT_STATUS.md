@@ -92,7 +92,7 @@ pins                     AE_PIN / AEB_REF the port is verified against
 | `src/tools/background.zig` | 866 | `ae/nib/tools/background/module.ae` | a2dd439 | bash only: typed inbox, started record, lost on resume, detached across Turns; agents and background Runs not yet |
 | `src/tools/stop.zig` | 29 | `ae/nib/tools/module.ae`, `ae/nib/tui/live/module.ae` | a2dd439 | userStop is the TUI port's `user_stop_`; a stop requested during a Turn runs on a worker, not in Tools.poll |
 | `src/tools/undo.zig` | 606 | `ae/nib/tools/undo/module.ae` | a2dd439 | Session wires begin/finish/undo; off for `nib ask` as upstream; /undo itself is the TUI's |
-| `src/tools/view.zig` | 92 | not yet |  | needs src/image.zig and the Session image store |
+| `src/tools/view.zig` | 92 | `ae/nib/tools/view/module.ae` | a2dd439 | credential-path refusal as read; the Run's images in `RunScope.images` (`nib.image` Attached, 4 per Run, none from background Runs) |
 | `src/tools/progress.zig` | 249 | `ae/nib/tools/progress/module.ae` | a2dd439 | agent kinds wait for tools.agent |
 | `src/tools/web.zig` | 161 | not yet |  | fetch: a later slice |
 | `src/tools/html.zig` | 504 | not yet |  | with fetch |
@@ -102,7 +102,7 @@ pins                     AE_PIN / AEB_REF the port is verified against
 | `src/tools/agent/input.zig` | 90 | not yet |  |  |
 | `src/tools/agent/sessions.zig` | 119 | not yet |  |  |
 | `src/tools/mcp.zig` | 101 | not yet |  | with src/mcp* |
-| `src/session.zig` | 999 | `ae/nib/session/module.ae` | a2dd439 | Turn/Step loop, resume/continue, interrupted commits, auto compaction, Step-limit wait, undo wiring; no fork, reopen/switchConfig (TUI), skills, MCP, images |
+| `src/session.zig` | 999 | `ae/nib/session/module.ae` | a2dd439 | Turn/Step loop, resume/continue, interrupted commits, auto compaction, Step-limit wait, undo wiring, the Run's viewed images on its tool message; no fork, reopen/switchConfig (TUI), skills, MCP, user-message images (`turnWithImages`, TUI) |
 | `src/session/run.zig` | 236 | `ae/nib/session/module.ae` | a2dd439 | execute; no automatic Run backgrounding |
 | `src/session/run_job.zig` | 116 | not yet |  | automatic Run backgrounding (rN): next |
 | `src/session/log.zig` | 1402 | `ae/nib/session/log/module.ae` | a2dd439 | records are JSON text; tool summaries travel on the logged tool messages (the TUI reads them on resume); bash replacements (superseded bash rows) are not restored onto replayed messages yet |
@@ -110,17 +110,17 @@ pins                     AE_PIN / AEB_REF the port is verified against
 | `src/session/prompt.zig` | 322 | `ae/nib/session/prompt/module.ae` | a2dd439 |  |
 | `src/session/profile.zig` | 58 | `ae/nib/session/profile/module.ae` | a2dd439 |  |
 | `src/session/instructions.zig` | 49 | `ae/nib/session/instructions/module.ae` | a2dd439 |  |
-| `src/session/compact.zig` | 175 | `ae/nib/session/compact/module.ae` | a2dd439 | no image placeholders |
-| `src/session/tool_summary.zig` | 249 | `ae/nib/session/tool_summary/module.ae` | a2dd439 | no annotateViews (images) |
+| `src/session/compact.zig` | 175 | `ae/nib/session/compact/module.ae` | a2dd439 | withoutImages is `without_images` |
+| `src/session/tool_summary.zig` | 249 | `ae/nib/session/tool_summary/module.ae` | a2dd439 | annotateViews takes the images as JSON text |
 | `src/session/events.zig` | 182 | `ae/nib/session/module.ae` | a2dd439 | events are the NDJSON text they print as |
 | `src/session/inbox.zig` | 278 | `ae/nib/tools/background/module.ae` | a2dd439 | bash results, FIFO, detached kept; user interjections (`enqueue_user`/`take_users`, kind "user") inserted before the next Step |
 | `src/session/history.zig` | 130 | not yet |  | fork (subagents): next |
 | `src/session/hooks.zig`, `skills.zig` | 538 | not yet |  | next slice |
 | `src/provider.zig` | 395 | `ae/nib/provider/types/module.ae`, `ae/nib/provider/module.ae` | a2dd439 | less Codex |
 | `src/provider/retry.zig` | 331 | `ae/nib/provider/module.ae` | a2dd439 | no Codex Retry-After or stale-socket paths |
-| `src/provider/anthropic.zig` | 444 | `ae/nib/provider/anthropic/module.ae` | a2dd439 | no images |
-| `src/provider/responses.zig` | 1033 | `ae/nib/provider/responses/module.ae` | a2dd439 | SSE only; no Codex auth/WebSocket, images or web search |
-| `src/provider/openai.zig` | 428 | `ae/nib/provider/openai/module.ae` | a2dd439 | no images; HTTP errors never echo the body |
+| `src/provider/anthropic.zig` | 444 | `ae/nib/provider/anthropic/module.ae` | a2dd439 | |
+| `src/provider/responses.zig` | 1033 | `ae/nib/provider/responses/module.ae` | a2dd439 | SSE only; no Codex auth/WebSocket or web search |
+| `src/provider/openai.zig` | 428 | `ae/nib/provider/openai/module.ae` | a2dd439 | HTTP errors never echo the body |
 | `src/provider/sse.zig` | 52 | `ae/nib/provider/sse/module.ae` | a2dd439 | plus fixed/live line sources |
 | `src/provider/timing.zig` | 319 | `ae/nib/provider/model_timing/module.ae` | a2dd439 | renamed: asks/aether-module-basename-collision.md |
 | `src/provider/body.zig`, `cancel.zig`, `idle.zig` | 393 | `ae/nib/provider/http/module.ae` | a2dd439 | a request thread plus a polling reader on std.http.client |
@@ -128,7 +128,8 @@ pins                     AE_PIN / AEB_REF the port is verified against
 | `src/config.zig` | 1680 | `ae/nib/config/module.ae`, `ae/nib/config/env/module.ae` | a2dd439 | no Codex provider ([codex] validated and ignored); default service anthropic |
 | `src/mcp*` | 700 | | | |
 | `src/main.zig` | 311 | `ae/main.ae` | a2dd439 | ask, js, login/logout, help, version, __jail; bare `nib` opens the TUI (`run_tui_`); no replay, update |
-| `src/replay.zig`, `src/image.zig` | 900 | not yet | | |
+| `src/replay.zig` | 900 | not yet | | |
+| `src/image.zig` | 324 | `ae/nib/image/module.ae` | a2dd439 | images are JSON texts (the log's `images` entries); binary-safe reads; SHA-256 hash name; Attached/Target for the Run's images; pastedPath is ported, the TUI still has its stand-ins |
 | `src/tui.zig` | 1911 | `ae/nib/tui/module.ae` | 7788541 | the App; takes term, Session port and clock; app events through `nib.tui.app_queue`; the Ticker is the poll timeout; images are a marked stand-in |
 | `src/tui/view.zig` | 744 | `ae/nib/tui/tui_view/module.ae` | 7788541 | renamed (basename `view`); both snapshot files match cell for cell |
 | `src/tui/transcript.zig`, `transcript/entry.zig`, `transcript/changes.zig`, `transcript/intraline.zig`, `transcript/label.zig` | 2634 | `ae/nib/tui/transcript`, `entry`, `turn_changes` (renamed), `intraline`, `label` | 7788541 | replayed tool summaries are read from the messages' `tool_summary` members |
@@ -218,7 +219,7 @@ unknown fields kept); `--help` with the active provider.
 **Unit tests.** `aeb .tests.ae`: 35 std.spec suites (about 430 tests) plus
 workspace.sh and check_layers.sh. Every upstream inline test of a ported file
 is ported under its upstream name, except those listed in each suite's
-header (Codex, images, MCP, allocation failures, the Zig Record type). Each
+header (Codex, MCP, allocation failures, the Zig Record type). Each
 module was mutation-checked.
 
 **Upstream e2e (`ae/tests/upstream-e2e.sh`, tests unchanged).**
@@ -236,7 +237,7 @@ module was mutation-checked.
 | test_limits.py | max-steps cases pass; LLM limits pass with the same assertion set aside | agent limits, `nib replay`, Codex classes |
 | test_effort.py | the chat_completions half passes | its second half is Codex |
 | test_model.py, test_undo.py, test_tui_*.py, test_at_files.py, test_interjections.py, test_prediction.py | pass (TUI slice) | |
-| test_images.py | not yet | images and tools.view (not TUI-driven) |
+| test_images.py | pass (its `View` cases; the TUI functions need the TUI's clipboard and paste, still stand-ins) | |
 | test_mcp.py, test_replay.py, test_web_search.py, test_stats.py | not yet | their slices (agents, Run backgrounding, TUI, hooks/skills, MCP, replay, web search) |
 | test_codex.py, test_codex_websocket.py, test_provider_login.py | excluded | policy: no Codex sign-in or WebSocket |
 
@@ -276,8 +277,8 @@ cell instead of the process flag.
 
 **Next after that.** Subagents (tools.agent, agent/input, agent/sessions,
 session/history fork, `--agent-input`), automatic Run backgrounding
-(run_job), hooks and skills, MCP, tools.fetch/web_search, images and
-tools.view, record/replay.
+(run_job), hooks and skills, MCP, tools.fetch/web_search,
+record/replay.
 
 ## TUI slice (2026-11-12)
 
@@ -333,7 +334,7 @@ mutation-checked (`tools/mutate.py` for the app).
 | test_tui_stream.py, test_tui_mouse.py, test_model.py, test_undo.py, test_interjections.py, test_at_files.py, test_prediction.py | pass | pass | pass |
 | test_hooks.py, test_skills.py, test_skill_mentions.py (TUI parts included) | pass | pass except `test_sandbox_denies_external_write` (kernel 5.15: no Landlock ABI 2) | pass |
 | TUI cases of test_background_agent/bash/run (escape, interjection, `/tasks`, `/stop`, step-limit result in the next TUI Turn) | their `/proc` helper needs Linux | pass | pass |
-| test_images.py | not TUI-driven: images and tools.view are not ported | | |
+| test_images.py | `View` cases pass; its four `test_tui_*` functions need the paste UI (stand-ins) | | |
 | test_replay.py, test_codex_websocket.py, test_provider_login.py | excluded: replay not ported; Codex by policy | | |
 
 **Stand-ins and stubs (marked).** Images: Ctrl+V and an empty paste say

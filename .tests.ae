@@ -315,6 +315,14 @@ aeb(cap) {
             source("ae/tests/agent_test.ae")
             lib("ae")
         }
+        aether.program_test() {
+            source("ae/tests/image_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/view_test.ae")
+            lib("ae")
+        }
         // Workspace mode end to end, through the built binary.
         dep(".build.ae")
         bash.test() {

@@ -4,13 +4,15 @@
 // Text content items are joined with newlines; structuredContent rides
 // along.
 //
-// STAND-IN: images are not ported. An image item reads "[image omitted]"
-// when the model has no vision and "[image omitted: images not ported]"
-// otherwise, where upstream stores it in the Session image store (subject
-// to the four-per-Run limit) and writes "[image attached]".
+// An image item is stored in the Session's image store and attached to the
+// Run's result (subject to the four-per-Run limit; upstream attach()): the
+// content reads "[image attached]", or "[image omitted]" when the model has
+// no vision, "[image omitted: Run image limit]" or "[image omitted: Err]".
 
+import std.encoding
 import std.json
 import std.string
+import nib.image
 import nib.jsonx
 import nib.mcp
 
@@ -20,15 +22,26 @@ failure_(message_text: string) -> string {
     return "{\"ok\":false,\"content\":\"\",\"error\":${jsonx.quote(message_text)}}"
 }
 
-image_status_(vision: int) -> string {
-    // STAND-IN for upstream attach(): see the module comment.
-    if vision == 0 { return "[image omitted]" }
-    return "[image omitted: images not ported]"
+// upstream attach(): `target` is an image.Target, or null (no vision).
+attach_(target: ptr, item: ptr) -> string {
+    if target == null { return "[image omitted]" }
+    t = target as *image.Target
+    if t.vision == 0 { return "[image omitted]" }
+    if image.attached_count(t.attached) >= image.MAX_PER_RUN { return "[image omitted: Run image limit]" }
+    if t.data_home == "" || t.session_id == "" { return "[image omitted]" }
+    if jsonx.kind(item, "data") != json.JSON_STRING { return "[image omitted: InvalidImage]" }
+    bytes, derr = encoding.base64_decode(jsonx.str_or(item, "data", ""))
+    if derr != "" { return "[image omitted: InvalidCharacter]" }
+    if string.length(bytes) > image.MAX_BYTES { return "[image omitted: ImageTooLarge]" }
+    stored, serr = image.store(image.image_dir(t.data_home, t.session_id), "mcp", bytes)
+    if serr != "" { return "[image omitted: ${serr}]" }
+    if image.attach(t.attached, stored) == 0 { return "[image omitted: Run image limit]" }
+    return "[image attached]"
 }
 
 // The text of a tool result's `content` array (JSON text): items joined
 // with newlines, each as upstream mapContent.
-map_content(content_json: string, vision: int) -> string {
+map_content(content_json: string, target: ptr) -> string {
     doc = jsonx.parse(content_json)
     n = jsonx.array_size(doc)
     out = ""
@@ -40,7 +53,7 @@ map_content(content_json: string, vision: int) -> string {
         if kind == "text" {
             out = "${out}${jsonx.str_or(item, "text", "")}"
         } else if kind == "image" {
-            out = "${out}${image_status_(vision)}"
+            out = "${out}${attach_(target, item)}"
         } else if kind == "resource_link" {
             out = "${out}[resource link: ${jsonx.str_or(item, "uri", "")}]"
         } else if kind == "resource" {
@@ -59,8 +72,8 @@ map_content(content_json: string, vision: int) -> string {
 // args: {"name": "server.tool", "arguments": {...}}. schema 1: the tool's
 // input schema (mcp_schema), else a call (mcp). client: an mcp.Client or
 // null. (1, JSON text) is the call's result, data even when it failed;
-// (0, text) rejects the call with `text`. vision: 1 when the model takes images.
-execute(client: ptr, args: string, schema: int, cancel: @keep ptr, vision: int) -> (int, string) {
+// (0, text) rejects the call with `text`. target: an image.Target (null: no images).
+execute(client: ptr, args: string, schema: int, cancel: @keep ptr, target: ptr) -> (int, string) {
     input = jsonx.parse(args)
     if input == null { return 0, "expected a server.tool name and argument object" }
     if jsonx.kind(input, "name") != json.JSON_STRING {
@@ -99,7 +112,7 @@ execute(client: ptr, args: string, schema: int, cancel: @keep ptr, vision: int) 
     doc = jsonx.parse(result)
     content = ""
     cj = jsonx.field(doc, "content")
-    if cj != null { content = map_content(jsonx.encode(cj), vision) }
+    if cj != null { content = map_content(jsonx.encode(cj), target) }
     ok = 1
     if jsonx.bool_or(doc, "isError", 0) == 1 { ok = 0 }
     structured = "null"

@@ -34,10 +34,12 @@ import nib.tools.agent_input
 import nib.tools.mcp_tool
 import nib.tools.web
 import nib.tools.web_search
+import nib.tools.view
+import nib.image
 import nib.provider.types
 
 exports(Tools, RunScope, new, new_scope, host, call_tool, names_json, docs, all_docs, tool_names,
-        is_ported, credential_paths, writable_roots, nib_home, take_changes, set_workspace,
+        is_ported, take_images, credential_paths, writable_roots, nib_home, take_changes, set_workspace,
         cancel_cell, set_log, sandbox_roots, change_paths, export_versions, import_versions, set_config, take_usage, take_jail_notice, enable_undo, begin_turn_undo, finish_turn_undo, run_undo, turn_undo_dir, attach_turn_undo_dir, close_undo)
 
 const DOC_MCP = "  // Call an enabled MCP server tool. Server/transport failures are data; argument errors reject. Full results stay in JS; images share the Run image limit.\n  async mcp(name, args = {}) {}, // → { ok, content, structured?, error? }\n"
@@ -107,6 +109,7 @@ is_ported(name: string) -> int {
         "fetch" -> { return 1 }
         "search" -> { return 1 }
         "mcp_schema" -> { return 1 }
+        "view" -> { return 1 }
         _ -> { return 0 }
     }
 }
@@ -155,6 +158,7 @@ struct RunScope {
     changes: ptr           // *changes.Tracker for this Run
     llm_calls: ptr         // std.sync cell: tools.llm calls admitted in this Run
     fork: ptr              // the Step's *agent_input.Fork when the Run started, or null
+    images: ptr            // *image.Attached: the images this Run viewed, for its result
 }
 
 new(home: string) -> ptr {
@@ -320,6 +324,7 @@ new_scope(tp: @keep ptr, id: int) -> ptr {
     s.changes = changes.new() as ptr
     s.llm_calls = sync.atomic_new(0)
     s.fork = (tp as *Tools).fork_snapshot
+    s.images = image.new_attached()
     return s as ptr
 }
 
@@ -543,9 +548,21 @@ bash_(s: *RunScope, args: string, out: ptr) {
     if ok == 1 { sandbox.result_set_ok(out, text) } else { sandbox.result_set_err(out, text) }
 }
 
+// Whether the model takes images (no Config: yes, as upstream).
 vision_(t: *Tools) -> int {
-    if t.cfg == null { return 0 }
+    if t.cfg == null { return 1 }
     return types.vision(t.cfg)
+}
+
+// Where tools.view and tools.mcp attach this Run's images.
+image_target_(s: *RunScope) -> ptr {
+    t = s.tools as *Tools
+    return image.new_target(vision_(t), nib_home(s.tools), t.session_id, s.images)
+}
+
+// The images this Run viewed as a JSON array of Images ("" none), emptied.
+take_images(sp: ptr) -> string {
+    return image.take((sp as *RunScope).images)
 }
 
 // What tools.agent needs from the Tools and this Run.
@@ -698,10 +715,17 @@ call_tool(sp: ptr, name: string, args: string, out: ptr) {
             ok, text = web_search.search(t.cfg, args, s.cancel)
         }
         "mcp" -> {
-            ok, text = mcp_tool.execute(t.mcp_client, args, 0, s.cancel, vision_(t))
+            tg = image_target_(s)
+            ok, text = mcp_tool.execute(t.mcp_client, args, 0, s.cancel, tg)
+            heap.free(tg)
         }
         "mcp_schema" -> {
-            ok, text = mcp_tool.execute(t.mcp_client, args, 1, s.cancel, vision_(t))
+            ok, text = mcp_tool.execute(t.mcp_client, args, 1, s.cancel, null)
+        }
+        "view" -> {
+            tg = image_target_(s)
+            ok, text = view.view(tg, credential_paths(s.tools), args)
+            heap.free(tg)
         }
         _ -> {
             text = "SandboxOnlyTool"

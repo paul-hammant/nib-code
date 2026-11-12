@@ -1,8 +1,7 @@
 // Ports the tests of upstream src/session/tool_summary.zig under their names,
 // plus the summary half of events.zig's "run_end JSON includes actual tool
 // summary including empty counts". Not ported: "summary allocation failures
-// release counts and names" (Zig allocator testing), "annotateViews labels
-// viewed images with their dimensions" (images are not ported).
+// release counts and names" (Zig allocator testing).
 import std.spec
 import std.string
 import std.list
@@ -135,6 +134,22 @@ main() {
             s.omitted = 3 as long
             spec.assert_str_eq(tool_summary.to_json(s), "{\"counts\":[{\"name\":\"bash\",\"count\":2},{\"name\":\"read\",\"count\":1}],\"omitted\":3,\"files\":[]}", "populated")
             spec.assert_str_eq(tool_summary.to_json(tool_summary.empty()), "{\"counts\":[],\"omitted\":0,\"files\":[]}", "empty")
+        }
+        spec.it("annotateViews labels viewed images with their dimensions") callback {
+            r = timing.new()
+            timing.set_detail(r, 1)
+            i = timing.reserve(r, "view")
+            timing.describe(r, i, "view", "{\"path\":\"shot.png\"}")
+            timing.complete(r, i, 0 as long, 1 as long, 1)
+            j = timing.reserve(r, "view")
+            timing.describe(r, j, "view", "{\"path\":\"gone.png\"}")
+            timing.complete(r, j, 0 as long, 1 as long, 1)
+            s = tool_summary.init(r, 0, 0 as long)
+            tool_summary.annotate_views(s, "[{\"path\":\"p\",\"name\":\"shot.png\",\"media_type\":\"image/png\",\"bytes\":1,\"width\":1280,\"height\":720}]")
+            spec.assert_str_eq((list.list_get_raw(s.files, 0) as *tool_summary.File).path, "shot.png · 1280×720", "labelled")
+            spec.assert_str_eq((list.list_get_raw(s.files, 1) as *tool_summary.File).path, "gone.png", "unviewed kept")
+            tool_summary.annotate_views(s, "")
+            spec.assert_str_eq((list.list_get_raw(s.files, 0) as *tool_summary.File).path, "shot.png · 1280×720", "no images: no change")
         }
     }
     return spec.run_summary(fw)

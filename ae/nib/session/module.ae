@@ -28,6 +28,7 @@ import std.sync
 import std.worker
 import std.cryptography
 import nib.jsonx
+import nib.image
 import nib.lock
 import nib.msg
 import nib.sandbox
@@ -615,6 +616,7 @@ struct Executed {
     run_ms: long
     has_run_ms: int
     summary: string          // tool_summary JSON, "" none
+    images: string           // the images the Run viewed, a JSON array, "" none
     tool_bytes: long
     omitted: long
 }
@@ -628,6 +630,7 @@ new_executed_(output: string, ok: int) -> *Executed {
     e.run_ms = 0 as long
     e.has_run_ms = 0
     e.summary = ""
+    e.images = ""
     e.tool_bytes = 0 as long
     e.omitted = 0 as long
     return e
@@ -778,6 +781,8 @@ execute_(s: *Session, tc: *types.ToolCall, sk: ptr, cancel: @keep ptr, run: @kee
     if j.hook_notice != "" { emit_(sk, "{\"notice\":${jsonx.quote(j.hook_notice)}}") }
     out_text = output.step_limit_output(output.format_hook(o as ptr, j.hook, l.run_output_bytes as long), remaining_steps_(s))
     summary = tool_summary.init(run, run_index, timing.omitted(run) - before_omitted)
+    viewed = tools.take_images(j.scope)
+    tool_summary.annotate_views(summary, viewed)
     sj = tool_summary.to_json(summary)
     okt = "false"
     if o.ok == 1 { okt = "true" }
@@ -787,6 +792,7 @@ execute_(s: *Session, tc: *types.ToolCall, sk: ptr, cancel: @keep ptr, run: @kee
     e.run_ms = run_ms
     e.has_run_ms = 1
     e.summary = sj
+    e.images = viewed
     e.tool_bytes = timing.tool_bytes(run) - before_bytes
     e.omitted = timing.omitted(run) - before_omitted
     return e as ptr
@@ -1248,9 +1254,10 @@ run_steps_(s: *Session, pending: ptr, sk: @keep ptr, cancel: @keep ptr) -> (stri
             run_ms = run_ms + ex.run_ms
             emit_(sk, usage_event_(s))
             extra = ""
+            if ex.images != "" { extra = ",\"images\":${ex.images}" }
             okt = "false"
             if ex.ok == 1 { okt = "true" }
-            if ex.has_run_ms == 1 && ex.background_id == "" { extra = ",\"run_ok\":${okt}" }
+            if ex.has_run_ms == 1 && ex.background_id == "" { extra = "${extra},\"run_ok\":${okt}" }
             if ex.summary != "" { extra = "${extra},\"tool_summary\":${ex.summary}" }
             if ex.background_id != "" { extra = "${extra},\"background_id\":${jsonx.quote(ex.background_id)}" }
             list.list_add(pending, msg.tool(tc.id, ex.output, extra))
@@ -1267,7 +1274,7 @@ run_steps_(s: *Session, pending: ptr, sk: @keep ptr, cancel: @keep ptr) -> (stri
             rem = remaining_steps_(s)
             if rem >= 0 { run_results = "${run_results},\"remaining_steps\":${rem}" }
             run_results = "${run_results}}"
-            output_tokens = output_tokens + (string.length(ex.output) as long) / 3 + 1
+            output_tokens = output_tokens + (string.length(ex.output) as long) / 3 + 1 + (image.count(ex.images) as long) * (image.ESTIMATED_TOKENS as long)
             k = k + 1
         }
         run_results = "${run_results}]"

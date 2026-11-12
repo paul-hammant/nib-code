@@ -5,8 +5,9 @@
 // SSE replies, modern and legacy). Run from the repository root.
 //
 // Differences from the Zig tests: values are JSON text, the readLine test
-// reads a fixed Source, watch takes a std.sync cell, and mapContent takes a
-// vision flag instead of a Tools config.
+// reads a fixed Source, watch takes a std.sync cell, and mapContent takes an
+// image.Target (vision, storage, the Run's attached images; null: no vision)
+// instead of a Tools config. Attaching an image is tested in view_test.ae.
 import std.spec
 import std.fs
 import std.list
@@ -14,6 +15,7 @@ import std.os
 import std.string
 import std.strbuilder
 import std.sync
+import nib.image
 import nib.jsonx
 import nib.mcp
 import nib.mcp.mcp_headers
@@ -55,7 +57,7 @@ call_text_(c: ptr, target: string, args: string) -> string {
 
 content_of_(result: string) -> string {
     doc = jsonx.parse(result)
-    out = string.copy(mcp_tool.map_content(jsonx.encode(jsonx.field(doc, "content")), 0))
+    out = string.copy(mcp_tool.map_content(jsonx.encode(jsonx.field(doc, "content")), null))
     jsonx.free(doc)
     return out
 }
@@ -261,28 +263,30 @@ main() {
     spec.describe(fw, "tools/mcp") {
         spec.it("MCP content text and nonvision images keep full text") callback {
             content = "[{\"type\":\"text\",\"text\":\"hello\"},{\"type\":\"image\",\"data\":\"fake\"},{\"type\":\"audio\"}]"
-            spec.assert_str_eq(mcp_tool.map_content(content, 0), "hello\n[image omitted]\n[audio omitted]", "mixed")
+            off = image.new_target(0, "", "", image.new_attached())
+            spec.assert_str_eq(mcp_tool.map_content(content, off), "hello\n[image omitted]\n[audio omitted]", "mixed")
             empty = "[{\"type\":\"text\",\"text\":\"\"},{\"type\":\"text\",\"text\":\"next\"},{\"type\":\"text\",\"text\":\"\"}]"
-            spec.assert_str_eq(mcp_tool.map_content(empty, 0), "\nnext\n", "empty items keep their separators")
+            spec.assert_str_eq(mcp_tool.map_content(empty, off), "\nnext\n", "empty items keep their separators")
         }
-        spec.it("images are a stand-in with vision, other items get summaries") callback {
+        spec.it("an image item without data is named, other items get summaries") callback {
+            on = image.new_target(1, "/unused", "s", image.new_attached())
             content = "[{\"type\":\"image\"},{\"type\":\"resource_link\",\"uri\":\"u:1\"},{\"type\":\"resource\",\"resource\":{\"uri\":\"u:2\"}},{\"type\":\"weird\"}]"
-            spec.assert_str_eq(mcp_tool.map_content(content, 1), "[image omitted: images not ported]\n[resource link: u:1]\n[resource: u:2]\n[unsupported content omitted]", "summaries")
+            spec.assert_str_eq(mcp_tool.map_content(content, on), "[image omitted: InvalidImage]\n[resource link: u:1]\n[resource: u:2]\n[unsupported content omitted]", "summaries")
         }
         spec.it("argument errors reject, an absent client is data") callback {
-            ok, text = mcp_tool.execute(null, "{", 0, null, 0)
+            ok, text = mcp_tool.execute(null, "{", 0, null, null)
             spec.assert_eq(ok, 0, "bad json rejects")
             spec.assert_str_eq(text, "expected a server.tool name and argument object", "bad json text")
-            ok2, t2 = mcp_tool.execute(null, "{\"arguments\":{}}", 0, null, 0)
+            ok2, t2 = mcp_tool.execute(null, "{\"arguments\":{}}", 0, null, null)
             spec.assert_str_eq(t2, "expected a server.tool name", "no name")
-            ok3, t3 = mcp_tool.execute(null, "{\"name\":\"echo\",\"arguments\":{}}", 0, null, 0)
+            ok3, t3 = mcp_tool.execute(null, "{\"name\":\"echo\",\"arguments\":{}}", 0, null, null)
             spec.assert_str_eq(t3, "expected server.tool", "no dot")
-            ok4, t4 = mcp_tool.execute(null, "{\"name\":\"a.b\",\"arguments\":3}", 0, null, 0)
+            ok4, t4 = mcp_tool.execute(null, "{\"name\":\"a.b\",\"arguments\":3}", 0, null, null)
             spec.assert_str_eq(t4, "arguments must be an object", "args object")
-            ok5, t5 = mcp_tool.execute(null, "{\"name\":\"a.b\",\"arguments\":{}}", 0, null, 0)
+            ok5, t5 = mcp_tool.execute(null, "{\"name\":\"a.b\",\"arguments\":{}}", 0, null, null)
             spec.assert_eq(ok5, 1, "data")
             spec.assert_str_eq(t5, "{\"ok\":false,\"content\":\"\",\"error\":\"MCP is unavailable\"}", "unavailable")
-            ok6, t6 = mcp_tool.execute(null, "{\"name\":\"a.b\"}", 1, null, 0)
+            ok6, t6 = mcp_tool.execute(null, "{\"name\":\"a.b\"}", 1, null, null)
             spec.assert_eq(ok6, 1, "schema needs no arguments")
         }
     }
@@ -352,17 +356,17 @@ main() {
         spec.it("mcp_tool.execute maps results, failures and schemas") callback {
             home = tmp_()
             c = stdio_client_(home, 0, 1, null)
-            ok, text = mcp_tool.execute(c, "{\"name\":\"local.echo\",\"arguments\":{\"text\":\"hey\"}}", 0, null, 0)
+            ok, text = mcp_tool.execute(c, "{\"name\":\"local.echo\",\"arguments\":{\"text\":\"hey\"}}", 0, null, null)
             spec.assert_eq(ok, 1, "result")
             spec.assert_str_eq(text, "{\"ok\":true,\"content\":\"hey\",\"structured\":{\"echo\":\"hey\"},\"error\":null}", "ok result")
-            ok2, t2 = mcp_tool.execute(c, "{\"name\":\"local.fail\",\"arguments\":{}}", 0, null, 0)
+            ok2, t2 = mcp_tool.execute(c, "{\"name\":\"local.fail\",\"arguments\":{}}", 0, null, null)
             spec.assert_str_eq(t2, "{\"ok\":false,\"content\":\"\",\"structured\":{\"echo\":\"\"},\"error\":\"MCP tool failed\"}", "isError")
-            ok3, t3 = mcp_tool.execute(c, "{\"name\":\"local.rpc_error\",\"arguments\":{}}", 0, null, 0)
+            ok3, t3 = mcp_tool.execute(c, "{\"name\":\"local.rpc_error\",\"arguments\":{}}", 0, null, null)
             spec.assert_str_eq(t3, "{\"ok\":false,\"content\":\"\",\"error\":\"mock RPC failure\"}", "rpc error is data")
-            ok4, t4 = mcp_tool.execute(c, "{\"name\":\"local.echo\"}", 1, null, 0)
+            ok4, t4 = mcp_tool.execute(c, "{\"name\":\"local.echo\"}", 1, null, null)
             spec.assert_eq(ok4, 1, "schema")
             spec.assert_true(has_(t4, "\"required\":[\"text\"]") == 1, "schema text")
-            ok5, t5 = mcp_tool.execute(c, "{\"name\":\"local.zip\"}", 1, null, 0)
+            ok5, t5 = mcp_tool.execute(c, "{\"name\":\"local.zip\"}", 1, null, null)
             spec.assert_str_eq(t5, "{\"ok\":false,\"content\":\"\",\"error\":\"UnknownTool\"}", "unknown tool is data")
             mcp.close(c)
         }

@@ -2,9 +2,7 @@
 // instructions.zig and compact.zig under their names.
 //
 // Not ported (unported parts): prompt.zig "MCP API descriptions enter context
-// only with enabled servers" (MCP); compact.zig "compaction replaces images
-// with placeholders and budgets them" (images; estimate_tokens' image budget
-// is covered by "estimate_tokens budgets an images array" below);
+// only with enabled servers" (MCP);
 // profile.zig "a custom provider resolves by its model" keeps only its
 // assertion, for_model on the custom provider's model.
 import std.spec
@@ -113,8 +111,8 @@ main() {
             spec.assert_false(has_(prompt_text, "{s}"), "no marker left")
             spec.assert_false(has_(prompt_text, "{d}"), "no marker left")
             spec.assert_true(has_(prompt_text, "You are nib, a coding agent working in /work.\n"), "cwd")
-            // Upstream-complete documentation: tools not ported yet (view, fetch,
-            // search) are checked against tools.all_docs().
+            // Upstream-complete documentation: every tool is checked against
+            // tools.all_docs().
             full = prompt.render_system("/work", tools.all_docs(), 16384 as long, "", "gpt-6.1-sol")
             spec.assert_true(has_(full, "1800000 (30 min)"), "bash timeout")
             spec.assert_true(has_(full, "resume:a1 after completion; busy:wait, don't retry/replace"), "agent resume")
@@ -317,6 +315,35 @@ main() {
             order = [0, 1, 4, 5, 6, 4, 5, 6, 4, 5, 6]
             long_turn = pick_(m, order, 11)
             spec.assert_eq(compact.compaction_cut(long_turn, 11, 128000 as long), 5, "long turn")
+        }
+        spec.it("compaction replaces images with placeholders and budgets them") callback {
+            shot = "{\"path\":\"p\",\"name\":\"shot.png\",\"media_type\":\"image/png\",\"bytes\":10,\"width\":1280,\"height\":720}"
+            img_msg = msg.set_raw(msg.user("look"), "images", "[${shot}]")
+            plain = compact.without_images(img_msg)
+            spec.assert_str_eq(msg.raw(plain, "images"), "", "images dropped")
+            spec.assert_str_eq(msg.content(plain), "look\n[image shot.png 1280×720 omitted]", "placeholder after the text")
+            spec.assert_str_eq(msg.role(plain), "user", "role kept")
+            bare = msg.tool("c", "", ",\"images\":[${shot}]")
+            bare = msg.without(bare, "content")
+            spec.assert_str_eq(msg.content(compact.without_images(bare)), "[image shot.png 1280×720 omitted]", "no text: just the placeholder")
+            two = msg.set_raw(msg.user("x"), "images", "[${shot},${shot}]")
+            spec.assert_str_eq(msg.content(compact.without_images(two)), "x\n[image shot.png 1280×720 omitted]\n[image shot.png 1280×720 omitted]", "one line each")
+            spec.assert_str_eq(compact.without_images(msg.user("none")), msg.user("none"), "untouched without images")
+            one = list.list_new()
+            list.list_add(one, msg.user("look"))
+            two_l = list.list_new()
+            list.list_add(two_l, img_msg)
+            spec.assert_eq_long(compact.estimate_tokens(two_l, 0, 1), compact.estimate_tokens(one, 0, 1) + 1500, "one image budgeted")
+            // the summary request carries placeholders, not images
+            history = list.list_new()
+            list.list_add(history, msg.system("s"))
+            list.list_add(history, img_msg)
+            req = compact.summary_request(history, 2)
+            first, _g = list.get_string(req, 1)
+            spec.assert_str_eq(msg.raw(first, "images"), "", "request has no images")
+            spec.assert_str_eq(msg.content(first), "look\n[image shot.png 1280×720 omitted]", "request has the placeholder")
+            kept, _h = list.get_string(history, 1)
+            spec.assert_true(msg.raw(kept, "images") != "", "the history keeps its images")
         }
         spec.it("estimate_tokens budgets an images array") callback {
             plain = list.list_new()

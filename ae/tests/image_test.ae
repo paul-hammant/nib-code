@@ -1,0 +1,264 @@
+// Ports the inline tests of upstream src/image.zig under their names:
+// "probe reads PNG and GIF headers", "probe skips JPEG segments to the frame
+// header", "probe reads the three WebP encodings", "probe rejects truncated
+// and unknown data", "store keeps content-hash files and rejects bad input",
+// "pastedPath understands quoting, escapes and file URLs".
+//
+// Adapted: Zig's "\xNN" bytes are written `~NN` by bin_() (an Aether string
+// literal cannot hold a NUL); the store tests use a temp directory.
+// Added: a PNG with NUL bytes survives probe, store and base64 (binary
+// safety), the hash name is the first 16 bytes of SHA-256, the store's modes,
+// and the Run's Attached list.
+import std.spec
+import std.string
+import std.list
+import std.fs
+import std.bytes
+import std.strbuilder
+import std.cryptography
+import std.encoding
+import nib.image
+import nib.sysgap
+
+hexv_(c: int) -> int {
+    if c >= 48 && c <= 57 { return c - 48 }
+    if c >= 97 && c <= 102 { return c - 87 }
+    return c - 55
+}
+
+// A binary string: `~HH` is the byte HH, anything else is itself.
+bin_(spec_text: string) -> string {
+    n = string.length(spec_text)
+    b = bytes.new(n + 1)
+    k = 0
+    i = 0
+    while i < n {
+        c = string.char_at(spec_text, i)
+        if c == 126 && i + 2 < n + 0 + 1 {
+            bytes.set(b, k, hexv_(string.char_at(spec_text, i + 1)) * 16 + hexv_(string.char_at(spec_text, i + 2)))
+            i = i + 3
+        } else {
+            bytes.set(b, k, c)
+            i = i + 1
+        }
+        k = k + 1
+    }
+    return bytes.finish(b, k)
+}
+
+// A PNG header of the given size (24 bytes).
+png_(w: int, h: int) -> string {
+    b = bytes.new(32)
+    bytes.set_length(b, 24)
+    m = [137, 80, 78, 71, 13, 10, 26, 10]
+    i = 0
+    while i < 8 {
+        bytes.set(b, i, m[i])
+        i = i + 1
+    }
+    bytes.set_be32(b, 8, 13)
+    bytes.set(b, 12, 73)
+    bytes.set(b, 13, 72)
+    bytes.set(b, 14, 68)
+    bytes.set(b, 15, 82)
+    bytes.set_be32(b, 16, w)
+    bytes.set_be32(b, 20, h)
+    return bytes.finish(b, 24)
+}
+
+webp_(tag: string) -> ptr {
+    b = bytes.new(32)
+    bytes.set_length(b, 30)
+    i = 0
+    while i < 30 {
+        bytes.set(b, i, 0)
+        i = i + 1
+    }
+    bytes.set(b, 0, 82)
+    bytes.set(b, 1, 73)
+    bytes.set(b, 2, 70)
+    bytes.set(b, 3, 70)
+    bytes.set(b, 8, 87)
+    bytes.set(b, 9, 69)
+    bytes.set(b, 10, 66)
+    bytes.set(b, 11, 80)
+    i = 0
+    while i < 4 {
+        bytes.set(b, 12 + i, string.char_at(tag, i))
+        i = i + 1
+    }
+    return b
+}
+
+tmp_() -> string {
+    d, _e = fs.make_temp_dir("", "nib-image")
+    real, _k, _m = fs.realpath(d)
+    return real
+}
+
+mode_(path: string) -> int {
+    st = sysgap.new_stat()
+    sysgap.stat(path, 1, st)
+    return (st as *sysgap.Stat).mode & 511
+}
+
+filler_(n: int) -> string {
+    b = strbuilder.new(n + 16)
+    chunk = string.pad_end("", 1024, 120)
+    i = 0
+    while i < n / 1024 {
+        strbuilder.append(b, chunk)
+        i = i + 1
+    }
+    strbuilder.append(b, string.pad_end("", n % 1024, 120))
+    return strbuilder.finish(b)
+}
+
+check_paste_(input: string, want: string, label: string) {
+    spec.assert_str_eq(image.pasted_path(input), want, label)
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "image") {
+        spec.it("probe reads PNG and GIF headers") callback {
+            spec.assert_str_eq(image.probe_json(png_(1280, 720)), "png 1280x720", "png")
+            spec.assert_str_eq(image.probe_json(bin_("GIF89a~03~00~02~00~00~00")), "gif 3x2", "gif")
+            spec.assert_str_eq(image.probe_json(bin_("GIF87a~03~00~02~00")), "gif 3x2", "gif 87a at the minimum length")
+            spec.assert_str_eq(image.probe_json(png_(0, 5)), "", "zero width")
+        }
+        spec.it("probe skips JPEG segments to the frame header") callback {
+            jpeg = bin_("~ff~d8~ff~e0~00~04ab~ff~ff~ff~c2~00~0b~08~01~02~00~03~01~01~11~00")
+            spec.assert_str_eq(image.probe_json(jpeg), "jpeg 3x258", "frame header after an APP0 segment and fill bytes")
+            spec.assert_str_eq(image.probe_json(bin_("~ff~d8~ff~da~00~02")), "", "start of scan first")
+            spec.assert_str_eq(image.probe_json(bin_("~ff~d8~ff~c0~00~0b~08")), "", "truncated frame header")
+            spec.assert_str_eq(image.probe_json(bin_("~ff~d8~ff~c4~00~04~00~00~ff~c0~00~0b~08~00~09~00~07~01")), "jpeg 7x9", "the Huffman table (c4) is not a frame")
+        }
+        spec.it("probe reads the three WebP encodings") callback {
+            lossy = webp_("VP8 ")
+            bytes.set(lossy, 23, 157)
+            bytes.set(lossy, 24, 1)
+            bytes.set(lossy, 25, 42)
+            bytes.set_le16(lossy, 26, 640)
+            bytes.set_le16(lossy, 28, 480)
+            spec.assert_str_eq(image.probe_json(bytes.finish(lossy, 30)), "webp 640x480", "lossy")
+            lossless = webp_("VP8L")
+            bytes.set(lossless, 20, 47)
+            bytes.set_le32(lossless, 21, 99 | (49 << 14))
+            spec.assert_str_eq(image.probe_json(bytes.finish(lossless, 30)), "webp 100x50", "lossless")
+            extended = webp_("VP8X")
+            bytes.set(extended, 24, 15)
+            bytes.set(extended, 25, 1)
+            bytes.set(extended, 27, 9)
+            spec.assert_str_eq(image.probe_json(bytes.finish(extended, 30)), "webp 272x10", "extended")
+        }
+        spec.it("probe rejects truncated and unknown data") callback {
+            spec.assert_str_eq(image.probe_json(""), "", "empty")
+            spec.assert_str_eq(image.probe_json(bin_("~89PNG~0d~0a~1a~0a")), "", "png magic alone")
+            spec.assert_str_eq(image.probe_json(bin_("GIF89a~03")), "", "short gif")
+            spec.assert_str_eq(image.probe_json(bin_("RIFF~00~00~00~00WEBPVP8 ")), "", "short webp")
+            spec.assert_str_eq(image.probe_json("not an image at all, just text bytes"), "", "text")
+        }
+        spec.it("store keeps content-hash files and rejects bad input") callback {
+            d = tmp_()
+            dir = "${d}/images"
+            p = png_(7, 9)
+            first, e1 = image.store(dir, "shot.png", p)
+            second, e2 = image.store(dir, "again.png", p)
+            spec.assert_str_eq(e1, "", "first")
+            spec.assert_str_eq(e2, "", "second")
+            spec.assert_str_eq(string.substring(first, 0, string.index_of(first, ",\"name\"")), string.substring(second, 0, string.index_of(second, ",\"name\"")), "same content, same path")
+            spec.assert_str_eq(image.name_of(first), "shot.png", "name kept")
+            spec.assert_str_eq(image.name_of(second), "again.png", "second name")
+            spec.assert_true(string.contains(first, "\"media_type\":\"image/png\"") == 1, "media type")
+            spec.assert_eq_long(image.height_of(first), 9 as long, "height")
+            spec.assert_eq_long(image.width_of(first), 7 as long, "width")
+            spec.assert_eq_long(image.bytes_of(first), 24 as long, "bytes")
+            _s, uerr = image.store(dir, "x", "text")
+            spec.assert_str_eq(uerr, "UnsupportedImage", "unsupported")
+            _t, terr = image.store(dir, "x", filler_(image.MAX_BYTES + 1))
+            spec.assert_str_eq(terr, "ImageTooLarge", "too large")
+            spec.assert_str_eq(image.rejection("UnsupportedImage"), "unsupported image: expected png, jpeg, gif or webp", "text of unsupported")
+            spec.assert_str_eq(image.rejection("ImageTooLarge"), "image is larger than 5 MB", "text of large")
+            spec.assert_str_eq(image.rejection("FileNotFound"), "file not found", "text of missing")
+            spec.assert_str_eq(image.rejection("AccessDenied"), "AccessDenied", "others by name")
+            images = "[${first}]"
+            kind, media, b64 = image.part_at(images, 0, 1)
+            spec.assert_eq(kind, 1, "pixels")
+            spec.assert_str_eq(media, "image/png", "media")
+            spec.assert_str_eq(string.substring(b64, 0, 11), "iVBORw0KGgo", "base64 of the PNG magic")
+            k2, text, _x = image.part_at(images, 0, 0)
+            spec.assert_eq(k2, 0, "text")
+            spec.assert_str_eq(text, "[image shot.png 7×9 omitted]", "omitted text")
+            gone = "[{\"path\":\"${d}/missing-file.png\",\"name\":\"shot.png\",\"media_type\":\"image/png\",\"bytes\":24,\"width\":7,\"height\":9}]"
+            k3, text3, _y = image.part_at(gone, 0, 1)
+            spec.assert_eq(k3, 0, "gone is text")
+            spec.assert_true(string.starts_with(text3, "[image shot.png unavailable"), "gone text: ${text3}")
+            fs.remove_tree(d)
+        }
+        spec.it("pastedPath understands quoting, escapes and file URLs") callback {
+            check_paste_("/tmp/shot.png", "/tmp/shot.png", "plain")
+            check_paste_("  '/tmp/my shot.JPG'\n", "/tmp/my shot.JPG", "single quotes, trimmed")
+            check_paste_("\"/tmp/a.webp\"", "/tmp/a.webp", "double quotes")
+            check_paste_("/tmp/my\\ shot\\ \\(1\\).jpeg", "/tmp/my shot (1).jpeg", "escapes")
+            check_paste_("file:///tmp/my%20shot.gif", "/tmp/my shot.gif", "file url")
+            check_paste_("/tmp/notes.txt", "", "not an image")
+            check_paste_("look at /tmp/shot.png please", "", "prose")
+            check_paste_("/tmp/a.png\n/tmp/b.png", "", "two lines")
+            check_paste_("", "", "empty")
+        }
+        spec.it("a PNG with NUL bytes survives probe, store and base64") callback {
+            d = tmp_()
+            p = image.sample_png()
+            spec.assert_eq(string.length(p), 29, "29 bytes, NULs inside")
+            stored, serr = image.store("${d}/a/b/images", "nul.png", p)
+            spec.assert_str_eq(serr, "", "stored under missing parents")
+            path = string.copy(jsonx_path_(stored))
+            back, n, rerr = fs.read_binary(path)
+            spec.assert_str_eq(rerr, "", "read back")
+            spec.assert_eq(n, 29, "all bytes on disk")
+            h1, _a = cryptography.sha256_hex(string.bytes(p)[0..29])
+            h2, _b = cryptography.sha256_hex(string.bytes(back)[0..n])
+            spec.assert_str_eq(h1, h2, "same digest")
+            spec.assert_true(string.ends_with(path, "${string.substring(h1, 0, 32)}.png") == 1, "name is the first 16 bytes of SHA-256: ${path}")
+            kind, media, b64 = image.part_at("[${stored}]", 0, 1)
+            spec.assert_eq(kind, 1, "pixels")
+            decoded, derr = encoding.base64_decode(b64)
+            spec.assert_str_eq(derr, "", "decodes")
+            spec.assert_eq(string.length(decoded), 29, "29 decoded bytes")
+            h3, _c = cryptography.sha256_hex(string.bytes(decoded)[0..29])
+            spec.assert_str_eq(h3, h1, "round trip")
+            spec.assert_str_eq(image.data_url(media, b64), "data:image/png;base64,${b64}", "data url")
+            spec.assert_eq(mode_(path), 384, "file 0600")
+            spec.assert_eq(mode_("${d}/a/b/images"), 448, "directory 0700")
+            // a different file of the same type gets its own name
+            other, _e = image.store("${d}/a/b/images", "o.png", png_(2, 2))
+            spec.assert_true(jsonx_path_(other) != path, "different content, different file")
+            fs.remove_tree(d)
+        }
+        spec.it("the Run's Attached list holds four images and is taken once") callback {
+            a = image.new_attached()
+            spec.assert_str_eq(image.take(a), "", "empty")
+            i = 0
+            while i < 4 {
+                spec.assert_eq(image.attach(a, "{\"name\":\"i${i}\"}"), 1, "attach ${i}")
+                i = i + 1
+            }
+            spec.assert_eq(image.attach(a, "{\"name\":\"x\"}"), 0, "fifth refused")
+            spec.assert_eq(image.attached_count(a), 4, "count")
+            spec.assert_str_eq(image.take(a), "[{\"name\":\"i0\"},{\"name\":\"i1\"},{\"name\":\"i2\"},{\"name\":\"i3\"}]", "taken in order")
+            spec.assert_eq(image.attached_count(a), 0, "emptied")
+            spec.assert_eq(image.attach(a, "{\"name\":\"again\"}"), 1, "room again")
+            image.clear(a)
+            spec.assert_eq(image.attached_count(a), 0, "cleared")
+        }
+    }
+    return spec.run_summary(fw)
+}
+
+jsonx_path_(image_text: string) -> string {
+    marker = "\"path\":\""
+    from = string.index_of(image_text, marker) + string.length(marker)
+    to = string.index_of_from(image_text, "\"", from)
+    return string.substring(image_text, from, to)
+}

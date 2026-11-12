@@ -1,0 +1,162 @@
+// Ports the inline tests of upstream src/tools/view.zig under their names:
+// "view returns metadata and attaches the stored image to the Run" and "view
+// refuses models without vision and rejects bad arguments". Each test makes a
+// Tools with its own temp home and nib data dir and calls through
+// tools.call_tool, as files_test does. The image bytes are the sample PNG
+// (it has NUL bytes).
+//
+// Added: the credential-file refusal, storage unavailable without a Session
+// id, the Run's images taken once with their stored files, tools.mcp
+// attaching an image (upstream tools/mcp.zig attach), and that `view` is in
+// the Run API only now that it is ported.
+import std.spec
+import std.fs
+import std.list
+import std.string
+import std.json
+import std.encoding
+import nib.jsonx
+import nib.image
+import nib.sandbox
+import nib.tools
+import nib.tools.mcp_tool
+import nib.provider.types
+
+tmp_() -> string {
+    d, _e = fs.make_temp_dir("", "nib-view")
+    real, _k, _m = fs.realpath(d)
+    return real
+}
+
+new_tools_(d: string, session: string) -> ptr {
+    t = tools.new(d)
+    tt = t as *tools.Tools
+    tt.data_home = "${d}/nibhome"
+    tt.session_id = session
+    return t
+}
+
+call_(s: ptr, name: string, args: string) -> *sandbox.ToolResult {
+    out = sandbox.result_ok("")
+    tools.call_tool(s, name, args, out)
+    return out as *sandbox.ToolResult
+}
+
+write_png_(path: string) {
+    p = image.sample_png()
+    fs.write_binary(path, string.bytes(p)[0..29])
+}
+
+has_(s: string, part: string) -> int {
+    if string.index_of(s, part) >= 0 { return 1 }
+    return 0
+}
+
+expect_json_(r: *sandbox.ToolResult, needle: string) {
+    spec.assert_eq(r.ok, 1, "a result: ${r.text}")
+    spec.assert_true(has_(r.text, needle) == 1, "${r.text} contains ${needle}")
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tools.view") {
+        spec.it("view returns metadata and attaches the stored image to the Run") callback {
+            d = tmp_()
+            write_png_("${d}/shot.png")
+            fs.write("${d}/notes.png", "not an image")
+            t = new_tools_(d, "abc")
+            s = tools.new_scope(t, 1)
+            good = "{\"path\":${jsonx.quote("${d}/shot.png")}}"
+            expect_json_(call_(s, "view", good), "\"width\":640,\"height\":480,\"bytes\":29")
+            spec.assert_eq(image.attached_count((s as *tools.RunScope).images), 1, "one attached")
+            bad = "{\"path\":${jsonx.quote("${d}/notes.png")}}"
+            expect_json_(call_(s, "view", bad), "\"ok\":false,\"error\":\"unsupported image")
+            expect_json_(call_(s, "view", "{\"path\":\"missing.png\"}"), "\"error\":\"file not found\"")
+            spec.assert_eq(image.attached_count((s as *tools.RunScope).images), 1, "refusals attach nothing")
+            i = 0
+            while i < 4 {
+                call_(s, "view", good)
+                i = i + 1
+            }
+            spec.assert_eq(image.attached_count((s as *tools.RunScope).images), 4, "four at most")
+            expect_json_(call_(s, "view", good), "at most 4 images per Run")
+            taken = tools.take_images(s)
+            spec.assert_eq(image.count(taken), 4, "the Run's four")
+            spec.assert_str_eq(image.name_of(image.image_at(taken, 0)), "${d}/shot.png", "named by the path as given")
+            spec.assert_true(has_(taken, "\"media_type\":\"image/png\"") == 1, "media type")
+            spec.assert_true(has_(taken, "${d}/nibhome/sessions/abc.images/") == 1, "stored under the session's images")
+            spec.assert_str_eq(tools.take_images(s), "", "taken once")
+            // content-addressed: four views, one file
+            names, _le = fs.list_dir("${d}/nibhome/sessions/abc.images")
+            spec.assert_eq(fs.dir_list_count(names), 1, "one stored file")
+            fs.remove_tree(d)
+        }
+        spec.it("view refuses models without vision and rejects bad arguments") callback {
+            d = tmp_()
+            t = new_tools_(d, "abc")
+            tools.set_config(t, types.new_config("deepseek", "", "", "deepseek-flash"), "abc")
+            s = tools.new_scope(t, 1)
+            expect_json_(call_(s, "view", "{\"path\":\"a.png\"}"), "does not support image input")
+            r = call_(s, "view", "{}")
+            spec.assert_eq(r.ok, 0, "rejected")
+            spec.assert_str_eq(r.text, "expected { path: string }", "usage")
+            fs.remove_tree(d)
+        }
+        spec.it("view does not read the credential files the file tools refuse") callback {
+            d = tmp_()
+            fs.mkdir_p("${d}/nibhome")
+            write_png_("${d}/nibhome/auth.json")
+            t = new_tools_(d, "abc")
+            s = tools.new_scope(t, 1)
+            r = call_(s, "view", "{\"path\":${jsonx.quote("${d}/nibhome/auth.json")}}")
+            spec.assert_eq(r.ok, 0, "rejected")
+            spec.assert_str_eq(r.text, "CredentialAccessDenied", "as read refuses")
+            spec.assert_eq(image.attached_count((s as *tools.RunScope).images), 0, "nothing attached")
+            fs.remove_tree(d)
+        }
+        spec.it("view needs a Session to store into") callback {
+            d = tmp_()
+            write_png_("${d}/shot.png")
+            t = new_tools_(d, "")
+            s = tools.new_scope(t, 1)
+            expect_json_(call_(s, "view", "{\"path\":${jsonx.quote("${d}/shot.png")}}"), "image storage is unavailable")
+            fs.remove_tree(d)
+        }
+        spec.it("view is a documented tool of the Run API") callback {
+            spec.assert_eq(tools.is_ported("view"), 1, "ported")
+            t = tools.new("/work")
+            spec.assert_true(has_(tools.names_json(t), "\"view\"") == 1, "in the names")
+            spec.assert_true(has_(tools.docs(t), "async view({ path }) {}, // → { ok, path, width, height, bytes } or { ok: false, error }") == 1, "documented")
+            spec.assert_eq(tools.is_ported("nosuch"), 0, "others stay out")
+        }
+        spec.it("tools.mcp attaches an image content item as upstream's attach does") callback {
+            d = tmp_()
+            t = new_tools_(d, "abc")
+            s = tools.new_scope(t, 1)
+            png = image.sample_png()
+            b64 = encode_(png)
+            content = "[{\"type\":\"text\",\"text\":\"pic\"},{\"type\":\"image\",\"data\":${jsonx.quote(b64)}}]"
+            tg = image.new_target(1, "${d}/nibhome", "abc", (s as *tools.RunScope).images)
+            spec.assert_str_eq(mcp_tool.map_content(content, tg), "pic\n[image attached]", "attached")
+            spec.assert_eq(image.attached_count((s as *tools.RunScope).images), 1, "one")
+            bad = "[{\"type\":\"image\",\"data\":\"bm90IGFuIGltYWdl\"},{\"type\":\"image\"},{\"type\":\"image\",\"data\":\"!!\"}]"
+            spec.assert_str_eq(mcp_tool.map_content(bad, tg), "[image omitted: UnsupportedImage]\n[image omitted: InvalidImage]\n[image omitted: InvalidCharacter]", "errors by name")
+            i = 0
+            while i < 3 {
+                mcp_tool.map_content(content, tg)
+                i = i + 1
+            }
+            spec.assert_eq(image.attached_count((s as *tools.RunScope).images), 4, "limit")
+            spec.assert_str_eq(mcp_tool.map_content(content, tg), "pic\n[image omitted: Run image limit]", "over the limit")
+            off = image.new_target(0, "${d}/nibhome", "abc", (s as *tools.RunScope).images)
+            spec.assert_str_eq(mcp_tool.map_content(content, off), "pic\n[image omitted]", "no vision")
+            spec.assert_str_eq(mcp_tool.map_content(content, null), "pic\n[image omitted]", "no target")
+            fs.remove_tree(d)
+        }
+    }
+    return spec.run_summary(fw)
+}
+
+encode_(data: string) -> string {
+    return encoding.base64_encode_padded(string.bytes(data)[0..string.length(data)])
+}

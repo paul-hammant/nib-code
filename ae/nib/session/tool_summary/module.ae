@@ -4,8 +4,8 @@
 //
 // Differences from upstream: init() reads a sandbox.timing Run (ptr) instead
 // of a slice of Calls, and the JSON is written by to_json() with the field
-// order events.zig's serializer produces. Not ported: annotateViews (it
-// labels `view` entries with image dimensions; images are not ported).
+// order events.zig's serializer produces. annotate_views takes the viewed
+// images as a JSON array text.
 
 import std.list
 import std.string
@@ -13,7 +13,7 @@ import std.strbuilder
 import nib.jsonx
 import nib.sandbox.timing
 
-exports(Count, File, Summary, init, empty, clone, to_json)
+exports(Count, File, Summary, init, empty, clone, to_json, annotate_views)
 
 struct Count {
     name: string
@@ -104,6 +104,30 @@ init(run: ptr, run_index: int, omitted: long) -> *Summary {
         i = i + 1
     }
     return s
+}
+
+// Appends the dimensions of each viewed image to its `view` file entry
+// (upstream annotateViews). images: a JSON array of Images, "" none.
+annotate_views(s: *Summary, images: string) {
+    if images == "" { return }
+    doc = jsonx.parse(images)
+    if doc == null { return }
+    n = jsonx.array_size(doc)
+    i = 0
+    while i < list.list_size(s.files) {
+        file = list.list_get_raw(s.files, i) as *File
+        i = i + 1
+        if file.tool != "view" { continue }
+        k = 0
+        while k < n {
+            item = jsonx.array_at(doc, k)
+            k = k + 1
+            if jsonx.str_or(item, "name", "") != file.path { continue }
+            file.path = "${file.path} · ${jsonx.long_or(item, "width", 0 as long)}×${jsonx.long_or(item, "height", 0 as long)}"
+            break
+        }
+    }
+    jsonx.free(doc)
 }
 
 // A deep copy.

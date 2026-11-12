@@ -1,0 +1,66 @@
+// tools.view: look at an image file (upstream src/tools/view.zig). JS gets
+// only metadata; the pixels are attached to the Run's result for the next
+// request. The image is copied into the Session's image store under a
+// content-hash name and its reference (not its bytes) is what the Run keeps.
+// What a call needs comes in its Target (nib.image: the model's vision, the
+// data home, the Session id, the Run's Attached) and the credential paths
+// the file tools refuse. No module state.
+
+import std.fs
+import std.list
+import std.string
+import nib.image
+import nib.jsonx
+import nib.sysgap
+import nib.tools.atomic_file
+
+exports(view)
+
+refuse_(message_text: string) -> (int, string) {
+    return 1, "{\"ok\":false,\"error\":${jsonx.quote(message_text)}}"
+}
+
+credential_(creds: ptr, path: string) -> int {
+    if creds == null { return 0 }
+    n = list.list_size(creds)
+    i = 0
+    while i < n {
+        p, _e = list.get_string(creds, i)
+        if p == path { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+limit_text_() -> string { return "at most ${image.MAX_PER_RUN} images per Run" }
+
+// (1, JSON text) is the call's result, data even when refused; (0, text)
+// rejects the call.
+view(tp: ptr, creds: ptr, args: string) -> (int, string) {
+    t = tp as *image.Target
+    a = jsonx.parse(args)
+    if a == null || jsonx.kind(a, "path") != 3 {
+        jsonx.free(a)
+        return 0, "expected { path: string }"
+    }
+    raw = string.copy(jsonx.str_or(a, "path", ""))
+    jsonx.free(a)
+    if t.vision == 0 { return refuse_("the current model does not support image input") }
+    if t.data_home == "" || t.session_id == "" { return refuse_("image storage is unavailable") }
+    path, perr = atomic_file.canonical_path(raw)
+    if perr != "" { return 0, perr }
+    if credential_(creds, path) == 1 { return 0, "CredentialAccessDenied" }
+    if image.attached_count(t.attached) >= image.MAX_PER_RUN { return refuse_(limit_text_()) }
+    st = sysgap.new_stat()
+    rc = sysgap.stat(path, 1, st)
+    if rc != 0 { return refuse_(image.rejection(sysgap.errname(rc))) }
+    s = st as *sysgap.Stat
+    if s.kind != sysgap.KIND_FILE { return refuse_("not a file") }
+    if s.size > (image.MAX_BYTES as long) { return refuse_(image.rejection("ImageTooLarge")) }
+    data, _n, rerr = fs.read_binary(path)
+    if string.length(rerr) > 0 { return refuse_("AccessDenied") }
+    stored, serr = image.store(image.image_dir(t.data_home, t.session_id), raw, data)
+    if serr != "" { return refuse_(image.rejection(serr)) }
+    if image.attach(t.attached, stored) == 0 { return refuse_(limit_text_()) }
+    return 1, "{\"ok\":true,\"path\":${jsonx.quote(raw)},\"width\":${image.width_of(stored)},\"height\":${image.height_of(stored)},\"bytes\":${image.bytes_of(stored)}}"
+}
