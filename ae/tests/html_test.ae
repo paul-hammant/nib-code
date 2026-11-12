@@ -1,0 +1,31 @@
+// Ports src/tools/html.zig's tests.
+import std.spec
+import std.string
+import nib.tools.html
+
+const BASE = "https://ziglang.org/documentation/master/index.html"
+
+expect_markdown_(want: string, page: string) {
+    got, err = html.to_markdown(page, BASE)
+    spec.assert_str_eq(err, "", "no error")
+    spec.assert_str_eq(got, want, "markdown")
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tools.html") {
+        spec.it("keeps structure and drops page chrome") callback {
+            expect_markdown_(
+                "# Title\n\nSome **bold** and _em_ text with `code`.\n\n- one\n- two [link](https://ziglang.org/learn/)\n  1. nested\n\n```zig\nconst x = 1;\nif (a < b) {}\n```\n\n| A | B |\n| --- | --- |\n| 1 | 2 |",
+                "<html><head><title>T</title><style>body{}</style></head><body>\n<nav><a href=\"/\">Home</a></nav>\n<h1>Title</h1>\n<p>Some <b>bold</b> and <em>em</em>\n   text with <code>code</code>.</p>\n<script>if (a < b) alert(\"x\")</script>\n<ul><li>one</li><li>two <a href=\"/learn/\">link</a><ol><li>nested</li></ol></li></ul>\n<pre><code class=\"language-zig\">const x = 1;\nif (a &lt; b) {}\n</code></pre>\n<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>\n<form><input name=\"q\"><button>Go</button></form>\n</body></html>")
+        }
+        spec.it("prefers main content and resolves links and entities") callback {
+            expect_markdown_(
+                "Fish &amp; chips — [rel](https://ziglang.org/documentation/master/std.html) [abs](https://x.dev/a) [proto](https://cdn.dev/x) 中文 é",
+                "<header>Site</header><main><p>Fish &amp;amp; chips &mdash;\n<a href=\"std.html\">rel</a> <a href=\"https://x.dev/a\">abs</a> <a href=\"//cdn.dev/x\">proto</a>\n<a href=\"#top\"></a> 中文 &#233;</p></main><footer>F</footer>")
+            expect_markdown_("# Page\n\na < b, [image: chart]", "<title>Page</title><p>a < b, <img src=x.png alt=\"chart\"></p><!-- note -->")
+            expect_markdown_("x\n\n| a |\n| --- |\n\ny", "<p>x<b><table><tr><td>a</td></tr></table></b>y<i> </i></p>")
+        }
+    }
+    return spec.run_summary(fw)
+}

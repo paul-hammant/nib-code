@@ -35,6 +35,7 @@ expect_imports ae/nib/sandbox/timing/module.ae "nib.jsonx|std.list|std.os|std.st
 expect_imports $T/policy/module.ae "std.list|std.strbuilder|std.string"
 expect_imports $T/secrets/module.ae "std.list|std.string"
 expect_imports $T/diff/module.ae "std.list|std.string"
+expect_imports $T/html/module.ae "std.strbuilder|std.string"
 expect_imports $T/changes/module.ae "nib.tools.diff|std.list|std.strbuilder|std.string"
 expect_imports $T/registry/module.ae "nib.jsonx|nib.lock|std.list|std.os|std.string|std.sync"
 expect_imports $T/progress/module.ae "nib.jsonx|nib.lock|std.list|std.os|std.string"

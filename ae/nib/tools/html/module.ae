@@ -1,0 +1,893 @@
+// tools.html: readable Markdown from HTML (upstream src/tools/html.zig).
+// Keeps headings, paragraphs, links, lists, code and tables; drops scripts,
+// styles, navigation, forms and embedded media. When the page has <main> (or
+// else <article>), only that part is converted. Relative links resolve
+// against `base`.
+//
+// to_markdown(html, base) -> (markdown, err). Upstream's only errors are
+// allocation failures (OutOfMemory), which Aether does not surface, so err is
+// always "".
+//
+// Everything works on bytes, as upstream does. The output is a byte array
+// (int per byte) so the converter can look at and rewrite earlier output.
+
+import std.string
+import std.strbuilder
+
+exports(MAX_HREF, to_markdown)
+
+const MAX_HREF = 300
+
+// byte values
+const C_TAB = 9
+const C_NL = 10
+const C_SP = 32
+const C_DQ = 34
+const C_HASH = 35
+const C_AMP = 38
+const C_SQ = 39
+const C_LP = 40
+const C_STAR = 42
+const C_PLUS = 43
+const C_MINUS = 45
+const C_DOT = 46
+const C_SLASH = 47
+const C_SEMI = 59
+const C_LT = 60
+const C_EQ = 61
+const C_GT = 62
+const C_Q = 63
+const C_BANG = 33
+const C_LB = 91
+const C_RB = 93
+const C_BQ = 96
+const C_PIPE = 124
+
+const MAX_CP = 2097151
+
+struct Conv {
+    base: string
+    out: int[]
+    n: int
+    cap: int
+    space: int
+    pre: int
+    // open lists: ordered flag and running item count per level
+    lo: int[]
+    ln: int[]
+    lcount: int
+    lcap: int
+    quote: int
+    link_on: int
+    link_href: string
+    link_start: int
+    row_cells: int
+    rows: int
+    // output positions of open emphasis marks
+    marks: int[]
+    mcount: int
+    mcap: int
+}
+
+// ---- byte helpers ----
+
+is_space_(c: int) -> int {
+    if c == C_SP || (c >= 9 && c <= 13) { return 1 }
+    return 0
+}
+
+is_alnum_(c: int) -> int {
+    if (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) { return 1 }
+    return 0
+}
+
+lower_(c: int) -> int {
+    if c >= 65 && c <= 90 { return c + 32 }
+    return c
+}
+
+// Index of byte c in s at or after from, -1 when absent.
+find_byte_(s: string, c: int, from: int) -> int {
+    n = string.length(s)
+    i = from
+    while i < n {
+        if string.char_at(s, i) == c { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// s[at..at+t.len] equals t, ASCII case-insensitive.
+eq_icase_at_(s: string, at: int, t: string) -> int {
+    n = string.length(t)
+    if at + n > string.length(s) { return 0 }
+    i = 0
+    while i < n {
+        if lower_(string.char_at(s, at + i)) != lower_(string.char_at(t, i)) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+eq_(a: string, b: string) -> int {
+    return string.equals(a, b)
+}
+
+// Index of "<tag" or "</tag" followed by a delimiter, case-insensitive; -1 if none.
+find_tag_(html: string, from: int, tag: string, closing: int) -> int {
+    n = string.length(html)
+    tl = string.length(tag)
+    pos = from
+    while pos <= n {
+        lt = find_byte_(html, C_LT, pos)
+        if lt < 0 { return -1 }
+        pos = lt + 1
+        i = lt + 1
+        if closing != 0 {
+            if i >= n || string.char_at(html, i) != C_SLASH { continue }
+            i = i + 1
+        }
+        if i + tl > n || eq_icase_at_(html, i, tag) == 0 { continue }
+        if i + tl == n { return lt }
+        aft = string.char_at(html, i + tl)
+        if aft == C_GT || aft == C_SLASH || is_space_(aft) != 0 { return lt }
+    }
+    return -1
+}
+
+// ---- output buffer ----
+
+put_(c: *Conv, ch: int) {
+    if c.n < c.cap {
+        c.out[c.n] = ch
+    } else {
+        c.out.push(ch)
+        c.cap = c.cap + 1
+    }
+    c.n = c.n + 1
+}
+
+put_str_(c: *Conv, s: string) {
+    n = string.length(s)
+    i = 0
+    while i < n {
+        put_(c, string.char_at(s, i))
+        i = i + 1
+    }
+}
+
+last_(c: *Conv) -> int {
+    if c.n == 0 { return -1 }
+    return c.out[c.n - 1]
+}
+
+pop_(c: *Conv) {
+    if c.n > 0 { c.n = c.n - 1 }
+}
+
+// ---- entities ----
+
+// (found, replacement)
+entity_(name: string) -> (int, string) {
+    if eq_(name, "amp") != 0 { return 1, "&" }
+    if eq_(name, "lt") != 0 { return 1, "<" }
+    if eq_(name, "gt") != 0 { return 1, ">" }
+    if eq_(name, "quot") != 0 { return 1, "\"" }
+    if eq_(name, "apos") != 0 { return 1, "'" }
+    if eq_(name, "nbsp") != 0 { return 1, " " }
+    if eq_(name, "mdash") != 0 { return 1, "—" }
+    if eq_(name, "ndash") != 0 { return 1, "–" }
+    if eq_(name, "hellip") != 0 { return 1, "…" }
+    if eq_(name, "copy") != 0 { return 1, "©" }
+    if eq_(name, "reg") != 0 { return 1, "®" }
+    if eq_(name, "trade") != 0 { return 1, "™" }
+    if eq_(name, "lsquo") != 0 { return 1, "‘" }
+    if eq_(name, "rsquo") != 0 { return 1, "’" }
+    if eq_(name, "ldquo") != 0 { return 1, "“" }
+    if eq_(name, "rdquo") != 0 { return 1, "”" }
+    if eq_(name, "times") != 0 { return 1, "×" }
+    if eq_(name, "middot") != 0 { return 1, "·" }
+    if eq_(name, "bull") != 0 { return 1, "•" }
+    if eq_(name, "rarr") != 0 { return 1, "→" }
+    if eq_(name, "larr") != 0 { return 1, "←" }
+    if eq_(name, "laquo") != 0 { return 1, "«" }
+    if eq_(name, "raquo") != 0 { return 1, "»" }
+    if eq_(name, "zwj") != 0 { return 1, "" }
+    if eq_(name, "zwnj") != 0 { return 1, "" }
+    return 0, ""
+}
+
+digit_(c: int) -> int {
+    if c >= 48 && c <= 57 { return c - 48 }
+    if c >= 97 && c <= 122 { return c - 97 + 10 }
+    if c >= 65 && c <= 90 { return c - 65 + 10 }
+    return 99
+}
+
+// std.fmt.parseInt(u21, s[lo..hi], base) as an int; -1 when it fails
+// (empty, bad digit, negative non-zero, or above u21).
+parse_cp_(s: string, lo: int, hi: int, base: int) -> int {
+    if lo >= hi { return -1 }
+    p = lo
+    positive = 1
+    c0 = string.char_at(s, p)
+    if c0 == C_MINUS {
+        positive = 0
+        p = p + 1
+    } else if c0 == C_PLUS {
+        p = p + 1
+    }
+    if p >= hi { return -1 }
+    acc = 0
+    while p < hi {
+        d = digit_(string.char_at(s, p))
+        if d >= base { return -1 }
+        if positive == 0 {
+            if d != 0 { return -1 }
+        } else {
+            acc = acc * base + d
+            if acc > MAX_CP { return -1 }
+        }
+        p = p + 1
+    }
+    return acc
+}
+
+append_utf8_(sb: ptr, cp: int) {
+    if cp < 128 {
+        strbuilder.append_byte(sb, cp)
+    } else if cp < 2048 {
+        strbuilder.append_byte(sb, 192 + cp / 64)
+        strbuilder.append_byte(sb, 128 + cp % 64)
+    } else if cp < 65536 {
+        strbuilder.append_byte(sb, 224 + cp / 4096)
+        strbuilder.append_byte(sb, 128 + (cp / 64) % 64)
+        strbuilder.append_byte(sb, 128 + cp % 64)
+    } else {
+        strbuilder.append_byte(sb, 240 + cp / 262144)
+        strbuilder.append_byte(sb, 128 + (cp / 4096) % 64)
+        strbuilder.append_byte(sb, 128 + (cp / 64) % 64)
+        strbuilder.append_byte(sb, 128 + cp % 64)
+    }
+}
+
+// Entity-decoded copy of s.
+decode_(s: string) -> string {
+    n = string.length(s)
+    sb = strbuilder.new(n + 1)
+    i = 0
+    while i < n {
+        amp = find_byte_(s, C_AMP, i)
+        if amp < 0 { amp = n }
+        if amp > i { strbuilder.append(sb, string.substring(s, i, amp)) }
+        if amp == n { break }
+        semi = find_byte_(s, C_SEMI, amp)
+        took = 0
+        if semi >= 0 && semi - amp <= 10 {
+            lo = amp + 1
+            if semi - lo > 1 && string.char_at(s, lo) == C_HASH {
+                x = string.char_at(s, lo + 1)
+                cp = 0
+                if x == 120 || x == 88 {
+                    cp = parse_cp_(s, lo + 2, semi, 16)
+                } else {
+                    cp = parse_cp_(s, lo + 1, semi, 10)
+                }
+                if cp >= 0 && cp <= 1114111 && (cp < 55296 || cp > 57343) {
+                    append_utf8_(sb, cp)
+                    took = 1
+                }
+            } else {
+                found, val = entity_(string.substring(s, lo, semi))
+                if found != 0 {
+                    strbuilder.append(sb, val)
+                    took = 1
+                }
+            }
+        }
+        if took != 0 {
+            i = semi + 1
+        } else {
+            strbuilder.append_byte(sb, C_AMP)
+            i = amp + 1
+        }
+    }
+    return strbuilder.finish(sb)
+}
+
+// ---- attributes ----
+
+// Value of attribute `name` (lowercase) in a tag's attribute text, still
+// entity-encoded, as (value, found).
+attr_(attrs: string, name: string) -> (string, int) {
+    n = string.length(attrs)
+    i = 0
+    while i < n {
+        while i < n && (is_space_(string.char_at(attrs, i)) != 0 || string.char_at(attrs, i) == C_SLASH) { i = i + 1 }
+        key_start = i
+        while i < n && string.char_at(attrs, i) != C_EQ && is_space_(string.char_at(attrs, i)) == 0 && string.char_at(attrs, i) != C_SLASH { i = i + 1 }
+        key_end = i
+        while i < n && is_space_(string.char_at(attrs, i)) != 0 { i = i + 1 }
+        if i >= n || string.char_at(attrs, i) != C_EQ {
+            if i == key_start { i = i + 1 }
+            continue
+        }
+        i = i + 1
+        while i < n && is_space_(string.char_at(attrs, i)) != 0 { i = i + 1 }
+        vs = i
+        ve = i
+        if i < n && (string.char_at(attrs, i) == C_DQ || string.char_at(attrs, i) == C_SQ) {
+            q = string.char_at(attrs, i)
+            e = find_byte_(attrs, q, i + 1)
+            if e < 0 { e = n }
+            vs = i + 1
+            ve = e
+            i = e + 1
+        } else {
+            vs = i
+            while i < n && is_space_(string.char_at(attrs, i)) == 0 { i = i + 1 }
+            ve = i
+        }
+        if key_end - key_start == string.length(name) && eq_icase_at_(attrs, key_start, name) != 0 {
+            while vs < ve && is_trim3_(string.char_at(attrs, vs)) != 0 { vs = vs + 1 }
+            while ve > vs && is_trim3_(string.char_at(attrs, ve - 1)) != 0 { ve = ve - 1 }
+            return string.substring(attrs, vs, ve), 1
+        }
+    }
+    return "", 0
+}
+
+// " \t\n", the set upstream trims attribute values with.
+is_trim3_(c: int) -> int {
+    if c == C_SP || c == C_TAB || c == C_NL { return 1 }
+    return 0
+}
+
+// Language word of a class attribute ("language-x" or "lang-x"), "" if none.
+language_(attrs: string) -> string {
+    class, found = attr_(attrs, "class")
+    if found == 0 { return "" }
+    n = string.length(class)
+    i = 0
+    while i < n {
+        while i < n && (string.char_at(class, i) == C_SP || string.char_at(class, i) == C_TAB) { i = i + 1 }
+        if i >= n { break }
+        ws = i
+        while i < n && string.char_at(class, i) != C_SP && string.char_at(class, i) != C_TAB { i = i + 1 }
+        w = string.substring(class, ws, i)
+        if string.starts_with(w, "language-") != 0 { return string.substring(w, 9, string.length(w)) }
+        if string.starts_with(w, "lang-") != 0 { return string.substring(w, 5, string.length(w)) }
+    }
+    return ""
+}
+
+// Attributes of a <code> that directly follows html[from..], where
+// highlighters put the language.
+inner_code_attrs_(html: string, from: int) -> string {
+    n = string.length(html)
+    i = from
+    while i < n && (string.char_at(html, i) == C_SP || string.char_at(html, i) == C_TAB || string.char_at(html, i) == 13 || string.char_at(html, i) == C_NL) { i = i + 1 }
+    if eq_icase_at_(html, i, "<code") == 0 { return "" }
+    e = find_byte_(html, C_GT, i)
+    if e < 0 { return "" }
+    return string.substring(html, i + 5, e)
+}
+
+heading_(name: string) -> int {
+    if string.length(name) == 2 && string.char_at(name, 0) == 104 {
+        d = string.char_at(name, 1)
+        if d >= 49 && d <= 54 { return d - 48 }
+    }
+    return 0
+}
+
+is_dropped_(name: string) -> int {
+    if eq_(name, "script") != 0 || eq_(name, "style") != 0 || eq_(name, "noscript") != 0 || eq_(name, "template") != 0 { return 1 }
+    if eq_(name, "svg") != 0 || eq_(name, "canvas") != 0 || eq_(name, "iframe") != 0 || eq_(name, "object") != 0 { return 1 }
+    if eq_(name, "head") != 0 || eq_(name, "title") != 0 || eq_(name, "nav") != 0 || eq_(name, "aside") != 0 { return 1 }
+    if eq_(name, "form") != 0 || eq_(name, "select") != 0 || eq_(name, "dialog") != 0 || eq_(name, "button") != 0 { return 1 }
+    return 0
+}
+
+// ---- converter ----
+
+new_conv_(base: string) -> *Conv {
+    c = heap.new(Conv)
+    c.base = string.copy(base)
+    c.out = make([]int, 0)
+    c.n = 0
+    c.cap = 0
+    c.space = 0
+    c.pre = 0
+    c.lo = make([]int, 0)
+    c.ln = make([]int, 0)
+    c.lcount = 0
+    c.lcap = 0
+    c.quote = 0
+    c.link_on = 0
+    c.link_href = ""
+    c.link_start = 0
+    c.row_cells = 0
+    c.rows = 0
+    c.marks = make([]int, 0)
+    c.mcount = 0
+    c.mcap = 0
+    return c
+}
+
+push_list_(c: *Conv, ordered: int) {
+    if c.lcount < c.lcap {
+        c.lo[c.lcount] = ordered
+        c.ln[c.lcount] = 0
+    } else {
+        c.lo.push(ordered)
+        c.ln.push(0)
+        c.lcap = c.lcap + 1
+    }
+    c.lcount = c.lcount + 1
+}
+
+push_mark_(c: *Conv, pos: int) {
+    if c.mcount < c.mcap {
+        c.marks[c.mcount] = pos
+    } else {
+        c.marks.push(pos)
+        c.mcap = c.mcap + 1
+    }
+    c.mcount = c.mcount + 1
+}
+
+separate_(c: *Conv) {
+    if c.space != 0 && c.n > 0 {
+        l = last_(c)
+        if l != C_SP && l != C_NL && l != C_LB && l != C_LP { put_(c, C_SP) }
+    }
+    c.space = 0
+}
+
+inline_mark_(c: *Conv, mark: string) {
+    separate_(c)
+    push_mark_(c, c.n)
+    put_str_(c, mark)
+}
+
+// Markdown emphasis cannot span blocks or be empty: then the opening mark is removed.
+close_mark_(c: *Conv, mark: string) {
+    if c.mcount == 0 { return }
+    c.mcount = c.mcount - 1
+    start = c.marks[c.mcount]
+    ml = string.length(mark)
+    if start + ml > c.n { return }
+    drop = 1
+    k = start + ml
+    while k < c.n {
+        v = c.out[k]
+        if v != C_SP { drop = 0 }
+        if v == C_NL {
+            drop = 1
+            break
+        }
+        k = k + 1
+    }
+    if drop != 0 {
+        k = start
+        while k + ml < c.n {
+            c.out[k] = c.out[k + ml]
+            k = k + 1
+        }
+        c.n = c.n - ml
+        return
+    }
+    put_str_(c, mark)
+}
+
+newline_(c: *Conv) {
+    while c.n > 0 && last_(c) == C_SP { pop_(c) }
+    put_(c, C_NL)
+    c.space = 0
+    if c.quote > 0 { put_str_(c, "> ") }
+}
+
+// Ends the current line and leaves n - 1 blank lines, without stacking.
+block_(c: *Conv, n: int) {
+    c.space = 0
+    if c.pre > 0 { return }
+    while c.n > 0 && (last_(c) == C_SP || last_(c) == C_GT) { pop_(c) }
+    if c.n == 0 { return }
+    have = 0
+    while have < c.n && have < n && c.out[c.n - 1 - have] == C_NL { have = have + 1 }
+    while have < n {
+        put_(c, C_NL)
+        have = have + 1
+    }
+    if c.quote > 0 { put_str_(c, "> ") }
+}
+
+resolve_(c: *Conv, href: string) {
+    base = c.base
+    bl = string.length(base)
+    if string.contains(href, "://") != 0 || string.starts_with(href, "mailto:") != 0 {
+        put_str_(c, decode_(href))
+        return
+    }
+    si = string.index_of(base, "://")
+    if si < 0 {
+        put_str_(c, decode_(href))
+        return
+    }
+    scheme_end = si + 3
+    origin_end = find_byte_(base, C_SLASH, scheme_end)
+    if origin_end < 0 { origin_end = bl }
+    if string.starts_with(href, "//") != 0 {
+        put_str_(c, string.substring(base, 0, scheme_end - 2))
+    } else if string.char_at(href, 0) == C_SLASH {
+        put_str_(c, string.substring(base, 0, origin_end))
+    } else {
+        // end of the path: first ? or # after the origin
+        path_end = bl - origin_end
+        k = origin_end
+        while k < bl {
+            ch = string.char_at(base, k)
+            if ch == C_Q || ch == C_HASH {
+                path_end = k - origin_end
+                break
+            }
+            k = k + 1
+        }
+        dir_end = origin_end
+        k = origin_end + path_end - 1
+        while k >= origin_end {
+            if string.char_at(base, k) == C_SLASH {
+                dir_end = k + 1
+                break
+            }
+            k = k - 1
+        }
+        put_str_(c, string.substring(base, 0, dir_end))
+        if dir_end == origin_end { put_(c, C_SLASH) }
+    }
+    put_str_(c, decode_(href))
+}
+
+open_pre_(c: *Conv, attrs: string) {
+    block_(c, 2)
+    put_str_(c, "```")
+    put_str_(c, language_(attrs))
+    put_(c, C_NL)
+    c.pre = c.pre + 1
+}
+
+open_tag_(c: *Conv, name: string, attrs: string) {
+    level = heading_(name)
+    if level > 0 {
+        block_(c, 2)
+        k = 0
+        while k < level {
+            put_(c, C_HASH)
+            k = k + 1
+        }
+        put_(c, C_SP)
+    } else if eq_(name, "p") != 0 || eq_(name, "div") != 0 || eq_(name, "section") != 0 || eq_(name, "header") != 0 || eq_(name, "footer") != 0 || eq_(name, "figure") != 0 || eq_(name, "dl") != 0 || eq_(name, "table") != 0 {
+        if c.lcount > 0 { block_(c, 1) } else { block_(c, 2) }
+        if eq_(name, "table") != 0 { c.rows = 0 }
+    } else if eq_(name, "br") != 0 {
+        newline_(c)
+    } else if eq_(name, "hr") != 0 {
+        block_(c, 2)
+        put_str_(c, "---")
+        block_(c, 2)
+    } else if eq_(name, "ul") != 0 || eq_(name, "ol") != 0 {
+        if c.lcount > 0 { block_(c, 1) } else { block_(c, 2) }
+        if eq_(name, "ol") != 0 { push_list_(c, 1) } else { push_list_(c, 0) }
+    } else if eq_(name, "li") != 0 {
+        block_(c, 1)
+        depth = c.lcount
+        k = 1
+        while k < depth {
+            put_str_(c, "  ")
+            k = k + 1
+        }
+        if depth > 0 && c.lo[depth - 1] != 0 {
+            c.ln[depth - 1] = c.ln[depth - 1] + 1
+            put_str_(c, "${c.ln[depth - 1]}. ")
+        } else {
+            put_str_(c, "- ")
+        }
+    } else if eq_(name, "dt") != 0 {
+        block_(c, 1)
+    } else if eq_(name, "dd") != 0 {
+        block_(c, 1)
+        put_str_(c, ": ")
+    } else if eq_(name, "blockquote") != 0 {
+        block_(c, 2)
+        c.quote = c.quote + 1
+        put_str_(c, "> ")
+    } else if eq_(name, "code") != 0 {
+        if c.pre == 0 { inline_mark_(c, "`") }
+    } else if eq_(name, "strong") != 0 || eq_(name, "b") != 0 {
+        inline_mark_(c, "**")
+    } else if eq_(name, "em") != 0 || eq_(name, "i") != 0 {
+        inline_mark_(c, "_")
+    } else if eq_(name, "a") != 0 {
+        href, found = attr_(attrs, "href")
+        if found == 0 { return }
+        hl = string.length(href)
+        if hl == 0 || hl > MAX_HREF || string.char_at(href, 0) == C_HASH || string.starts_with(href, "javascript:") != 0 { return }
+        separate_(c)
+        c.link_on = 1
+        c.link_href = string.copy(href)
+        c.link_start = c.n
+        put_(c, C_LB)
+    } else if eq_(name, "img") != 0 {
+        alt, found = attr_(attrs, "alt")
+        if found == 0 { return }
+        if string.length(alt) == 0 { return }
+        separate_(c)
+        put_str_(c, "[image: ")
+        put_str_(c, decode_(alt))
+        put_(c, C_RB)
+    } else if eq_(name, "tr") != 0 {
+        block_(c, 1)
+        c.row_cells = 0
+        put_(c, C_PIPE)
+    } else if eq_(name, "td") != 0 || eq_(name, "th") != 0 {
+        c.row_cells = c.row_cells + 1
+        c.space = 0
+        put_(c, C_SP)
+    }
+}
+
+close_tag_(c: *Conv, name: string) {
+    if heading_(name) > 0 || eq_(name, "p") != 0 || eq_(name, "table") != 0 || eq_(name, "dl") != 0 {
+        if c.lcount > 0 { block_(c, 1) } else { block_(c, 2) }
+    } else if eq_(name, "div") != 0 || eq_(name, "section") != 0 || eq_(name, "li") != 0 || eq_(name, "dd") != 0 || eq_(name, "figure") != 0 {
+        block_(c, 1)
+    } else if eq_(name, "ul") != 0 || eq_(name, "ol") != 0 {
+        if c.lcount > 0 { c.lcount = c.lcount - 1 }
+        if c.lcount > 0 { block_(c, 1) } else { block_(c, 2) }
+    } else if eq_(name, "blockquote") != 0 {
+        if c.quote > 0 { c.quote = c.quote - 1 }
+        block_(c, 2)
+    } else if eq_(name, "pre") != 0 {
+        if c.pre == 0 { return }
+        c.pre = c.pre - 1
+        if c.n > 0 && last_(c) != C_NL { put_(c, C_NL) }
+        put_str_(c, "```")
+        block_(c, 2)
+    } else if eq_(name, "code") != 0 {
+        if c.pre == 0 { put_(c, C_BQ) }
+    } else if eq_(name, "strong") != 0 || eq_(name, "b") != 0 {
+        close_mark_(c, "**")
+    } else if eq_(name, "em") != 0 || eq_(name, "i") != 0 {
+        close_mark_(c, "_")
+    } else if eq_(name, "a") != 0 {
+        if c.link_on == 0 { return }
+        c.link_on = 0
+        start = c.link_start
+        // Upstream would trap here (slice past the end); leave the output alone.
+        if start + 1 > c.n { return }
+        empty = 1
+        k = start + 1
+        while k < c.n {
+            v = c.out[k]
+            if v != C_SP && v != C_NL {
+                empty = 0
+                break
+            }
+            k = k + 1
+        }
+        if empty != 0 {
+            c.n = start
+            return
+        }
+        put_str_(c, "](")
+        resolve_(c, c.link_href)
+        put_(c, 41)
+    } else if eq_(name, "td") != 0 || eq_(name, "th") != 0 {
+        put_str_(c, " |")
+    } else if eq_(name, "tr") != 0 {
+        c.rows = c.rows + 1
+        if c.rows == 1 && c.row_cells > 0 {
+            put_str_(c, "\n|")
+            k = 0
+            while k < c.row_cells {
+                put_str_(c, " --- |")
+                k = k + 1
+            }
+        }
+    }
+}
+
+text_(c: *Conv, raw: string) {
+    if string.length(raw) == 0 { return }
+    decoded = decode_(raw)
+    n = string.length(decoded)
+    i = 0
+    if c.pre > 0 {
+        while i < n {
+            put_(c, string.char_at(decoded, i))
+            i = i + 1
+        }
+        return
+    }
+    while i < n {
+        ch = string.char_at(decoded, i)
+        i = i + 1
+        if is_space_(ch) != 0 {
+            c.space = 1
+            continue
+        }
+        if c.space != 0 { separate_(c) }
+        put_(c, ch)
+    }
+}
+
+// Handles the markup at html[lt] and returns the index after it.
+tag_(c: *Conv, html: string, lt: int) -> int {
+    n = string.length(html)
+    if string.starts_with(string.substring(html, lt, lt + 4), "<!--") != 0 {
+        e = string.index_of_from(html, "-->", lt + 4)
+        if e < 0 { return n }
+        return e + 3
+    }
+    i = lt + 1
+    closing = 0
+    if i < n && string.char_at(html, i) == C_SLASH {
+        closing = 1
+        i = i + 1
+    }
+    name_start = i
+    while i < n && (is_alnum_(string.char_at(html, i)) != 0 || string.char_at(html, i) == C_MINUS) { i = i + 1 }
+    if i == name_start {
+        if i < n && (string.char_at(html, i) == C_BANG || string.char_at(html, i) == C_Q) {
+            e = find_byte_(html, C_GT, i)
+            if e < 0 { e = n - 1 }
+            return e + 1
+        }
+        text_(c, "<")
+        return lt + 1
+    }
+    raw_name = string.substring(html, name_start, i)
+    name = raw_name
+    if string.length(raw_name) <= 16 {
+        sb = strbuilder.new(20)
+        k = 0
+        while k < string.length(raw_name) {
+            strbuilder.append_byte(sb, lower_(string.char_at(raw_name, k)))
+            k = k + 1
+        }
+        name = strbuilder.finish(sb)
+    }
+    attrs_start = i
+    quote = 0
+    while i < n {
+        ch = string.char_at(html, i)
+        if quote != 0 {
+            if ch == quote { quote = 0 }
+        } else if ch == C_DQ || ch == C_SQ {
+            quote = ch
+        } else if ch == C_GT {
+            break
+        }
+        i = i + 1
+    }
+    attrs_end = i
+    if attrs_end > n { attrs_end = n }
+    attrs = string.substring(html, attrs_start, attrs_end)
+    next = i + 1
+    if next > n { next = n }
+
+    if closing == 0 && is_dropped_(name) != 0 {
+        al = string.length(attrs)
+        if al > 0 && string.char_at(attrs, al - 1) == C_SLASH { return next }
+        end = find_tag_(html, next, name, 1)
+        if end < 0 { return n }
+        e = find_byte_(html, C_GT, end)
+        if e < 0 { e = n - 1 }
+        return e + 1
+    }
+    if closing != 0 {
+        close_tag_(c, name)
+    } else if eq_(name, "pre") != 0 {
+        if string.length(language_(attrs)) > 0 {
+            open_pre_(c, attrs)
+        } else {
+            open_pre_(c, inner_code_attrs_(html, next))
+        }
+    } else {
+        open_tag_(c, name, attrs)
+    }
+    return next
+}
+
+run_(c: *Conv, html: string) {
+    n = string.length(html)
+    i = 0
+    while i < n {
+        lt = find_byte_(html, C_LT, i)
+        if lt < 0 { lt = n }
+        text_(c, string.substring(html, i, lt))
+        if lt == n { break }
+        i = tag_(c, html, lt)
+    }
+}
+
+finish_(c: *Conv) -> string {
+    sb = strbuilder.new(c.n + 1)
+    blank = 0
+    pos = 0
+    while pos <= c.n {
+        e = pos
+        while e < c.n && c.out[e] != C_NL { e = e + 1 }
+        te = e
+        while te > pos && (c.out[te - 1] == C_SP || c.out[te - 1] == C_TAB) { te = te - 1 }
+        if te == pos || (te - pos == 1 && c.out[pos] == C_GT) {
+            blank = blank + 1
+        } else {
+            if strbuilder.length(sb) > 0 {
+                if blank > 0 { strbuilder.append(sb, "\n\n") } else { strbuilder.append(sb, "\n") }
+            }
+            blank = 0
+            k = pos
+            while k < te {
+                strbuilder.append_byte(sb, c.out[k])
+                k = k + 1
+            }
+        }
+        pos = e + 1
+    }
+    return strbuilder.finish(sb)
+}
+
+// Part of html to convert: the content of the last <main>, else <article>, else all of it.
+main_content_(html: string) -> string {
+    tags = ["main", "article"]
+    t = 0
+    while t < 2 {
+        tag = tags[t]
+        t = t + 1
+        open = find_tag_(html, 0, tag, 0)
+        if open < 0 { continue }
+        start = find_byte_(html, C_GT, open)
+        if start < 0 { continue }
+        end = -1
+        pos = start
+        while pos <= string.length(html) {
+            close = find_tag_(html, pos, tag, 1)
+            if close < 0 { break }
+            end = close
+            pos = close + 1
+        }
+        if end < 0 { end = string.length(html) }
+        return string.substring(html, start + 1, end)
+    }
+    return html
+}
+
+// Trimmed content of <title>, "" when missing or empty.
+title_(html: string) -> string {
+    open = find_tag_(html, 0, "title", 0)
+    if open < 0 { return "" }
+    gt = find_byte_(html, C_GT, open)
+    if gt < 0 { return "" }
+    start = gt + 1
+    end = find_tag_(html, start, "title", 1)
+    if end < 0 { return "" }
+    lo = start
+    hi = end
+    while lo < hi && (string.char_at(html, lo) == C_SP || string.char_at(html, lo) == C_TAB || string.char_at(html, lo) == 13 || string.char_at(html, lo) == C_NL) { lo = lo + 1 }
+    while hi > lo && (string.char_at(html, hi - 1) == C_SP || string.char_at(html, hi - 1) == C_TAB || string.char_at(html, hi - 1) == 13 || string.char_at(html, hi - 1) == C_NL) { hi = hi - 1 }
+    return string.substring(html, lo, hi)
+}
+
+to_markdown(html: string, base: string) -> (string, string) {
+    c = new_conv_(base)
+    run_(c, main_content_(html))
+    body = finish_(c)
+    if string.starts_with(body, "# ") != 0 || string.contains(body, "\n# ") != 0 { return body, "" }
+    t = title_(html)
+    if string.length(t) == 0 { return body, "" }
+    sep = ""
+    if string.length(body) > 0 { sep = "\n\n" }
+    return "# ${decode_(t)}${sep}${body}", ""
+}
