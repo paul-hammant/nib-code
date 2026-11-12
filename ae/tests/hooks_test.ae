@@ -1,0 +1,43 @@
+// session.hooks (upstream src/session/hooks.zig). "after-edit batches both
+// tracked paths into one failure payload" drives hooks.run with the paths a
+// Run's tracker holds (the Session's after_edit_ passes tools.change_paths);
+// its first/second paths are two edits of one file plus another file.
+import std.spec
+import std.list
+import std.os
+import nib.session.hooks
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "session.hooks") {
+        spec.it("shell quoting preserves spaces quotes and unicode") callback {
+            spec.assert_str_eq(hooks.quote("a b'你好"), "'a b'\\''你好'", "quoted")
+        }
+        spec.it("hook failure payload and timeout") callback {
+            c = hooks.new_ctx()
+            cmds = list.list_new()
+            list.list_add(cmds, "printf bad; exit 7")
+            f = hooks.run(c, "after_edit", cmds, list.list_new(), "", 1000 as long)
+            spec.assert_true(f != null, "failed")
+            spec.assert_eq((f as *hooks.Failure).exit_code, 7, "exit code")
+            spec.assert_str_eq((f as *hooks.Failure).output, "bad", "output")
+            spec.assert_str_eq(hooks.payload(f), "{\"hook\":{\"command\":\"printf bad; exit 7\",\"exit_code\":7,\"output\":\"bad\"}}", "payload")
+            slow = list.list_new()
+            list.list_add(slow, "sleep 5")
+            t = hooks.run(c, "after_edit", slow, list.list_new(), "", 20 as long)
+            spec.assert_eq((t as *hooks.Failure).exit_code, 124, "timeout")
+        }
+        spec.it("after-edit batches both tracked paths into one failure payload") callback {
+            cwd = os.getcwd()
+            c = hooks.new_ctx()
+            cmds = list.list_new()
+            list.list_add(cmds, "exit 7 # {files}")
+            paths = list.list_new()
+            list.list_add(paths, "${cwd}/first")
+            list.list_add(paths, "${cwd}/second")
+            f = hooks.run(c, "after_edit", cmds, paths, "", 30000 as long)
+            spec.assert_str_eq(hooks.payload(f), "{\"hook\":{\"command\":\"exit 7 # 'first' 'second'\",\"exit_code\":7,\"output\":\"\"}}", "payload")
+        }
+    }
+    return spec.run_summary(fw)
+}

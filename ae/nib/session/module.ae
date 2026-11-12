@@ -50,10 +50,11 @@ import nib.session.compact
 import nib.session.tool_summary
 import nib.session.fork_history
 import nib.build_info
+import nib.session.hooks
 import nib.tools.agent_input
 import nib.tools.agent_sessions
 
-exports(Session, Options, Sink, new_options, new_sink, init, turn, compact_now, close, error_message, timing_json, undo,
+exports(Session, Options, Sink, new_options, new_sink, init, turn, compact_now, close, turn_end_hooks, error_message, timing_json, undo,
         VERSION)
 
 const VERSION = "0.13.0-ae"   // `nib --version`; Session headers record build_info.nib_version()
@@ -568,6 +569,8 @@ struct RunJob {
     exec_start: long
     exec_end: long
     id: string               // rN once in the background
+    hook: string             // an after-edit hook failure's payload, "" none
+    hook_notice: string
 }
 
 start_run_job_(s: *Session, code: string, run_index: int) -> *RunJob {
@@ -588,6 +591,9 @@ start_run_job_(s: *Session, code: string, run_index: int) -> *RunJob {
     j.exec_start = os.now_unix_ms()
     j.exec_end = 0 as long
     j.id = ""
+    j.hook = ""
+    j.hook_notice = ""
+    sp = s as ptr
     jp = j as ptr
     worker.run_detached(|| {
         jj = jp as *RunJob
@@ -595,12 +601,52 @@ start_run_job_(s: *Session, code: string, run_index: int) -> *RunJob {
         sandbox.host_set_timing(h, jj.timing)
         sandbox.host_set_waiting(h, jj.waiting)
         jj.outcome = sandbox.eval(jj.code, sandbox.limits(), h, jj.cancel)
+        after_edit_(sp as *Session, jj)
         jj.elapsed_ms = timing.elapsed(jj.timing)
         jj.exec_end = os.now_unix_ms()
         sync.atomic_store(jj.done, 1)
         return null
     })
     return j
+}
+
+// The hook context of this Session's commands.
+hooks_ctx_(s: *Session) -> ptr {
+    t = s.tools as *tools.Tools
+    hp = hooks.new_ctx()
+    h = hp as *hooks.Ctx
+    h.env = t.env
+    h.strip_env = (s.cfg as *types.Config).api_key_env
+    h.roots = tools.sandbox_roots(s.tools)
+    h.self_exe = t.self_exe
+    h.has_log = 1
+    h.log_ctx = s as ptr
+    h.log_fn = |ctx: ptr, members: string| {
+        ss = ctx as *Session
+        log.event(ss.log, members, 0)
+    }
+    return hp
+}
+
+// after_edit hooks once a Run that changed files ends (upstream afterEdit).
+after_edit_(s: *Session, j: *RunJob) {
+    c = s.cfg as *types.Config
+    if list.list_size(c.hooks_after_edit) == 0 { return }
+    paths = tools.change_paths(j.scope)
+    if list.list_size(paths) == 0 { return }
+    f = hooks.run(hooks_ctx_(s), "after_edit", c.hooks_after_edit, paths, "", hooks.TIMEOUT_MS as long)
+    if f != null {
+        j.hook = hooks.payload(f)
+        j.hook_notice = hooks.notice(f)
+    }
+}
+
+// turn_end hooks of a root Session (status: completed, failed, cancelled).
+turn_end_hooks(sp: ptr, status: string) {
+    s = sp as *Session
+    c = s.cfg as *types.Config
+    if (s.tools as *tools.Tools).depth != 0 || list.list_size(c.hooks_turn_end) == 0 { return }
+    hooks.run(hooks_ctx_(s), "turn_end", c.hooks_turn_end, list.list_new(), status, hooks.TIMEOUT_MS as long)
 }
 
 // One `run` tool call (upstream run.zig execute + executeTimed).
@@ -645,7 +691,8 @@ execute_(s: *Session, tc: *types.ToolCall, sk: ptr, cancel: @keep ptr, run: @kee
     // Terminal snapshots of the Run's tasks precede its run_end.
     poll_(s, sk)
     changes = tools.take_changes(j.scope)
-    out_text = output.step_limit_output(output.format(o as ptr, l.run_output_bytes as long), remaining_steps_(s))
+    if j.hook_notice != "" { emit_(sk, "{\"notice\":${jsonx.quote(j.hook_notice)}}") }
+    out_text = output.step_limit_output(output.format_hook(o as ptr, j.hook, l.run_output_bytes as long), remaining_steps_(s))
     summary = tool_summary.init(run, run_index, timing.omitted(run) - before_omitted)
     sj = tool_summary.to_json(summary)
     okt = "false"
@@ -711,11 +758,13 @@ poll_runs_(s: *Session) {
     while k < list.list_size(done) {
         j2 = list.list_get_raw(done, k) as *RunJob
         o2 = j2.outcome as *sandbox.Outcome
-        out_text = output.format(o2 as ptr, l.run_output_bytes as long)
+        out_text = output.format_hook(o2 as ptr, j2.hook, l.run_output_bytes as long)
         okt = "false"
         if o2.ok == 1 { okt = "true" }
         changes = tools.take_changes(j2.scope)
-        completion = "{\"execution\":{\"start_ms_epoch\":${j2.exec_start},\"end_ms_epoch\":${j2.exec_end}},\"step\":${j2.step},\"run_index\":${j2.run_index},\"ok\":${okt},\"output\":${jsonx.quote(out_text)},\"run_ms\":${j2.elapsed_ms},\"tool_bytes\":${timing.tool_bytes(j2.timing)},\"calls\":${calls_json_(j2.timing)},\"calls_omitted\":${timing.omitted(j2.timing)},\"changes\":${changes_json_(changes)}}"
+        hn = ""
+        if j2.hook_notice != "" { hn = "\"hook_notice\":${jsonx.quote(j2.hook_notice)}," }
+        completion = "{${hn}\"execution\":{\"start_ms_epoch\":${j2.exec_start},\"end_ms_epoch\":${j2.exec_end}},\"step\":${j2.step},\"run_index\":${j2.run_index},\"ok\":${okt},\"output\":${jsonx.quote(out_text)},\"run_ms\":${j2.elapsed_ms},\"tool_bytes\":${timing.tool_bytes(j2.timing)},\"calls\":${calls_json_(j2.timing)},\"calls_omitted\":${timing.omitted(j2.timing)},\"changes\":${changes_json_(changes)}}"
         background.enqueue_run(t.background, j2.id, o2.ok, "[background run ${j2.id} finished]\n${out_text}", completion, j2.exec_start, j2.exec_end)
         k = k + 1
     }

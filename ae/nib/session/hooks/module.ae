@@ -1,0 +1,195 @@
+// session.hooks: configured shell commands after a Run's edits and at the
+// end of a root Turn (upstream src/session/hooks.zig, docs/config.md#hooks).
+// Each command runs through /bin/sh in the project root with NIB_EVENT,
+// NIB_FILES (newline-separated, relative to the root) and NIB_TURN_STATUS,
+// {files} replaced by the shell-quoted paths, inside the bash write sandbox
+// when it is on. Commands run in order; the first failure stops the rest.
+
+import std.list
+import std.string
+import std.os
+import std.sync
+import nib.jsonx
+import nib.session.instructions
+import nib.tools.process
+import nib.tools.jail
+import nib.tools.secrets
+
+exports(Ctx, Failure, TIMEOUT_MS, new_ctx, quote, run, payload, notice)
+
+const TIMEOUT_MS = 30000
+
+struct Ctx {
+    env: ptr          // "NAME=value" list the commands start from, null: this process's
+    strip_env: string // the provider key variable, "" none
+    roots: ptr        // writable roots to wrap the shell in, null: unsandboxed
+    self_exe: string
+    has_log: int
+    log_ctx: ptr
+    log_fn: fn        // |ctx: ptr, members: string|: the `hook` record
+}
+
+struct Failure {
+    command: string
+    exit_code: int
+    output: string
+}
+
+new_ctx() -> ptr {
+    c = heap.new(Ctx)
+    c.env = null
+    c.strip_env = ""
+    c.roots = null
+    c.self_exe = ""
+    c.has_log = 0
+    c.log_ctx = null
+    c.log_fn = |ctx: ptr, members: string| {}
+    return c as ptr
+}
+
+// `text` in single quotes for /bin/sh.
+quote(text: string) -> string {
+    out = "'"
+    i = 0
+    n = string.length(text)
+    start = 0
+    while i < n {
+        if string.char_at(text, i) == 39 {
+            out = "${out}${string.substring(text, start, i)}'\\''"
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return "${out}${string.substring(text, start, n)}'"
+}
+
+relative_(root: string, path: string) -> string {
+    if path == root { return "." }
+    if string.starts_with(path, "${root}/") == 1 { return string.substring(path, string.length(root) + 1, string.length(path)) }
+    return path
+}
+
+replace_all_(text: string, needle: string, with: string) -> string {
+    out = ""
+    rest = text
+    while true {
+        i = string.index_of(rest, needle)
+        if i < 0 { break }
+        out = "${out}${string.substring(rest, 0, i)}${with}"
+        rest = string.substring(rest, i + string.length(needle), string.length(rest))
+    }
+    return "${out}${rest}"
+}
+
+env_without_(env: ptr, names: ptr) -> ptr {
+    out = list.list_new()
+    i = 0
+    while i < list.list_size(env) {
+        e, _g = list.get_string(env, i)
+        eq = string.index_of(e, "=")
+        name = e
+        if eq >= 0 { name = string.substring(e, 0, eq) }
+        drop = 0
+        k = 0
+        while k < list.list_size(names) {
+            n, _g2 = list.get_string(names, k)
+            if n == name { drop = 1 }
+            k = k + 1
+        }
+        if drop == 0 { list.list_add(out, e) }
+        i = i + 1
+    }
+    return out
+}
+
+// Runs `commands` (a list of templates) for `event`. paths: absolute paths
+// (a list), status: the Turn's for turn_end. Returns the first failure, or null.
+run(cp: ptr, event: string, commands: ptr, paths: ptr, status: string, timeout_ms: long) -> ptr {
+    c = cp as *Ctx
+    if list.list_size(commands) == 0 { return null }
+    cwd = os.getcwd()
+    root = instructions.project_root(cwd)
+    quoted = ""
+    files = ""
+    i = 0
+    while i < list.list_size(paths) {
+        p, _g = list.get_string(paths, i)
+        rel = relative_(root, p)
+        if i > 0 {
+            quoted = "${quoted} "
+            files = "${files}\n"
+        }
+        quoted = "${quoted}${quote(rel)}"
+        files = "${files}${rel}"
+        i = i + 1
+    }
+    base = c.env
+    if base == null { base = process.environ() }
+    names = list.list_new()
+    list.list_add(names, "NIB_EVENT")
+    list.list_add(names, "NIB_FILES")
+    list.list_add(names, "NIB_TURN_STATUS")
+    if c.strip_env != "" { list.list_add(names, c.strip_env) }
+    env = secrets.remove_from(env_without_(base, names))
+    list.list_add(env, "NIB_EVENT=${event}")
+    list.list_add(env, "NIB_FILES=${files}")
+    list.list_add(env, "NIB_TURN_STATUS=${status}")
+    started = os.now_monotonic_ms()
+    redirect = "exec 2>&1"
+    if event == "turn_end" { redirect = "exec >/dev/null 2>&1" }
+    k = 0
+    while k < list.list_size(commands) {
+        template, _g3 = list.get_string(commands, k)
+        command = replace_all_(template, "{files}", quoted)
+        // The project root is the commands' working directory.
+        script = "cd ${quote(root)} || exit 1\n${redirect}\n${command}"
+        inner = list.list_new()
+        list.list_add(inner, "/bin/sh")
+        list.list_add(inner, "-c")
+        list.list_add(inner, script)
+        argv = inner
+        if c.roots != null { argv = jail.wrap(c.roots, inner, c.self_exe) }
+        remaining = timeout_ms
+        if event == "turn_end" { remaining = timeout_ms - (os.now_monotonic_ms() - started) }
+        if remaining <= 0 {
+            f0 = heap.new(Failure)
+            f0.command = command
+            f0.exit_code = 124
+            f0.output = "timed out"
+            return f0 as ptr
+        }
+        command_start = os.now_monotonic_ms()
+        rp = process.run(argv, env, null, null, remaining, 9223372036854775807 as long)
+        r = rp as *process.Result
+        code = r.exit_code
+        out = r.output
+        if r.stop != "" { code = 124 }
+        if r.error != "" {
+            code = 1
+            out = r.error
+        }
+        duration = os.now_monotonic_ms() - command_start
+        if c.has_log == 1 { call(c.log_fn, c.log_ctx, ",\"hook\":{\"event\":${jsonx.quote(event)},\"command\":${jsonx.quote(command)},\"exit_code\":${code},\"duration_ms\":${duration}}") }
+        if code != 0 {
+            f = heap.new(Failure)
+            f.command = command
+            f.exit_code = code
+            f.output = out
+            return f as ptr
+        }
+        k = k + 1
+    }
+    return null
+}
+
+// The failure as the Run output's payload: {"hook":{command, exit_code, output}}.
+payload(fp: ptr) -> string {
+    f = fp as *Failure
+    return "{\"hook\":{\"command\":${jsonx.quote(f.command)},\"exit_code\":${f.exit_code},\"output\":${jsonx.quote(f.output)}}}"
+}
+
+// The notice an after-edit failure shows: "hook <command> · exit <n>".
+notice(fp: ptr) -> string {
+    f = fp as *Failure
+    return "hook ${f.command} · exit ${f.exit_code}"
+}
