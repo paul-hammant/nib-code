@@ -10,7 +10,7 @@ import std.string
 import std.list
 import nib.jsonx
 
-exports(Config, Limits, McpServer, mcp_server_new, mcp_server_copy, Usage, Reply, ToolCall, new_config, new_limits, copy, name, protocol, vision,
+exports(session_max_tokens, Config, Limits, McpServer, mcp_server_new, mcp_server_copy, Usage, Reply, ToolCall, new_config, new_limits, copy, name, protocol, vision,
         custom_run, set_effort, check_session, key_hint, missing_key, known_id, definition_protocol,
         definition_base_url, definition_key_envs, definition_default_model, definition_name,
         definition_vision, definition_custom_run, definition_models, model_context_window, small_model, builtin_ids,
@@ -59,6 +59,7 @@ struct Config {
     custom_provider: string       // "" unless custom
     custom_protocol: string
     custom_vision: int            // -1 none
+    custom_max_output: long       // -1 none
     api_key_env: string           // "" none
     key_source: string            // none, env, store
     nib_home: string
@@ -128,6 +129,7 @@ new_config(provider: string, base_url: string, api_key: string, model: string) -
     c.custom_provider = ""
     c.custom_protocol = "chat_completions"
     c.custom_vision = -1
+    c.custom_max_output = -1 as long
     c.api_key_env = ""
     c.key_source = "none"
     c.nib_home = ""
@@ -207,6 +209,7 @@ copy(cp: ptr) -> ptr {
     n.custom_provider = string.copy(c.custom_provider)
     n.custom_protocol = string.copy(c.custom_protocol)
     n.custom_vision = c.custom_vision
+    n.custom_max_output = c.custom_max_output
     n.api_key_env = string.copy(c.api_key_env)
     n.key_source = string.copy(c.key_source)
     n.nib_home = string.copy(c.nib_home)
@@ -398,6 +401,14 @@ protocol(cp: ptr) -> string {
     c = cp as *Config
     if c.provider == "custom" { return c.custom_protocol }
     return definition_protocol(c.provider)
+}
+
+// The Session's output-token limit, -1 none. Responses services get none:
+// that encoder turns max_tokens into a summary-length prompt.
+session_max_tokens(cp: ptr) -> int {
+    c = cp as *Config
+    if protocol(cp) == "responses" { return -1 }
+    return c.custom_max_output as int
 }
 
 // Whether the model accepts image input; custom providers declare it.

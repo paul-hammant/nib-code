@@ -501,6 +501,20 @@ main() {
             spec.assert_str_eq(cfg_(cp).model, "override", "model override")
             spec.assert_eq(cfg_(cp).context_window as int, 9876, "window override")
         }
+        spec.it("custom max_output is an optional positive integer") callback {
+            e = env.new()
+            head = "provider = \"site\"\n[providers.site]\nprotocol = \"chat_completions\"\nbase_url = \"http://localhost:1/v1\"\nmodel = \"m\"\ncontext_window = 1000\n"
+            spec.assert_eq(cfg_(ok_(e, head)).custom_max_output as int, -1, "unset")
+            spec.assert_eq(cfg_(ok_(e, "${head}max_output = 8_192\n")).custom_max_output as int, 8192, "set")
+            bads = ["max_output = 0\n", "max_output = -5\n", "max_output = \"8\"\n", "max_output = true\n", "max_output = 5000000000\n"]
+            i = 0
+            while i < 5 {
+                spec.assert_str_eq(err_(e, "${head}${bads[i]}"), "InvalidConfig", "bad ${i}")
+                spec.assert_true(contains_(detail_(e, "${head}${bads[i]}"), "max_output must be") == 1, "message ${i}")
+                i = i + 1
+            }
+            spec.assert_str_eq(err_(e, "[openai]\nmax_output = 5\n"), "InvalidConfig", "built-in rejects")
+        }
         spec.it("custom configuration rejects incomplete duplicate conflicting and secret fields") callback {
             bads = ["[providers.site]\nmodel = \"x\"", "[providers.openai]\n", "[providers.site]\n[providers.site]\n", "[providers.site]\napi_key = \"secret\"",
                     "[providers.site]\nprotocol = \"fourth_protocol\"", "[providers.site]\napi_key_env = \"BAD-NAME\"", "[openai]\nmodel = \"a\"\nmodel = \"b\"",

@@ -63,6 +63,7 @@ struct Prov {
     protocol: string
     api_key_env: string
     vision: int
+    max_output: long         // -1 none
     seen: int
 }
 
@@ -539,6 +540,7 @@ new_prov_(name: string, line: int, custom: int) -> *Prov {
     p.protocol = ""
     p.api_key_env = ""
     p.vision = -1
+    p.max_output = -1 as long
     p.seen = 0
     return p
 }
@@ -862,6 +864,8 @@ generic_kv_(s: *S, key: string, value: string, voff: int, start: int, lstart: in
             index = 7
         } else if pcustom == 1 && key == "vision" {
             index = 8
+        } else if pcustom == 1 && key == "max_output" {
+            index = 10
         } else {
             return "unknown provider key '${key}'"
         }
@@ -894,6 +898,10 @@ generic_kv_(s: *S, key: string, value: string, voff: int, start: int, lstart: in
     } else if sec != SEC_TOP && index == 8 {
         if v.kind != 2 { return "vision must be true or false" }
         settings.vision = v.b
+    } else if sec != SEC_TOP && index == 10 {
+        if v.kind != 1 { return "max_output must be an integer" }
+        if v.n <= (0 as long) || v.n > (4294967295 as long) { return "max_output must be a positive u32 integer" }
+        settings.max_output = v.n
     } else if sec != SEC_TOP && index == 2 {
         if v.kind != 1 { return "context_window must be an integer" }
         if v.n <= (0 as long) || v.n == (9223372036854775807 as long) { return "context_window must be a positive u64 integer" }
@@ -1200,6 +1208,7 @@ resolve(envp: ptr, text: string, path: string) -> (ptr, string, string) {
         c.custom_provider = string.copy(name)
         c.custom_protocol = string.copy(settings.protocol)
         c.custom_vision = settings.vision
+        c.custom_max_output = settings.max_output
     }
     if settings.api_key_env != "" {
         c.api_key_env = string.copy(settings.api_key_env)

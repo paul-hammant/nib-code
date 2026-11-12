@@ -622,7 +622,7 @@ complete_(s: *Session, request: ptr, sk: @keep ptr, cancel: @keep ptr, buffer_te
         }
     }
     rr.has_event = 1
-    return provider.complete(s.cfg, s.cache_key, request, prompt.TOOLS_JSON, -1, ps, cancel, 0, rp)
+    return provider.complete(s.cfg, s.cache_key, request, prompt.TOOLS_JSON, types.session_max_tokens(s.cfg), ps, cancel, 0, rp)
 }
 
 // An unfinished Step is dropped, since its tool calls would need results.
