@@ -25,7 +25,7 @@ import nib.qjsgap
 import nib.jsonx
 
 exports(TOOL_CONCURRENCY, MAX_STOPPED_BYTES, Limits, ToolResult, Host, Outcome,
-        limits, new_host, host_set_admit, host_set_cancel, host_set_timing,
+        limits, new_host, host_set_admit, host_set_cancel, host_set_timing, host_set_waiting,
         result_ok, result_err, result_set_ok, result_set_err, result_set_identity,
         eval, syntax_context)
 
@@ -59,6 +59,7 @@ struct Host {
     has_admit: int
     cancel: ptr        // std.sync cell set when the Run stops its tools; may be null
     timing: ptr        // *timing.Run, or null
+    waiting: ptr       // std.sync cell, 1 while the Run waits only on tools or timers; may be null
 }
 
 struct Outcome {
@@ -127,6 +128,7 @@ new_host(ctx: @keep ptr, names_json: string, call_fn: @keep fn) -> ptr {
     h.has_admit = 0
     h.cancel = null
     h.timing = null
+    h.waiting = null
     return h as ptr
 }
 
@@ -138,6 +140,7 @@ host_set_admit(hp: ptr, admit_fn: @keep fn) {
 
 host_set_cancel(hp: ptr, cell: @keep ptr) { (hp as *Host).cancel = cell }
 host_set_timing(hp: ptr, t: @keep ptr) { (hp as *Host).timing = t }
+host_set_waiting(hp: ptr, cell: @keep ptr) { (hp as *Host).waiting = cell }
 
 new_result_() -> ptr {
     r = heap.new(ToolResult)
@@ -568,11 +571,15 @@ jobs_(st: *State) -> int {
             if failed == 1 || has_timers_(st) == 0 { return 1 }
         }
         // Wait for a completion, a timer, or the next cancellation check.
+        wc = null
+        if st.host != null { wc = (st.host as *Host).waiting }
+        if wc != null { sync.atomic_store(wc, 1) }
         deadline = os.now_monotonic_ms() + wait_ms
         while any_done_(st) == 0 && os.now_monotonic_ms() < deadline {
             if canceled_(st) == 1 { break }
             sleep(1)
         }
+        if wc != null { sync.atomic_store(wc, 0) }
     }
 }
 

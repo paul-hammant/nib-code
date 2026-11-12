@@ -108,6 +108,7 @@ struct Session {
     poll_guard: ptr          // one poll (events + progress) at a time
     ticker_stop: ptr         // std.sync cells of the poll thread
     ticker_done: ptr
+    bg_runs: ptr             // *RunJob of Runs in the background, until finished
 }
 
 new_options(home: string, user_home: string) -> ptr {
@@ -228,6 +229,7 @@ init(cp: @keep ptr, op: @keep ptr) -> (ptr, string, string) {
     s.poll_guard = lock.new()
     s.ticker_stop = sync.atomic_new(0)
     s.ticker_done = sync.atomic_new(1)
+    s.bg_runs = list.list_new()
     reset_timing_(s)
     directory = atomic_file.join(o.home, "sessions")
     fs.mkdir_p(directory)
@@ -421,6 +423,7 @@ poll_(s: *Session, sk: ptr) {
         emit_(sk, "{\"background\":{\"id\":${jsonx.quote(id)},\"kind\":${jsonx.quote(kind)},\"state\":\"started\"}}")
         i = i + 1
     }
+    poll_runs_(s)
     progress.drain(t.progress)
     // tools.llm's usage joins the Turn's as it arrives.
     llm_usage = tools.take_usage(s.tools) as *types.Usage
@@ -523,6 +526,7 @@ calls_json_(run: ptr) -> string {
 }
 
 struct Executed {
+    background_id: string    // the Run moved to the background, "" none
     output: string
     ok: int
     empty: int
@@ -535,6 +539,7 @@ struct Executed {
 
 new_executed_(output: string, ok: int) -> *Executed {
     e = heap.new(Executed)
+    e.background_id = ""
     e.output = output
     e.ok = ok
     e.empty = 0
@@ -546,8 +551,59 @@ new_executed_(output: string, ok: int) -> *Executed {
     return e
 }
 
-// One `run` tool call (upstream run.zig execute + executeTimed, without
-// automatic backgrounding).
+// A Run on its own thread (upstream session/run_job.zig): the Session
+// waits for it, and once it has run past limits.run_background_after_ms
+// while only waiting on tools it may hand it to the Background (ADR 0014).
+struct RunJob {
+    code: string
+    scope: ptr               // *tools.RunScope
+    timing: ptr              // its own *timing.Run
+    cancel: ptr              // std.sync cells
+    done: ptr
+    waiting: ptr
+    outcome: ptr             // *sandbox.Outcome once done
+    step: int
+    run_index: int
+    elapsed_ms: long
+    exec_start: long
+    exec_end: long
+    id: string               // rN once in the background
+}
+
+start_run_job_(s: *Session, code: string, run_index: int) -> *RunJob {
+    j = heap.new(RunJob)
+    j.code = code
+    s.run_id = s.run_id + 1
+    j.scope = tools.new_scope(s.tools, s.run_id)
+    j.timing = timing.new()
+    timing.set_detail(j.timing, 1)
+    timing.set_run_index(j.timing, run_index)
+    j.cancel = sync.atomic_new(0)
+    j.done = sync.atomic_new(0)
+    j.waiting = sync.atomic_new(0)
+    j.outcome = null
+    j.step = (s.log as *log.Log).steps + 1
+    j.run_index = run_index
+    j.elapsed_ms = 0 as long
+    j.exec_start = os.now_unix_ms()
+    j.exec_end = 0 as long
+    j.id = ""
+    jp = j as ptr
+    worker.run_detached(|| {
+        jj = jp as *RunJob
+        h = tools.host(jj.scope)
+        sandbox.host_set_timing(h, jj.timing)
+        sandbox.host_set_waiting(h, jj.waiting)
+        jj.outcome = sandbox.eval(jj.code, sandbox.limits(), h, jj.cancel)
+        jj.elapsed_ms = timing.elapsed(jj.timing)
+        jj.exec_end = os.now_unix_ms()
+        sync.atomic_store(jj.done, 1)
+        return null
+    })
+    return j
+}
+
+// One `run` tool call (upstream run.zig execute + executeTimed).
 execute_(s: *Session, tc: *types.ToolCall, sk: ptr, cancel: @keep ptr, run: @keep ptr, run_index: int) -> ptr {
     c = s.cfg as *types.Config
     l = c.limits as *types.Limits
@@ -565,16 +621,30 @@ execute_(s: *Session, tc: *types.ToolCall, sk: ptr, cancel: @keep ptr, run: @kee
     before_omitted = timing.omitted(run)
     before_bytes = timing.tool_bytes(run)
     timing.set_run_index(run, run_index)
-    s.run_id = s.run_id + 1
-    scope = tools.new_scope(s.tools, s.run_id)
-    h = tools.host(scope)
-    sandbox.host_set_timing(h, run)
     started = os.now_monotonic_ms()
-    o = sandbox.eval(code, sandbox.limits(), h, cancel) as *sandbox.Outcome
+    j = start_run_job_(s, code, run_index)
+    attempted = 0
+    beat = 0
+    while sync.atomic_load(j.done) == 0 {
+        if canceled_(cancel) == 1 { sync.atomic_store(j.cancel, 1) }
+        if beat % 10 == 0 {
+            poll_(s, sk)
+            if attempted == 0 && canceled_(cancel) == 0 && timing.elapsed(j.timing) >= (l.run_background_after_ms as long) && sync.atomic_load(j.waiting) == 1 {
+                attempted = 1
+                if background.active_runs(t.background) < background.RUN_LIMIT {
+                    return background_run_(s, j, sk, started) as ptr
+                }
+            }
+        }
+        beat = beat + 1
+        sleep(2)
+    }
+    o = j.outcome as *sandbox.Outcome
+    timing.merge(run, j.timing)
     run_ms = os.now_monotonic_ms() - started
     // Terminal snapshots of the Run's tasks precede its run_end.
     poll_(s, sk)
-    changes = tools.take_changes(scope)
+    changes = tools.take_changes(j.scope)
     out_text = output.step_limit_output(output.format(o as ptr, l.run_output_bytes as long), remaining_steps_(s))
     summary = tool_summary.init(run, run_index, timing.omitted(run) - before_omitted)
     sj = tool_summary.to_json(summary)
@@ -589,6 +659,74 @@ execute_(s: *Session, tc: *types.ToolCall, sk: ptr, cancel: @keep ptr, run: @kee
     e.tool_bytes = timing.tool_bytes(run) - before_bytes
     e.omitted = timing.omitted(run) - before_omitted
     return e as ptr
+}
+
+// The Run keeps executing as background task rN; the model gets upstream's
+// notice in its place.
+background_run_(s: *Session, j: *RunJob, sk: ptr, started: long) -> *Executed {
+    t = s.tools as *tools.Tools
+    l = (s.cfg as *types.Config).limits as *types.Limits
+    rs = j.scope as *tools.RunScope
+    j.id = progress.add(t.progress, progress.KIND_RUN, "Run", rs.id, 1)
+    background.adopt_run(t.background, j.id, rs.id, j.cancel, j.done, j as ptr)
+    list.list_add(s.bg_runs, j as ptr)
+    notice = "Run still executing after ${l.run_background_after_ms} ms; continuing in background as ${j.id}. Its captured output is preserved and will arrive automatically as a message when it finishes. Continue useful work meanwhile; no ps, cat/tail logs, sleep, empty Runs or timeout reruns to check/wait. Do not read its redirected logs before completion. If no independent work remains, end the model response immediately with a brief text reply and no run/tool call (not even console.log); Session waits locally, delivers the result and continues the Turn. After edit/write changes, rerun the same command/cwd directly: older Run bash stops with {superseded_by}, not failure. Do not wait for the stale result."
+    text = output.step_limit_output(notice, remaining_steps_(s))
+    sj = tool_summary.to_json(tool_summary.empty())
+    emit_(sk, "{\"run_end\":{\"background_id\":${jsonx.quote(j.id)},\"ok\":true,\"output\":${jsonx.quote(text)},\"changes\":[],\"tool_summary\":${sj}}}")
+    e = new_executed_(text, 1)
+    e.background_id = j.id
+    e.run_ms = os.now_monotonic_ms() - started
+    e.has_run_ms = 1
+    e.summary = sj
+    return e
+}
+
+// Background Runs: progress while they execute; a finished one's
+// completion queued once (upstream Background.poll's runs half).
+poll_runs_(s: *Session) {
+    t = s.tools as *tools.Tools
+    l = (s.cfg as *types.Config).limits as *types.Limits
+    i = 0
+    while i < list.list_size(s.bg_runs) {
+        j = list.list_get_raw(s.bg_runs, i) as *RunJob
+        rs = j.scope as *tools.RunScope
+        v = progress.new_value(j.id, progress.KIND_RUN, "Run", rs.id) as *progress.Progress
+        v.background = 1
+        if sync.atomic_load(j.done) == 0 {
+            v.elapsed_ms = timing.elapsed(j.timing)
+        } else {
+            o = j.outcome as *sandbox.Outcome
+            v.elapsed_ms = j.elapsed_ms
+            v.state = "failed"
+            if o.ok == 1 { v.state = "done" }
+            if o.text == "Error: run timed out" { v.state = "timed_out" }
+            if sync.atomic_load(j.cancel) != 0 { v.state = "canceled" }
+        }
+        progress.update(t.progress, v as ptr)
+        i = i + 1
+    }
+    done = background.take_done_runs(t.background)
+    k = 0
+    while k < list.list_size(done) {
+        j2 = list.list_get_raw(done, k) as *RunJob
+        o2 = j2.outcome as *sandbox.Outcome
+        out_text = output.format(o2 as ptr, l.run_output_bytes as long)
+        okt = "false"
+        if o2.ok == 1 { okt = "true" }
+        changes = tools.take_changes(j2.scope)
+        completion = "{\"execution\":{\"start_ms_epoch\":${j2.exec_start},\"end_ms_epoch\":${j2.exec_end}},\"step\":${j2.step},\"run_index\":${j2.run_index},\"ok\":${okt},\"output\":${jsonx.quote(out_text)},\"run_ms\":${j2.elapsed_ms},\"tool_bytes\":${timing.tool_bytes(j2.timing)},\"calls\":${calls_json_(j2.timing)},\"calls_omitted\":${timing.omitted(j2.timing)},\"changes\":${changes_json_(changes)}}"
+        background.enqueue_run(t.background, j2.id, o2.ok, "[background run ${j2.id} finished]\n${out_text}", completion, j2.exec_start, j2.exec_end)
+        k = k + 1
+    }
+    kept = list.list_new()
+    m = 0
+    while m < list.list_size(s.bg_runs) {
+        j3 = list.list_get_raw(s.bg_runs, m) as *RunJob
+        if sync.atomic_load(j3.done) == 0 { list.list_add(kept, j3 as ptr) }
+        m = m + 1
+    }
+    s.bg_runs = kept
 }
 
 struct Fwd {
@@ -633,7 +771,7 @@ insert_background_(s: *Session, pending: ptr, sk: ptr, include_detached: int) ->
     while i < n {
         it = list.list_get_raw(items, i) as *background.Item
         content = it.text
-        if it.state == "finished" {
+        if it.state == "finished" && it.completion == "" {
             nl = string.index_of(it.text, "\n")
             head = it.text
             body = ""
@@ -653,6 +791,10 @@ insert_background_(s: *Session, pending: ptr, sk: ptr, include_detached: int) ->
             event = "${event},\"ok\":${okt}"
         }
         m = msg.set_raw(m, "background_kind", jsonx.quote(it.kind))
+        if it.completion != "" {
+            m = msg.set_raw(m, "background_run", it.completion)
+            event = "${event},\"completion\":${it.completion}"
+        }
         if it.exec_end > 0 { event = "${event},\"execution\":{\"start_ms_epoch\":${it.exec_start},\"end_ms_epoch\":${it.exec_end}}" }
         event = "${event}}"
         list.list_add(pending, m)
@@ -949,11 +1091,18 @@ run_steps_(s: *Session, pending: ptr, sk: @keep ptr, cancel: @keep ptr) -> (stri
             extra = ""
             okt = "false"
             if ex.ok == 1 { okt = "true" }
-            if ex.has_run_ms == 1 { extra = ",\"run_ok\":${okt}" }
+            if ex.has_run_ms == 1 && ex.background_id == "" { extra = ",\"run_ok\":${okt}" }
             if ex.summary != "" { extra = "${extra},\"tool_summary\":${ex.summary}" }
+            if ex.background_id != "" { extra = "${extra},\"background_id\":${jsonx.quote(ex.background_id)}" }
             list.list_add(pending, msg.tool(tc.id, ex.output, extra))
             if k > 0 { run_results = "${run_results}," }
-            run_results = "${run_results}{\"tool_call_id\":${jsonx.quote(tc.id)},\"ok\":${okt}"
+            run_results = "${run_results}{\"tool_call_id\":${jsonx.quote(tc.id)}"
+            if ex.background_id != "" {
+                run_results = "${run_results},\"background_id\":${jsonx.quote(ex.background_id)}"
+            } else {
+                run_results = "${run_results},\"ok\":${okt}"
+            }
+
             if ex.has_run_ms == 1 { run_results = "${run_results},\"run_ms\":${ex.run_ms}" }
             run_results = "${run_results},\"tool_bytes\":${ex.tool_bytes},\"calls_omitted\":${ex.omitted},\"output_bytes\":${string.length(ex.output)}"
             rem = remaining_steps_(s)

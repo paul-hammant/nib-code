@@ -10,7 +10,7 @@ import nib.jsonx
 
 exports(MAX_ENTRIES, new, elapsed, reserve, reserve_entry, describe, undo_reservation, result, complete,
         entry, count, omitted, llm_calls, agent_calls, tool_bytes, set_run_index, restart, set_detail,
-        stable_name, now_epoch_ms, Run, Call)
+        stable_name, now_epoch_ms, merge, Run, Call)
 
 const MAX_ENTRIES = 200
 
@@ -167,4 +167,27 @@ complete(rp: ptr, index: int, start_ms: long, end_ms: long, ok: int) {
     c.start_ms = start_ms
     c.end_ms = end_ms
     c.ok = ok
+}
+
+// Appends src's entries (a Run that executed on its own timing) to dst,
+// bounded as reserve bounds them, adds its counters, and takes its start
+// (upstream executeTimed's copy).
+merge(dp: ptr, sp: ptr) {
+    d = dp as *Run
+    src = sp as *Run
+    n = list.list_size(src.entries)
+    i = 0
+    while i < n {
+        if list.list_size(d.entries) < MAX_ENTRIES {
+            list.list_add(d.entries, list.list_get_raw(src.entries, i))
+        } else {
+            d.omitted = d.omitted + 1
+        }
+        i = i + 1
+    }
+    d.omitted = d.omitted + src.omitted
+    d.tool_bytes = d.tool_bytes + src.tool_bytes
+    d.llm_calls = d.llm_calls + src.llm_calls
+    d.agent_calls = d.agent_calls + src.agent_calls
+    d.started_ms = src.started_ms
 }

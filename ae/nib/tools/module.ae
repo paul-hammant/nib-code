@@ -591,7 +591,7 @@ stop_(s: *RunScope, args: string, out: ptr) {
         sandbox.result_set_err(out, STOP_REASON_REQUIRED)
         return
     }
-    stopped, err = background.stop_task(t.background, id)
+    stopped, err = background.stop_task_from(t.background, id, s.id)
     if err != "" {
         sandbox.result_set_err(out, err)
         return

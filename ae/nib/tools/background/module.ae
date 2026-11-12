@@ -17,14 +17,15 @@ import nib.lock
 import nib.jsonx
 
 exports(Background, Job, Item, BASH_LIMIT, new, set_log, set_turn_step, begin_turn, start, stop_task,
-        finish_turn, stop_all, take_inbox, take_items, inbox_size, active_bash, set_result, poll, start_agent, agent_message,
+        finish_turn, stop_all, take_inbox, take_items, inbox_size, active_bash, set_result, poll, start_agent, agent_message, stop_task_from, active_runs, adopt_run, take_done_runs, enqueue_run, RUN_LIMIT,
         pending, any_pending, pending_names, delivered, enqueue_lost, enqueue_finished)
 
 const BASH_LIMIT = 8
+const RUN_LIMIT = 8
 
 struct Job {
     id: string
-    kind: string     // bash, agent
+    kind: string     // bash, agent, run
     invocation: int  // an agent id's call (resume reuses the id)
     command: string
     detached: int
@@ -38,12 +39,16 @@ struct Job {
     delivered: int
     exec_start: long // epoch ms before spawn, 0: it never spawned
     exec_end: long
+    payload: ptr     // a run: the Session's run job
+    collected: int   // a run: its completion has been queued
+    scope_id: int    // a run: the Run scope it executes
 }
 
 // One queued message: a finished or lost task.
 struct Item {
     id: string
     invocation: int
+    completion: string   // a run's completion object (JSON), "" none; its text is already formatted
     kind: string
     state: string    // finished, lost
     ok: int          // -1: none (lost), 0, 1
@@ -232,6 +237,9 @@ start(bp: @keep ptr, id: string, command: string, detached: int, run: @keep fn) 
     j.delivered = 0
     j.exec_start = 0 as long
     j.exec_end = 0 as long
+    j.payload = null
+    j.collected = 0
+    j.scope_id = 0
     // The lifecycle record is on disk before the job runs.
     if b.has_log == 1 { call(b.log_fn, b.log_ctx, "{\"id\":${jsonx.quote(id)},\"kind\":\"bash\",\"state\":\"started\"}", b.turn_step) }
     lock.acquire(b.guard)
@@ -270,11 +278,16 @@ find_(b: *Background, id: string) -> ptr {
 }
 
 // (1 stopped / 0 already finished, "") or (0, "UnknownBackgroundTask").
-stop_task(bp: ptr, id: string) -> (int, string) {
+stop_task(bp: ptr, id: string) -> (int, string) { return stop_task_from(bp, id, -1) }
+
+// stop_task from a Run (current_run: its scope id; -1 the user): a Run
+// cannot stop itself.
+stop_task_from(bp: ptr, id: string, current_run: int) -> (int, string) {
     b = bp as *Background
     jp = find_(b, id)
     if jp == null { return 0, "UnknownBackgroundTask" }
     j = jp as *Job
+    if j.kind == "run" && current_run >= 0 && j.scope_id == current_run { return 0, "CannotStopCurrentRun" }
     stopped = 1
     if sync.atomic_load(j.done) != 0 { stopped = 0 }
     sync.atomic_store(j.cancel, 1)
@@ -338,6 +351,7 @@ enqueue_finished(bp: ptr, id: string, ok: int, text: string, detached: int, exec
     it = heap.new(Item)
     it.id = id
     it.invocation = invocation
+    it.completion = ""
     it.kind = "bash"
     if string.starts_with(id, "a") == 1 { it.kind = "agent" }
     it.state = "finished"
@@ -357,6 +371,7 @@ enqueue_lost(bp: ptr, id: string, kind: string) {
     it = heap.new(Item)
     it.id = id
     it.invocation = 0
+    it.completion = ""
     it.kind = kind
     it.state = "lost"
     it.ok = -1
@@ -450,6 +465,9 @@ start_agent(bp: @keep ptr, id: string, invocation: int, run: @keep fn, done_ctx:
     j.delivered = 0
     j.exec_start = 0 as long
     j.exec_end = 0 as long
+    j.payload = null
+    j.collected = 0
+    j.scope_id = 0
     if b.has_log == 1 { call(b.log_fn, b.log_ctx, "{\"id\":${jsonx.quote(id)},\"kind\":\"agent\",\"state\":\"started\"}", b.turn_step) }
     lock.acquire(b.guard)
     list.list_add(b.jobs, j as ptr)
@@ -471,4 +489,89 @@ start_agent(bp: @keep ptr, id: string, invocation: int, run: @keep fn, done_ctx:
         return null
     })
     return "{\"id\":${jsonx.quote(id)}}", ""
+}
+
+// Background Runs still executing.
+active_runs(bp: ptr) -> int {
+    b = bp as *Background
+    n = 0
+    lock.acquire(b.guard)
+    i = 0
+    while i < list.list_size(b.jobs) {
+        j = list.list_get_raw(b.jobs, i) as *Job
+        if j.kind == "run" && sync.atomic_load(j.done) == 0 { n = n + 1 }
+        i = i + 1
+    }
+    lock.release(b.guard)
+    return n
+}
+
+// A Run the Session moved to the background (upstream adoptRun): its own
+// thread keeps running it; cancel and done are its cells; payload is the
+// Session's job, handed back by take_done_runs. Logs `started`.
+adopt_run(bp: ptr, id: string, scope_id: int, cancel: @keep ptr, done: @keep ptr, payload: @keep ptr) {
+    b = bp as *Background
+    j = heap.new(Job)
+    j.id = id
+    j.kind = "run"
+    j.invocation = 0
+    j.command = ""
+    j.detached = 0
+    j.cancel = cancel
+    j.done = done
+    j.ok = 0
+    j.text = ""
+    j.state = "working"
+    j.run = |c: ptr, jp: ptr| {}
+    j.announced = 0
+    j.delivered = 0
+    j.exec_start = 0 as long
+    j.exec_end = 0 as long
+    j.payload = payload
+    j.collected = 0
+    j.scope_id = scope_id
+    if b.has_log == 1 { call(b.log_fn, b.log_ctx, "{\"id\":${jsonx.quote(id)},\"kind\":\"run\",\"state\":\"started\"}", b.turn_step) }
+    lock.acquire(b.guard)
+    list.list_add(b.jobs, j as ptr)
+    lock.release(b.guard)
+}
+
+// The payloads of background Runs that finished and were not collected
+// yet, now collected (none once the Session is stopping).
+take_done_runs(bp: ptr) -> ptr {
+    b = bp as *Background
+    out = list.list_new()
+    if sync.atomic_load(b.stopping) != 0 { return out }
+    lock.acquire(b.guard)
+    i = 0
+    while i < list.list_size(b.jobs) {
+        j = list.list_get_raw(b.jobs, i) as *Job
+        if j.kind == "run" && j.collected == 0 && sync.atomic_load(j.done) != 0 {
+            j.collected = 1
+            list.list_add(out, j.payload)
+        }
+        i = i + 1
+    }
+    lock.release(b.guard)
+    return out
+}
+
+// A finished background Run's message: text already formatted, completion
+// the run completion object.
+enqueue_run(bp: ptr, id: string, ok: int, text: string, completion: string, exec_start: long, exec_end: long) {
+    b = bp as *Background
+    it = heap.new(Item)
+    it.id = id
+    it.invocation = 0
+    it.completion = completion
+    it.kind = "run"
+    it.state = "finished"
+    it.ok = ok
+    it.text = text
+    it.detached = 0
+    it.exec_start = exec_start
+    it.exec_end = exec_end
+    lock.acquire(b.guard)
+    list.list_add(b.inbox, it as ptr)
+    lock.release(b.guard)
 }
