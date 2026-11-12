@@ -14,7 +14,7 @@ import nib.jsonx
 import nib.provider.types
 
 exports(Fork, Input, new_fork, new_input, config_json, config_from, fork_json, fork_from,
-        input_json, parse, Observation, new_observation)
+        input_json, parse, Observation, new_observation, mcp_servers_json, mcp_servers_from)
 
 // One remembered file version (upstream file_state.Observation).
 struct Observation {
@@ -316,4 +316,31 @@ parse(text: string) -> (ptr, string) {
     i.undo_dir = string.copy(jsonx.str_or(v, "undo_dir", ""))
     jsonx.free(v)
     return ip, ""
+}
+
+// A list of *types.McpServer as the JSON array the Session header records.
+mcp_servers_json(servers: ptr) -> string {
+    b = strbuilder.new(256)
+    strbuilder.append(b, "[")
+    i = 0
+    while i < list.list_size(servers) {
+        if i > 0 { strbuilder.append(b, ",") }
+        strbuilder.append(b, mcp_server_json_(list.list_get_raw(servers, i)))
+        i = i + 1
+    }
+    strbuilder.append(b, "]")
+    return strbuilder.finish(b)
+}
+
+// The servers of mcp_servers_json's array text (empty list for "" or bad JSON).
+mcp_servers_from(text: string) -> ptr {
+    out = list.list_new()
+    v = jsonx.parse(text)
+    i = 0
+    while i < jsonx.array_size(v) {
+        list.list_add(out, mcp_server_from_(jsonx.array_at(v, i)))
+        i = i + 1
+    }
+    jsonx.free(v)
+    return out
 }

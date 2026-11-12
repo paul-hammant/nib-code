@@ -31,6 +31,7 @@ import nib.tools.llm_call
 import nib.tools.agent
 import nib.tools.agent_sessions
 import nib.tools.agent_input
+import nib.tools.mcp_tool
 import nib.provider.types
 
 exports(Tools, RunScope, new, new_scope, host, call_tool, names_json, docs, all_docs, tool_names,
@@ -100,6 +101,8 @@ is_ported(name: string) -> int {
         "stop" -> { return 1 }
         "llm" -> { return 1 }
         "agent" -> { return 1 }
+        "mcp" -> { return 1 }
+        "mcp_schema" -> { return 1 }
         _ -> { return 0 }
     }
 }
@@ -137,6 +140,8 @@ struct Tools {
     agent_gate: ptr        // *agent.Gate
     fork_snapshot: ptr     // *agent_input.Fork of the running Step, or null
     undo_dir: string       // a sub-agent's: the parent Turn's snapshot directory
+    mcp_client: ptr        // *mcp.Client of the Session, or null
+    mcp_enabled: int       // 1: an enabled server puts tools.mcp in the API
 }
 
 struct RunScope {
@@ -184,6 +189,8 @@ new(home: string) -> ptr {
     t.agent_gate = agent.new_gate()
     t.fork_snapshot = null
     t.undo_dir = ""
+    t.mcp_client = null
+    t.mcp_enabled = 0
     return t as ptr
 }
 
@@ -314,6 +321,7 @@ new_scope(tp: @keep ptr, id: int) -> ptr {
 
 enabled_(t: *Tools, name: string) -> int {
     if is_ported(name) == 0 { return 0 }
+    if (name == "mcp" || name == "mcp_schema") && t.mcp_enabled == 0 { return 0 }
     if name == "agent" && t.depth != 0 && t.forked == 0 { return 0 }
     return 1
 }
@@ -530,6 +538,11 @@ bash_(s: *RunScope, args: string, out: ptr) {
     if ok == 1 { sandbox.result_set_ok(out, text) } else { sandbox.result_set_err(out, text) }
 }
 
+vision_(t: *Tools) -> int {
+    if t.cfg == null { return 0 }
+    return types.vision(t.cfg)
+}
+
 // What tools.agent needs from the Tools and this Run.
 agent_ctx_(s: *RunScope) -> ptr {
     t = s.tools as *Tools
@@ -672,6 +685,12 @@ call_tool(sp: ptr, name: string, args: string, out: ptr) {
         "agent" -> {
             agent_(s, args, out)
             return
+        }
+        "mcp" -> {
+            ok, text = mcp_tool.execute(t.mcp_client, args, 0, s.cancel, vision_(t))
+        }
+        "mcp_schema" -> {
+            ok, text = mcp_tool.execute(t.mcp_client, args, 1, s.cancel, vision_(t))
         }
         _ -> {
             text = "SandboxOnlyTool"

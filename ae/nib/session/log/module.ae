@@ -45,6 +45,7 @@ struct Log {
     parent_session_id: string
     cache_key: string
     forked_from: string        // the forked_from object's JSON, "" none
+    mcp_servers: string        // the header's mcp_servers array (JSON), "" none
     next_agent_id: long
     next_bash_id: long
     next_run_id: long
@@ -61,6 +62,7 @@ struct Replayed {
     parent_session_id: string
     cache_key: string
     forked_from: string
+    mcp_servers: string
     provider: string
     custom_provider: string
     model: string
@@ -87,6 +89,7 @@ new_log_(fd: int, offset: long) -> ptr {
     l.parent_session_id = ""
     l.cache_key = ""
     l.forked_from = ""
+    l.mcp_servers = ""
     l.next_agent_id = 1 as long
     l.next_bash_id = 1 as long
     l.next_run_id = 1 as long
@@ -143,6 +146,7 @@ restore(path: string, history: ptr, expected_parent: string, check_parent: int) 
     l.parent_session_id = r.parent_session_id
     l.cache_key = r.cache_key
     l.forked_from = r.forked_from
+    l.mcp_servers = r.mcp_servers
     l.next_agent_id = r.next_agent_id
     l.next_bash_id = r.next_bash_id
     l.next_run_id = r.next_run_id
@@ -371,6 +375,7 @@ new_replayed_() -> ptr {
     r.parent_session_id = ""
     r.cache_key = ""
     r.forked_from = ""
+    r.mcp_servers = ""
     r.provider = "chat_completions"
     r.custom_provider = ""
     r.model = ""
@@ -420,6 +425,9 @@ replay(data: string, history: ptr) -> ptr {
             ff = jsonx.field(rec, "forked_from")
             r.forked_from = ""
             if ff != null { r.forked_from = jsonx.encode(ff) }
+            ms = jsonx.field(rec, "mcp_servers")
+            r.mcp_servers = ""
+            if ms != null { r.mcp_servers = jsonx.encode(ms) }
             r.provider = string.copy(jsonx.str_or(rec, "provider", "chat_completions"))
             r.custom_provider = string.copy(jsonx.str_or(rec, "custom_provider", ""))
         }

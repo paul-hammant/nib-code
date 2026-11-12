@@ -52,6 +52,7 @@ import nib.session.fork_history
 import nib.build_info
 import nib.session.hooks
 import nib.session.skills
+import nib.mcp
 import nib.tools.agent_input
 import nib.tools.agent_sessions
 
@@ -276,6 +277,7 @@ init(cp: @keep ptr, op: @keep ptr) -> (ptr, string, string) {
     s.cfg = cp
     s.options = op
     s.tools = new_tools_(cp, op)
+    attach_mcp_(s, c.mcp_servers)
     s.history = list.list_new()
     s.parent_session_id = o.parent_session_id
     s.usage = types.usage_new()
@@ -317,6 +319,10 @@ init(cp: @keep ptr, op: @keep ptr) -> (ptr, string, string) {
             log.close(lp)
             return null, cerr, ""
         }
+        // A resumed Session keeps the MCP servers it started with.
+        logged = agent_input.mcp_servers_from(l.mcp_servers)
+        c.mcp_servers = logged
+        attach_mcp_(s, logged)
         s.pending_background_bytes = l.pending_background_bytes
         s.cache_key = l.cache_key
         if s.cache_key == "" { s.cache_key = s.id }
@@ -392,7 +398,7 @@ initialize_fork_(s: *Session, fp: ptr, cwd: string) -> string {
     tools.import_versions(s.tools, f.file_versions)
     msgs, herr = fork_history.inherit(f.history, f.message_count, f.id, f.session)
     if herr != "" { return herr }
-    members = ",\"cwd\":${jsonx.quote(cwd)},\"provider\":${jsonx.quote(c.provider)}"
+    members = ",\"mcp_servers\":${agent_input.mcp_servers_json(c.mcp_servers)},\"cwd\":${jsonx.quote(cwd)},\"provider\":${jsonx.quote(c.provider)}"
     if c.custom_provider != "" { members = "${members},\"custom_provider\":${jsonx.quote(c.custom_provider)}" }
     members = "${members},\"model\":${jsonx.quote(c.model)},\"parent_session_id\":${jsonx.quote(s.parent_session_id)},\"cache_key\":${jsonx.quote(s.cache_key)}"
     members = "${members},\"forked_from\":{\"session\":${jsonx.quote(f.session)},\"message_count\":${f.message_count}},\"nib_version\":${jsonx.quote(build_info.nib_version())}"
@@ -416,6 +422,16 @@ restore_agent_sessions_(s: *Session) {
         jsonx.free(v)
         i = i + 1
     }
+}
+
+// The Session's MCP client over `servers` (opt-in: only enabled ones start).
+attach_mcp_(s: *Session, servers: ptr) {
+    c = s.cfg as *types.Config
+    o = s.options as *Options
+    t = s.tools as *tools.Tools
+    if t.mcp_client != null { mcp.close(t.mcp_client) }
+    t.mcp_client = mcp.new(servers, t.env, o.home, o.user_home, c.sandbox_writable, c.sandbox_workspace, o.self_exe)
+    t.mcp_enabled = mcp.enabled_any(servers)
 }
 
 json_list_(l: ptr) -> string {
@@ -442,8 +458,8 @@ initialize_history_(s: *Session, cwd: string) -> string {
     instructed, aerr = instructions.append(base, global, project)
     if aerr != "" { return aerr }
     found = skills.select(skills.load(o.home, o.user_home, root), c.enabled_skills)
-    system = skills.append(instructed, found.skills)
-    members = ",\"skills\":${skills.summary_json(found.summary)},\"cwd\":${jsonx.quote(cwd)},\"provider\":${jsonx.quote(c.provider)}"
+    system = mcp.prompt((s.tools as *tools.Tools).mcp_client, skills.append(instructed, found.skills))
+    members = ",\"mcp_servers\":${agent_input.mcp_servers_json(c.mcp_servers)},\"skills\":${skills.summary_json(found.summary)},\"cwd\":${jsonx.quote(cwd)},\"provider\":${jsonx.quote(c.provider)}"
     if c.custom_provider != "" { members = "${members},\"custom_provider\":${jsonx.quote(c.custom_provider)}" }
     members = "${members},\"model\":${jsonx.quote(c.model)}"
     if s.parent_session_id != "" { members = "${members},\"parent_session_id\":${jsonx.quote(s.parent_session_id)}" }
@@ -464,6 +480,8 @@ close(sp: ptr) {
     stop_ticker_(s)
     background.stop_all((s.tools as *tools.Tools).background)
     tools.close_undo(s.tools)
+    t = s.tools as *tools.Tools
+    if t.mcp_client != null { mcp.close(t.mcp_client) }
     log.close(s.log)
 }
 

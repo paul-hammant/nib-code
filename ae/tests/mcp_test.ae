@@ -1,7 +1,7 @@
 // Ports the inline tests of upstream src/mcp/index.zig, src/mcp/headers.zig,
 // src/mcp/transport.zig and src/tools/mcp.zig under their upstream names,
 // then drives nib.mcp over tests/mock_mcp.py (python3 on PATH) on stdio
-// (modern and --legacy) and Streamable HTTP (tests/mock_mcp_http.py: JSON and
+// (modern and --legacy) and Streamable HTTP (ae/tests/mock_mcp_http.py: JSON and
 // SSE replies, modern and legacy). Run from the repository root.
 //
 // Differences from the Zig tests: values are JSON text, the readLine test
@@ -112,11 +112,11 @@ wait_file_(path: string) -> string {
     return ""
 }
 
-// Starts tests/mock_mcp_http.py; (url, token for os.kill).
+// Starts ae/tests/mock_mcp_http.py; (url, token for os.kill).
 start_http_(dir: string, flags: string) -> (string, int) {
     urlfile = "${dir}/url"
     argv = list.list_new()
-    list.list_add(argv, "${os.getcwd()}/tests/mock_mcp_http.py")
+    list.list_add(argv, "${os.getcwd()}/ae/tests/mock_mcp_http.py")
     list.list_add(argv, urlfile)
     if flags != "" { list.list_add(argv, flags) }
     token, err = os.spawn_proc_to("python3", argv, null, "${dir}/http.out")
