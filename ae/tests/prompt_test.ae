@@ -96,7 +96,8 @@ main() {
             spec.assert_false(has_(prompt_text, "{{llm_limits}}"), "no llm limits placeholder")
             spec.assert_true(has_(prompt_text, "async llm({"), "llm is documented: it is ported")
             spec.assert_true(has_(prompt_text, "4 concurrent/process, 100/Run, 256 KiB"), "llm limits")
-            spec.assert_false(has_(prompt_text, "async agent("), "agent is not ported, so not offered")
+            spec.assert_true(has_(prompt_text, "async agent("), "agent is documented: it is ported")
+            spec.assert_true(has_(prompt_text, "resume:a1 after completion; busy:wait, don't retry/replace"), "agent resume")
             spec.assert_false(has_(prompt_text, "TypeScript"), "no TypeScript")
             spec.assert_true(has_(prompt_text, "backticks, \${ or backslashes"), "json-escape patch")
             spec.assert_true(has_(prompt_text, "last expression and console.log output share 16 KiB per Run"), "budget")
@@ -112,8 +113,8 @@ main() {
             spec.assert_false(has_(prompt_text, "{s}"), "no marker left")
             spec.assert_false(has_(prompt_text, "{d}"), "no marker left")
             spec.assert_true(has_(prompt_text, "You are nib, a coding agent working in /work.\n"), "cwd")
-            // Upstream-complete documentation: agent is not ported, so its
-            // text is checked against tools.all_docs().
+            // Upstream-complete documentation: tools not ported yet (view, fetch,
+            // search) are checked against tools.all_docs().
             full = prompt.render_system("/work", tools.all_docs(), 16384 as long, "", "gpt-6.1-sol")
             spec.assert_true(has_(full, "1800000 (30 min)"), "bash timeout")
             spec.assert_true(has_(full, "resume:a1 after completion; busy:wait, don't retry/replace"), "agent resume")

@@ -135,6 +135,11 @@ int nibsys_watch_signals(void) {
 }
 int nibsys_signal_received(void) { return (int)nibsys_signal; }
 
+/* A child's stdin writer must see EPIPE, not die of SIGPIPE: std.ipc's
+   write_some to a full pipe whose reader died raises it
+   (asks/aether-ipc-write-sigpipe.md). */
+int nibsys_ignore_sigpipe(void) { return signal(SIGPIPE, SIG_IGN) == SIG_ERR ? -errno : 0; }
+
 /* Terminal echo on stdin (nib login's masked key entry). 1 changed, 0 not a tty. */
 int nibsys_stdin_echo(int on) {
     struct termios t;

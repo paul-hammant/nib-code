@@ -164,6 +164,7 @@ run_lines(argv: ptr, env: ptr, input: string, cancel: ptr, timeout_ms: long, gra
         list.list_add(rest, a)
         i = i + 1
     }
+    sysgap.ignore_sigpipe()
     to_fd, from_fd, pid, serr = os.run_stdio(prog, rest, env)
     if serr != "" {
         r.error = serr
@@ -176,7 +177,15 @@ run_lines(argv: ptr, env: ptr, input: string, cancel: ptr, timeout_ms: long, gra
     fp = f as ptr
     worker.run_detached(|| {
         ff = fp as *Feeder
-        ipc.write(ff.fd, ff.input)
+        // write_some reports a gone reader as an error; a plain write could raise SIGPIPE.
+        off = 0
+        n = string.length(ff.input)
+        while off < n {
+            ipc.wait_writable(ff.fd, 50)
+            wrote, werr = ipc.write_some(ff.fd, ff.input, off)
+            if werr != "" { break }
+            off = off + wrote
+        }
         io.fd_close(ff.fd)
         sync.atomic_store(ff.done, 1)
         return null
