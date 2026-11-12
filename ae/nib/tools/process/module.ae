@@ -156,9 +156,15 @@ run_lines(argv: ptr, env: ptr, input: string, cancel: ptr, timeout_ms: long, gra
     r.error = ""
     r.start_ms_epoch = os.now_unix_ms()
     r.end_ms_epoch = 0
-    prog, _e = list.get_string(argv, 0)
+    // The child's stderr is discarded, as upstream's (.stderr = .ignore):
+    // os.run_stdio hands it this process's, which would keep a reader of
+    // ours open after we die (asks/aether-run-stdio-stderr.md). exec keeps the pid.
+    prog = "/bin/sh"
     rest = list.list_new()
-    i = 1
+    list.list_add(rest, "-c")
+    list.list_add(rest, "exec \"$@\" 2>/dev/null")
+    list.list_add(rest, "sh")
+    i = 0
     while i < list.list_size(argv) {
         a, _e2 = list.get_string(argv, i)
         list.list_add(rest, a)
