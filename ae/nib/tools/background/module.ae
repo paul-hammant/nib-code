@@ -17,13 +17,15 @@ import nib.lock
 import nib.jsonx
 
 exports(Background, Job, Item, BASH_LIMIT, new, set_log, set_turn_step, begin_turn, start, stop_task,
-        finish_turn, stop_all, take_inbox, take_items, inbox_size, active_bash, set_result, poll,
+        finish_turn, stop_all, take_inbox, take_items, inbox_size, active_bash, set_result, poll, start_agent, agent_message,
         pending, any_pending, pending_names, delivered, enqueue_lost, enqueue_finished)
 
 const BASH_LIMIT = 8
 
 struct Job {
     id: string
+    kind: string     // bash, agent
+    invocation: int  // an agent id's call (resume reuses the id)
     command: string
     detached: int
     cancel: ptr      // std.sync cell
@@ -41,6 +43,7 @@ struct Job {
 // One queued message: a finished or lost task.
 struct Item {
     id: string
+    invocation: int
     kind: string
     state: string    // finished, lost
     ok: int          // -1: none (lost), 0, 1
@@ -100,7 +103,7 @@ active_bash(bp: ptr) -> int {
     i = 0
     while i < list.list_size(b.jobs) {
         j = list.list_get_raw(b.jobs, i) as *Job
-        if sync.atomic_load(j.done) == 0 { n = n + 1 }
+        if j.kind == "bash" && sync.atomic_load(j.done) == 0 { n = n + 1 }
         i = i + 1
     }
     lock.release(b.guard)
@@ -147,7 +150,7 @@ pending_names(bp: ptr) -> string {
         j = list.list_get_raw(b.jobs, i) as *Job
         if j.detached == 0 && j.delivered == 0 {
             if names != "" { names = "${names}, " }
-            names = "${names}bash ${j.id}"
+            names = "${names}${j.kind} ${j.id}"
         }
         i = i + 1
     }
@@ -156,13 +159,13 @@ pending_names(bp: ptr) -> string {
 }
 
 // The task `id` reached the model: its job no longer holds a Turn open.
-delivered(bp: ptr, id: string) {
+delivered(bp: ptr, id: string, invocation: int) {
     b = bp as *Background
     lock.acquire(b.guard)
     i = 0
     while i < list.list_size(b.jobs) {
         j = list.list_get_raw(b.jobs, i) as *Job
-        if j.id == id && j.delivered == 0 {
+        if j.id == id && j.delivered == 0 && j.invocation == invocation {
             j.delivered = 1
             break
         }
@@ -215,6 +218,8 @@ start(bp: @keep ptr, id: string, command: string, detached: int, run: @keep fn) 
     }
     j = heap.new(Job)
     j.id = id
+    j.kind = "bash"
+    j.invocation = 0
     j.command = command
     j.detached = detached
     j.cancel = sync.atomic_new(0)
@@ -240,7 +245,7 @@ start(bp: @keep ptr, id: string, command: string, detached: int, run: @keep fn) 
         if sync.atomic_load(b.stopping) == 0 {
             body = jj.text
             if jj.ok == 0 { body = "{\"error\":${jsonx.quote(jj.text)}}" }
-            enqueue_finished(bp, jj.id, ok_of_(jj.ok, jj.text), "[background bash ${jj.id} finished]\n${body}", jj.detached, jj.exec_start, jj.exec_end)
+            enqueue_finished(bp, jj.id, ok_of_(jj.ok, jj.text), "[background bash ${jj.id} finished]\n${body}", jj.detached, jj.exec_start, jj.exec_end, 0)
         }
         sync.atomic_store(jj.done, 1)
         return null
@@ -328,11 +333,13 @@ inbox_size(bp: ptr) -> int {
 
 // A finished task's message (text: head line, newline, result body), after its
 // job ran; FIFO with the others.
-enqueue_finished(bp: ptr, id: string, ok: int, text: string, detached: int, exec_start: long, exec_end: long) {
+enqueue_finished(bp: ptr, id: string, ok: int, text: string, detached: int, exec_start: long, exec_end: long, invocation: int) {
     b = bp as *Background
     it = heap.new(Item)
     it.id = id
+    it.invocation = invocation
     it.kind = "bash"
+    if string.starts_with(id, "a") == 1 { it.kind = "agent" }
     it.state = "finished"
     it.ok = ok
     it.text = text
@@ -349,6 +356,7 @@ enqueue_lost(bp: ptr, id: string, kind: string) {
     b = bp as *Background
     it = heap.new(Item)
     it.id = id
+    it.invocation = 0
     it.kind = kind
     it.state = "lost"
     it.ok = -1
@@ -401,4 +409,66 @@ set_result(jp: ptr, ok: int, text: string, exec_start: long, exec_end: long) {
     j.text = text
     j.exec_start = exec_start
     j.exec_end = exec_end
+}
+
+// The message body of a finished background agent: its result without
+// usage (upstream messageResult), or the failure as an ok:false result.
+agent_message(id: string, ok: int, text: string) -> (string, int) {
+    if ok == 0 { return "{\"ok\":false,\"id\":${jsonx.quote(id)},\"text\":\"\",\"changes\":[],\"error\":${jsonx.quote(text)}}", 0 }
+    v = jsonx.parse(text)
+    if v == null { return "{\"ok\":false,\"id\":${jsonx.quote(id)},\"text\":\"\",\"changes\":[],\"error\":\"InvalidAgentResult\"}", 0 }
+    rok = jsonx.bool_or(v, "ok", 0)
+    out = "{\"ok\":false"
+    if rok == 1 { out = "{\"ok\":true" }
+    if jsonx.has(v, "id") == 1 { out = "${out},\"id\":${jsonx.quote(jsonx.str_or(v, "id", ""))}" }
+    out = "${out},\"text\":${jsonx.quote(jsonx.str_or(v, "text", ""))},\"changes\":${jsonx.encode(jsonx.field(v, "changes"))}"
+    if jsonx.has(v, "error") == 1 { out = "${out},\"error\":${jsonx.quote(jsonx.str_or(v, "error", ""))}" }
+    jsonx.free(v)
+    return "${out}}", rok
+}
+
+// Starts a background agent call `id` (invocation: its progress slot):
+// run(cancel, job) fills the job through set_result with the tool's
+// (ok, text); done(ctx) runs after its completion is queued (the registry
+// release). Logs `started` first. ({"id"}, "") or ("", error).
+start_agent(bp: @keep ptr, id: string, invocation: int, run: @keep fn, done_ctx: @keep ptr, done: @keep fn) -> (string, string) {
+    b = bp as *Background
+    if sync.atomic_load(b.stopping) != 0 { return "", "Canceled" }
+    j = heap.new(Job)
+    j.id = id
+    j.kind = "agent"
+    j.invocation = invocation
+    j.command = ""
+    j.detached = 0
+    j.cancel = sync.atomic_new(0)
+    j.done = sync.atomic_new(0)
+    j.ok = 0
+    j.text = ""
+    j.state = "working"
+    j.run = run
+    j.announced = 0
+    j.delivered = 0
+    j.exec_start = 0 as long
+    j.exec_end = 0 as long
+    if b.has_log == 1 { call(b.log_fn, b.log_ctx, "{\"id\":${jsonx.quote(id)},\"kind\":\"agent\",\"state\":\"started\"}", b.turn_step) }
+    lock.acquire(b.guard)
+    list.list_add(b.jobs, j as ptr)
+    lock.release(b.guard)
+    jp = j as ptr
+    worker.run_detached(|| {
+        jj = jp as *Job
+        call(jj.run, jj.cancel, jp)
+        canceled = sync.atomic_load(jj.cancel) as int
+        if sync.atomic_load(b.stopping) == 0 {
+            body, rok = agent_message(jj.id, jj.ok, jj.text)
+            jj.state = "failed"
+            if rok == 1 { jj.state = "done" }
+            if canceled == 1 { jj.state = "canceled" }
+            enqueue_finished(bp, jj.id, rok, "[background agent ${jj.id} finished]\n${body}", 0, jj.exec_start, jj.exec_end, jj.invocation)
+        }
+        call(done, done_ctx)
+        sync.atomic_store(jj.done, 1)
+        return null
+    })
+    return "{\"id\":${jsonx.quote(id)}}", ""
 }

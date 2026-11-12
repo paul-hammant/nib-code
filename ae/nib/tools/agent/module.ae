@@ -498,7 +498,8 @@ tracker_line(tp: ptr, line: string) {
 
 fail_(text: string) -> (int, string) { return 0, text }
 
-// tools.agent. (1, result JSON) or (0, rejection message). identity: the
+// tools.agent. (1, result JSON), (0, rejection message), or (2, "") for a
+// background call the caller starts with execute(…, background 1, …). identity: the
 // call's task id is written to id_out (a *string cell list: [id]).
 agent(cp: ptr, args: string, id_out: ptr) -> (int, string) {
     c = cp as *Ctx
@@ -567,6 +568,11 @@ agent(cp: ptr, args: string, id_out: ptr) -> (int, string) {
         ip.fork = copyf as ptr
         ip.undo_dir = c.undo_dir
         fork_input = agent_input.input_json(ip as ptr)
+    }
+    if a.background == 1 {
+        // The caller starts it as a background job: id_out is [id, fork_input].
+        list.list_add(id_out, fork_input)
+        return 2, ""
     }
     return execute(cp, args, c.cancel, id, c.run_id, 0, fork_input)
 }

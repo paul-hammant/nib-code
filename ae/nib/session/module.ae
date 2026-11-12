@@ -414,7 +414,10 @@ poll_(s: *Session, sk: ptr) {
     i = 0
     while i < list.list_size(ids) {
         id, _g = list.get_string(ids, i)
-        emit_(sk, "{\"background\":{\"id\":${jsonx.quote(id)},\"kind\":\"bash\",\"state\":\"started\"}}")
+        kind = "bash"
+        if string.starts_with(id, "a") == 1 { kind = "agent" }
+        if string.starts_with(id, "r") == 1 { kind = "run" }
+        emit_(sk, "{\"background\":{\"id\":${jsonx.quote(id)},\"kind\":${jsonx.quote(kind)},\"state\":\"started\"}}")
         i = i + 1
     }
     progress.drain(t.progress)
@@ -653,7 +656,7 @@ insert_background_(s: *Session, pending: ptr, sk: ptr, include_detached: int) ->
         event = "${event}}"
         list.list_add(pending, m)
         list.list_add(added, event)
-        background.delivered(t.background, it.id)
+        background.delivered(t.background, it.id, it.invocation)
         s.pending_background_bytes = s.pending_background_bytes + (string.length(content) as long)
         emit_(sk, "{\"background\":${event}}")
         i = i + 1

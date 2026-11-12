@@ -539,7 +539,31 @@ agent_ctx_(s: *RunScope) -> ptr {
 
 agent_(s: *RunScope, args: string, out: ptr) {
     ids = list.list_new()
-    ok, text = agent.agent(agent_ctx_(s), args, ids)
+    cp = agent_ctx_(s)
+    ok, text = agent.agent(cp, args, ids)
+    if ok == 2 {
+        t = s.tools as *Tools
+        id, _g0 = list.get_string(ids, 0)
+        fork_input, _g1 = list.get_string(ids, 1)
+        c = cp as *agent.Ctx
+        run_id = s.id
+        invocation = progress.current_invocation(t.progress, id)
+        sessions = t.agent_sessions
+        started, serr = background.start_agent(t.background, id, invocation, |cancel: ptr, job: ptr| {
+            bok, btext = agent.execute(cp, args, cancel, id, run_id, 1, fork_input)
+            background.set_result(job, bok, btext, 0 as long, 0 as long)
+        }, sessions, |ctx: ptr| {
+            agent_sessions.release(ctx, id)
+        })
+        if serr != "" {
+            agent_sessions.release(sessions, id)
+            sandbox.result_set_err(out, serr)
+            return
+        }
+        sandbox.result_set_identity(out, id, 1)
+        sandbox.result_set_ok(out, started)
+        return
+    }
     if list.list_size(ids) > 0 {
         id, _g = list.get_string(ids, 0)
         sandbox.result_set_identity(out, id, 0)
