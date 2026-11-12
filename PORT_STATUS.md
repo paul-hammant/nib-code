@@ -228,6 +228,12 @@ module was mutation-checked.
 | test_agent*.py, test_background_agent.py, test_background_run.py, test_interjections.py, test_hooks.py, test_skills.py, test_skill_mentions.py, test_mcp.py, test_replay.py, test_web_search.py, test_prediction.py, test_stats.py | not yet | their slices (agents, Run backgrounding, TUI, hooks/skills, MCP, replay, web search) |
 | test_codex.py, test_codex_websocket.py, test_provider_login.py | excluded | policy: no Codex sign-in or WebSocket |
 
+**Lanes.** macOS arm64, ae-x64 (Ubuntu 22.04) and cachyos: unit suites green on all
+three; e2e results as in the table on all three, except that on ae-x64 (kernel 5.15,
+no Landlock ABI 2) test_sandbox's six workspace cases fail because bash runs
+unsandboxed there, as upstream's would. On Linux test_background_bash runs
+unpatched: every non-TUI Chat case passes except the four that need tools.agent.
+
 **Stand-ins (marked, each with an ask).** `ae/nib/sysgap` grows pwrite
 (asks/aether-fs-stat-flock-exclusive.md item 6), SIGINT/SIGTERM as a polled
 flag and stdin echo (asks/aether-signal-flag-and-tty-echo.md).

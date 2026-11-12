@@ -12,6 +12,10 @@
 # Verified: aeb .tests.ae (20 suites, 156 tests, workspace.sh, check_layers.sh)
 # on macOS arm64, ae-x64 (Ubuntu 22.04, kernel 5.15: no Landlock ABI 2, bash
 # runs unsandboxed there as upstream) and cachyos (kernel 7.3: Landlock holds).
+# Session + provider slice (2026-11-12), same pins: aeb .tests.ae green (35 suites)
+# on macOS arm64, ae-x64 and cachyos; ae/tests/upstream-e2e.sh gives the same
+# results on all three, except test_sandbox's workspace cases on ae-x64
+# (kernel 5.15, no Landlock ABI 2: bash runs unsandboxed there, as upstream).
 AE_PIN=0.909.0
 
 # v0.344 (2026-11-12): aether.program and aether.program_test with lib().
