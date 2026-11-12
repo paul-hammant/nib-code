@@ -138,8 +138,9 @@ pub const Config = struct {
         return if (cfg.provider == .custom) cfg.custom_protocol else definition(cfg.provider).protocol;
     }
 
-    pub fn mainLimit(cfg: Config, max_tokens: ?u32) bool {
-        return cfg.custom_max_output != null and max_tokens == cfg.custom_max_output;
+    /// Responses services get no limit: that encoder turns `max_tokens` into a summary-length prompt.
+    pub fn sessionMaxTokens(cfg: Config) ?u32 {
+        return if (cfg.protocol() == .responses) null else cfg.custom_max_output;
     }
 
     /// Whether the model accepts image input; custom providers declare it, defaulting to the protocol.

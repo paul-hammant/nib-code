@@ -114,7 +114,7 @@ class Providers(unittest.TestCase):
                     for body in bodies:
                         if protocol == "anthropic_messages" and limit is None:
                             self.assertEqual(body["max_tokens"], 128000)
-                        elif limit is None:
+                        elif limit is None or protocol == "responses":
                             self.assertNotIn(field, body)
                         else:
                             self.assertEqual(body[field], limit)
