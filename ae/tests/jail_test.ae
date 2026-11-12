@@ -1,0 +1,97 @@
+// Ports upstream src/tools/bash/jail.zig's tests (a2dd439).
+import std.spec
+import std.fs
+import std.list
+import std.string
+import nib.tools.jail
+
+contains_(l: ptr, s: string) -> int {
+    n = list.list_size(l)
+    i = 0
+    while i < n {
+        v, _e = list.get_string(l, i)
+        if v == s { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+tmp_() -> string {
+    d, _e = fs.make_temp_dir("", "nib-jail")
+    real, _k, _m = fs.realpath(d)
+    return real
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tools.jail") {
+        spec.it("roots hold the project, temp dirs, existing caches and extras only") callback {
+            base = tmp_()
+            fs.mkdir_p("${base}/proj/.git")
+            fs.mkdir_p("${base}/proj/src/deep")
+            fs.mkdir_p("${base}/home/.cache")
+            fs.mkdir_p("${base}/extra")
+            fs.mkdir_p("${base}/elsewhere")
+            extra = list.list_new()
+            list.list_add(extra, "${base}/extra")
+            list.list_add(extra, "${base}/missing")
+            list.list_add(extra, "relative")
+            l = jail.roots("${base}/proj/src/deep", "${base}/home", list.list_new(), extra)
+            spec.assert_eq(contains_(l, "${base}/proj"), 1, "project")
+            spec.assert_eq(contains_(l, "${base}/home/.cache"), 1, "cache")
+            spec.assert_eq(contains_(l, "${base}/extra"), 1, "extra")
+            spec.assert_eq(contains_(l, "${base}/home/.npm"), 0, "missing cache")
+            spec.assert_eq(contains_(l, "${base}/missing"), 0, "missing extra")
+            spec.assert_eq(contains_(l, "${base}/elsewhere"), 0, "elsewhere")
+            spec.assert_eq(contains_(l, "${base}/proj/src/deep"), 0, "not cwd")
+            n = list.list_size(l)
+            i = 0
+            while i < n {
+                a, _e = list.get_string(l, i)
+                j = i + 1
+                while j < n {
+                    b, _e2 = list.get_string(l, j)
+                    spec.assert_true(a != b, "unique ${a}")
+                    j = j + 1
+                }
+                i = i + 1
+            }
+        }
+        spec.it("a linked worktree adds its git directories") callback {
+            base = tmp_()
+            fs.mkdir_p("${base}/main/.git/worktrees/w")
+            fs.mkdir_p("${base}/linked")
+            fs.write("${base}/main/.git/worktrees/w/commondir", "../..\n")
+            fs.write("${base}/linked/.git", "gitdir: ${base}/main/.git/worktrees/w\n")
+            l = jail.roots("${base}/linked", "", list.list_new(), null)
+            spec.assert_eq(contains_(l, "${base}/main/.git/worktrees/w"), 1, "gitdir")
+            spec.assert_eq(contains_(l, "${base}/main/.git"), 1, "commondir")
+        }
+        spec.it("allows matches whole path components only") callback {
+            two = list.list_new()
+            list.list_add(two, "/work/proj")
+            list.list_add(two, "/dev/null")
+            spec.assert_eq(jail.allows(two, "/work/proj"), 1, "root")
+            spec.assert_eq(jail.allows(two, "/work/proj/a/b"), 1, "below")
+            spec.assert_eq(jail.allows(two, "/dev/null"), 1, "device")
+            spec.assert_eq(jail.allows(two, "/work/project"), 0, "prefix only")
+            spec.assert_eq(jail.allows(two, "/work"), 0, "parent")
+            spec.assert_eq(jail.allows(two, "/dev/nullx"), 0, "device prefix")
+            slash = list.list_new()
+            list.list_add(slash, "/")
+            spec.assert_eq(jail.allows(slash, "/anything"), 1, "slash root")
+        }
+        spec.it("profile denies writes by default and escapes paths") callback {
+            l = list.list_new()
+            list.list_add(l, "/p")
+            list.list_add(l, "/with\"quote\\")
+            spec.assert_str_eq(jail.profile(l), "(version 1)(allow default)(deny file-write*)(allow file-write*(regex #\"^/dev/ttys[0-9]+$\")(subpath \"/p\")(subpath \"/with\\\"quote\\\\\"))", "profile")
+        }
+        spec.it("expandHome expands only a leading tilde") callback {
+            spec.assert_str_eq(jail.expand_home("/h", "~/x"), "/h/x", "tilde slash")
+            spec.assert_str_eq(jail.expand_home("/h", "~"), "/h", "tilde")
+            spec.assert_str_eq(jail.expand_home("/h", "/a/~/x"), "/a/~/x", "inner tilde")
+        }
+    }
+    return spec.run_summary(fw)
+}

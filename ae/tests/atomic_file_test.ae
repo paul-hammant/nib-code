@@ -1,0 +1,133 @@
+// Ports upstream src/tools/atomic_file.zig's tests (a2dd439).
+import std.spec
+import std.fs
+import std.string
+import std.dir
+import nib.tools.atomic_file
+import nib.sysgap
+
+tmp_() -> string {
+    d, _e = fs.make_temp_dir("", "nib-atomic")
+    real, _k, _m = fs.realpath(d)
+    return real
+}
+
+read_(p: string) -> string {
+    s, _e = fs.read(p)
+    return s
+}
+
+mode_(p: string) -> int {
+    st = sysgap.new_stat()
+    sysgap.stat(p, 1, st)
+    return (st as *sysgap.Stat).mode
+}
+
+kind_nofollow_(p: string) -> int {
+    st = sysgap.new_stat()
+    sysgap.stat(p, 0, st)
+    return (st as *sysgap.Stat).kind
+}
+
+no_temps_(d: string) -> int {
+    l, _e = fs.list_dir(d)
+    if l == null { return 1 }
+    n = fs.dir_list_count(l)
+    i = 0
+    while i < n {
+        if string.starts_with(fs.dir_list_get(l, i), ".nib-") == 1 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tools.atomic_file") {
+        spec.it("replacement preserves existing permissions and uses creation permissions") callback {
+            d = tmp_()
+            p = "${d}/file"
+            spec.assert_str_eq(atomic_file.replace(p, "first", 384, 0, 0, null), "", "created")
+            spec.assert_eq(mode_(p), 384, "0600")
+            modes = [489, 288, 3560]
+            i = 0
+            while i < 3 {
+                sysgap.chmod(p, modes[i])
+                spec.assert_str_eq(atomic_file.replace(p, "replacement", 420, 0, 0, null), "", "replaced")
+                spec.assert_eq(mode_(p), modes[i], "kept mode ${modes[i]}")
+                spec.assert_str_eq(read_(p), "replacement", "content")
+                i = i + 1
+            }
+            spec.assert_str_eq(atomic_file.replace(p, "executable", 493, 1, 1, null), "", "forced")
+            spec.assert_eq(mode_(p), 493, "0755")
+            spec.assert_eq(no_temps_(d), 1, "no temps")
+        }
+        spec.it("replacement follows relative absolute and dangling symlinks") callback {
+            d = tmp_()
+            fs.create_dir("${d}/real")
+            fs.symlink("real", "${d}/alias")
+            fs.symlink("alias/target", "${d}/link")
+            p = "${d}/link"
+            spec.assert_str_eq(atomic_file.replace(p, "created", 420, 0, 0, null), "", "created")
+            spec.assert_str_eq(atomic_file.replace(p, "updated", 420, 0, 1, null), "", "updated")
+            spec.assert_eq(kind_nofollow_(p), sysgap.KIND_LINK, "link kept")
+            spec.assert_str_eq(read_("${d}/real/target"), "updated", "target written")
+            target, _e = atomic_file.canonical_path(p)
+            fs.symlink(target, "${d}/absolute")
+            spec.assert_str_eq(atomic_file.replace("${d}/absolute", "absolute", 420, 0, 0, null), "", "absolute")
+            actual, _e2 = atomic_file.canonical_path("${d}/absolute")
+            spec.assert_str_eq(actual, target, "same target")
+            spec.assert_eq(kind_nofollow_("${d}/absolute"), sysgap.KIND_LINK, "absolute link kept")
+            spec.assert_eq(no_temps_(d), 1, "no temps")
+        }
+        spec.it("canonical paths resolve links before dotdot and normalize missing suffixes") callback {
+            d = tmp_()
+            fs.mkdir_p("${d}/real/child")
+            fs.symlink("real/child", "${d}/alias")
+            fs.symlink("alias/../missing/deep", "${d}/dangling")
+            expected, _e = atomic_file.canonical_path("${d}/real/missing/deep/file")
+            suffixes = ["real/missing/deep/file", "alias/../missing/deep/file", "dangling/./file", "real/missing/other/../deep/file"]
+            i = 0
+            while i < 4 {
+                actual, err = atomic_file.canonical_path("${d}/${suffixes[i]}")
+                spec.assert_str_eq(err, "", "no error ${i}")
+                spec.assert_str_eq(actual, expected, "same ${suffixes[i]}")
+                i = i + 1
+            }
+            spec.assert_true(string.starts_with(expected, "/"), "absolute")
+        }
+        spec.it("failed rename cleans temporary file and leaves target intact") callback {
+            d = tmp_()
+            fs.create_dir("${d}/target")
+            fs.write("${d}/target/keep", "original")
+            spec.assert_str_eq(atomic_file.replace("${d}/target", "replacement", 420, 0, 0, null), "IsDir", "IsDir")
+            spec.assert_str_eq(read_("${d}/target/keep"), "original", "intact")
+            spec.assert_eq(no_temps_(d), 1, "no temps")
+        }
+        spec.it("symlink loops fail without replacing links or leaving temporary files") callback {
+            d = tmp_()
+            fs.symlink("b", "${d}/a")
+            fs.symlink("a", "${d}/b")
+            spec.assert_str_eq(atomic_file.replace("${d}/a", "replacement", 420, 0, 0, null), "SymLinkLoop", "loop")
+            spec.assert_eq(kind_nofollow_("${d}/a"), sysgap.KIND_LINK, "link kept")
+            spec.assert_eq(no_temps_(d), 1, "no temps")
+        }
+        spec.it("canonical paths do not traverse regular files as directories") callback {
+            d = tmp_()
+            fs.write("${d}/plain", "plain")
+            fs.write("${d}/victim", "keep")
+            fs.symlink("plain", "${d}/link")
+            fs.symlink("plain/", "${d}/directory-required")
+            cases = ["plain/../victim", "plain/./../victim", "plain/", "link/../victim", "link/", "directory-required"]
+            i = 0
+            while i < 6 {
+                spec.assert_str_eq(atomic_file.replace("${d}/${cases[i]}", "overwrite", 420, 0, 0, null), "NotDir", "NotDir ${cases[i]}")
+                i = i + 1
+            }
+            spec.assert_str_eq(read_("${d}/plain"), "plain", "plain kept")
+            spec.assert_str_eq(read_("${d}/victim"), "keep", "victim kept")
+            spec.assert_eq(no_temps_(d), 1, "no temps")
+        }
+    }
+    return spec.run_summary(fw)
+}

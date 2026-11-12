@@ -1,0 +1,310 @@
+// tools.jail: bash's OS write sandbox, workspace mode (upstream
+// src/tools/bash/jail.zig, ADR 0004). Writable roots: the project (first
+// ancestor of cwd with .git), a linked worktree's git dirs, temp dirs, a few
+// devices, the cache allowlist, user extras; reads and network stay open.
+// macOS: sandbox-exec with a per-command profile. Linux: `nib __jail
+// <root>... -- <command>...`, which restricts itself with Landlock and execs
+// the command. No module state: a probe result is cached by the caller.
+
+import std.fs
+import std.os
+import std.string
+import std.list
+import nib.tools.atomic_file
+
+@source("landlock.c")
+
+exports(HELPER_COMMAND, SANDBOX_EXEC, project_root, roots, allows, expand_home, profile,
+        unavailable, unavailable_text, wrap, helper)
+
+const HELPER_COMMAND = "__jail"
+const SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+
+extern nibjail_probe() -> int
+extern nibjail_restrict(roots: string) -> int
+
+home_caches_() -> ptr {
+    l = list.list_new()
+    names = [".cache", "Library/Caches", "Library/Developer", ".npm", ".cargo/registry", ".cargo/git", ".rustup", "go/pkg", ".gradle", ".m2", ".bun/install/cache", ".yarn", ".pnpm-store", ".local/share/pnpm", ".local/share/uv"]
+    mac = 0
+    if os.platform() == "macos" { mac = 1 }
+    i = 0
+    while i < 15 {
+        if mac == 1 || (i != 1 && i != 2) { list.list_add(l, names[i]) }
+        i = i + 1
+    }
+    return l
+}
+
+system_paths_() -> ptr {
+    l = list.list_new()
+    if os.platform() == "macos" {
+        p = ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp", "/private/var/folders", "/dev/null", "/dev/zero", "/dev/tty", "/dev/ptmx", "/dev/dtracehelper", "/dev/fd"]
+        i = 0
+        while i < 11 {
+            list.list_add(l, p[i])
+            i = i + 1
+        }
+    } else {
+        p = ["/tmp", "/var/tmp", "/dev/null", "/dev/zero", "/dev/full", "/dev/tty", "/dev/ptmx", "/dev/pts", "/dev/shm"]
+        i = 0
+        while i < 9 {
+            list.list_add(l, p[i])
+            i = i + 1
+        }
+    }
+    return l
+}
+
+// The first ancestor of cwd (inclusive) holding a .git, else cwd.
+project_root(cwd: string) -> string {
+    path = cwd
+    while true {
+        if fs.exists(atomic_file.join(path, ".git")) == 1 { return path }
+        if path == "/" { return cwd }
+        path = atomic_file.dirname(path)
+    }
+    return cwd
+}
+
+contains_(l: ptr, s: string) -> int {
+    n = list.list_size(l)
+    i = 0
+    while i < n {
+        v, _e = list.get_string(l, i)
+        if v == s { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+add_(out: ptr, path: string) {
+    if string.starts_with(path, "/") == 0 { return }
+    real, _k, err = fs.realpath(path)
+    if err != "" { return }
+    if string.length(real) == 0 { return }
+    if contains_(out, real) == 1 { return }
+    list.list_add(out, real)
+}
+
+trim_(s: string) -> string { return string.trim(s) }
+
+// A linked worktree keeps its git state outside the project directory.
+add_git_dirs_(out: ptr, project: string) {
+    text, err = fs.read(atomic_file.join(project, ".git"))
+    if err != "" { return }
+    if string.length(text) > 4096 { return }
+    line = trim_(text)
+    if string.starts_with(line, "gitdir:") == 0 { return }
+    raw = trim_(string.substring(line, 7, string.length(line)))
+    git_dir = raw
+    if string.starts_with(raw, "/") == 0 { git_dir = atomic_file.join(project, raw) }
+    add_(out, git_dir)
+    common, cerr = fs.read(atomic_file.join(git_dir, "commondir"))
+    if cerr != "" { return }
+    rel = trim_(common)
+    if string.starts_with(rel, "/") == 1 { add_(out, rel) } else { add_(out, atomic_file.join(git_dir, rel)) }
+}
+
+env_(env: ptr, name: string) -> string {
+    // env: list of "NAME=value", or null for this process's own
+    if env == null {
+        v = os.getenv(name)
+        if v == null { return "" }
+        return v
+    }
+    prefix = "${name}="
+    n = list.list_size(env)
+    i = 0
+    while i < n {
+        e, _x = list.get_string(env, i)
+        if string.starts_with(e, prefix) == 1 { return string.substring(e, string.length(prefix), string.length(e)) }
+        i = i + 1
+    }
+    return ""
+}
+
+// Canonical writable roots; candidates that do not exist are dropped.
+// env: the child environment as "NAME=value" (null: this process's).
+roots(cwd: string, home: string, env: ptr, extra: ptr) -> ptr {
+    out = list.list_new()
+    project = project_root(cwd)
+    add_(out, project)
+    add_git_dirs_(out, project)
+    sp = system_paths_()
+    i = 0
+    while i < list.list_size(sp) {
+        s, _e = list.get_string(sp, i)
+        add_(out, s)
+        i = i + 1
+    }
+    tmp = env_(env, "TMPDIR")
+    if tmp != "" { add_(out, tmp) }
+    if string.length(home) > 0 {
+        hc = home_caches_()
+        i = 0
+        while i < list.list_size(hc) {
+            rel, _e2 = list.get_string(hc, i)
+            add_(out, atomic_file.join(home, rel))
+            i = i + 1
+        }
+    }
+    names = ["XDG_CACHE_HOME", "ZIG_GLOBAL_CACHE_DIR", "RUSTUP_HOME", "GOCACHE", "GOMODCACHE", "GRADLE_USER_HOME", "npm_config_cache", "PIP_CACHE_DIR", "UV_CACHE_DIR"]
+    i = 0
+    while i < 9 {
+        v = env_(env, names[i])
+        if v != "" { add_(out, v) }
+        i = i + 1
+    }
+    cargo = env_(env, "CARGO_HOME")
+    if cargo != "" {
+        add_(out, atomic_file.join(cargo, "registry"))
+        add_(out, atomic_file.join(cargo, "git"))
+    }
+    gopath = env_(env, "GOPATH")
+    if gopath != "" { add_(out, atomic_file.join(gopath, "pkg")) }
+    if extra != null {
+        i = 0
+        while i < list.list_size(extra) {
+            x, _e3 = list.get_string(extra, i)
+            add_(out, x)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// 1 when canonical lies inside one of the roots, by whole components.
+allows(writable: ptr, canonical: string) -> int {
+    n = list.list_size(writable)
+    i = 0
+    while i < n {
+        root, _e = list.get_string(writable, i)
+        rn = string.length(root)
+        if string.starts_with(canonical, root) == 1 {
+            if string.length(canonical) == rn { return 1 }
+            if string.char_at(root, rn - 1) == 47 { return 1 }
+            if string.char_at(canonical, rn) == 47 { return 1 }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+expand_home(home: string, path: string) -> string {
+    if path == "~" { return home }
+    if string.starts_with(path, "~/") == 1 { return atomic_file.join(home, string.substring(path, 2, string.length(path))) }
+    return path
+}
+
+profile(writable: ptr) -> string {
+    text = "(version 1)(allow default)(deny file-write*)(allow file-write*(regex #\"^/dev/ttys[0-9]+$\")"
+    n = list.list_size(writable)
+    i = 0
+    while i < n {
+        path, _e = list.get_string(writable, i)
+        esc = ""
+        k = 0
+        pn = string.length(path)
+        while k < pn {
+            c = string.char_at(path, k)
+            if c == 34 || c == 92 { esc = "${esc}\\" }
+            if c >= 32 { esc = "${esc}${string.substring(path, k, k + 1)}" }
+            k = k + 1
+        }
+        text = "${text}(subpath \"${esc}\")"
+        i = i + 1
+    }
+    return "${text})"
+}
+
+// "" when the OS sandbox can be applied here, else why not (upstream's
+// Unavailable texts). The caller caches it per Tools.
+unavailable() -> string {
+    if os.platform() == "macos" {
+        if fs.exists(SANDBOX_EXEC) == 0 { return "sandbox-exec not found" }
+        argv = list.list_new()
+        list.list_add(argv, "-p")
+        list.list_add(argv, "(version 1)(allow default)")
+        list.list_add(argv, "/usr/bin/true")
+        _out, code, err = os.run_capture(SANDBOX_EXEC, argv, null)
+        if err != "" || code != 0 { return "sandbox-exec cannot apply a profile here" }
+        return ""
+    }
+    if os.platform() == "linux" { return unavailable_text(nibjail_probe()) }
+    return "unsupported OS"
+}
+
+unavailable_text(code: int) -> string {
+    match code {
+        0 -> { return "" }
+        1 -> { return "kernel has no Landlock" }
+        2 -> { return "Landlock is disabled" }
+        3 -> { return "Landlock ABI below 2" }
+        _ -> { return "unsupported OS" }
+    }
+}
+
+// argv (program first) running `inner` (program first) so that writes
+// outside `writable` fail. self_exe is this nib binary (the Linux helper).
+wrap(writable: ptr, inner: ptr, self_exe: string) -> ptr {
+    argv = list.list_new()
+    if os.platform() == "macos" {
+        list.list_add(argv, SANDBOX_EXEC)
+        list.list_add(argv, "-p")
+        list.list_add(argv, profile(writable))
+    } else {
+        list.list_add(argv, self_exe)
+        list.list_add(argv, HELPER_COMMAND)
+        i = 0
+        while i < list.list_size(writable) {
+            r, _e = list.get_string(writable, i)
+            list.list_add(argv, r)
+            i = i + 1
+        }
+        list.list_add(argv, "--")
+    }
+    i = 0
+    while i < list.list_size(inner) {
+        a, _e2 = list.get_string(inner, i)
+        list.list_add(argv, a)
+        i = i + 1
+    }
+    return argv
+}
+
+// `nib __jail <root>... -- <command>...` (args after __jail): restrict this
+// process, then become the command. Returns only on failure, with the reason.
+helper(args: ptr) -> string {
+    if os.platform() != "linux" { return "UnsupportedOs" }
+    n = list.list_size(args)
+    split = -1
+    i = 0
+    while i < n {
+        a, _e = list.get_string(args, i)
+        if a == "--" {
+            split = i
+            break
+        }
+        i = i + 1
+    }
+    if split < 0 || split + 1 >= n { return "InvalidArguments" }
+    joined = ""
+    i = 0
+    while i < split {
+        r, _e2 = list.get_string(args, i)
+        joined = "${joined}${r}\n"
+        i = i + 1
+    }
+    if nibjail_restrict(joined) != 0 { return "LandlockUnavailable" }
+    command = list.list_new()
+    i = split + 1
+    while i < n {
+        c, _e3 = list.get_string(args, i)
+        list.list_add(command, c)
+        i = i + 1
+    }
+    prog, _e4 = list.get_string(command, 0)
+    os.os_execv(prog, command)
+    return "exec failed"
+}

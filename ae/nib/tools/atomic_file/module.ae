@@ -1,0 +1,190 @@
+// tools.atomic_file: canonical paths and atomic same-directory replacement
+// (upstream src/tools/atomic_file.zig). Errors are Zig's names for them
+// ("FileNotFound", "NotDir", "SymLinkLoop", ...), which tool errors show.
+
+import std.fs
+import std.os
+import std.string
+import std.list
+import std.cryptography
+import nib.sysgap
+
+exports(canonical_path, replace, dirname, basename, join, cwd_path)
+
+const MAX_LINKS = 40
+
+cwd_path() -> string {
+    c = os.getcwd()
+    return c
+}
+
+// "/a/b" -> "/a"; "/a" -> "/"; "/" -> "/".
+dirname(p: string) -> string {
+    n = string.length(p)
+    while n > 1 && string.char_at(p, n - 1) == 47 { n = n - 1 }
+    i = n - 1
+    while i >= 0 && string.char_at(p, i) != 47 { i = i - 1 }
+    if i <= 0 { return "/" }
+    return string.substring(p, 0, i)
+}
+
+basename(p: string) -> string {
+    n = string.length(p)
+    while n > 1 && string.char_at(p, n - 1) == 47 { n = n - 1 }
+    i = n - 1
+    while i >= 0 && string.char_at(p, i) != 47 { i = i - 1 }
+    return string.substring(p, i + 1, n)
+}
+
+join(a: string, b: string) -> string {
+    if string.ends_with(a, "/") == 1 { return "${a}${b}" }
+    return "${a}/${b}"
+}
+
+// The components of p ("." and ".." kept, empty ones dropped).
+components_(p: string) -> ptr {
+    out = list.list_new()
+    n = string.length(p)
+    i = 0
+    while i < n {
+        while i < n && string.char_at(p, i) == 47 { i = i + 1 }
+        if i >= n { break }
+        j = i
+        while j < n && string.char_at(p, j) != 47 { j = j + 1 }
+        list.list_add(out, string.substring(p, i, j))
+        i = j
+    }
+    return out
+}
+
+// Absolute path with every symlink resolved and . / .. applied in order; a
+// missing suffix is allowed. (path, "") or ("", error name).
+canonical_path(path: string) -> (string, string) {
+    if string.length(path) == 0 { return "", "FileNotFound" }
+    resolved = "/"
+    pending = path
+    if string.starts_with(path, "/") == 0 {
+        resolved = cwd_path()
+    }
+    links = 0
+    st = sysgap.new_stat()
+    // Process pending's components; a symlink restarts with its target + rest.
+    comps = components_(pending)
+    idx = 0
+    total = list.list_size(comps)
+    trailing_dir = 0
+    while idx < total {
+        name, _ge = list.get_string(comps, idx)
+        is_last = 0
+        if idx == total - 1 { is_last = 1 }
+        idx = idx + 1
+        if name == "." { continue }
+        if name == ".." {
+            resolved = dirname(resolved)
+            continue
+        }
+        candidate = join(resolved, name)
+        rc = sysgap.stat(candidate, 0, st)
+        if rc != 0 {
+            if sysgap.errname(rc) == "FileNotFound" {
+                resolved = candidate
+                continue
+            }
+            if sysgap.errname(rc) == "NotDir" { return "", "NotDir" }
+            return "", sysgap.errname(rc)
+        }
+        if (st as *sysgap.Stat).kind != sysgap.KIND_LINK {
+            if is_last == 0 {
+                if (st as *sysgap.Stat).kind != sysgap.KIND_DIR { return "", "NotDir" }
+            }
+            resolved = candidate
+            continue
+        }
+        links = links + 1
+        if links > MAX_LINKS { return "", "SymLinkLoop" }
+        target, lerr = fs.readlink(candidate)
+        if lerr != "" { return "", "Unexpected" }
+        // target + the rest of the components
+        rest = ""
+        k = idx
+        while k < total {
+            rc_, _ge2 = list.get_string(comps, k)
+            rest = "${rest}/${rc_}"
+            k = k + 1
+        }
+        if string.ends_with(pending, "/") == 1 && total > 0 { rest = "${rest}/" }
+        pending = "${target}${rest}"
+        if string.starts_with(target, "/") == 1 { resolved = "/" }
+        comps = components_(pending)
+        total = list.list_size(comps)
+        idx = 0
+    }
+    // A trailing "/", "." or ".." requires a directory.
+    last = basename(pending)
+    if string.ends_with(pending, "/") == 1 || last == "." || last == ".." {
+        rc2 = sysgap.stat(resolved, 1, st)
+        if rc2 != 0 { return "", sysgap.errname(rc2) }
+        if (st as *sysgap.Stat).kind != sysgap.KIND_DIR { return "", "NotDir" }
+    }
+    return resolved, ""
+}
+
+random_name_() -> string {
+    hex, _e = cryptography.random_hex(16)
+    return ".nib-${hex}"
+}
+
+// Writes data to a fresh .nib-* file beside the canonical target and renames
+// it over the target. An existing target keeps its permission bits unless
+// force_mode; a new one gets `mode` (subject to umask). Fills out (*sysgap.Stat)
+// with the written file. "" or the error name.
+replace(path: string, data: string, mode: int, force_mode: int, sync: int, out: ptr) -> string {
+    target, err = canonical_path(path)
+    if err != "" { return err }
+    dir = dirname(target)
+    base = basename(target)
+    st = sysgap.new_stat()
+    drc = sysgap.stat(dir, 1, st)
+    if drc != 0 { return sysgap.errname(drc) }
+    if (st as *sysgap.Stat).kind != sysgap.KIND_DIR { return "NotDir" }
+    existing = 0
+    existing_mode = 0
+    rc = sysgap.stat(target, 1, st)
+    if rc == 0 {
+        k = (st as *sysgap.Stat).kind
+        if k != sysgap.KIND_FILE && k != sysgap.KIND_DIR { return "NotFile" }
+        existing = 1
+        existing_mode = (st as *sysgap.Stat).mode
+    } else if sysgap.errname(rc) != "FileNotFound" {
+        return sysgap.errname(rc)
+    }
+    create_mode = mode
+    if existing == 1 { create_mode = 384 }
+    fd = -1
+    name = ""
+    tries = 0
+    while tries < 16 {
+        name = join(dir, random_name_())
+        fd = sysgap.create_excl(name, create_mode)
+        if fd >= 0 { break }
+        if sysgap.errname(fd) != "PathAlreadyExists" { return sysgap.errname(fd) }
+        tries = tries + 1
+    }
+    if fd < 0 { return "PathAlreadyExists" }
+    wrc = sysgap.write_all(fd, data)
+    if wrc == 0 && existing == 1 && force_mode == 0 { wrc = sysgap.fchmod(fd, existing_mode) }
+    if wrc == 0 && force_mode == 1 { wrc = sysgap.fchmod(fd, mode) }
+    if wrc == 0 && sync == 1 { wrc = sysgap.fsync(fd) }
+    sysgap.close(fd)
+    if wrc != 0 {
+        sysgap.unlink(name)
+        return sysgap.errname(wrc)
+    }
+    if out != null { sysgap.stat(name, 1, out) }
+    rrc = sysgap.rename(name, target)
+    if rrc != 0 {
+        sysgap.unlink(name)
+        return sysgap.errname(rrc)
+    }
+    return ""
+}

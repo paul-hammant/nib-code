@@ -53,6 +53,14 @@ aeb(cap) {
             source("ae/tests/search_test.ae")
             lib("ae")
         }
+        aether.program_test() {
+            source("ae/tests/atomic_file_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/jail_test.ae")
+            lib("ae")
+        }
         return 0
     }
 }

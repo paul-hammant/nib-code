@@ -1,0 +1,119 @@
+// tools.process: one child in its own process group, output (stdout and
+// stderr, merged by the caller's command) captured whole, stopped by cancel,
+// deadline or output size (upstream src/tools/process.zig). The call returns
+// when the child exits; anything left in its group is killed then (nohup and
+// & descendants included); daemons that left the group keep running and
+// cannot hold the call open, since output goes to a file, not a pipe.
+
+import std.os
+import std.fs
+import std.string
+import std.list
+import std.sync
+import std.worker
+import std.cryptography
+import nib.sysgap
+
+exports(Result, run, STOP_NONE, STOP_CANCELED, STOP_TIMED_OUT)
+
+const STOP_NONE = ""
+const STOP_CANCELED = "Canceled"
+const STOP_TIMED_OUT = "TimedOut"
+
+struct Result {
+    exit_code: int      // the shell's status (128+n after a signal)
+    stop: string        // "", "Canceled", "TimedOut"
+    output: string
+    error: string       // "" or "OutputLimit" or the spawn error
+    start_ms_epoch: long
+    end_ms_epoch: long
+}
+
+struct Waiter {
+    token: int
+    done: ptr
+    code: int
+}
+
+set_(c: ptr) -> int {
+    if c == null { return 0 }
+    if sync.atomic_load(c) != 0 { return 1 }
+    return 0
+}
+
+output_size_(path: string) -> long {
+    st = sysgap.new_stat()
+    if sysgap.stat(path, 1, st) != 0 { return 0 }
+    return (st as *sysgap.Stat).size
+}
+
+// argv: program first. env: "NAME=value" list or null (inherit). cancels: up
+// to two std.sync cells (either set cancels; may be null). timeout_ms 0: none.
+run(argv: ptr, env: ptr, cancel_a: ptr, cancel_b: ptr, timeout_ms: long, max_output: long) -> ptr {
+    r = heap.new(Result)
+    r.exit_code = -1
+    r.stop = ""
+    r.output = ""
+    r.error = ""
+    r.start_ms_epoch = os.now_unix_ms()
+    r.end_ms_epoch = 0
+    hex, _h = cryptography.random_hex(12)
+    out_path = "${os.temp_dir()}/nib-out-${hex}"
+    prog, _e = list.get_string(argv, 0)
+    rest = list.list_new()
+    i = 1
+    while i < list.list_size(argv) {
+        a, _e2 = list.get_string(argv, i)
+        list.list_add(rest, a)
+        i = i + 1
+    }
+    token, serr = os.spawn_proc_to(prog, rest, env, out_path)
+    if serr != "" {
+        r.error = serr
+        sysgap.unlink(out_path)
+        return r as ptr
+    }
+    w = heap.new(Waiter)
+    w.token = token
+    w.done = sync.atomic_new(0)
+    w.code = -1
+    wp = w as ptr
+    worker.run_detached(|| {
+        ww = wp as *Waiter
+        code, _we = os.wait(ww.token)
+        ww.code = code
+        sync.atomic_store(ww.done, 1)
+        return null
+    })
+    deadline = 0 as long
+    if timeout_ms > 0 { deadline = os.now_monotonic_ms() + timeout_ms }
+    killed = 0
+    while sync.atomic_load(w.done) == 0 {
+        if killed == 0 {
+            if set_(cancel_a) == 1 || set_(cancel_b) == 1 {
+                r.stop = STOP_CANCELED
+            } else if deadline != 0 && os.now_monotonic_ms() >= deadline {
+                r.stop = STOP_TIMED_OUT
+            } else if output_size_(out_path) > max_output {
+                r.error = "OutputLimit"
+            }
+            if r.stop != "" || r.error != "" {
+                os.kill(0 - token, 9)
+                killed = 1
+            }
+        }
+        sleep(20)
+    }
+    r.end_ms_epoch = os.now_unix_ms()
+    // The shell is gone: end whatever it left in its group.
+    os.kill(0 - token, 9)
+    r.exit_code = w.code
+    sync.atomic_free(w.done)
+    if r.error == "" && output_size_(out_path) > max_output { r.error = "OutputLimit" }
+    if r.error == "" && r.stop == "" {
+        data, rerr = fs.read(out_path)
+        if rerr == "" { r.output = data }
+    }
+    sysgap.unlink(out_path)
+    return r as ptr
+}

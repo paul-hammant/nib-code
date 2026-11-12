@@ -1,0 +1,162 @@
+// tools.bash: tools.bash in the foreground (upstream src/tools/bash.zig).
+// The command runs as `bash -c "exec 2>&1\n<command>"` in nib's cwd, in its
+// own process group, with credentials scrubbed from its environment, behind
+// the deny-list, and inside the OS write sandbox when workspace mode is on.
+
+import std.os
+import std.string
+import std.list
+import std.sync
+import nib.jsonx
+import nib.tools.policy
+import nib.tools.secrets
+import nib.tools.process
+import nib.tools.registry
+import nib.tools.jail
+import nib.sysgap
+
+exports(Ctx, Args, new_ctx, parse_args, validation_error, timeout_ms_of, check, execute, MAX_OUTPUT,
+        DEFAULT_TIMEOUT_MS, child_env)
+
+const MAX_OUTPUT = 16 * 1024 * 1024
+const DEFAULT_TIMEOUT_MS = 1800000
+
+struct Ctx {
+    home: string
+    codex_home: string    // "" when unset
+    data_home: string     // nib's own credential directory
+    cancel: ptr           // the Run's (or task's) cancel cell
+    registry: ptr         // *registry.Registry
+    ids: ptr              // std.sync cell: the Session's bash id counter
+    run_id: int
+    roots: ptr            // writable roots, or null (sandbox off or unavailable)
+    self_exe: string
+    env: ptr              // "NAME=value" list the child starts from (null: this process's)
+    strip_env: string     // one more variable to remove (the provider key's), or ""
+}
+
+struct Args {
+    command: string
+    has_timeout: int
+    timeout_ms: long
+    background: int
+    detached: int
+}
+
+new_ctx(home: string, cancel: @keep ptr, registry: @keep ptr, ids: @keep ptr) -> ptr {
+    c = heap.new(Ctx)
+    c.home = home
+    c.codex_home = ""
+    c.data_home = ""
+    c.cancel = cancel
+    c.registry = registry
+    c.ids = ids
+    c.run_id = 0
+    c.roots = null
+    c.self_exe = ""
+    c.env = null
+    c.strip_env = ""
+    return c as ptr
+}
+
+// The parsed args, or null when they do not have upstream's shape.
+parse_args(args: string) -> ptr {
+    v = jsonx.parse(args)
+    if v == null || jsonx.kind(v, "command") != 3 { return null }
+    a = heap.new(Args)
+    a.command = jsonx.str_or(v, "command", "")
+    a.has_timeout = 0
+    a.timeout_ms = 0
+    tk = jsonx.kind(v, "timeout_ms")
+    if tk == 2 {
+        if jsonx.is_integer(jsonx.field(v, "timeout_ms")) == 0 { return null }
+        a.has_timeout = 1
+        a.timeout_ms = jsonx.long_or(v, "timeout_ms", 0)
+    } else if tk != -1 && tk != 0 {
+        return null
+    }
+    bk = jsonx.kind(v, "background")
+    if bk != -1 && bk != 1 { return null }
+    dk = jsonx.kind(v, "detached")
+    if dk != -1 && dk != 1 { return null }
+    a.background = jsonx.bool_or(v, "background", 0)
+    a.detached = jsonx.bool_or(v, "detached", 0)
+    jsonx.free(v)
+    return a as ptr
+}
+
+timeout_ms_of(ap: ptr) -> long {
+    a = ap as *Args
+    if a.has_timeout == 1 { return a.timeout_ms }
+    if a.detached == 1 { return 0 }
+    return DEFAULT_TIMEOUT_MS
+}
+
+validation_error(ap: ptr) -> string {
+    a = ap as *Args
+    if a.detached == 1 && a.background == 0 { return "detached requires background: true" }
+    t = timeout_ms_of(ap)
+    if t < 0 { return "timeout_ms must not be negative" }
+    if t == 0 && a.detached == 0 { return "timeout_ms: 0 requires detached: true" }
+    return ""
+}
+
+// "" when the command may run, else the whole refusal text.
+check(cp: ptr, command: string) -> string {
+    c = cp as *Ctx
+    why = policy.check_credentials(command, c.codex_home, c.data_home)
+    if why != "" { return "refused by nib: ${why}" }
+    why2 = policy.check(command, c.home)
+    if why2 == "" { return "" }
+    if why2 == policy.too_long() { return "refused by nib: ${why2}" }
+    return "refused by nib: ${why2}. If it is really needed, ask the user to run it."
+}
+
+// The child's environment: c.env (or this process's) without credentials.
+child_env(cp: ptr) -> ptr {
+    c = cp as *Ctx
+    base = c.env
+    if base == null { base = sysenv_() }
+    env = secrets.remove_from(base)
+    if c.strip_env == "" { return env }
+    out = list.list_new()
+    prefix = "${c.strip_env}="
+    i = 0
+    while i < list.list_size(env) {
+        e, _x = list.get_string(env, i)
+        if string.starts_with(e, prefix) == 0 { list.list_add(out, e) }
+        i = i + 1
+    }
+    return out
+}
+
+sysenv_() -> ptr { return sysgap.environ() }
+
+// Runs one command; (1, result JSON) or (0, error text). The id it ran
+// under is stored in *id_out (a one-element list) for the call's identity.
+// task_cancel: a background task's own cancel cell, or null.
+execute(cp: ptr, command: string, timeout_ms: long, detached: int, id: string, task_cancel: ptr) -> (int, string) {
+    c = cp as *Ctx
+    cwd = os.getcwd()
+    cmd = registry.new_command(id, c.run_id, command, cwd, detached)
+    registry.start(c.registry, cmd)
+    script = "exec 2>&1\n${command}"
+    inner = list.list_new()
+    list.list_add(inner, "bash")
+    list.list_add(inner, "-c")
+    list.list_add(inner, script)
+    argv = inner
+    if c.roots != null { argv = jail.wrap(c.roots, inner, c.self_exe) }
+    cancel_b = (cmd as *registry.Command).cancel
+    first = c.cancel
+    if task_cancel != null { first = task_cancel }
+    // Either the Run's/task's cancel or this command's own (supersession) stops it.
+    r = process.run(argv, child_env(cp), first, cancel_b, timeout_ms, MAX_OUTPUT) as *process.Result
+    superseded = registry.finish(c.registry, cmd)
+    if superseded != "" { return 1, "{\"superseded_by\":${jsonx.quote(superseded)}}" }
+    if r.error == "OutputLimit" { return 0, "output exceeds 16 MiB; redirect output to a file" }
+    if r.error != "" { return 0, r.error }
+    if r.stop == process.STOP_TIMED_OUT { return 0, "timed out after ${timeout_ms} ms" }
+    if r.stop == process.STOP_CANCELED { return 0, "canceled" }
+    return 1, "{\"exit_code\":${r.exit_code},\"output\":${jsonx.quote(r.output)}}"
+}

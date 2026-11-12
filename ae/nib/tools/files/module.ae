@@ -1,0 +1,295 @@
+// tools.files: read, edit and write (upstream src/tools/files.zig). What a
+// call may touch comes in its *Ctx: the Session's observed versions, the lock
+// directory, the cancel flag, the writable roots (null: sandbox off), the
+// credential paths, and where a change is reported. No module state.
+
+import std.fs
+import std.string
+import std.strbuilder
+import std.list
+import std.sync
+import nib.jsonx
+import nib.sysgap
+import nib.tools.atomic_file
+import nib.tools.file_state
+import nib.tools.jail
+
+exports(Ctx, new_ctx, read, edit, write, FILE_LIMIT, count_occurrences, replace_all)
+
+const FILE_LIMIT = 16 * 1024 * 1024
+
+struct Ctx {
+    nib_home: string
+    cancel: ptr        // std.sync cell, or null
+    state: ptr         // *file_state.State
+    roots: ptr         // canonical writable roots, or null when the sandbox is off
+    creds: ptr         // canonical credential paths
+    // |path: string, has_before: int, before: string, after: string, tracked: int|
+    // called after a successful edit/write (tracked 0: the before was unreadable)
+    on_change: fn
+    has_on_change: int
+}
+
+new_ctx(nib_home: string, cancel: @keep ptr, state: @keep ptr, roots: @keep ptr, creds: @keep ptr) -> ptr {
+    c = heap.new(Ctx)
+    c.nib_home = nib_home
+    c.cancel = cancel
+    c.state = state
+    c.roots = roots
+    c.creds = creds
+    c.has_on_change = 0
+    return c as ptr
+}
+
+canceled_(c: *Ctx) -> int {
+    if c.cancel == null { return 0 }
+    if sync.atomic_load(c.cancel) != 0 { return 1 }
+    return 0
+}
+
+credential_(c: *Ctx, path: string) -> int {
+    if c.creds == null { return 0 }
+    n = list.list_size(c.creds)
+    i = 0
+    while i < n {
+        p, _e = list.get_string(c.creds, i)
+        if p == path { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// (canonical, "") or ("", the error the call returns as text).
+resolve_(c: *Ctx, raw: string) -> (string, string) {
+    path, err = atomic_file.canonical_path(raw)
+    if err != "" { return "", err }
+    if credential_(c, path) == 1 { return "", "CredentialAccessDenied" }
+    return path, ""
+}
+
+blocked_(c: *Ctx, path: string) -> string {
+    if c.roots == null { return "" }
+    if jail.allows(c.roots, path) == 1 { return "" }
+    return "outside the project; the sandbox only allows writes inside the project and its writable roots"
+}
+
+// (data, "") or ("", Zig's error name).
+read_file_(path: string) -> (string, string) {
+    st = sysgap.new_stat()
+    rc = sysgap.stat(path, 1, st)
+    if rc != 0 { return "", sysgap.errname(rc) }
+    s = st as *sysgap.Stat
+    if s.kind == sysgap.KIND_DIR { return "", "IsDir" }
+    if s.size > FILE_LIMIT { return "", "StreamTooLong" }
+    data, err = fs.read(path)
+    if err != "" { return "", "AccessDenied" }
+    if string.length(data) > FILE_LIMIT { return "", "StreamTooLong" }
+    return data, ""
+}
+
+find_nl_(data: string, from: int) -> int {
+    return string.index_of_from(data, "\n", from)
+}
+
+read(cp: ptr, args: string) -> (int, string) {
+    c = cp as *Ctx
+    a = jsonx.parse(args)
+    if a == null || jsonx.kind(a, "path") != 3 { return 0, "expected { path: string, offset?: number, limit?: number }" }
+    if jsonx.has(a, "offset") == 1 && jsonx.kind(a, "offset") != 2 { return 0, "expected { path: string, offset?: number, limit?: number }" }
+    if jsonx.has(a, "limit") == 1 && jsonx.kind(a, "limit") != 2 { return 0, "expected { path: string, offset?: number, limit?: number }" }
+    raw = jsonx.str_or(a, "path", "")
+    offset = jsonx.long_or(a, "offset", 1)
+    limit = jsonx.long_or(a, "limit", 2000)
+    if offset < 0 || limit < 0 { return 0, "expected { path: string, offset?: number, limit?: number }" }
+    path, perr = resolve_(c, raw)
+    if perr != "" { return 0, perr }
+    fd, lerr = file_state.lock(c.nib_home, path, c.cancel)
+    if lerr != "" { return 0, lerr }
+    st = sysgap.new_stat()
+    src = sysgap.stat(path, 1, st)
+    if src != 0 {
+        file_state.unlock(fd)
+        return 0, "${raw}: ${sysgap.errname(src)}"
+    }
+    data, rerr = read_file_(path)
+    if rerr != "" {
+        file_state.unlock(fd)
+        return 0, "${raw}: ${rerr}"
+    }
+    n = string.length(data)
+    start = 0
+    line = 1 as long
+    while line < offset && start < n {
+        nl = find_nl_(data, start)
+        if nl < 0 { start = n } else { start = nl + 1 }
+        line = line + 1
+    }
+    end = start
+    k = 0 as long
+    while k < limit && end < n {
+        nl = find_nl_(data, end)
+        if nl < 0 { end = n } else { end = nl + 1 }
+        k = k + 1
+    }
+    next = "null"
+    if end < n { next = "${line + k}" }
+    result = "{\"text\":${jsonx.quote(string.substring(data, start, end))},\"next_offset\":${next}}"
+    file_state.remember_stat(c.state, path, st)
+    file_state.unlock(fd)
+    return 1, result
+}
+
+// Non-overlapping occurrences of needle (non-empty) in hay.
+count_occurrences(hay: string, needle: string) -> int {
+    count = 0
+    at = 0
+    nn = string.length(needle)
+    while true {
+        i = string.index_of_from(hay, needle, at)
+        if i < 0 { break }
+        count = count + 1
+        at = i + nn
+    }
+    return count
+}
+
+replace_all(hay: string, needle: string, with: string) -> string {
+    b = strbuilder.new(string.length(hay) + 16)
+    at = 0
+    nn = string.length(needle)
+    while true {
+        i = string.index_of_from(hay, needle, at)
+        if i < 0 { break }
+        strbuilder.append(b, string.substring(hay, at, i))
+        strbuilder.append(b, with)
+        at = i + nn
+    }
+    strbuilder.append(b, string.substring(hay, at, string.length(hay)))
+    return strbuilder.finish(b)
+}
+
+parent_dirs_(path: string) -> string {
+    parent = atomic_file.dirname(path)
+    if fs.exists(parent) == 1 { return "" }
+    e = fs.mkdir_p(parent)
+    if e != "" {
+        // the error name of the first component that cannot be made
+        st = sysgap.new_stat()
+        p = parent
+        while p != "/" {
+            rc = sysgap.stat(p, 1, st)
+            if rc == 0 {
+                if (st as *sysgap.Stat).kind != sysgap.KIND_DIR { return "${parent}: NotDir" }
+                return "${parent}: AccessDenied"
+            }
+            p = atomic_file.dirname(p)
+        }
+        return "${parent}: AccessDenied"
+    }
+    return ""
+}
+
+edit(cp: ptr, args: string) -> (int, string) {
+    c = cp as *Ctx
+    usage = "expected { path: string, old_text: string, new_text: string, all?: boolean }"
+    a = jsonx.parse(args)
+    if a == null || jsonx.kind(a, "path") != 3 || jsonx.kind(a, "old_text") != 3 || jsonx.kind(a, "new_text") != 3 { return 0, usage }
+    if jsonx.has(a, "all") == 1 && jsonx.kind(a, "all") != 1 { return 0, usage }
+    raw = jsonx.str_or(a, "path", "")
+    old_text = jsonx.str_or(a, "old_text", "")
+    new_text = jsonx.str_or(a, "new_text", "")
+    all = jsonx.bool_or(a, "all", 0)
+    path, perr = resolve_(c, raw)
+    if perr != "" { return 0, perr }
+    why = blocked_(c, path)
+    if why != "" { return 0, "${raw}: ${why}" }
+    fd, lerr = file_state.lock(c.nib_home, path, c.cancel)
+    if lerr != "" { return 0, lerr }
+    if canceled_(c) == 1 {
+        file_state.unlock(fd)
+        return 0, "Canceled"
+    }
+    if string.length(old_text) == 0 {
+        file_state.unlock(fd)
+        return 0, "old_text is empty; use write to create a file"
+    }
+    data, rerr = read_file_(path)
+    if rerr != "" {
+        file_state.unlock(fd)
+        return 0, "${raw}: ${rerr}"
+    }
+    count = count_occurrences(data, old_text)
+    if count == 0 {
+        file_state.unlock(fd)
+        return 0, "old_text not found in ${raw}"
+    }
+    if count > 1 && all == 0 {
+        file_state.unlock(fd)
+        return 0, "old_text matches ${count} times in ${raw}; include more surrounding text or pass all: true"
+    }
+    out = replace_all(data, old_text, new_text)
+    written = sysgap.new_stat()
+    werr = atomic_file.replace(path, out, 438, 0, 0, written)
+    if werr != "" {
+        file_state.unlock(fd)
+        return 0, "${raw}: ${werr}"
+    }
+    file_state.remember_stat(c.state, path, written)
+    if c.has_on_change == 1 { call(c.on_change, path, 1, data, out, 1) }
+    file_state.unlock(fd)
+    return 1, "{\"replaced\":${count}}"
+}
+
+write(cp: ptr, args: string) -> (int, string) {
+    c = cp as *Ctx
+    a = jsonx.parse(args)
+    if a == null || jsonx.kind(a, "path") != 3 || jsonx.kind(a, "content") != 3 { return 0, "expected { path: string, content: string }" }
+    raw = jsonx.str_or(a, "path", "")
+    content = jsonx.str_or(a, "content", "")
+    path, perr = resolve_(c, raw)
+    if perr != "" { return 0, perr }
+    why = blocked_(c, path)
+    if why != "" { return 0, "${raw}: ${why}" }
+    fd, lerr = file_state.lock(c.nib_home, path, c.cancel)
+    if lerr != "" { return 0, lerr }
+    if canceled_(c) == 1 {
+        file_state.unlock(fd)
+        return 0, "Canceled"
+    }
+    current = sysgap.new_stat()
+    rc = sysgap.stat(path, 1, current)
+    if rc == 0 {
+        if file_state.changed(c.state, path, current) == 1 {
+            file_state.unlock(fd)
+            return 0, "${raw} changed since this session last read or wrote it (by bash, a background agent, or the user); read it again before overwriting"
+        }
+    } else if sysgap.errname(rc) != "FileNotFound" {
+        file_state.unlock(fd)
+        return 0, "${raw}: ${sysgap.errname(rc)}"
+    }
+    tracked = 1
+    has_before = 0
+    before = ""
+    if rc == 0 {
+        b, berr = read_file_(path)
+        if berr != "" { tracked = 0 } else {
+            before = b
+            has_before = 1
+        }
+    }
+    derr = parent_dirs_(path)
+    if derr != "" {
+        file_state.unlock(fd)
+        return 0, derr
+    }
+    written = sysgap.new_stat()
+    werr = atomic_file.replace(path, content, 438, 0, 0, written)
+    if werr != "" {
+        file_state.unlock(fd)
+        return 0, "${raw}: ${werr}"
+    }
+    file_state.remember_stat(c.state, path, written)
+    if c.has_on_change == 1 { call(c.on_change, path, has_before, before, content, tracked) }
+    file_state.unlock(fd)
+    return 1, "{\"bytes\":${string.length(content)}}"
+}

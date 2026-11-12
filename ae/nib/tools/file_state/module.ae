@@ -1,0 +1,161 @@
+// tools.file_state: the Session's observed file versions and the
+// cross-process path locks (upstream src/tools/file_state.zig). A State is
+// an instance (inode, size and nanosecond mtime by canonical path), guarded
+// by its own lock; lock() takes the advisory lock in $NIB_HOME/locks named
+// by the canonical path's SHA-256.
+
+import std.string
+import std.list
+import std.map
+import std.fs
+import std.cryptography
+import std.sync
+import nib.lock
+import nib.sysgap
+
+exports(State, Version, new, remember, remember_stat, changed, export_versions, import_versions,
+        version_of, count, lock_path, lock, unlock)
+
+struct Version {
+    ino: long
+    size: long
+    mtime_ns: long
+}
+
+struct State {
+    guard: ptr        // nib.lock
+    seen: ptr         // map: path -> *Version
+    keys: ptr         // list of paths, insertion order
+}
+
+new() -> ptr {
+    s = heap.new(State)
+    s.guard = lock.new()
+    s.seen = map.map_new()
+    s.keys = list.list_new()
+    return s as ptr
+}
+
+version_of(stp: ptr) -> ptr {
+    st = stp as *sysgap.Stat
+    v = heap.new(Version)
+    v.ino = st.ino
+    v.size = st.size
+    v.mtime_ns = st.mtime_ns
+    return v as ptr
+}
+
+put_(s: *State, path: string, v: @keep ptr) {
+    if map.map_has(s.seen, path) == 0 { list.list_add(s.keys, path) }
+    map.map_put(s.seen, path, v)
+}
+
+remember(sp: ptr, path: string, v: @keep ptr) {
+    s = sp as *State
+    lock.acquire(s.guard)
+    put_(s, path, v)
+    lock.release(s.guard)
+}
+
+// remember from a *sysgap.Stat
+remember_stat(sp: ptr, path: string, stp: ptr) { remember(sp, path, version_of(stp)) }
+
+count(sp: ptr) -> int { return list.list_size((sp as *State).keys) }
+
+// 1 if path was observed and its version differs from stp's.
+changed(sp: ptr, path: string, stp: ptr) -> int {
+    s = sp as *State
+    lock.acquire(s.guard)
+    r = 0
+    if map.map_has(s.seen, path) == 1 {
+        b = map.map_get_raw(s.seen, path) as *Version
+        st = stp as *sysgap.Stat
+        if b.ino != st.ino || b.size != st.size || b.mtime_ns != st.mtime_ns { r = 1 }
+    }
+    lock.release(s.guard)
+    return r
+}
+
+// A copy: list of [path, *Version] pairs as two parallel lists in a map-free form.
+export_versions(sp: ptr) -> ptr {
+    s = sp as *State
+    out = list.list_new()
+    lock.acquire(s.guard)
+    n = list.list_size(s.keys)
+    i = 0
+    while i < n {
+        k, _ge = list.get_string(s.keys, i)
+        b = map.map_get_raw(s.seen, k) as *Version
+        v = heap.new(Version)
+        v.ino = b.ino
+        v.size = b.size
+        v.mtime_ns = b.mtime_ns
+        list.list_add(out, string.copy(k))
+        list.list_add(out, v as ptr)
+        i = i + 1
+    }
+    lock.release(s.guard)
+    return out
+}
+
+import_versions(sp: ptr, versions: ptr) {
+    s = sp as *State
+    lock.acquire(s.guard)
+    n = list.list_size(versions)
+    i = 0
+    while i + 1 < n {
+        k0, _ge = list.get_string(versions, i)
+        k = string.copy(k0)
+        b = list.list_get_raw(versions, i + 1) as *Version
+        v = heap.new(Version)
+        v.ino = b.ino
+        v.size = b.size
+        v.mtime_ns = b.mtime_ns
+        put_(s, k, v as ptr)
+        i = i + 2
+    }
+    lock.release(s.guard)
+}
+
+lock_path(nib_home: string, path: string) -> string {
+    h, _e = cryptography.sha256_hex(string.bytes(path))
+    return "${nib_home}/locks/${h}"
+}
+
+// The advisory lock on path's lock file: (fd, "") or (-1, error name).
+// "Canceled" once cancel (a std.sync cell, may be null) is set.
+lock(nib_home: string, path: string, cancel: ptr) -> (int, string) {
+    if canceled_(cancel) == 1 { return -1, "Canceled" }
+    _m = fs.mkdir_p("${nib_home}/locks")
+    fd = sysgap.lock_open(lock_path(nib_home, path))
+    if fd < 0 { return -1, sysgap.errname(fd) }
+    while true {
+        if canceled_(cancel) == 1 {
+            sysgap.close(fd)
+            return -1, "Canceled"
+        }
+        got = sysgap.try_lock(fd)
+        if got == 1 { break }
+        if got < 0 {
+            sysgap.close(fd)
+            return -1, sysgap.errname(got)
+        }
+        sleep(20)
+    }
+    if canceled_(cancel) == 1 {
+        sysgap.close(fd)
+        return -1, "Canceled"
+    }
+    // Lock files stay linked: unlinking lets waiters lock different inodes.
+    return fd, ""
+}
+
+unlock(fd: int) { if fd >= 0 { sysgap.close(fd) } }
+
+canceled_(cancel: ptr) -> int {
+    if cancel == null { return 0 }
+    if sync_load_(cancel) != 0 { return 1 }
+    return 0
+}
+
+sync_load_(c: ptr) -> long { return sync.atomic_load(c) }
