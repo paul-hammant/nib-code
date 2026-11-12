@@ -1,0 +1,182 @@
+// tools.search: the grep and glob tool entries (upstream src/tools/search.zig).
+//
+//   grep(args_json, cred_paths, cancel) -> (1, result JSON) | (0, error text)
+//   glob(args_json, cred_paths, cancel) -> (1, result JSON) | (0, error text)
+//
+// `cred_paths` is a std.list of canonical absolute credential paths that are
+// never listed, entered or searched (upstream Tools.credentialPaths), or null.
+// `cancel` is a std.sync cell (nonzero cancels), or null.
+//
+// grep -> { "matches": [{ "path", "line", "column", "text", "before"?, "after"? }], "truncated" }
+// glob -> { "paths": [...], "truncated" }
+
+import std.json
+import std.string
+import std.list
+import std.strbuilder
+import nib.jsonx
+import nib.tools.walk
+import nib.tools.grep
+
+exports(grep, glob)
+
+const GREP_USAGE = "expected { pattern: string, path?: string, glob?: string, ignore_case?: boolean, literal?: boolean, context?: number, limit?: number }"
+const GLOB_USAGE = "expected { pattern: string, path?: string, limit?: number }"
+const INT_MAX = 2147483647
+
+// 1 when member `key` is absent or of kind `want` (a json.JSON_* kind, or
+// also null when null_ok).
+member_ok_(o: ptr, key: string, want: int, null_ok: int) -> int {
+    k = jsonx.kind(o, key)
+    if k == jsonx.KIND_MISSING || k == want { return 1 }
+    if null_ok != 0 && k == json.JSON_NULL { return 1 }
+    return 0
+}
+
+// A non-negative integral number member, or `d` when absent; -1 when present but not one.
+count_or_(o: ptr, key: string, d: int) -> int {
+    k = jsonx.kind(o, key)
+    if k == jsonx.KIND_MISSING { return d }
+    if k != json.JSON_NUMBER { return -1 }
+    n = jsonx.num_or(o, key, -1.0)
+    if n < 0.0 { return -1 }
+    if n >= 2147483647.0 { return INT_MAX }
+    whole = n as int
+    if (whole as float) != n { return -1 }
+    return whole
+}
+
+fail_(text: string) -> (int, string) { return 0, text }
+
+// First 200 bytes of `pattern`, cut back to a UTF-8 boundary.
+preview_(pattern: string) -> string {
+    n = string.length(pattern)
+    end = n
+    if end > 200 { end = 200 }
+    while end < n && end > 0 && (string.char_at(pattern, end) & 192) == 128 { end = end - 1 }
+    return string.substring(pattern, 0, end)
+}
+
+strings_json_(sb: ptr, items: ptr) {
+    strbuilder.append(sb, "[")
+    n = list.list_size(items)
+    i = 0
+    while i < n {
+        if i > 0 { strbuilder.append(sb, ",") }
+        s, _e = list.get_string(items, i)
+        strbuilder.append(sb, jsonx.quote(s))
+        i = i + 1
+    }
+    strbuilder.append(sb, "]")
+}
+
+grep(args: string, cred_paths: @keep ptr, cancel: @keep ptr) -> (int, string) {
+    a = jsonx.parse(args)
+    if a == null { return fail_(GREP_USAGE) }
+    defer jsonx.free(a)
+    if json.json_type(a) != json.JSON_OBJECT { return fail_(GREP_USAGE) }
+    if jsonx.kind(a, "pattern") != json.JSON_STRING { return fail_(GREP_USAGE) }
+    if member_ok_(a, "path", json.JSON_STRING, 0) == 0 { return fail_(GREP_USAGE) }
+    if member_ok_(a, "glob", json.JSON_STRING, 1) == 0 { return fail_(GREP_USAGE) }
+    if member_ok_(a, "ignore_case", json.JSON_BOOL, 0) == 0 { return fail_(GREP_USAGE) }
+    if member_ok_(a, "literal", json.JSON_BOOL, 0) == 0 { return fail_(GREP_USAGE) }
+    context = count_or_(a, "context", 0)
+    limit = count_or_(a, "limit", 100)
+    if context < 0 || limit < 0 { return fail_(GREP_USAGE) }
+
+    pattern = jsonx.str_or(a, "pattern", "")
+    o = grep.options(pattern)
+    o.path = jsonx.str_or(a, "path", ".")
+    if jsonx.kind(a, "glob") == json.JSON_STRING { grep.set_glob(o, jsonx.str_or(a, "glob", "")) }
+    o.ignore_case = jsonx.bool_or(a, "ignore_case", 0)
+    o.literal = jsonx.bool_or(a, "literal", 0)
+    o.context = context
+    o.limit = limit
+    r, err, reason = grep.search(o, cred_paths, cancel)
+    path = o.path
+    grep.free_options(o)
+    if err != "" {
+        if err == "InvalidPattern" {
+            return fail_("invalid pattern ${jsonx.quote(preview_(pattern))}: ${reason}")
+        }
+        if err == "Canceled" { return fail_("canceled") }
+        if err == "CredentialAccessDenied" { return fail_("CredentialAccessDenied") }
+        return fail_("${path}: ${err}")
+    }
+    res = r as *grep.Result
+    sb = strbuilder.new(256)
+    strbuilder.append(sb, "{\"matches\":[")
+    n = list.list_size(res.matches)
+    i = 0
+    while i < n {
+        m = list.list_get_raw(res.matches, i) as *grep.Match
+        if i > 0 { strbuilder.append(sb, ",") }
+        strbuilder.append(sb, "{\"path\":")
+        strbuilder.append(sb, jsonx.quote(m.path))
+        strbuilder.append(sb, ",\"line\":")
+        strbuilder.append_int(sb, m.line)
+        strbuilder.append(sb, ",\"column\":")
+        strbuilder.append_int(sb, m.column)
+        strbuilder.append(sb, ",\"text\":")
+        strbuilder.append(sb, jsonx.quote(m.text))
+        if m.before != null {
+            strbuilder.append(sb, ",\"before\":")
+            strings_json_(sb, m.before)
+        }
+        if m.after != null {
+            strbuilder.append(sb, ",\"after\":")
+            strings_json_(sb, m.after)
+        }
+        strbuilder.append(sb, "}")
+        i = i + 1
+    }
+    strbuilder.append(sb, "],\"truncated\":")
+    if res.truncated != 0 { strbuilder.append(sb, "true") } else { strbuilder.append(sb, "false") }
+    strbuilder.append(sb, "}")
+    grep.release(r)
+    return 1, strbuilder.finish(sb)
+}
+
+glob(args: string, cred_paths: @keep ptr, cancel: @keep ptr) -> (int, string) {
+    a = jsonx.parse(args)
+    if a == null { return fail_(GLOB_USAGE) }
+    defer jsonx.free(a)
+    if json.json_type(a) != json.JSON_OBJECT { return fail_(GLOB_USAGE) }
+    if jsonx.kind(a, "pattern") != json.JSON_STRING { return fail_(GLOB_USAGE) }
+    if member_ok_(a, "path", json.JSON_STRING, 0) == 0 { return fail_(GLOB_USAGE) }
+    limit = count_or_(a, "limit", 1000)
+    if limit < 0 { return fail_(GLOB_USAGE) }
+    path = jsonx.str_or(a, "path", ".")
+    pattern = jsonx.str_or(a, "pattern", "")
+    if string.starts_with(pattern, "./") != 0 { pattern = string.substring(pattern, 2, string.length(pattern)) }
+
+    wo = walk.options()
+    walk.set_deny(wo, cred_paths)
+    walk.set_cancel(wo, cancel)
+    walk.set_filter(wo, pattern)
+    walk.set_max(wo, limit as long)
+    found, err = walk.files(path, wo)
+    walk.free_options(wo)
+    if err != "" {
+        if err == "Canceled" { return fail_("canceled") }
+        if err == "CredentialAccessDenied" { return fail_("CredentialAccessDenied") }
+        return fail_("${path}: ${err}")
+    }
+    n = list.list_size(found)
+    shown = n
+    if shown > limit { shown = limit }
+    sb = strbuilder.new(256)
+    strbuilder.append(sb, "{\"paths\":[")
+    i = 0
+    while i < shown {
+        if i > 0 { strbuilder.append(sb, ",") }
+        f = list.list_get_raw(found, i) as *walk.File
+        strbuilder.append(sb, jsonx.quote(f.path))
+        i = i + 1
+    }
+    strbuilder.append(sb, "],\"truncated\":")
+    if n > limit { strbuilder.append(sb, "true") } else { strbuilder.append(sb, "false") }
+    strbuilder.append(sb, "}")
+    walk.release(found)
+    return 1, strbuilder.finish(sb)
+}

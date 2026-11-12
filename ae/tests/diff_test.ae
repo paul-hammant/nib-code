@@ -1,0 +1,36 @@
+// Ports src/tools/diff.zig's tests.
+import std.spec
+import std.string
+import nib.tools.diff
+
+expect_diff_(before: string, after: string, added: int, removed: int, want: string) {
+    s = diff.compare(before, after)
+    spec.assert_str_eq(s.diff, want, "diff")
+    spec.assert_eq(s.added, added, "added")
+    spec.assert_eq(s.removed, removed, "removed")
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tools.diff") {
+        spec.it("line diff with context and gaps") callback {
+            expect_diff_("a\nb\nc\nd\ne\nf\ng\n", "a\nB\nc\nd\ne\nf\nG\n", 2, 2, " a\n-b\n+B\n c\n…\n f\n-g\n+G\n")
+            expect_diff_("", "x\ny\n", 2, 0, "+x\n+y\n")
+            expect_diff_("x\n", "", 0, 1, "-x\n")
+            expect_diff_("same\n", "same\n", 0, 0, "")
+            expect_diff_("a\nb\nc\n", "a\nc\n", 0, 1, " a\n-b\n c\n")
+        }
+        spec.it("long diffs are cut with a count of the rest") callback {
+            after = ""
+            i = 0
+            while i < 250 {
+                after = "${after}line ${i}\n"
+                i = i + 1
+            }
+            s = diff.compare("", after)
+            spec.assert_eq(s.added, 250, "added")
+            spec.assert_eq(string.ends_with(s.diff, "+line 199\n… 50 more lines\n"), 1, "cut")
+        }
+    }
+    return spec.run_summary(fw)
+}

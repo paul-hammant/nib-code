@@ -1,0 +1,542 @@
+// tools.grep: the grep engine (upstream src/tools/grep.zig and regex.zig).
+//
+// Upstream matches with QuickJS's libregexp. Here the matching is a JS
+// RegExp inside a small PRIVATE contrib.quickjs runtime, made per search on
+// the calling thread and disposed at its end (it is not the Run's sandbox),
+// so the syntax is JavaScript's. Files are copied into the runtime as a
+// Uint8Array; the JS side decodes them the way upstream does (ASCII or
+// invalid UTF-8: the bytes as Latin-1; valid non-ASCII UTF-8: UTF-16),
+// finds the first match per line, and answers line numbers and UTF-8 byte
+// columns. Everything else (clipping, context, limits) is plain Aether.
+//
+// Differences from upstream are listed in the report that came with this
+// port: the search is single-threaded (upstream: up to 8 workers), and a
+// running regex cannot be interrupted by the cancel cell, only bounded by
+// quickjs.set_time_limit (contrib.quickjs has no host-controlled interrupt,
+// asks/aether-quickjs-async-eval-and-interrupt.md).
+
+import std.string
+import std.list
+import std.fs
+import std.sync
+import std.strbuilder
+import contrib.quickjs
+import nib.tools.walk
+
+exports(options, set_glob, free_options, search, release, clip, escape,
+        matcher_new, matcher_free, matcher_scan, matcher_set_time_limit,
+        Options, Match, Result, Snippet, Hit, Matcher,
+        MAX_LINE, MAX_FILE, SCAN_LIMIT_MS)
+
+const MAX_LINE = 500
+const MAX_FILE = 16777216
+// Bounds one file's regex run: the only way to stop a catastrophic pattern.
+const SCAN_LIMIT_MS = 10000
+const NO_LIMIT = 4611686018427387904
+
+struct Options {
+    pattern: string
+    path: string
+    has_glob: int
+    glob: string
+    ignore_case: int
+    literal: int
+    context: int
+    limit: int
+}
+
+struct Match {
+    path: string
+    line: int
+    column: int
+    text: string
+    before: ptr     // list of strings, or null
+    after: ptr
+}
+
+struct Result {
+    matches: ptr    // list of *Match
+    truncated: int
+}
+
+struct Snippet {
+    text: string
+    start: int
+}
+
+struct Hit {
+    line: int
+    offset: int
+}
+
+struct Matcher {
+    q: ptr
+    cancel: ptr
+    limit_ms: int
+}
+
+options(pattern: string) -> *Options {
+    o = heap.new(Options)
+    o.pattern = pattern
+    o.path = "."
+    o.has_glob = 0
+    o.glob = ""
+    o.ignore_case = 0
+    o.literal = 0
+    o.context = 0
+    o.limit = 100
+    return o
+}
+
+set_glob(o: *Options, g: string) {
+    o.glob = g
+    o.has_glob = 1
+}
+
+free_options(o: *Options) { heap.free(o) }
+
+// ---- the matcher: a private JS runtime holding one compiled RegExp ----
+
+js_source_() -> string {
+    return <<JS
+var re = null, needle = null;
+function init(p, ic, lit) {
+  if (lit && !ic) { needle = unescape(encodeURIComponent(p)); return ''; }
+  var src = lit ? p.replace(/[\\^$.*+?()[\]{}|\/]/g, '\\$&') : p;
+  try { re = new RegExp(src, ic ? 'gmi' : 'gm'); } catch (e) { return String(e.message); }
+  return '';
+}
+function latin1(u8) {
+  var n = u8.length;
+  if (n <= 8192) return String.fromCharCode.apply(null, u8);
+  var parts = [];
+  for (var i = 0; i < n; i += 8192) parts.push(String.fromCharCode.apply(null, u8.subarray(i, i + 8192)));
+  return parts.join('');
+}
+function u16len(s, a, b) {
+  var bytes = 0;
+  for (var i = a; i < b; i++) {
+    var c = s.charCodeAt(i);
+    bytes += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0xD800 ? 3 : c < 0xDC00 ? 0 : c < 0xE000 ? 4 : 3;
+  }
+  return bytes;
+}
+function scan(u8, limit) {
+  var s = latin1(u8), wide = false;
+  if (needle === null && /[^\x00-\x7f]/.test(s)) {
+    try { s = decodeURIComponent(escape(s)); wide = true; } catch (e) {}
+  }
+  var out = [], line = 1, counted = 0, from = 0, n = s.length, max = limit * 2;
+  while (out.length < max) {
+    var at;
+    if (needle !== null) {
+      at = s.indexOf(needle, from);
+    } else {
+      if (from > n) break;
+      re.lastIndex = from;
+      var m = re.exec(s);
+      at = m === null ? -1 : m.index;
+    }
+    if (at < 0) break;
+    var c = 0, last = -1, p = counted;
+    while (true) {
+      p = s.indexOf('\n', p);
+      if (p === -1 || p >= at) break;
+      c++; last = p; p++;
+    }
+    line += c;
+    var start = last >= 0 ? last + 1 : counted;
+    out.push(line, wide ? u16len(s, start, at) : at - start);
+    var nl = s.indexOf('\n', at);
+    if (nl < 0) break;
+    line++; counted = nl + 1; from = nl + 1;
+    if (from >= n) break;
+  }
+  return out.join(',');
+}
+JS
+}
+
+// A matcher for `pattern`: (matcher, "") or (null, the reason the pattern is
+// invalid). `cancel` is a std.sync cell polled before each scan (or null).
+// Free with matcher_free, on the same thread.
+matcher_new(pattern: string, ignore_case: int, literal: int, cancel: @keep ptr) -> (ptr, string) {
+    q = quickjs.runtime(1048576, 0)
+    if q == null { return null, "cannot create the regex engine" }
+    _v, err = quickjs.eval(q, js_source_(), "<grep>")
+    if err != "" {
+        quickjs.dispose(q)
+        return null, err
+    }
+    p = quickjs.new_string(q, pattern)
+    quickjs.set_global(q, "P", p)
+    quickjs.release(q, p)
+    ic = quickjs.new_bool(q, ignore_case)
+    quickjs.set_global(q, "IC", ic)
+    quickjs.release(q, ic)
+    lit = quickjs.new_bool(q, literal)
+    quickjs.set_global(q, "LIT", lit)
+    quickjs.release(q, lit)
+    r, rerr = quickjs.eval(q, "init(P, IC, LIT)", "<grep>")
+    if rerr != "" {
+        quickjs.dispose(q)
+        return null, rerr
+    }
+    reason = quickjs.to_string(q, r)
+    quickjs.release(q, r)
+    if reason != "" {
+        quickjs.dispose(q)
+        return null, reason
+    }
+    m = heap.new(Matcher)
+    m.q = q
+    m.cancel = cancel
+    m.limit_ms = SCAN_LIMIT_MS
+    return m as ptr, ""
+}
+
+matcher_free(mp: ptr) {
+    if mp == null { return }
+    m = mp as *Matcher
+    quickjs.dispose(m.q)
+    heap.free(m)
+}
+
+// Bound on one scan's regex run; 0 for none.
+matcher_set_time_limit(mp: ptr, ms: int) { (mp as *Matcher).limit_ms = ms }
+
+canceled_(cancel: ptr) -> int {
+    if cancel == null { return 0 }
+    if sync.atomic_load(cancel) != 0 { return 1 }
+    return 0
+}
+
+// The first match on each line of `data` (a string holding the file's bytes),
+// at most `limit`: (list of *Hit, "") or (null, "Canceled" | "Timeout" | the engine's error).
+// Hit.offset is the UTF-8 byte offset of the match in its line.
+matcher_scan(mp: ptr, data: string, limit: int) -> (ptr, string) {
+    m = mp as *Matcher
+    if canceled_(m.cancel) != 0 { return null, "Canceled" }
+    q = m.q
+    n = string.length(data)
+    bs = string.bytes(data)
+    u8 = quickjs.new_uint8array(q, bs as ptr, n)
+    if u8 < 0 { return null, "OutOfMemory" }
+    quickjs.set_global(q, "D", u8)
+    quickjs.release(q, u8)
+    lim = quickjs.new_int(q, limit)
+    quickjs.set_global(q, "L", lim)
+    quickjs.release(q, lim)
+    quickjs.set_time_limit(q, m.limit_ms)
+    r, err = quickjs.eval(q, "scan(D, L)", "<grep>")
+    quickjs.set_time_limit(q, 0)
+    undef = quickjs.new_undefined(q)
+    quickjs.set_global(q, "D", undef)
+    quickjs.release(q, undef)
+    if err != "" {
+        if string.contains(err, "interrupted") != 0 { return null, "Timeout" }
+        if string.contains(err, "out of memory") != 0 { return null, "OutOfMemory" }
+        return null, err
+    }
+    text = quickjs.to_string(q, r)
+    quickjs.release(q, r)
+    return parse_hits_(text), ""
+}
+
+parse_hits_(text: string) -> ptr {
+    hits = list.list_new()
+    n = string.length(text)
+    i = 0
+    line = 0
+    have_line = 0
+    cur = 0
+    while i <= n {
+        c = 44
+        if i < n { c = string.char_at(text, i) }
+        if c == 44 {
+            if n > 0 {
+                if have_line == 0 {
+                    line = cur
+                    have_line = 1
+                } else {
+                    h = heap.new(Hit)
+                    h.line = line
+                    h.offset = cur
+                    list.list_add(hits, h)
+                    have_line = 0
+                }
+            }
+            cur = 0
+        } else {
+            cur = cur * 10 + (c - 48)
+        }
+        i = i + 1
+    }
+    return hits
+}
+
+free_hits_(hits: ptr) {
+    n = list.list_size(hits)
+    i = 0
+    while i < n {
+        heap.free(list.list_get_raw(hits, i) as *Hit)
+        i = i + 1
+    }
+    list.list_free(hits)
+}
+
+// ---- clipping ----
+
+// `line` clipped to MAX_LINE bytes around byte offset `at`, with "…" where
+// text is omitted, never splitting a UTF-8 character.
+clip(line: string, at: int) -> *Snippet {
+    s = heap.new(Snippet)
+    n = string.length(line)
+    if n <= MAX_LINE {
+        s.text = line
+        s.start = 0
+        return s
+    }
+    ellipsis = "…"
+    el = string.length(ellipsis)
+    from = at - MAX_LINE / 2
+    if from < 0 { from = 0 }
+    start = from
+    if n - (MAX_LINE - el) < start { start = n - (MAX_LINE - el) }
+    while start < n && (string.char_at(line, start) & 192) == 128 { start = start + 1 }
+    prefix = ""
+    if start > 0 { prefix = ellipsis }
+    end = start + MAX_LINE - string.length(prefix)
+    if n < end { end = n }
+    if end < n { end = end - el }
+    while end < n && end > start && (string.char_at(line, end) & 192) == 128 { end = end - 1 }
+    suffix = ""
+    if end < n { suffix = ellipsis }
+    s.text = "${prefix}${string.substring(line, start, end)}${suffix}"
+    s.start = start
+    return s
+}
+
+special_(c: int) -> int {
+    // \ ^ $ . * + ? ( ) [ ] { } | /
+    if c == 92 || c == 94 || c == 36 || c == 46 || c == 42 || c == 43 || c == 63 { return 1 }
+    if c == 40 || c == 41 || c == 91 || c == 93 || c == 123 || c == 125 || c == 124 || c == 47 { return 1 }
+    return 0
+}
+
+// `literal` as a regex source matching it exactly.
+escape(literal: string) -> string {
+    n = string.length(literal)
+    sb = strbuilder.new(n + 8)
+    i = 0
+    while i < n {
+        c = string.char_at(literal, i)
+        if special_(c) != 0 { strbuilder.append_byte(sb, 92) }
+        strbuilder.append_byte(sb, c)
+        i = i + 1
+    }
+    return strbuilder.finish(sb)
+}
+
+// ---- searching ----
+
+// The matches of one file; a list of *Match (empty when the file is skipped).
+scan_file_(m: ptr, f: *walk.File, context: int, limit: int) -> (ptr, string) {
+    out = list.list_new()
+    _k, size, _mt, serr = fs.file_stat(f.absolute)
+    if serr != "" { return out, "" }
+    if size > MAX_FILE { return out, "" }
+    data, len, rerr = fs.read_binary(f.absolute)
+    if rerr != "" { return out, "" }
+    probe = len
+    if probe > 8192 { probe = 8192 }
+    i = 0
+    while i < probe {
+        if string.char_at(data, i) == 0 { return out, "" }
+        i = i + 1
+    }
+
+    hits, err = matcher_scan(m, data, limit)
+    if err != "" {
+        list.list_free(out)
+        return null, err
+    }
+    nh = list.list_size(hits)
+    if nh == 0 {
+        free_hits_(hits)
+        return out, ""
+    }
+
+    // line starts
+    nl = 0
+    i = 0
+    while i < len {
+        if string.char_at(data, i) == 10 { nl = nl + 1 }
+        i = i + 1
+    }
+    nstarts = nl + 1
+    starts = make([]int, nstarts)
+    starts[0] = 0
+    k = 1
+    i = 0
+    while i < len {
+        if string.char_at(data, i) == 10 {
+            starts[k] = i + 1
+            k = k + 1
+        }
+        i = i + 1
+    }
+    count = nstarts
+    if len > 0 && string.char_at(data, len - 1) == 10 { count = nstarts - 1 }
+
+    h = 0
+    while h < nh {
+        hit = list.list_get_raw(hits, h) as *Hit
+        h = h + 1
+        n = hit.line
+        snippet = clip(line_text_(data, len, starts, nstarts, n), hit.offset)
+        mm = heap.new(Match)
+        mm.path = f.path
+        mm.line = n
+        mm.column = hit.offset + 1
+        mm.text = snippet.text
+        heap.free(snippet)
+        mm.before = null
+        mm.after = null
+        if context != 0 {
+            first = 1
+            if n > context { first = n - context }
+            last = n + context
+            if count < last { last = count }
+            before = list.list_new()
+            j = first
+            while j < n {
+                s = clip(line_text_(data, len, starts, nstarts, j), 0)
+                list.list_add(before, s.text)
+                heap.free(s)
+                j = j + 1
+            }
+            after = list.list_new()
+            j = n + 1
+            while j <= last {
+                s = clip(line_text_(data, len, starts, nstarts, j), 0)
+                list.list_add(after, s.text)
+                heap.free(s)
+                j = j + 1
+            }
+            mm.before = before
+            mm.after = after
+        }
+        list.list_add(out, mm)
+    }
+    free_hits_(hits)
+    return out, ""
+}
+
+// Line `n` (1-based) without its line ending.
+line_text_(data: string, len: int, starts: int[], nstarts: int, n: int) -> string {
+    start = starts[n - 1]
+    end = len
+    if n < nstarts { end = starts[n] - 1 }
+    while end > start && string.char_at(data, end - 1) == 13 { end = end - 1 }
+    return string.substring(data, start, end)
+}
+
+// The matches of `o`: (result, "", "") or (null, error, message). error is
+// "InvalidPattern" (message says why), "Canceled", "CredentialAccessDenied",
+// "Timeout" or a filesystem error name. `deny` is a list of canonical
+// credential paths, `cancel` a std.sync cell; both may be null.
+search(o: *Options, deny: @keep ptr, cancel: @keep ptr) -> (ptr, string, string) {
+    m, reason = matcher_new(o.pattern, o.ignore_case, o.literal, cancel)
+    if m == null { return null, "InvalidPattern", reason }
+
+    wo = walk.options()
+    walk.set_deny(wo, deny)
+    walk.set_cancel(wo, cancel)
+    if o.has_glob != 0 { walk.set_filter(wo, o.glob) }
+    found_files, werr = walk.files(o.path, wo)
+    walk.free_options(wo)
+    if werr != "" {
+        matcher_free(m)
+        return null, werr, ""
+    }
+
+    limit = o.limit
+    if limit < 1 { limit = 1 }
+    nfiles = list.list_size(found_files)
+    slots = list.list_new()
+    found = 0
+    processed = 0
+    failure = ""
+    while found < limit && processed < nfiles && failure == "" {
+        if canceled_(cancel) != 0 {
+            failure = "Canceled"
+        } else {
+            f = list.list_get_raw(found_files, processed) as *walk.File
+            got, serr = scan_file_(m, f, o.context, limit)
+            if serr != "" {
+                failure = serr
+            } else {
+                list.list_add(slots, got)
+                found = found + list.list_size(got)
+                processed = processed + 1
+            }
+        }
+    }
+    matcher_free(m)
+
+    matches = list.list_new()
+    ns = list.list_size(slots)
+    i = 0
+    while i < ns {
+        slot = list.list_get_raw(slots, i)
+        nm = list.list_size(slot)
+        j = 0
+        while j < nm {
+            mm = list.list_get_raw(slot, j) as *Match
+            if failure == "" && list.list_size(matches) < limit {
+                list.list_add(matches, mm)
+            } else {
+                free_match_(mm)
+            }
+            j = j + 1
+        }
+        list.list_free(slot)
+        i = i + 1
+    }
+    list.list_free(slots)
+    walk.release(found_files)
+    if failure != "" {
+        release_matches_(matches)
+        return null, failure, ""
+    }
+    res = heap.new(Result)
+    res.matches = matches
+    res.truncated = 0
+    if found > limit || (found >= limit && processed < nfiles) { res.truncated = 1 }
+    return res as ptr, "", ""
+}
+
+free_match_(m: *Match) {
+    if m.before != null { list.list_free(m.before) }
+    if m.after != null { list.list_free(m.after) }
+    heap.free(m)
+}
+
+release_matches_(matches: ptr) {
+    n = list.list_size(matches)
+    i = 0
+    while i < n {
+        free_match_(list.list_get_raw(matches, i) as *Match)
+        i = i + 1
+    }
+    list.list_free(matches)
+}
+
+// Frees a search result.
+release(rp: ptr) {
+    if rp == null { return }
+    r = rp as *Result
+    release_matches_(r.matches)
+    heap.free(r)
+}

@@ -1,0 +1,365 @@
+// Ports the tests of upstream src/tools/grep.zig and src/tools/regex.zig (a2dd439).
+// The regex tests drive the matcher (the private JS runtime holding the
+// RegExp) instead of libregexp; positions are reported as (line, byte column).
+import std.spec
+import std.string
+import std.list
+import std.fs
+import std.sync
+import std.strbuilder
+import nib.tools.grep
+
+tmp_dir_() -> string {
+    d, err = fs.make_temp_dir("", "nibgrep")
+    spec.assert_str_eq(err, "", "make_temp_dir")
+    return d
+}
+
+put_(path: string, data: string) {
+    h, err = fs.open(path, "wb")
+    spec.assert_str_eq(err, "", "open ${path}")
+    fs.file_write_raw(h, data, string.length(data))
+    fs.close(h)
+}
+
+mkdirs_(path: string) { fs.mkdir_p(path) }
+
+rep_(text: string, count: int) -> string {
+    sb = strbuilder.new(string.length(text) * count + 8)
+    i = 0
+    while i < count {
+        strbuilder.append(sb, text)
+        i = i + 1
+    }
+    return strbuilder.finish(sb)
+}
+
+utf8_valid_(s: string) -> int {
+    n = string.length(s)
+    i = 0
+    while i < n {
+        c = string.char_at(s, i)
+        need = 0
+        if c < 128 {
+            need = 0
+        } else if c >= 194 && c <= 223 {
+            need = 1
+        } else if c >= 224 && c <= 239 {
+            need = 2
+        } else if c >= 240 && c <= 244 {
+            need = 3
+        } else {
+            return 0
+        }
+        if need > 0 && i + need > n - 1 { return 0 }
+        k = 1
+        while k <= need {
+            if (string.char_at(s, i + k) & 192) != 128 { return 0 }
+            k = k + 1
+        }
+        i = i + need + 1
+    }
+    return 1
+}
+
+ends_(s: string, suffix: string) -> int { return string.ends_with(s, suffix) }
+starts_(s: string, prefix: string) -> int { return string.starts_with(s, prefix) }
+
+fixture_(root: string) {
+    mkdirs_("${root}/.git")
+    mkdirs_("${root}/src")
+    mkdirs_("${root}/out")
+    put_("${root}/.gitignore", "out/\n")
+    put_("${root}/out/gen.zig", "fn hidden() void {}\n")
+    put_("${root}/src/a.zig", "const a = 1;\nfn alpha() void {}\r\n// 注释 TODO 中文\nfn beta() void {}\n")
+    put_("${root}/src/b.py", "def alpha():\n    pass\n")
+    put_("${root}/bin.dat", "fn \x00 binary\n")
+}
+
+// A search of `root` for `pattern`; the Result.
+run_(root: string, pattern: string, ic: int, lit: int, context: int, limit: int, glob: string) -> *grep.Result {
+    o = grep.options(pattern)
+    o.path = root
+    o.ignore_case = ic
+    o.literal = lit
+    o.context = context
+    o.limit = limit
+    if glob != "" { grep.set_glob(o, glob) }
+    r, err, msg = grep.search(o, null, null)
+    grep.free_options(o)
+    spec.assert_str_eq(err, "", "search ${pattern}: ${msg}")
+    return r as *grep.Result
+}
+
+match_at_(r: *grep.Result, i: int) -> *grep.Match { return list.list_get_raw(r.matches, i) as *grep.Match }
+count_(r: *grep.Result) -> int { return list.list_size(r.matches) }
+
+strs_eq_(l: ptr, want: string, msg: string) {
+    spec.assert_eq(list.list_size(l), 1, "${msg} length")
+    s, _e = list.get_string(l, 0)
+    spec.assert_str_eq(s, want, msg)
+}
+
+expect_snippet_(line: string, snip: *grep.Snippet) {
+    prefix = 0
+    if snip.start > 0 { prefix = 3 }
+    suffix = 0
+    if ends_(snip.text, "…") != 0 { suffix = 3 }
+    spec.assert_true(string.length(snip.text) <= 500, "within 500")
+    spec.assert_true(utf8_valid_(snip.text), "valid utf-8")
+    if prefix > 0 { spec.assert_true(starts_(snip.text, "…"), "prefix marker") }
+    body = string.substring(snip.text, prefix, string.length(snip.text) - suffix)
+    spec.assert_str_eq(body, string.substring(line, snip.start, snip.start + string.length(body)), "body is a slice of the line")
+    more = 0
+    if snip.start + string.length(body) < string.length(line) { more = 1 }
+    has_suffix = 0
+    if suffix > 0 { has_suffix = 1 }
+    spec.assert_eq(has_suffix, more, "suffix marker iff text omitted after")
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tools.grep") {
+        spec.it("grep finds regex matches in path order, skipping ignored and binary files") callback {
+            root = tmp_dir_()
+            fixture_(root)
+            s = run_(root, "^(fn|def) \\w+", 0, 0, 0, 100, "")
+            spec.assert_eq(count_(s), 3, "three matches")
+            spec.assert_true(ends_(match_at_(s, 0).path, "src/a.zig"), "first path")
+            spec.assert_eq(match_at_(s, 0).line, 2, "line")
+            spec.assert_str_eq(match_at_(s, 0).text, "fn alpha() void {}", "text without CR")
+            spec.assert_eq(match_at_(s, 1).line, 4, "second line")
+            spec.assert_true(ends_(match_at_(s, 2).path, "src/b.py"), "third path")
+            spec.assert_eq(s.truncated, 0, "not truncated")
+            grep.release(s)
+
+            limited = run_(root, "alpha", 0, 0, 0, 1, "*.zig")
+            spec.assert_eq(count_(limited), 1, "limited")
+            spec.assert_eq(limited.truncated, 0, "not truncated with glob")
+            grep.release(limited)
+
+            capped = run_(root, "alpha", 0, 0, 0, 1, "")
+            spec.assert_eq(capped.truncated, 1, "truncated")
+            grep.release(capped)
+            fs.remove_tree(root)
+        }
+        spec.it("grep handles UTF-8, literals, case and context") callback {
+            root = tmp_dir_()
+            fixture_(root)
+            file = "${root}/src/a.zig"
+            zh = run_(file, "注释.*中文", 0, 0, 1, 100, "")
+            spec.assert_eq(count_(zh), 1, "one")
+            spec.assert_eq(match_at_(zh, 0).line, 3, "line 3")
+            strs_eq_(match_at_(zh, 0).before, "fn alpha() void {}", "before")
+            strs_eq_(match_at_(zh, 0).after, "fn beta() void {}", "after")
+            grep.release(zh)
+
+            literal = run_(file, "alpha()", 0, 1, 0, 100, "")
+            spec.assert_eq(count_(literal), 1, "literal parens")
+            grep.release(literal)
+            folded = run_(file, "TODO", 1, 1, 0, 100, "")
+            spec.assert_eq(count_(folded), 1, "ignore case literal")
+            grep.release(folded)
+            lower = run_(file, "todo", 0, 0, 0, 100, "")
+            spec.assert_eq(count_(lower), 0, "case sensitive")
+            grep.release(lower)
+
+            o = grep.options("(")
+            o.path = file
+            r, err, msg = grep.search(o, null, null)
+            grep.free_options(o)
+            spec.assert_str_eq(err, "InvalidPattern", "invalid pattern")
+            spec.assert_true(string.length(msg) > 0, "reason")
+            spec.assert_null(r, "no result")
+            fs.remove_tree(root)
+        }
+        spec.it("grep centers long JSONL snippets on the first match in byte columns") callback {
+            root = tmp_dir_()
+            path = "${root}/session.jsonl"
+            prefixes = ["{\"text\":\"${rep_("a", 6000)}", "{\"text\":\"${rep_("中文😀", 600)}"]
+            pi = 0
+            while pi < 2 {
+                prefix = prefixes[pi]
+                line = "${prefix}SyntaxError then SyntaxError${rep_("末尾", 10)}\"}"
+                put_(path, "前文\r\n${line}\r\n后文\n")
+                variants = 0
+                while variants < 3 {
+                    pat = "Syntax[E]rror"
+                    ic = 0
+                    lit = 0
+                    if variants == 1 {
+                        pat = "SyntaxError"
+                        lit = 1
+                    }
+                    if variants == 2 {
+                        pat = "syntaxerror"
+                        lit = 1
+                        ic = 1
+                    }
+                    s = run_(path, pat, ic, lit, 1, 100, "")
+                    spec.assert_eq(count_(s), 1, "one match")
+                    m = match_at_(s, 0)
+                    spec.assert_eq(m.line, 2, "line")
+                    spec.assert_eq(m.column, string.length(prefix) + 1, "byte column")
+                    spec.assert_true(string.contains(m.text, "SyntaxError"), "text holds the hit")
+                    spec.assert_true(string.length(m.text) <= 500, "text bound")
+                    spec.assert_true(utf8_valid_(m.text), "valid utf-8")
+                    spec.assert_true(starts_(m.text, "…"), "starts with marker")
+                    strs_eq_(m.before, "前文", "before")
+                    strs_eq_(m.after, "后文", "after")
+                    spec.assert_eq(s.truncated, 0, "not truncated")
+                    grep.release(s)
+                    variants = variants + 1
+                }
+                pi = pi + 1
+            }
+            fs.remove_tree(root)
+        }
+        spec.it("grep reports byte columns for short, empty, zero-width and surrogate matches") callback {
+            root = tmp_dir_()
+            path = "${root}/text"
+            put_(path, "前行\n😀中文SyntaxError SyntaxError\r\n\nSyntaxError")
+            lit = 0
+            while lit < 2 {
+                s = run_(path, "SyntaxError", 0, lit, 0, 100, "")
+                spec.assert_eq(count_(s), 2, "two")
+                spec.assert_eq(match_at_(s, 0).line, 2, "line 2")
+                spec.assert_eq(match_at_(s, 0).column, 11, "column 11")
+                spec.assert_str_eq(match_at_(s, 0).text, "😀中文SyntaxError SyntaxError", "text")
+                spec.assert_eq(match_at_(s, 1).line, 4, "line 4")
+                spec.assert_eq(match_at_(s, 1).column, 1, "column 1")
+                grep.release(s)
+                lit = lit + 1
+            }
+            low = run_(path, "\\uDE00", 0, 0, 0, 100, "")
+            spec.assert_eq(count_(low), 1, "low surrogate")
+            spec.assert_eq(match_at_(low, 0).column, 1, "low surrogate maps to the character start")
+            grep.release(low)
+
+            empty = run_(path, "(?<=\n)^$", 0, 0, 0, 100, "")
+            spec.assert_eq(count_(empty), 1, "empty line")
+            spec.assert_eq(match_at_(empty, 0).line, 3, "empty line number")
+            spec.assert_eq(match_at_(empty, 0).column, 1, "empty column")
+            spec.assert_str_eq(match_at_(empty, 0).text, "", "empty text")
+            grep.release(empty)
+
+            tail = run_(path, "(?<=^SyntaxError)$", 0, 0, 0, 100, "")
+            spec.assert_eq(count_(tail), 1, "end of last line")
+            spec.assert_eq(match_at_(tail, 0).line, 4, "last line")
+            spec.assert_eq(match_at_(tail, 0).column, 12, "last column")
+            grep.release(tail)
+            fs.remove_tree(root)
+        }
+        spec.it("grep clips at UTF-8 boundaries within 500 bytes including omission markers") callback {
+            lines = [rep_("a", 500), rep_("a", 501), rep_("a", 2000), rep_("é中😀", 300)]
+            li = 0
+            while li < 4 {
+                line = lines[li]
+                n = string.length(line)
+                at = 0
+                while at <= n {
+                    snip = grep.clip(line, at)
+                    expect_snippet_(line, snip)
+                    spec.assert_true(snip.start <= at, "start before the hit")
+                    prefix = 0
+                    if snip.start > 0 { prefix = 3 }
+                    suffix = 0
+                    if ends_(snip.text, "…") != 0 { suffix = 3 }
+                    end = snip.start + string.length(snip.text) - prefix - suffix
+                    if at < n { spec.assert_true(at < end, "the hit is inside") }
+                    if n <= 500 {
+                        spec.assert_eq(snip.start, 0, "short lines verbatim")
+                        spec.assert_str_eq(snip.text, line, "short line text")
+                    }
+                    heap.free(snip)
+                    at = at + 1
+                }
+                li = li + 1
+            }
+            line = "SyntaxError${rep_("a", 6000)}"
+            snip = grep.clip(line, 0)
+            spec.assert_eq(snip.start, 0, "start 0")
+            spec.assert_str_eq(snip.text, "${string.substring(line, 0, 497)}…", "head window")
+        }
+        spec.it("grep keeps final multibyte matches when the tail window needs UTF-8 alignment") callback {
+            root = tmp_dir_()
+            path = "${root}/text"
+            prefixes = [rep_("中", 199), rep_("😀", 200), rep_("é", 300)]
+            pi = 0
+            while pi < 3 {
+                prefix = prefixes[pi]
+                put_(path, "${prefix}末")
+                lit = 0
+                while lit < 2 {
+                    s = run_(path, "末", 0, lit, 0, 100, "")
+                    spec.assert_eq(count_(s), 1, "one")
+                    m = match_at_(s, 0)
+                    spec.assert_eq(m.column, string.length(prefix) + 1, "column")
+                    spec.assert_true(ends_(m.text, "末"), "ends with the match")
+                    spec.assert_true(string.length(m.text) <= 500, "bound")
+                    spec.assert_true(utf8_valid_(m.text), "valid")
+                    spec.assert_true(starts_(m.text, "…"), "marker")
+                    grep.release(s)
+                    lit = lit + 1
+                }
+                pi = pi + 1
+            }
+            fs.remove_tree(root)
+        }
+        spec.it("grep skips binary files (NUL in the first 8 KiB) and files over 16 MiB") callback {
+            root = tmp_dir_()
+            put_("${root}/bin1", "needle\x00 binary\n")
+            put_("${root}/late", "needle\n${rep_("a", 9000)}\x00\n")
+            put_("${root}/exact", "needle\n${rep_("b", 16777216 - 7)}")
+            put_("${root}/over", "needle\n${rep_("b", 16777216 - 6)}")
+            s = run_(root, "needle", 0, 1, 0, 100, "")
+            spec.assert_eq(count_(s), 2, "late NUL and exactly 16 MiB are searched; binary and oversize are not")
+            spec.assert_true(ends_(match_at_(s, 0).path, "/exact"), "exact")
+            spec.assert_true(ends_(match_at_(s, 1).path, "/late"), "late")
+            grep.release(s)
+            fs.remove_tree(root)
+        }
+        // regex.zig
+        spec.it("JS regex over Latin-1 and UTF-16 text, with per-line anchors") callback {
+            m, err = grep.matcher_new("^fn \\w+\\(", 0, 0, null)
+            spec.assert_str_eq(err, "", "compiled")
+            hits, serr = grep.matcher_scan(m, "const x = 1;\nfn main() {}\n", 100)
+            spec.assert_str_eq(serr, "", "scan")
+            spec.assert_eq(list.list_size(hits), 1, "one hit")
+            h = list.list_get_raw(hits, 0) as *grep.Hit
+            spec.assert_eq(h.line, 2, "line 2 (offset 13 in the text)")
+            spec.assert_eq(h.offset, 0, "at the start of the line")
+            grep.matcher_free(m)
+
+            zh, zerr = grep.matcher_new("函数.*名字", 1, 0, null)
+            spec.assert_str_eq(zerr, "", "chinese compiled")
+            zhits, zserr = grep.matcher_scan(zh, "注释\n函数 fn 名字(", 100)
+            spec.assert_str_eq(zserr, "", "chinese scan")
+            spec.assert_eq(list.list_size(zhits), 1, "one chinese hit")
+            zhit = list.list_get_raw(zhits, 0) as *grep.Hit
+            spec.assert_eq(zhit.line, 2, "UTF-16 index 3 is line 2")
+            spec.assert_eq(zhit.offset, 0, "column")
+            grep.matcher_free(zh)
+
+            bad, berr = grep.matcher_new("(unclosed", 0, 0, null)
+            spec.assert_null(bad, "no matcher")
+            spec.assert_true(string.length(berr) > 0, "reason given")
+        }
+        spec.it("a set cancel cell stops a scan and a time limit interrupts catastrophic backtracking") callback {
+            cell = sync.atomic_new(1)
+            m, err = grep.matcher_new("(a+)+$", 0, 0, cell)
+            spec.assert_str_eq(err, "", "compiled")
+            hits, serr = grep.matcher_scan(m, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab", 100)
+            spec.assert_str_eq(serr, "Canceled", "canceled before running")
+            spec.assert_null(hits, "no hits")
+            sync.atomic_store(cell, 0)
+            grep.matcher_set_time_limit(m, 200)
+            hits2, serr2 = grep.matcher_scan(m, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab", 100)
+            spec.assert_str_eq(serr2, "Timeout", "runaway regex is bounded")
+            spec.assert_null(hits2, "no hits either")
+            grep.matcher_free(m)
+            sync.atomic_free(cell)
+        }
+    }
+    return spec.run_summary(fw)
+}

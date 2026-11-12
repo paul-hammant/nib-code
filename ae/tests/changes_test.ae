@@ -1,0 +1,119 @@
+// Ports src/tools/changes.zig's tests.
+import std.spec
+import std.string
+import std.list
+import nib.tools.diff
+import nib.tools.changes
+
+change_(l: ptr, i: int) -> *diff.Change { return list.list_get_raw(l, i) as *diff.Change }
+
+file_(l: ptr, i: int) -> *changes.File { return list.list_get_raw(l, i) as *changes.File }
+
+count_(s: string, needle: string) -> int {
+    n = 0
+    pos = 0
+    while true {
+        k = string.index_of_from(s, needle, pos)
+        if k < 0 { break }
+        n = n + 1
+        pos = k + string.length(needle)
+    }
+    return n
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tools.changes") {
+        spec.it("changes accumulate writes and reversals in first-seen path order") callback {
+            t = changes.new()
+            changes.record(t, "/project/a", 1, "old\n", "new\n")
+            changes.record(t, "/project/b", 0, "", "")
+            changes.record(t, "/project/a", 1, "new\n", "old\n")
+            changes.record(t, "/project/b", 1, "", "created\n")
+            changes.record(t, "/project/noop", 1, "same\n", "same\n")
+            cs = changes.take(t, "/project")
+            spec.assert_eq(list.list_size(cs), 2, "len")
+            spec.assert_str_eq(change_(cs, 0).path, "a", "path a")
+            spec.assert_eq(change_(cs, 0).added, 2, "a added")
+            spec.assert_eq(change_(cs, 0).removed, 2, "a removed")
+            spec.assert_eq(change_(cs, 0).created, 0, "a created")
+            spec.assert_str_eq(change_(cs, 0).diff, "-old\n+new\n…\n-new\n+old\n", "a diff")
+            spec.assert_str_eq(change_(cs, 1).path, "b", "path b")
+            spec.assert_eq(change_(cs, 1).added, 1, "b added")
+            spec.assert_eq(change_(cs, 1).removed, 0, "b removed")
+            spec.assert_eq(change_(cs, 1).created, 1, "b created")
+            spec.assert_str_eq(change_(cs, 1).diff, "+created\n", "b diff")
+            spec.assert_eq(list.list_size(changes.take(t, "/project")), 0, "taken once")
+        }
+        spec.it("diff preview stays bounded across repeated operations while totals accumulate") callback {
+            t = changes.new()
+            i = 0
+            while i < 250 {
+                changes.record(t, "/f", 1, "old\n", "new\n")
+                i = i + 1
+            }
+            cs = changes.take(t, "/project")
+            c = change_(cs, 0)
+            spec.assert_str_eq(c.path, "/f", "path")
+            spec.assert_eq(c.added, 250, "added")
+            spec.assert_eq(c.removed, 250, "removed")
+            spec.assert_eq(count_(c.diff, "+new\n"), 100, "+new")
+            spec.assert_eq(count_(c.diff, "-old\n"), 100, "-old")
+            spec.assert_eq(string.ends_with(c.diff, "… 300 more lines\n"), 1, "rest")
+        }
+        spec.it("diff preview combines already-truncated operations") callback {
+            t = changes.new()
+            text = ""
+            i = 0
+            while i < 250 {
+                text = "${text}line\n"
+                i = i + 1
+            }
+            changes.record(t, "/f", 0, "", text)
+            changes.record(t, "/f", 1, text, "")
+            cs = changes.take(t, "/project")
+            c = change_(cs, 0)
+            spec.assert_eq(c.added, 250, "added")
+            spec.assert_eq(c.removed, 250, "removed")
+            spec.assert_eq(c.created, 1, "created")
+            spec.assert_eq(string.ends_with(c.diff, "… 300 more lines\n"), 1, "rest")
+        }
+        spec.it("recovery records only this Turn's unique paths and distinguishes failure categories") callback {
+            r = changes.recovery_new(1)
+            changes.recovery_record(r, "/project/a.zig", 1, "x\n", "y\n")
+            changes.recovery_record(r, "/project/a.zig", 1, "y\n", "y\nz\n")
+            changes.recovery_record(r, "/project/b.zig", 0, "", "new\n")
+            changes.recovery_note_bash(r)
+            fl = changes.recovery_files(r, "/project")
+            spec.assert_eq(list.list_size(fl), 2, "len")
+            f0 = file_(fl, 0)
+            f1 = file_(fl, 1)
+            spec.assert_str_eq(f0.path, "a.zig", "p0")
+            spec.assert_eq(f0.added, 2, "a added")
+            spec.assert_eq(f0.removed, 1, "a removed")
+            spec.assert_str_eq(f1.path, "b.zig", "p1")
+            spec.assert_eq(f1.added, 1, "b added")
+            spec.assert_eq(f1.removed, 0, "b removed")
+            text = changes.recovery_hint(r, changes.REASON_CANCELED, "/project")
+            spec.assert_str_eq(text, "Canceled · edited: a.zig, b.zig · bash changes untracked · /undo to revert edit/write · type continue to resume", "hint")
+            changes.recovery_clear(r)
+            empty = changes.recovery_hint(r, changes.REASON_MODEL, "/project")
+            spec.assert_str_eq(empty, "model connection/request failed · no recorded edit/write changes · type continue to resume", "empty hint")
+            spec.assert_eq(changes.classify("StreamIdleTimeout", 0, changes.REASON_MODEL), changes.REASON_TIMEOUT, "timeout")
+            spec.assert_eq(changes.classify("ReadFailed", 1, changes.REASON_MODEL), changes.REASON_CANCELED, "canceled")
+            spec.assert_eq(changes.classify("TestScriptFailure", 0, changes.REASON_TOOL), changes.REASON_TOOL, "tool")
+        }
+        spec.it("extra (not upstream): disabled recovery records nothing, hints strip control bytes, step limit classifies") callback {
+            r = changes.recovery_new(0)
+            changes.recovery_record(r, "/p/a", 1, "x\n", "y\n")
+            changes.recovery_note_bash(r)
+            spec.assert_eq(list.list_size(changes.recovery_files(r, "/p")), 0, "disabled")
+            spec.assert_str_eq(changes.recovery_hint(r, changes.REASON_LIMIT, "/p"), "step limit reached · no recorded edit/write changes · type continue to resume", "limit hint")
+            r2 = changes.recovery_new(1)
+            changes.recovery_record(r2, "/p/a\tb", 1, "x\n", "y\n")
+            spec.assert_str_eq(changes.recovery_hint(r2, changes.REASON_TOOL, "/p"), "tool/script failed · edited: a b · /undo to revert edit/write · type continue to resume", "control")
+            spec.assert_eq(changes.classify("TooManySteps", 0, changes.REASON_MODEL), changes.REASON_LIMIT, "limit")
+        }
+    }
+    return spec.run_summary(fw)
+}

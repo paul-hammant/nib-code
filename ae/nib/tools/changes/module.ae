@@ -1,0 +1,236 @@
+// tools.changes: per-Run change tracking (upstream src/tools/changes.zig).
+// Tracker accumulates edit/write operations per path in first-seen order;
+// Recovery keeps this Turn's unique paths and failure categories. Both are
+// instances; the caller serializes access (no locking here).
+
+import std.string
+import std.strbuilder
+import std.list
+import nib.tools.diff
+
+exports(REASON_MODEL, REASON_TOOL, REASON_TIMEOUT, REASON_CANCELED, REASON_LIMIT,
+        Tracker, Entry, Recovery, Counts, File,
+        new, record, take, discard, free,
+        recovery_new, recovery_record, recovery_files, recovery_note_bash,
+        recovery_clear, recovery_hint, classify)
+
+const REASON_MODEL = 0
+const REASON_TOOL = 1
+const REASON_TIMEOUT = 2
+const REASON_CANCELED = 3
+const REASON_LIMIT = 4
+
+struct Entry {
+    path: string
+    added: int
+    removed: int
+    created: int
+    preview: *diff.Preview
+}
+
+struct Tracker {
+    entries: ptr   // list of *Entry, first-seen order
+}
+
+new() -> *Tracker {
+    t = heap.new(Tracker)
+    t.entries = list.list_new()
+    return t
+}
+
+// Path shown relative to cwd when inside it.
+shown_(path: string, cwd: string) -> string {
+    cl = string.length(cwd)
+    if string.starts_with(path, cwd) != 0 && string.length(path) > cl && string.char_at(path, cl) == 47 {
+        return string.substring(path, cl + 1, string.length(path))
+    }
+    return path
+}
+
+// before absent: has_before == 0 (before is then ignored).
+record(t: *Tracker, path: string, has_before: int, before: string, after: string) {
+    b = ""
+    if has_before != 0 { b = before }
+    stat = diff.compare(b, after)
+    if stat.added == 0 && stat.removed == 0 && has_before != 0 { return }
+    idx = -1
+    n = list.list_size(t.entries)
+    i = 0
+    while i < n {
+        if string.equals((list.list_get_raw(t.entries, i) as *Entry).path, path) != 0 {
+            idx = i
+            break
+        }
+        i = i + 1
+    }
+    if idx < 0 {
+        e = heap.new(Entry)
+        e.path = string.copy(path)
+        e.added = 0
+        e.removed = 0
+        e.created = 0
+        e.preview = diff.new_preview()
+        list.list_add_raw(t.entries, e)
+        idx = list.list_size(t.entries) - 1
+    }
+    entry = list.list_get_raw(t.entries, idx) as *Entry
+    diff.preview_append(entry.preview, stat.preview)
+    entry.added = entry.added + stat.added
+    entry.removed = entry.removed + stat.removed
+    if has_before == 0 { entry.created = 1 }
+}
+
+// Per-path changes (list of *diff.Change) in first-seen order; clears the tracker.
+take(t: *Tracker, cwd: string) -> ptr {
+    out = list.list_new()
+    n = list.list_size(t.entries)
+    i = 0
+    while i < n {
+        e = list.list_get_raw(t.entries, i) as *Entry
+        c = heap.new(diff.Change)
+        c.path = string.copy(shown_(e.path, cwd))
+        c.added = e.added
+        c.removed = e.removed
+        c.created = e.created
+        c.diff = diff.preview_format(e.preview)
+        list.list_add_raw(out, c)
+        i = i + 1
+    }
+    discard(t)
+    return out
+}
+
+discard(t: *Tracker) {
+    t.entries = list.list_new()
+}
+
+free(t: *Tracker) {
+    discard(t)
+}
+
+struct Counts {
+    path: string
+    added: int
+    removed: int
+}
+
+struct File {
+    path: string
+    added: int
+    removed: int
+}
+
+struct Recovery {
+    enabled: int
+    items: ptr     // list of *Counts, unique paths in first-change order
+    bash: int
+}
+
+recovery_new(enabled: int) -> *Recovery {
+    r = heap.new(Recovery)
+    r.enabled = enabled
+    r.items = list.list_new()
+    r.bash = 0
+    return r
+}
+
+classify(err: string, canceled: int, stage: int) -> int {
+    if canceled != 0 || string.equals(err, "Canceled") != 0 { return REASON_CANCELED }
+    match (err) {
+        "Timeout" -> { return REASON_TIMEOUT }
+        "TimedOut" -> { return REASON_TIMEOUT }
+        "StreamIdleTimeout" -> { return REASON_TIMEOUT }
+        "StreamContentTimeout" -> { return REASON_TIMEOUT }
+        "ModelRequestTimeout" -> { return REASON_TIMEOUT }
+        "TooManySteps" -> { return REASON_LIMIT }
+        _ -> { return stage }
+    }
+}
+
+recovery_record(r: *Recovery, path: string, has_before: int, before: string, after: string) {
+    if r.enabled == 0 { return }
+    b = ""
+    if has_before != 0 { b = before }
+    stat = diff.compare(b, after)
+    n = list.list_size(r.items)
+    i = 0
+    while i < n {
+        c = list.list_get_raw(r.items, i) as *Counts
+        if string.equals(c.path, path) != 0 {
+            c.added = c.added + stat.added
+            c.removed = c.removed + stat.removed
+            return
+        }
+        i = i + 1
+    }
+    c = heap.new(Counts)
+    c.path = string.copy(path)
+    c.added = stat.added
+    c.removed = stat.removed
+    list.list_add_raw(r.items, c)
+}
+
+// Directly edited files (list of *File) in first-change order, paths relative to cwd when inside it.
+recovery_files(r: *Recovery, cwd: string) -> ptr {
+    out = list.list_new()
+    n = list.list_size(r.items)
+    i = 0
+    while i < n {
+        c = list.list_get_raw(r.items, i) as *Counts
+        f = heap.new(File)
+        f.path = string.copy(shown_(c.path, cwd))
+        f.added = c.added
+        f.removed = c.removed
+        list.list_add_raw(out, f)
+        i = i + 1
+    }
+    return out
+}
+
+recovery_note_bash(r: *Recovery) {
+    if r.enabled == 0 { return }
+    r.bash = 1
+}
+
+recovery_clear(r: *Recovery) {
+    r.items = list.list_new()
+    r.bash = 0
+}
+
+recovery_hint(r: *Recovery, reason: int, cwd: string) -> string {
+    text = "model connection/request failed"
+    match (reason) {
+        1 -> { text = "tool/script failed" }
+        2 -> { text = "Timed out" }
+        3 -> { text = "Canceled" }
+        4 -> { text = "step limit reached" }
+        _ -> { text = "model connection/request failed" }
+    }
+    n = list.list_size(r.items)
+    if n == 0 {
+        text = "${text} · no recorded edit/write changes"
+    } else {
+        text = "${text} · edited: "
+    }
+    i = 0
+    while i < n {
+        c = list.list_get_raw(r.items, i) as *Counts
+        if i > 0 { text = "${text}, " }
+        text = "${text}${shown_(c.path, cwd)}"
+        i = i + 1
+    }
+    if r.bash != 0 { text = "${text} · bash changes untracked" }
+    if n > 0 { text = "${text} · /undo to revert edit/write" }
+    text = "${text} · type continue to resume"
+    // control bytes (< 0x20, 0x7f) become spaces
+    sb = strbuilder.new(string.length(text) + 1)
+    k = 0
+    len = string.length(text)
+    while k < len {
+        ch = string.char_at(text, k)
+        if ch < 32 || ch == 127 { ch = 32 }
+        strbuilder.append_byte(sb, ch)
+        k = k + 1
+    }
+    return strbuilder.finish(sb)
+}

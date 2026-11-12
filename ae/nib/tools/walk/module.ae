@@ -1,0 +1,674 @@
+// tools.walk: file walking and glob matching (upstream src/tools/walk.zig).
+//
+// matches (upstream `match`, a reserved word here) / match_path: glob over `/`-separated relative paths. `*` and `?`
+// stay within a segment, a whole `**` segment spans any number of segments,
+// `[a-z]` / `[!a]` classes, `{a,b}` alternatives, `\` escapes. A pattern
+// without `/` matches the last segment at any depth (match_path).
+//
+// files(root, options): the regular files under `root` in name order,
+// skipping `.git`, symlinks and .gitignore'd entries, including .gitignore
+// files between the enclosing repository's top and `root`. A file `root` is
+// returned as is. Results are a std.list of *File; release with
+// walk.release(files). Errors are the upstream names: "Canceled",
+// "CredentialAccessDenied", else "FileNotFound", "AccessDenied" ...
+//
+// Options is a heap struct from walk.options(). `deny` is a std.list of
+// canonical absolute paths never listed or entered (Tools.credentialPaths);
+// `cancel` is a std.sync cell (nonzero cancels; null for none).
+
+import std.fs
+import std.dir
+import std.string
+import std.list
+import std.strbuilder
+import std.sync
+
+exports(matches, match_path, options, set_deny, set_cancel, set_filter, set_max, set_dirs, free_options,
+        files, release, rules_new, rules_free, parse_ignore, ignored,
+        Options, File, Rule, UNLIMITED)
+
+const UNLIMITED = 9223372036854775807
+const SLASH = 47
+const BSL = 92
+const STAR = 42
+const QMARK = 63
+const LBRACKET = 91
+const RBRACKET = 93
+const LBRACE = 123
+const RBRACE = 125
+const COMMA = 44
+const BANG = 33
+const CARET = 94
+const DASH = 45
+const HASH = 35
+const SPACE = 32
+const CR = 13
+
+struct Options {
+    deny: ptr       // std.list of strings, or null
+    cancel: ptr     // std.sync cell, or null
+    has_filter: int
+    filter: string  // glob over paths relative to root, see match_path
+    max: long       // stops after collecting one file more than this
+    dirs: int       // 1: also lists directories, each before its contents; filter applies to files only
+}
+
+struct File {
+    path: string      // `root` joined with the path below it
+    absolute: string
+    dir: int
+}
+
+struct Rule {
+    base: string      // directory of the .gitignore relative to the walk's top, no trailing `/`
+    pattern: string
+    negate: int
+    dir_only: int
+    anchored: int
+}
+
+struct Walk {
+    options: ptr
+    rules: ptr
+    out: ptr
+    root: string
+}
+
+options() -> *Options {
+    o = heap.new(Options)
+    o.deny = null
+    o.cancel = null
+    o.has_filter = 0
+    o.filter = ""
+    o.max = UNLIMITED
+    o.dirs = 0
+    return o
+}
+
+// The list is borrowed: the caller keeps it alive and frees it.
+set_deny(o: *Options, deny: @keep ptr) { o.deny = deny }
+set_cancel(o: *Options, cancel: @keep ptr) { o.cancel = cancel }
+set_filter(o: *Options, f: string) {
+    o.filter = f
+    o.has_filter = 1
+}
+set_max(o: *Options, n: long) { o.max = n }
+set_dirs(o: *Options, on: int) { o.dirs = on }
+free_options(o: *Options) { heap.free(o) }
+
+// ---- glob ----
+
+ch_(s: string, i: int) -> int { return string.char_at(s, i) & 255 }
+
+matches(pattern: string, path: string) -> int {
+    open = brace_open_(pattern)
+    if open < 0 { return glob_match_(pattern, 0, path, 0) }
+    close = brace_close_(pattern, open)
+    if close < 0 { return glob_match_(pattern, 0, path, 0) }
+    plen = string.length(pattern)
+    start = open + 1
+    depth = 0
+    i = start
+    while i <= close {
+        c = ch_(pattern, i)
+        if c == BSL {
+            i = i + 2
+        } else {
+            if c == LBRACE { depth = depth + 1 }
+            if c == RBRACE && depth > 0 && i != close { depth = depth - 1 }
+            if (c == COMMA && depth == 0) || i == close {
+                alt = string.substring(pattern, start, i)
+                total = open + string.length(alt) + (plen - close - 1)
+                if total > 1024 { return glob_match_(pattern, 0, path, 0) }
+                head = string.substring(pattern, 0, open)
+                tail = string.substring(pattern, close + 1, plen)
+                expanded = "${head}${alt}${tail}"
+                if matches(expanded, path) != 0 { return 1 }
+                start = i + 1
+            }
+            i = i + 1
+        }
+    }
+    return 0
+}
+
+last_segment_(path: string) -> string {
+    n = string.length(path)
+    // std.fs.path.basename ignores trailing separators
+    e = n
+    while e > 0 && ch_(path, e - 1) == SLASH { e = e - 1 }
+    b = e
+    while b > 0 && ch_(path, b - 1) != SLASH { b = b - 1 }
+    return string.substring(path, b, e)
+}
+
+// Patterns without `/` match the last segment at any depth, as in .gitignore.
+match_path(pattern: string, path: string) -> int {
+    if string.index_of(pattern, "/") >= 0 { return matches(pattern, path) }
+    return matches(pattern, last_segment_(path))
+}
+
+brace_open_(p: string) -> int {
+    n = string.length(p)
+    i = 0
+    while i < n {
+        c = ch_(p, i)
+        if c == BSL {
+            i = i + 1
+        } else if c == LBRACE {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+brace_close_(p: string, open: int) -> int {
+    n = string.length(p)
+    depth = 0
+    comma = 0
+    i = open + 1
+    while i < n {
+        c = ch_(p, i)
+        if c == BSL {
+            i = i + 1
+        } else if c == LBRACE {
+            depth = depth + 1
+        } else if c == COMMA {
+            if depth == 0 { comma = 1 }
+        } else if c == RBRACE {
+            if depth == 0 {
+                if comma != 0 { return i }
+                return -1
+            }
+            depth = depth - 1
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Match p[pi..] against s[si..].
+glob_match_(p: string, pi0: int, s: string, si0: int) -> int {
+    pi = pi0
+    si = si0
+    plen = string.length(p)
+    slen = string.length(s)
+    while pi < plen {
+        if globstar_(p, pi, plen) != 0 {
+            rest = pi + 2
+            if rest < plen { rest = rest + 1 }
+            if rest == plen { return 1 }
+            k = si
+            while k <= slen {
+                if k == si || ch_(s, k - 1) == SLASH {
+                    if glob_match_(p, rest, s, k) != 0 { return 1 }
+                }
+                k = k + 1
+            }
+            return 0
+        }
+        c = ch_(p, pi)
+        if c == STAR {
+            rest = pi + 1
+            k = si
+            while true {
+                if glob_match_(p, rest, s, k) != 0 { return 1 }
+                if k == slen || ch_(s, k) == SLASH { return 0 }
+                k = k + 1
+            }
+        } else if c == QMARK {
+            if si == slen || ch_(s, si) == SLASH { return 0 }
+            pi = pi + 1
+            si = si + 1
+        } else if c == LBRACKET {
+            end = class_end_(p, pi, plen)
+            if end < 0 {
+                if si == slen || ch_(s, si) != LBRACKET { return 0 }
+                pi = pi + 1
+                si = si + 1
+            } else {
+                if si == slen || ch_(s, si) == SLASH || class_match_(p, pi + 1, end, ch_(s, si)) == 0 { return 0 }
+                pi = end + 1
+                si = si + 1
+            }
+        } else {
+            want = c
+            if c == BSL && pi + 1 < plen {
+                pi = pi + 1
+                want = ch_(p, pi)
+            }
+            if si == slen || ch_(s, si) != want { return 0 }
+            pi = pi + 1
+            si = si + 1
+        }
+    }
+    if si == slen { return 1 }
+    return 0
+}
+
+globstar_(p: string, i: int, plen: int) -> int {
+    if i + 1 < plen && ch_(p, i) == STAR && ch_(p, i + 1) == STAR {
+        if (i == 0 || ch_(p, i - 1) == SLASH) && (i + 2 == plen || ch_(p, i + 2) == SLASH) { return 1 }
+    }
+    return 0
+}
+
+class_end_(p: string, open: int, plen: int) -> int {
+    i = open + 1
+    if i < plen && (ch_(p, i) == BANG || ch_(p, i) == CARET) { i = i + 1 }
+    if i < plen && ch_(p, i) == RBRACKET { i = i + 1 }
+    while i < plen {
+        if ch_(p, i) == RBRACKET { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// The class body is p[a..b).
+class_match_(p: string, a0: int, b: int, c: int) -> int {
+    a = a0
+    negate = 0
+    if b > a && (ch_(p, a) == BANG || ch_(p, a) == CARET) {
+        negate = 1
+        a = a + 1
+    }
+    hit = 0
+    i = a
+    while i < b {
+        if i + 2 < b && ch_(p, i + 1) == DASH {
+            if ch_(p, i) <= c && c <= ch_(p, i + 2) { hit = 1 }
+            i = i + 2
+        } else if ch_(p, i) == c {
+            hit = 1
+        }
+        i = i + 1
+    }
+    if hit != negate { return 1 }
+    return 0
+}
+
+// ---- ignore rules ----
+
+rules_new() -> ptr { return list.list_new() }
+
+rules_free(rules: ptr) {
+    shrink_(rules, 0)
+    list.list_free(rules)
+}
+
+shrink_(rules: ptr, to: int) {
+    while list.list_size(rules) > to {
+        i = list.list_size(rules) - 1
+        r = list.list_get_raw(rules, i) as *Rule
+        list.list_remove(rules, i)
+        heap.free(r)
+    }
+}
+
+// Appends the rules of `text`, a .gitignore found in directory `base`
+// (relative to the walk's top, no trailing `/`).
+parse_ignore(base: string, text: string, rules: ptr) {
+    n = string.length(text)
+    pos = 0
+    while pos <= n {
+        nl = string.index_of_from(text, "\n", pos)
+        e = nl
+        if nl < 0 { e = n }
+        parse_line_(base, string.substring(text, pos, e), rules)
+        pos = e + 1
+    }
+}
+
+parse_line_(base: string, raw: string, rules: ptr) {
+    n = string.length(raw)
+    while n > 0 && ch_(raw, n - 1) == CR { n = n - 1 }
+    while n > 0 && ch_(raw, n - 1) == SPACE && !(n > 1 && ch_(raw, n - 2) == BSL) { n = n - 1 }
+    if n == 0 || ch_(raw, 0) == HASH { return }
+    a = 0
+    negate = 0
+    dir_only = 0
+    anchored = 0
+    if ch_(raw, 0) == BANG {
+        negate = 1
+        a = 1
+    } else if ch_(raw, 0) == BSL && n > 1 && (ch_(raw, 1) == HASH || ch_(raw, 1) == BANG) {
+        a = 1
+    }
+    if n > a && ch_(raw, n - 1) == SLASH {
+        dir_only = 1
+        n = n - 1
+    }
+    line = string.substring(raw, a, n)
+    if string.index_of(line, "/") >= 0 { anchored = 1 }
+    if string.length(line) > 0 && ch_(line, 0) == SLASH { line = string.substring(line, 1, string.length(line)) }
+    if string.length(line) == 0 { return }
+    r = heap.new(Rule)
+    r.base = base
+    r.pattern = line
+    r.negate = negate
+    r.dir_only = dir_only
+    r.anchored = anchored
+    list.list_add(rules, r)
+}
+
+// Whether the last matching rule ignores `rel` (relative to the walk's top).
+ignored(rules: ptr, rel: string, is_dir: int) -> int {
+    i = list.list_size(rules)
+    while i > 0 {
+        i = i - 1
+        r = list.list_get_raw(rules, i) as *Rule
+        if r.dir_only != 0 && is_dir == 0 { continue }
+        sub = rel
+        bl = string.length(r.base)
+        if bl != 0 {
+            if string.length(rel) > bl && ch_(rel, bl) == SLASH && string.starts_with(rel, r.base) != 0 {
+                sub = string.substring(rel, bl + 1, string.length(rel))
+            } else {
+                continue
+            }
+        }
+        hit = 0
+        if r.anchored != 0 {
+            hit = matches(r.pattern, sub)
+        } else {
+            hit = matches(r.pattern, last_segment_(sub))
+        }
+        if hit != 0 {
+            if r.negate != 0 { return 0 }
+            return 1
+        }
+    }
+    return 0
+}
+
+// ---- walking ----
+
+join_(a: string, b: string) -> string {
+    if string.length(a) == 0 { return b }
+    if string.length(b) == 0 { return a }
+    if ch_(a, string.length(a) - 1) == SLASH { return "${a}${b}" }
+    return "${a}/${b}"
+}
+
+denied_(deny: ptr, path: string) -> int {
+    if deny == null { return 0 }
+    n = list.list_size(deny)
+    i = 0
+    while i < n {
+        d, _e = list.get_string(deny, i)
+        if d == path { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+canceled_(cancel: ptr) -> int {
+    if cancel == null { return 0 }
+    if sync.atomic_load(cancel) != 0 { return 1 }
+    return 0
+}
+
+kind_error_(kind: int) -> string {
+    if kind == fs.KIND_NOT_FOUND { return "FileNotFound" }
+    if kind == fs.KIND_PERMISSION_DENIED { return "AccessDenied" }
+    if kind == fs.KIND_NOT_DIR { return "NotDir" }
+    if kind == fs.KIND_IS_DIR { return "IsDir" }
+    if kind == fs.KIND_LOOP { return "SymLinkLoop" }
+    if kind == fs.KIND_NAME_TOO_LONG { return "NameTooLong" }
+    return "Unexpected"
+}
+
+struct Ent {
+    name: string
+    kind: int
+}
+
+// Entries in byte order of name (merge sort; the list is rewritten in place).
+sort_ents_(ents: ptr) {
+    n = list.list_size(ents)
+    if n < 2 { return }
+    src = ents
+    scratch = list.list_new()
+    tmp = scratch
+    i = 0
+    while i < n {
+        list.list_add_raw(scratch, list.list_get_raw(ents, i))
+        i = i + 1
+    }
+    width = 1
+    while width < n {
+        lo = 0
+        while lo < n {
+            mid = lo + width
+            if mid > n { mid = n }
+            hi = lo + 2 * width
+            if hi > n { hi = n }
+            a = lo
+            b = mid
+            o = lo
+            while a < mid && b < hi {
+                ea = list.list_get_raw(src, a) as *Ent
+                eb = list.list_get_raw(src, b) as *Ent
+                if string.compare(ea.name, eb.name) <= 0 {
+                    list.list_set(tmp, o, ea)
+                    a = a + 1
+                } else {
+                    list.list_set(tmp, o, eb)
+                    b = b + 1
+                }
+                o = o + 1
+            }
+            while a < mid {
+                list.list_set(tmp, o, list.list_get_raw(src, a))
+                a = a + 1
+                o = o + 1
+            }
+            while b < hi {
+                list.list_set(tmp, o, list.list_get_raw(src, b))
+                b = b + 1
+                o = o + 1
+            }
+            lo = lo + 2 * width
+        }
+        t = src
+        src = tmp
+        tmp = t
+        width = width * 2
+    }
+    if src != ents {
+        i = 0
+        while i < n {
+            list.list_set(ents, i, list.list_get_raw(src, i))
+            i = i + 1
+        }
+    }
+    list.list_free(scratch)
+}
+
+read_ignore_(path: string) -> string {
+    text, err = fs.read(path)
+    if err != "" { return "" }
+    // upstream reads at most 1 MiB; a larger file is not read at all
+    if string.length(text) > 1048576 { return "" }
+    return text
+}
+
+// Regular files under `root` in name order. (list of *File, "") or (null, error).
+files(root: string, o: *Options) -> (ptr, string) {
+    absolute_root, kind, _msg = fs.realpath(root)
+    if kind != 0 { return null, kind_error_(kind) }
+    out = list.list_new()
+    skind, _sz, _mt, serr = fs.file_stat(absolute_root)
+    if serr != "" { return null, "FileNotFound" }
+    if skind != 2 {
+        if denied_(o.deny, absolute_root) != 0 { return null, "CredentialAccessDenied" }
+        f = heap.new(File)
+        f.path = root
+        f.absolute = absolute_root
+        f.dir = 0
+        list.list_add(out, f)
+        return out, ""
+    }
+
+    top = absolute_root
+    probe = absolute_root
+    searching = 1
+    while searching != 0 {
+        marker = join_(probe, ".git")
+        _mk, _s2, _m2, merr = fs.file_stat(marker)
+        if merr == "" {
+            top = probe
+            searching = 0
+        } else {
+            parent = path_dirname_(probe)
+            if parent == probe || string.length(parent) == 0 {
+                searching = 0
+            } else {
+                probe = parent
+            }
+        }
+    }
+    rules = rules_new()
+    below = ""
+    if string.length(absolute_root) > string.length(top) {
+        below = string.substring(absolute_root, string.length(top) + 1, string.length(absolute_root))
+    }
+    bl = string.length(below)
+    end = 0
+    while end < bl {
+        base = string.substring(below, 0, end)
+        text = read_ignore_(join_(join_(top, base), ".gitignore"))
+        parse_ignore(base, text, rules)
+        from = end
+        if end > 0 { from = end + 1 }
+        nx = string.index_of_from(below, "/", from)
+        if nx < 0 { nx = bl }
+        end = nx
+    }
+
+    w = heap.new(Walk)
+    w.options = o as ptr
+    w.rules = rules
+    w.out = out
+    r = root
+    while string.length(r) > 0 && ch_(r, string.length(r) - 1) == SLASH { r = string.substring(r, 0, string.length(r) - 1) }
+    w.root = r
+    err = visit_(w, absolute_root, below, "", 1)
+    rules_free(rules)
+    heap.free(w)
+    if err != "" {
+        release(out)
+        return null, err
+    }
+    return out, ""
+}
+
+path_dirname_(p: string) -> string {
+    n = string.length(p)
+    e = n
+    while e > 1 && ch_(p, e - 1) == SLASH { e = e - 1 }
+    b = e
+    while b > 0 && ch_(p, b - 1) != SLASH { b = b - 1 }
+    // b is the start of the last component; the parent ends before its separator
+    while b > 1 && ch_(p, b - 1) == SLASH { b = b - 1 }
+    if b == 0 { return "" }
+    return string.substring(p, 0, b)
+}
+
+release(files: ptr) {
+    if files == null { return }
+    n = list.list_size(files)
+    i = 0
+    while i < n {
+        heap.free(list.list_get_raw(files, i) as *File)
+        i = i + 1
+    }
+    list.list_free(files)
+}
+
+// `top_rel` locates `absolute` from the walk's top (for ignore rules); `rel` from root (for output).
+visit_(w: *Walk, absolute: string, top_rel: string, rel: string, is_root: int) -> string {
+    o = w.options as *Options
+    if canceled_(o.cancel) != 0 { return "Canceled" }
+    restore = list.list_size(w.rules)
+    err = visit_inner_(w, absolute, top_rel, rel, is_root)
+    shrink_(w.rules, restore)
+    return err
+}
+
+visit_inner_(w: *Walk, absolute: string, top_rel: string, rel: string, is_root: int) -> string {
+    o = w.options as *Options
+    parse_ignore(top_rel, read_ignore_(join_(absolute, ".gitignore")), w.rules)
+
+    listing, lerr = dir.list(absolute)
+    if lerr != "" {
+        if is_root != 0 { return "AccessDenied" }
+        return ""
+    }
+    ents = list.list_new()
+    n = dir.list_count(listing)
+    i = 0
+    while i < n {
+        name = string.copy(dir.list_get(listing, i))
+        k = dir.list_kind(listing, i)
+        if k == 0 {
+            sk, _sz, _mt, serr = fs.file_stat(join_(absolute, name))
+            if serr == "" { k = sk }
+        }
+        if (k == 1 || k == 2) && !(k == 2 && name == ".git") {
+            e = heap.new(Ent)
+            e.name = name
+            e.kind = k
+            list.list_add(ents, e)
+        }
+        i = i + 1
+    }
+    dir.dir_list_free(listing)
+    sort_ents_(ents)
+
+    result = ""
+    n = list.list_size(ents)
+    i = 0
+    while i < n && result == "" {
+        e = list.list_get_raw(ents, i) as *Ent
+        i = i + 1
+        if list.list_size(w.out) > o.max { break }
+        is_dir = 0
+        if e.kind == 2 { is_dir = 1 }
+        entry_top = join_(top_rel, e.name)
+        if ignored(w.rules, entry_top, is_dir) != 0 { continue }
+        entry_abs = join_(absolute, e.name)
+        if denied_(o.deny, entry_abs) != 0 { continue }
+        entry_rel = join_(rel, e.name)
+        if is_dir != 0 {
+            if o.dirs != 0 { add_(w, entry_abs, entry_rel, 1) }
+            result = visit_(w, entry_abs, entry_top, entry_rel, 0)
+        } else {
+            if o.has_filter != 0 && match_path(o.filter, entry_rel) == 0 { continue }
+            add_(w, entry_abs, entry_rel, 0)
+        }
+    }
+    i = 0
+    n = list.list_size(ents)
+    while i < n {
+        heap.free(list.list_get_raw(ents, i) as *Ent)
+        i = i + 1
+    }
+    list.list_free(ents)
+    return result
+}
+
+add_(w: *Walk, abs_path: string, entry_rel: string, is_dir: int) {
+    p = entry_rel
+    if w.root != "." {
+        base = w.root
+        if string.length(base) == 0 { base = "/" }
+        p = join_(base, entry_rel)
+    }
+    f = heap.new(File)
+    f.path = p
+    f.absolute = abs_path
+    f.dir = is_dir
+    list.list_add(w.out, f)
+}

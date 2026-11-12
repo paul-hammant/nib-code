@@ -25,6 +25,34 @@ aeb(cap) {
             source("ae/tests/timer_test.ae")
             lib("ae")
         }
+        aether.program_test() {
+            source("ae/tests/policy_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/secrets_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/diff_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/changes_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/walk_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/grep_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/search_test.ae")
+            lib("ae")
+        }
         return 0
     }
 }

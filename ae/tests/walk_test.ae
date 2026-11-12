@@ -1,0 +1,149 @@
+// Ports the tests of upstream src/tools/walk.zig (a2dd439).
+import std.spec
+import std.string
+import std.list
+import std.fs
+import std.sync
+import nib.tools.walk
+
+check_(on: int, msg: string) { spec.assert_true(on, msg) }
+neg_(on: int, msg: string) { spec.assert_false(on, msg) }
+
+tmp_dir_() -> string {
+    d, err = fs.make_temp_dir("", "nibwalk")
+    spec.assert_str_eq(err, "", "make_temp_dir")
+    return d
+}
+
+put_(root: string, rel: string, data: string) {
+    i = string.length(rel)
+    while i > 0 && string.char_at(rel, i - 1) != 47 { i = i - 1 }
+    if i > 1 { fs.mkdir_p("${root}/${string.substring(rel, 0, i - 1)}") }
+    err = fs.write("${root}/${rel}", data)
+    spec.assert_str_eq(err, "", "write ${rel}")
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tools.walk") {
+        spec.it("glob segments, globstar, classes and alternatives") callback {
+            check_(walk.matches("*.zig", "main.zig"), "1")
+            neg_(walk.matches("*.zig", "src/main.zig"), "2")
+            check_(walk.match_path("*.zig", "src/main.zig"), "3")
+            check_(walk.matches("src/**/*.zig", "src/main.zig"), "4")
+            check_(walk.matches("src/**/*.zig", "src/a/b/main.zig"), "5")
+            check_(walk.matches("**", "a/b"), "6")
+            check_(walk.matches("docs/**", "docs/adr/x.md"), "7")
+            neg_(walk.matches("docs/**", "src/x.md"), "8")
+            check_(walk.matches("file?.[ch]", "file1.c"), "9")
+            neg_(walk.matches("file?.[!ch]", "file1.c"), "10")
+            check_(walk.matches("*.{zig,zon}", "build.zig.zon"), "11")
+            check_(walk.matches("{src,scripts}/*.{py,zig}", "scripts/mock.py"), "12")
+            neg_(walk.matches("{src,scripts}/*.{py,zig}", "docs/a.py"), "13")
+            check_(walk.matches("\\*literal", "*literal"), "14")
+            check_(walk.matches("a{b", "a{b"), "15")
+        }
+        spec.it("gitignore rules: anchoring, directories, negation and nesting") callback {
+            rules = walk.rules_new()
+            walk.parse_ignore("", "# comment\n*.log\n!keep.log\n/build\nzig-out/\ndocs/*.tmp\n\\#hash\n", rules)
+            walk.parse_ignore("sub", "local.txt\n", rules)
+            check_(walk.ignored(rules, "x/y.log", 0), "log ignored")
+            neg_(walk.ignored(rules, "x/keep.log", 0), "keep.log negated")
+            check_(walk.ignored(rules, "build", 1), "anchored build")
+            neg_(walk.ignored(rules, "src/build", 1), "anchored build not nested")
+            check_(walk.ignored(rules, "a/zig-out", 1), "dir rule on dir")
+            neg_(walk.ignored(rules, "a/zig-out", 0), "dir rule not on file")
+            check_(walk.ignored(rules, "docs/a.tmp", 0), "docs/*.tmp")
+            neg_(walk.ignored(rules, "docs/sub/a.tmp", 0), "docs/*.tmp not nested")
+            check_(walk.ignored(rules, "#hash", 0), "escaped hash")
+            check_(walk.ignored(rules, "sub/deep/local.txt", 0), "nested rule below its base")
+            neg_(walk.ignored(rules, "local.txt", 0), "nested rule not above its base")
+            walk.rules_free(rules)
+        }
+        spec.it("files skips .git, ignored, denied and symlinked entries") callback {
+            root = tmp_dir_()
+            fs.mkdir_p("${root}/.git")
+            fs.mkdir_p("${root}/src/gen")
+            fs.mkdir_p("${root}/.github")
+            put_(root, ".gitignore", "gen/\n*.o\n")
+            put_(root, ".git/config", "")
+            put_(root, ".github/ci.yml", "")
+            put_(root, "src/b.zig", "")
+            put_(root, "src/a.o", "")
+            put_(root, "src/gen/x.zig", "")
+            put_(root, "secret", "")
+            fs.symlink("src/b.zig", "${root}/link.zig")
+
+            absolute, _k, _m = fs.realpath(root)
+            secret = "${absolute}/secret"
+            deny = list.list_new()
+            list.list_add(deny, secret)
+            o = walk.options()
+            walk.set_deny(o, deny)
+            all, err = walk.files(root, o)
+            spec.assert_str_eq(err, "", "files")
+            spec.assert_eq(list.list_size(all), 3, "three files")
+            want = [".github/ci.yml", ".gitignore", "src/b.zig"]
+            i = 0
+            while i < 3 {
+                f = list.list_get_raw(all, i) as *walk.File
+                spec.assert_str_eq(f.path, "${root}/${want[i]}", "path ${i}")
+                i = i + 1
+            }
+            walk.release(all)
+
+            plain = walk.options()
+            below, err2 = walk.files("${root}/src", plain)
+            spec.assert_str_eq(err2, "", "below")
+            spec.assert_eq(list.list_size(below), 1, "one below")
+            spec.assert_str_eq((list.list_get_raw(below, 0) as *walk.File).path, "${root}/src/b.zig", "b.zig")
+            walk.release(below)
+
+            denied, err3 = walk.files(secret, o)
+            spec.assert_str_eq(err3, "CredentialAccessDenied", "direct credential file")
+            spec.assert_null(denied, "nothing returned")
+            list.list_free(deny)
+            fs.remove_tree(root)
+        }
+        spec.it("a set cancel cell stops the walk with Canceled") callback {
+            root = tmp_dir_()
+            put_(root, "a.txt", "x")
+            cell = sync.atomic_new(1)
+            o = walk.options()
+            walk.set_cancel(o, cell)
+            got, err = walk.files(root, o)
+            spec.assert_str_eq(err, "Canceled", "canceled")
+            spec.assert_null(got, "no files")
+            sync.atomic_store(cell, 0)
+            ok, err2 = walk.files(root, o)
+            spec.assert_str_eq(err2, "", "not canceled")
+            spec.assert_eq(list.list_size(ok), 1, "one file")
+            walk.release(ok)
+            sync.atomic_free(cell)
+            fs.remove_tree(root)
+        }
+        spec.it("max stops after one file more than the limit; dirs lists directories first") callback {
+            root = tmp_dir_()
+            put_(root, "d/a.txt", "x")
+            put_(root, "d/b.txt", "x")
+            put_(root, "d/c.txt", "x")
+            o = walk.options()
+            walk.set_max(o, 1)
+            got, err = walk.files(root, o)
+            spec.assert_str_eq(err, "", "err")
+            spec.assert_eq(list.list_size(got), 2, "limit + 1")
+            walk.release(got)
+            o2 = walk.options()
+            walk.set_dirs(o2, 1)
+            with_dirs, err2 = walk.files(root, o2)
+            spec.assert_str_eq(err2, "", "err2")
+            spec.assert_eq(list.list_size(with_dirs), 4, "dir + 3 files")
+            first = list.list_get_raw(with_dirs, 0) as *walk.File
+            spec.assert_eq(first.dir, 1, "dir first")
+            spec.assert_str_eq(first.path, "${root}/d", "dir path")
+            walk.release(with_dirs)
+            fs.remove_tree(root)
+        }
+    }
+    return spec.run_summary(fw)
+}

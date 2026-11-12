@@ -1,0 +1,839 @@
+// tools.policy: refuses destructive deletion and privilege/system commands
+// (upstream src/tools/policy.zig). A guard against mistakes, not against a
+// model trying to evade it. Calls from other languages, such as os.system in a
+// Python heredoc, are not inspected.
+//
+// check / check_credentials return the denial message, "" when allowed.
+
+import std.string
+import std.strbuilder
+import std.list
+
+exports(check, check_credentials, too_long)
+
+const MAX_WORDS = 256
+
+const SEP_NONE = 0
+const SEP_PIPE = 1
+const SEP_LIST = 2
+
+// byte values
+const C_TAB = 9
+const C_NL = 10
+const C_SP = 32
+const C_DQ = 34
+const C_HASH = 35
+const C_DOLLAR = 36
+const C_AMP = 38
+const C_SQ = 39
+const C_LP = 40
+const C_RP = 41
+const C_STAR = 42
+const C_DASH = 45
+const C_SLASH = 47
+const C_SEMI = 59
+const C_LT = 60
+const C_EQ = 61
+const C_GT = 62
+const C_BS = 92
+const C_BT = 96
+const C_LB = 123
+const C_PIPE = 124
+const C_RB = 125
+
+struct Heredoc {
+    delimiter_start: int
+    delimiter_end: int
+    quoted: int
+    strip_tabs: int
+    start: int
+    end: int
+    after: int
+}
+
+struct Word {
+    text: string
+    sep: int
+    substitutes_fetch: int
+}
+
+too_long() -> string {
+    return "command portion has more than 256 shell words; write long scripts to a file with tools.write and run that file"
+}
+
+// ---- small helpers -------------------------------------------------------
+
+in_always_denied(s: string) -> int {
+    match (s) {
+        "sudo" -> { return 1 }
+        "su" -> { return 1 }
+        "doas" -> { return 1 }
+        "pkexec" -> { return 1 }
+        "shutdown" -> { return 1 }
+        "reboot" -> { return 1 }
+        "poweroff" -> { return 1 }
+        "halt" -> { return 1 }
+        "telinit" -> { return 1 }
+        "systemctl" -> { return 1 }
+        "shred" -> { return 1 }
+        "wipefs" -> { return 1 }
+        "fdisk" -> { return 1 }
+        "sfdisk" -> { return 1 }
+        "parted" -> { return 1 }
+        _ -> { return 0 }
+    }
+}
+
+in_shells(s: string) -> int {
+    match (s) {
+        "sh" -> { return 1 }
+        "bash" -> { return 1 }
+        "zsh" -> { return 1 }
+        "dash" -> { return 1 }
+        "ksh" -> { return 1 }
+        "fish" -> { return 1 }
+        _ -> { return 0 }
+    }
+}
+
+in_wrappers(s: string) -> int {
+    match (s) {
+        "env" -> { return 1 }
+        "command" -> { return 1 }
+        "builtin" -> { return 1 }
+        "exec" -> { return 1 }
+        "nohup" -> { return 1 }
+        "time" -> { return 1 }
+        "nice" -> { return 1 }
+        "ionice" -> { return 1 }
+        "timeout" -> { return 1 }
+        "xargs" -> { return 1 }
+        "stdbuf" -> { return 1 }
+        _ -> { return 0 }
+    }
+}
+
+in_protected_paths(s: string) -> int {
+    match (s) {
+        "/" -> { return 1 }
+        "/bin" -> { return 1 }
+        "/boot" -> { return 1 }
+        "/dev" -> { return 1 }
+        "/etc" -> { return 1 }
+        "/home" -> { return 1 }
+        "/lib" -> { return 1 }
+        "/lib64" -> { return 1 }
+        "/opt" -> { return 1 }
+        "/proc" -> { return 1 }
+        "/root" -> { return 1 }
+        "/sbin" -> { return 1 }
+        "/snap" -> { return 1 }
+        "/srv" -> { return 1 }
+        "/sys" -> { return 1 }
+        "/usr" -> { return 1 }
+        "/var" -> { return 1 }
+        "~" -> { return 1 }
+        "$HOME" -> { return 1 }
+        "\${HOME}" -> { return 1 }
+        _ -> { return 0 }
+    }
+}
+
+eq(a: string, b: string) -> int { return string.equals(a, b) }
+
+has(s: string, needle: string) -> int { return string.contains(s, needle) }
+
+// does s[a..b] contain needle?
+has_in(s: string, a: int, b: int, needle: string) -> int {
+    if a >= b { return 0 }
+    return string.contains(string.substring(s, a, b), needle)
+}
+
+// index of byte ch in s at or after pos, or -1
+find_byte(s: string, pos: int, ch: int) -> int {
+    n = string.length(s)
+    i = pos
+    while i < n {
+        if string.char_at(s, i) == ch { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// first index at or after pos of ch, or the string length (indexOfScalarPos orelse len)
+find_byte_or_len(s: string, pos: int, ch: int) -> int {
+    r = find_byte(s, pos, ch)
+    if r < 0 { return string.length(s) }
+    return r
+}
+
+min_int(a: int, b: int) -> int {
+    if a < b { return a }
+    return b
+}
+
+in_chars(set: string, c: int) -> int {
+    n = string.length(set)
+    i = 0
+    while i < n {
+        if string.char_at(set, i) == c { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+is_digit(c: int) -> int {
+    if c >= 48 && c <= 57 { return 1 }
+    return 0
+}
+
+// std.fs.path.basename (posix): ignores trailing slashes, text after the last slash.
+basename(p: string) -> string {
+    e = string.length(p)
+    while e > 0 && string.char_at(p, e - 1) == C_SLASH { e = e - 1 }
+    s = e
+    while s > 0 && string.char_at(p, s - 1) != C_SLASH { s = s - 1 }
+    return string.substring(p, s, e)
+}
+
+// ---- credentials ---------------------------------------------------------
+
+check_credentials(command: string, codex_home: string, nib_home: string) -> string {
+    if has(command, "auth.json") == 1 {
+        named = 0
+        if has(command, ".nib") == 1 || has(command, "NIB_HOME") == 1 { named = 1 }
+        located = 0
+        if string.length(nib_home) > 0 && has(command, nib_home) == 1 { located = 1 }
+        if named == 1 || located == 1 { return "access to nib credentials" }
+    }
+    if has(command, ".codex") == 1 || has(command, "$CODEX_HOME") == 1 || has(command, "\${CODEX_HOME}") == 1 {
+        return "access to Codex credentials"
+    }
+    if string.length(codex_home) > 0 && has(command, codex_home) == 1 {
+        return "access to Codex credentials"
+    }
+    return ""
+}
+
+check(command: string, home: string) -> string {
+    why = check_credentials(command, "", "")
+    if string.length(why) > 0 { return why }
+    return check_depth(command, home, 0)
+}
+
+// ---- heredoc scanning ----------------------------------------------------
+
+free_heredocs(l: ptr) {
+    n = list.list_size(l)
+    i = 0
+    while i < n {
+        heap.free(list.list_get_raw(l, i) as *Heredoc)
+        i = i + 1
+    }
+    list.list_free(l)
+}
+
+heredoc_at(l: ptr, i: int) -> *Heredoc {
+    return list.list_get_raw(l, i) as *Heredoc
+}
+
+quoted_end(s: string, open: int) -> int {
+    quote = string.char_at(s, open)
+    n = string.length(s)
+    i = open + 1
+    while i < n {
+        c = string.char_at(s, i)
+        if c == quote { return i + 1 }
+        if c == C_BS && quote != C_SQ { i = i + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// number of trailing backslashes in s[a..b] is odd
+continued_line(s: string, a: int, b: int) -> int {
+    k = 0
+    i = b
+    while i > a && string.char_at(s, i - 1) == C_BS {
+        k = k + 1
+        i = i - 1
+    }
+    return k % 2
+}
+
+// next byte of the line s[.. lb] from idx (-1 at the end) and the new index
+line_byte(s: string, lb: int, idx: int, join_lines: int) -> (int, int) {
+    i = idx
+    while i < lb {
+        if join_lines == 1 && string.char_at(s, i) == C_BS && i + 1 < lb && string.char_at(s, i + 1) == C_NL {
+            i = i + 2
+            continue
+        }
+        return string.char_at(s, i), i + 1
+    }
+    return 0 - 1, i
+}
+
+esc_in_dq(c: int) -> int {
+    if c == C_DOLLAR || c == C_BT || c == C_DQ || c == C_BS || c == C_NL { return 1 }
+    return 0
+}
+
+// raw delimiter is cmd[ra..rb], the candidate line cmd[la..lb]
+delimiter_matches(cmd: string, ra: int, rb: int, la: int, lb: int, join_lines: int) -> int {
+    quote = 0
+    i = ra
+    n = la
+    while i < rb {
+        ch = string.char_at(cmd, i)
+        if quote == 0 && (ch == C_SQ || ch == C_DQ) {
+            quote = ch
+            i = i + 1
+            continue
+        }
+        if quote != 0 && ch == quote {
+            quote = 0
+            i = i + 1
+            continue
+        }
+        if ch == C_BS && quote != C_SQ && i + 1 < rb && (quote == 0 || esc_in_dq(string.char_at(cmd, i + 1)) == 1) {
+            i = i + 1
+            ch = string.char_at(cmd, i)
+        }
+        b = 0
+        b, n = line_byte(cmd, lb, n, join_lines)
+        if b != ch { return 0 }
+        i = i + 1
+    }
+    if quote != 0 { return 0 }
+    b2 = 0
+    b2, n = line_byte(cmd, lb, n, join_lines)
+    if b2 == 0 - 1 { return 1 }
+    return 0
+}
+
+skip_parens(s: string, open: int) -> int {
+    depth = 0
+    n = string.length(s)
+    i = open
+    while i < n {
+        c = string.char_at(s, i)
+        if c == C_BS {
+            i = i + 2
+            continue
+        }
+        if c == C_SQ || c == C_DQ || c == C_BT {
+            i = quoted_end(s, i)
+            continue
+        }
+        if c == C_LP { depth = depth + 1 }
+        if c == C_RP {
+            depth = depth - 1
+            if depth == 0 { return i }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+comment_start(s: string, i: int) -> int {
+    if string.char_at(s, i) != C_HASH { return 0 }
+    if i == 0 { return 1 }
+    return in_chars(" \t\n;|&()", string.char_at(s, i - 1))
+}
+
+// Returns the list of heredocs (each *Heredoc), or an empty list when the
+// command's heredocs cannot be scanned (upstream: null, treated as none).
+scan_heredocs(command: string) -> ptr {
+    result = list.list_new()
+    pending = 0
+    n = string.length(command)
+    i = 0
+    while i < n {
+        ch = string.char_at(command, i)
+        if ch == C_BS {
+            i = min_int(i + 2, n)
+        } else if ch == C_SQ || ch == C_DQ || ch == C_BT {
+            i = quoted_end(command, i)
+        } else if ch == C_LP && i + 1 < n && string.char_at(command, i + 1) == C_LP {
+            i = min_int(skip_parens(command, i) + 1, n)
+        } else if comment_start(command, i) == 1 {
+            i = find_byte_or_len(command, i, C_NL)
+        } else if ch == C_NL {
+            i = i + 1
+            while pending < list.list_size(result) {
+                body = heredoc_at(result, pending)
+                body.start = i
+                done = 0
+                while done == 0 {
+                    end = find_byte_or_len(command, i, C_NL)
+                    if body.quoted == 0 {
+                        while end < n && continued_line(command, i, end) == 1 {
+                            end = find_byte_or_len(command, end + 1, C_NL)
+                        }
+                    }
+                    la = i
+                    if body.strip_tabs == 1 {
+                        while la < end && string.char_at(command, la) == C_TAB { la = la + 1 }
+                    }
+                    join = 0
+                    if body.quoted == 0 { join = 1 }
+                    if delimiter_matches(command, body.delimiter_start, body.delimiter_end, la, end, join) == 1 {
+                        body.end = i
+                        if end < n {
+                            body.after = end + 1
+                        } else {
+                            body.after = end
+                        }
+                        i = body.after
+                        done = 1
+                    } else {
+                        if end == n {
+                            free_heredocs(result)
+                            return list.list_new()
+                        }
+                        i = end + 1
+                    }
+                }
+                pending = pending + 1
+            }
+        } else if ch == C_LT && i + 1 < n && string.char_at(command, i + 1) == C_LT {
+            i = i + 2
+            if i < n && string.char_at(command, i) == C_LT {
+                while i < n && string.char_at(command, i) == C_LT { i = i + 1 }
+            } else {
+                strip_tabs = 0
+                if i < n && string.char_at(command, i) == C_DASH {
+                    strip_tabs = 1
+                    i = i + 1
+                }
+                while i < n && (string.char_at(command, i) == C_SP || string.char_at(command, i) == C_TAB) { i = i + 1 }
+                begin = i
+                quoted = 0
+                stop = 0
+                while i < n && stop == 0 {
+                    c = string.char_at(command, i)
+                    if c == C_SQ || c == C_DQ {
+                        quoted = 1
+                        i = quoted_end(command, i)
+                    } else if c == C_BS {
+                        quoted = 1
+                        i = min_int(i + 2, n)
+                    } else if in_chars(" \t\n|;&()<>", c) == 1 {
+                        stop = 1
+                    } else {
+                        i = i + 1
+                    }
+                }
+                if i == begin || list.list_size(result) == MAX_WORDS {
+                    free_heredocs(result)
+                    return list.list_new()
+                }
+                h = heap.new(Heredoc)
+                h.delimiter_start = begin
+                h.delimiter_end = i
+                h.quoted = quoted
+                h.strip_tabs = strip_tabs
+                h.start = 0
+                h.end = 0
+                h.after = 0
+                list.list_add(result, h as ptr)
+            }
+        } else {
+            i = i + 1
+        }
+    }
+    if pending == list.list_size(result) { return result }
+    free_heredocs(result)
+    return list.list_new()
+}
+
+// ---- expansions inside heredoc bodies ------------------------------------
+
+check_expansions(text: string, home: string, depth: int, shell_quotes: int) -> string {
+    if depth > 4 { return "command nesting is too deep to check" }
+    heredocs = list.list_new()
+    if shell_quotes == 1 {
+        free_heredocs(heredocs)
+        heredocs = scan_heredocs(text)
+    }
+    defer free_heredocs(heredocs)
+    nh = list.list_size(heredocs)
+    n = string.length(text)
+    body_index = 0
+    quote = 0
+    i = 0
+    while i < n {
+        if body_index < nh && i == heredoc_at(heredocs, body_index).start {
+            i = heredoc_at(heredocs, body_index).after
+            body_index = body_index + 1
+            continue
+        }
+        c = string.char_at(text, i)
+        if c == C_BS {
+            i = min_int(i + 2, n)
+            continue
+        }
+        if shell_quotes == 1 {
+            if c == C_DQ {
+                if quote == 0 {
+                    quote = C_DQ
+                } else {
+                    quote = 0
+                }
+                i = i + 1
+                continue
+            }
+            if quote == 0 && c == C_SQ {
+                i = quoted_end(text, i)
+                continue
+            }
+            if quote == 0 && comment_start(text, i) == 1 {
+                i = find_byte_or_len(text, i, C_NL)
+                continue
+            }
+        }
+        begin = 0
+        end = 0
+        if c == C_DOLLAR && i + 1 < n && string.char_at(text, i + 1) == C_LP {
+            begin = i + 2
+            end = skip_parens(text, i + 1)
+        } else if c == C_BT {
+            begin = i + 1
+            after = quoted_end(text, i)
+            if after > begin && string.char_at(text, after - 1) == C_BT {
+                end = after - 1
+            } else {
+                end = n
+            }
+        } else {
+            i = i + 1
+            continue
+        }
+        inner = string.substring(text, begin, end)
+        arithmetic = 0
+        if c == C_DOLLAR && begin < n && string.char_at(text, begin) == C_LP { arithmetic = 1 }
+        if arithmetic == 0 {
+            why = check_depth(inner, home, depth + 1)
+            if string.length(why) > 0 { return why }
+        }
+        why2 = check_expansions(inner, home, depth + 1, 1)
+        if string.length(why2) > 0 { return why2 }
+        i = min_int(end + 1, n)
+    }
+    return ""
+}
+
+// ---- word splitting ------------------------------------------------------
+
+free_words(l: ptr) {
+    n = list.list_size(l)
+    i = 0
+    while i < n {
+        heap.free(list.list_get_raw(l, i) as *Word)
+        i = i + 1
+    }
+    list.list_free(l)
+}
+
+word_at(l: ptr, i: int) -> *Word {
+    return list.list_get_raw(l, i) as *Word
+}
+
+new_word(text: string, sep: int, fetch: int) -> *Word {
+    w = heap.new(Word)
+    w.text = text
+    w.sep = sep
+    w.substitutes_fetch = fetch
+    return w
+}
+
+unquote(raw: string) -> string {
+    n = string.length(raw)
+    if n >= 2 {
+        f = string.char_at(raw, 0)
+        if (f == C_SQ || f == C_DQ) && string.char_at(raw, n - 1) == f {
+            return string.substring(raw, 1, n - 1)
+        }
+    }
+    return raw
+}
+
+part_fetches(part: string) -> int {
+    n = string.length(part)
+    s = 0
+    while s < n && string.char_at(part, s) == C_SP { s = s + 1 }
+    rest = string.substring(part, s, n)
+    if string.starts_with(rest, "curl") == 1 || string.starts_with(rest, "wget") == 1 { return 1 }
+    return 0
+}
+
+// splitAny(raw, "$<(") pieces, each checked for a leading fetcher name
+substitutes_fetch(raw: string) -> int {
+    n = string.length(raw)
+    start = 0
+    i = 0
+    while i <= n {
+        if i == n || in_chars("$<(", string.char_at(raw, i)) == 1 {
+            if part_fetches(string.substring(raw, start, i)) == 1 { return 1 }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Returns (words, ok); ok == 0 when more than MAX_WORDS words (upstream: null).
+split(command: string, bodies: ptr) -> (ptr, int) {
+    words = list.list_new()
+    n = string.length(command)
+    nb = list.list_size(bodies)
+    i = 0
+    body_index = 0
+    while i < n {
+        if body_index < nb && i == heredoc_at(bodies, body_index).start {
+            i = heredoc_at(bodies, body_index).after
+            body_index = body_index + 1
+            continue
+        }
+        ch = string.char_at(command, i)
+        if ch == C_SP || ch == C_TAB {
+            i = i + 1
+            continue
+        }
+        sep = SEP_NONE
+        if ch == C_PIPE {
+            if i + 1 < n && string.char_at(command, i + 1) == C_PIPE {
+                sep = SEP_LIST
+            } else {
+                sep = SEP_PIPE
+            }
+        } else if ch == C_SEMI || ch == C_AMP || ch == C_NL || ch == C_LP || ch == C_RP || ch == C_LB || ch == C_RB || ch == C_BT {
+            sep = SEP_LIST
+        }
+        if sep != SEP_NONE {
+            if list.list_size(words) == MAX_WORDS {
+                free_words(words)
+                return list.list_new(), 0
+            }
+            list.list_add(words, new_word("", sep, 0) as ptr)
+            if sep == SEP_LIST && ch == C_PIPE {
+                i = i + 2
+            } else {
+                i = i + 1
+            }
+            continue
+        }
+        begin = i
+        quote = 0
+        stop = 0
+        while i < n && stop == 0 {
+            cc = string.char_at(command, i)
+            if quote != 0 {
+                if cc == quote {
+                    quote = 0
+                } else if cc == C_BS && quote == C_DQ {
+                    i = i + 1
+                }
+                i = i + 1
+            } else if cc == C_SQ || cc == C_DQ {
+                quote = cc
+                i = i + 1
+            } else if cc == C_BS {
+                i = i + 2
+            } else if (cc == C_DOLLAR || cc == C_LT) && i + 1 < n && string.char_at(command, i + 1) == C_LP {
+                i = skip_parens(command, i + 1) + 1
+            } else if in_chars(" \t|;&\n(){}`", cc) == 1 {
+                stop = 1
+            } else {
+                i = i + 1
+            }
+        }
+        if list.list_size(words) == MAX_WORDS {
+            free_words(words)
+            return list.list_new(), 0
+        }
+        raw = string.substring(command, begin, min_int(i, n))
+        list.list_add(words, new_word(unquote(raw), SEP_NONE, substitutes_fetch(raw)) as ptr)
+    }
+    return words, 1
+}
+
+// ---- command classification ----------------------------------------------
+
+// index of the first word after leading VAR=val words and wrappers (with their flags)
+strip_prefix(words: ptr, s: int, e: int) -> int {
+    i = s
+    while i < e {
+        w = word_at(words, i).text
+        if has(w, "=") == 1 && string.starts_with(w, "-") == 0 && string.char_at(w, 0) != C_EQ {
+            i = i + 1
+        } else if in_wrappers(basename(w)) == 1 {
+            i = i + 1
+            while i < e {
+                t = word_at(words, i).text
+                if string.length(t) > 0 && (string.char_at(t, 0) == C_DASH || is_digit(string.char_at(t, 0)) == 1) {
+                    i = i + 1
+                } else {
+                    break
+                }
+            }
+        } else {
+            break
+        }
+    }
+    return i
+}
+
+// trims trailing bytes in `set` from s[0..len]; returns the new end
+trim_end_chars(s: string, len: int, set: string) -> int {
+    e = len
+    while e > 0 && in_chars(set, string.char_at(s, e - 1)) == 1 { e = e - 1 }
+    return e
+}
+
+is_protected(path: string, home: string) -> int {
+    if string.length(path) > 512 { return 0 }
+    sb = strbuilder.new(string.length(path) + 1)
+    n = string.length(path)
+    i = 0
+    while i < n {
+        c = string.char_at(path, i)
+        if c != C_SQ && c != C_DQ { strbuilder.append_byte(sb, c) }
+        i = i + 1
+    }
+    buf = strbuilder.finish(sb)
+    p = string.substring(buf, 0, trim_end_chars(buf, string.length(buf), "/*"))
+    if string.length(p) == 0 || eq(p, ".") == 1 || eq(p, "..") == 1 { return 1 }
+    if in_protected_paths(p) == 1 { return 1 }
+    if string.length(home) > 0 {
+        h = string.substring(home, 0, trim_end_chars(home, string.length(home), "/"))
+        if eq(p, h) == 1 { return 1 }
+    }
+    return 0
+}
+
+// args are words[s..e]
+rm_is_destructive(words: ptr, s: int, e: int, home: string) -> int {
+    recursive = 0
+    no_more_flags = 0
+    i = s
+    while i < e {
+        t = word_at(words, i).text
+        tl = string.length(t)
+        if no_more_flags == 0 && eq(t, "--") == 1 {
+            no_more_flags = 1
+        } else if no_more_flags == 0 && string.starts_with(t, "--") == 1 {
+            if eq(t, "--recursive") == 1 { recursive = 1 }
+        } else if no_more_flags == 0 && tl > 1 && string.char_at(t, 0) == C_DASH {
+            if has(string.substring(t, 1, tl), "r") == 1 || has(string.substring(t, 1, tl), "R") == 1 { recursive = 1 }
+        }
+        i = i + 1
+    }
+    if recursive == 0 { return 0 }
+    no_more_flags = 0
+    i = s
+    while i < e {
+        t = word_at(words, i).text
+        tl = string.length(t)
+        if no_more_flags == 0 && eq(t, "--") == 1 {
+            no_more_flags = 1
+        } else if no_more_flags == 0 && tl > 1 && string.char_at(t, 0) == C_DASH {
+            // flag
+        } else if is_protected(t, home) == 1 {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- the check proper ----------------------------------------------------
+
+check_depth(command: string, home: string, depth: int) -> string {
+    if depth > 4 { return "command nesting is too deep to check" }
+    bodies = scan_heredocs(command)
+    defer free_heredocs(bodies)
+    nb = list.list_size(bodies)
+    n = string.length(command)
+    checked = 0
+    bi = 0
+    while bi < nb {
+        body = heredoc_at(bodies, bi)
+        if has_in(command, checked, body.start, "--no-preserve-root") == 1 { return "rm --no-preserve-root" }
+        if body.quoted == 0 {
+            why = check_expansions(string.substring(command, body.start, body.end), home, depth, 0)
+            if string.length(why) > 0 { return why }
+        }
+        checked = body.after
+        bi = bi + 1
+    }
+    if has_in(command, checked, n, "--no-preserve-root") == 1 { return "rm --no-preserve-root" }
+
+    words, ok = split(command, bodies)
+    if ok == 0 { return too_long() }
+    defer free_words(words)
+    nw = list.list_size(words)
+
+    fetched = 0
+    runs_shell = 0
+    start = 0
+    while start < nw {
+        end = start
+        while end < nw && word_at(words, end).sep == SEP_NONE { end = end + 1 }
+        sep = SEP_NONE
+        if end < nw { sep = word_at(words, end).sep }
+        simple_start = start
+        start = end + 1
+
+        a0 = strip_prefix(words, simple_start, end)
+        if a0 >= end { continue }
+        cmd = basename(word_at(words, a0).text)
+
+        if in_always_denied(cmd) == 1 || string.starts_with(cmd, "mkfs") == 1 {
+            return "privileged or system-level command"
+        }
+        if eq(cmd, "dd") == 1 {
+            k = a0 + 1
+            while k < end {
+                if string.starts_with(word_at(words, k).text, "of=/dev/") == 1 { return "dd onto a device" }
+                k = k + 1
+            }
+        }
+        if eq(cmd, "rm") == 1 && rm_is_destructive(words, a0 + 1, end, home) == 1 {
+            return "recursive rm of a protected path"
+        }
+
+        if in_shells(cmd) == 1 || eq(cmd, "eval") == 1 {
+            runs_shell = 1
+            if fetched == 1 { return "piping a downloaded script into a shell" }
+            k = a0 + 1
+            while k < end {
+                a = word_at(words, k)
+                if a.substitutes_fetch == 1 { return "running a downloaded script" }
+                idx = k - a0
+                inline_script = 0
+                if eq(cmd, "eval") == 1 { inline_script = 1 }
+                if idx > 1 && eq(word_at(words, k - 1).text, "-c") == 1 { inline_script = 1 }
+                if inline_script == 1 {
+                    why = check_depth(a.text, home, depth + 1)
+                    if string.length(why) > 0 { return why }
+                }
+                k = k + 1
+            }
+        }
+        if (eq(cmd, "curl") == 1 || eq(cmd, "wget") == 1) && sep == SEP_PIPE { fetched = 1 }
+        if sep != SEP_PIPE { fetched = 0 }
+    }
+    // A heredoc may be a shell's stdin script; when a shell runs here, its bodies are commands, not data.
+    if runs_shell == 1 {
+        bi = 0
+        while bi < nb {
+            body = heredoc_at(bodies, bi)
+            why = check_depth(string.substring(command, body.start, body.end), home, depth + 1)
+            if string.length(why) > 0 { return why }
+            bi = bi + 1
+        }
+    }
+    return ""
+}
