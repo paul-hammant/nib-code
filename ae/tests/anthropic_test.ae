@@ -198,6 +198,16 @@ main() {
             spec.assert_eq(jsonx.has(block_(lroot, 0, 0), "cache_control"), 0, "text has none")
             spec.assert_eq(jsonx.has(block_(lroot, 0, 1), "cache_control"), 1, "image has it")
             jsonx.free(lroot)
+            // two images: only the last block carries the breakpoint
+            pair = list.list_new()
+            list.list_add(pair, msg.system("instructions"))
+            list.list_add(pair, msg.set_raw(msg.user("two"), "images", "[${shot},${shot}]"))
+            pbody, perr = anthropic.request_body(cp, pair, "[]", -1)
+            proot = doc_(pbody)
+            spec.assert_eq(jsonx.has(block_(proot, 0, 0), "cache_control"), 0, "text has none")
+            spec.assert_eq(jsonx.has(block_(proot, 0, 1), "cache_control"), 0, "first image has none")
+            spec.assert_eq(jsonx.has(block_(proot, 0, 2), "cache_control"), 1, "last image has it")
+            jsonx.free(proot)
             // a custom provider without vision gets text
             ccp = types.new_config("custom", "", "", "m")
             cc = ccp as *types.Config

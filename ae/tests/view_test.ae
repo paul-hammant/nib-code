@@ -73,8 +73,13 @@ main() {
             expect_json_(call_(s, "view", bad), "\"ok\":false,\"error\":\"unsupported image")
             expect_json_(call_(s, "view", "{\"path\":\"missing.png\"}"), "\"error\":\"file not found\"")
             spec.assert_eq(image.attached_count((s as *tools.RunScope).images), 1, "refusals attach nothing")
+            // a path that is not canonical is named and echoed as given
+            fs.mkdir_p("${d}/sub")
+            odd = "${d}/sub/../shot.png"
+            r2 = call_(s, "view", "{\"path\":${jsonx.quote(odd)}}")
+            expect_json_(r2, "\"path\":${jsonx.quote(odd)}")
             i = 0
-            while i < 4 {
+            while i < 2 {
                 call_(s, "view", good)
                 i = i + 1
             }
@@ -83,6 +88,7 @@ main() {
             taken = tools.take_images(s)
             spec.assert_eq(image.count(taken), 4, "the Run's four")
             spec.assert_str_eq(image.name_of(image.image_at(taken, 0)), "${d}/shot.png", "named by the path as given")
+            spec.assert_str_eq(image.name_of(image.image_at(taken, 1)), "${d}/sub/../shot.png", "a non-canonical path stays as given")
             spec.assert_true(has_(taken, "\"media_type\":\"image/png\"") == 1, "media type")
             spec.assert_true(has_(taken, "${d}/nibhome/sessions/abc.images/") == 1, "stored under the session's images")
             spec.assert_str_eq(tools.take_images(s), "", "taken once")
