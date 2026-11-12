@@ -105,7 +105,7 @@ pins                     AE_PIN / AEB_REF the port is verified against
 | `src/session.zig` | 999 | `ae/nib/session/module.ae` | a2dd439 | Turn/Step loop, resume/continue, interrupted commits, auto compaction, Step-limit wait, undo wiring; no fork, reopen/switchConfig (TUI), skills, MCP, images |
 | `src/session/run.zig` | 236 | `ae/nib/session/module.ae` | a2dd439 | execute; no automatic Run backgrounding |
 | `src/session/run_job.zig` | 116 | not yet |  | automatic Run backgrounding (rN): next |
-| `src/session/log.zig` | 1402 | `ae/nib/session/log/module.ae` | a2dd439 | records are JSON text; tool summaries/bash replacements not restored onto replayed messages (the TUI needs them) |
+| `src/session/log.zig` | 1402 | `ae/nib/session/log/module.ae` | a2dd439 | records are JSON text; tool summaries travel on the logged tool messages (the TUI reads them on resume); bash replacements (superseded bash rows) are not restored onto replayed messages yet |
 | `src/session/output.zig` | 596 | `ae/nib/session/output/module.ae` | a2dd439 |  |
 | `src/session/prompt.zig` | 322 | `ae/nib/session/prompt/module.ae` | a2dd439 |  |
 | `src/session/profile.zig` | 58 | `ae/nib/session/profile/module.ae` | a2dd439 |  |
