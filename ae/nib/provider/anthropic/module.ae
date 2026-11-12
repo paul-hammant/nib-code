@@ -6,13 +6,15 @@
 // Errors are names (upstream's error set) with a detail text:
 // HttpStatus, HttpTransient, ProviderTransient, RateLimited, ProviderFailed,
 // InvalidResponse, IncompleteResponse, TooManyToolCalls, Canceled, the
-// http timeouts, Transport. Images are not ported: a message's `images`
-// are not sent (the Session image store comes with tools.view).
+// http timeouts, Transport. A message's `images` ride as image blocks in user
+// messages and inside tool results (a model without vision, or a file that
+// is gone, gets a text placeholder: nib.image).
 
 import std.json
 import std.list
 import std.string
 import std.strbuilder
+import nib.image
 import nib.jsonx
 import nib.msg
 import nib.provider.types
@@ -23,6 +25,15 @@ import nib.provider.http
 exports(effort, adaptive, family, request_body, read_stream, stream)
 
 const EPHEMERAL = ",\"cache_control\":{\"type\":\"ephemeral\"}"
+
+// One image as a content block; cache puts the cache breakpoint on it.
+image_block_(images: string, i: int, vision: int, cache: int) -> string {
+    control = ""
+    if cache == 1 { control = EPHEMERAL }
+    kind, a, b = image.part_at(images, i, vision)
+    if kind == 0 { return "{\"type\":\"text\",\"text\":${jsonx.quote(a)}${control}}" }
+    return "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":${jsonx.quote(a)},\"data\":\"${b}\"}${control}}"
+}
 
 is_digit_(c: int) -> int {
     if c >= 48 && c <= 57 { return 1 }
@@ -102,6 +113,7 @@ valid_history_effort_(e: string) -> int {
 // (body, "") or ("", "InvalidResponse") when a stored message is malformed.
 request_body(cp: ptr, messages: ptr, tools_json: string, max_tokens: int) -> (string, string) {
     c = cp as *types.Config
+    vision = types.vision(cp)
     level = effort(cp)
     managed = 0
     if managed_effort_(c.model) == 1 && level != "" && level != "off" { managed = 1 }
@@ -192,7 +204,21 @@ request_body(cp: ptr, messages: ptr, tools_json: string, max_tokens: int) -> (st
                     if id == "" { return "", "InvalidResponse" }
                     cache = ""
                     if last_user == i { cache = EPHEMERAL }
-                    strbuilder.append(w, "${block_sep}{\"type\":\"tool_result\",\"tool_use_id\":${jsonx.quote(id)},\"content\":${jsonx.quote(msg.content(res))}${cache}}")
+                    strbuilder.append(w, "${block_sep}{\"type\":\"tool_result\",\"tool_use_id\":${jsonx.quote(id)},\"content\":")
+                    rimages = msg.raw(res, "images")
+                    rn = image.count(rimages)
+                    if rn > 0 {
+                        strbuilder.append(w, "[{\"type\":\"text\",\"text\":${jsonx.quote(msg.content(res))}}")
+                        q = 0
+                        while q < rn {
+                            strbuilder.append(w, ",${image_block_(rimages, q, vision, 0)}")
+                            q = q + 1
+                        }
+                        strbuilder.append(w, "]")
+                    } else {
+                        strbuilder.append(w, jsonx.quote(msg.content(res)))
+                    }
+                    strbuilder.append(w, "${cache}}")
                     if i + 1 == n { break }
                     nx, _e3 = list.get_string(messages, i + 1)
                     if msg.role(nx) != "tool" { break }
@@ -200,9 +226,20 @@ request_body(cp: ptr, messages: ptr, tools_json: string, max_tokens: int) -> (st
                     block_sep = ","
                 }
             } else {
-                cache = ""
-                if last_user == i { cache = EPHEMERAL }
-                strbuilder.append(w, "{\"type\":\"text\",\"text\":${jsonx.quote(msg.content(m))}${cache}}")
+                ucache = 0
+                if last_user == i { ucache = 1 }
+                uimages = msg.raw(m, "images")
+                un = image.count(uimages)
+                text_cache = ""
+                if ucache == 1 && un == 0 { text_cache = EPHEMERAL }
+                strbuilder.append(w, "{\"type\":\"text\",\"text\":${jsonx.quote(msg.content(m))}${text_cache}}")
+                q = 0
+                while q < un {
+                    on_last = 0
+                    if ucache == 1 && q + 1 == un { on_last = 1 }
+                    strbuilder.append(w, ",${image_block_(uimages, q, vision, on_last)}")
+                    q = q + 1
+                }
             }
             strbuilder.append(w, "]}")
         }

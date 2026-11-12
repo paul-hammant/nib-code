@@ -1,8 +1,8 @@
 // Ports the inline tests of upstream src/provider/openai.zig (Chat
 // Completions) under their names, on fixtures (sse.fixed), never a network.
 //
-// Not ported (images): "Chat Completions images use image_url parts and follow
-// tool results in a user message".
+// "Chat Completions images use image_url parts and follow tool results in a
+// user message" is ported with a real image store in a temp directory.
 // Adapted: "chat timing collects argument chunks without emitted text" drove
 // ModelTiming (not ported); it keeps the stream half (the chunks assemble one
 // call and report two argument deltas, no text delta). "chunk decodes ..."
@@ -11,6 +11,8 @@ import std.spec
 import std.string
 import std.list
 import std.json
+import std.fs
+import nib.image
 import nib.jsonx
 import nib.msg
 import nib.provider.types
@@ -254,6 +256,44 @@ main() {
             cp = types.new_config("deepseek", "", "fake-key", "m")
             body, err = openai.request_body(cp, user_only_("hi"), "[]", -1)
             spec.assert_eq(string.index_of(body, "fake-key"), -1, "key not in body")
+        }
+        spec.it("Chat Completions images use image_url parts and follow tool results in a user message") callback {
+            d, _e = fs.make_temp_dir("", "nib-chat-img")
+            shot, serr = image.store("${d}/images", "shot.png", image.sample_png())
+            spec.assert_str_eq(serr, "", "stored")
+            cl = list.list_new()
+            list.list_add(cl, types.tool_call_new("one", "run", "{}"))
+            list.list_add(cl, types.tool_call_new("two", "run", "{}"))
+            history = list.list_new()
+            list.list_add(history, msg.set_raw(msg.user("look"), "images", "[${shot}]"))
+            list.list_add(history, msg.assistant("", cl, "", "", 0, "", -1, ""))
+            list.list_add(history, msg.tool("one", "viewed", ",\"images\":[${shot}]"))
+            list.list_add(history, msg.tool("two", "plain", ""))
+            cp = types.new_config("custom", "", "", "m")
+            c = cp as *types.Config
+            c.custom_provider = "site"
+            c.custom_vision = 1
+            body, err = openai.request_body(cp, history, "[]", -1)
+            spec.assert_str_eq(err, "", "body")
+            root = jsonx.parse(body)
+            wire = jsonx.field(root, "messages")
+            spec.assert_eq(json.json_array_size(wire), 5, "a follow-up user message")
+            parts = jsonx.field(jsonx.array_at(wire, 0), "content")
+            spec.assert_str_eq(jsonx.str_or(jsonx.array_at(parts, 0), "text", ""), "look", "text part")
+            url = jsonx.str_or(jsonx.field(jsonx.array_at(parts, 1), "image_url"), "url", "")
+            spec.assert_true(string.starts_with(url, "data:image/png;base64,iVBOR"), "data url")
+            spec.assert_str_eq(jsonx.str_or(jsonx.array_at(wire, 2), "content", ""), "viewed", "tool text stays text")
+            spec.assert_str_eq(jsonx.str_or(jsonx.array_at(wire, 3), "role", ""), "tool", "second tool first")
+            spec.assert_str_eq(jsonx.str_or(jsonx.array_at(wire, 4), "role", ""), "user", "then the user message")
+            follow = jsonx.field(jsonx.array_at(wire, 4), "content")
+            spec.assert_str_eq(jsonx.str_or(jsonx.array_at(follow, 0), "text", ""), "[tool result image: shot.png]", "label")
+            spec.assert_str_eq(jsonx.str_or(jsonx.array_at(follow, 1), "type", ""), "image_url", "image part")
+            jsonx.free(root)
+            // no vision: placeholders, no pixels
+            c.custom_vision = 0
+            tbody, terr = openai.request_body(cp, history, "[]", -1)
+            spec.assert_true(string.index_of(tbody, "[image shot.png 640×480 omitted]") >= 0, "placeholder")
+            spec.assert_eq(string.index_of(tbody, "base64"), -1, "no pixels")
         }
     }
     return spec.run_summary(fw)

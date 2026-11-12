@@ -1,15 +1,16 @@
 // Ports the inline tests of upstream src/provider/anthropic.zig under their
 // names, on fixtures (sse.fixed), never a network.
 //
-// Not ported (images): "Anthropic images ride in user blocks and tool
-// results with the cache breakpoint last" needs the Session image store and
-// image blocks. The part that applies without images (the cache breakpoint
-// rides on the last user block / last tool result) is the adapted test
-// "Anthropic cache breakpoint rides the last user block (text only)".
+// "Anthropic images ride in user blocks and tool results with the cache
+// breakpoint last" is ported with a real image store in a temp directory. The
+// text-only cache breakpoint case is the adapted test "Anthropic cache
+// breakpoint rides the last user block (text only)".
 import std.spec
 import std.string
 import std.list
 import std.json
+import std.fs
+import nib.image
 import nib.jsonx
 import nib.msg
 import nib.provider.types
@@ -156,6 +157,56 @@ main() {
             spec.assert_eq(jsonx.has(jsonx.array_at(ts, 0), "cache_control"), 0, "first tool uncached")
             spec.assert_eq(jsonx.has(jsonx.array_at(ts, 1), "cache_control"), 1, "last tool cached")
             spec.assert_str_eq(jsonx.str_or(jsonx.array_at(ts, 1), "name", ""), "b", "name")
+        }
+
+        spec.it("Anthropic images ride in user blocks and tool results with the cache breakpoint last") callback {
+            d, _e = fs.make_temp_dir("", "nib-anth-img")
+            shot, serr = image.store("${d}/images", "shot.png", image.sample_png())
+            spec.assert_str_eq(serr, "", "stored")
+            cp = cfg_("claude-sonnet-5-5")
+            cl = list.list_new()
+            list.list_add(cl, types.tool_call_new("call", "run", "{\"code\":\"1\"}"))
+            history = list.list_new()
+            list.list_add(history, msg.system("instructions"))
+            list.list_add(history, msg.set_raw(msg.user("look [Image #1]"), "images", "[${shot}]"))
+            list.list_add(history, msg.assistant("", cl, "", "", 0, "", -1, ""))
+            list.list_add(history, msg.tool("call", "viewed", ",\"images\":[${shot}]"))
+            body, err = anthropic.request_body(cp, history, "[]", -1)
+            spec.assert_str_eq(err, "", "body")
+            root = doc_(body)
+            spec.assert_str_eq(jsonx.str_or(block_(root, 0, 0), "type", ""), "text", "text block")
+            spec.assert_eq(jsonx.has(block_(root, 0, 0), "cache_control"), 0, "no breakpoint on the text")
+            spec.assert_str_eq(jsonx.str_or(block_(root, 0, 1), "type", ""), "image", "image block")
+            spec.assert_eq(jsonx.has(block_(root, 0, 1), "cache_control"), 0, "none on a non-final user message")
+            src = jsonx.field(block_(root, 0, 1), "source")
+            spec.assert_str_eq(jsonx.str_or(src, "type", ""), "base64", "base64 source")
+            spec.assert_str_eq(jsonx.str_or(src, "media_type", ""), "image/png", "media type")
+            spec.assert_str_eq(string.substring(jsonx.str_or(src, "data", ""), 0, 11), "iVBORw0KGgo", "png data")
+            result = block_(root, 2, 0)
+            spec.assert_str_eq(jsonx.str_or(result, "type", ""), "tool_result", "tool result")
+            spec.assert_eq(jsonx.has(result, "cache_control"), 1, "breakpoint on the result")
+            inner = jsonx.field(result, "content")
+            spec.assert_str_eq(jsonx.str_or(jsonx.array_at(inner, 0), "text", ""), "viewed", "result text")
+            spec.assert_str_eq(jsonx.str_or(jsonx.array_at(inner, 1), "type", ""), "image", "result image")
+            jsonx.free(root)
+            // a user message last: the breakpoint rides the final image block
+            only = list.list_new()
+            list.list_add(only, msg.system("instructions"))
+            list.list_add(only, msg.set_raw(msg.user("look [Image #1]"), "images", "[${shot}]"))
+            lbody, lerr = anthropic.request_body(cp, only, "[]", -1)
+            lroot = doc_(lbody)
+            spec.assert_eq(jsonx.has(block_(lroot, 0, 0), "cache_control"), 0, "text has none")
+            spec.assert_eq(jsonx.has(block_(lroot, 0, 1), "cache_control"), 1, "image has it")
+            jsonx.free(lroot)
+            // a custom provider without vision gets text
+            ccp = types.new_config("custom", "", "", "m")
+            cc = ccp as *types.Config
+            cc.custom_provider = "site"
+            cc.custom_protocol = "anthropic_messages"
+            cc.custom_vision = 0
+            tbody, terr = anthropic.request_body(ccp, only, "[]", -1)
+            spec.assert_true(has_(tbody, "[image shot.png 640×480 omitted]") == 1, "placeholder")
+            spec.assert_eq(has_(tbody, "base64"), 0, "no pixels")
         }
 
         spec.it("Anthropic thinking blocks without a signature are rejected") callback {

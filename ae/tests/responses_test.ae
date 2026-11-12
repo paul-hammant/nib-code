@@ -1,13 +1,11 @@
 // Ports the inline tests of upstream src/provider/responses.zig under their
 // names, on fixtures (sse.fixed), never a network.
 //
-// Not ported, by policy (no Codex, no websocket, no images):
+// Not ported, by policy (no Codex, no websocket):
 //  - "Codex catalog context windows" (the Codex model catalog and its
 //    contextWindow; the built-in windows live in provider.types),
 //  - "WebSocket protocol fallback keeps cancellation and transient failures
-//    on their existing paths" (websocket),
-//  - "Responses images use input_image and tool outputs only where the API
-//    accepts them" (images).
+//    on their existing paths" (websocket).
 // Adapted: tests that drove ModelTiming/idle.Monitor/body.Reader (no
 // equivalent in the port) keep their stream assertions and drop the timing
 // ones; the Codex provider is the openai provider; codex_run_tool custom/
@@ -16,6 +14,8 @@ import std.spec
 import std.string
 import std.list
 import std.json
+import std.fs
+import nib.image
 import nib.jsonx
 import nib.msg
 import nib.provider.types
@@ -536,6 +536,49 @@ main() {
             spec.assert_str_eq(jsonx.str_or(arr_(root, "input", 1), "phase", ""), "final_answer", "phase replayed")
             spec.assert_eq(json.json_array_size(jsonx.field(root, "input")), 2, "no duplicate message item")
             jsonx.free(root)
+        }
+
+        spec.it("Responses images use input_image and tool outputs only where the API accepts them") callback {
+            d, _e = fs.make_temp_dir("", "nib-resp-img")
+            shot, serr = image.store("${d}/images", "shot.png", image.sample_png())
+            spec.assert_str_eq(serr, "", "stored")
+            calls = types.tool_call_new("call", "run", "{\"code\":\"1\"}")
+            cl = list.list_new()
+            list.list_add(cl, calls)
+            history = list.list_new()
+            list.list_add(history, msg.set_raw(msg.user("look"), "images", "[${shot}]"))
+            asst = msg.set_raw(msg.assistant("", cl, "", "", 0, "", -1, ""), "tool_calls", "[{\"id\":\"call\",\"type\":\"custom\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"code\\\":\\\"1\\\"}\"}}]")
+            list.list_add(history, asst)
+            list.list_add(history, msg.tool("call", "viewed", ",\"images\":[${shot}]"))
+            ids = ["openai", "xai"]
+            k = 0
+            while k < 2 {
+                id = ids[k]
+                body, err = responses.request_body(types.new_config(id, "", "", "m"), "key", history, "[]", -1)
+                spec.assert_str_eq(err, "", "body for ${id}")
+                root = doc_(body)
+                input = jsonx.field(root, "input")
+                user = jsonx.field(arr_(root, "input", 0), "content")
+                spec.assert_str_eq(jsonx.str_or(json.json_array_get_raw(user, 0), "type", ""), "input_text", "text first")
+                spec.assert_true(string.starts_with(jsonx.str_or(json.json_array_get_raw(user, 1), "image_url", ""), "data:image/png;base64,iVBOR"), "data url")
+                spec.assert_str_eq(jsonx.str_or(arr_(root, "input", 2), "type", ""), "custom_tool_call_output", "custom output")
+                if id == "openai" {
+                    spec.assert_eq(json.json_array_size(input), 3, "no follow-up message")
+                    output = jsonx.field(arr_(root, "input", 2), "output")
+                    spec.assert_str_eq(jsonx.str_or(json.json_array_get_raw(output, 0), "text", ""), "viewed", "output text")
+                    spec.assert_str_eq(jsonx.str_or(json.json_array_get_raw(output, 1), "type", ""), "input_image", "output image")
+                } else {
+                    spec.assert_eq(json.json_array_size(input), 4, "follow-up message")
+                    spec.assert_str_eq(jsonx.str_or(arr_(root, "input", 2), "output", ""), "viewed", "plain output")
+                    spec.assert_str_eq(jsonx.str_or(arr_(root, "input", 3), "role", ""), "user", "user follow-up")
+                    follow = jsonx.field(arr_(root, "input", 3), "content")
+                    spec.assert_str_eq(jsonx.str_or(json.json_array_get_raw(follow, 0), "text", ""), "[tool result image: shot.png]", "label")
+                    spec.assert_str_eq(jsonx.str_or(json.json_array_get_raw(follow, 1), "type", ""), "input_image", "image")
+                    spec.assert_eq(jsonx.has(json.json_array_get_raw(follow, 1), "text"), 0, "no text on the image item")
+                }
+                jsonx.free(root)
+                k = k + 1
+            }
         }
 
         spec.it("a summary request asks to stay within max_tokens on its last user message") callback {

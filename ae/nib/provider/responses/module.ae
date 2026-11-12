@@ -10,8 +10,10 @@
 // timeouts, Transport.
 //
 // Not ported, by policy: the Codex backend (ChatGPT sign-in, chatgpt-account-id
-// and the codex headers, the websocket transport, codex_state), and images
-// (a message's `images` are not sent). Web search is not in this slice.
+// and the codex headers, the websocket transport, codex_state). A message's
+// `images` ride as input_image items; a tool output carries them only for
+// OpenAI's own Responses (the others get a user message after the tool
+// output(s)). Web search is not in this slice.
 //
 // A model-built custom call (type "custom") reaches the log as a function
 // call named "run" with arguments {"code":...} (types.ToolCall carries no
@@ -23,6 +25,7 @@ import std.json
 import std.list
 import std.string
 import std.strbuilder
+import nib.image
 import nib.jsonx
 import nib.msg
 import nib.provider.types
@@ -137,12 +140,27 @@ is_custom_call_(provider: string, messages: ptr, upto: int, id: string) -> int {
     return 0
 }
 
+// The input items of the i-th image: an input_text, or an input_image.
+input_item_(images: string, i: int, vision: int) -> string {
+    kind, a, b = image.part_at(images, i, vision)
+    if kind == 0 { return "{\"type\":\"input_text\",\"text\":${jsonx.quote(a)}}" }
+    return "{\"type\":\"input_image\",\"image_url\":${jsonx.quote(image.data_url(a, b))}}"
+}
+
+// Only OpenAI's own Responses accept images inside tool outputs.
+tool_output_images_(provider: string) -> int {
+    if provider == "codex" || provider == "openai" { return 1 }
+    return 0
+}
+
 // (body, "") or ("", "InvalidResponse") when a stored message, the tools or
 // the output schema are malformed.
 request_body(cp: ptr, cache_key: string, messages: ptr, tools_json: string, max_tokens: int) -> (string, string) {
     c = cp as *types.Config
+    vision = types.vision(cp)
     n = list.list_size(messages)
     instructions = "You are a helpful assistant."
+    pending_images = ""
     w = strbuilder.new(4096)
     strbuilder.append(w, "[")
     sep = ""
@@ -188,13 +206,57 @@ request_body(cp: ptr, cache_key: string, messages: ptr, tools_json: string, max_
             if id_raw != "" && is_custom_call_(c.provider, messages, i, id) == 1 { kind = "custom_tool_call_output" }
             idj = "null"
             if id_raw != "" { idj = id_raw }
-            strbuilder.append(w, "${sep}{\"type\":\"${kind}\",\"call_id\":${idj},\"output\":${jsonx.quote(msg.content(m))}}")
+            timages = msg.raw(m, "images")
+            tn = image.count(timages)
+            cidj = ""
+            if id_raw != "" { cidj = "\"call_id\":${id_raw}," }
+            if tn > 0 && tool_output_images_(c.provider) == 1 {
+                oitems = "{\"type\":\"input_text\",\"text\":${jsonx.quote(msg.content(m))}}"
+                q = 0
+                while q < tn {
+                    oitems = "${oitems},${input_item_(timages, q, vision)}"
+                    q = q + 1
+                }
+                strbuilder.append(w, "${sep}{\"type\":\"${kind}\",${cidj}\"output\":[${oitems}]}")
+            } else {
+                strbuilder.append(w, "${sep}{\"type\":\"${kind}\",\"call_id\":${idj},\"output\":${jsonx.quote(msg.content(m))}}")
+                q = 0
+                while q < tn {
+                    label = "[tool result image: ${image.name_of(image.image_at(timages, q))}]"
+                    if pending_images != "" { pending_images = "${pending_images}," }
+                    pending_images = "${pending_images}{\"type\":\"input_text\",\"text\":${jsonx.quote(label)}},${input_item_(timages, q, vision)}"
+                    q = q + 1
+                }
+            }
             sep = ","
+            next_is_tool = 0
+            if i + 1 < n {
+                nx, _e4 = list.get_string(messages, i + 1)
+                if msg.role(nx) == "tool" { next_is_tool = 1 }
+            }
+            if pending_images != "" && next_is_tool == 0 {
+                strbuilder.append(w, ",{\"role\":\"user\",\"content\":[${pending_images}]}")
+                pending_images = ""
+            }
             i = i + 1
             continue
         }
         body_text = msg.content(m)
-        if msg.has_content(m) == 1 && string.length(body_text) > 0 {
+        uimages = msg.raw(m, "images")
+        un = image.count(uimages)
+        if un > 0 {
+            uitems = "{\"type\":\"input_text\",\"text\":${jsonx.quote(body_text)}}"
+            q = 0
+            while q < un {
+                uitems = "${uitems},${input_item_(uimages, q, vision)}"
+                q = q + 1
+            }
+            uph = ""
+            uphase = msg.raw(m, "phase")
+            if uphase != "" && uphase != "null" { uph = ",\"phase\":${uphase}" }
+            strbuilder.append(w, "${sep}{\"role\":${jsonx.quote(r)},\"content\":[${uitems}]${uph}}")
+            sep = ","
+        } else if msg.has_content(m) == 1 && string.length(body_text) > 0 {
             if max_tokens >= 0 && r == "user" && i == n - 1 {
                 body_text = "${body_text}\nKeep the summary within ${max_tokens} tokens."
             }
