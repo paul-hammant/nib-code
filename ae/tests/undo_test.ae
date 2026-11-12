@@ -1,0 +1,388 @@
+// Ports the tests of upstream src/tools/undo.zig (each under its upstream
+// name), then a few for what the port adds (the Session-facing notice, the
+// private modes). Each test gets its own temp dir holding the project files,
+// the nib data dir (path locks) and the history root; paths are absolute
+// (Zig used cwd-relative .zig-cache paths). The Session calls
+// tools.begin_turn_undo / finish_turn_undo / run_undo; the tests do the same.
+import std.spec
+import std.fs
+import std.list
+import std.string
+import std.strbuilder
+import nib.jsonx
+import nib.sandbox
+import nib.tools
+import nib.tools.undo
+import nib.tools.atomic_file
+import nib.tools.file_state
+import nib.sysgap
+
+struct Fx {
+    d: string
+    t: ptr
+    s: ptr
+    h: ptr
+}
+
+tmp_() -> string {
+    d, _e = fs.make_temp_dir("", "nib-undo")
+    real, _k, _m = fs.realpath(d)
+    return real
+}
+
+// Tools with undo on: history root <d>/undo, nib data dir <d>/nibhome.
+fx_() -> *Fx {
+    f = heap.new(Fx)
+    f.d = tmp_()
+    f.t = tools.new(f.d)
+    (f.t as *tools.Tools).data_home = "${f.d}/nibhome"
+    tools.enable_undo(f.t, "${f.d}/undo")
+    f.s = tools.new_scope(f.t, 1)
+    f.h = (f.t as *tools.Tools).undo_history
+    return f
+}
+
+// A sub-agent's Tools on the same data dir, snapshotting into the parent's Turn.
+child_(f: *Fx) -> ptr {
+    c = tools.new(f.d)
+    (c as *tools.Tools).data_home = "${f.d}/nibhome"
+    tools.attach_turn_undo_dir(c, tools.turn_undo_dir(f.t))
+    return tools.new_scope(c, 2)
+}
+
+call_(s: ptr, name: string, args: string) -> *sandbox.ToolResult {
+    out = sandbox.result_ok("")
+    tools.call_tool(s, name, args, out)
+    return out as *sandbox.ToolResult
+}
+
+// write succeeds and reports its byte count (the upstream fixture checks it)
+write_(s: ptr, path: string, content: string) -> int {
+    r = call_(s, "write", "{\"path\":${jsonx.quote(path)},\"content\":${jsonx.quote(content)}}")
+    if r.ok == 0 { return 0 }
+    if r.text != "{\"bytes\":${string.length(content)}}" { return 0 }
+    return 1
+}
+
+edit_(s: ptr, path: string, old_text: string, new_text: string) -> int {
+    r = call_(s, "edit", "{\"path\":${jsonx.quote(path)},\"old_text\":${jsonx.quote(old_text)},\"new_text\":${jsonx.quote(new_text)}}")
+    return r.ok
+}
+
+begin_(f: *Fx) { tools.begin_turn_undo(f.t) }
+finish_(f: *Fx) -> string { return tools.finish_turn_undo(f.t) }
+undo_(f: *Fx) -> string { return tools.run_undo(f.t) }
+
+contains_(s: string, part: string) -> int {
+    if string.index_of(s, part) >= 0 { return 1 }
+    return 0
+}
+
+read_(p: string) -> string {
+    s, _e = fs.read(p)
+    return s
+}
+
+exists_(p: string) -> int {
+    st = sysgap.new_stat()
+    if sysgap.stat(p, 0, st) == 0 { return 1 }
+    return 0
+}
+
+// the canonical path of a name under the temp dir (it need not exist)
+path_(f: *Fx, name: string) -> string {
+    p, _e = atomic_file.canonical_path("${f.d}/${name}")
+    return p
+}
+
+filled_(n: int, ch: string) -> string {
+    b = strbuilder.new(n + 16)
+    chunk = ch
+    while string.length(chunk) < 1048576 { chunk = "${chunk}${chunk}" }
+    left = n
+    while left >= 1048576 {
+        strbuilder.append(b, chunk)
+        left = left - 1048576
+    }
+    if left > 0 { strbuilder.append(b, string.substring(chunk, 0, left)) }
+    return strbuilder.finish(b)
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tools.undo") {
+        spec.it("undo multiple files, first snapshot, binary Chinese paths, creation and consecutive Turns") callback {
+            f = fx_()
+            fs.write("${f.d}/中文", "\x00\xffold\n")
+            path = path_(f, "中文")
+            created = path_(f, "new")
+            begin_(f)
+            spec.assert_eq(edit_(f.s, path, "old", "new"), 1, "edit")
+            spec.assert_eq(write_(f.s, path, "first"), 1, "write first")
+            spec.assert_eq(write_(f.s, created, ""), 1, "create")
+            finish_(f)
+            begin_(f)
+            spec.assert_eq(write_(f.s, path, "second"), 1, "write second")
+            finish_(f)
+            begin_(f)
+            finish_(f)
+            spec.assert_true(contains_(undo_(f), "restored:"), "undo second Turn")
+            spec.assert_str_eq(read_("${f.d}/中文"), "first", "content after first undo")
+            spec.assert_str_eq(read_("${f.d}/new"), "", "new kept")
+            spec.assert_true(contains_(undo_(f), "deleted:"), "undo first Turn")
+            spec.assert_str_eq(read_("${f.d}/中文"), "\x00\xffold\n", "binary original back")
+            spec.assert_eq(exists_("${f.d}/new"), 0, "created file deleted")
+            spec.assert_true(contains_(undo_(f), "Nothing to undo"), "nothing left")
+            fs.remove_tree(f.d)
+        }
+        spec.it("undo rejects whole Turn on external edit, deletion, symlink or in-Turn interference") callback {
+            f = fx_()
+            fs.write("${f.d}/a", "old")
+            path = path_(f, "a")
+            created = path_(f, "b")
+            begin_(f)
+            spec.assert_eq(write_(f.s, path, "new"), 1, "write a")
+            spec.assert_eq(write_(f.s, created, "created"), 1, "write b")
+            finish_(f)
+            fs.write("${f.d}/a", "external")
+            spec.assert_true(contains_(undo_(f), "skipped (external change"), "external edit refused")
+            spec.assert_str_eq(read_("${f.d}/a"), "external", "a untouched")
+            spec.assert_str_eq(read_("${f.d}/b"), "created", "b untouched")
+            fs.unlink("${f.d}/a")
+            spec.assert_true(contains_(undo_(f), "no files changed"), "deletion refused")
+            fs.write("${f.d}/victim", "new")
+            fs.symlink("victim", "${f.d}/a")
+            spec.assert_true(contains_(undo_(f), "no files changed"), "symlink refused")
+            spec.assert_str_eq(read_("${f.d}/victim"), "new", "victim untouched")
+            fs.unlink("${f.d}/a")
+            fs.write("${f.d}/a", "new")
+            spec.assert_true(contains_(undo_(f), "restored:"), "undo once the file is what nib wrote")
+            begin_(f)
+            spec.assert_eq(write_(f.s, path, "first"), 1, "write first")
+            fs.write("${f.d}/a", "external")
+            spec.assert_eq(edit_(f.s, path, "external", "last"), 1, "edit external")
+            finish_(f)
+            spec.assert_true(contains_(undo_(f), "no files changed"), "in-Turn interference refused")
+            spec.assert_str_eq(read_("${f.d}/a"), "last", "content")
+            fs.remove_tree(f.d)
+        }
+        spec.it("undo shares parent snapshots with child tools and evicts only edited Turns") callback {
+            f = fx_()
+            path = path_(f, "a")
+            begin_(f)
+            c = child_(f)
+            spec.assert_eq(write_(c, path, "child"), 1, "child write")
+            finish_(f)
+            spec.assert_true(contains_(undo_(f), "deleted:"), "child's file undone with the Turn")
+            i = 0
+            while i < undo.HISTORY_LIMIT + 1 {
+                begin_(f)
+                spec.assert_eq(write_(f.s, path, "${i}"), 1, "write ${i}")
+                finish_(f)
+                i = i + 1
+            }
+            spec.assert_eq(undo.turn_count(f.h), undo.HISTORY_LIMIT, "history capped")
+            i = 0
+            while i < undo.HISTORY_LIMIT + 2 {
+                begin_(f)
+                finish_(f)
+                i = i + 1
+            }
+            spec.assert_eq(undo.turn_count(f.h), undo.HISTORY_LIMIT, "empty Turns are not recorded")
+            i = 0
+            while i < undo.HISTORY_LIMIT {
+                spec.assert_true(contains_(undo_(f), "restored:"), "undo ${i}")
+                i = i + 1
+            }
+            spec.assert_str_eq(read_("${f.d}/a"), "0", "oldest kept Turn's before")
+            spec.assert_true(contains_(undo_(f), "Nothing to undo"), "nothing left")
+            fs.remove_tree(f.d)
+        }
+        spec.it("undo file limit allows edits and writes but blocks the whole Turn and earlier history") callback {
+            f = fx_()
+            path = path_(f, "a")
+            begin_(f)
+            spec.assert_eq(write_(f.s, path, "earlier"), 1, "earlier write")
+            finish_(f)
+            begin_(f)
+            spec.assert_eq(write_(f.s, path_(f, "tracked"), "keep"), 1, "tracked write")
+            large = filled_(undo.FILE_LIMIT + 2, "x")
+            spec.assert_eq(edit_(f.s, path, "earlier", large), 1, "edit past the limit")
+            spec.assert_eq(write_(f.s, path, "written over unreadable snapshot"), 1, "write over a large file")
+            n = finish_(f)
+            spec.assert_str_eq(n, undo.NOTICE_INCOMPLETE, "notice for the Turn")
+            spec.assert_eq(undo.notice(f.h), undo.REASON_FILE_TOO_LARGE, "first reason kept")
+            spec.assert_true(contains_(undo_(f), "file exceeds undo limit (16 MiB)"), "refused with the reason")
+            spec.assert_str_eq(read_("${f.d}/a"), "written over unreadable snapshot", "a untouched")
+            spec.assert_str_eq(read_("${f.d}/tracked"), "keep", "tracked untouched")
+            spec.assert_true(contains_(undo_(f), "earlier Turns cannot be undone across it"), "earlier Turns blocked")
+            spec.assert_eq(undo.turn_count(f.h), 2, "both Turns still recorded")
+            begin_(f)
+            spec.assert_eq(write_(f.s, path, "newer"), 1, "newer write")
+            finish_(f)
+            spec.assert_true(contains_(undo_(f), "restored:"), "newer Turn undone")
+            spec.assert_str_eq(read_("${f.d}/a"), "written over unreadable snapshot", "restored")
+            spec.assert_true(contains_(undo_(f), "file exceeds undo limit"), "blocked again")
+            fs.remove_tree(f.d)
+        }
+        spec.it("undo byte limit allows writes and refuses partial restoration") callback {
+            f = fx_()
+            begin_(f)
+            block = filled_(undo.FILE_LIMIT, "x")
+            i = 0
+            while i < 4 {
+                fs.write("${f.d}/file${i}", block)
+                spec.assert_eq(write_(f.s, path_(f, "file${i}"), "small"), 1, "write file${i}")
+                i = i + 1
+            }
+            fs.write("${f.d}/overflow", "x")
+            spec.assert_eq(write_(f.s, path_(f, "overflow"), "y"), 1, "write overflow")
+            finish_(f)
+            spec.assert_true(contains_(undo_(f), "Turn exceeds undo snapshot limit (64 MiB)"), "refused")
+            spec.assert_str_eq(read_("${f.d}/file0"), "small", "file0")
+            spec.assert_str_eq(read_("${f.d}/overflow"), "y", "overflow")
+            fs.remove_tree(f.d)
+        }
+        spec.it("undo path limit allows all writes and refuses partial deletion") callback {
+            f = fx_()
+            begin_(f)
+            i = 0
+            while i < 300 {
+                spec.assert_eq(write_(f.s, path_(f, "new${i}"), ""), 1, "write new${i}")
+                i = i + 1
+            }
+            finish_(f)
+            spec.assert_true(contains_(undo_(f), "Turn exceeds undo path limit (256 files)"), "refused")
+            spec.assert_eq(exists_("${f.d}/new0"), 1, "new0 kept")
+            spec.assert_eq(exists_("${f.d}/new299"), 1, "new299 kept")
+            fs.remove_tree(f.d)
+        }
+        spec.it("unavailable snapshot directories never prevent file tools or child writes") callback {
+            f = fx_()
+            begin_(f)
+            directory = tools.turn_undo_dir(f.t)
+            fs.remove_tree(directory)
+            fs.write(directory, "not a directory")
+            c = child_(f)
+            r = call_(c, "write", "{\"path\":${jsonx.quote(path_(f, "child"))},\"content\":\"written\"}")
+            spec.assert_eq(r.ok, 1, "child write ok")
+            spec.assert_str_eq(r.text, "{\"bytes\":7}", "child bytes")
+            fs.unlink(directory)
+            fs.mkdir_p(directory)
+            spec.assert_eq(edit_(f.s, path_(f, "child"), "written", "edited"), 1, "parent edit ok")
+            finish_(f)
+            spec.assert_true(contains_(undo_(f), "undo snapshot could not be read or saved"), "refused")
+            spec.assert_str_eq(read_("${f.d}/child"), "edited", "content")
+            fs.remove_tree(f.d)
+        }
+        spec.it("snapshot directory creation failure does not stop a Turn") callback {
+            f = fx_()
+            root = "${f.d}/undo"
+            fs.remove_tree(root)
+            fs.write(root, "not a directory")
+            begin_(f)
+            spec.assert_eq(write_(f.s, path_(f, "a"), "written"), 1, "write")
+            finish_(f)
+            spec.assert_true(contains_(undo_(f), "undo snapshot could not be read or saved"), "refused")
+            spec.assert_str_eq(read_("${f.d}/a"), "written", "content")
+            fs.remove_tree(f.d)
+        }
+        spec.it("snapshot commit failure preserves successful write and blocks child Turn undo") callback {
+            f = fx_()
+            begin_(f)
+            spec.assert_eq(write_(f.s, path_(f, "tracked"), "keep"), 1, "tracked write")
+            child_active = undo.attach_new(tools.turn_undo_dir(f.t))
+            nh = tools.nib_home(f.t)
+            path = path_(f, "a")
+            w = undo.prepare(child_active, nh, path, 0, "", "written")
+            spec.assert_true(w != null, "prepared")
+            metadata = (w as *undo.Write).metadata
+            fs.unlink(metadata)
+            fs.mkdir_p(metadata)
+            fs.write("${f.d}/a", "written")
+            undo.commit(child_active, nh, w, "written")
+            undo.release(w)
+            finish_(f)
+            spec.assert_true(contains_(undo_(f), "undo snapshot could not be read or saved"), "refused")
+            spec.assert_str_eq(read_("${f.d}/a"), "written", "a kept")
+            spec.assert_str_eq(read_("${f.d}/tracked"), "keep", "tracked kept")
+            fs.remove_tree(f.d)
+        }
+        spec.it("aborted file replacement preserves the prior undo record") callback {
+            f = fx_()
+            path = path_(f, "a")
+            fs.write("${f.d}/a", "old")
+            begin_(f)
+            spec.assert_eq(write_(f.s, path, "first"), 1, "write first")
+            active = (f.t as *tools.Tools).undo
+            nh = tools.nib_home(f.t)
+            abandoned = undo.prepare(active, nh, path, 1, "first", "unwritten")
+            spec.assert_true(abandoned != null, "abandoned prepared")
+            undo.release(abandoned)
+            fresh = undo.prepare(active, nh, path_(f, "unwritten"), 0, "", "unwritten")
+            spec.assert_true(fresh != null, "fresh prepared")
+            undo.release(fresh)
+            finish_(f)
+            spec.assert_true(contains_(undo_(f), "restored:"), "undo")
+            spec.assert_str_eq(read_("${f.d}/a"), "old", "original back")
+            fs.remove_tree(f.d)
+        }
+        // ---- added by the port ----
+        spec.it("finish gives the notice only for a Turn without a complete record") callback {
+            f = fx_()
+            begin_(f)
+            spec.assert_eq(write_(f.s, path_(f, "a"), "x"), 1, "write")
+            spec.assert_str_eq(finish_(f), "", "complete record: no notice")
+            begin_(f)
+            spec.assert_str_eq(finish_(f), "", "no change: no notice")
+            spec.assert_eq(undo.turn_count(f.h), 1, "only the edited Turn recorded")
+            fs.remove_tree(f.d)
+        }
+        spec.it("snapshots are private: root 0700, records 0600, one .before per existing file") callback {
+            f = fx_()
+            fs.write("${f.d}/a", "old")
+            begin_(f)
+            spec.assert_eq(write_(f.s, path_(f, "a"), "new"), 1, "write")
+            spec.assert_eq(write_(f.s, path_(f, "b"), "created"), 1, "create")
+            dirpath = tools.turn_undo_dir(f.t)
+            st = sysgap.new_stat()
+            spec.assert_eq(sysgap.stat("${f.d}/undo", 1, st), 0, "root exists")
+            spec.assert_eq((st as *sysgap.Stat).mode % 512, 448, "root mode 0700")
+            names, _e = fs.list_dir(dirpath)
+            n = 0
+            befores = 0
+            i = 0
+            while i < fs.dir_list_count(names) {
+                nm = fs.dir_list_get(names, i)
+                if string.ends_with(nm, ".before") == 1 {
+                    befores = befores + 1
+                    spec.assert_eq(sysgap.stat("${dirpath}/${nm}", 1, st), 0, "stat before")
+                    spec.assert_eq((st as *sysgap.Stat).mode % 512, 384, "before mode 0600")
+                }
+                if string.ends_with(nm, ".json") == 1 {
+                    n = n + 1
+                    spec.assert_eq(sysgap.stat("${dirpath}/${nm}", 1, st), 0, "stat json")
+                    spec.assert_eq((st as *sysgap.Stat).mode % 512, 384, "json mode 0600")
+                }
+                i = i + 1
+            }
+            spec.assert_eq(n, 2, "two records")
+            spec.assert_eq(befores, 1, "one before (b was created)")
+            finish_(f)
+            tools.close_undo(f.t)
+            spec.assert_eq(exists_("${f.d}/undo"), 0, "close deletes the history")
+            fs.remove_tree(f.d)
+        }
+        spec.it("undo is a no-op report when undo is off") callback {
+            d = tmp_()
+            t = tools.new(d)
+            s = tools.new_scope(t, 1)
+            tools.begin_turn_undo(t)
+            spec.assert_eq(write_(s, "${d}/a", "x"), 1, "write")
+            spec.assert_str_eq(tools.finish_turn_undo(t), "", "no notice")
+            spec.assert_true(contains_(tools.run_undo(t), "Nothing to undo"), "nothing")
+            fs.remove_tree(d)
+        }
+    }
+    return spec.run_summary(fw)
+}

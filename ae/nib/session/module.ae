@@ -32,6 +32,7 @@ import nib.tools.diff
 import nib.provider
 import nib.provider.types
 import nib.provider.sink
+import nib.provider.model_timing as modeltiming
 import nib.session.log
 import nib.session.output
 import nib.session.prompt
@@ -40,7 +41,7 @@ import nib.session.instructions
 import nib.session.compact
 import nib.session.tool_summary
 
-exports(Session, Options, Sink, new_options, new_sink, init, turn, compact_now, close, error_message, timing_json,
+exports(Session, Options, Sink, new_options, new_sink, init, turn, compact_now, close, error_message, timing_json, undo,
         VERSION)
 
 const VERSION = "0.13.0-ae"
@@ -55,6 +56,7 @@ struct Options {
     patches_off: string      // NIB_PATCHES_OFF
     self_exe: string
     record_env: string       // NIB_RECORD
+    undo_enabled: int        // the TUI's /undo (nib ask has none, as upstream)
 }
 
 struct Sink {
@@ -101,6 +103,7 @@ new_options(home: string, user_home: string) -> ptr {
     o.patches_off = ""
     o.self_exe = ""
     o.record_env = ""
+    o.undo_enabled = 0
     return o as ptr
 }
 
@@ -231,6 +234,7 @@ init(cp: @keep ptr, op: @keep ptr) -> (ptr, string, string) {
         ierr = initialize_history_(s, cwd)
         if ierr != "" { return null, ierr, "" }
     }
+    if o.undo_enabled == 1 && s.parent_session_id == "" { tools.enable_undo(s.tools, "${directory}/${s.id}.undo") }
     return s as ptr, "", ""
 }
 
@@ -276,6 +280,7 @@ initialize_history_(s: *Session, cwd: string) -> string {
 close(sp: ptr) {
     s = sp as *Session
     background.stop_all((s.tools as *tools.Tools).background)
+    tools.close_undo(s.tools)
     log.close(s.log)
 }
 
@@ -412,6 +417,7 @@ struct Fwd {
     buffer_text: int
     first_data_ms: long
     started_ms: long
+    model: ptr            // the Step's provider timing model
 }
 
 // Delivers finished background bash results as user messages before the
@@ -472,6 +478,7 @@ complete_(s: *Session, request: ptr, sk: @keep ptr, cancel: @keep ptr, buffer_te
     fp = fwd as ptr
     ps = sink.new(fp)
     pk = ps as *sink.Sink
+    pk.timing = fwd.model
     pk.on_delta = |ctx: ptr, kind: string, text: string| {
         f = ctx as *Fwd
         ss = f.session as *Session
@@ -603,6 +610,7 @@ turn(sp: @keep ptr, user_text: string, sk: @keep ptr, cancel: @keep ptr) -> (str
     lim = c.limits as *types.Limits
     list.list_add(pending, msg.user(prompt.turn_budget_text(msg.content(first), lim.max_steps as long, user_text)))
     emit_(sk, usage_event_(s))
+    tools.begin_turn_undo(s.tools)
     err, detail = run_steps_(s, pending, sk, cancel)
     stop_background = 1
     if err != "" {
@@ -618,6 +626,8 @@ turn(sp: @keep ptr, user_text: string, sk: @keep ptr, cancel: @keep ptr) -> (str
     if stop_background == 1 || canceled_(cancel) == 1 {
         background.finish_turn((s.tools as *tools.Tools).background)
     }
+    undo_notice = tools.finish_turn_undo(s.tools)
+    if undo_notice != "" { emit_(sk, "{\"notice\":${jsonx.quote(undo_notice)}}") }
     s.wall_ms = os.now_monotonic_ms() - started
     return err, detail
 }
@@ -665,10 +675,14 @@ run_steps_(s: *Session, pending: ptr, sk: @keep ptr, cancel: @keep ptr) -> (stri
         fwd.buffer_text = buffer_text
         fwd.first_data_ms = -1 as long
         fwd.started_ms = step_started
+        fwd.model = modeltiming.new(step_started)
         s.partial_text = ""
         s.partial_reasoning = ""
         rep, err, detail, attempts = complete_(s, request, sk, cancel, buffer_text, fwd)
-        if err != "" { return err, detail }
+        if err != "" {
+            modeltiming.release(fwd.model)
+            return err, detail
+        }
         r = rep as *types.Reply
         ncalls = list.list_size(r.tool_calls)
         waiting = 0
@@ -731,8 +745,14 @@ run_steps_(s: *Session, pending: ptr, sk: @keep ptr, cancel: @keep ptr) -> (stri
         u = r.usage as *types.Usage
         tokens = u.prompt_tokens + u.completion_tokens + output_tokens
         ms = os.now_monotonic_ms() - step_started
-        members = ",\"usage\":${types.usage_json(r.usage)},\"effort\":${jsonx.quote(effort)},\"turn_step\":${step_index + 1},\"ms\":${ms},\"model_ms\":${model_ms},\"transport\":\"sse\",\"attempts\":${attempts}"
+        members = ",\"usage\":${types.usage_json(r.usage)},\"effort\":${jsonx.quote(effort)},\"turn_step\":${step_index + 1},\"ms\":${ms},\"model_ms\":${model_ms},\"transport\":\"sse\",\"model_attempts\":${modeltiming.attempts_json(fwd.model)}"
+        mt = fwd.model as *modeltiming.Model
+        if mt.max_content_gap_ms >= 0 { members = "${members},\"max_content_gap_ms\":${mt.max_content_gap_ms}" }
+        members = "${members},\"attempts\":${attempts}"
         if fwd.first_data_ms >= 0 { members = "${members},\"first_data_ms\":${fwd.first_data_ms}" }
+        if mt.max_gap_ms >= 0 { members = "${members},\"max_gap_ms\":${mt.max_gap_ms}" }
+        members = "${members},\"code\":${modeltiming.code_json(modeltiming.finish(fwd.model, r.tool_calls))}"
+        modeltiming.release(fwd.model)
         if ncalls > 0 {
             members = "${members},\"run_ms\":${run_ms},\"calls\":${calls_json_(run)},\"calls_omitted\":${timing.omitted(run)}"
         }
@@ -780,4 +800,22 @@ step_limit_detail_(s: *Session, sk: ptr, cancel: ptr, max_steps: int) -> string 
         return "stopped after ${max_steps} step${plural} (waited for background tasks)"
     }
     return "stopped after ${max_steps} step${plural}"
+}
+
+// /undo (upstream Session.undo): the intent, then the restoration result,
+// committed as user messages with source "undo". The text is returned.
+undo(sp: ptr) -> (string, string) {
+    s = sp as *Session
+    intent = "[undo requested] File restoration may follow. Re-read affected files before continuing."
+    one = list.list_new()
+    list.list_add(one, msg.user_from(intent, "undo"))
+    l = s.log as *log.Log
+    e = log.commit(s.log, s.history, list.list_size(s.history), one, l.context_tokens + compact.estimate_tokens(one, 0, 1), "", 0)
+    if e != "" { return "", e }
+    text = tools.run_undo(s.tools)
+    two = list.list_new()
+    list.list_add(two, msg.user_from(text, "undo"))
+    e2 = log.commit(s.log, s.history, list.list_size(s.history), two, l.context_tokens + compact.estimate_tokens(two, 0, 1), "", 0)
+    if e2 != "" { return "", e2 }
+    return text, ""
 }

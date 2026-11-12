@@ -41,7 +41,8 @@ expect_imports $T/background/module.ae "nib.jsonx|nib.lock|std.list|std.string|s
 # File system, no process.
 expect_imports $T/atomic_file/module.ae "nib.sysgap|std.cryptography|std.fs|std.list|std.os|std.string"
 expect_imports $T/file_state/module.ae "nib.lock|nib.sysgap|std.cryptography|std.fs|std.list|std.map|std.string|std.sync"
-expect_imports $T/files/module.ae "nib.jsonx|nib.sysgap|nib.tools.atomic_file|nib.tools.file_state|nib.tools.jail|std.fs|std.list|std.strbuilder|std.string|std.sync"
+expect_imports $T/files/module.ae "nib.jsonx|nib.sysgap|nib.tools.atomic_file|nib.tools.file_state|nib.tools.jail|nib.tools.undo|std.fs|std.list|std.strbuilder|std.string|std.sync"
+expect_imports $T/undo/module.ae "nib.jsonx|nib.sysgap|nib.tools.atomic_file|nib.tools.file_state|nib.tools.registry|std.cryptography|std.dir|std.fs|std.list|std.string|std.strbuilder|std.sync"
 expect_imports $T/walk/module.ae "std.dir|std.fs|std.list|std.strbuilder|std.string|std.sync"
 expect_imports $T/grep/module.ae "contrib.quickjs|nib.tools.walk|std.fs|std.list|std.strbuilder|std.string|std.sync"
 expect_imports $T/search/module.ae "nib.jsonx|nib.tools.grep|nib.tools.walk|std.json|std.list|std.strbuilder|std.string"
@@ -49,7 +50,7 @@ expect_imports $T/search/module.ae "nib.jsonx|nib.tools.grep|nib.tools.walk|std.
 expect_imports $T/process/module.ae "nib.sysgap|std.cryptography|std.fs|std.list|std.os|std.string|std.sync|std.worker"
 expect_imports $T/bash/module.ae "nib.jsonx|nib.sysgap|nib.tools.jail|nib.tools.policy|nib.tools.process|nib.tools.registry|nib.tools.secrets|std.list|std.os|std.string|std.sync"
 expect_imports $T/jail/module.ae "nib.tools.atomic_file|std.fs|std.list|std.os|std.string"
-expect_imports $T/module.ae "nib.jsonx|nib.lock|nib.sandbox|nib.tools.atomic_file|nib.tools.background|nib.tools.bash|nib.tools.changes|nib.tools.file_state|nib.tools.files|nib.tools.jail|nib.tools.registry|nib.tools.search|std.list|std.os|std.strbuilder|std.string|std.sync"
+expect_imports $T/module.ae "nib.jsonx|nib.lock|nib.sandbox|nib.tools.atomic_file|nib.tools.background|nib.tools.bash|nib.tools.changes|nib.tools.file_state|nib.tools.files|nib.tools.jail|nib.tools.registry|nib.tools.search|nib.tools.undo|std.list|std.os|std.strbuilder|std.string|std.sync"
 
 # The Session + provider slice.
 expect_imports ae/nib/auth/module.ae "nib.auth.store|nib.config|nib.config.env|nib.provider.types|std.list|std.string"
@@ -58,17 +59,18 @@ expect_imports ae/nib/config/env/module.ae "nib.sysgap|std.list|std.string"
 expect_imports ae/nib/config/module.ae "nib.auth.store|nib.config.env|nib.jsonx|nib.provider.types|nib.tools.atomic_file|std.fs|std.list|std.string"
 expect_imports ae/nib/msg/module.ae "nib.jsonx|nib.provider.types|std.json|std.list|std.string"
 expect_imports ae/nib/provider/anthropic/module.ae "nib.jsonx|nib.msg|nib.provider.http|nib.provider.sink|nib.provider.sse|nib.provider.types|std.json|std.list|std.strbuilder|std.string"
-expect_imports ae/nib/provider/http/module.ae "nib.lock|std.http.client|std.list|std.string|std.sync|std.time|std.worker"
-expect_imports ae/nib/provider/module.ae "nib.provider.anthropic|nib.provider.openai|nib.provider.responses|nib.provider.sink|nib.provider.types|std.list|std.string|std.sync"
+expect_imports ae/nib/provider/http/module.ae "nib.lock|nib.provider.model_timing|std.http.client|std.list|std.string|std.sync|std.time|std.worker"
+expect_imports ae/nib/provider/module.ae "nib.provider.anthropic|nib.provider.model_timing|nib.provider.openai|nib.provider.responses|nib.provider.sink|nib.provider.types|std.list|std.string|std.sync"
 expect_imports ae/nib/provider/openai/module.ae "nib.jsonx|nib.msg|nib.provider.http|nib.provider.sink|nib.provider.sse|nib.provider.types|std.json|std.list|std.strbuilder|std.string"
 expect_imports ae/nib/provider/responses/module.ae "nib.jsonx|nib.msg|nib.provider.http|nib.provider.sink|nib.provider.sse|nib.provider.types|std.json|std.list|std.strbuilder|std.string"
-expect_imports ae/nib/provider/sink/module.ae "nib.provider.http"
+expect_imports ae/nib/provider/sink/module.ae "nib.provider.http|nib.provider.model_timing"
+expect_imports ae/nib/provider/model_timing/module.ae "nib.jsonx|nib.provider.types|std.list|std.longarr|std.os|std.string"
 expect_imports ae/nib/provider/sse/module.ae "nib.provider.http|std.string"
 expect_imports ae/nib/provider/types/module.ae "nib.jsonx|std.list|std.string"
 expect_imports ae/nib/session/compact/module.ae "nib.jsonx|nib.msg|nib.provider.types|std.json|std.list|std.string"
 expect_imports ae/nib/session/instructions/module.ae "std.fs|std.strbuilder|std.string"
 expect_imports ae/nib/session/log/module.ae "nib.jsonx|nib.lock|nib.msg|nib.provider.types|nib.sysgap|std.dir|std.fs|std.json|std.list|std.string|std.time"
-expect_imports ae/nib/session/module.ae "nib.jsonx|nib.msg|nib.provider|nib.provider.sink|nib.provider.types|nib.sandbox|nib.sandbox.timing|nib.session.compact|nib.session.instructions|nib.session.log|nib.session.output|nib.session.profile|nib.session.prompt|nib.session.tool_summary|nib.tools|nib.tools.atomic_file|nib.tools.background|nib.tools.diff|std.cryptography|std.fs|std.json|std.list|std.os|std.string|std.sync"
+expect_imports ae/nib/session/module.ae "nib.jsonx|nib.msg|nib.provider|nib.provider.model_timing as modeltiming|nib.provider.sink|nib.provider.types|nib.sandbox|nib.sandbox.timing|nib.session.compact|nib.session.instructions|nib.session.log|nib.session.output|nib.session.profile|nib.session.prompt|nib.session.tool_summary|nib.tools|nib.tools.atomic_file|nib.tools.background|nib.tools.diff|std.cryptography|std.fs|std.json|std.list|std.os|std.string|std.sync"
 expect_imports ae/nib/session/output/module.ae "nib.sandbox|nib.sandbox.console|std.list|std.strbuilder|std.string"
 expect_imports ae/nib/session/profile/module.ae "std.string"
 expect_imports ae/nib/session/prompt/module.ae "nib.sandbox|nib.session.output|nib.session.profile|std.cryptography|std.list|std.strbuilder|std.string"
@@ -91,8 +93,8 @@ rule "a program is started only in tools/process (and the jail's probe and exec 
     "$T/process/|$T/jail/"
 rule "QuickJS is embedded only by the sandbox and grep's private matcher" \
     '^import contrib\.quickjs' "ae/nib/sandbox/module.ae|$T/grep/"
-rule "the file stand-in is used only by the file and process tools, the Session log, the environment and main (signals, echo)" \
-    '^import nib\.sysgap' "$T/atomic_file/|$T/file_state/|$T/files/|$T/process/|$T/bash/|ae/nib/session/log/|ae/nib/config/env/|ae/main.ae"
+rule "the file stand-in is used only by the file, undo and process tools, the Session log, the environment and main (signals, echo)" \
+    '^import nib\.sysgap' "$T/atomic_file/|$T/file_state/|$T/files/|$T/undo/|$T/process/|$T/bash/|ae/nib/session/log/|ae/nib/config/env/|ae/main.ae"
 rule "the QuickJS stand-in is used only by the sandbox" \
     '^import nib\.qjsgap' "ae/nib/sandbox/module.ae"
 rule "only provider/http reaches the network (the model request)" \

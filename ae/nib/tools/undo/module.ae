@@ -1,0 +1,642 @@
+// tools.undo: Turn undo history (upstream src/tools/undo.zig). Before edit or
+// write changes a file, the file's bytes are snapshotted into the Turn's
+// directory under the Session's `<id>.undo` directory; /undo restores the
+// last Turn's files when each still holds what nib last wrote, and otherwise
+// refuses without touching anything.
+//
+// Two instances cooperate and neither is module state:
+//   History  the Session's: its root, the Turns still undoable, the notice
+//   Active   what the file tools see: the running Turn's directory and a
+//            failure cell. A sub-agent's Tools gets its own Active for the
+//            same directory (attach_new); failures cross over through the
+//            directory's lock file, whose length holds the first Reason.
+//
+// On disk, in a Turn directory: `<sha256(path)>.json` (the Entry) and, when
+// the file existed, `<sha256(path)>.before` (its bytes before the Turn's
+// first change). Everything is mode 0600.
+
+import std.fs
+import std.dir
+import std.string
+import std.strbuilder
+import std.list
+import std.sync
+import std.cryptography
+import nib.jsonx
+import nib.sysgap
+import nib.tools.atomic_file
+import nib.tools.file_state
+import nib.tools.registry
+
+exports(Active, History, Write, Entry,
+        FILE_LIMIT, TURN_LIMIT, PATH_LIMIT, HISTORY_LIMIT,
+        REASON_NONE, REASON_UNAVAILABLE, REASON_FILE_TOO_LARGE, REASON_PATH_LIMIT, REASON_TURN_LIMIT,
+        reason_text, NOTICE_INCOMPLETE,
+        new, close, active_of, attach_new, active_dir, turn_count, notice,
+        begin, finish, undo,
+        prepare, commit, release, mark_incomplete)
+
+const FILE_LIMIT = 16 * 1024 * 1024
+const TURN_LIMIT = 64 * 1024 * 1024
+const PATH_LIMIT = 256
+const HISTORY_LIMIT = 8
+
+const REASON_NONE = 0
+const REASON_UNAVAILABLE = 1
+const REASON_FILE_TOO_LARGE = 2
+const REASON_PATH_LIMIT = 3
+const REASON_TURN_LIMIT = 4
+
+// What the TUI shows when a finished Turn has no complete undo record.
+const NOTICE_INCOMPLETE = "This Turn has no complete undo record; /undo cannot cross it."
+
+reason_text(r: int) -> string {
+    match r {
+        1 -> { return "undo snapshot could not be read or saved" }
+        2 -> { return "file exceeds undo limit (16 MiB)" }
+        3 -> { return "Turn exceeds undo path limit (256 files)" }
+        4 -> { return "Turn exceeds undo snapshot limit (64 MiB)" }
+        _ -> { return "undo snapshot could not be read or saved" }
+    }
+}
+
+struct Active {
+    dir: string        // the running Turn's snapshot directory, "" outside a Turn
+    failure: ptr       // std.sync cell: the first Reason this process saw
+}
+
+struct Turn {
+    path: string
+    reason: int
+}
+
+struct History {
+    root: string       // "" when undo is off
+    active: ptr        // *Active, what the Tools carry
+    turns: ptr         // list of *Turn, oldest first
+    notice: int        // the last finished Turn's Reason
+}
+
+struct Entry {
+    path: string
+    created: int
+    hash: string       // sha256 hex of what nib last wrote
+    pending: int
+    tainted: int
+    undone: int
+}
+
+// A snapshot in flight: held between prepare and commit/release.
+struct Write {
+    lock_fd: int
+    metadata: string
+    snapshot: string
+    entry: *Entry
+    has_previous: int
+    previous: *Entry
+    written: int
+}
+
+sha_(data: string) -> string {
+    h, _e = cryptography.sha256_hex(string.bytes(data))
+    return h
+}
+
+join_(a: string, b: string) -> string { return "${a}/${b}" }
+
+// ---- Entry <-> JSON ----
+
+entry_json_(e: *Entry) -> string {
+    return "{\"path\":${jsonx.quote(e.path)},\"created\":${bool_(e.created)},\"hash\":\"${e.hash}\",\"pending\":${bool_(e.pending)},\"tainted\":${bool_(e.tainted)},\"undone\":${bool_(e.undone)}}"
+}
+
+bool_(b: int) -> string {
+    if b != 0 { return "true" }
+    return "false"
+}
+
+// null when text is not an Entry.
+entry_parse_(text: string) -> ptr {
+    v = jsonx.parse(text)
+    if v == null { return null }
+    if jsonx.kind(v, "path") != 3 || jsonx.kind(v, "hash") != 3 {
+        jsonx.free(v)
+        return null
+    }
+    e = heap.new(Entry)
+    e.path = string.copy(jsonx.str_or(v, "path", ""))
+    e.hash = string.copy(jsonx.str_or(v, "hash", ""))
+    e.created = jsonx.bool_or(v, "created", 0)
+    e.pending = jsonx.bool_or(v, "pending", 0)
+    e.tainted = jsonx.bool_or(v, "tainted", 0)
+    e.undone = jsonx.bool_or(v, "undone", 0)
+    jsonx.free(v)
+    return e as ptr
+}
+
+entry_blank_(path: string) -> *Entry {
+    e = heap.new(Entry)
+    e.path = string.copy(path)
+    e.hash = ""
+    e.created = 0
+    e.pending = 0
+    e.tainted = 0
+    e.undone = 0
+    return e
+}
+
+entry_copy_(o: *Entry) -> *Entry {
+    e = heap.new(Entry)
+    e.path = string.copy(o.path)
+    e.hash = string.copy(o.hash)
+    e.created = o.created
+    e.pending = o.pending
+    e.tainted = o.tainted
+    e.undone = o.undone
+    return e
+}
+
+// "" or the error name.
+save_(path: string, e: *Entry) -> string {
+    return atomic_file.replace(path, entry_json_(e), 384, 0, 0, null)
+}
+
+// ---- failure state ----
+
+active_new_(dir: string) -> *Active {
+    a = heap.new(Active)
+    a.dir = string.copy(dir)
+    a.failure = sync.atomic_new(0)
+    return a
+}
+
+// A fresh Active for the same Turn directory, for a sub-agent's Tools: its
+// own failure cell, the same lock file.
+attach_new(dir: string) -> ptr { return active_new_(dir) as ptr }
+
+active_dir(ap: ptr) -> string {
+    if ap == null { return "" }
+    return (ap as *Active).dir
+}
+
+// The first Reason this process or any holder of the directory's lock file
+// recorded: (reason, "") or (0, error name).
+recorded_reason_(a: *Active, nib_home: string, dirpath: string) -> (int, string) {
+    local = sync.atomic_load(a.failure)
+    if local != 0 { return local as int, "" }
+    fd, err = file_state.lock(nib_home, dirpath, null)
+    if err != "" { return 0, err }
+    code = sysgap.fd_size(fd)
+    file_state.unlock(fd)
+    if code == 0 { return 0, "" }
+    if code >= 1 && code <= 4 { return code as int, "" }
+    return REASON_UNAVAILABLE, ""
+}
+
+// Records that the running Turn has no complete undo record. The first
+// Reason wins, locally and in the lock file shared with children.
+mark_incomplete(ap: ptr, nib_home: string, reason: int) {
+    if ap == null { return }
+    a = ap as *Active
+    if a.dir == "" { return }
+    sync.atomic_cas(a.failure, 0, reason)
+    fd, err = file_state.lock(nib_home, a.dir, null)
+    if err != "" { return }
+    if sysgap.fd_size(fd) == 0 { sysgap.fd_truncate(fd, reason as long) }
+    file_state.unlock(fd)
+}
+
+// ---- snapshots ----
+
+// The names in a directory without . and ..: (list, "") or (null, error).
+names_(path: string) -> (ptr, string) {
+    listing, err = dir.list(path)
+    if err != "" { return null, err }
+    out = list.list_new()
+    n = dir.list_count(listing)
+    i = 0
+    while i < n {
+        name = string.copy(dir.list_get(listing, i))
+        if name != "." && name != ".." { list.list_add(out, name) }
+        i = i + 1
+    }
+    dir.dir_list_free(listing)
+    return out, ""
+}
+
+// (Write, 0): snapshot saved, entry pending. (null, 0): nothing to track.
+// (null, reason): the Turn cannot be fully undone. The directory lock is
+// released on every path except a returned Write.
+tracked_(a: *Active, nib_home: string, path: string, has_before: int, before: string, after_text: string) -> (ptr, int) {
+    dirpath = a.dir
+    if string.length(after_text) > FILE_LIMIT { return null, REASON_FILE_TOO_LARGE }
+    if has_before == 1 && string.length(before) > FILE_LIMIT { return null, REASON_FILE_TOO_LARGE }
+    fd, lerr = file_state.lock(nib_home, dirpath, null)
+    if lerr != "" { return null, REASON_UNAVAILABLE }
+    if sysgap.fd_size(fd) != 0 {
+        file_state.unlock(fd)
+        return null, 0
+    }
+    key = sha_(path)
+    metadata = join_(dirpath, "${key}.json")
+    snapshot = join_(dirpath, "${key}.before")
+    has_old = fs.exists(metadata)
+    previous = null
+    if has_old == 1 {
+        text, rerr = fs.read(metadata)
+        if rerr != "" {
+            file_state.unlock(fd)
+            return null, REASON_UNAVAILABLE
+        }
+        previous = entry_parse_(text)
+        if previous == null {
+            file_state.unlock(fd)
+            return null, REASON_UNAVAILABLE
+        }
+    }
+    entry = entry_blank_(path)
+    if previous != null {
+        entry = entry_copy_(previous as *Entry)
+        entry.path = string.copy(path)
+    } else {
+        entry.created = 1
+        entry.hash = sha_("")
+        if has_before == 1 {
+            entry.created = 0
+            entry.hash = sha_(before)
+        }
+    }
+    if previous == null {
+        names, nerr = names_(dirpath)
+        if nerr != "" {
+            file_state.unlock(fd)
+            return null, REASON_UNAVAILABLE
+        }
+        total = 0 as long
+        paths = 0
+        n = list.list_size(names)
+        i = 0
+        while i < n {
+            name, _ge = list.get_string(names, i)
+            if string.ends_with(name, ".json") == 1 { paths = paths + 1 }
+            if string.ends_with(name, ".before") == 1 {
+                st = sysgap.new_stat()
+                src = sysgap.stat(join_(dirpath, name), 1, st)
+                if src != 0 {
+                    file_state.unlock(fd)
+                    return null, REASON_UNAVAILABLE
+                }
+                total = total + (st as *sysgap.Stat).size
+            }
+            i = i + 1
+        }
+        if paths >= PATH_LIMIT {
+            file_state.unlock(fd)
+            return null, REASON_PATH_LIMIT
+        }
+        extra = 0
+        if has_before == 1 { extra = string.length(before) }
+        if total + extra > TURN_LIMIT {
+            file_state.unlock(fd)
+            return null, REASON_TURN_LIMIT
+        }
+        if has_before == 1 {
+            serr = atomic_file.replace(snapshot, before, 384, 0, 0, null)
+            if serr != "" {
+                fs.unlink(snapshot)
+                file_state.unlock(fd)
+                return null, REASON_UNAVAILABLE
+            }
+        }
+    } else if has_before == 0 || entry.hash != sha_(before) {
+        entry.tainted = 1
+    }
+    entry.pending = 1
+    verr = save_(metadata, entry)
+    if verr != "" {
+        if previous == null {
+            fs.unlink(metadata)
+            fs.unlink(snapshot)
+        }
+        file_state.unlock(fd)
+        return null, REASON_UNAVAILABLE
+    }
+    w = heap.new(Write)
+    w.lock_fd = fd
+    w.metadata = metadata
+    w.snapshot = snapshot
+    w.entry = entry
+    w.has_previous = 0
+    w.previous = entry
+    if previous != null {
+        w.has_previous = 1
+        w.previous = previous as *Entry
+    }
+    w.written = 0
+    return w as ptr, 0
+}
+
+// Snapshots `path` before a change to `after_text` (before: has_before 0 means
+// the file does not exist yet). Returns a Write for commit/release, or null
+// when there is nothing to track or the Turn is not undoable (then the
+// Reason is recorded). Call it before the first byte is changed; hold it
+// through the change, then commit on success, and always release.
+prepare(ap: ptr, nib_home: string, path: string, has_before: int, before: string, after_text: string) -> ptr {
+    if ap == null { return null }
+    a = ap as *Active
+    if a.dir == "" { return null }
+    if sync.atomic_load(a.failure) != 0 { return null }
+    if has_before == 1 && before == after_text { return null }
+    w, reason = tracked_(a, nib_home, path, has_before, before, after_text)
+    if reason != 0 { mark_incomplete(ap, nib_home, reason) }
+    return w
+}
+
+// The change reached the file: its new bytes are what a later undo expects.
+commit(ap: ptr, nib_home: string, wp: ptr, after_text: string) {
+    if wp == null { return }
+    w = wp as *Write
+    a = ap as *Active
+    w.written = 1
+    w.entry.hash = sha_(after_text)
+    w.entry.pending = 0
+    err = save_(w.metadata, w.entry)
+    if err != "" {
+        sync.atomic_cas(a.failure, 0, REASON_UNAVAILABLE)
+        if sysgap.fd_size(w.lock_fd) == 0 { sysgap.fd_truncate(w.lock_fd, 1 as long) }
+    }
+}
+
+// Ends a Write: when it was never committed (the change did not happen) the
+// record goes back to what it was; then the directory lock is dropped.
+release(wp: ptr) {
+    if wp == null { return }
+    w = wp as *Write
+    if w.written == 0 {
+        if w.has_previous == 1 {
+            save_(w.metadata, w.previous)
+        } else {
+            fs.unlink(w.metadata)
+            fs.unlink(w.snapshot)
+        }
+    }
+    file_state.unlock(w.lock_fd)
+}
+
+// ---- history ----
+
+// A history under `root`, which is emptied and created private (0700).
+new(root: string) -> ptr {
+    h = heap.new(History)
+    h.root = root
+    h.active = active_new_("") as ptr
+    h.turns = list.list_new()
+    h.notice = 0
+    if root != "" {
+        fs.remove_tree(root)
+        sysgap.mkdir(root, 448)
+    }
+    return h as ptr
+}
+
+// Deletes every snapshot of the Session (Session teardown).
+close(hp: ptr) {
+    h = hp as *History
+    if h.root != "" { fs.remove_tree(h.root) }
+}
+
+// The *Active the Session's Tools carry.
+active_of(hp: ptr) -> ptr { return (hp as *History).active }
+
+turn_count(hp: ptr) -> int { return list.list_size((hp as *History).turns) }
+
+// The Reason the last finished Turn has no complete record, 0 if it has.
+notice(hp: ptr) -> int { return (hp as *History).notice }
+
+turn_at_(h: *History, i: int) -> *Turn { return list.list_get_raw(h.turns, i) as *Turn }
+
+drop_turn_(h: *History, i: int) {
+    t = turn_at_(h, i)
+    fs.remove_tree(t.path)
+    list.list_remove(h.turns, i)
+}
+
+// Starts a Turn: a fresh snapshot directory that the file tools now fill.
+// A directory that cannot be made does not stop the Turn; it only marks it
+// not undoable.
+begin(hp: ptr) {
+    h = hp as *History
+    if h.root == "" { return }
+    hex, rerr = cryptography.random_hex(16)
+    if rerr != "" { hex = "turn${list.list_size(h.turns)}" }
+    path = join_(h.root, hex)
+    t = heap.new(Turn)
+    t.path = path
+    t.reason = 0
+    if fs.mkdir_p(path) != "" { t.reason = REASON_UNAVAILABLE }
+    list.list_add_raw(h.turns, t)
+    a = h.active as *Active
+    sync.atomic_store(a.failure, 0)
+    h.notice = 0
+    a.dir = string.copy(path)
+}
+
+// Ends the Turn: the directory stops being written. A Turn that changed
+// nothing and failed nothing leaves no record. Returns NOTICE_INCOMPLETE
+// when the Turn has no complete undo record, else "".
+finish(hp: ptr, nib_home: string) -> string {
+    h = hp as *History
+    if h.root == "" { return "" }
+    a = h.active as *Active
+    a.dir = ""
+    n = list.list_size(h.turns)
+    if n == 0 { return "" }
+    turn = turn_at_(h, n - 1)
+    path = turn.path
+    if turn.reason == 0 {
+        r, rerr = recorded_reason_(a, nib_home, path)
+        if rerr != "" { r = REASON_UNAVAILABLE }
+        turn.reason = r
+    }
+    has_entries = 0
+    names, lerr = names_(path)
+    if lerr != "" {
+        turn.reason = REASON_UNAVAILABLE
+        has_entries = 1
+    } else if list.list_size(names) > 0 {
+        has_entries = 1
+    }
+    h.notice = turn.reason
+    if turn.reason != 0 || has_entries == 1 {
+        if n > HISTORY_LIMIT { drop_turn_(h, 0) }
+        if h.notice != 0 { return NOTICE_INCOMPLETE }
+        return ""
+    }
+    drop_turn_(h, n - 1)
+    return ""
+}
+
+// ---- /undo ----
+
+struct Item {
+    entry: *Entry
+    metadata: string
+    has_before: int
+    before: string
+    fd: int
+}
+
+release_items_(items: ptr) {
+    n = list.list_size(items)
+    i = 0
+    while i < n {
+        it = list.list_get_raw(items, i) as *Item
+        if it.fd >= 0 { file_state.unlock(it.fd) }
+        it.fd = -1
+        i = i + 1
+    }
+}
+
+// 1 when the file is not exactly what nib last wrote.
+conflicted_(e: *Entry) -> int {
+    if e.pending != 0 || e.tainted != 0 { return 1 }
+    canonical, cerr = atomic_file.canonical_path(e.path)
+    if cerr != "" || canonical != e.path { return 1 }
+    st = sysgap.new_stat()
+    rc = sysgap.stat(e.path, 0, st)
+    if rc != 0 { return 1 }
+    s = st as *sysgap.Stat
+    if s.kind != sysgap.KIND_FILE { return 1 }
+    if s.size > FILE_LIMIT { return 1 }
+    data, rerr = fs.read(e.path)
+    if rerr != "" { return 1 }
+    if sha_(data) != e.hash { return 1 }
+    return 0
+}
+
+// Restores the last Turn's files, or says why it did not. The result is the
+// text the Session records as the /undo outcome (both the refusals and
+// the report); `seen` is the Tools' file_state and `reg` its registry.
+undo(hp: ptr, nib_home: string, seen: ptr, reg: ptr) -> string {
+    h = hp as *History
+    n = list.list_size(h.turns)
+    if n == 0 { return "Nothing to undo in this process. Restored sessions cannot undo earlier Turns." }
+    turn = turn_at_(h, n - 1)
+    path = turn.path
+    a = h.active as *Active
+    if turn.reason == 0 {
+        r, rerr = recorded_reason_(a, nib_home, path)
+        if rerr != "" { r = REASON_UNAVAILABLE }
+        turn.reason = r
+    }
+    if turn.reason != 0 {
+        return "Undo refused; no files changed: ${reason_text(turn.reason)}. This Turn cannot be fully undone; earlier Turns cannot be undone across it."
+    }
+    names, lerr = names_(path)
+    if lerr != "" { return "Undo failed: ${lerr}" }
+    items = list.list_new()
+    i = 0
+    while i < list.list_size(names) {
+        name, _ge = list.get_string(names, i)
+        i = i + 1
+        if string.ends_with(name, ".json") == 0 { continue }
+        text, rerr = fs.read(join_(path, name))
+        if rerr != "" { return "Undo failed: ${rerr}" }
+        e = entry_parse_(text)
+        if e == null { return "Undo failed: SyntaxError" }
+        if (e as *Entry).undone != 0 { continue }
+        it = heap.new(Item)
+        it.entry = e as *Entry
+        it.metadata = join_(path, name)
+        it.has_before = 0
+        it.before = ""
+        it.fd = -1
+        if (e as *Entry).created == 0 {
+            stem = string.substring(name, 0, string.length(name) - 5)
+            bdata, berr = fs.read(join_(path, "${stem}.before"))
+            if berr != "" { return "Undo failed: ${berr}" }
+            it.has_before = 1
+            it.before = bdata
+        }
+        list.list_add_raw(items, it)
+    }
+    sort_items_(items)
+    // every file's lock, in path order, held until the end
+    k = 0
+    while k < list.list_size(items) {
+        it = list.list_get_raw(items, k) as *Item
+        fd, lerr2 = file_state.lock(nib_home, it.entry.path, null)
+        if lerr2 != "" {
+            release_items_(items)
+            return "Undo failed: ${lerr2}"
+        }
+        it.fd = fd
+        k = k + 1
+    }
+    conflicts = ""
+    k = 0
+    while k < list.list_size(items) {
+        it = list.list_get_raw(items, k) as *Item
+        if conflicted_(it.entry) == 1 {
+            conflicts = "${conflicts}\nskipped (external change or incomplete snapshot): ${it.entry.path}"
+        }
+        k = k + 1
+    }
+    if conflicts != "" {
+        release_items_(items)
+        return "Undo refused; no files changed. Resolve conflicts before retrying.${conflicts}"
+    }
+    report = "[undo] Restoring files to their contents before the latest edited Turn. Re-read listed files before continuing."
+    k = 0
+    while k < list.list_size(items) {
+        it = list.list_get_raw(items, k) as *Item
+        ent = it.entry
+        restored = sysgap.new_stat()
+        if it.has_before == 1 {
+            werr = atomic_file.replace(ent.path, it.before, 438, 0, 0, restored)
+            if werr != "" {
+                release_items_(items)
+                return "${report}\nfailed: ${ent.path}: ${werr} (retry /undo)"
+            }
+        } else {
+            urc = sysgap.unlink(ent.path)
+            if urc != 0 {
+                release_items_(items)
+                return "${report}\nfailed: ${ent.path}: ${sysgap.errname(urc)} (retry /undo)"
+            }
+        }
+        ent.undone = 1
+        registry.changed(reg)
+        verb = "restored"
+        if ent.created == 1 { verb = "deleted" }
+        report = "${report}\n${verb}: ${ent.path}"
+        if it.has_before == 1 { file_state.remember_stat(seen, ent.path, restored) }
+        serr = save_(it.metadata, ent)
+        if serr != "" {
+            release_items_(items)
+            return "${report}\nundo tracking failed: ${serr}; inspect files before retrying"
+        }
+        k = k + 1
+    }
+    release_items_(items)
+    drop_turn_(h, n - 1)
+    return report
+}
+
+// Insertion sort by path.
+sort_items_(items: ptr) {
+    n = list.list_size(items)
+    i = 1
+    while i < n {
+        j = i
+        while j > 0 {
+            x = list.list_get_raw(items, j - 1) as *Item
+            y = list.list_get_raw(items, j) as *Item
+            if string.string_compare(x.entry.path, y.entry.path) <= 0 { break }
+            list.list_set(items, j - 1, y as ptr)
+            list.list_set(items, j, x as ptr)
+            j = j - 1
+        }
+        i = i + 1
+    }
+}

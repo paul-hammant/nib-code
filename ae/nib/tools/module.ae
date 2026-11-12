@@ -25,10 +25,11 @@ import nib.tools.registry
 import nib.tools.changes
 import nib.tools.jail
 import nib.tools.background
+import nib.tools.undo
 
 exports(Tools, RunScope, new, new_scope, host, call_tool, names_json, docs, all_docs, tool_names,
         is_ported, credential_paths, writable_roots, nib_home, take_changes, set_workspace,
-        cancel_cell)
+        cancel_cell, enable_undo, begin_turn_undo, finish_turn_undo, run_undo, turn_undo_dir, attach_turn_undo_dir, close_undo)
 
 const DOC_MCP = "  // Call an enabled MCP server tool. Server/transport failures are data; argument errors reject. Full results stay in JS; images share the Run image limit.\n  async mcp(name, args = {}) {}, // → { ok, content, structured?, error? }\n"
 const DOC_MCP_SCHEMA = "  // Full input JSON Schema for an enabled server.tool, including tools omitted from the compact index.\n  async mcp_schema(name) {}, // → JSON Schema or { ok: false, error }\n"
@@ -115,6 +116,8 @@ struct Tools {
     self_exe: string
     env: ptr               // the child environment base, or null (this process's)
     background: ptr        // *background.Background
+    undo: ptr              // *undo.Active the file tools snapshot into, or null
+    undo_history: ptr      // *undo.History, null when undo is off
 }
 
 struct RunScope {
@@ -147,11 +150,65 @@ new(home: string) -> ptr {
     t.self_exe = ""
     t.env = null
     t.background = background.new()
+    t.undo = null
+    t.undo_history = null
     return t as ptr
 }
 
 set_workspace(tp: ptr, on: int) { (tp as *Tools).workspace = on }
 cancel_cell(tp: ptr) -> ptr { return (tp as *Tools).cancel }
+
+// ---- Turn undo (tools/undo) ----
+
+// Turns undo on with a fresh history under root (emptied, created 0700).
+enable_undo(tp: ptr, root: string) {
+    t = tp as *Tools
+    if t.undo_history != null { undo.close(t.undo_history) }
+    t.undo_history = undo.new(root)
+    t.undo = undo.active_of(t.undo_history)
+}
+
+// Starts a Turn's undo record; no-op when undo is off.
+begin_turn_undo(tp: ptr) {
+    t = tp as *Tools
+    if t.undo_history == null { return }
+    undo.begin(t.undo_history)
+}
+
+// Ends the Turn's record. "" or the notice to show: this Turn has no complete undo record.
+finish_turn_undo(tp: ptr) -> string {
+    t = tp as *Tools
+    if t.undo_history == null { return "" }
+    return undo.finish(t.undo_history, nib_home(tp))
+}
+
+// Reverts the latest edited Turn: the text to record as the /undo result.
+run_undo(tp: ptr) -> string {
+    t = tp as *Tools
+    if t.undo_history == null { return "Nothing to undo in this process. Restored sessions cannot undo earlier Turns." }
+    return undo.undo(t.undo_history, nib_home(tp), t.file_state, t.registry)
+}
+
+// The running Turn's snapshot directory, "" outside a Turn or with undo off.
+turn_undo_dir(tp: ptr) -> string {
+    return undo.active_dir((tp as *Tools).undo)
+}
+
+// A sub-agent's Tools snapshot into the parent's Turn directory (its own failure cell).
+attach_turn_undo_dir(tp: ptr, dir: string) {
+    t = tp as *Tools
+    if dir == "" { return }
+    t.undo = undo.attach_new(dir)
+}
+
+// Session teardown: deletes every snapshot.
+close_undo(tp: ptr) {
+    t = tp as *Tools
+    if t.undo_history == null { return }
+    undo.close(t.undo_history)
+    t.undo_history = null
+    t.undo = null
+}
 
 new_scope(tp: @keep ptr, id: int) -> ptr {
     s = heap.new(RunScope)
@@ -288,6 +345,7 @@ file_ctx_(s: *RunScope) -> ptr {
         note_change_(sp as *RunScope, path, has_before, before, after_text, tracked)
     }
     c.has_on_change = 1
+    c.undo = t.undo
     return c as ptr
 }
 

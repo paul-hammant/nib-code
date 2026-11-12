@@ -1,0 +1,864 @@
+// Ports the tests of upstream src/session/log.zig (inline `test` blocks),
+// under their upstream names. Real temp directories and real files; records
+// are JSON text, as the port's log works on message and record text.
+//
+// Dropped or adapted (the port has no Record struct and does not yet restore
+// tool summaries / bash replacements onto messages):
+//  - "legacy chat reasoning": the parseRecord(`{}`/`{"at":null}`) asserts
+//    are about the Zig Record type and have no counterpart.
+//  - "timing fields are optional": the Record field/Stringify round trip is
+//    dropped; the replay half (mixed old and measured Steps) is ported.
+//  - "Step effort restores": the parseRecord asserts are dropped; a commit
+//    with an effort member replaces them.
+//  - "ID restoration rejects overflow": restoreId is private; it is driven
+//    through replay. The port holds counters in signed long, so ids beyond
+//    18 digits are refused (upstream refuses only past u64).
+//  - "0.4.0 replay restores background Run ids and bash replacements":
+//    only the id restoration applies (run_results background_id and
+//    bash_replacements onto messages are not ported).
+//  - "background Run completion restores its superseded bash": dropped,
+//    it tests only restoreToolSummaries.
+//  - "replay restores image references and view summaries": the images
+//    survive (messages are JSON text); the tool_summary view path is
+//    dropped.
+//  - "background Run" progress.Queue ids in the ID maxima test: dropped.
+import std.spec
+import std.fs
+import std.list
+import std.string
+import std.time
+import nib.jsonx
+import nib.msg
+import nib.sysgap
+import nib.session.log
+import nib.provider.types
+
+tmp_() -> string {
+    d, _e = fs.make_temp_dir("", "nib-slog")
+    real, _k, _m = fs.realpath(d)
+    return real
+}
+
+read_(p: string) -> string {
+    s, _e = fs.read(p)
+    return s
+}
+
+L0_() -> ptr { return list.list_new() }
+
+L1_(a: string) -> ptr {
+    l = list.list_new()
+    list.list_add(l, a)
+    return l
+}
+
+L2_(a: string, b: string) -> ptr {
+    l = L1_(a)
+    list.list_add(l, b)
+    return l
+}
+
+L3_(a: string, b: string, c: string) -> ptr {
+    l = L2_(a, b)
+    list.list_add(l, c)
+    return l
+}
+
+hist_(h: ptr) -> string { return msg.history_json(h, 0) }
+
+// the texts of a list joined by newlines
+join_(l: ptr) -> string {
+    out = ""
+    i = 0
+    while i < list.list_size(l) {
+        t, _g = list.get_string(l, i)
+        if i > 0 { out = "${out}\n" }
+        out = "${out}${t}"
+        i = i + 1
+    }
+    return out
+}
+
+item_(l: ptr, i: int) -> string {
+    t, _g = list.get_string(l, i)
+    return t
+}
+
+// a record line shaped like the log's own (at/from/messages/context_tokens/repair)
+rec_(members: string, from: int, messages: string, tokens: int) -> string {
+    return "{\"at\":1${members},\"from\":${from},\"messages\":${messages},\"context_tokens\":${tokens},\"repair\":false}"
+}
+
+app_(data: string, members: string, from: int, messages: string, tokens: int) -> string {
+    return "${data}\n${rec_(members, from, messages, tokens)}"
+}
+
+asst_call_(id: string) -> string {
+    calls = list.list_new()
+    list.list_add_raw(calls, types.tool_call_new(id, "run", "{}"))
+    return msg.assistant("", calls, "", "", 0, "", -1, "")
+}
+
+rp_(data: string, history: ptr) -> *log.Replayed {
+    return log.replay(data, history) as *log.Replayed
+}
+
+lg_(l: @into ptr) -> *log.Log { return l as *log.Log }
+
+// commit with no error allowed
+cm_(l: ptr, h: ptr, from: int, msgs: ptr, tokens: int, members: string) {
+    e = log.commit(l, h, from, msgs, tokens as long, members, 0)
+    spec.assert_str_eq(e, "", "commit ok")
+}
+
+// the file replays to `h` with `tokens`
+check_replay_(path: string, h: ptr, tokens: int) {
+    restored = list.list_new()
+    r = rp_(read_(path), restored)
+    spec.assert_str_eq(r.err, "", "replay ok")
+    spec.assert_str_eq(hist_(restored), hist_(h), "replay equals history")
+    spec.assert_eq(r.context_tokens as int, tokens, "replay tokens")
+}
+
+const LINE0_ = "{\"from\":0,\"messages\":[{\"role\":\"system\",\"content\":\"s\"}]}"
+
+// ---------------------------------------------------------------------------
+
+t_list_() {
+    d = tmp_()
+    fs.write("${d}/aaaa.jsonl", "{\"cwd\":\"/w\",\"messages\":[{\"role\":\"system\",\"content\":\"s\"}]}\n{\"from\":1,\"messages\":[{\"role\":\"user\",\"content\":\"first question\\nmore\"}]}\n")
+    sleep(30)
+    fs.write("${d}/bbbb.jsonl", "{\"cwd\":\"/w\",\"messages\":[{\"role\":\"system\",\"content\":\"s\"}]}\n{\"from\":1,\"messages\":[{\"role\":\"user\",\"content\":\"second\"}]}\n")
+    fs.write("${d}/empty.jsonl", "{\"cwd\":\"/w\",\"messages\":[{\"role\":\"system\",\"content\":\"s\"}]}\n")
+    fs.write("${d}/child.jsonl", "{\"cwd\":\"/w\",\"parent_session_id\":\"aaaa\",\"messages\":[]}\n")
+    fs.write("${d}/other.jsonl", "{\"cwd\":\"/elsewhere\",\"messages\":[]}\n")
+    sysgap.mkdir("${d}/private.calls.jsonl", 448)
+    all = log.list_sessions(d, "/w")
+    spec.assert_eq(list.list_size(all), 2, "two sessions")
+    a = list.list_get_raw(all, 0) as *log.Summary
+    b = list.list_get_raw(all, 1) as *log.Summary
+    spec.assert_str_eq(a.id, "bbbb", "newest first")
+    spec.assert_str_eq(a.preview, "second", "preview")
+    spec.assert_str_eq(b.id, "aaaa", "older")
+    spec.assert_str_eq(b.preview, "first question", "first line only")
+    p, e = log.latest(d, "/w")
+    spec.assert_str_eq(e, "", "latest ok")
+    spec.assert_str_eq(p, a.path, "latest is newest")
+    fs.remove_tree(d)
+}
+
+t_commit_replay_() {
+    d = tmp_()
+    path = "${d}/s.jsonl"
+    l, err = log.create(path)
+    spec.assert_str_eq(err, "", "create")
+    history = list.list_new()
+    before = time.now_ms()
+    cm_(l, history, 0, L1_(msg.system("base")), 0, ",\"cwd\":\"/work\"")
+    check_replay_(path, history, 0)
+    steps3 = L3_(msg.user("hi"), asst_call_("c"), msg.tool("c", "ok", ""))
+    cm_(l, history, 1, steps3, 100, ",\"usage\":{\"prompt_tokens\":90,\"completion_tokens\":10,\"prompt_cache_hit_tokens\":20},\"ms\":42,\"run_results\":[{\"tool_call_id\":\"c\",\"ok\":false}]")
+    check_replay_(path, history, 100)
+    cm_(l, history, 1, L1_(msg.user("summary")), 10, "")
+    check_replay_(path, history, 10)
+    cm_(l, history, 2, L2_(msg.user("interrupted"), msg.assistant("partial\n\n[interrupted by user]", null, "", "", 0, "", -1, "")), 10, "")
+    check_replay_(path, history, 10)
+    spec.assert_eq(sysgap.pwrite_all(lg_(l).fd, "{\"from\":\n{\"repair\":", lg_(l).offset), 0, "torn tail written")
+    log.close(l)
+    restored = list.list_new()
+    l2, e2 = log.restore(path, restored, "", 0)
+    spec.assert_str_eq(e2, "", "restore after torn tail")
+    spec.assert_str_eq(hist_(restored), hist_(history), "torn tail restores safe history")
+    cm_(l2, restored, list.list_size(restored), L1_(msg.assistant("next", null, "", "", 0, "", -1, "")), 0, "")
+    data = read_(path)
+    after = time.now_ms()
+    lines = string.split(data, "\n")
+    stamped = 0
+    repairs = 0
+    i = 0
+    while i < string.array_size(lines) {
+        line = string.array_get(lines, i)
+        i = i + 1
+        if string.length(line) == 0 { continue }
+        rec = jsonx.parse(line)
+        if rec == null { continue }
+        at = jsonx.long_or(rec, "at", -1 as long)
+        spec.assert_true(at >= before && at <= after, "at stamped in range")
+        stamped = stamped + 1
+        if jsonx.bool_or(rec, "repair", 0) == 1 { repairs = repairs + 1 }
+        jsonx.free(rec)
+    }
+    spec.assert_eq(stamped, 6, "four records, the repair and the next commit are stamped")
+    spec.assert_eq(repairs, 1, "one repair record")
+    again = list.list_new()
+    r = rp_(data, again)
+    spec.assert_eq(r.needs_repair, 0, "repaired log needs no repair")
+    spec.assert_str_eq(hist_(again), hist_(restored), "history after next")
+    log.close(l2)
+    fs.remove_tree(d)
+}
+
+t_rejects_() {
+    header = "{\"messages\":[{\"role\":\"system\",\"content\":\"base\"}]}\n"
+    dangling = "${header}{\"from\":1,\"messages\":[{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"c\",\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}]}\n"
+    h = list.list_new()
+    spec.assert_str_eq(rp_(dangling, h).err, "InvalidSessionLog", "dangling tool call")
+    corrupt = "${header}broken\n{\"from\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}\n"
+    h2 = list.list_new()
+    spec.assert_str_eq(rp_(corrupt, h2).err, "InvalidSessionLog", "interior corruption")
+    // a torn FINAL line is not an error
+    h3 = list.list_new()
+    r = rp_("${header}{\"from\":", h3)
+    spec.assert_str_eq(r.err, "", "torn tail tolerated")
+    spec.assert_eq(r.needs_repair, 1, "torn tail needs repair")
+    // a log with no safe history, and a non-system first message
+    spec.assert_str_eq(rp_("", list.list_new()).err, "InvalidSessionLog", "empty log")
+    spec.assert_str_eq(rp_("{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}\n", list.list_new()).err, "InvalidSessionLog", "first must be system")
+    // a record that starts past the end of history
+    spec.assert_str_eq(rp_("${header}{\"from\":5,\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}\n", list.list_new()).err, "InvalidSessionLog", "from past end")
+    // an unanswered call whose tool message has the wrong id
+    wrong = "${header}{\"from\":1,\"messages\":[{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"c\",\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"zz\",\"content\":\"x\"}]}\n"
+    spec.assert_str_eq(rp_(wrong, list.list_new()).err, "InvalidSessionLog", "tool id mismatch")
+}
+
+t_legacy_reasoning_() {
+    data = "${LINE0_}\n{\"from\":1,\"messages\":[{\"role\":\"user\",\"content\":\"u\"},{\"role\":\"assistant\",\"content\":\"a\",\"reasoning_content\":\"legacy\"}]}\n"
+    h = list.list_new()
+    r = rp_(data, h)
+    spec.assert_str_eq(r.err, "", "replay ok")
+    spec.assert_str_eq(r.provider, "chat_completions", "provider identity unchanged")
+    m = item_(h, 2)
+    spec.assert_str_eq(msg.reasoning_provider(m), "chat_completions", "migrated provider")
+    spec.assert_str_eq(msg.reasoning_data(m), "legacy", "migrated data")
+    spec.assert_str_eq(msg.raw(m, "reasoning_content"), "", "legacy key removed")
+    // a non-string legacy value is dropped, not migrated
+    h2 = list.list_new()
+    rp_("${LINE0_}\n{\"from\":1,\"messages\":[{\"role\":\"user\",\"content\":\"u\"},{\"role\":\"assistant\",\"content\":\"a\",\"reasoning_content\":null}]}\n", h2)
+    spec.assert_str_eq(msg.raw(item_(h2, 2), "reasoning"), "", "null legacy not migrated")
+}
+
+t_diagnostic_() {
+    d = tmp_()
+    path = "${d}/s.jsonl"
+    l, _e = log.create(path)
+    h = list.list_new()
+    cm_(l, h, 0, L1_(msg.system("base")), 123, ",\"cwd\":\"/work\"")
+    before = time.now_ms()
+    i = 0
+    while i < 10 {
+        e = log.event(l, ",\"diagnostic\":{\"error_name\":\"ProviderTransient\",\"message\":\"server_error: mock failure\",\"attempts\":5,\"step\":1}", 1)
+        spec.assert_str_eq(e, "", "diagnose ok")
+        i = i + 1
+    }
+    after = time.now_ms()
+    data = read_(path)
+    lines = string.split(data, "\n")
+    diagnostics = 0
+    k = 0
+    while k < string.array_size(lines) {
+        line = string.array_get(lines, k)
+        k = k + 1
+        if string.length(line) == 0 { continue }
+        rec = jsonx.parse(line)
+        spec.assert_true(rec != null, "every line parses")
+        if jsonx.has(rec, "diagnostic") == 0 { continue }
+        at = jsonx.long_or(rec, "at", -1 as long)
+        spec.assert_true(at >= before && at <= after, "diagnostic stamped")
+        diagnostics = diagnostics + 1
+    }
+    spec.assert_eq(diagnostics, 10, "ten diagnostics")
+    spec.assert_eq(list.list_size(h), 1, "history unchanged")
+    check_replay_(path, h, 123)
+    cm_(l, h, 1, L2_(msg.user("next"), msg.assistant("ok", null, "", "", 0, "", -1, "")), 200, "")
+    check_replay_(path, h, 200)
+    sums = log.list_sessions(d, "/work")
+    spec.assert_eq(list.list_size(sums), 1, "one summary")
+    spec.assert_str_eq((list.list_get_raw(sums, 0) as *log.Summary).preview, "next", "preview")
+    log.close(l)
+    fs.remove_tree(d)
+}
+
+t_fallback_() {
+    d = tmp_()
+    path = "${d}/s.jsonl"
+    l, _e = log.create(path)
+    h = list.list_new()
+    cm_(l, h, 0, L1_(msg.system("base")), 123, "")
+    reasons = L2_("WebSocketHandshake", "previous_response_not_found")
+    i = 0
+    while i < 2 {
+        reason = item_(reasons, i)
+        e = log.event(l, ",\"transport\":\"websocket\",\"transport_fallback\":\"${reason}\",\"transport_fallback_at\":1,\"turn_step\":1", 1)
+        spec.assert_str_eq(e, "", "fallback event")
+        cm_(l, h, list.list_size(h), L2_(msg.user("next"), msg.assistant("ok", null, "", "", 0, "", -1, "")), 200, ",\"model_ms\":1,\"transport_fallback\":\"${reason}\"")
+        i = i + 1
+    }
+    restored = list.list_new()
+    r = rp_(read_(path), restored)
+    spec.assert_str_eq(r.err, "", "replay ok")
+    spec.assert_str_eq(hist_(restored), hist_(h), "history")
+    spec.assert_eq(r.context_tokens as int, 200, "tokens")
+    spec.assert_eq(r.steps, 2, "two Steps")
+    spec.assert_eq(lg_(l).steps, 2, "log counts the same Steps")
+    log.close(l)
+    fs.remove_tree(d)
+}
+
+t_timing_() {
+    legacy = rec_(",\"ms\":10,\"run_results\":[]", 1, "[{\"role\":\"assistant\",\"content\":\"old\"}]", 0)
+    measured = rec_(",\"ms\":80,\"model_ms\":60,\"attempts\":2,\"first_data_ms\":3,\"max_gap_ms\":17,\"code\":[{\"tool_call_id\":\"c\",\"first_ms\":5,\"last_ms\":55,\"progress\":[[5,1],[55,20]]}],\"run_ms\":20,\"tool_bytes\":4000,\"output_bytes\":12,\"calls\":[{\"name\":\"read\",\"start_ms\":1,\"end_ms\":19,\"ok\":true,\"run_index\":0,\"result_bytes\":4000}],\"calls_omitted\":4,\"run_results\":[{\"tool_call_id\":\"c\",\"ok\":true,\"run_ms\":20,\"tool_bytes\":4000,\"output_bytes\":12}]", 2, "[{\"role\":\"assistant\",\"content\":\"new\"}]", 99)
+    data = "${LINE0_}\n${legacy}\n${measured}\n"
+    h = list.list_new()
+    r = rp_(data, h)
+    spec.assert_str_eq(r.err, "", "replay ok")
+    spec.assert_eq(list.list_size(h), 3, "three messages")
+    spec.assert_str_eq(msg.content(item_(h, 1)), "old", "old Step")
+    spec.assert_str_eq(msg.content(item_(h, 2)), "new", "measured Step")
+    spec.assert_eq(r.context_tokens as int, 99, "tokens")
+    spec.assert_eq(r.steps, 2, "both Steps counted")
+}
+
+t_effort_() {
+    base = "{\"from\":0,\"messages\":[{\"role\":\"system\",\"content\":\"base\"},{\"role\":\"user\",\"content\":\"task\"},{\"role\":\"assistant\",\"content\":\"legacy\"}],\"context_tokens\":0}"
+    step = "{\"from\":3,\"effort\":\"high\",\"context_tokens\":99,\"messages\":[{\"role\":\"assistant\",\"content\":\"new\",\"step_effort\":{\"effort\":\"low\"}}]}"
+    data = "${base}\n${step}\n"
+    h = list.list_new()
+    rp_(data, h)
+    spec.assert_str_eq(msg.step_effort(item_(h, 2)), "", "legacy Step has no effort")
+    spec.assert_str_eq(msg.step_effort(item_(h, 3)), "high", "Record effort wins over the message's")
+    compacted = "{\"from\":0,\"messages\":${hist_(h)},\"context_tokens\":20}"
+    restored = list.list_new()
+    r = rp_("${data}${compacted}\n", restored)
+    spec.assert_eq(r.steps, 2, "compaction adds no Steps")
+    spec.assert_str_eq(hist_(restored), hist_(h), "efforts survive the snapshot")
+    spec.assert_eq(r.context_tokens as int, 20, "tokens")
+    // the commit path stamps the effort on assistant messages only
+    d = tmp_()
+    path = "${d}/s.jsonl"
+    l, _e = log.create(path)
+    h2 = list.list_new()
+    cm_(l, h2, 0, L1_(msg.system("base")), 0, "")
+    cm_(l, h2, 1, L2_(msg.user("q"), msg.assistant("a", null, "", "", 0, "", -1, "")), 5, ",\"effort\":\"low\"")
+    spec.assert_str_eq(msg.step_effort(item_(h2, 1)), "", "user message gets no effort")
+    spec.assert_str_eq(msg.step_effort(item_(h2, 2)), "low", "assistant gets the effort")
+    check_replay_(path, h2, 5)
+    log.close(l)
+    fs.remove_tree(d)
+}
+
+t_child_restore_() {
+    d = tmp_()
+    path = "${d}/child.jsonl"
+    data = "{\"parent_session_id\":\"parent\",\"messages\":[{\"role\":\"system\",\"content\":\"child system\"}]}\n{\"from\":"
+    fs.write(path, data)
+    h = list.list_new()
+    _l0, e0 = log.restore(path, h, "other", 1)
+    spec.assert_str_eq(e0, "AgentSessionParentMismatch", "parent mismatch")
+    spec.assert_str_eq(read_(path), data, "file untouched by a refused restore")
+    h2 = list.list_new()
+    l, e = log.restore(path, h2, "parent", 1)
+    spec.assert_str_eq(e, "", "restore with right parent")
+    spec.assert_str_eq(lg_(l).parent_session_id, "parent", "parent_session_id")
+    spec.assert_str_eq(msg.content(item_(h2, 0)), "child system", "history")
+    // the refused restore released its lock, the successful one holds it
+    h3 = list.list_new()
+    _l3, e3 = log.restore(path, h3, "parent", 1)
+    spec.assert_str_eq(e3, "SessionBusy", "second restore is busy")
+    log.close(l)
+    fs.remove_tree(d)
+}
+
+t_id_maxima_() {
+    recs = rec_("", 0, "[{\"role\":\"system\",\"content\":\"base\"}]", 0)
+    recs = "${recs}\n{\"background\":{\"id\":\"a3\",\"kind\":\"agent\",\"state\":\"started\"}}"
+    recs = "${recs}\n{\"background\":{\"id\":\"a8\",\"kind\":\"agent\",\"state\":\"finished\"}}"
+    recs = "${recs}\n{\"background\":{\"id\":\"b12\",\"kind\":\"bash\",\"state\":\"lost\"}}"
+    recs = "${recs}\n{\"background\":{\"id\":\"b2\",\"kind\":\"bash\",\"state\":\"started\"}}"
+    recs = "${recs}\n{\"background\":{\"id\":\"b2\",\"kind\":\"bash\",\"state\":\"finished\"}}"
+    recs = "${recs}\n{\"from\":1,\"calls\":[{\"name\":\"agent\",\"id\":\"a10\",\"background\":false,\"start_ms\":0,\"end_ms\":1,\"ok\":true,\"run_index\":0},{\"name\":\"bash\",\"id\":\"b6\",\"background\":false,\"start_ms\":0,\"end_ms\":1,\"ok\":true,\"run_index\":0}]}"
+    recs = "${recs}\n{\"from\":1,\"messages\":[{\"role\":\"user\",\"content\":\"compacted\"}]}"
+    recs = "${recs}\n{\"bash\":{\"id\":\"b20\",\"run\":1,\"state\":\"started\"}}"
+    recs = "${recs}\n{\"bash\":{\"id\":\"b20\",\"run\":1,\"state\":\"superseded\",\"superseded_by\":\"b21\",\"elapsed_ms\":5}}"
+    recs = "${recs}\n{\"bash\":{\"id\":\"b21\",\"run\":2,\"state\":\"started\"}}\n"
+    h = list.list_new()
+    r = rp_(recs, h)
+    spec.assert_str_eq(r.err, "", "replay ok")
+    spec.assert_eq(r.next_agent_id as int, 11, "agent maximum a10")
+    spec.assert_eq(r.next_bash_id as int, 22, "bash maximum b21")
+    spec.assert_eq(r.next_run_id as int, 1, "no runs")
+    spec.assert_str_eq(msg.content(item_(h, 1)), "compacted", "history")
+    spec.assert_eq(list.list_size(r.lost_background), 1, "one lost")
+    spec.assert_str_eq(jsonx.str_or(jsonx.parse(item_(r.lost_background, 0)), "id", ""), "a3", "a3 is lost")
+}
+
+t_id_overflow_() {
+    base = rec_("", 0, "[{\"role\":\"system\",\"content\":\"base\"}]", 0)
+    over = "${base}\n{\"background\":{\"id\":\"a18446744073709551615\",\"kind\":\"agent\",\"state\":\"started\"}}\n"
+    spec.assert_str_eq(rp_(over, list.list_new()).err, "InvalidSessionLog", "overflowing id refused")
+    legacy = "${base}\n{\"background\":{\"id\":\"legacy_id\",\"kind\":\"agent\",\"state\":\"started\"}}\n"
+    r = rp_(legacy, list.list_new())
+    spec.assert_str_eq(r.err, "", "legacy id accepted")
+    spec.assert_eq(r.next_agent_id as int, 1, "agent counter unchanged")
+    spec.assert_eq(r.next_bash_id as int, 1, "bash counter unchanged")
+    bad = "${base}\n{\"background\":{\"id\":\"bash\",\"kind\":\"bash\",\"state\":\"started\"}}\n"
+    spec.assert_str_eq(rp_(bad, list.list_new()).err, "InvalidSessionLog", "a non-numeric a/b/r id is refused")
+    // run ids count too
+    runs = "${base}\n{\"background\":{\"id\":\"r7\",\"kind\":\"run\",\"state\":\"started\"}}\n"
+    spec.assert_eq(rp_(runs, list.list_new()).next_run_id as int, 8, "run maximum")
+}
+
+t_task_high_water_() {
+    base = rec_("", 0, "[{\"role\":\"system\",\"content\":\"base\"}]", 0)
+    overflow = "{\"from\":1,\"calls_omitted\":2,\"task_ids\":{\"agent\":7,\"bash\":12},\"messages\":[],\"context_tokens\":0}"
+    compacted = "{\"from\":0,\"messages\":[{\"role\":\"system\",\"content\":\"base\"}],\"task_ids\":{\"agent\":2,\"bash\":3},\"context_tokens\":0}"
+    r = rp_("${base}\n${overflow}\n${compacted}\n", list.list_new())
+    spec.assert_str_eq(r.err, "", "replay ok")
+    spec.assert_eq(r.next_agent_id as int, 8, "agent high water")
+    spec.assert_eq(r.next_bash_id as int, 13, "bash high water")
+    spec.assert_eq(r.next_run_id as int, 1, "run default")
+}
+
+// replays `data` and checks the whole restored state
+check13_(data: string, expected: ptr, tokens: int, maps: string, next_agent: int, next_bash: int, steps: int) {
+    h = list.list_new()
+    r = rp_(data, h)
+    spec.assert_str_eq(r.err, "", "replay ok")
+    spec.assert_str_eq(hist_(h), hist_(expected), "history")
+    spec.assert_eq(r.context_tokens as int, tokens, "tokens")
+    spec.assert_str_eq(join_(r.agent_sessions), maps, "mappings in order")
+    spec.assert_eq(r.next_agent_id as int, next_agent, "next agent")
+    spec.assert_eq(r.next_bash_id as int, next_bash, "next bash")
+    spec.assert_eq(r.steps, steps, "steps")
+}
+
+t_agent_session_snapshots_() {
+    M17 = "{\"id\":\"a17\",\"session\":\"child-17\"}"
+    M3 = "{\"id\":\"a3\",\"session\":\"child-3\"}"
+    M21 = "{\"id\":\"a21\",\"session\":\"child-21\"}"
+    sys = msg.system("base")
+    task = msg.user("task")
+    answer = msg.assistant("answer", null, "", "", 0, "", -1, "")
+    summary = msg.user("summary")
+    data = rec_("", 0, "[${sys}]", 10)
+    check13_("${data}\n", L1_(sys), 10, "", 1, 1, 0)
+    data = app_(data, ",\"agent_session\":${M17}", 0, "[]", 0)
+    check13_("${data}\n", L1_(sys), 10, M17, 18, 1, 0)
+    data = app_(data, ",\"task_ids\":{\"agent\":8,\"bash\":12}", 1, "[${task},${answer}]", 100)
+    check13_("${data}\n", L3_(sys, task, answer), 100, M17, 18, 13, 1)
+    data = app_(data, "", 0, "[${sys},${task},${answer}]", 100)
+    check13_("${data}\n", L3_(sys, task, answer), 100, M17, 18, 13, 1)
+    data = app_(data, ",\"agent_session\":${M3}", 0, "[]", 0)
+    check13_("${data}\n", L3_(sys, task, answer), 100, "${M17}\n${M3}", 18, 13, 1)
+    data = app_(data, ",\"task_ids\":{\"agent\":2,\"bash\":3}", 1, "[${summary}]", 20)
+    check13_("${data}\n", L2_(sys, summary), 20, "${M17}\n${M3}", 18, 13, 1)
+    data = app_(data, ",\"agent_session\":${M21}", 0, "[]", 0)
+    check13_("${data}\n", L2_(sys, summary), 20, "${M17}\n${M3}\n${M21}", 22, 13, 1)
+}
+
+t_agent_session_resumes_() {
+    d = tmp_()
+    path = "${d}/parent.jsonl"
+    M9 = "{\"id\":\"a9\",\"session\":\"child-9\"}"
+    M4 = "{\"id\":\"a4\",\"session\":\"child-4\"}"
+    M27 = "{\"id\":\"a27\",\"session\":\"child-27\"}"
+    l, _e = log.create(path)
+    spec.assert_eq(list.list_size(lg_(l).agent_sessions), 0, "none yet")
+    h = list.list_new()
+    cm_(l, h, 0, L1_(msg.system("base")), 40, ",\"task_ids\":{\"agent\":20,\"bash\":30}")
+    spec.assert_str_eq(log.event(l, ",\"agent_session\":${M9}", 1), "", "mapping a9")
+    cm_(l, h, 0, L1_(msg.system("base")), 12, "")
+    log.close(l)
+
+    h2 = list.list_new()
+    l2, e2 = log.restore(path, h2, "", 0)
+    spec.assert_str_eq(e2, "", "restore 1")
+    spec.assert_str_eq(join_(lg_(l2).agent_sessions), M9, "a9 restored")
+    spec.assert_eq(lg_(l2).next_agent_id as int, 21, "agent high water from task_ids")
+    spec.assert_eq(lg_(l2).next_bash_id as int, 31, "bash high water")
+    spec.assert_eq(lg_(l2).context_tokens as int, 12, "tokens")
+    spec.assert_eq(list.list_size(h2), 1, "history")
+    spec.assert_str_eq(log.event(l2, ",\"agent_session\":${M4}", 1), "", "mapping a4")
+    cm_(l2, h2, 0, L2_(msg.system("base"), msg.user("summary")), 8, ",\"task_ids\":{\"agent\":2,\"bash\":3}")
+    spec.assert_str_eq(log.event(l2, ",\"agent_session\":${M27}", 1), "", "mapping a27")
+    log.close(l2)
+
+    h3 = list.list_new()
+    l3, e3 = log.restore(path, h3, "", 0)
+    spec.assert_str_eq(e3, "", "restore 2")
+    spec.assert_str_eq(join_(lg_(l3).agent_sessions), "${M9}\n${M4}\n${M27}", "all mappings in order")
+    spec.assert_eq(lg_(l3).next_agent_id as int, 28, "a27 high water")
+    spec.assert_eq(lg_(l3).next_bash_id as int, 31, "bash high water survives compaction")
+    spec.assert_eq(lg_(l3).context_tokens as int, 8, "tokens")
+    spec.assert_eq(list.list_size(h3), 2, "history")
+    spec.assert_str_eq(msg.content(item_(h3, 1)), "summary", "summary")
+    lg_(l3).poisoned = 1
+    spec.assert_str_eq(log.event(l3, ",\"agent_session\":{\"id\":\"a99\",\"session\":\"not-written\"}", 1), "SessionLogFailed", "poisoned log refuses")
+    log.close(l3)
+    fs.remove_tree(d)
+}
+
+const STARTED_FIRST_ = "{\"id\":\"a1\",\"kind\":\"agent\",\"state\":\"started\",\"result\":\"first\"}"
+const STARTED_OTHER_ = "{\"id\":\"b1\",\"kind\":\"bash\",\"state\":\"started\"}"
+const STARTED_SECOND_ = "{\"id\":\"a1\",\"kind\":\"agent\",\"state\":\"started\",\"result\":\"second\"}"
+
+t_fifo_replay_one_(terminal: string, delivered: int) {
+    sys = msg.system("base")
+    data = rec_("", 0, "[${sys}]", 10)
+    data = app_(data, ",\"agent_session\":{\"id\":\"a1\",\"session\":\"child\"}", 0, "[]", 0)
+    data = app_(data, ",\"background\":${STARTED_FIRST_}", 0, "[]", 0)
+    data = app_(data, ",\"background\":${STARTED_OTHER_}", 0, "[]", 0)
+    data = app_(data, ",\"background\":${STARTED_SECOND_}", 0, "[]", 0)
+    data = "${data}\n"
+    h = list.list_new()
+    started = rp_(data, h)
+    spec.assert_str_eq(join_(started.lost_background), "${STARTED_FIRST_}\n${STARTED_OTHER_}\n${STARTED_SECOND_}", "all three start lost")
+    spec.assert_eq(list.list_size(started.background_repairs), 0, "no repairs yet")
+    tokens_expected = 10
+    if delivered == 1 {
+        msgtext = "{\"role\":\"user\",\"content\":\"first done\",\"source\":\"background\",\"background_id\":\"a1\"}"
+        data = app_(data, "", 1, "[${msgtext}]", 20)
+        data = "${data}\n"
+        h2 = list.list_new()
+        committed = rp_(data, h2)
+        spec.assert_str_eq(join_(committed.lost_background), "${STARTED_OTHER_}\n${STARTED_SECOND_}", "first delivered leaves other and second")
+        spec.assert_str_eq(join_(committed.background_repairs), "{\"id\":\"a1\",\"kind\":\"agent\",\"state\":\"lost\"}", "delivered first is repaired as lost")
+        tokens_expected = 20
+    }
+    endev = ",\"background\":{\"id\":\"a1\",\"kind\":\"agent\",\"state\":\"${terminal}\"}"
+    data = app_(data, endev, 0, "[]", 0)
+    data = "${data}\n"
+    h3 = list.list_new()
+    restored = rp_(data, h3)
+    spec.assert_str_eq(join_(restored.lost_background), "${STARTED_OTHER_}\n${STARTED_SECOND_}", "terminal closes the FIRST a1")
+    spec.assert_eq(list.list_size(restored.background_repairs), 0, "no repair left")
+    spec.assert_str_eq(join_(restored.agent_sessions), "{\"id\":\"a1\",\"session\":\"child\"}", "mapping")
+    spec.assert_eq(restored.next_agent_id as int, 2, "next agent")
+    spec.assert_eq(restored.next_bash_id as int, 2, "next bash")
+    spec.assert_eq(restored.context_tokens as int, tokens_expected, "tokens")
+    want = 1
+    if delivered == 1 { want = 2 }
+    spec.assert_eq(list.list_size(h3), want, "history")
+}
+
+t_fifo_replay_() {
+    t_fifo_replay_one_("finished", 0)
+    t_fifo_replay_one_("finished", 1)
+    t_fifo_replay_one_("lost", 0)
+    t_fifo_replay_one_("lost", 1)
+}
+
+const BG_MSG_ = "{\"role\":\"user\",\"content\":\"first done\",\"source\":\"background\",\"background_id\":\"a1\"}"
+
+t_restore_no_redeliver_() {
+    d = tmp_()
+    path = "${d}/background.jsonl"
+    started = "{\"id\":\"a1\",\"kind\":\"agent\",\"state\":\"started\"}"
+    l, _e = log.create(path)
+    h = list.list_new()
+    cm_(l, h, 0, L1_(msg.system("base")), 0, "")
+    spec.assert_str_eq(log.background(l, started, 1), "", "background started")
+    cm_(l, h, 1, L1_(BG_MSG_), 0, "")
+    log.close(l)
+    attempt = 0
+    while attempt < 2 {
+        h2 = list.list_new()
+        l2, e2 = log.restore(path, h2, "", 0)
+        spec.assert_str_eq(e2, "", "restore")
+        spec.assert_eq(list.list_size(lg_(l2).lost_background), 0, "delivered start is not lost")
+        spec.assert_eq(list.list_size(h2), 2, "history")
+        if attempt == 1 { log.background(l2, started, 2) }
+        log.close(l2)
+        attempt = attempt + 1
+    }
+    h3 = list.list_new()
+    l3, _e3 = log.restore(path, h3, "", 0)
+    spec.assert_str_eq(join_(lg_(l3).lost_background), started, "the new start is lost")
+    log.background(l3, "{\"id\":\"a1\",\"kind\":\"agent\",\"state\":\"finished\"}", 1)
+    log.close(l3)
+    h4 = list.list_new()
+    l4, _e4 = log.restore(path, h4, "", 0)
+    spec.assert_eq(list.list_size(lg_(l4).lost_background), 0, "finished closes it")
+    cm_(l4, h4, 2, L1_("{\"role\":\"user\",\"content\":\"second done\",\"source\":\"background\",\"background_id\":\"a1\"}"), 0, "")
+    log.close(l4)
+    h5 = list.list_new()
+    l5, _e5 = log.restore(path, h5, "", 0)
+    spec.assert_eq(list.list_size(lg_(l5).lost_background), 0, "nothing lost")
+    spec.assert_eq(list.list_size(h5), 3, "history")
+    spec.assert_eq(lg_(l5).next_agent_id as int, 2, "next agent")
+    log.close(l5)
+    fs.remove_tree(d)
+}
+
+t_fifo_restore_one_(okmode: int, torn: int) {
+    d = tmp_()
+    path = "${d}/fifo.jsonl"
+    first = "{\"id\":\"a1\",\"kind\":\"agent\",\"state\":\"started\",\"result\":\"old invocation\"}"
+    second = "{\"id\":\"a1\",\"kind\":\"agent\",\"state\":\"started\",\"result\":\"new invocation\"}"
+    okmember = ""
+    terminal = "{\"id\":\"a1\",\"kind\":\"agent\",\"state\":\"lost\"}"
+    if okmode == 1 {
+        okmember = ",\"background_ok\":true"
+        terminal = "{\"id\":\"a1\",\"kind\":\"agent\",\"state\":\"finished\",\"ok\":true}"
+    }
+    if okmode == 0 {
+        okmember = ",\"background_ok\":false"
+        terminal = "{\"id\":\"a1\",\"kind\":\"agent\",\"state\":\"finished\",\"ok\":false}"
+    }
+    original = list.list_new()
+    l, _e = log.create(path)
+    cm_(l, original, 0, L2_(msg.system("base"), msg.assistant("ready", null, "", "", 0, "", -1, "")), 12, ",\"parent_session_id\":\"parent\"")
+    log.background(l, first, 1)
+    log.background(l, second, 2)
+    result = "{\"role\":\"user\",\"content\":\"opaque result, not lifecycle text\",\"source\":\"background\",\"background_id\":\"a1\",\"background_kind\":\"agent\"${okmember}}"
+    cm_(l, original, list.list_size(original), L1_(result), 37, "")
+    if torn == 1 { sysgap.pwrite_all(lg_(l).fd, "{\"background\":", lg_(l).offset) }
+    log.close(l)
+    before = read_(path)
+    h = list.list_new()
+    _lx, ex = log.restore(path, h, "other", 1)
+    spec.assert_str_eq(ex, "AgentSessionParentMismatch", "mismatch before repair")
+    spec.assert_str_eq(read_(path), before, "mismatch leaves the file alone")
+
+    h1 = list.list_new()
+    l1, e1 = log.restore(path, h1, "parent", 1)
+    spec.assert_str_eq(e1, "", "restore")
+    spec.assert_str_eq(join_(lg_(l1).lost_background), second, "only the reused invocation is lost")
+    spec.assert_str_eq(hist_(h1), hist_(original), "history")
+    spec.assert_eq(lg_(l1).context_tokens as int, 37, "tokens")
+    spec.assert_eq(lg_(l1).steps, 1, "steps")
+    spec.assert_eq(lg_(l1).next_agent_id as int, 2, "next agent")
+    repaired = read_(path)
+    spec.assert_true(string.starts_with(repaired, before), "repair only appends")
+    trimmed = string.trim(repaired)
+    lines = string.split(trimmed, "\n")
+    lastline = string.array_get(lines, string.array_size(lines) - 1)
+    rec = jsonx.parse(lastline)
+    spec.assert_str_eq(jsonx.encode(jsonx.field(rec, "background")), terminal, "terminal event appended")
+    spec.assert_eq(json_len_(jsonx.field(rec, "messages")), 0, "no messages in the repair")
+    replayed = list.list_new()
+    rr = rp_(repaired, replayed)
+    spec.assert_eq(rr.needs_repair, 0, "repaired log is whole")
+    spec.assert_eq(list.list_size(rr.background_repairs), 0, "no repairs left")
+    spec.assert_str_eq(join_(rr.lost_background), second, "second still lost")
+    spec.assert_str_eq(hist_(replayed), hist_(original), "replayed history")
+    spec.assert_eq(rr.context_tokens as int, 37, "replayed tokens")
+    spec.assert_eq(rr.steps, 1, "replayed steps")
+    log.close(l1)
+
+    h2 = list.list_new()
+    l2, e2 = log.restore(path, h2, "parent", 1)
+    spec.assert_str_eq(e2, "", "second restore")
+    spec.assert_str_eq(read_(path), repaired, "restore is idempotent")
+    spec.assert_str_eq(join_(lg_(l2).lost_background), second, "second lost")
+    cm_(l2, h2, list.list_size(h2), L1_("{\"role\":\"user\",\"content\":\"new invocation lost\",\"source\":\"background\",\"background_id\":\"a1\",\"background_kind\":\"agent\"}"), 43, "")
+    log.background(l2, "{\"id\":\"a1\",\"kind\":\"agent\",\"state\":\"lost\"}", 2)
+    log.close(l2)
+    k = 0
+    while k < 2 {
+        h3 = list.list_new()
+        l3, e3 = log.restore(path, h3, "parent", 1)
+        spec.assert_str_eq(e3, "", "final restore")
+        spec.assert_eq(list.list_size(lg_(l3).lost_background), 0, "nothing lost")
+        spec.assert_str_eq(hist_(h3), hist_(h2), "delivered history")
+        spec.assert_eq(lg_(l3).context_tokens as int, 43, "tokens")
+        spec.assert_eq(lg_(l3).steps, 1, "steps")
+        spec.assert_eq(lg_(l3).next_agent_id as int, 2, "next agent")
+        spec.assert_eq(lg_(l3).next_bash_id as int, 1, "next bash")
+        log.close(l3)
+        k = k + 1
+    }
+    fs.remove_tree(d)
+}
+
+json_len_(v: ptr) -> int { return jsonx.array_size(v) }
+
+t_fifo_restore_() {
+    t_fifo_restore_one_(1, 0)
+    t_fifo_restore_one_(1, 1)
+    t_fifo_restore_one_(0, 0)
+    t_fifo_restore_one_(0, 1)
+    t_fifo_restore_one_(-1, 0)
+    t_fifo_restore_one_(-1, 1)
+}
+
+t_pending_interrupted_() {
+    waiting = "{\"messages\":[{\"role\":\"system\",\"content\":\"s\"}]}\n{\"from\":1,\"messages\":[{\"role\":\"user\",\"content\":\"你好🙂\",\"source\":\"background\",\"background_kind\":\"bash\",\"background_id\":\"b1\"}]}\n{\"from\":2,\"messages\":[{\"role\":\"assistant\",\"content\":\"[interrupted by user]\"}]}\n"
+    h = list.list_new()
+    pending = rp_(waiting, h)
+    spec.assert_eq(pending.pending_background_bytes as int, string.length("你好🙂"), "bytes of the unbilled output")
+    spec.assert_eq(pending.pending_background_bytes as int, 10, "ten UTF-8 bytes")
+    h2 = list.list_new()
+    charged = rp_("${waiting}{\"from\":3,\"model_ms\":0,\"output_bytes\":10,\"messages\":[{\"role\":\"assistant\",\"content\":\"received\"}]}\n", h2)
+    spec.assert_eq(charged.pending_background_bytes as int, 0, "a measured Step clears it")
+}
+
+check_pending_(data: string, want: int) {
+    h = list.list_new()
+    r = rp_(data, h)
+    spec.assert_str_eq(r.err, "", "replay ok")
+    spec.assert_eq(r.pending_background_bytes as int, want, "pending background bytes")
+}
+
+t_pending_table_() {
+    bg = "{\"role\":\"user\",\"content\":\"你好🙂\",\"source\":\"background\",\"background_id\":\"b1\",\"background_kind\":\"bash\"}"
+    notbg = "{\"role\":\"user\",\"content\":\"not background\",\"background_id\":\"b2\",\"background_kind\":\"bash\"}"
+    nocontent = "{\"role\":\"user\",\"source\":\"background\"}"
+    empty = "{\"role\":\"user\",\"content\":\"\",\"source\":\"background\"}"
+    sys = msg.system("base")
+    B = 10
+    d = rec_("", 0, "[${sys}]", 0)
+    check_pending_("${d}\n", 0)
+    d = app_(d, "", 1, "[${bg},${notbg},${nocontent},${empty}]", 0)
+    check_pending_("${d}\n", B)
+    d = app_(d, "", 0, "[${sys},${bg}]", 0)
+    check_pending_("${d}\n", B)
+    d = app_(d, ",\"model_ms\":0", 1, "[${bg}]", 0)
+    check_pending_("${d}\n", B)
+    d = app_(d, ",\"model_ms\":1", 1, "[{\"role\":\"user\",\"content\":\"summary\"}]", 0)
+    check_pending_("${d}\n", B)
+    d = app_(d, ",\"ms\":10,\"output_bytes\":10", 2, "[{\"role\":\"assistant\",\"content\":\"[interrupted by user]\"}]", 0)
+    check_pending_("${d}\n", B)
+    d = app_(d, ",\"diagnostic\":{\"error_name\":\"Canceled\",\"message\":\"interrupted\",\"attempts\":1,\"step\":1},\"model_ms\":0", 0, "[]", 0)
+    check_pending_("${d}\n", B)
+    d = app_(d, ",\"agent_session\":{\"id\":\"a1\",\"session\":\"child\"},\"model_ms\":0", 0, "[]", 0)
+    check_pending_("${d}\n", B)
+    d = app_(d, ",\"background\":{\"id\":\"b1\",\"kind\":\"bash\",\"state\":\"finished\"},\"model_ms\":0", 0, "[]", 0)
+    check_pending_("${d}\n", B)
+    d = app_(d, "", 3, "[${bg}]", 0)
+    check_pending_("${d}\n", B * 2)
+    d = app_(d, ",\"model_ms\":0", 4, "[${bg},{\"role\":\"assistant\",\"content\":\"received\"}]", 0)
+    check_pending_("${d}\n", 0)
+    d = app_(d, "", 0, "[${sys},${bg}]", 0)
+    check_pending_("${d}\n", 0)
+    d = app_(d, "", 2, "[${bg}]", 0)
+    check_pending_("${d}\n", B)
+}
+
+t_pending_restore_() {
+    d = tmp_()
+    path = "${d}/pending.jsonl"
+    bgm = "{\"role\":\"user\",\"content\":\"你好🙂\",\"source\":\"background\",\"background_id\":\"a1\",\"background_kind\":\"agent\",\"background_ok\":true}"
+    l, _e = log.create(path)
+    h = list.list_new()
+    cm_(l, h, 0, L1_(msg.system("base")), 0, ",\"parent_session_id\":\"parent\"")
+    log.event(l, ",\"agent_session\":{\"id\":\"a1\",\"session\":\"child\"}", 1)
+    log.background(l, "{\"id\":\"a1\",\"kind\":\"agent\",\"state\":\"started\"}", 1)
+    cm_(l, h, 1, L1_(bgm), 17, "")
+    cm_(l, h, 0, L2_(msg.system("base"), bgm), 17, "")
+    sysgap.pwrite_all(lg_(l).fd, "{\"model_ms\":", lg_(l).offset)
+    log.close(l)
+    previous = ""
+    k = 0
+    while k < 3 {
+        h2 = list.list_new()
+        l2, e2 = log.restore(path, h2, "parent", 1)
+        spec.assert_str_eq(e2, "", "restore")
+        spec.assert_eq(lg_(l2).pending_background_bytes as int, 10, "pending bytes survive")
+        spec.assert_eq(list.list_size(lg_(l2).lost_background), 0, "nothing lost")
+        spec.assert_str_eq(join_(lg_(l2).agent_sessions), "{\"id\":\"a1\",\"session\":\"child\"}", "mapping")
+        spec.assert_eq(lg_(l2).next_agent_id as int, 2, "next agent")
+        spec.assert_eq(lg_(l2).context_tokens as int, 17, "tokens")
+        data = read_(path)
+        if k > 0 { spec.assert_str_eq(data, previous, "restores after the first add nothing") }
+        previous = string.copy(data)
+        h3 = list.list_new()
+        r = rp_(data, h3)
+        spec.assert_eq(r.needs_repair, 0, "whole")
+        spec.assert_eq(list.list_size(r.background_repairs), 0, "no repairs")
+        spec.assert_eq(r.pending_background_bytes as int, lg_(l2).pending_background_bytes as int, "replay agrees")
+        log.close(l2)
+        k = k + 1
+    }
+    h4 = list.list_new()
+    l4, _e4 = log.restore(path, h4, "parent", 1)
+    cm_(l4, h4, list.list_size(h4), L1_(msg.assistant("received", null, "", "", 0, "", -1, "")), 0, ",\"model_ms\":0")
+    log.close(l4)
+    k = 0
+    while k < 2 {
+        h5 = list.list_new()
+        l5, _e5 = log.restore(path, h5, "parent", 1)
+        spec.assert_eq(lg_(l5).pending_background_bytes as int, 0, "cleared by a full Step")
+        spec.assert_eq(list.list_size(lg_(l5).lost_background), 0, "nothing lost")
+        log.close(l5)
+        k = k + 1
+    }
+    fs.remove_tree(d)
+}
+
+t_fork_header_() {
+    forked = ",\"cache_key\":\"parent-cache\",\"forked_from\":{\"session\":\"parent-session\",\"message_count\":3}"
+    r0 = rec_(forked, 0, "[{\"role\":\"system\",\"content\":\"original system\"},{\"role\":\"user\",\"content\":\"old background output\",\"source\":\"background\",\"background_id\":\"b1\"},{\"role\":\"assistant\",\"content\":\"inherited assistant\"}]", 100)
+    r1 = rec_("", 3, "[{\"role\":\"user\",\"content\":\"child prompt\"},{\"role\":\"assistant\",\"content\":\"child answer\"}]", 200)
+    r2 = rec_("", 1, "[{\"role\":\"user\",\"content\":\"compacted child history\"}]", 50)
+    recs = L3_(r0, r1, r2)
+    data = ""
+    i = 0
+    while i < 3 {
+        data = "${data}${item_(recs, i)}\n"
+        h = list.list_new()
+        r = rp_(data, h)
+        spec.assert_str_eq(r.err, "", "replay ok")
+        want = 1
+        if i == 0 { want = 0 }
+        spec.assert_eq(r.steps, want, "inherited Steps are not billed")
+        spec.assert_eq(r.pending_background_bytes as int, 0, "inherited background output is not pending")
+        spec.assert_str_eq(r.cache_key, "parent-cache", "cache key")
+        spec.assert_str_eq(r.forked_from, "{\"session\":\"parent-session\",\"message_count\":3}", "provenance")
+        i = i + 1
+    }
+}
+
+t_run_ids_() {
+    base = rec_("", 0, "[{\"role\":\"system\",\"content\":\"system\"}]", 0)
+    superseded = "{\"bash\":{\"id\":\"b1\",\"run\":1,\"state\":\"superseded\",\"superseded_by\":\"b2\"}}"
+    step = rec_(",\"calls\":[{\"name\":\"bash\",\"id\":\"b1\",\"start_ms\":0,\"end_ms\":1,\"ok\":true,\"run_index\":0}],\"run_results\":[{\"tool_call_id\":\"run\",\"background_id\":\"r3\"}]", 1, "[${asst_call_("run")},${msg.tool("run", "registered", "")}]", 0)
+    h = list.list_new()
+    r = rp_("${base}\n${superseded}\n${step}\n", h)
+    spec.assert_str_eq(r.err, "", "replay ok")
+    spec.assert_eq(list.list_size(h), 3, "history")
+    spec.assert_eq(r.next_bash_id as int, 2, "b1 restores the bash counter")
+}
+
+t_images_() {
+    data = "{\"from\":0,\"messages\":[{\"role\":\"system\",\"content\":\"s\"}],\"provider\":\"codex\",\"model\":\"m\"}\n{\"from\":1,\"messages\":[{\"role\":\"user\",\"content\":\"look [Image #1]\",\"images\":[{\"path\":\"/x/a.png\",\"name\":\"a.png\",\"media_type\":\"image/png\",\"bytes\":3,\"width\":4,\"height\":3}]},{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"c\",\"type\":\"function\",\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"c\",\"content\":\"ok\",\"images\":[{\"path\":\"/x/b.png\",\"name\":\"shot.png\",\"media_type\":\"image/png\",\"bytes\":3,\"width\":640,\"height\":480}]}],\"calls\":[{\"name\":\"view\",\"start_ms\":0,\"end_ms\":1,\"ok\":true,\"run_index\":0,\"path\":\"shot.png\"}]}\n"
+    h = list.list_new()
+    r = rp_(data, h)
+    spec.assert_str_eq(r.err, "", "replay ok")
+    spec.assert_str_eq(r.provider, "codex", "provider from the header")
+    spec.assert_str_eq(r.model, "m", "model from the header")
+    first = jsonx.parse(msg.raw(item_(h, 1), "images"))
+    spec.assert_str_eq(jsonx.str_or(jsonx.array_at(first, 0), "name", ""), "a.png", "user image name")
+    second = jsonx.parse(msg.raw(item_(h, 3), "images"))
+    spec.assert_eq(jsonx.int_or(jsonx.array_at(second, 0), "width", 0), 640, "tool image width")
+    spec.assert_true(string.starts_with(msg.raw(item_(h, 1), "images"), "[{\"path\":\"/x/a.png\""), "images are written back as read")
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "session.log") {
+        spec.it("list finds top-level sessions with messages for a directory, newest first") callback { t_list_() }
+        spec.it("commit and replay preserve safe history, compaction and torn tail") callback { t_commit_replay_() }
+        spec.it("replay rejects dangling tool calls and unrepaired interior corruption") callback { t_rejects_() }
+        spec.it("legacy chat reasoning is migrated without changing provider identity") callback { t_legacy_reasoning_() }
+        spec.it("diagnostic append and replay do not commit messages or replace context tokens") callback { t_diagnostic_() }
+        spec.it("transport fallback events preserve history, tokens and Steps across restore") callback { t_fallback_() }
+        spec.it("timing fields are optional and replay preserves mixed old and measured Steps") callback { t_timing_() }
+        spec.it("Step effort restores from Record and survives compacted message snapshots") callback { t_effort_() }
+        spec.it("child restore checks parent before repairing and keeps the session exclusively locked") callback { t_child_restore_() }
+        spec.it("replay restores independent ID maxima from every background state and foreground call") callback { t_id_maxima_() }
+        spec.it("ID restoration rejects overflow rather than wrapping the session counter") callback { t_id_overflow_() }
+        spec.it("task ID high water survives omitted calls and later compacted snapshots") callback { t_task_high_water_() }
+        spec.it("agent session mappings survive snapshots and compaction without changing history") callback { t_agent_session_snapshots_() }
+        spec.it("agentSession append restores mappings and ID high water across repeated resumes") callback { t_agent_session_resumes_() }
+        spec.it("replay matches reused background IDs in FIFO order for finished and lost events") callback { t_fifo_replay_() }
+        spec.it("restore after background message commit without finished does not redeliver lost") callback { t_restore_no_redeliver_() }
+        spec.it("restore closes delivered FIFO entries before delivering a reused ID as lost") callback { t_fifo_restore_() }
+        spec.it("replay carries unbilled background bytes across interrupted Turns and clears on a committed Step") callback { t_pending_interrupted_() }
+        spec.it("pending background bytes count only appended UTF-8 content and clear only on full Steps") callback { t_pending_table_() }
+        spec.it("restore preserves pending background bytes across snapshots and idempotent lifecycle repairs") callback { t_pending_restore_() }
+        spec.it("fork header retains provenance and cache across compaction without billing inherited Steps") callback { t_fork_header_() }
+        spec.it("0.4.0 replay restores background Run ids and bash replacements from lifecycle records") callback { t_run_ids_() }
+        spec.it("replay restores image references and view summaries") callback { t_images_() }
+    }
+    return spec.run_summary(fw)
+}

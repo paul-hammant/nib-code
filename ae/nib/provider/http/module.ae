@@ -22,8 +22,9 @@ import std.sync
 import std.time
 import std.worker
 import nib.lock
+import nib.provider.model_timing
 
-exports(Stream, Reader, open, reader, wait_head, next_line, content, read_rest, status_of,
+exports(Stream, Reader, open, reader, set_timing, set_data_hook, wait_head, next_line, content, read_rest, status_of,
         timeout_message, TIMEOUT_BYTES, TIMEOUT_CONTENT, TIMEOUT_REQUEST)
 
 const TIMEOUT_BYTES = "StreamIdleTimeout"
@@ -50,6 +51,10 @@ struct Reader {
     request_s: int
     timeout_kind: string
     received: long
+    model: ptr         // the Step's provider.model_timing model, or null
+    on_data: fn        // |ctx: ptr| after each body chunk
+    has_data: int
+    data_ctx: ptr
 }
 
 now_() -> long { return time.now_ms() }
@@ -123,7 +128,21 @@ reader(sp: @keep ptr, idle_s: int, content_s: int, request_s: int) -> ptr {
     r.request_s = request_s
     r.timeout_kind = ""
     r.received = 0 as long
+    r.model = null
+    r.has_data = 0
+    r.data_ctx = null
     return r as ptr
+}
+
+// Feeds body bytes and content progress to the Step's timing model.
+set_timing(rp: ptr, model: @keep ptr) { (rp as *Reader).model = model }
+
+// Calls hook(ctx) after every chunk of body bytes (upstream Sink.onData).
+set_data_hook(rp: ptr, hook: @keep fn, ctx: @keep ptr) {
+    r = rp as *Reader
+    r.on_data = hook
+    r.data_ctx = ctx
+    r.has_data = 1
 }
 
 status_of(rp: ptr) -> int {
@@ -140,6 +159,7 @@ content(rp: ptr, bytes: int) {
     if bytes == 0 { return }
     r = rp as *Reader
     r.last_content_ms = now_()
+    if r.model != null { model_timing.content(r.model, bytes) }
 }
 
 // "" or the timeout error name, set in r.timeout_kind.
@@ -175,6 +195,8 @@ pull_(r: *Reader) -> (int, int, string) {
         r.pending = "${r.pending}${got}"
         r.last_ms = now_()
         r.received = r.received + (n as long)
+        if r.model != null { model_timing.received(r.model, n) }
+        if r.has_data == 1 { call(r.on_data, r.data_ctx) }
     }
     return n, done, e
 }

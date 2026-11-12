@@ -160,6 +160,7 @@ read_stream(lines: ptr, cp: ptr, sk: ptr, cancel: ptr) -> (ptr, string, string) 
                             return fail_("InvalidResponse", "")
                         }
                         sink.content(sk, string.length(jsonx.str_or(fo, "arguments", "")))
+                        if jsonx.kind(fo, "arguments") == json.JSON_STRING { sink.arguments(sk, jsonx.int_or(tc, "index", 0), string.length(jsonx.str_or(fo, "arguments", ""))) }
                         ti = ti + 1
                     }
                     if string.length(rc) > 0 {
@@ -208,6 +209,7 @@ read_stream(lines: ptr, cp: ptr, sk: ptr, cancel: ptr) -> (ptr, string, string) 
         slot = list.list_get_raw(calls, i) as *Partial
         if string.length(slot.id) == 0 || string.length(slot.name) == 0 { return fail_("InvalidResponse", "") }
         list.list_add(rep.tool_calls, types.tool_call_new(slot.id, slot.name, slot.args))
+        sink.bind(sk, i, i)
         i = i + 1
     }
     rep.text = text
@@ -238,7 +240,7 @@ timeout_detail_(r: ptr, err: string) -> string {
 }
 
 // One request attempt against `cfg.base_url`/chat/completions.
-stream(cp: ptr, messages: ptr, tools_json: string, max_tokens: int, sk: ptr, cancel: ptr) -> (ptr, string, string) {
+stream(cp: ptr, messages: ptr, tools_json: string, max_tokens: int, sk: @keep ptr, cancel: ptr) -> (ptr, string, string) {
     c = cp as *types.Config
     body, berr = request_body(cp, messages, tools_json, max_tokens)
     if berr != "" { return fail_(berr, "") }
@@ -253,10 +255,9 @@ stream(cp: ptr, messages: ptr, tools_json: string, max_tokens: int, sk: ptr, can
     l = c.limits as *types.Limits
     st = http.open("${trim_slash_(c.base_url)}/chat/completions", names, values, body, l.request_timeout_s + 5)
     r = http.reader(st, l.stream_idle_timeout_s, l.stream_content_timeout_s, l.request_timeout_s)
-    (sk as *sink.Sink).monitor = r
+    sink.attach(sk, r)
     status, herr = http.wait_head(r, cancel)
     if herr != "" { return fail_(herr, timeout_detail_(r, herr)) }
-    sink.received(sk)
     if status < 200 || status > 299 {
         detail = "${types.name(cp)}: HTTP ${status}; check ${types.key_hint(cp)}."
         if status == 429 || status >= 500 { return fail_("HttpTransient", detail) }

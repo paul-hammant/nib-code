@@ -2,11 +2,13 @@
 // provider.Sink): text and reasoning deltas, tool-argument progress, and
 // that bytes arrived. Each callback is optional (has_* flags). `monitor`
 // is the live response's *http.Reader (content progress feeds its
-// content timeout), null on fixtures.
+// content timeout), null on fixtures. `timing` is the Step's
+// provider.model_timing model, null when nobody records timings.
 
 import nib.provider.http
+import nib.provider.model_timing
 
-exports(Sink, new, delta, tool_arguments, received, content)
+exports(Sink, new, attach, delta, tool_arguments, received, content, arguments, final_arguments, bind)
 
 struct Sink {
     ctx: ptr
@@ -18,6 +20,7 @@ struct Sink {
     has_data: int
     emitted: int          // a delta was forwarded (retry may not replay it)
     monitor: ptr
+    timing: ptr           // the Step's provider.model_timing model
 }
 
 new(ctx: @keep ptr) -> ptr {
@@ -28,7 +31,17 @@ new(ctx: @keep ptr) -> ptr {
     s.has_data = 0
     s.emitted = 0
     s.monitor = null
+    s.timing = null
     return s as ptr
+}
+
+// Connects a live response: it becomes the monitor, feeds the timing
+// model, and reports every body chunk through on_data.
+attach(sp: @keep ptr, reader: @keep ptr) {
+    s = sp as *Sink
+    s.monitor = reader
+    http.set_timing(reader, s.timing)
+    http.set_data_hook(reader, |ctx: ptr| { received(ctx) }, sp)
 }
 
 delta(sp: ptr, kind: string, text: string) {
@@ -47,7 +60,27 @@ received(sp: ptr) {
     if s.has_data == 1 { call(s.on_data, s.ctx) }
 }
 
+// Reasoning, text or tool-argument bytes arrived.
 content(sp: ptr, bytes: int) {
     s = sp as *Sink
     if s.monitor != null { http.content(s.monitor, bytes) }
+}
+
+// A fragment of tool call `index`'s arguments arrived.
+arguments(sp: ptr, index: int, bytes: int) {
+    s = sp as *Sink
+    if s.timing != null { model_timing.arguments(s.timing, index, bytes) }
+}
+
+// The complete arguments of tool call `index` (counted only when no
+// fragment arrived).
+final_arguments(sp: ptr, index: int, bytes: int) {
+    s = sp as *Sink
+    if s.timing != null { model_timing.final_arguments(s.timing, index, bytes) }
+}
+
+// Tool call `index` became call `call_index` of the reply.
+bind(sp: ptr, index: int, call_index: int) {
+    s = sp as *Sink
+    if s.timing != null { model_timing.bind(s.timing, index, call_index) }
 }

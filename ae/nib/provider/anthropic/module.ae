@@ -361,6 +361,7 @@ read_stream(lines: ptr, cp: ptr, sk: ptr, cancel: ptr) -> (ptr, string, string) 
                 pj = string.copy(jsonx.str_or(d, "partial_json", ""))
                 b.args = "${b.args}${pj}"
                 sink.content(sk, string.length(pj))
+                sink.arguments(sk, index, string.length(pj))
                 if string.length(pj) > 0 { sink.tool_arguments(sk) }
             }
         } else if kind == "content_block_stop" {
@@ -437,6 +438,8 @@ read_stream(lines: ptr, cp: ptr, sk: ptr, cancel: ptr) -> (ptr, string, string) 
             jsonx.free(bv2)
             if ok_id == false { return fail_("InvalidResponse", "") }
             list.list_add(rep.tool_calls, types.tool_call_new(id, nm, input))
+            sink.final_arguments(sk, i, string.length(b.args))
+            sink.bind(sk, i, list.list_size(rep.tool_calls) - 1)
         }
         if i > 0 { content = "${content}," }
         content = "${content}${v}"
@@ -466,7 +469,7 @@ trim_slash_(s: string) -> string {
 }
 
 // One request attempt against `cfg.base_url`/v1/messages.
-stream(cp: ptr, messages: ptr, tools_json: string, max_tokens: int, sk: ptr, cancel: ptr) -> (ptr, string, string) {
+stream(cp: ptr, messages: ptr, tools_json: string, max_tokens: int, sk: @keep ptr, cancel: ptr) -> (ptr, string, string) {
     c = cp as *types.Config
     body, berr = request_body(cp, messages, tools_json, max_tokens)
     if berr != "" { return fail_(berr, "") }
@@ -483,10 +486,9 @@ stream(cp: ptr, messages: ptr, tools_json: string, max_tokens: int, sk: ptr, can
     l = c.limits as *types.Limits
     st = http.open("${trim_slash_(c.base_url)}/v1/messages", names, values, body, l.request_timeout_s + 5)
     r = http.reader(st, l.stream_idle_timeout_s, l.stream_content_timeout_s, l.request_timeout_s)
-    (sk as *sink.Sink).monitor = r
+    sink.attach(sk, r)
     status, herr = http.wait_head(r, cancel)
     if herr != "" { return fail_(herr, timeout_detail_(r, herr)) }
-    sink.received(sk)
     if status < 200 || status > 299 {
         detail = "${types.name(cp)}: HTTP ${status}; check ${types.key_hint(cp)}."
         if status == 429 || status >= 500 { return fail_("HttpTransient", detail) }

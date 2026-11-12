@@ -13,6 +13,7 @@ import nib.sysgap
 import nib.tools.atomic_file
 import nib.tools.file_state
 import nib.tools.jail
+import nib.tools.undo
 
 exports(Ctx, new_ctx, read, edit, write, FILE_LIMIT, count_occurrences, replace_all)
 
@@ -28,6 +29,7 @@ struct Ctx {
     // called after a successful edit/write (tracked 0: the before was unreadable)
     on_change: fn
     has_on_change: int
+    undo: ptr          // *undo.Active of the running Turn, or null (undo off)
 }
 
 new_ctx(nib_home: string, cancel: @keep ptr, state: @keep ptr, roots: @keep ptr, creds: @keep ptr) -> ptr {
@@ -38,6 +40,7 @@ new_ctx(nib_home: string, cancel: @keep ptr, state: @keep ptr, roots: @keep ptr,
     c.roots = roots
     c.creds = creds
     c.has_on_change = 0
+    c.undo = null
     return c as ptr
 }
 
@@ -228,12 +231,17 @@ edit(cp: ptr, args: string) -> (int, string) {
         return 0, "old_text matches ${count} times in ${raw}; include more surrounding text or pass all: true"
     }
     out = replace_all(data, old_text, new_text)
+    // the file as it is now goes into the Turn's undo record before any change
+    snap = undo.prepare(c.undo, c.nib_home, path, 1, data, out)
     written = sysgap.new_stat()
     werr = atomic_file.replace(path, out, 438, 0, 0, written)
     if werr != "" {
+        undo.release(snap)
         file_state.unlock(fd)
         return 0, "${raw}: ${werr}"
     }
+    undo.commit(c.undo, c.nib_home, snap, out)
+    undo.release(snap)
     file_state.remember_stat(c.state, path, written)
     if c.has_on_change == 1 { call(c.on_change, path, 1, data, out, 1) }
     file_state.unlock(fd)
@@ -277,17 +285,27 @@ write(cp: ptr, args: string) -> (int, string) {
             has_before = 1
         }
     }
+    // the file as it is now goes into the Turn's undo record before any change;
+    // an unreadable original means the Turn cannot be fully undone
+    snap = null
+    if tracked == 0 { undo.mark_incomplete(c.undo, c.nib_home, undo.REASON_UNAVAILABLE) } else {
+        snap = undo.prepare(c.undo, c.nib_home, path, has_before, before, content)
+    }
     derr = parent_dirs_(path)
     if derr != "" {
+        undo.release(snap)
         file_state.unlock(fd)
         return 0, derr
     }
     written = sysgap.new_stat()
     werr = atomic_file.replace(path, content, 438, 0, 0, written)
     if werr != "" {
+        undo.release(snap)
         file_state.unlock(fd)
         return 0, "${raw}: ${werr}"
     }
+    undo.commit(c.undo, c.nib_home, snap, content)
+    undo.release(snap)
     file_state.remember_stat(c.state, path, written)
     if c.has_on_change == 1 { call(c.on_change, path, has_before, before, content, tracked) }
     file_state.unlock(fd)

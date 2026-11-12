@@ -1,0 +1,347 @@
+// provider.model_timing: per-Step model timing (upstream src/provider/timing.zig
+// ModelTiming): bytes-arrival gaps, content gaps, one record per request
+// attempt, and per tool call argument-arrival progress (the `code` entries
+// of a Step record). All times are milliseconds relative to the Step start.
+//
+// Optional numbers are -1 when absent. Argument arrivals are kept in fixed
+// per-call buffers of 1024 [ms, cumulative bytes] points: once full, every
+// other point is dropped and the sampling stride doubles, so the endpoints
+// survive; finish() reduces each call to at most 32 points. resetAttempt
+// drops the slots (not the Step clock) before each request attempt. Only
+// the provider thread of the running attempt touches a Model.
+
+import std.list
+import std.longarr
+import std.os
+import std.string
+import nib.jsonx
+import nib.provider.types
+
+exports(MAX_ATTEMPTS, SLOTS, POINTS, Model, Attempt, Code, ArgSlot,
+        new, release, elapsed, reset_attempt, received, received_at, content, finish_attempt,
+        arguments, arguments_at, final_arguments, final_arguments_at, bind, slot_at, point_ms, point_bytes,
+        finish, attempts_json, code_json, attempt_count, attempt_at)
+
+const MAX_ATTEMPTS = 5
+const SLOTS = 65
+const POINTS = 1024
+
+struct ArgSlot {
+    index: int
+    call_index: int      // -1 until bound
+    bytes: long
+    points: ptr          // longarr: [ms0, bytes0, ms1, bytes1, ...]
+    len: int
+    arrivals: long
+    stride: long
+}
+
+struct Attempt {
+    start_ms: long
+    end_ms: long
+    error_name: string   // "" none
+    detail: string       // "" none
+    bytes: long
+    content_bytes: long
+    first_content_ms: long
+    last_content_ms: long
+    max_content_gap_ms: long
+    max_gap_ms: long
+}
+
+struct Code {
+    tool_call_id: string
+    first_ms: long
+    last_ms: long
+    count: int
+    progress: ptr        // longarr: [ms, bytes] * count
+}
+
+struct Model {
+    started_ms: long
+    slots: ptr           // list of *ArgSlot, allocated lazily, reused
+    used: int
+    max_gap_ms: long
+    last_byte_ms: long
+    bytes: long
+    content_bytes: long
+    first_content_ms: long
+    last_content_ms: long
+    max_content_gap_ms: long
+    attempts: ptr        // list of *Attempt
+}
+
+// A Model whose Step clock started at `started_ms` (os.now_monotonic_ms).
+new(started_ms: long) -> ptr {
+    m = heap.new(Model)
+    m.started_ms = started_ms
+    m.slots = list.list_new()
+    m.attempts = list.list_new()
+    reset_attempt(m as ptr)
+    return m as ptr
+}
+
+// Frees the argument buffers once the Step's code entries were taken.
+release(mp: ptr) {
+    m = mp as *Model
+    i = 0
+    while i < list.list_size(m.slots) {
+        s = list.list_get_raw(m.slots, i) as *ArgSlot
+        longarr.longarr_free(s.points)
+        i = i + 1
+    }
+    list.list_clear(m.slots)
+    m.used = 0
+}
+
+elapsed(mp: ptr) -> long {
+    d = os.now_monotonic_ms() - (mp as *Model).started_ms
+    if d < 0 { return 0 }
+    return d
+}
+
+reset_attempt(mp: ptr) {
+    m = mp as *Model
+    m.used = 0
+    m.max_gap_ms = -1 as long
+    m.last_byte_ms = -1 as long
+    m.bytes = 0 as long
+    m.content_bytes = 0 as long
+    m.first_content_ms = -1 as long
+    m.last_content_ms = -1 as long
+    m.max_content_gap_ms = -1 as long
+}
+
+received(mp: ptr, bytes: int) {
+    m = mp as *Model
+    m.bytes = m.bytes + (bytes as long)
+    received_at(mp, elapsed(mp))
+}
+
+received_at(mp: ptr, ms: long) {
+    m = mp as *Model
+    if m.last_byte_ms >= 0 {
+        gap = ms - m.last_byte_ms
+        if gap < 0 { gap = 0 }
+        if gap > m.max_gap_ms { m.max_gap_ms = gap }
+    }
+    m.last_byte_ms = ms
+}
+
+content(mp: ptr, bytes: int) {
+    m = mp as *Model
+    ms = elapsed(mp)
+    m.content_bytes = m.content_bytes + (bytes as long)
+    if m.first_content_ms < 0 { m.first_content_ms = ms }
+    if m.last_content_ms >= 0 {
+        gap = ms - m.last_content_ms
+        if gap < 0 { gap = 0 }
+        if gap > m.max_content_gap_ms { m.max_content_gap_ms = gap }
+    }
+    m.last_content_ms = ms
+}
+
+attempt_count(mp: ptr) -> int { return list.list_size((mp as *Model).attempts) }
+attempt_at(mp: ptr, i: int) -> ptr { return list.list_get_raw((mp as *Model).attempts, i) }
+
+// Records the finished attempt: err "" for success, detail "" for none.
+finish_attempt(mp: ptr, start_ms: long, err: string, detail: string) {
+    m = mp as *Model
+    if list.list_size(m.attempts) >= MAX_ATTEMPTS { return }
+    a = heap.new(Attempt)
+    a.start_ms = start_ms
+    a.end_ms = elapsed(mp)
+    a.error_name = string.copy(err)
+    a.detail = string.copy(detail)
+    a.bytes = m.bytes
+    a.content_bytes = m.content_bytes
+    a.first_content_ms = m.first_content_ms
+    a.last_content_ms = m.last_content_ms
+    a.max_content_gap_ms = m.max_content_gap_ms
+    a.max_gap_ms = m.max_gap_ms
+    list.list_add(m.attempts, a as ptr)
+}
+
+// The slot of a tool index (call index in the chat protocol, output_index
+// in Responses, block index in Messages), or null past SLOTS.
+slot_(m: *Model, index: int) -> ptr {
+    i = 0
+    while i < m.used {
+        s = list.list_get_raw(m.slots, i) as *ArgSlot
+        if s.index == index { return s as ptr }
+        i = i + 1
+    }
+    if m.used == SLOTS { return null }
+    fresh = null
+    if m.used < list.list_size(m.slots) {
+        fresh = list.list_get_raw(m.slots, m.used)
+    } else {
+        ns = heap.new(ArgSlot)
+        ns.points = longarr.longarr_new_raw(POINTS * 2)
+        list.list_add(m.slots, ns as ptr)
+        fresh = ns as ptr
+    }
+    s2 = fresh as *ArgSlot
+    s2.index = index
+    s2.call_index = -1
+    s2.bytes = 0 as long
+    s2.len = 0
+    s2.arrivals = 0 as long
+    s2.stride = 1 as long
+    m.used = m.used + 1
+    return fresh
+}
+
+slot_at(mp: ptr, i: int) -> ptr { return list.list_get_raw((mp as *Model).slots, i) }
+point_ms(sp: ptr, i: int) -> long { return longarr.longarr_get_raw((sp as *ArgSlot).points, i * 2) }
+point_bytes(sp: ptr, i: int) -> long { return longarr.longarr_get_raw((sp as *ArgSlot).points, i * 2 + 1) }
+
+set_point_(s: *ArgSlot, i: int, ms: long, bytes: long) {
+    longarr.longarr_set_raw(s.points, i * 2, ms)
+    longarr.longarr_set_raw(s.points, i * 2 + 1, bytes)
+}
+
+// Appends [ms, bytes]; times never go backwards. Past POINTS arrivals only
+// every `stride`th is kept, the rest overwrite the newest sample.
+append_(s: *ArgSlot, ms: long, bytes: long) {
+    pt = ms
+    if s.len > 0 {
+        prev = longarr.longarr_get_raw(s.points, (s.len - 1) * 2)
+        if prev > pt { pt = prev }
+    }
+    if s.len == 0 {
+        set_point_(s, 0, pt, bytes)
+        s.len = 1
+    } else if (s.arrivals - 1) % s.stride != 0 {
+        set_point_(s, s.len - 1, pt, bytes)
+    } else {
+        if s.len == POINTS {
+            i = 0
+            while i < POINTS / 2 {
+                set_point_(s, i, longarr.longarr_get_raw(s.points, i * 4), longarr.longarr_get_raw(s.points, i * 4 + 1))
+                i = i + 1
+            }
+            s.len = s.len / 2
+            s.stride = s.stride * 2
+        }
+        set_point_(s, s.len, pt, bytes)
+        s.len = s.len + 1
+    }
+    s.arrivals = s.arrivals + 1
+}
+
+arguments(mp: ptr, index: int, bytes: int) {
+    if bytes == 0 { return }
+    arguments_at(mp, index, bytes, elapsed(mp))
+}
+
+arguments_at(mp: ptr, index: int, bytes: int, ms: long) {
+    sp = slot_(mp as *Model, index)
+    if sp == null { return }
+    s = sp as *ArgSlot
+    s.bytes = s.bytes + (bytes as long)
+    append_(s, ms, s.bytes)
+}
+
+final_arguments(mp: ptr, index: int, bytes: int) {
+    final_arguments_at(mp, index, bytes, elapsed(mp))
+}
+
+// The complete arguments, when no fragment arrived (one-shot).
+final_arguments_at(mp: ptr, index: int, bytes: int, ms: long) {
+    sp = slot_(mp as *Model, index)
+    if sp == null { return }
+    s = sp as *ArgSlot
+    if s.len != 0 { return }
+    s.bytes = bytes as long
+    append_(s, ms, s.bytes)
+}
+
+bind(mp: ptr, index: int, call_index: int) {
+    sp = slot_(mp as *Model, index)
+    if sp == null { return }
+    (sp as *ArgSlot).call_index = call_index
+}
+
+// Code entries for the `run` calls (list of *types.ToolCall): a list of
+// *Code with at most 32 points each, endpoints kept.
+finish(mp: ptr, calls: ptr) -> ptr {
+    m = mp as *Model
+    codes = list.list_new()
+    i = 0
+    while i < list.list_size(calls) {
+        tc = list.list_get_raw(calls, i) as *types.ToolCall
+        if tc.name == "run" {
+            k = 0
+            while k < m.used {
+                s = list.list_get_raw(m.slots, k) as *ArgSlot
+                if s.call_index == i && s.len > 0 {
+                    count = s.len
+                    if count > 32 { count = 32 }
+                    c = heap.new(Code)
+                    c.tool_call_id = string.copy(tc.id)
+                    c.count = count
+                    c.progress = longarr.longarr_new_raw(count * 2)
+                    j = 0
+                    while j < count {
+                        at = 0
+                        if count > 1 { at = j * (s.len - 1) / (count - 1) }
+                        longarr.longarr_set_raw(c.progress, j * 2, longarr.longarr_get_raw(s.points, at * 2))
+                        longarr.longarr_set_raw(c.progress, j * 2 + 1, longarr.longarr_get_raw(s.points, at * 2 + 1))
+                        j = j + 1
+                    }
+                    c.first_ms = longarr.longarr_get_raw(s.points, 0)
+                    c.last_ms = longarr.longarr_get_raw(s.points, (s.len - 1) * 2)
+                    list.list_add(codes, c as ptr)
+                    k = m.used
+                }
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    return codes
+}
+
+// The Step record's `code` array.
+code_json(codes: ptr) -> string {
+    out = "["
+    i = 0
+    while i < list.list_size(codes) {
+        c = list.list_get_raw(codes, i) as *Code
+        if i > 0 { out = "${out}," }
+        out = "${out}{\"tool_call_id\":${jsonx.quote(c.tool_call_id)},\"first_ms\":${c.first_ms},\"last_ms\":${c.last_ms},\"progress\":["
+        j = 0
+        while j < c.count {
+            if j > 0 { out = "${out}," }
+            out = "${out}[${longarr.longarr_get_raw(c.progress, j * 2)},${longarr.longarr_get_raw(c.progress, j * 2 + 1)}]"
+            j = j + 1
+        }
+        out = "${out}]}"
+        i = i + 1
+    }
+    return "${out}]"
+}
+
+// The Step record's `model_attempts` array, in attempt order. Optional
+// members are omitted when missing; transport is always the SSE stream.
+attempts_json(mp: ptr) -> string {
+    m = mp as *Model
+    out = "["
+    i = 0
+    while i < list.list_size(m.attempts) {
+        a = list.list_get_raw(m.attempts, i) as *Attempt
+        if i > 0 { out = "${out}," }
+        out = "${out}{\"start_ms\":${a.start_ms},\"end_ms\":${a.end_ms}"
+        if a.error_name != "" { out = "${out},\"error_name\":${jsonx.quote(a.error_name)}" }
+        if a.detail != "" { out = "${out},\"detail\":${jsonx.quote(a.detail)}" }
+        out = "${out},\"transport\":\"sse\",\"incremental\":false,\"bytes\":${a.bytes},\"content_bytes\":${a.content_bytes}"
+        if a.first_content_ms >= 0 { out = "${out},\"first_content_ms\":${a.first_content_ms}" }
+        if a.last_content_ms >= 0 { out = "${out},\"last_content_ms\":${a.last_content_ms}" }
+        if a.max_content_gap_ms >= 0 { out = "${out},\"max_content_gap_ms\":${a.max_content_gap_ms}" }
+        if a.max_gap_ms >= 0 { out = "${out},\"max_gap_ms\":${a.max_gap_ms}" }
+        out = "${out}}"
+        i = i + 1
+    }
+    return "${out}]"
+}

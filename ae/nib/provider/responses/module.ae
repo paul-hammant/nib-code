@@ -507,6 +507,28 @@ incomplete_(cp: ptr) -> (ptr, string, string) {
     return null, "IncompleteResponse", "${types.name(cp)} stream failed: IncompleteResponse: the stream ended before a complete response; the Step was not committed."
 }
 
+// Argument arrival per output index (upstream observeTiming): argument
+// deltas, a call's arguments as first announced, and its final arguments.
+observe_timing_(sk: ptr, kind: string, ev: ptr, index: int, has_delta: int, delta: string) {
+    if kind == "response.function_call_arguments.delta" || kind == "response.custom_tool_call_input.delta" {
+        if has_delta == 1 { sink.arguments(sk, index, string.length(delta)) }
+        return
+    }
+    if kind != "response.output_item.added" && kind != "response.output_item.done" { return }
+    item = jsonx.field(ev, "item")
+    if item == null || json.json_type(item) != json.JSON_OBJECT { return }
+    key = ""
+    if jsonx.str_or(item, "type", "") == "function_call" { key = "arguments" }
+    if jsonx.str_or(item, "type", "") == "custom_tool_call" { key = "input" }
+    if key == "" || jsonx.kind(item, key) != json.JSON_STRING { return }
+    n = string.length(jsonx.str_or(item, key, ""))
+    if kind == "response.output_item.added" {
+        sink.arguments(sk, index, n)
+    } else {
+        sink.final_arguments(sk, index, n)
+    }
+}
+
 // The streamed reply. (reply, "", "") or (null, error name, detail).
 read_stream(lines: ptr, cp: ptr, sk: ptr, cancel: ptr) -> (ptr, string, string) {
     c = cp as *types.Config
@@ -553,6 +575,7 @@ read_stream(lines: ptr, cp: ptr, sk: ptr, cancel: ptr) -> (ptr, string, string) 
             }
             if string.length(delta) > 0 && (kind == "response.function_call_arguments.delta" || kind == "response.custom_tool_call_input.delta") { sink.tool_arguments(sk) }
         }
+        observe_timing_(sk, kind, ev, event_index, has_delta, delta)
         if kind == "response.output_text.delta" || kind == "response.refusal.delta" {
             if has_delta == 0 {
                 jsonx.free(ev)
@@ -648,6 +671,7 @@ read_stream(lines: ptr, cp: ptr, sk: ptr, cancel: ptr) -> (ptr, string, string) 
                 jsonx.free(v)
                 return fail_("TooManyToolCalls", "")
             }
+            sink.bind(sk, i, list.list_size(rep.tool_calls))
             custom = 0
             argkey = "arguments"
             if itype == "custom_tool_call" {
@@ -710,7 +734,7 @@ timeout_detail_(r: ptr, err: string) -> string {
 }
 
 // One request attempt against `cfg.base_url`/responses.
-stream(cp: ptr, cache_key: string, messages: ptr, tools_json: string, max_tokens: int, sk: ptr, cancel: ptr) -> (ptr, string, string) {
+stream(cp: ptr, cache_key: string, messages: ptr, tools_json: string, max_tokens: int, sk: @keep ptr, cancel: ptr) -> (ptr, string, string) {
     c = cp as *types.Config
     body, berr = request_body(cp, cache_key, messages, tools_json, max_tokens)
     if berr != "" { return fail_(berr, "") }
@@ -725,10 +749,9 @@ stream(cp: ptr, cache_key: string, messages: ptr, tools_json: string, max_tokens
     l = c.limits as *types.Limits
     st = http.open("${trim_slash_(c.base_url)}/responses", names, values, body, l.request_timeout_s + 5)
     r = http.reader(st, l.stream_idle_timeout_s, l.stream_content_timeout_s, l.request_timeout_s)
-    (sk as *sink.Sink).monitor = r
+    sink.attach(sk, r)
     status, herr = http.wait_head(r, cancel)
     if herr != "" { return fail_(herr, timeout_detail_(r, herr)) }
-    sink.received(sk)
     if status < 200 || status > 299 {
         detail = "${types.name(cp)}: HTTP ${status}; check ${types.key_hint(cp)}."
         if status == 429 || status >= 500 { return fail_("HttpTransient", detail) }

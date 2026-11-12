@@ -120,6 +120,18 @@ aeb(cap) {
             source("ae/tests/openai_test.ae")
             lib("ae")
         }
+        aether.program_test() {
+            source("ae/tests/session_log_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/provider_timing_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/undo_test.ae")
+            lib("ae")
+        }
         // Workspace mode end to end, through the built binary.
         dep(".build.ae")
         bash.test() {

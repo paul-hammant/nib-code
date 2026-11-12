@@ -12,6 +12,7 @@ import std.string
 import std.sync
 import nib.provider.types
 import nib.provider.sink
+import nib.provider.model_timing
 import nib.provider.anthropic
 import nib.provider.responses
 import nib.provider.openai
@@ -70,7 +71,7 @@ logged_effort(cp: ptr) -> string {
 }
 
 // One attempt over the Config's protocol.
-stream(cp: ptr, cache_key: string, messages: ptr, tools_json: string, max_tokens: int, sk: ptr, cancel: ptr) -> (ptr, string, string) {
+stream(cp: ptr, cache_key: string, messages: ptr, tools_json: string, max_tokens: int, sk: @keep ptr, cancel: ptr) -> (ptr, string, string) {
     p = types.protocol(cp)
     r = null
     err = ""
@@ -113,9 +114,9 @@ sleep_(ms: long, cancel: ptr) -> int {
 // complete with retries. replay_safe: the caller buffers deltas, so an
 // attempt that already streamed some may still be retried.
 // (reply, "", "", attempts) or (null, err, detail, attempts).
-complete(cp: ptr, cache_key: string, messages: ptr, tools_json: string, max_tokens: int, sk: ptr, cancel: ptr,
+complete(cp: ptr, cache_key: string, messages: ptr, tools_json: string, max_tokens: int, sk: @keep ptr, cancel: ptr,
          replay_safe: int, rp: ptr) -> (ptr, string, string, int) {
-    return complete_with(|c2: ptr, k: string, m: ptr, t: string, mt: int, s2: ptr, cl: ptr, out: ptr| {
+    return complete_with(|c2: ptr, k: string, m: ptr, t: string, mt: int, s2: @keep ptr, cl: ptr, out: ptr| {
         r, e, d = stream(c2, k, m, t, mt, s2, cl)
         o = out as *types.Reply
         o.phase = e
@@ -126,16 +127,27 @@ complete(cp: ptr, cache_key: string, messages: ptr, tools_json: string, max_toke
 
 // The retry loop over `request` (|cfg, key, messages, tools, max, sink, cancel, out|
 // filling out: *types.Reply with phase = err, text = detail, tool_calls = the reply).
-complete_with(request: fn, cp: ptr, cache_key: string, messages: ptr, tools_json: string, max_tokens: int, sk: ptr,
+complete_with(request: fn(ptr, string, ptr, string, int, @keep ptr, ptr, ptr), cp: ptr, cache_key: string, messages: ptr, tools_json: string, max_tokens: int, sk: @keep ptr,
               cancel: ptr, replay_safe: int, rp: ptr) -> (ptr, string, string, int) {
     attempt = 1
     while true {
         (sk as *sink.Sink).emitted = 0
         emit_(rp, "started", attempt, 0 as long, "")
         out = types.reply_new() as *types.Reply
+        tm = (sk as *sink.Sink).timing
+        attempt_start = 0 as long
+        if tm != null {
+            model_timing.reset_attempt(tm)
+            attempt_start = model_timing.elapsed(tm)
+        }
         call(request, cp, cache_key, messages, tools_json, max_tokens, sk, cancel, out as ptr)
         emit_(rp, "finished", attempt, 0 as long, "")
         err = out.phase
+        if tm != null {
+            failed_detail = out.text
+            if err == "" { failed_detail = "" }
+            model_timing.finish_attempt(tm, attempt_start, err, failed_detail)
+        }
         if err == "" { return out.tool_calls, "", "", attempt }
         detail = out.text
         if err == "Canceled" || (cancel != null && sync.atomic_load(cancel) != 0) { return null, "Canceled", detail, attempt }
