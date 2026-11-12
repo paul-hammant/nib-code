@@ -1679,8 +1679,14 @@ execute(a: *App, c: int, arg: string, line: string) {
     if c == commands.CMD_SIMPLE {
         toggle_simple(a)
     } else if c == commands.CMD_STATUS {
-        // Skills and hooks are not ported: their lines read the stubs.
+        // Skills are not ported: their line reads the stub.
         report(a, entry.KIND_INFO, "Skills: 0 on · 0 found")
+        hc = a.cfg as *types.Config
+        after = if hc.hooks_after_edit == null { 0 } else { list.list_size(hc.hooks_after_edit) }
+        ended = if hc.hooks_turn_end == null { 0 } else { list.list_size(hc.hooks_turn_end) }
+        if after + ended > 0 {
+            report(a, entry.KIND_INFO, "Hooks: after_edit ${after} · turn_end ${ended}")
+        }
         string sandbox_status = call(a.p.sandbox_status, a.p.ctx)
         report(a, entry.KIND_INFO, "Sandbox: ${sandbox_status}")
         cc = a.cfg as *types.Config

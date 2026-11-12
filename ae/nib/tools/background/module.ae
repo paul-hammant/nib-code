@@ -19,7 +19,7 @@ import nib.jsonx
 exports(Background, Job, Item, BASH_LIMIT, new, set_log, set_turn_step, begin_turn, start, stop_task,
         finish_turn, stop_all, take_inbox, take_items, inbox_size, active_bash, set_result, poll, start_agent, agent_message, stop_task_from, active_runs, adopt_run, take_done_runs, enqueue_run, RUN_LIMIT,
         pending, any_pending, pending_names, delivered, enqueue_lost, enqueue_finished,
-        enqueue_user, take_users)
+        enqueue_user, take_users, snapshot_json, waiting_json)
 
 const BASH_LIMIT = 8
 const RUN_LIMIT = 8
@@ -449,6 +449,54 @@ take_users(bp: ptr) -> ptr {
         i = i + 1
     }
     b.inbox = kept
+    lock.release(b.guard)
+    return out
+}
+
+// The TUI's /tasks rows (upstream Background.snapshot) as a JSON array:
+// [{"id","kind","description","state","elapsed_ms","detached"}]; `now_ms`
+// is epoch ms. No per-job deadlines are kept here: bash rows read
+// "deadline pending", Run rows "per-tool deadlines" (tui.tasks).
+snapshot_json(bp: ptr, now_ms: long) -> string {
+    b = bp as *Background
+    out = "["
+    lock.acquire(b.guard)
+    i = 0
+    while i < list.list_size(b.jobs) {
+        j = list.list_get_raw(b.jobs, i) as *Job
+        if i > 0 { out = "${out}," }
+        end = if j.exec_end > (0 as long) { j.exec_end } else { now_ms }
+        elapsed = if j.exec_start > (0 as long) { end - j.exec_start } else { 0 as long }
+        if elapsed < (0 as long) { elapsed = 0 as long }
+        st = j.state
+        if j.kind == "run" && sync.atomic_load(j.done) == 0 { st = "working" }
+        desc = if j.kind == "run" { "Run" } else { j.command }
+        det = if j.detached == 1 { "true" } else { "false" }
+        out = "${out}{\"id\":${jsonx.quote(j.id)},\"kind\":${jsonx.quote(j.kind)},\"description\":${jsonx.quote(desc)},\"state\":${jsonx.quote(st)},\"elapsed_ms\":${elapsed},\"detached\":${det}}"
+        i = i + 1
+    }
+    lock.release(b.guard)
+    return "${out}]"
+}
+
+// The task a waiting Turn waits for (upstream waitingTask):
+// {"id","elapsed_ms"}, "" none.
+waiting_json(bp: ptr, now_ms: long) -> string {
+    b = bp as *Background
+    out = ""
+    lock.acquire(b.guard)
+    i = 0
+    while i < list.list_size(b.jobs) {
+        j = list.list_get_raw(b.jobs, i) as *Job
+        if j.detached == 0 && j.delivered == 0 {
+            end = if j.exec_end > (0 as long) { j.exec_end } else { now_ms }
+            elapsed = if j.exec_start > (0 as long) { end - j.exec_start } else { 0 as long }
+            if elapsed < (0 as long) { elapsed = 0 as long }
+            out = "{\"id\":${jsonx.quote(j.id)},\"elapsed_ms\":${elapsed}}"
+            break
+        }
+        i = i + 1
+    }
     lock.release(b.guard)
     return out
 }

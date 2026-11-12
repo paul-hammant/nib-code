@@ -705,11 +705,14 @@ after_edit_(s: *Session, j: *RunJob) {
 }
 
 // turn_end hooks of a root Session (status: completed, failed, cancelled).
-turn_end_hooks(sp: ptr, status: string) {
+// The TUI's notice of a failed one ("hook turn_end · exit N"), "" none.
+turn_end_hooks(sp: ptr, status: string) -> string {
     s = sp as *Session
     c = s.cfg as *types.Config
-    if (s.tools as *tools.Tools).depth != 0 || list.list_size(c.hooks_turn_end) == 0 { return }
-    hooks.run(hooks_ctx_(s), "turn_end", c.hooks_turn_end, list.list_new(), status, hooks.TIMEOUT_MS as long)
+    if (s.tools as *tools.Tools).depth != 0 || list.list_size(c.hooks_turn_end) == 0 { return "" }
+    f = hooks.run(hooks_ctx_(s), "turn_end", c.hooks_turn_end, list.list_new(), status, hooks.TIMEOUT_MS as long)
+    if f == null { return "" }
+    return "hook turn_end · exit ${(f as *hooks.Failure).exit_code}"
 }
 
 // One `run` tool call (upstream run.zig execute + executeTimed).

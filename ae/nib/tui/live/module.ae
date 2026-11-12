@@ -28,6 +28,7 @@ import nib.session
 import nib.session.log
 import nib.tools
 import nib.tools.background
+import nib.tools.jail
 import nib.tools.changes
 import nib.tools.diff
 import nib.sandbox
@@ -45,6 +46,7 @@ struct Live {
     running: ptr             // std.sync cell: a Turn's thread is running
     stage: ptr               // std.sync cell: 1 once a Run started (failure stage tool)
     stops: ptr               // std.list of ids whose stop waits for the Turn's end
+    q: ptr                   // the app queue of the last Turn
 }
 
 session_of(p: *port.Port) -> ptr { return (p.ctx as *Live).sp }
@@ -101,6 +103,7 @@ new(sp: @keep ptr, cfg: @keep ptr, op: @keep ptr, home: string) -> *port.Port {
         lv = ctx as *Live
         q = qp as *app_queue.Queue
         tr = turn.new(text, compact, qp)
+        lv.q = qp
         tr.cancel = cancel
         sync.atomic_store(lv.running, 1)
         sync.atomic_store(lv.stage, 0)
@@ -138,10 +141,6 @@ new(sp: @keep ptr, cfg: @keep ptr, op: @keep ptr, home: string) -> *port.Port {
             }
             s = sess_(lw)
             if compact == 0 {
-                hs = if err == "" { "completed" } else if sync.atomic_load(cancel) != 0 { "cancelled" } else { "failed" }
-                session.turn_end_hooks(lw.sp, hs)
-            }
-            if compact == 0 {
                 app_queue.post(q, "{\"turn_end\":{\"status\":${jsonx.quote(s.status)},\"steps\":${s.steps},\"usage\":${types.usage_json(s.usage)},\"timing\":${session.timing_json(lw.sp)}}}")
             }
             if err == "" {
@@ -154,6 +153,14 @@ new(sp: @keep ptr, cfg: @keep ptr, op: @keep ptr, home: string) -> *port.Port {
                 app_queue.post(q, "{\"failed\":{\"message\":${jsonx.quote(msg)},\"reason\":${jsonx.quote(reason_name_(r))}}}")
             }
             sync.atomic_store(lw.running, 0)
+            // upstream's TurnJob: turn_end hooks after the Turn, their notice last
+            if compact == 0 {
+                hs = if err == "" { "completed" } else if sync.atomic_load(cancel) != 0 { "cancelled" } else { "failed" }
+                hn = session.turn_end_hooks(lw.sp, hs)
+                if hn != "" {
+                    app_queue.post(q, "{\"notice\":${jsonx.quote(hn)}}")
+                }
+            }
             return null
         })
     }
@@ -221,15 +228,26 @@ new(sp: @keep ptr, cfg: @keep ptr, op: @keep ptr, home: string) -> *port.Port {
         string out = sessions_json_(lv)
         return out
     }
-    p.tasks = |ctx: ptr| { return "[]" }
-    p.request_stop = |ctx: ptr, id: string| {
+    p.tasks = |ctx: ptr| {
+        string out = background.snapshot_json(tools_(ctx as *Live).background, os.os_wall_micros_raw() / 1000)
+        return out
+    }
+    // Upstream's Tools.poll performs a stop requested during a Turn and
+    // emits its notice; here a worker does, posting the notice to the app.
+    p.request_stop = |ctx: @keep ptr, id: string| {
         lv = ctx as *Live
-        list.list_add(lv.stops, string.copy(id))
+        q = lv.q
+        sid = string.copy(id)
+        worker.run_detached(|| {
+            text = user_stop_(ctx as *Live, sid)
+            if q != null {
+                app_queue.post(q as *app_queue.Queue, "{\"notice\":${jsonx.quote(text)}}")
+            }
+            return null
+        })
     }
     p.user_stop = |ctx: ptr, id: string| {
-        lv = ctx as *Live
-        stopped, err = background.stop_task(tools_(lv).background, id)
-        string out = if err != "" { "${id}: ${err}" } else if stopped == 1 { "${id}: stopped by user · partial changes may remain" } else { "${id}: already finished · partial changes may remain" }
+        string out = user_stop_(ctx as *Live, id)
         return out
     }
     p.take_stop = |ctx: ptr| {
@@ -251,7 +269,10 @@ new(sp: @keep ptr, cfg: @keep ptr, op: @keep ptr, home: string) -> *port.Port {
         int n = background.any_pending(tools_(ctx as *Live).background)
         return n
     }
-    p.waiting_task = |ctx: ptr| { return "" }
+    p.waiting_task = |ctx: ptr| {
+        string out = background.waiting_json(tools_(ctx as *Live).background, os.os_wall_micros_raw() / 1000)
+        return out
+    }
     p.recovery_hint = |ctx: ptr, reason: string| {
         lv = ctx as *Live
         r = changes.REASON_MODEL
@@ -283,7 +304,11 @@ new(sp: @keep ptr, cfg: @keep ptr, op: @keep ptr, home: string) -> *port.Port {
         string out = "{\"ok\":${if jo.ok == 1 { "true" } else { "false" }},\"text\":${jsonx.quote(jo.text)},\"logs\":${jsonx.quote(jo.logs)},\"diff\":${jsonx.quote(d)}}"
         return out
     }
-    p.sandbox_status = |ctx: ptr| { return "bash runs in the Session's sandbox" }
+    p.sandbox_status = |ctx: ptr| {
+        t = tools_(ctx as *Live)
+        string out = if t.workspace == 0 { "off" } else if jail.unavailable() == "" { "workspace" } else { "workspace · bash unavailable" }
+        return out
+    }
     p.drain_progress = |ctx: ptr| {
         ptr out = list.list_new()
         return out
@@ -317,6 +342,19 @@ predict_(l: *Live, instruction: string, input_text: string, cancel: ptr) -> stri
         return ""
     }
     return (rep as *types.Reply).text
+}
+
+// upstream tools/stop.zig userStop: stop a task now, log it, the notice.
+user_stop_(lv: *Live, id: string) -> string {
+    t = tools_(lv)
+    stopped, err = background.stop_task(t.background, id)
+    if err != "" {
+        return "${id}: ${err}"
+    }
+    if t.has_log == 1 {
+        call(t.log_fn, t.log_ctx, ",\"task_stop\":{\"id\":${jsonx.quote(id)},\"reason\":\"user requested stop\",\"stopped\":${if stopped == 1 { "true" } else { "false" }}}")
+    }
+    return if stopped == 1 { "${id}: stopped by user · partial changes may remain" } else { "${id}: already finished · partial changes may remain" }
 }
 
 // Opens Session `id` ("" a new one) with `cfg` in place of the current one.
