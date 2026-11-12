@@ -6,8 +6,24 @@
  * libvaxis's gwidth.zig, the library upstream nib renders with, so a cell
  * measures the same here as it did there.
  */
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <string.h>
-#include "std/unicode/utf8proc/utf8proc.h"
+
+/* utf8proc's own prototypes (2.x, the copy std/unicode/utf8proc vendors
+ * into libaether). Declared here rather than included because an installed
+ * Aether's include path does not reliably carry std's vendored headers. */
+typedef uint8_t utf8proc_uint8_t;
+typedef int32_t utf8proc_int32_t;
+typedef ptrdiff_t utf8proc_ssize_t;
+typedef int utf8proc_category_t;
+#define UTF8PROC_CATEGORY_MN 6
+#define UTF8PROC_CATEGORY_ME 8
+utf8proc_ssize_t utf8proc_iterate(const utf8proc_uint8_t *str, utf8proc_ssize_t strlen, utf8proc_int32_t *codepoint_ref);
+bool utf8proc_grapheme_break_stateful(utf8proc_int32_t codepoint1, utf8proc_int32_t codepoint2, utf8proc_int32_t *state);
+int utf8proc_charwidth(utf8proc_int32_t codepoint);
+utf8proc_category_t utf8proc_category(utf8proc_int32_t codepoint);
 
 /* Byte offset where the grapheme cluster starting at `off` ends. Invalid
  * UTF-8 bytes are a cluster of one byte each, as libvaxis treats them. */

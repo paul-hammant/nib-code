@@ -15,8 +15,10 @@ slice but cannot iterate: walking a string with `grapheme_substring(s, i, 1)`
 is O(n) per step. It has no width at all. So `ae/term/screen/unicode.c`
 calls the utf8proc that libaether already vendors
 (`utf8proc_grapheme_break_stateful`, `utf8proc_charwidth`,
-`utf8proc_category`, `utf8proc_iterate`) through `#include
-"std/unicode/utf8proc/utf8proc.h"`, which reaches into std's vendored copy.
+`utf8proc_category`, `utf8proc_iterate`), declaring their prototypes itself:
+it reaches into std's vendored copy, and an installed Aether's include path
+does not reliably carry `std/unicode/utf8proc/utf8proc.h` (it failed on two
+lab hosts).
 
 ## Proposed surface
 
@@ -54,5 +56,5 @@ is East Asian Wide, which `utf8proc_charwidth` already gives 2.
 
 ## Ask
 
-The functions above in `std.unicode`, so `ae/term` stops including
-`std/unicode/utf8proc/utf8proc.h` directly.
+The functions above in `std.unicode`, so `ae/term` stops calling std's
+vendored utf8proc behind its back.
