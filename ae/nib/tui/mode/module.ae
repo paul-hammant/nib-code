@@ -1,0 +1,10 @@
+// tui.mode: the Simple mode's names (upstream src/tui/mode.zig).
+// Differences from upstream: `key` is the key code (115, 's') as an int.
+
+exports(NAME, COMMAND, KEY, SHORTCUT, VALUE)
+
+const NAME = "Simple"
+const COMMAND = "simple"
+const KEY = 115
+const SHORTCUT = "Ctrl+S"
+const VALUE = "simple"

@@ -1,0 +1,358 @@
+// tui.open: clickable file paths: token parsing, argv from a template,
+// resolving, a Files cache, launching a program (upstream src/tui/open.zig).
+//
+// Differences from upstream:
+//  - Optionals become (value, bool) tuples: parse_token, token_at,
+//    change_row_at, resolve, Files.find return (value, found). Error unions
+//    become an error name: argv returns (words, "EmptyTemplate" or "").
+//  - Columns, widths and lines are `int`, not u16/u32. Gr.text is a string.
+//  - token_at/change_row_at have no caller buffer (`out`), so upstream's
+//    "token too long for the buffer" refusal is only parse_token's own
+//    1024-byte limit; change_row_at keeps its 128-byte limit on the text
+//    after the path.
+//  - resolve is lexical like upstream (fs.clean), but a relative `cwd` is not
+//    resolved against the process's directory.
+//  - Files is an instance (new/clear/free/find/count); the cache is a
+//    std.map from absolute path to "0" (not a file) or "1" (a regular file).
+//    find has no `out` buffer, it returns the path.
+//  - launch(command, env) takes a std.list of strings and an env list of
+//    "NAME=value" (or null to inherit); stdin/stdout/stderr are
+//    discarded (stdout and stderr go to the null device, stdin is empty) and
+//    the child is reaped on a std.worker thread. It returns "" or the error.
+
+import std.string
+import std.list
+import std.map
+import std.fs
+import std.os
+import std.worker
+import std.strbuilder
+
+exports(Token, Gr, Found, MAX_ENTRIES, parse_token, token_at, count_only, change_row_at,
+        argv, resolve, Files, files_new, files_clear, files_count, files_find, files_free, launch)
+
+const MAX_ENTRIES = 4096
+
+struct Token {
+    path: string
+    line: int
+}
+
+// One screen grapheme: its first column, cell width and text ("" or " " is blank).
+struct Gr {
+    col: int
+    width: int
+    text: string
+}
+
+// A file token on one screen row; `x1` is the last covered column.
+struct Found {
+    x0: int
+    x1: int
+    token: Token
+}
+
+is_lead_(c: int) -> int {
+    // ( [ < " ' `
+    if c == 40 || c == 91 || c == 60 || c == 34 || c == 39 || c == 96 { return 1 }
+    return 0
+}
+
+is_trail_(c: int) -> int {
+    // ) ] > " ' ` , ; . : ! ?
+    if c == 41 || c == 93 || c == 62 || c == 34 || c == 39 || c == 96 || c == 44 || c == 59 || c == 46 || c == 58 || c == 33 || c == 63 { return 1 }
+    return 0
+}
+
+blank_(g: Gr) -> int {
+    n = string.length(g.text)
+    if n == 0 { return 1 }
+    if n == 1 && g.text[0] == 32 { return 1 }
+    return 0
+}
+
+single_lead_(g: Gr) -> int {
+    if string.length(g.text) == 1 { return is_lead_(g.text[0]) }
+    return 0
+}
+
+single_trail_(g: Gr) -> int {
+    if string.length(g.text) == 1 { return is_trail_(g.text[0]) }
+    return 0
+}
+
+// Index of the last ':' in `s`, or -1.
+last_colon_(s: string) -> int {
+    i = string.length(s) - 1
+    while i >= 0 {
+        if s[i] == 58 { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+all_digits_(s: string) -> int {
+    i = 0
+    n = string.length(s)
+    while i < n {
+        if s[i] < 48 || s[i] > 57 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// `path`, `path:line` or `path:line:col`; the column is ignored.
+parse_token(text: string) -> (Token, bool) {
+    path = text
+    n = 0
+    last = 1
+    while n < 2 {
+        i = last_colon_(path)
+        if i < 0 { break }
+        tail = string.substring(path, i + 1, string.length(path))
+        if string.length(tail) == 0 || string.length(tail) > 9 || all_digits_(tail) == 0 { break }
+        num, _perr = string.to_int(tail)
+        last = num
+        n = n + 1
+        path = string.substring(path, 0, i)
+    }
+    nothing = Token { path: "", line: 1 }
+    if string.length(path) == 0 || string.length(path) > 1024 || string.index_of(path, "://") >= 0 { return nothing, false }
+    i = 0
+    while i < string.length(path) {
+        c = path[i]
+        if c < 32 || c == 127 { return nothing, false }
+        i = i + 1
+    }
+    line = 1
+    if n > 0 && last > 1 { line = last }
+    return Token { path: string.copy(path), line: line }, true
+}
+
+// The grapheme range [lo, hi) of the non-blank word covering `col`; lo -1 when none.
+word_(grs: Gr[], col: int) -> (int, int) {
+    at = -1
+    i = 0
+    while i < grs.len {
+        w = grs[i].width
+        if w < 1 { w = 1 }
+        if col >= grs[i].col && col < grs[i].col + w {
+            at = i
+            break
+        }
+        i = i + 1
+    }
+    if at < 0 { return -1, 0 }
+    if blank_(grs[at]) == 1 { return -1, 0 }
+    lo = at
+    while lo > 0 && blank_(grs[lo - 1]) == 0 { lo = lo - 1 }
+    hi = at + 1
+    while hi < grs.len && blank_(grs[hi]) == 0 { hi = hi + 1 }
+    return lo, hi
+}
+
+build_(grs: Gr[], lo_in: int, hi_in: int) -> (Found, bool) {
+    lo = lo_in
+    hi = hi_in
+    while lo < hi && single_lead_(grs[lo]) == 1 { lo = lo + 1 }
+    while hi > lo && single_trail_(grs[hi - 1]) == 1 { hi = hi - 1 }
+    nothing = Found { x0: 0, x1: 0, token: Token { path: "", line: 1 } }
+    if lo == hi { return nothing, false }
+    sb = strbuilder.new(64)
+    i = lo
+    while i < hi {
+        strbuilder.append(sb, grs[i].text)
+        i = i + 1
+    }
+    text = strbuilder.finish(sb)
+    token, ok = parse_token(text)
+    if ok == false { return nothing, false }
+    w = grs[hi - 1].width
+    if w < 1 { w = 1 }
+    return Found { x0: grs[lo].col, x1: grs[hi - 1].col + w - 1, token: token }, true
+}
+
+// The file-like word under `col` in prose.
+token_at(grs: Gr[], col: int) -> (Found, bool) {
+    lo, hi = word_(grs, col)
+    if lo < 0 { return Found { x0: 0, x1: 0, token: Token { path: "", line: 1 } }, false }
+    return build_(grs, lo, hi)
+}
+
+// "+" or "−" (U+2212) followed only by digits.
+is_count_(w: string) -> int {
+    n = string.length(w)
+    start = 0
+    if string.starts_with(w, "+") != 0 {
+        start = 1
+    } else if string.starts_with(w, "−") != 0 {
+        start = 3
+    } else {
+        return 0
+    }
+    if n - start <= 0 { return 0 }
+    return all_digits_(string.substring(w, start, n))
+}
+
+// True for `[(new)] +N [−M]` or `[(new)] −M`: what follows a path on a changes row.
+count_only(rest: string) -> int {
+    n = 0
+    i = 0
+    len = string.length(rest)
+    while i < len {
+        while i < len && rest[i] == 32 { i = i + 1 }
+        if i >= len { break }
+        j = i
+        while j < len && rest[j] != 32 { j = j + 1 }
+        w = string.substring(rest, i, j)
+        i = j
+        if n == 0 && w == "(new)" {
+            n = n + 1
+            continue
+        }
+        if is_count_(w) == 0 { return 0 }
+        n = n + 1
+    }
+    if n > 0 { return 1 }
+    return 0
+}
+
+// The path starting a changes row (`  src/a.zig  +3 −1`); not found when the row has another shape.
+change_row_at(grs: Gr[], col: int) -> (Found, bool) {
+    nothing = Found { x0: 0, x1: 0, token: Token { path: "", line: 1 } }
+    lo, hi = word_(grs, col)
+    if lo < 0 { return nothing, false }
+    i = 0
+    while i < lo {
+        if blank_(grs[i]) == 0 { return nothing, false }
+        i = i + 1
+    }
+    found, ok = build_(grs, lo, hi)
+    if ok == false { return nothing, false }
+    sb = strbuilder.new(64)
+    len = 0
+    i = hi
+    while i < grs.len {
+        text = grs[i].text
+        if string.length(text) == 0 { text = " " }
+        if len + string.length(text) > 128 { return nothing, false }
+        strbuilder.append(sb, text)
+        len = len + string.length(text)
+        i = i + 1
+    }
+    rest = strbuilder.finish(sb)
+    if count_only(rest) == 0 { return nothing, false }
+    return found, true
+}
+
+// Splits on whitespace into an argv (no shell); `{path}` and `{line}` are
+// substituted in every word. Returns (words, "") or ([], "EmptyTemplate").
+argv(template: string, path: string, line: int) -> (string[], string) {
+    string[] out = []
+    line_text = string.from_int(line)
+    i = 0
+    len = string.length(template)
+    while i < len {
+        while i < len && (template[i] == 32 || template[i] == 9) { i = i + 1 }
+        if i >= len { break }
+        j = i
+        while j < len && template[j] != 32 && template[j] != 9 { j = j + 1 }
+        w = string.substring(template, i, j)
+        i = j
+        with_path = string.replace_all(w, "{path}", path)
+        out.push(string.replace_all(with_path, "{line}", line_text))
+    }
+    if out.len == 0 { return out, "EmptyTemplate" }
+    return out, ""
+}
+
+// Absolute path of `path` (relative to `cwd`) when it lies inside `project`; lexical, no filesystem access.
+resolve(cwd: string, project: string, path: string) -> (string, bool) {
+    full = ""
+    if string.starts_with(path, "/") != 0 {
+        full = fs.clean(path)
+    } else {
+        full = fs.clean("${cwd}/${path}")
+    }
+    pn = string.length(project)
+    inside = 0
+    if string.starts_with(full, project) != 0 && string.length(full) > pn {
+        if full[pn] == 47 {
+            inside = 1
+        } else {
+            last = 0
+            if pn > 0 { last = project[pn - 1] }
+            if last == 47 { inside = 1 }
+        }
+    }
+    if inside == 0 { return "", false }
+    return full, true
+}
+
+// Existence of candidate files, so drawing and hovering never repeat filesystem work.
+struct Files {
+    cache: ptr
+}
+
+files_new() -> *Files {
+    f = heap.new(Files)
+    f.cache = map.map_new()
+    return f
+}
+
+files_clear(f: *Files) {
+    map.map_clear(f.cache)
+}
+
+files_free(f: *Files) {
+    map.map_free(f.cache)
+    heap.free(f)
+}
+
+// Entries in the cache.
+files_count(f: *Files) -> int {
+    return map.map_size(f.cache)
+}
+
+// The absolute path when `path` is an existing regular file inside `project`.
+files_find(f: *Files, cwd: string, project: string, path: string) -> (string, bool) {
+    full, inside = resolve(cwd, project, path)
+    if inside == false { return "", false }
+    ok = 0
+    if map.map_has(f.cache, full) != 0 {
+        cached, _gerr = map.get_string(f.cache, full)
+        if cached == "1" { ok = 1 }
+    } else {
+        kind, _sz, _mt, serr = fs.file_stat(full)
+        if serr == "" && kind == fs.STAT_KIND_FILE { ok = 1 }
+        if map.map_size(f.cache) >= MAX_ENTRIES { map.map_clear(f.cache) }
+        map.map_put_string_owned(f.cache, full, string.from_int(ok))
+    }
+    if ok == 0 { return "", false }
+    return full, true
+}
+
+// Starts the command detached from the terminal and reaps it on a helper
+// thread. `command` is a std.list of strings (program first), `env` a list of
+// "NAME=value" or null. Returns "" or the spawn error.
+launch(command: ptr, env: ptr) -> string {
+    prog, e0 = list.get_string(command, 0)
+    if e0 != "" { return "EmptyCommand" }
+    rest = list.list_new()
+    i = 1
+    while i < list.list_size(command) {
+        a, _e = list.get_string(command, i)
+        list.list_add(rest, string.copy(a))
+        i = i + 1
+    }
+    sink = "/dev/null"
+    if os.platform() == "windows" { sink = "NUL" }
+    token, err = os.spawn_proc_to(prog, rest, env, sink)
+    list.list_free(rest)
+    if err != "" { return err }
+    worker.run_detached(|| {
+        os.wait(token)
+        return null
+    })
+    return ""
+}

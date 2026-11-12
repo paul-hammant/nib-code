@@ -1,0 +1,124 @@
+// tui.title: the terminal title: git HEAD parsing, branch lookup, composition
+// (upstream src/tui/title.zig).
+// Differences from upstream: Head is a value struct {kind, name} with kind
+// HEAD_BRANCH/HEAD_DETACHED/HEAD_UNKNOWN; gitdir_of and read_branch return
+// (string, bool) instead of an optional (false = null); compose takes the
+// branch as a string where "" means "no branch" (parse_head never yields an
+// empty branch) and returns a new string; no allocator or Io arguments.
+
+import std.string
+import std.strbuilder
+import std.fs
+
+exports(Head, HEAD_BRANCH, HEAD_DETACHED, HEAD_UNKNOWN, parse_head, gitdir_of,
+        read_branch, compose)
+
+const HEAD_BRANCH = 0
+const HEAD_DETACHED = 1
+const HEAD_UNKNOWN = 2
+
+struct Head {
+    kind: int
+    name: string
+}
+
+in_set_(c: int, set: string) -> bool {
+    i = 0
+    while i < string.length(set) {
+        if set[i] == c { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// std.mem.trim(u8, s, set)
+trim_set_(s: string, set: string) -> string {
+    a = 0
+    b = string.length(s)
+    while a < b && in_set_(s[a], set) { a = a + 1 }
+    while b > a && in_set_(s[b - 1], set) { b = b - 1 }
+    return string.substring(s, a, b)
+}
+
+is_hex_(s: string) -> bool {
+    i = 0
+    while i < string.length(s) {
+        c = s[i]
+        ok = (c >= 48 && c <= 57) || (c >= 97 && c <= 102)
+        if !ok { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// Parses the content of a `.git/HEAD` file.
+parse_head(text: string) -> Head {
+    line = trim_set_(text, " \t\r\n")
+    if string.starts_with(line, "ref:") != 0 {
+        ref = trim_set_(string.substring(line, 4, string.length(line)), " \t")
+        branch = ref
+        if string.starts_with(ref, "refs/heads/") != 0 {
+            branch = string.substring(ref, 11, string.length(ref))
+        }
+        if string.length(branch) == 0 { return Head { kind: HEAD_UNKNOWN, name: "" } }
+        return Head { kind: HEAD_BRANCH, name: branch }
+    }
+    if string.length(line) >= 7 && is_hex_(line) {
+        return Head { kind: HEAD_DETACHED, name: string.substring(line, 0, 7) }
+    }
+    return Head { kind: HEAD_UNKNOWN, name: "" }
+}
+
+// Target of a `.git` file (`gitdir: <path>`), relative paths against `root`.
+gitdir_of(root: string, text: string) -> (string, bool) {
+    line = trim_set_(text, " \t\r\n")
+    if string.starts_with(line, "gitdir:") == 0 { return "", false }
+    dir = trim_set_(string.substring(line, 7, string.length(line)), " \t")
+    if string.length(dir) == 0 { return "", false }
+    if dir[0] == 47 { return dir, true }
+    return join_(root, dir), true
+}
+
+// std.fs.path.join of two parts (no normalisation).
+join_(a: string, b: string) -> string {
+    if string.length(a) == 0 { return b }
+    if a[string.length(a) - 1] == 47 { return "${a}${b}" }
+    return "${a}/${b}"
+}
+
+// Reads at most 4096 bytes of a file; ("", false) when unreadable.
+read_limited_(path: string) -> (string, bool) {
+    text, err = fs.read(path)
+    if err != "" { return "", false }
+    if string.length(text) > 4096 { return string.substring(text, 0, 4096), true }
+    return text, true
+}
+
+// Branch name or short SHA of the repository at `root`; false without git or when unreadable.
+read_branch(root: string) -> (string, bool) {
+    dot_git = join_(root, ".git")
+    head_path = join_(dot_git, "HEAD")
+    if fs.exists(head_path) == 0 {
+        pointer, ok = read_limited_(dot_git)
+        if !ok { return "", false }
+        gitdir, found = gitdir_of(root, pointer)
+        if !found { return "", false }
+        head_path = join_(gitdir, "HEAD")
+    }
+    text, ok2 = read_limited_(head_path)
+    if !ok2 { return "", false }
+    h = parse_head(text)
+    if h.kind == HEAD_UNKNOWN { return "", false }
+    return h.name, true
+}
+
+// `<project> · <branch> · <model> · <effort>`; the branch is omitted when "", the
+// effort when the server picks it.
+compose(project: string, branch: string, model: string, effort: string) -> string {
+    sb = strbuilder.new(64)
+    strbuilder.append(sb, project)
+    if string.length(branch) > 0 { strbuilder.append(sb, " · ${branch}") }
+    strbuilder.append(sb, " · ${model}")
+    if string.index_of(effort, "default") < 0 { strbuilder.append(sb, " · ${effort}") }
+    return strbuilder.finish(sb)
+}

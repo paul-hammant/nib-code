@@ -1,0 +1,41 @@
+// tui.frames: repaint pacing (upstream src/tui/frames.zig).
+// Differences from upstream: timestamps are long milliseconds passed in by
+// the caller (never read from a global clock); Refresh is the int constants
+// REFRESH_CONTENT/ANIMATION/IMMEDIATE; a Frames is a heap instance made by
+// new(); `last` is `last` + `has_last`.
+
+exports(Frames, INTERVAL_MS, ANIMATION_MS, REFRESH_CONTENT, REFRESH_ANIMATION,
+        REFRESH_IMMEDIATE, new, due, painted)
+
+const INTERVAL_MS = 16
+const ANIMATION_MS = 100
+const REFRESH_CONTENT = 0
+const REFRESH_ANIMATION = 1
+const REFRESH_IMMEDIATE = 2
+
+struct Frames {
+    pending: int
+    last: long
+    has_last: int
+}
+
+new() -> *Frames {
+    return heap.new(Frames)
+}
+
+due(f: *Frames, now: long, refresh: int) -> int {
+    if refresh != REFRESH_ANIMATION { f.pending = 1 }
+    if refresh == REFRESH_IMMEDIATE { return 1 }
+    if f.has_last == 0 { return 1 }
+    elapsed = now - f.last
+    limit = ANIMATION_MS
+    if f.pending != 0 { limit = INTERVAL_MS }
+    if elapsed >= limit { return 1 }
+    return 0
+}
+
+painted(f: *Frames, now: long) {
+    f.last = now
+    f.has_last = 1
+    f.pending = 0
+}

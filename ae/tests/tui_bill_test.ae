@@ -1,0 +1,65 @@
+// Ports the three tests of upstream src/tui/bill.zig under their names, plus a
+// from_json check of nib.tui.turn_summary (new here).
+import std.spec
+import std.string
+import nib.tui.bill
+import nib.tui.turn_summary
+
+example_() -> turn_summary.TurnSummary {
+    return turn_summary.new("completed", 3,
+        turn_summary.usage(6500, 100, 6000, 0),
+        turn_summary.timing(41999, 30000, 11000, 3200000, 18000, 0, 0))
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.bill") {
+        spec.it("quiet footer names Runs and units and leaves cache and timing details to status") callback {
+            ex = example_()
+            spec.assert_str_eq(bill.format_footer(ex, 2, 200), "2 Runs · 3 steps · 41s · 6.6k tokens · tool data 3.2MB → 18kB", "full")
+            spec.assert_str_eq(bill.format_footer(turn_summary.new("completed", 1), 1, 200), "1 Run · 1 step", "singular")
+            d = bill.details(ex)
+            spec.assert_contains(d, "model 30s · Run 11s", "model")
+            spec.assert_contains(d, "Cache 6000 tokens · 92% of input", "cache")
+            spec.assert_str_eq(d, "Last turn · completed\nTotal 41s · model 30s · Run 11s\nInput 6500 tokens · output 100 tokens\nCache 6000 tokens · 92% of input · writes 0 tokens\nDelegation · llm 0 · agent 0", "details")
+        }
+        spec.it("zero statistics and repeated outcomes stay out of the footer") callback {
+            spec.assert_str_eq(bill.format_footer(turn_summary.new(), 0, 200), "", "zero")
+            spec.assert_str_eq(bill.format_footer(turn_summary.new("completed", 0, turn_summary.usage(), turn_summary.timing(0, 0, 0, 320)), 0, 200), "tool data 320B", "tool bytes")
+            spec.assert_str_eq(bill.format_footer(turn_summary.new("completed", 0, turn_summary.usage(), turn_summary.timing(0, 0, 0, 0, 18000)), 0, 200), "Run result 18kB", "run result")
+            spec.assert_str_eq(bill.format_footer(turn_summary.new("canceled", 0, turn_summary.usage(), turn_summary.timing(1000)), 0, 200), "1s", "canceled")
+            spec.assert_str_eq(bill.format_footer(turn_summary.new("failed", 0, turn_summary.usage(), turn_summary.timing(1000)), 0, 200), "1s", "failed")
+        }
+        spec.it("footer drops complete fields and preserves UTF-8 at every width") callback {
+            full = bill.format_footer(example_(), 2, 200)
+            width = 0
+            while width < 200 {
+                line = bill.fit(full, width)
+                cps = 0
+                i = 0
+                while i < string.length(line) {
+                    if (line[i] & 192) != 128 { cps = cps + 1 }
+                    i = i + 1
+                }
+                spec.assert_true(cps <= width, "fits width ${width}")
+                spec.assert_eq(string.index_of(line, "\n"), -1, "no newline")
+                spec.assert_true(string.starts_with(full, line) != 0, "prefix of full")
+                width = width + 1
+            }
+            spec.assert_str_eq(bill.fit(full, 22), "2 Runs · 3 steps · 41s", "22")
+        }
+        spec.it("turn_summary.from_json reads the shape, missing fields are 0") callback {
+            s = turn_summary.from_json("{\"status\":\"failed\",\"steps\":2,\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"prompt_cache_hit_tokens\":4,\"prompt_cache_write_tokens\":3},\"timing\":{\"wall_ms\":1500,\"llm_calls\":7}}")
+            spec.assert_str_eq(s.status, "failed", "status")
+            spec.assert_eq_long(s.steps, 2, "steps")
+            spec.assert_eq_long(s.usage.prompt_cache_write_tokens, 3, "write")
+            spec.assert_eq_long(s.timing.wall_ms, 1500, "wall")
+            spec.assert_eq_long(s.timing.llm_calls, 7, "llm")
+            spec.assert_eq_long(s.timing.agent_calls, 0, "missing")
+            e = turn_summary.from_json("{}")
+            spec.assert_str_eq(e.status, "completed", "default status")
+            spec.assert_eq_long(e.steps, 0, "default steps")
+        }
+    }
+    return spec.run_summary(fw)
+}

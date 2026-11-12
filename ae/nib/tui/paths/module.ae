@@ -1,0 +1,413 @@
+// tui.paths: `@` path completion: mention parsing, insertion quoting, ranking
+// (`top`), and an Index that walks the project in the background
+// (upstream src/tui/paths.zig).
+//
+// Differences from upstream:
+//  - Optional results become values: mention() returns (start, query) with
+//    start -1 for "no mention"; Entry/Hit are boxes/values, entries are a
+//    `ptr[]` of *Entry (the snapshot).
+//  - top() returns a new Hit[] (at most MAX_HITS) instead of filling a buffer.
+//  - The Index is an instance made by new(); its clock is injected
+//    (`now: fn`, milliseconds) instead of read from the system, and
+//    refresh() takes the deny list (std.list of absolute path strings, copied
+//    for the job) instead of a `deny_source`; new() takes the root directory
+//    to list (upstream: always "."). The listing runs on a
+//    std.worker thread; wake is a closure field (set_wake) called after a
+//    listing is published. Shared fields are guarded by nib.lock as upstream
+//    guards them with a mutex.
+//  - free(ix) is upstream's deinit: it cancels a running listing and waits.
+//  - with_entries(ix, ctx, f) calls f(ctx, entries) with the lock held; the
+//    entries are `ptr[]` of *Entry ([] before the first listing).
+
+import std.string
+import std.list
+import std.fs
+import std.sync
+import std.worker
+import nib.lock
+import nib.tools.walk
+
+exports(MAX_ENTRIES, MAX_HITS, Entry, Hit, Index, mention, insertion, top,
+        new, free, set_wake, refresh, publish_, set_entries, with_entries, generation)
+
+const MAX_ENTRIES = 50000
+const MAX_HITS = 8
+const REFRESH_MS = 5000
+
+const SPACE = 32
+const TAB = 9
+const NL = 10
+const AT = 64
+const QUOTE = 34
+const SLASH = 47
+
+struct Entry {
+    path: string
+    dir: int
+}
+
+struct Hit {
+    index: int
+    tier: int
+    len: int
+}
+
+struct Snapshot {
+    entries: ptr[]
+}
+
+// Must not move once refresh has run (it is a heap box: it does not).
+struct Index {
+    root: string            // the directory listed ("." for the TUI)
+    mu: ptr
+    snapshot: ptr           // *Snapshot or null
+    generation: int
+    built_ms: long
+    has_built: int
+    building: ptr           // std.sync cell
+    cancel: ptr             // std.sync cell
+    now: fn
+    has_wake: int
+    wake: fn
+}
+
+struct Job {
+    index: ptr
+    deny: ptr               // std.list of strings, owned by the job
+}
+
+is_space_(c: int) -> int {
+    if c == SPACE || c == TAB || c == NL { return 1 }
+    return 0
+}
+
+boundary_before_(text: string, i: int) -> int {
+    if i == 0 { return 1 }
+    return is_space_(text[i - 1])
+}
+
+// Index of the last "@\"" in `s`, or -1.
+last_at_quote_(s: string) -> int {
+    i = string.length(s) - 2
+    while i >= 0 {
+        if s[i] == AT && s[i + 1] == QUOTE { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+has_byte_(s: string, from: int, b: int) -> int {
+    i = from
+    n = string.length(s)
+    while i < n {
+        if s[i] == b { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// `@` at the start of the text or after whitespace, with no whitespace between
+// it and `cursor` unless the path is quoted (`@"my file`). Returns
+// (start, query); start is -1 when there is no mention.
+mention(text: string, cursor: int) -> (int, string) {
+    before = string.substring(text, 0, cursor)
+    q = last_at_quote_(before)
+    if q >= 0 {
+        if boundary_before_(text, q) == 1 && has_byte_(before, q + 2, QUOTE) == 0 && has_byte_(before, q + 2, NL) == 0 {
+            return q, string.substring(before, q + 2, cursor)
+        }
+    }
+    w = cursor
+    while w > 0 && is_space_(text[w - 1]) == 0 { w = w - 1 }
+    if w == cursor || text[w] != AT { return -1, "" }
+    return w, string.substring(before, w + 1, cursor)
+}
+
+// The text accepting `path` leaves behind: directories keep completing, files end with a space.
+insertion(path: string, dir: int) -> string {
+    quoted = 0
+    if has_byte_(path, 0, SPACE) == 1 || has_byte_(path, 0, TAB) == 1 { quoted = 1 }
+    open = ""
+    if quoted == 1 { open = "\"" }
+    slash = ""
+    if dir == 1 { slash = "/" }
+    tail = " "
+    if dir == 1 {
+        tail = ""
+    } else if quoted == 1 {
+        tail = "\" "
+    }
+    return "@${open}${path}${slash}${tail}"
+}
+
+lower_(c: int) -> int {
+    if c >= 65 && c <= 90 { return c + 32 }
+    return c
+}
+
+starts_with_fold_(s: string, prefix: string) -> int {
+    n = string.length(prefix)
+    if n > string.length(s) { return 0 }
+    i = 0
+    while i < n {
+        if lower_(prefix[i]) != lower_(s[i]) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+subsequence_fold_(s: string, query: string) -> int {
+    q = 0
+    qn = string.length(query)
+    i = 0
+    n = string.length(s)
+    while i < n {
+        if q < qn && lower_(s[i]) == lower_(query[q]) { q = q + 1 }
+        i = i + 1
+    }
+    if q == qn { return 1 }
+    return 0
+}
+
+// std.fs.path.basename: the last segment, ignoring trailing slashes.
+basename_(path: string) -> string {
+    end = string.length(path)
+    while end > 0 && path[end - 1] == SLASH { end = end - 1 }
+    start = end
+    while start > 0 && path[start - 1] != SLASH { start = start - 1 }
+    return string.substring(path, start, end)
+}
+
+// The tier of `e` for `query`, or -1 when it does not match.
+tier_(e: *Entry, query: string) -> int {
+    if string.length(query) == 0 { return 0 }
+    if starts_with_fold_(basename_(e.path), query) == 1 { return 0 }
+    if starts_with_fold_(e.path, query) == 1 { return 1 }
+    if subsequence_fold_(e.path, query) == 1 { return 2 }
+    return -1
+}
+
+// std.mem.lessThan(u8, a, b): bytewise, the shorter prefix first.
+less_than_(a: string, b: string) -> int {
+    an = string.length(a)
+    bn = string.length(b)
+    n = an
+    if bn < n { n = bn }
+    i = 0
+    while i < n {
+        if a[i] != b[i] {
+            if a[i] < b[i] { return 1 }
+            return 0
+        }
+        i = i + 1
+    }
+    if an < bn { return 1 }
+    return 0
+}
+
+better_(a: Hit, b: Hit, entries: ptr[]) -> int {
+    if a.tier != b.tier {
+        if a.tier < b.tier { return 1 }
+        return 0
+    }
+    if a.len != b.len {
+        if a.len < b.len { return 1 }
+        return 0
+    }
+    return less_than_((entries[a.index] as *Entry).path, (entries[b.index] as *Entry).path)
+}
+
+// The best matches of `query` among `entries` (a ptr[] of *Entry), best first.
+top(entries: ptr[], query: string) -> Hit[] {
+    out = make([]Hit, MAX_HITS)
+    n = 0
+    i = 0
+    while i < entries.len {
+        e = entries[i] as *Entry
+        t = tier_(e, query)
+        if t >= 0 {
+            hit = Hit { index: i, tier: t, len: string.length(e.path) }
+            at = n
+            while at > 0 && better_(hit, out[at - 1], entries) == 1 { at = at - 1 }
+            if at < MAX_HITS {
+                if n < MAX_HITS { n = n + 1 }
+                j = n - 1
+                while j > at {
+                    out[j] = Hit { index: out[j - 1].index, tier: out[j - 1].tier, len: out[j - 1].len }
+                    j = j - 1
+                }
+                out[at] = Hit { index: hit.index, tier: hit.tier, len: hit.len }
+            }
+        }
+        i = i + 1
+    }
+    return out[0..n]
+}
+
+// `root` is the directory listed (upstream hardcodes "."; a parameter so the
+// listing can be tested). `now` returns the current time in milliseconds
+// (injected clock).
+new(root: string, now: @keep fn) -> *Index {
+    ix = heap.new(Index)
+    ix.root = root
+    ix.mu = lock.new()
+    ix.snapshot = null
+    ix.generation = 0
+    ix.built_ms = 0 as long
+    ix.has_built = 0
+    ix.building = sync.atomic_new(0)
+    ix.cancel = sync.atomic_new(0)
+    ix.now = now
+    ix.has_wake = 0
+    return ix
+}
+
+set_wake(ix: *Index, wake: @keep fn) {
+    ix.wake = wake
+    ix.has_wake = 1
+}
+
+free_snapshot_(sp: ptr) {
+    if sp == null { return }
+    s = sp as *Snapshot
+    i = 0
+    while i < s.entries.len {
+        heap.free(s.entries[i] as *Entry)
+        i = i + 1
+    }
+    heap.free(s)
+}
+
+// upstream deinit: cancels a running listing, waits for it, frees the snapshot.
+free(ix: *Index) {
+    sync.atomic_store(ix.cancel, 1)
+    while sync.atomic_load(ix.building) != 0 { sleep(2) }
+    free_snapshot_(ix.snapshot)
+    ix.snapshot = null
+    sync.atomic_free(ix.building)
+    sync.atomic_free(ix.cancel)
+    lock.free(ix.mu)
+    heap.free(ix)
+}
+
+generation(ix: *Index) -> int {
+    lock.acquire(ix.mu)
+    g = ix.generation
+    lock.release(ix.mu)
+    return g
+}
+
+// Lists in the background when nothing was listed yet or the listing is a few
+// seconds old. `deny` is a std.list of canonical absolute paths (or null); it
+// is copied, so the caller may free it at once.
+refresh(ix: *Index, deny: ptr) {
+    if sync.atomic_load(ix.building) != 0 { return }
+    long now = call(ix.now)
+    lock.acquire(ix.mu)
+    fresh = 0
+    if ix.has_built == 1 && now - ix.built_ms < REFRESH_MS { fresh = 1 }
+    lock.release(ix.mu)
+    if fresh == 1 { return }
+    job = heap.new(Job)
+    job.index = ix as ptr
+    job.deny = list.list_new()
+    if deny != null {
+        i = 0
+        while i < list.list_size(deny) {
+            d, _e = list.get_string(deny, i)
+            list.list_add(job.deny, string.copy(d))
+            i = i + 1
+        }
+    }
+    sync.atomic_store(ix.building, 1)
+    jp = job as ptr
+    started = worker.run_detached(|| {
+        work_(jp)
+        return null
+    })
+    if started == false {
+        sync.atomic_store(ix.building, 0)
+        list.list_free(job.deny)
+        heap.free(job)
+    }
+}
+
+work_(jp: ptr) {
+    job = jp as *Job
+    ix = job.index as *Index
+    o = walk.options()
+    walk.set_deny(o, job.deny)
+    walk.set_cancel(o, ix.cancel)
+    walk.set_dirs(o, 1)
+    walk.set_max(o, MAX_ENTRIES as long)
+    found, err = walk.files(ix.root, o)
+    if err == "" {
+        n = list.list_size(found)
+        if n > MAX_ENTRIES { n = MAX_ENTRIES }
+        ptr[] entries = []
+        i = 0
+        while i < n {
+            f = list.list_get_raw(found, i) as *walk.File
+            e = heap.new(Entry)
+            e.path = string.copy(f.path)
+            e.dir = f.dir
+            entries.push(e as ptr)
+            i = i + 1
+        }
+        walk.release(found)
+        publish_(ix, entries)
+        if ix.has_wake == 1 { call(ix.wake) }
+    }
+    walk.free_options(o)
+    list.list_free(job.deny)
+    heap.free(job)
+    sync.atomic_store(ix.building, 0)
+}
+
+// Replaces the snapshot with `entries` (a ptr[] of boxed *Entry, now owned).
+publish_(ix: *Index, entries: ptr[]) {
+    snap = heap.new(Snapshot)
+    snap.entries = entries
+    long now = call(ix.now)
+    lock.acquire(ix.mu)
+    old = ix.snapshot
+    ix.snapshot = snap as ptr
+    ix.generation = ix.generation + 1
+    ix.built_ms = now
+    ix.has_built = 1
+    free_snapshot_(old)
+    lock.release(ix.mu)
+}
+
+// Replaces the listing; for tests. A trailing `/` marks a directory.
+set_entries(ix: *Index, paths: string[]) {
+    ptr[] entries = []
+    i = 0
+    while i < paths.len {
+        p = paths[i]
+        n = string.length(p)
+        e = heap.new(Entry)
+        if n > 0 && p[n - 1] == SLASH {
+            e.path = string.substring(p, 0, n - 1)
+            e.dir = 1
+        } else {
+            e.path = string.copy(p)
+            e.dir = 0
+        }
+        entries.push(e as ptr)
+        i = i + 1
+    }
+    publish_(ix, entries)
+}
+
+// Calls f(ctx, entries) with the listing locked, or with no entries before the first listing.
+with_entries(ix: *Index, ctx: ptr, f: fn) {
+    lock.acquire(ix.mu)
+    if ix.snapshot == null {
+        ptr[] none_ = []
+        call(f, ctx, none_)
+    } else {
+        call(f, ctx, (ix.snapshot as *Snapshot).entries)
+    }
+    lock.release(ix.mu)
+}

@@ -1,0 +1,29 @@
+// upstream src/tui/long_text.zig has no tests; these cover its behaviour.
+import std.spec
+import std.string
+import std.strbuilder
+import nib.tui.long_text
+
+string_repeat_(s: string, n: int) -> string {
+    sb = strbuilder.new(64)
+    i = 0
+    while i < n { strbuilder.append(sb, s)
+        i = i + 1 }
+    return strbuilder.finish(sb)
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.long_text") {
+        spec.it("lines, chars and the long threshold") callback {
+            spec.assert_eq(long_text.lines("a"), 1, "one line")
+            spec.assert_eq(long_text.lines("a\nb\n"), 3, "three")
+            spec.assert_eq(long_text.chars("é中"), 2, "codepoints")
+            spec.assert_eq(long_text.is_long("a\nb\nc\nd\ne"), 0, "5 lines")
+            spec.assert_eq(long_text.is_long("a\nb\nc\nd\ne\nf"), 1, "6 lines")
+            spec.assert_eq(long_text.is_long(string_repeat_("é", 800)), 0, "800 chars")
+            spec.assert_eq(long_text.is_long(string_repeat_("é", 801)), 1, "801 chars")
+        }
+    }
+    return spec.run_summary(fw)
+}

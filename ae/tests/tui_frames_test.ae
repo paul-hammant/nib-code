@@ -1,0 +1,51 @@
+// Ports the three tests of upstream src/tui/frames.zig under their names.
+// Times are long milliseconds; upstream's `at(0)` is 0.
+import std.spec
+import nib.tui.frames
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.frames") {
+        spec.it("stream bursts coalesce without starving continuous output") callback {
+            f = frames.new()
+            spec.assert_true(frames.due(f, 0, frames.REFRESH_CONTENT), "first due")
+            frames.painted(f, 0)
+            paints = 0
+            ms = 1
+            while ms <= 1000 {
+                n = 0
+                while n < 10 {
+                    if frames.due(f, ms as long, frames.REFRESH_CONTENT) != 0 {
+                        paints = paints + 1
+                        frames.painted(f, ms as long)
+                    }
+                    n = n + 1
+                }
+                ms = ms + 1
+            }
+            spec.assert_eq(paints, 62, "paints")
+            spec.assert_true(f.pending, "pending")
+        }
+        spec.it("a tick flushes the last fragment even if no more model events arrive") callback {
+            f = frames.new()
+            frames.painted(f, 0)
+            spec.assert_false(frames.due(f, 1, frames.REFRESH_CONTENT), "early")
+            spec.assert_true(f.pending, "pending")
+            spec.assert_true(frames.due(f, 16, frames.REFRESH_ANIMATION), "tick")
+            frames.painted(f, 16)
+            spec.assert_false(f.pending, "not pending")
+        }
+        spec.it("input and terminal events bypass pacing; quiet activity stays at ten fps") callback {
+            f = frames.new()
+            frames.painted(f, 0)
+            spec.assert_false(frames.due(f, 1, frames.REFRESH_ANIMATION), "early anim")
+            spec.assert_true(frames.due(f, 1, frames.REFRESH_IMMEDIATE), "immediate")
+            frames.painted(f, 1)
+            spec.assert_false(frames.due(f, 100, frames.REFRESH_ANIMATION), "before")
+            spec.assert_true(frames.due(f, 101, frames.REFRESH_ANIMATION), "next")
+            frames.painted(f, 101)
+            spec.assert_true(frames.due(f, 101, frames.REFRESH_IMMEDIATE), "immediate again")
+        }
+    }
+    return spec.run_summary(fw)
+}

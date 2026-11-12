@@ -1,0 +1,116 @@
+// Ports the three tests of upstream src/tui/smooth.zig under their names.
+// Times are long milliseconds with now = 0; the last test's xorshift-free LCG
+// is upstream's (u32 wrapping, kept in a long masked to 32 bits). Upstream's
+// debug print of the max lag is not ported.
+import std.spec
+import std.string
+import std.strbuilder
+import term.screen
+import nib.tui.smooth
+
+repeat_(c: string, n: int) -> string {
+    sb = strbuilder.new(64)
+    i = 0
+    while i < n {
+        strbuilder.append(sb, c)
+        i = i + 1
+    }
+    return strbuilder.finish(sb)
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.smooth") {
+        spec.it("bursts drain proportionally within three frames on grapheme boundaries") callback {
+            s = smooth.new()
+            smooth.arrive(s, 0, 1, 0)
+            spec.assert_eq(s.visible, 1, "first arrival shows all")
+            text = "a中文👩‍💻🙂abcdef"
+            tlen = string.length(text)
+            smooth.arrive(s, 1, tlen, 0)
+            smooth.advance(s, text, 0)
+            spec.assert_true(s.visible > 1 && s.visible < tlen, "partial")
+            end = 0
+            while end < tlen {
+                end = screen.grapheme_end(text, end)
+                if end >= s.visible { break }
+            }
+            spec.assert_eq(end, s.visible, "on a grapheme boundary")
+            smooth.advance(s, text, 48)
+            spec.assert_eq(s.visible, tlen, "drained")
+            big = smooth.new()
+            big.visible = 1
+            smooth.arrive(big, 1, 1001, 0)
+            smooth.advance(big, repeat_("a", 1001), 0)
+            spec.assert_true(big.visible > 300, "proportional")
+            exact = smooth.new()
+            smooth.arrive(exact, 5, 50, 0)
+            smooth.advance(exact, repeat_("a", 50), 8)
+            spec.assert_true(exact.visible < 50, "before the deadline")
+            smooth.advance(exact, repeat_("a", 50), 40)
+            spec.assert_eq(exact.visible, 50, "at the deadline everything shows")
+            smooth.flush(big, 1001)
+            spec.assert_eq(big.has_deadline, 0, "flush clears")
+        }
+        spec.it("new arrivals preserve the deadline and a paused stream drains") callback {
+            s = smooth.new()
+            smooth.arrive(s, 0, 1, 0)
+            smooth.arrive(s, 1, 100, 0)
+            deadline = s.deadline
+            spec.assert_eq(s.has_deadline, 1, "deadline set")
+            bytes = repeat_("x", 1000)
+            ats = [0, 16, 32]
+            i = 0
+            while i < 3 {
+                at = ats[i] as long
+                smooth.arrive(s, 100, 1000, at)
+                spec.assert_eq_long(s.deadline, deadline, "deadline preserved")
+                smooth.advance(s, bytes, at)
+                i = i + 1
+            }
+            spec.assert_eq(s.visible, 1000, "drained")
+            spec.assert_eq(s.has_deadline, 0, "no deadline")
+        }
+        spec.it("irregular bursts have bounded arrival to display lag") callback {
+            total = 30000
+            text = repeat_("a", total)
+            arrivals = make([]int, total)
+            s = smooth.new()
+            len = 0
+            next = 0
+            max_lag = 0
+            seed = 17 as long
+            ms = 0
+            while len < total || s.has_deadline != 0 {
+                now = ms as long
+                if len < total && ms >= next {
+                    seed = (seed * 1664525 + 1013904223) & 4294967295
+                    end = len + 1 + ((seed % 2000) as int)
+                    if end > total { end = total }
+                    j = len
+                    while j < end {
+                        arrivals[j] = ms
+                        j = j + 1
+                    }
+                    smooth.arrive(s, len, end, now)
+                    len = end
+                    next = ms + ((seed % 401) as int)
+                }
+                if ms % 16 == 0 {
+                    before = s.visible
+                    smooth.advance(s, string.substring(text, 0, len), now)
+                    k = before
+                    while k < s.visible {
+                        lag = ms - arrivals[k]
+                        if lag > max_lag { max_lag = lag }
+                        k = k + 1
+                    }
+                }
+                ms = ms + 1
+            }
+            spec.assert_eq(s.visible, total, "fully visible")
+            spec.assert_true(max_lag <= 56, "lag bounded")
+        }
+    }
+    return spec.run_summary(fw)
+}

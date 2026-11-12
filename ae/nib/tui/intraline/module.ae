@@ -1,0 +1,214 @@
+// tui.intraline: the changed middle of a modified diff line and the pairing of
+// -/+ runs (upstream src/tui/transcript/intraline.zig).
+// Differences from upstream: middle() returns (Middle, bool) instead of an
+// optional; Lines is a heap instance made by lines_new() and next() returns
+// (Item, bool); Item.emphasis is `emphasis` + `has_emphasis`; offsets are int
+// byte offsets; grapheme boundaries come from screen.grapheme_end.
+
+import std.string
+import term.screen
+
+exports(Range, Middle, Lines, Item, MODE_NONE, MODE_SKIP, MODE_MINUS, MODE_PLUS,
+        middle, lines_new, next)
+
+struct Range {
+    start: int
+    end: int
+}
+
+// Changed middle of a line within its content, as byte offsets.
+struct Middle {
+    old: Range
+    new: Range
+}
+
+// A changed middle above this share of the longer line means the line was rewritten.
+const MAX_MIDDLE_PERCENT = 60
+
+const MODE_NONE = 0
+const MODE_SKIP = 1
+const MODE_MINUS = 2
+const MODE_PLUS = 3
+
+// First grapheme start at or after `at`, else the text length.
+grapheme_boundaries_(text: string, at: int) -> int {
+    len = string.length(text)
+    start = 0
+    while start < len {
+        if start >= at { return start }
+        start = screen.grapheme_end(text, start)
+    }
+    return len
+}
+
+min_(a: int, b: int) -> int {
+    if a < b { return a }
+    return b
+}
+
+max_(a: int, b: int) -> int {
+    if a > b { return a }
+    return b
+}
+
+// Common prefix and suffix on grapheme boundaries; false when emphasis would add nothing.
+middle(old: string, new: string) -> (Middle, bool) {
+    nothing = Middle { old: Range { start: 0, end: 0 }, new: Range { start: 0, end: 0 } }
+    olen = string.length(old)
+    nlen = string.length(new)
+    if olen == 0 || nlen == 0 { return nothing, false }
+    prefix = 0
+    oa = 0
+    ob = 0
+    while oa < olen {
+        if ob >= nlen { break }
+        ea = screen.grapheme_end(old, oa)
+        eb = screen.grapheme_end(new, ob)
+        if string.substring(old, oa, ea) != string.substring(new, ob, eb) { break }
+        prefix = ea
+        oa = ea
+        ob = eb
+    }
+    suffix = 0
+    while suffix < olen - prefix && suffix < nlen - prefix && old[olen - 1 - suffix] == new[nlen - 1 - suffix] {
+        suffix = suffix + 1
+    }
+    while suffix > 0 {
+        old_at = grapheme_boundaries_(string.substring(old, prefix, olen), olen - prefix - suffix) + prefix
+        new_at = grapheme_boundaries_(string.substring(new, prefix, nlen), nlen - prefix - suffix) + prefix
+        fit = min_(olen - old_at, nlen - new_at)
+        if fit == suffix { break }
+        suffix = fit
+    }
+    result = Middle {
+        old: Range { start: prefix, end: olen - suffix },
+        new: Range { start: prefix, end: nlen - suffix }
+    }
+    old_len = result.old.end - result.old.start
+    new_len = result.new.end - result.new.start
+    if old_len == 0 && new_len == 0 { return nothing, false }
+    longer = max_(olen, nlen)
+    if max_(old_len, new_len) * 100 > MAX_MIDDLE_PERCENT * longer { return nothing, false }
+    return result, true
+}
+
+// Walks diff text one line at a time (lines keep their trailing newline) and
+// pairs each `-` line of a run with the `+` line at the same position of the
+// run that directly follows, when both runs have the same length.
+struct Lines {
+    text: string
+    pos: int
+    mode: int
+    remaining: int
+    partner: int
+    minus_start: int
+}
+
+struct Item {
+    line: string
+    // Changed part of the line, offsets into `line` (after the sign), when paired.
+    emphasis: Range
+    has_emphasis: int
+}
+
+lines_new(text: string) -> *Lines {
+    l = heap.new(Lines)
+    l.text = string.copy(text)
+    return l
+}
+
+line_end_(ln: *Lines, at: int) -> int {
+    nl = string.index_of_from(ln.text, "\n", at)
+    if nl >= 0 { return nl + 1 }
+    return string.length(ln.text)
+}
+
+body_(line: string) -> string {
+    end = string.length(line)
+    while end > 1 && (line[end - 1] == 10 || line[end - 1] == 13) { end = end - 1 }
+    return string.substring(line, 1, end)
+}
+
+// (count, end) of the run of lines starting with `sign` from `from`.
+run_length_(ln: *Lines, from: int, sign: int) -> (int, int) {
+    at = from
+    count = 0
+    tlen = string.length(ln.text)
+    while at < tlen && ln.text[at] == sign {
+        count = count + 1
+        at = line_end_(ln, at)
+    }
+    return count, at
+}
+
+plain_(line: string) -> (Item, bool) {
+    return Item { line: line, emphasis: Range { start: 0, end: 0 }, has_emphasis: 0 }, true
+}
+
+next(ln: *Lines) -> (Item, bool) {
+    tlen = string.length(ln.text)
+    if ln.pos >= tlen { return Item { line: "", emphasis: Range { start: 0, end: 0 }, has_emphasis: 0 }, false }
+    start = ln.pos
+    end = line_end_(ln, start)
+    ln.pos = end
+    line = string.substring(ln.text, start, end)
+    c = line[0]
+    if c == 45 {
+        if ln.mode == MODE_NONE {
+            mcount, mend = run_length_(ln, start, 45)
+            pcount, _pend = run_length_(ln, mend, 43)
+            if mcount == pcount {
+                ln.mode = MODE_MINUS
+                ln.remaining = mcount
+                ln.partner = mend
+                ln.minus_start = start
+            } else if mcount + pcount > 1 {
+                ln.mode = MODE_SKIP
+                ln.remaining = mcount + pcount
+            }
+        }
+    } else if c == 43 {
+        if ln.mode == MODE_NONE {
+            pcount, _pend = run_length_(ln, start, 43)
+            if pcount > 1 {
+                ln.mode = MODE_SKIP
+                ln.remaining = pcount
+            }
+        }
+    } else {
+        ln.mode = MODE_NONE
+    }
+    if ln.mode == MODE_NONE { return plain_(line) }
+    if ln.mode == MODE_SKIP {
+        ln.remaining = ln.remaining - 1
+        if ln.remaining == 0 { ln.mode = MODE_NONE }
+        return plain_(line)
+    }
+    // minus or plus
+    partner_end = line_end_(ln, ln.partner)
+    partner = string.substring(ln.text, ln.partner, partner_end)
+    m = Middle { old: Range { start: 0, end: 0 }, new: Range { start: 0, end: 0 } }
+    found = false
+    if ln.mode == MODE_MINUS {
+        m, found = middle(body_(line), body_(partner))
+    } else {
+        m, found = middle(body_(partner), body_(line))
+    }
+    ln.partner = partner_end
+    ln.remaining = ln.remaining - 1
+    if ln.remaining == 0 {
+        if ln.mode == MODE_MINUS {
+            ln.mode = MODE_PLUS
+            rc, _re = run_length_(ln, ln.minus_start, 45)
+            ln.remaining = rc
+            ln.partner = ln.minus_start
+        } else {
+            ln.mode = MODE_NONE
+        }
+    }
+    if !found { return plain_(line) }
+    r = m.new
+    if c == 45 { r = m.old }
+    if r.start == r.end { return plain_(line) }
+    return Item { line: line, emphasis: Range { start: r.start + 1, end: r.end + 1 }, has_emphasis: 1 }, true
+}

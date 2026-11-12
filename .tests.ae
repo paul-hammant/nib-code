@@ -152,6 +152,59 @@ aeb(cap) {
             source("ae/tests/provider_test.ae")
             lib("ae")
         }
+        // The TUI (ae/nib/tui), upstream src/tui*.
+        aether.program_test() {
+            source("ae/tests/tui_bill_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tui_clipboard_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tui_format_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tui_frames_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tui_intraline_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tui_label_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tui_long_text_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tui_markdown_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tui_open_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tui_paths_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tui_smooth_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tui_syntax_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tui_title_test.ae")
+            lib("ae")
+        }
         // Workspace mode end to end, through the built binary.
         dep(".build.ae")
         bash.test() {

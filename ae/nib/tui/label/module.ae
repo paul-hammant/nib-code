@@ -1,0 +1,74 @@
+// tui.label: the one-line tool summary and prompt prefix of a transcript turn
+// (upstream src/tui/transcript/label.zig).
+// Differences from upstream: returns a new string instead of filling a caller
+// buffer (so no truncation at the buffer size); the summary is the ported
+// session.tool_summary Summary pointer.
+
+import std.string
+import std.list
+import std.strbuilder
+import nib.session.tool_summary
+
+exports(actual_tool_summary, prompt_prefix)
+
+actual_tool_summary(summary: *tool_summary.Summary, changed_files: int) -> string {
+    ncounts = list.list_size(summary.counts)
+    if ncounts == 0 && summary.omitted == 0 { return "" }
+    sb = strbuilder.new(64)
+    wrote = 0
+    changed_shown = 0
+    nfiles = list.list_size(summary.files)
+    i = 0
+    while i < ncounts {
+        call = list.list_get_raw(summary.counts, i) as *tool_summary.Count
+        i = i + 1
+        has_file = 0
+        j = 0
+        while j < nfiles {
+            file = list.list_get_raw(summary.files, j) as *tool_summary.File
+            if file.tool == call.name { has_file = 1 }
+            j = j + 1
+        }
+        if has_file == 1 { continue }
+        changed = 0
+        if changed_files > 0 && (call.name == "edit" || call.name == "write") { changed = 1 }
+        if changed == 1 && changed_shown == 1 { continue }
+        if wrote > 0 { strbuilder.append(sb, " · ") }
+        if changed == 1 {
+            plural = "s"
+            if changed_files == 1 { plural = "" }
+            strbuilder.append(sb, "edit ${changed_files} file${plural}")
+            changed_shown = 1
+        } else {
+            strbuilder.append(sb, call.name)
+            if call.count > 1 { strbuilder.append(sb, " ×${call.count}") }
+        }
+        wrote = 1
+    }
+    if summary.omitted > 0 {
+        if wrote > 0 { strbuilder.append(sb, " · ") }
+        strbuilder.append(sb, "+${summary.omitted}")
+    }
+    return strbuilder.finish(sb)
+}
+
+// UTF-8 sequence length from a lead byte; 1 for an invalid lead (upstream's catch 1).
+seq_len_(b: int) -> int {
+    if b < 128 { return 1 }
+    if b >= 194 && b <= 223 { return 2 }
+    if b >= 224 && b <= 239 { return 3 }
+    if b >= 240 && b <= 244 { return 4 }
+    return 1
+}
+
+prompt_prefix(prompt: string) -> string {
+    len = string.length(prompt)
+    end = 0
+    count = 0
+    while end < len && count < 40 {
+        end = end + seq_len_(prompt[end])
+        if end > len { end = len }
+        count = count + 1
+    }
+    return string.substring(prompt, 0, end)
+}

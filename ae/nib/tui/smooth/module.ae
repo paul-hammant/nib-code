@@ -1,0 +1,56 @@
+// tui.smooth: spreads a burst of streamed text over a few frames
+// (upstream src/tui/smooth.zig).
+// Differences from upstream: timestamps are long milliseconds passed in; a
+// Smooth is a heap instance made by new(); `deadline` is `deadline` +
+// `has_deadline`; grapheme boundaries come from screen.grapheme_end.
+
+import std.string
+import term.screen
+
+exports(Smooth, new, arrive, flush, advance)
+
+struct Smooth {
+    visible: int
+    deadline: long
+    has_deadline: int
+}
+
+new() -> *Smooth {
+    return heap.new(Smooth)
+}
+
+flush(s: *Smooth, len: int) {
+    s.visible = len
+    s.has_deadline = 0
+}
+
+arrive(s: *Smooth, old_len: int, len: int, now: long) {
+    if old_len == 0 {
+        flush(s, len)
+        return
+    }
+    if s.has_deadline == 0 {
+        s.deadline = now + 40
+        s.has_deadline = 1
+    }
+}
+
+advance(s: *Smooth, text: string, now: long) {
+    if s.has_deadline == 0 { return }
+    left = s.deadline - now
+    tlen = string.length(text)
+    if left <= 0 {
+        flush(s, tlen)
+        return
+    }
+    frames = (left + 15) / 16
+    if frames < 1 { frames = 1 }
+    target = s.visible + (tlen - s.visible + (frames as int) - 1) / (frames as int)
+    end = 0
+    while end < tlen {
+        end = screen.grapheme_end(text, end)
+        if end >= target { break }
+    }
+    s.visible = end
+    if end == tlen { s.has_deadline = 0 }
+}

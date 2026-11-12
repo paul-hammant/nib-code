@@ -1,0 +1,136 @@
+// Ports all six tests of upstream src/tui/transcript/intraline.zig under their
+// names. collect() returns parallel arrays instead of Zig's Item buffer.
+// The last assertion of "middle splits only on grapheme boundaries" (utf8
+// validity of a slice) is checked as "the cut is on a code point boundary".
+import std.spec
+import std.string
+import std.list
+import term.screen
+import nib.tui.intraline
+
+struct Collected {
+    lines: string[]
+    emph: string[]
+    has: int[]
+    n: int
+}
+
+collect_(text: string) -> *Collected {
+    c = heap.new(Collected)
+    string[] ls = []
+    string[] es = []
+    int[] hs = []
+    n = 0
+    l = intraline.lines_new(text)
+    while true {
+        item, ok = intraline.next(l)
+        if !ok { break }
+        ls.push(item.line)
+        e = ""
+        if item.has_emphasis != 0 { e = string.substring(item.line, item.emphasis.start, item.emphasis.end) }
+        es.push(e)
+        hs.push(item.has_emphasis)
+        n = n + 1
+    }
+    c.lines = ls
+    c.emph = es
+    c.has = hs
+    c.n = n
+    return c
+}
+
+expect_middle_(old: string, new: string, want_old: string, want_new: string) {
+    m, ok = intraline.middle(old, new)
+    if !ok {
+        spec.fail("middle returned none for ${old}")
+        return
+    }
+    spec.assert_str_eq(string.substring(old, m.old.start, m.old.end), want_old, "old of ${old}")
+    spec.assert_str_eq(string.substring(new, m.new.start, m.new.end), want_new, "new of ${new}")
+}
+
+is_none_(old: string, new: string) -> bool {
+    _m, ok = intraline.middle(old, new)
+    return !ok
+}
+
+no_emphasis_(c: *Collected) {
+    i = 0
+    while i < c.n {
+        spec.assert_eq(c.has[i], 0, "no emphasis on line ${i}")
+        i = i + 1
+    }
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.intraline") {
+        spec.it("middle trims the common prefix and suffix") callback {
+            expect_middle_("const value = compute(a, b);", "const value = compute(a, c, b);", "", "c, ")
+            expect_middle_("let count = 10;", "let count = 11;", "0", "1")
+            expect_middle_("    return foo(x) + 1;", "    return bar(x) + 1;", "foo", "bar")
+            expect_middle_("pub fn init(gpa: Allocator) !Self {", "pub fn init(gpa: Allocator, io: Io) !Self {", "", ", io: Io")
+            expect_middle_("abcdefghij klmnop", "abcdefghij xlmnop", "k", "x")
+        }
+        spec.it("middle skips rewritten, empty and identical lines") callback {
+            spec.assert_true(is_none_("hello world", "goodbye"), "rewritten")
+            spec.assert_true(is_none_("", "x"), "empty old")
+            spec.assert_true(is_none_("x", ""), "empty new")
+            spec.assert_true(is_none_("same", "same"), "identical")
+            spec.assert_true(is_none_("ab", "cd"), "ab cd")
+            // 6 of 10 bytes is within the limit, 7 of 10 is not
+            spec.assert_false(is_none_("aaaXXXXXXa", "aaaYYYYYYa"), "6 of 10")
+            spec.assert_true(is_none_("aaXXXXXXXa", "aaYYYYYYYa"), "7 of 10")
+        }
+        spec.it("middle splits only on grapheme boundaries") callback {
+            expect_middle_("名前: 太郎 です", "名前: 次郎 です", "太", "次")
+            expect_middle_("x = é end suffix text", "x = ê end suffix text", "é", "ê")
+            expect_middle_("aaaaaaaa é", "aaaaaaaa ê", "é", "ê")
+            expect_middle_("aaaaaaaa 👩‍💻 b", "aaaaaaaa 👨‍💻 b", "👩‍💻", "👨‍💻")
+            expect_middle_("aaaaaaaa éz", "aaaaaaaa óz", "é", "ó")
+            old = "long prefix text é suffix text"
+            m, ok = intraline.middle(old, "long prefix text è suffix text")
+            spec.assert_true(ok, "found")
+            spec.assert_true(screen.codepoint_at(old, m.old.start) >= 0, "start on a code point")
+            spec.assert_eq(m.old.start, 17, "start before the é")
+        }
+        spec.it("equal runs pair line by line") callback {
+            c = collect_(" ctx\n-let a = 1;\n-let b = 2;\n+let a = 3;\n+let b = 4;\n ctx\n")
+            spec.assert_eq(c.n, 6, "count")
+            spec.assert_str_eq(c.emph[1], "1", "1")
+            spec.assert_str_eq(c.emph[2], "2", "2")
+            spec.assert_str_eq(c.emph[3], "3", "3")
+            spec.assert_str_eq(c.emph[4], "4", "4")
+            spec.assert_true(c.has[0] == 0 && c.has[5] == 0, "context has none")
+            spec.assert_str_eq(c.lines[1], "-let a = 1;\n", "line keeps newline")
+        }
+        spec.it("unequal runs, lone lines and headers get no emphasis") callback {
+            c = collect_("-let a = 1;\n-let b = 2;\n+let a = 3;\n")
+            spec.assert_eq(c.n, 3, "three")
+            no_emphasis_(c)
+            no_emphasis_(collect_("-let a = 1;\n+let a = 3;\n+let b = 3;\n"))
+            c = collect_("-let a = 1;\n-let b = 2;\n+let b = 3;\n")
+            spec.assert_true(c.has[2] == 0 && c.has[1] == 0, "tail")
+            // the unpaired minus run must not make its tail pair up on its own
+            no_emphasis_(collect_("-let a = 1;\n-let b = 2;\n-let c = 3;\n+let c = 4;\n"))
+            no_emphasis_(collect_("-only removed 1\n x\n+only added 1\n"))
+            c = collect_("src/a.zig +1 −1\n-let a = 1;\n+let a = 2;\n")
+            spec.assert_eq(c.has[0], 0, "header")
+            spec.assert_str_eq(c.emph[1], "1", "1")
+            spec.assert_str_eq(c.emph[2], "2", "2")
+        }
+        spec.it("consecutive pairs and empty lines") callback {
+            c = collect_("-a1 text here\n+a2 text here\n x\n-b1 text here\n+b2 text here\n")
+            spec.assert_eq(c.n, 5, "five")
+            spec.assert_str_eq(c.emph[0], "1", "0")
+            spec.assert_str_eq(c.emph[1], "2", "1")
+            spec.assert_str_eq(c.emph[3], "1", "3")
+            spec.assert_str_eq(c.emph[4], "2", "4")
+            no_emphasis_(collect_("-\n+text\n"))
+            c = collect_("-keep this line a\n+keep this line b")
+            spec.assert_str_eq(c.emph[0], "a", "a")
+            spec.assert_str_eq(c.emph[1], "b", "b")
+        }
+    }
+    return spec.run_summary(fw)
+}

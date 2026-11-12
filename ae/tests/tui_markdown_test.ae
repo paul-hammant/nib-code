@@ -1,0 +1,418 @@
+// Ports the tests of upstream src/tui/markdown.zig under their exact names
+// (all 18). Upstream's `Shot` (a vaxis Screen plus Window) is a Shot struct
+// over term.screen's Surface; `expectLines` takes a flat list of
+// (kind letter, gap, text) triples: kind p prose, h heading, c code, t table,
+// q quote, l list, o other; gap "g" (blank row above) or "-".
+// The two deep-equality checks of the cache tests (`expectEqualDeep` over the
+// whole cell buffer) compare a text dump of every cell: grapheme, width,
+// style, link, default and wrapped flags.
+import std.spec
+import std.string
+import std.strbuilder
+import term.screen
+import nib.tui.markdown
+import nib.tui.syntax
+
+struct Shot {
+    surf: *screen.Surface
+    win: screen.Window
+}
+
+shot_new_(cols: int) -> Shot {
+    s = screen.surface(cols, 32)
+    return Shot { surf: s, win: screen.window(s) }
+}
+
+row_(shot: Shot, r: int) -> string {
+    sb = strbuilder.new(64)
+    col = 0
+    while col < shot.surf.width {
+        c, _ok = screen.read_cell(shot.surf, col, r)
+        g = if string.length(c.grapheme) == 0 { " " } else { c.grapheme }
+        strbuilder.append(sb, g)
+        col = col + (if c.width > 1 { c.width } else { 1 })
+    }
+    line = strbuilder.finish(sb)
+    n = string.length(line)
+    while n > 0 && line[n - 1] == 32 {
+        n = n - 1
+    }
+    return string.substring(line, 0, n)
+}
+
+expect_rows_(shot: Shot, want: string[]) {
+    for r in 0..want.len {
+        spec.assert_str_eq(row_(shot, r), want[r], "row ${r}")
+    }
+}
+
+cell_(shot: Shot, col: int, r: int) -> screen.Cell {
+    c, _ok = screen.read_cell(shot.surf, col, r)
+    return c
+}
+
+style_(shot: Shot, col: int, r: int) -> screen.Style {
+    return cell_(shot, col, r).style
+}
+
+bold_(shot: Shot, col: int, r: int) -> bool { return screen.has_attr(style_(shot, col, r), screen.BOLD) }
+dim_(shot: Shot, col: int, r: int) -> bool { return screen.has_attr(style_(shot, col, r), screen.DIM) }
+italic_(shot: Shot, col: int, r: int) -> bool { return screen.has_attr(style_(shot, col, r), screen.ITALIC) }
+fg_(shot: Shot, col: int, r: int) -> int { return style_(shot, col, r).fg }
+bg_(shot: Shot, col: int, r: int) -> int { return style_(shot, col, r).bg }
+
+draw_text_(shot: Shot, text: string, theme: markdown.Theme) -> int {
+    return markdown.`print`(shot.win, text, theme, true)
+}
+
+kind_of_(letter: string) -> int {
+    if letter == "p" {
+        return markdown.KIND_PROSE
+    }
+    if letter == "h" {
+        return markdown.KIND_HEADING
+    }
+    if letter == "c" {
+        return markdown.KIND_CODE
+    }
+    if letter == "t" {
+        return markdown.KIND_TABLE
+    }
+    if letter == "q" {
+        return markdown.KIND_QUOTE
+    }
+    if letter == "l" {
+        return markdown.KIND_LIST
+    }
+    return markdown.KIND_OTHER
+}
+
+expect_lines_(text: string, want: string[]) {
+    lines = markdown.lines_new(text, markdown.fresh_state())
+    i = 0
+    while i < want.len {
+        line, ok = markdown.lines_next(lines)
+        if !ok {
+            spec.fail("ran out of lines before ${want[i + 2]}")
+            return
+        }
+        spec.assert_eq(line.kind, kind_of_(want[i]), "kind of ${want[i + 2]}")
+        spec.assert_eq(if line.gap { 1 } else { 0 }, if want[i + 1] == "g" { 1 } else { 0 }, "gap of ${want[i + 2]}")
+        spec.assert_str_eq(line.text, want[i + 2], "text")
+        i = i + 3
+    }
+    _line, more = markdown.lines_next(lines)
+    spec.assert_false(more, "more lines than expected in ${text}")
+}
+
+// Every cell of the surface as text, for whole-buffer comparison.
+dump_(s: *screen.Surface) -> string {
+    sb = strbuilder.new(4096)
+    for i in 0..s.cells.len {
+        c = s.cells[i]
+        strbuilder.append(sb, c.grapheme)
+        strbuilder.append(sb, "|${c.width}|${c.style.fg}|${c.style.bg}|${c.style.ul}|${c.style.ul_style}|${c.style.attrs}|${c.link}|${c.link_params}|")
+        strbuilder.append(sb, if c.is_default { "d" } else { "-" })
+        strbuilder.append(sb, if c.wrapped { "w" } else { "-" })
+        strbuilder.append(sb, ";")
+    }
+    return strbuilder.finish(sb)
+}
+
+stream_step_(shot: Shot, cache: *markdown.Cache, text: string, want: string[], i: int) {
+    plain = markdown.default_theme()
+    screen.surface_clear(shot.surf)
+    h = markdown.cache_draw(cache, shot.win, text, plain, true)
+    spec.assert_eq(markdown.`print`(shot.win, text, plain, false), h, "cached height matches uncached at step ${i}")
+    expect_rows_(shot, want)
+    spec.assert_eq(h, want.len, "height at step ${i}")
+}
+
+// std.unicode.utf8ValidateSlice(text[0..n])
+valid_prefix_(text: string, n: int) -> bool {
+    p = string.substring(text, 0, n)
+    off = 0
+    while off < n {
+        if screen.codepoint_at(p, off) < 0 {
+            return false
+        }
+        off = off + screen.codepoint_len(p, off)
+    }
+    return true
+}
+
+main() {
+    tint = screen.color_rgb(20, 20, 20)
+    green = screen.color_index(2)
+    plain = markdown.default_theme()
+    tinted = markdown.theme(tint, screen.color_index(6))
+    theme_syntax = markdown.theme(tint, green)
+    DEF = screen.DEFAULT
+
+    fw = spec.init()
+    spec.describe(fw, "tui.markdown") {
+        spec.it("fences, indentation, and headings") callback {
+            expect_lines_("~~~zig\n  one\n~~~\n```\ntwo", ["c", "-", "  one", "c", "-", "two"])
+            expect_lines_("  # Title\n    # plain", ["h", "-", "Title", "p", "-", "    # plain"])
+        }
+
+        spec.it("paragraph breaks: blank lines collapse, single newlines between prose separate") callback {
+            expect_lines_("one\ntwo", ["p", "-", "one", "p", "g", "two"])
+            expect_lines_("one\n\n\n\ntwo", ["p", "-", "one", "p", "g", "two"])
+            expect_lines_("\n\none\n\n", ["p", "-", "one"])
+            expect_lines_("a\n\n  \nb", ["p", "-", "a", "p", "g", "b"])
+        }
+
+        spec.it("no paragraph gap around lists, quotes, headings, code and tables") callback {
+            expect_lines_("- a\ncont\n  more\n1. b", ["l", "-", "- a", "p", "-", "cont", "p", "-", "  more", "l", "-", "1. b"])
+            expect_lines_("para\n- item", ["p", "-", "para", "l", "-", "- item"])
+            expect_lines_("> q\nlazy\n> r", ["q", "-", "q", "p", "-", "lazy", "q", "-", "r"])
+            expect_lines_("para\n# H\ntext", ["p", "-", "para", "h", "g", "H", "p", "-", "text"])
+            expect_lines_("para\n```\ncode\n```\nafter", ["p", "-", "para", "c", "-", "code", "p", "-", "after"])
+            expect_lines_("para\n| a | b |\n|---|---|\n| 1 | 2 |\nnext", ["p", "-", "para", "t", "-", "| a | b |\n|---|---|\n| 1 | 2 |", "p", "-", "next"])
+            expect_lines_("a\n\n```\nx\n\ny\n```\n\nb", ["p", "-", "a", "c", "g", "x", "c", "-", "", "c", "-", "y", "p", "g", "b"])
+        }
+
+        spec.it("headings keep bold blue and get one blank row above except first") callback {
+            shot = shot_new_(20)
+            spec.assert_eq(draw_text_(shot, "# Top\nintro\n## Title\nbody", plain), 5, "rows")
+            expect_rows_(shot, ["Top", "intro", "", "Title", "body"])
+            spec.assert_true(bold_(shot, 0, 0), "bold")
+            spec.assert_eq(fg_(shot, 0, 3), screen.color_index(4), "blue")
+            spec.assert_false(bold_(shot, 0, 1), "intro not bold")
+        }
+
+        spec.it("inline code tint and no-tint fallback") callback {
+            shot = shot_new_(20)
+            draw_text_(shot, "a `b` c", tinted)
+            expect_rows_(shot, ["a b c"])
+            spec.assert_eq(bg_(shot, 2, 0), tint, "tinted bg")
+            spec.assert_eq(bg_(shot, 0, 0), DEF, "plain bg")
+            spec.assert_eq(fg_(shot, 2, 0), DEF, "fg")
+            screen.surface_clear(shot.surf)
+            draw_text_(shot, "a `b` c", plain)
+            spec.assert_eq(bg_(shot, 2, 0), DEF, "untinted bg")
+            spec.assert_eq(fg_(shot, 2, 0), DEF, "untinted fg")
+        }
+
+        spec.it("code blocks: tinted with padding, bar fallback, info string hidden") callback {
+            shot = shot_new_(12)
+            spec.assert_eq(draw_text_(shot, "```zig\nlet x\n\ty\n```", tinted), 2, "rows")
+            expect_rows_(shot, [" let x", "     y"])
+            for c in 0..12 {
+                spec.assert_eq(bg_(shot, c, 0), tint, "row 0 tinted ${c}")
+            }
+            spec.assert_eq(fg_(shot, 1, 0), DEF, "fg")
+            spec.assert_eq(bg_(shot, 0, 2), DEF, "below the block")
+            screen.surface_clear(shot.surf)
+            draw_text_(shot, "```zig\nlet x\n```", plain)
+            expect_rows_(shot, ["│ let x"])
+            spec.assert_true(dim_(shot, 0, 0), "bar dim")
+            spec.assert_eq(fg_(shot, 0, 0), DEF, "bar fg")
+            spec.assert_eq(bg_(shot, 2, 0), DEF, "bar bg")
+        }
+
+        spec.it("italic, links and quotes") callback {
+            shot = shot_new_(60)
+            draw_text_(shot, "*it* and _it2_ snake_case_x 2 * 3 * 4", plain)
+            expect_rows_(shot, ["it and it2 snake_case_x 2 * 3 * 4"])
+            spec.assert_true(italic_(shot, 0, 0), "it italic")
+            spec.assert_false(italic_(shot, 3, 0), "space not italic")
+            spec.assert_true(italic_(shot, 7, 0), "it2 italic")
+            spec.assert_false(italic_(shot, 13, 0), "snake_case_x not italic")
+            screen.surface_clear(shot.surf)
+            draw_text_(shot, "[docs](https://x.dev/a) and https://y.dev ![i](p)", plain)
+            expect_rows_(shot, ["docs (https://x.dev/a) and https://y.dev ![i](p)"])
+            spec.assert_false(dim_(shot, 0, 0), "link text")
+            spec.assert_true(dim_(shot, 4, 0), "open paren dim")
+            spec.assert_true(dim_(shot, 10, 0), "url dim")
+            spec.assert_false(dim_(shot, 24, 0), "after link")
+            screen.surface_clear(shot.surf)
+            spec.assert_eq(draw_text_(shot, "> quoted **b**\n> second", plain), 2, "quote rows")
+            expect_rows_(shot, ["│ quoted b", "│ second"])
+            spec.assert_true(dim_(shot, 0, 0), "bar dim")
+            spec.assert_false(dim_(shot, 2, 0), "text not dim")
+            spec.assert_true(bold_(shot, 9, 0), "b bold")
+        }
+
+        spec.it("table renders aligned borderless columns by display width") callback {
+            shot = shot_new_(60)
+            text = "| 文件 | 改动 | 说明 |\n|---|:---:|---:|\n| src/grep.zig | +38 −9 | 边界检查 |\n| tests/a.py | +54 | 空 |"
+            spec.assert_eq(draw_text_(shot, text, plain), 3, "rows")
+            expect_rows_(shot, [
+                "文件           改动       说明",
+                "src/grep.zig  +38 −9  边界检查",
+                "tests/a.py     +54          空"
+            ])
+            spec.assert_true(dim_(shot, 0, 0) && !bold_(shot, 0, 0), "header dim not bold")
+            spec.assert_true(!dim_(shot, 0, 1) && !bold_(shot, 0, 1), "body plain")
+        }
+
+        spec.it("table cells keep inline styles, unescape pipes, pad ragged rows") callback {
+            shot = shot_new_(40)
+            draw_text_(shot, "a|b\n-|-\n`x`|**y**", tinted)
+            expect_rows_(shot, ["a  b", "x  y"])
+            spec.assert_eq(bg_(shot, 0, 1), tint, "code cell tinted")
+            spec.assert_true(bold_(shot, 3, 1), "bold cell")
+            screen.surface_clear(shot.surf)
+            draw_text_(shot, "| a | b |\n|---|---|\n| x\\|y | z |", plain)
+            expect_rows_(shot, ["a    b", "x|y  z"])
+            screen.surface_clear(shot.surf)
+            spec.assert_eq(draw_text_(shot, "|a|b|c|\n|-|-|-|\n|1|\n|1|2|3|4|", plain), 3, "rows")
+            expect_rows_(shot, ["a  b  c", "1", "1  2  3"])
+        }
+
+        spec.it("too-wide tables and non-tables render as plain lines") callback {
+            shot = shot_new_(33)
+            wide = "aaaaaaaaaaaaaaaa|bbbbbbbbbbbbbbbb\n-|-\ncccccccccccccccc|dddddddddddddddd"
+            spec.assert_eq(draw_text_(shot, wide, plain), 3, "rows")
+            expect_rows_(shot, ["aaaaaaaaaaaaaaaa|bbbbbbbbbbbbbbbb", "-|-", "cccccccccccccccc|dddddddddddddddd"])
+            screen.surface_clear(shot.surf)
+            draw_text_(shot, "```\n| a | b |\n|---|---|\n```\nx | y\n\nz | w", plain)
+            expect_rows_(shot, ["│ | a | b |", "│ |---|---|", "x | y", "", "z | w"])
+        }
+
+        spec.it("table streaming: renders once header and delimiter exist and relays out as rows arrive") callback {
+            cache = markdown.cache_new()
+            shot = shot_new_(40)
+            stream_step_(shot, cache, "| a | b |\n", ["| a | b |"], 0)
+            stream_step_(shot, cache, "| a | b |\n|---|--", ["a  b"], 1)
+            stream_step_(shot, cache, "| a | b |\n|---|---|\n| 1 | 2 |\n", ["a  b", "1  2"], 2)
+            stream_step_(shot, cache, "| a | b |\n|---|---|\n| 1 | 2 |\n| long cell | 3 |\n", ["a          b", "1          2", "long cell  3"], 3)
+            stream_step_(shot, cache, "| a | b |\n|---|---|\n| 1 | 2 |\n| long cell | 3 |\n\ntail", ["a          b", "1          2", "long cell  3", "", "tail"], 4)
+            markdown.cache_free(cache)
+        }
+
+        spec.it("rendered rows and styles match measurement") callback {
+            shot = shot_new_(8)
+            win = shot.win
+            spec.assert_eq(markdown.`print`(win, "12345678", plain, false), 1, "fits exactly")
+            spec.assert_eq(markdown.`print`(win, "abcde **def**", plain, false), 2, "measure wrap")
+            spec.assert_eq(markdown.`print`(win, "abcde **def**", plain, true), 2, "commit wrap")
+            spec.assert_true(bold_(shot, 0, 1), "wrapped bold")
+            screen.surface_clear(shot.surf)
+            spec.assert_eq(markdown.`print`(win, "```\n\txyz\n```\nlast", plain, false), 3, "code measure")
+            spec.assert_eq(markdown.`print`(win, "```\n\txyz\n```\nlast", plain, true), 3, "code commit")
+            spec.assert_str_eq(cell_(shot, 0, 0).grapheme, "│", "bar")
+            spec.assert_str_eq(cell_(shot, 2, 1).grapheme, "z", "wrapped z")
+            screen.surface_clear(shot.surf)
+            spec.assert_eq(markdown.`print`(win, "~~~\n1234567", plain, true), 2, "tilde fence wraps")
+        }
+
+        spec.it("cached append and resize match uncached markdown") callback {
+            cache = markdown.cache_new()
+            shot = shot_new_(60)
+            win = shot.win
+            text = "# Heading\n**late\nclose**\npara one\npara two\n```zig\ncode\n\nmore\n```\n> quote\nlazy\n| a | b |\n|---|--:|\n| 中文 | 1 |\n| x\n- item\ncont\n\n\n中文 👩‍💻 [l](u) *i* tail"
+            themes = [plain, tinted]
+            widths = [60, 20, 60]
+            offsets = [0, -3, -10]
+            for ti in 0..2 {
+                theme = themes[ti]
+                for wi in 0..3 {
+                    win.width = widths[wi]
+                    for n in 0..string.length(text) + 1 {
+                        if !valid_prefix_(text, n) {
+                            continue
+                        }
+                        prefix = string.substring(text, 0, n)
+                        spec.assert_eq(markdown.`print`(win, prefix, theme, false), markdown.cache_draw(cache, win, prefix, theme, false), "height at ${n} w${widths[wi]}")
+                        for oi in 0..3 {
+                            win.y_off = offsets[oi]
+                            screen.clear(win)
+                            markdown.`print`(win, prefix, theme, true)
+                            expected = dump_(shot.surf)
+                            screen.clear(win)
+                            markdown.cache_draw(cache, win, prefix, theme, true)
+                            spec.assert_true(expected == dump_(shot.surf), "cells at ${n} w${widths[wi]} off${offsets[oi]}")
+                        }
+                        win.y_off = 0
+                    }
+                }
+            }
+            markdown.cache_free(cache)
+        }
+
+        spec.it("tagged code blocks: dim comments, colored strings, bold keywords") callback {
+            shot = shot_new_(40)
+            draw_text_(shot, "```zig\nconst s = \"hi\"; // c\n```", theme_syntax)
+            expect_rows_(shot, [" const s = \"hi\"; // c"])
+            spec.assert_true(bold_(shot, 1, 0), "const bold")
+            spec.assert_false(bold_(shot, 7, 0), "plain not bold")
+            spec.assert_eq(fg_(shot, 7, 0), DEF, "plain fg")
+            spec.assert_eq(fg_(shot, 11, 0), green, "string start")
+            spec.assert_eq(fg_(shot, 14, 0), green, "string end")
+            spec.assert_true(!dim_(shot, 15, 0) && fg_(shot, 15, 0) == DEF, "after string")
+            spec.assert_true(dim_(shot, 17, 0), "comment dim")
+            spec.assert_true(dim_(shot, 20, 0), "comment dim end")
+            for c in 0..40 {
+                spec.assert_eq(bg_(shot, c, 0), tint, "tinted ${c}")
+            }
+        }
+
+        spec.it("untagged and unknown-language blocks and inline code stay plain") callback {
+            shot = shot_new_(40)
+            texts = ["```\nconst s = \"hi\"; // c\n```", "```text\nconst s = \"hi\"; // c\n```"]
+            for ti in 0..2 {
+                screen.surface_clear(shot.surf)
+                draw_text_(shot, texts[ti], theme_syntax)
+                for c in 1..22 {
+                    spec.assert_true(!bold_(shot, c, 0) && !dim_(shot, c, 0), "no style ${c}")
+                    spec.assert_eq(fg_(shot, c, 0), DEF, "fg ${c}")
+                }
+            }
+            screen.surface_clear(shot.surf)
+            draw_text_(shot, "`const \"x\" // y`", theme_syntax)
+            for c in 0..14 {
+                spec.assert_true(!bold_(shot, c, 0) && !dim_(shot, c, 0), "inline no style ${c}")
+                spec.assert_eq(fg_(shot, c, 0), DEF, "inline fg ${c}")
+            }
+        }
+
+        spec.it("lexer state carries across code lines and resets at the fence") callback {
+            shot = shot_new_(40)
+            draw_text_(shot, "```c\n/* one\ntwo */ return\n```\n```c\nreturn\n```", theme_syntax)
+            spec.assert_true(dim_(shot, 1, 0), "comment line 0")
+            spec.assert_true(dim_(shot, 1, 1), "comment continues")
+            spec.assert_true(!dim_(shot, 8, 1) && bold_(shot, 8, 1), "return after close")
+            spec.assert_true(bold_(shot, 1, 2), "new fence resets")
+            screen.surface_clear(shot.surf)
+            draw_text_(shot, "```c\n/* open\n```\n```c\nreturn\n```", theme_syntax)
+            spec.assert_true(bold_(shot, 1, 1) && !dim_(shot, 1, 1), "state reset at closing fence")
+        }
+
+        spec.it("python triple quotes and tabs render within width") callback {
+            shot = shot_new_(20)
+            spec.assert_eq(draw_text_(shot, "```py\n\"\"\"a\n\tb\"\"\" x\n```", theme_syntax), 2, "rows")
+            expect_rows_(shot, [" \"\"\"a", "     b\"\"\" x"])
+            spec.assert_eq(fg_(shot, 1, 0), green, "triple quote line 0")
+            spec.assert_eq(fg_(shot, 5, 1), green, "triple quote line 1")
+            spec.assert_eq(fg_(shot, 10, 1), DEF, "after close")
+        }
+
+        spec.it("syntax colored blocks stream like uncached ones") callback {
+            cache = markdown.cache_new()
+            shot = shot_new_(24)
+            win = shot.win
+            text = "x\n```zig\nconst a = \"é̈\"; /* open\n\tmore */ pub\n\\\\raw 中文 // z\n```\ntail"
+            widths = [24, 9, 24]
+            for wi in 0..3 {
+                win.width = widths[wi]
+                for n in 0..string.length(text) + 1 {
+                    if !valid_prefix_(text, n) {
+                        continue
+                    }
+                    prefix = string.substring(text, 0, n)
+                    spec.assert_eq(markdown.`print`(win, prefix, theme_syntax, false), markdown.cache_draw(cache, win, prefix, theme_syntax, false), "height at ${n} w${widths[wi]}")
+                    screen.clear(win)
+                    markdown.`print`(win, prefix, theme_syntax, true)
+                    expected = dump_(shot.surf)
+                    screen.clear(win)
+                    markdown.cache_draw(cache, win, prefix, theme_syntax, true)
+                    spec.assert_true(expected == dump_(shot.surf), "cells at ${n} w${widths[wi]}")
+                }
+            }
+            markdown.cache_free(cache)
+        }
+    }
+}

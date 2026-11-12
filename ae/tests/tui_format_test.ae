@@ -1,0 +1,38 @@
+// Ports both tests of upstream src/tui/format.zig under their names.
+import std.spec
+import nib.tui.format
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.format") {
+        spec.it("UI state vocabulary and decimal units") callback {
+            spec.assert_str_eq(format.`state`("working"), "running", "working")
+            spec.assert_str_eq(format.`state`("done"), "completed", "done")
+            spec.assert_str_eq(format.`state`("ok"), "completed", "ok")
+            spec.assert_str_eq(format.`state`("timed_out"), "timed out", "timed_out")
+            spec.assert_str_eq(format.`state`("other"), "other", "passthrough")
+            spec.assert_str_eq(format.duration(0), "<1s", "0")
+            spec.assert_str_eq(format.duration(999), "<1s", "999")
+            spec.assert_str_eq(format.duration(1000), "1s", "1000")
+            spec.assert_str_eq(format.duration(59999), "59s", "59999")
+            spec.assert_str_eq(format.duration(100000), "1m40s", "100000")
+            spec.assert_str_eq(format.duration(3661999), "1h1m1s", "3661999")
+            spec.assert_str_eq(format.duration(3600000), "1h0m0s", "3600000")
+            spec.assert_str_eq(format.number(1000000), "1M", "1M")
+            spec.assert_str_eq(format.number(6699), "6.6k", "6699")
+            spec.assert_str_eq(format.number(999), "999", "999")
+            spec.assert_str_eq(format.number(2500000), "2.5M", "2.5M")
+            spec.assert_str_eq(format.bytes(18000), "18kB", "18kB")
+            spec.assert_str_eq(format.bytes(3200000), "3.2MB", "3.2MB")
+        }
+        spec.it("single-line previews mark omissions and preserve graphemes") callback {
+            r = format.fit("á👩‍💻xyz", 4)
+            spec.assert_str_eq(r.text, "á👩‍💻", "text")
+            spec.assert_str_eq(r.suffix, "…", "suffix")
+            spec.assert_str_eq(format.fit("word", 0).text, "", "zero columns")
+            spec.assert_str_eq(format.fit("word", 4).text, "word", "fits")
+            spec.assert_str_eq(format.fit("word", 4).suffix, "", "fits suffix")
+        }
+    }
+    return spec.run_summary(fw)
+}

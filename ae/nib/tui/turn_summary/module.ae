@@ -1,0 +1,86 @@
+// tui.turn_summary: the data bill.zig reads from upstream's session/events.zig
+// TurnSummary, provider.Usage and sandbox/timing.zig Timing.
+// Differences from upstream: value structs; status is the string "completed",
+// "canceled" or "failed"; every count is a long; from_json() builds one from
+// {"status":..,"steps":..,"usage":{..},"timing":{..}}, missing fields 0 (and
+// status "completed").
+
+import std.string
+import nib.jsonx
+
+exports(Usage, Timing, TurnSummary, usage, timing, new, from_json)
+
+struct Usage {
+    prompt_tokens: long
+    completion_tokens: long
+    prompt_cache_hit_tokens: long
+    prompt_cache_write_tokens: long
+}
+
+struct Timing {
+    wall_ms: long
+    model_ms: long
+    run_ms: long
+    tool_bytes: long
+    output_bytes: long
+    llm_calls: long
+    agent_calls: long
+}
+
+struct TurnSummary {
+    status: string
+    steps: long
+    usage: Usage
+    timing: Timing
+}
+
+usage(prompt_tokens: long = 0, completion_tokens: long = 0, prompt_cache_hit_tokens: long = 0,
+      prompt_cache_write_tokens: long = 0) -> Usage {
+    return Usage {
+        prompt_tokens: prompt_tokens,
+        completion_tokens: completion_tokens,
+        prompt_cache_hit_tokens: prompt_cache_hit_tokens,
+        prompt_cache_write_tokens: prompt_cache_write_tokens
+    }
+}
+
+timing(wall_ms: long = 0, model_ms: long = 0, run_ms: long = 0, tool_bytes: long = 0,
+       output_bytes: long = 0, llm_calls: long = 0, agent_calls: long = 0) -> Timing {
+    return Timing {
+        wall_ms: wall_ms,
+        model_ms: model_ms,
+        run_ms: run_ms,
+        tool_bytes: tool_bytes,
+        output_bytes: output_bytes,
+        llm_calls: llm_calls,
+        agent_calls: agent_calls
+    }
+}
+
+new(status: string = "completed", steps: long = 0, u: Usage = usage(), t: Timing = timing()) -> TurnSummary {
+    return TurnSummary { status: status, steps: steps, usage: u, timing: t }
+}
+
+from_json(text: string) -> TurnSummary {
+    doc = jsonx.parse(text)
+    u = jsonx.field(doc, "usage")
+    t = jsonx.field(doc, "timing")
+    out = new(
+        jsonx.str_or(doc, "status", "completed"),
+        jsonx.long_or(doc, "steps", 0),
+        usage(
+            jsonx.long_or(u, "prompt_tokens", 0),
+            jsonx.long_or(u, "completion_tokens", 0),
+            jsonx.long_or(u, "prompt_cache_hit_tokens", 0),
+            jsonx.long_or(u, "prompt_cache_write_tokens", 0)),
+        timing(
+            jsonx.long_or(t, "wall_ms", 0),
+            jsonx.long_or(t, "model_ms", 0),
+            jsonx.long_or(t, "run_ms", 0),
+            jsonx.long_or(t, "tool_bytes", 0),
+            jsonx.long_or(t, "output_bytes", 0),
+            jsonx.long_or(t, "llm_calls", 0),
+            jsonx.long_or(t, "agent_calls", 0)))
+    jsonx.free(doc)
+    return out
+}

@@ -1,0 +1,1095 @@
+// tui.markdown: a streaming-friendly markdown renderer for the transcript. It
+// classifies text a line at a time (prose, heading, fenced code, table, quote,
+// list), lays inline spans (code, bold, italic, links) out with word wrapping,
+// colours tagged code blocks with tui.syntax, and keeps a per-entry Cache so
+// appending text only lays out the new lines. Upstream src/tui/markdown.zig.
+//
+// Differences from upstream:
+//  - vaxis.Window / Style / Color / Segment are term.screen's Window / Style /
+//    int colours / Segment. `win.screen.height` is `win.surf.height`.
+//  - Zig enums are ints (KIND_*, ALIGN_*, and tui.syntax's LANG_/STATE_/CLASS_;
+//    LANG_NONE = -1 stands for a null `?Lang`). Theme's `string` field is
+//    `string_color` (`string` is a type name in Aether).
+//  - `print` is reserved in Aether, so the entry point is spelled with
+//    backticks: markdown.`print`(...). Upstream's `Cache.draw(gpa, ...)` is
+//    cache_draw(cache, ...); Cache is a *Cache made by cache_new() and freed
+//    with cache_free(), and holds all the state (no module-level state).
+//  - Line carries `offset`, the byte offset of its text in the source, because
+//    Aether strings have no pointer identity (upstream's Cache computes it from
+//    the slice pointers). Line.text is a copy.
+//  - The iterators (Lines, Cells, Inline) are heap structs with a `_next`
+//    function returning (value, bool); the u16 saturating arithmetic of
+//    upstream is plain int arithmetic (no value reaches 65535).
+//  - Table.measure returns (Table, bool); the Table's aligns/widths are int
+//    slices of max_cols.
+//  - Not ported: the allocation-failure fallback in Cache.draw (`catch return
+//    print(...)`), there being no allocation failure to catch.
+
+import std.string
+import std.strbuilder
+import term.screen
+import nib.tui.syntax
+
+exports(
+    Theme, theme, default_theme, KIND_PROSE, KIND_HEADING, KIND_CODE, KIND_TABLE,
+    KIND_QUOTE, KIND_LIST, KIND_OTHER, Line, Lines, State, fresh_state, lines_new, lines_next,
+    `print`, Cache, cache_new, cache_free, cache_draw
+)
+
+struct Theme {
+    // Background of inline code and code blocks; screen.DEFAULT renders them unshaded.
+    tint: int
+    // Strings in tagged code blocks: a palette colour, which terminals keep
+    // readable on light and dark backgrounds.
+    string_color: int
+}
+
+// Upstream's `.{}`: no tint, palette colour 6 for strings.
+default_theme() -> Theme {
+    return Theme { tint: screen.DEFAULT, string_color: screen.color_index(6) }
+}
+
+theme(tint: int, string_color: int) -> Theme {
+    return Theme { tint: tint, string_color: string_color }
+}
+
+const KIND_PROSE = 0
+const KIND_HEADING = 1
+const KIND_CODE = 2
+const KIND_TABLE = 3
+const KIND_QUOTE = 4
+const KIND_LIST = 5
+const KIND_OTHER = 6
+
+const MAX_COLS = 16
+const COL_GAP = 2
+
+const ALIGN_LEFT = 0
+const ALIGN_CENTER = 1
+const ALIGN_RIGHT = 2
+
+const SPACE = 32
+const TAB = 9
+const NL = 10
+const CR = 13
+const BANG = 33
+const HASH = 35
+const STAR = 42
+const PLUS = 43
+const DASH = 45
+const COLON = 58
+const GT = 62
+const LBRACKET = 91
+const BSLASH = 92
+const RBRACKET = 93
+const UNDERSCORE = 95
+const BACKTICK = 96
+const PIPE = 124
+const TILDE = 126
+const LPAREN = 40
+const RPAREN = 41
+const DOT = 46
+
+struct Line {
+    text: string
+    // byte offset of text in the source
+    offset: int
+    kind: int
+    // One blank row above the line.
+    gap: bool
+    // Tables: a terminated line after the last row ended the block.
+    closed: bool
+    // Classification may change when more text arrives.
+    undecided: bool
+    // Code lines of a recognized language, with the lexer state at the start of the line.
+    lang: int
+    lex: int
+}
+
+mk_line_(text: string, offset: int, kind: int) -> Line {
+    return Line { text: text, offset: offset, kind: kind, gap: false, closed: true, undecided: false, lang: syntax.LANG_NONE, lex: syntax.STATE_NONE }
+}
+
+struct State {
+    pos: int
+    fence: bool
+    fence_char: int
+    fence_len: int
+    fence_lang: int
+    lex: int
+    prev: int
+    blank: bool
+    emitted: bool
+}
+
+// upstream's `.{}`: prev starts as .other
+fresh_state() -> State {
+    return State { pos: 0, fence: false, fence_char: 0, fence_len: 0, fence_lang: syntax.LANG_NONE, lex: syntax.STATE_NONE, prev: KIND_OTHER, blank: false, emitted: false }
+}
+
+// ---------------------------------------------------------------- helpers
+
+// std.mem.trim(u8, s, " \t")
+trim_blank_(s: string) -> string {
+    n = string.length(s)
+    a = 0
+    while a < n && (s[a] == SPACE || s[a] == TAB) {
+        a = a + 1
+    }
+    b = n
+    while b > a && (s[b - 1] == SPACE || s[b - 1] == TAB) {
+        b = b - 1
+    }
+    return string.substring(s, a, b)
+}
+
+// std.mem.trimEnd(u8, s, "\r")
+trim_cr_(s: string) -> string {
+    b = string.length(s)
+    while b > 0 && s[b - 1] == CR {
+        b = b - 1
+    }
+    return string.substring(s, 0, b)
+}
+
+is_blank_(s: string) -> bool {
+    return string.length(trim_blank_(s)) == 0
+}
+
+is_alnum_(c: int) -> bool {
+    return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+}
+
+is_digit_(c: int) -> bool { return c >= 48 && c <= 57 }
+
+is_word_(c: int) -> bool { return is_alnum_(c) || c >= 0x80 }
+
+// index of byte b at or after `from`, -1 when absent
+find_byte_(t: string, from: int, b: int) -> int {
+    n = string.length(t)
+    i = from
+    while i < n {
+        if t[i] == b {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// index of `sub` at or after `from`, -1 when absent
+find_sub_(t: string, from: int, sub: string) -> int {
+    if from > string.length(t) {
+        return -1
+    }
+    return string.index_of_from(t, sub, from)
+}
+
+// Splits on '\n' like std.mem.splitScalar: "a\n" gives ["a", ""].
+split_lines_(block: string) -> string[] {
+    out = make([]string, 0)
+    n = string.length(block)
+    start = 0
+    i = 0
+    while i < n {
+        if block[i] == NL {
+            out.push(string.substring(block, start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    out.push(string.substring(block, start, n))
+    return out
+}
+
+is_list_item_(body: string) -> bool {
+    n0 = string.length(body)
+    if n0 >= 2 && (body[0] == DASH || body[0] == STAR || body[0] == PLUS) && body[1] == SPACE {
+        return true
+    }
+    n = 0
+    while n < n0 && n < 9 && is_digit_(body[n]) {
+        n = n + 1
+    }
+    return n > 0 && n + 1 < n0 && (body[n] == DOT || body[n] == RPAREN) && body[n + 1] == SPACE
+}
+
+is_rule_(body: string) -> bool {
+    count = 0
+    mark = 0
+    for i in 0..string.length(body) {
+        c = body[i]
+        if c == SPACE {
+            continue
+        }
+        if c != DASH && c != STAR && c != UNDERSCORE {
+            return false
+        }
+        if mark != 0 && c != mark {
+            return false
+        }
+        mark = c
+        count = count + 1
+    }
+    return count >= 3
+}
+
+// ---------------------------------------------------------------- table cells
+
+struct Cells {
+    s: string
+    pos: int
+    done: bool
+}
+
+cells_init_(line: string) -> *Cells {
+    s = trim_blank_(line)
+    if string.length(s) > 0 && s[0] == PIPE {
+        s = string.substring(s, 1, string.length(s))
+    }
+    n = string.length(s)
+    if n > 0 && s[n - 1] == PIPE && !(n > 1 && s[n - 2] == BSLASH) {
+        s = string.substring(s, 0, n - 1)
+    }
+    c = heap.new(Cells)
+    c.s = s
+    c.pos = 0
+    c.done = false
+    return c
+}
+
+// The next cell, false when there are no more.
+cells_next_(c: *Cells) -> (string, bool) {
+    if c.done {
+        return "", false
+    }
+    n = string.length(c.s)
+    i = c.pos
+    while i < n {
+        if c.s[i] == BSLASH {
+            i = i + 1
+        } else if c.s[i] == PIPE {
+            cell = string.substring(c.s, c.pos, i)
+            c.pos = i + 1
+            return trim_blank_(cell), true
+        }
+        i = i + 1
+    }
+    c.done = true
+    return trim_blank_(string.substring(c.s, c.pos, n)), true
+}
+
+cell_count_(line: string) -> int {
+    cells = cells_init_(line)
+    n = 0
+    while true {
+        _cell, ok = cells_next_(cells)
+        if !ok {
+            break
+        }
+        n = n + 1
+    }
+    heap.free(cells)
+    return n
+}
+
+// The column count of a delimiter row, -1 when `line` is not one. Fills
+// `aligns` (length MAX_COLS) when it has any length.
+parse_delimiter_(line: string, aligns: int[]) -> int {
+    if find_byte_(line, 0, PIPE) < 0 {
+        return -1
+    }
+    cells = cells_init_(line)
+    n = 0
+    while true {
+        cell, ok = cells_next_(cells)
+        if !ok {
+            break
+        }
+        if n == MAX_COLS {
+            return -1
+        }
+        cl = string.length(cell)
+        left = cl > 0 && cell[0] == COLON
+        right = cl > 0 && cell[cl - 1] == COLON
+        lo = if left { 1 } else { 0 }
+        hi = cl
+        if right && cl > lo {
+            hi = cl - 1
+        }
+        dashes = string.substring(cell, lo, hi)
+        if string.length(dashes) == 0 {
+            return -1
+        }
+        for k in 0..string.length(dashes) {
+            if dashes[k] != DASH {
+                return -1
+            }
+        }
+        if aligns.len > 0 {
+            if left && right {
+                aligns[n] = ALIGN_CENTER
+            } else if right {
+                aligns[n] = ALIGN_RIGHT
+            } else {
+                aligns[n] = ALIGN_LEFT
+            }
+        }
+        n = n + 1
+    }
+    heap.free(cells)
+    return n
+}
+
+// ---------------------------------------------------------------- lines
+
+struct Raw {
+    raw: string
+    start: int
+    end: int
+    terminated: bool
+}
+
+struct Lines {
+    text: string
+    st: State
+}
+
+lines_new(text: string, st: State) -> *Lines {
+    ls = heap.new(Lines)
+    ls.text = text
+    ls.st = st
+    return ls
+}
+
+// The raw line starting at `start`; false when start is past the end.
+raw_at_(ls: *Lines, start: int) -> (Raw, bool) {
+    n = string.length(ls.text)
+    if start > n {
+        return Raw { raw: "", start: 0, end: 0, terminated: false }, false
+    }
+    end = find_byte_(ls.text, start, NL)
+    if end < 0 {
+        end = n
+    }
+    return Raw { raw: trim_cr_(string.substring(ls.text, start, end)), start: start, end: end, terminated: end < n }, true
+}
+
+emit_(ls: *Lines, line_in: Line, continuation: bool) -> Line {
+    line = line_in
+    if ls.st.emitted {
+        line.gap = ls.st.blank || line.kind == KIND_HEADING || (line.kind == KIND_PROSE && !continuation && ls.st.prev == KIND_PROSE)
+    }
+    ls.st.blank = false
+    ls.st.emitted = true
+    if !continuation {
+        ls.st.prev = line.kind
+    }
+    return line
+}
+
+// The next line, false at the end of the text.
+lines_next(ls: *Lines) -> (Line, bool) {
+    n = string.length(ls.text)
+    while ls.st.pos <= n {
+        cur, _ok = raw_at_(ls, ls.st.pos)
+        raw = cur.raw
+        ls.st.pos = if cur.end == n { n + 1 } else { cur.end + 1 }
+        rl = string.length(raw)
+        indent = 0
+        while indent < rl && raw[indent] == SPACE {
+            indent = indent + 1
+        }
+        body = string.substring(raw, indent, rl)
+        bl = string.length(body)
+        if indent <= 3 && bl >= 3 && (body[0] == BACKTICK || body[0] == TILDE) {
+            fc = 0
+            while fc < bl && body[fc] == body[0] {
+                fc = fc + 1
+            }
+            if fc >= 3 {
+                if ls.st.fence {
+                    if body[0] == ls.st.fence_char && fc >= ls.st.fence_len && string.length(trim_blank_(string.substring(body, fc, bl))) == 0 {
+                        ls.st.fence = false
+                        ls.st.lex = syntax.STATE_NONE
+                        continue
+                    }
+                } else {
+                    ls.st.fence = true
+                    ls.st.fence_char = body[0]
+                    ls.st.fence_len = fc
+                    ls.st.fence_lang = syntax.lang_from_info(string.substring(body, fc, bl))
+                    ls.st.lex = syntax.STATE_NONE
+                    continue
+                }
+            }
+        }
+        if ls.st.fence {
+            fl = mk_line_(raw, cur.start, KIND_CODE)
+            fl.lang = ls.st.fence_lang
+            fl.lex = ls.st.lex
+            line = emit_(ls, fl, false)
+            if ls.st.fence_lang != syntax.LANG_NONE {
+                ls.st.lex = syntax.advance(ls.st.fence_lang, ls.st.lex, raw)
+            }
+            return line, true
+        }
+        if is_blank_(raw) {
+            ls.st.blank = true
+            ls.st.prev = KIND_OTHER
+            continue
+        }
+        marks = 0
+        while marks < bl && body[marks] == HASH {
+            marks = marks + 1
+        }
+        if indent <= 3 && marks > 0 && marks <= 6 && marks < bl && body[marks] == SPACE {
+            return emit_(ls, mk_line_(string.substring(body, marks + 1, bl), cur.start + indent + marks + 1, KIND_HEADING), false), true
+        }
+        if indent <= 3 && body[0] == GT {
+            skip = 1
+            if bl > 1 && body[1] == SPACE {
+                skip = 2
+            }
+            return emit_(ls, mk_line_(string.substring(body, skip, bl), cur.start + indent + skip, KIND_QUOTE), false), true
+        }
+        if is_rule_(body) {
+            return emit_(ls, mk_line_(raw, cur.start, KIND_OTHER), false), true
+        }
+        if is_list_item_(body) {
+            return emit_(ls, mk_line_(raw, cur.start, KIND_LIST), false), true
+        }
+        if indent <= 3 && cur.terminated && find_byte_(raw, 0, PIPE) >= 0 {
+            tl, tok = table_(ls, cur)
+            if tok {
+                return tl, true
+            }
+            if undecided_(ls, cur) {
+                ul = emit_(ls, mk_line_(raw, cur.start, KIND_PROSE), false)
+                ul.undecided = true
+                return ul, true
+            }
+        }
+        continuation = !ls.st.blank && (ls.st.prev == KIND_LIST || ls.st.prev == KIND_QUOTE)
+        return emit_(ls, mk_line_(raw, cur.start, KIND_PROSE), continuation), true
+    }
+    return mk_line_("", 0, KIND_PROSE), false
+}
+
+undecided_(ls: *Lines, header: Raw) -> bool {
+    nxt, ok = raw_at_(ls, header.end + 1)
+    if !ok {
+        return true
+    }
+    if nxt.terminated {
+        return false
+    }
+    for i in 0..string.length(nxt.raw) {
+        c = nxt.raw[i]
+        if c != PIPE && c != DASH && c != COLON && c != SPACE && c != TAB {
+            return false
+        }
+    }
+    return true
+}
+
+table_(ls: *Lines, header: Raw) -> (Line, bool) {
+    n = string.length(ls.text)
+    delim, dok = raw_at_(ls, header.end + 1)
+    if !dok {
+        return mk_line_("", 0, KIND_TABLE), false
+    }
+    cols = parse_delimiter_(delim.raw, make([]int, 0))
+    if cols < 0 {
+        return mk_line_("", 0, KIND_TABLE), false
+    }
+    if cell_count_(header.raw) != cols {
+        return mk_line_("", 0, KIND_TABLE), false
+    }
+    end = delim.end
+    closed = false
+    at = if delim.terminated { delim.end + 1 } else { n + 1 }
+    while true {
+        row, rok = raw_at_(ls, at)
+        if !rok {
+            break
+        }
+        if is_blank_(row.raw) || find_byte_(row.raw, 0, PIPE) < 0 {
+            closed = row.terminated
+            break
+        }
+        end = row.end
+        at = if row.terminated { row.end + 1 } else { n + 1 }
+    }
+    ls.st.pos = at
+    tl = mk_line_(string.substring(ls.text, header.start, end), header.start, KIND_TABLE)
+    tl.closed = closed
+    return emit_(ls, tl, false), true
+}
+
+// ---------------------------------------------------------------- inline spans
+
+const SPAN_CODE = 0
+const SPAN_BOLD = 1
+const SPAN_ITALIC = 2
+const SPAN_LINK = 3
+
+struct Span {
+    kind: int
+    open: int
+    end: int
+    close: int
+    url: string
+}
+
+no_span_() -> Span {
+    return Span { kind: 0, open: 0, end: 0, close: 0, url: "" }
+}
+
+span_(t: string, i: int) -> (Span, bool) {
+    n = string.length(t)
+    c = t[i]
+    if c == BACKTICK {
+        end = find_byte_(t, i + 1, BACKTICK)
+        if end < 0 {
+            return no_span_(), false
+        }
+        return Span { kind: SPAN_CODE, open: 1, end: end, close: 1, url: "" }, true
+    }
+    if c == STAR {
+        if i + 1 < n && t[i + 1] == STAR {
+            end = find_sub_(t, i + 2, "**")
+            if end < 0 {
+                return no_span_(), false
+            }
+            return Span { kind: SPAN_BOLD, open: 2, end: end, close: 2, url: "" }, true
+        }
+        if i + 1 >= n || t[i + 1] == SPACE {
+            return no_span_(), false
+        }
+        end = find_byte_(t, i + 1, STAR)
+        if end < 0 {
+            return no_span_(), false
+        }
+        if t[end - 1] == SPACE || (end + 1 < n && t[end + 1] == STAR) {
+            return no_span_(), false
+        }
+        return Span { kind: SPAN_ITALIC, open: 1, end: end, close: 1, url: "" }, true
+    }
+    if c == UNDERSCORE {
+        if (i > 0 && is_word_(t[i - 1])) || i + 1 >= n || t[i + 1] == SPACE || t[i + 1] == UNDERSCORE {
+            return no_span_(), false
+        }
+        end = i + 1
+        while true {
+            e = find_byte_(t, end, UNDERSCORE)
+            if e < 0 {
+                break
+            }
+            if t[e - 1] != SPACE && (e + 1 >= n || !is_word_(t[e + 1])) {
+                return Span { kind: SPAN_ITALIC, open: 1, end: e, close: 1, url: "" }, true
+            }
+            end = e + 1
+        }
+        return no_span_(), false
+    }
+    if c == LBRACKET {
+        if i > 0 && t[i - 1] == BANG {
+            return no_span_(), false
+        }
+        close = find_byte_(t, i + 1, RBRACKET)
+        if close < 0 {
+            return no_span_(), false
+        }
+        if close == i + 1 || close + 1 >= n || t[close + 1] != LPAREN {
+            return no_span_(), false
+        }
+        paren = find_byte_(t, close + 2, RPAREN)
+        if paren < 0 {
+            return no_span_(), false
+        }
+        url = string.substring(t, close + 2, paren)
+        if string.length(url) == 0 || find_byte_(url, 0, SPACE) >= 0 || find_byte_(url, 0, NL) >= 0 {
+            return no_span_(), false
+        }
+        return Span { kind: SPAN_LINK, open: 1, end: close, close: paren + 1 - close, url: url }, true
+    }
+    return no_span_(), false
+}
+
+struct Inline {
+    text: string
+    pos: int
+    base: screen.Style
+    code_bg: int
+    url: string
+    url_stage: int
+}
+
+inline_new_(text: string, base: screen.Style, code_bg: int) -> *Inline {
+    s = heap.new(Inline)
+    s.text = text
+    s.pos = 0
+    s.base = base
+    s.code_bg = code_bg
+    s.url = ""
+    s.url_stage = 0
+    return s
+}
+
+with_attr_(st: screen.Style, attr: int) -> screen.Style {
+    return screen.Style { fg: st.fg, bg: st.bg, ul: st.ul, ul_style: st.ul_style, attrs: st.attrs | attr }
+}
+
+with_fg_(st: screen.Style, fg: int) -> screen.Style {
+    return screen.Style { fg: fg, bg: st.bg, ul: st.ul, ul_style: st.ul_style, attrs: st.attrs }
+}
+
+with_bg_(st: screen.Style, bg: int) -> screen.Style {
+    return screen.Style { fg: st.fg, bg: bg, ul: st.ul, ul_style: st.ul_style, attrs: st.attrs }
+}
+
+inline_next_(s: *Inline) -> (screen.Segment, bool) {
+    if s.url_stage != 0 {
+        style = with_attr_(s.base, screen.DIM)
+        t = if s.url_stage == 1 { " (" } else if s.url_stage == 2 { s.url } else { ")" }
+        s.url_stage = if s.url_stage == 3 { 0 } else { s.url_stage + 1 }
+        return screen.seg(t, style), true
+    }
+    n = string.length(s.text)
+    if s.pos >= n {
+        return screen.seg("", s.base), false
+    }
+    i = s.pos
+    while i < n {
+        found, ok = span_(s.text, i)
+        if !ok {
+            i = i + 1
+            continue
+        }
+        if i > s.pos {
+            plain = string.substring(s.text, s.pos, i)
+            s.pos = i
+            return screen.seg(plain, s.base), true
+        }
+        s.pos = found.end + found.close
+        style = s.base
+        if found.kind == SPAN_CODE {
+            style = with_bg_(style, s.code_bg)
+        } else if found.kind == SPAN_BOLD {
+            style = with_attr_(style, screen.BOLD)
+        } else if found.kind == SPAN_ITALIC {
+            style = with_attr_(style, screen.ITALIC)
+        } else {
+            s.url = found.url
+            s.url_stage = 1
+        }
+        return screen.seg(string.substring(s.text, i + found.open, found.end), style), true
+    }
+    plain = string.substring(s.text, s.pos, n)
+    s.pos = n
+    return screen.seg(plain, s.base), true
+}
+
+// ---------------------------------------------------------------- printing
+
+rows_(result: screen.PrintResult) -> int {
+    r = result.row + (if result.col > 0 { 1 } else { 0 })
+    return if r > 1 { r } else { 1 }
+}
+
+no_result_() -> screen.PrintResult {
+    return screen.PrintResult { col: 0, row: 0, overflow: false }
+}
+
+print_tabbed_(win: screen.Window, text: string, style: screen.Style, from: screen.PrintResult, commit: bool) -> screen.PrintResult {
+    result = from
+    n = string.length(text)
+    pos = 0
+    while pos < n {
+        tab = find_byte_(text, pos, TAB)
+        if tab < 0 {
+            tab = n
+        }
+        result = screen.draw_segment(win, screen.seg(string.substring(text, pos, tab), style), row_offset: result.row, col_offset: result.col, commit: commit)
+        if tab == n {
+            break
+        }
+        result = screen.draw_segment(win, screen.seg("    ", style), row_offset: result.row, col_offset: result.col, commit: commit)
+        pos = tab + 1
+    }
+    return result
+}
+
+struct Code {
+    lang: int
+    lex: int
+}
+
+token_style_(base: screen.Style, class: int, theme: Theme) -> screen.Style {
+    if class == syntax.CLASS_COMMENT {
+        return with_attr_(base, screen.DIM)
+    }
+    if class == syntax.CLASS_STRING {
+        return with_fg_(base, theme.string_color)
+    }
+    if class == syntax.CLASS_KEYWORD {
+        return with_attr_(base, screen.BOLD)
+    }
+    return base
+}
+
+code_line_(win: screen.Window, text: string, base: screen.Style, code: Code, theme: Theme, commit: bool) -> int {
+    result = no_result_()
+    if code.lang != syntax.LANG_NONE {
+        lexer = syntax.lexer_init(code.lang, code.lex, text)
+        while true {
+            token, ok = syntax.lexer_next(lexer)
+            if !ok {
+                break
+            }
+            result = print_tabbed_(win, string.substring(text, token.start, token.end), token_style_(base, token.class, theme), result, commit)
+        }
+        heap.free(lexer)
+    } else {
+        result = print_tabbed_(win, text, base, result, commit)
+    }
+    return rows_(result)
+}
+
+shade_(win: screen.Window, count: int, bg: int) {
+    for r in 0..count {
+        for c in 0..win.width {
+            cell, ok = screen.win_read(win, c, r)
+            if !ok {
+                continue
+            }
+            cell.style = with_bg_(cell.style, bg)
+            cell.is_default = false
+            screen.win_write(win, c, r, cell)
+        }
+    }
+}
+
+print_code_(row: screen.Window, text: string, code: Code, theme: Theme, commit: bool) -> int {
+    if row.width <= 2 {
+        return code_line_(row, text, screen.style(), code, theme, commit)
+    }
+    if theme.tint != screen.DEFAULT {
+        used = code_line_(screen.child(row, x_off: 1, width: row.width - 2), text, screen.style(bg: theme.tint), code, theme, commit)
+        if commit {
+            shade_(row, used, theme.tint)
+        }
+        return used
+    }
+    bar = screen.style(attrs: screen.DIM)
+    used = code_line_(screen.child(row, x_off: 2), text, screen.style(), code, theme, commit)
+    for r in 0..used {
+        screen.draw_segment(row, screen.seg("│ ", bar), row_offset: r, commit: commit)
+    }
+    return used
+}
+
+print_prose_(row: screen.Window, text: string, base: screen.Style, theme: Theme, commit: bool) -> int {
+    spans = inline_new_(text, base, theme.tint)
+    result = no_result_()
+    while true {
+        segment, ok = inline_next_(spans)
+        if !ok {
+            break
+        }
+        result = screen.draw_segment(row, segment, row_offset: result.row, col_offset: result.col, wrap: screen.WRAP_WORD, commit: commit)
+    }
+    heap.free(spans)
+    return rows_(result)
+}
+
+print_quote_(row: screen.Window, text: string, theme: Theme, commit: bool) -> int {
+    if row.width <= 2 {
+        return print_prose_(row, text, screen.style(), theme, commit)
+    }
+    used = print_prose_(screen.child(row, x_off: 2), text, screen.style(), theme, commit)
+    for r in 0..used {
+        screen.draw_segment(row, screen.seg("│ ", screen.style(attrs: screen.DIM)), row_offset: r, commit: commit)
+    }
+    return used
+}
+
+unescaped_width_(win: screen.Window, text: string) -> int {
+    w = 0
+    rest = text
+    while true {
+        at = find_sub_(rest, 0, "\\|")
+        if at < 0 {
+            break
+        }
+        w = w + screen.win_gwidth(win, string.substring(rest, 0, at)) + 1
+        rest = string.substring(rest, at + 2, string.length(rest))
+    }
+    return w + screen.win_gwidth(win, rest)
+}
+
+cell_width_(win: screen.Window, cell: string) -> int {
+    spans = inline_new_(cell, screen.style(), screen.DEFAULT)
+    w = 0
+    while true {
+        segment, ok = inline_next_(spans)
+        if !ok {
+            break
+        }
+        w = w + unescaped_width_(win, segment.text)
+    }
+    heap.free(spans)
+    return w
+}
+
+print_cell_(win: screen.Window, x: int, cell: string, base: screen.Style, theme: Theme) {
+    spans = inline_new_(cell, base, theme.tint)
+    col = x
+    while true {
+        segment, ok = inline_next_(spans)
+        if !ok {
+            break
+        }
+        rest = segment.text
+        while true {
+            at = find_sub_(rest, 0, "\\|")
+            piece = if at >= 0 { string.substring(rest, 0, at) } else { rest }
+            screen.draw_segment(win, screen.seg(piece, segment.style), col_offset: col, wrap: screen.WRAP_NONE)
+            col = col + screen.win_gwidth(win, piece)
+            if at < 0 {
+                break
+            }
+            screen.draw_segment(win, screen.seg("|", segment.style), col_offset: col, wrap: screen.WRAP_NONE)
+            col = col + 1
+            rest = string.substring(rest, at + 2, string.length(rest))
+        }
+    }
+    heap.free(spans)
+}
+
+struct Table {
+    cols: int
+    aligns: int[]
+    widths: int[]
+    total: int
+}
+
+// The table laid out for `win`; false when it is not one or does not fit.
+table_measure_(win: screen.Window, block: string) -> (Table, bool) {
+    lines = split_lines_(block)
+    absent = Table { cols: 0, aligns: make([]int, 0), widths: make([]int, 0), total: 0 }
+    header = trim_cr_(lines[0])
+    if lines.len < 2 {
+        return absent, false
+    }
+    aligns = make([]int, MAX_COLS)
+    cols = parse_delimiter_(trim_cr_(lines[1]), aligns)
+    if cols < 0 {
+        return absent, false
+    }
+    widths = make([]int, MAX_COLS)
+    measure_row_(win, cols, widths, header)
+    for i in 2..lines.len {
+        measure_row_(win, cols, widths, trim_cr_(lines[i]))
+    }
+    total = (cols - 1) * COL_GAP
+    for i in 0..cols {
+        total = total + widths[i]
+    }
+    if total > win.width {
+        return absent, false
+    }
+    return Table { cols: cols, aligns: aligns, widths: widths, total: total }, true
+}
+
+measure_row_(win: screen.Window, cols: int, widths: int[], line: string) {
+    cells = cells_init_(line)
+    i = 0
+    while true {
+        cell, ok = cells_next_(cells)
+        if !ok {
+            break
+        }
+        if i == cols {
+            break
+        }
+        w = cell_width_(win, cell)
+        if w > widths[i] {
+            widths[i] = w
+        }
+        i = i + 1
+    }
+    heap.free(cells)
+}
+
+table_print_row_(t: Table, win: screen.Window, line: string, base: screen.Style, theme: Theme) {
+    cells = cells_init_(line)
+    x = 0
+    for i in 0..t.cols {
+        cell, ok = cells_next_(cells)
+        if !ok {
+            cell = ""
+        }
+        pad = t.widths[i] - cell_width_(win, cell)
+        if pad < 0 {
+            pad = 0
+        }
+        at = x
+        if t.aligns[i] == ALIGN_CENTER {
+            at = x + pad / 2
+        } else if t.aligns[i] == ALIGN_RIGHT {
+            at = x + pad
+        }
+        print_cell_(win, at, cell, base, theme)
+        x = x + t.widths[i] + COL_GAP
+    }
+    heap.free(cells)
+}
+
+print_table_(win: screen.Window, block: string, theme: Theme, commit: bool) -> int {
+    t, ok = table_measure_(win, block)
+    lines = split_lines_(block)
+    if !ok {
+        height = 0
+        for i in 0..lines.len {
+            height = height + print_prose_(screen.child(win, y_off: height), trim_cr_(lines[i]), screen.style(), theme, commit)
+        }
+        return height
+    }
+    header = trim_cr_(lines[0])
+    if commit {
+        table_print_row_(t, win, header, screen.style(attrs: screen.DIM), theme)
+    }
+    height = 1
+    for i in 2..lines.len {
+        if commit {
+            table_print_row_(t, screen.child(win, y_off: height), trim_cr_(lines[i]), screen.style(), theme)
+        }
+        height = height + 1
+    }
+    return height
+}
+
+print_line_(win: screen.Window, line: Line, theme: Theme, commit: bool) -> int {
+    top = if line.gap { 1 } else { 0 }
+    row = screen.child(win, y_off: top)
+    used = 0
+    if line.kind == KIND_CODE {
+        used = print_code_(row, line.text, Code { lang: line.lang, lex: line.lex }, theme, commit)
+    } else if line.kind == KIND_HEADING {
+        used = print_prose_(row, line.text, screen.style(fg: screen.color_index(4), attrs: screen.BOLD), theme, commit)
+    } else if line.kind == KIND_QUOTE {
+        used = print_quote_(row, line.text, theme, commit)
+    } else if line.kind == KIND_TABLE {
+        used = print_table_(row, line.text, theme, commit)
+    } else {
+        used = print_prose_(row, line.text, screen.style(), theme, commit)
+    }
+    return top + used
+}
+
+// Renders `text` into `win` (nothing is written when commit is false: the
+// result only measures) and returns the number of rows it takes, at least 1.
+`print`(win: screen.Window, text: string, theme: Theme, commit: bool) -> int {
+    lines = lines_new(text, fresh_state())
+    height = 0
+    while true {
+        line, ok = lines_next(lines)
+        if !ok {
+            break
+        }
+        row = screen.child(win, y_off: height)
+        height = height + print_line_(row, line, theme, commit)
+    }
+    heap.free(lines)
+    return if height > 1 { height } else { 1 }
+}
+
+// ---------------------------------------------------------------- cache
+
+struct CachedLine {
+    offset: int
+    len: int
+    kind: int
+    gap: bool
+    lang: int
+    lex: int
+    y: int
+    rows: int
+}
+
+// A per-entry layout cache: the settled lines of an appended-to text and
+// their row counts, valid for one window width.
+struct Cache {
+    lines: CachedLine[]
+    width: int
+    st: State
+    height: int
+}
+
+cache_new() -> *Cache {
+    c = heap.new(Cache)
+    c.lines = make([]CachedLine, 0)
+    c.width = 0
+    c.st = fresh_state()
+    c.height = 0
+    return c
+}
+
+cache_free(c: *Cache) {
+    heap.free(c)
+}
+
+// Lines whose layout may still change (partial, undecided table header, open
+// table) stay out of the cache.
+cache_draw(c: *Cache, win: screen.Window, text: string, theme: Theme, commit: bool) -> int {
+    n = string.length(text)
+    if c.width != win.width || c.st.pos > n {
+        c.lines = make([]CachedLine, 0)
+        c.width = win.width
+        c.st = fresh_state()
+        c.height = 0
+    }
+    parser = lines_new(text, c.st)
+    while true {
+        before = parser.st
+        line, ok = lines_next(parser)
+        if !ok {
+            break
+        }
+        if parser.st.pos > n || line.undecided || (line.kind == KIND_TABLE && !line.closed) {
+            parser.st = before
+            break
+        }
+        h = print_line_(win, line, theme, false)
+        c.lines.push(CachedLine { offset: line.offset, len: string.length(line.text), kind: line.kind, gap: line.gap, lang: line.lang, lex: line.lex, y: c.height, rows: h })
+        c.height = c.height + h
+        c.st = parser.st
+    }
+    heap.free(parser)
+    if commit {
+        for i in 0..c.lines.len {
+            cl = c.lines[i]
+            if win.y_off + cl.y + cl.rows <= 0 {
+                continue
+            }
+            if win.y_off + cl.y >= win.surf.height {
+                break
+            }
+            ln = Line { text: string.substring(text, cl.offset, cl.offset + cl.len), offset: cl.offset, kind: cl.kind, gap: cl.gap, closed: true, undecided: false, lang: cl.lang, lex: cl.lex }
+            print_line_(screen.child(win, y_off: cl.y), ln, theme, true)
+        }
+    }
+    height = c.height
+    tail = lines_new(text, c.st)
+    while true {
+        line, ok = lines_next(tail)
+        if !ok {
+            break
+        }
+        height = height + print_line_(screen.child(win, y_off: height), line, theme, commit)
+    }
+    heap.free(tail)
+    return if height > 1 { height } else { 1 }
+}

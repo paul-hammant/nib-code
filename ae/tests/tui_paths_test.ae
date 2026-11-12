@@ -1,0 +1,230 @@
+// Ports the tests of upstream src/tui/paths.zig. All six upstream tests are
+// ported under their exact names. Added (not upstream): two tests of the
+// Index itself (set_entries/with_entries, and a background refresh with the
+// wake closure and the 5 s freshness rule on an injected clock).
+import std.spec
+import std.string
+import std.list
+import std.fs
+import std.sync
+import nib.tui.paths
+
+expect_mention_(text: string, cursor: int, start: int, query: string) {
+    s, q = paths.mention(text, cursor)
+    spec.assert_eq(s, start, "start of '${text}'")
+    if start >= 0 { spec.assert_str_eq(q, query, "query of '${text}'") }
+}
+
+box_(path: string, dir: int) -> ptr {
+    e = heap.new(paths.Entry)
+    e.path = string.copy(path)
+    e.dir = dir
+    return e as ptr
+}
+
+hit_paths_(entries: ptr[], query: string) -> string[] {
+    hits = paths.top(entries, query)
+    string[] out = []
+    i = 0
+    while i < hits.len {
+        out.push(string.copy((entries[hits[i].index] as *paths.Entry).path))
+        i = i + 1
+    }
+    return out
+}
+
+struct Acc {
+    items: string[]
+}
+
+collect_(ctx: ptr, entries: ptr[]) {
+    acc = ctx as *Acc
+    i = 0
+    while i < entries.len {
+        e = entries[i] as *paths.Entry
+        if e.dir == 1 {
+            acc.items.push("${e.path}/")
+        } else {
+            acc.items.push(string.copy(e.path))
+        }
+        i = i + 1
+    }
+}
+
+// The paths in the index, directories with a trailing slash.
+listing_(ix: *paths.Index) -> string[] {
+    acc = heap.new(Acc)
+    paths.with_entries(ix, acc as ptr, |c: ptr, es: ptr[]| { collect_(c, es) })
+    return acc.items
+}
+
+wait_listed_(ix: *paths.Index) {
+    n = 0
+    while paths.generation(ix) == 0 && n < 5000 {
+        sleep(2)
+        n = n + 1
+    }
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.paths") {
+        spec.it("mention triggers at the start and after whitespace but not inside words") callback {
+            expect_mention_("@sr", 3, 0, "sr")
+            expect_mention_("@", 1, 0, "")
+            expect_mention_("look at @src/ma", 15, 8, "src/ma")
+            expect_mention_("a\n@x", 4, 2, "x")
+            expect_mention_("mail a@b.com", 12, -1, "")
+            expect_mention_("a@b", 3, -1, "")
+            expect_mention_("@sr and more", 12, -1, "")
+            expect_mention_("hello ", 6, -1, "")
+            expect_mention_("@src/ done", 5, 0, "src/")
+        }
+        spec.it("quoted mentions span spaces until the closing quote") callback {
+            expect_mention_("see @\"my dir/fi", 15, 4, "my dir/fi")
+            expect_mention_("see @\"my file.txt\" ok", 21, -1, "")
+            expect_mention_("x@\"a b", 6, -1, "")
+        }
+        spec.it("insertion quotes paths with spaces and keeps directories open") callback {
+            spec.assert_str_eq(paths.insertion("src/main.zig", 0), "@src/main.zig ", "file")
+            spec.assert_str_eq(paths.insertion("src", 1), "@src/", "dir")
+            spec.assert_str_eq(paths.insertion("my file.txt", 0), "@\"my file.txt\" ", "spaced")
+            spaced_dir = paths.insertion("my dir", 1)
+            spec.assert_str_eq(spaced_dir, "@\"my dir/", "spaced dir")
+            _s, q = paths.mention(spaced_dir, string.length(spaced_dir))
+            spec.assert_str_eq(q, "my dir/", "round trip")
+        }
+        spec.it("ranking: basename prefix, then path prefix, then subsequence, shorter first") callback {
+            ptr[] entries = []
+            entries.push(box_("docs/session.md", 0))
+            entries.push(box_("src/session.zig", 0))
+            entries.push(box_("src", 1))
+            entries.push(box_("session", 1))
+            entries.push(box_("a/s/e/s/s/ion", 0))
+            entries.push(box_("src/tools/search.zig", 0))
+            found = hit_paths_(entries, "ses")
+            spec.assert_eq(found.len, 4, "four")
+            spec.assert_str_eq(found[0], "session", "0")
+            spec.assert_str_eq(found[1], "docs/session.md", "1")
+            spec.assert_str_eq(found[2], "src/session.zig", "2")
+            spec.assert_str_eq(found[3], "a/s/e/s/s/ion", "3")
+
+            by_path = hit_paths_(entries, "src/s")
+            spec.assert_str_eq(by_path[0], "src/session.zig", "by_path 0")
+            spec.assert_str_eq(by_path[1], "src/tools/search.zig", "by_path 1")
+            spec.assert_eq(by_path.len, 2, "by_path len")
+
+            inside = hit_paths_(entries, "src/")
+            spec.assert_str_eq(inside[0], "src/session.zig", "inside 0")
+            spec.assert_str_eq(inside[1], "src/tools/search.zig", "inside 1")
+
+            all = hit_paths_(entries, "")
+            spec.assert_str_eq(all[0], "src", "all 0")
+            spec.assert_eq(all.len, 6, "all len")
+        }
+        spec.it("ranking keeps at most eight hits and ignores case") callback {
+            ptr[] entries = []
+            i = 0
+            while i < 20 {
+                name = "File${string.pad_start(string.from_int(i), 2, 48)}"
+                entries.push(box_(name, 0))
+                i = i + 1
+            }
+            hits = paths.top(entries, "file")
+            spec.assert_eq(hits.len, paths.MAX_HITS, "max hits")
+            spec.assert_eq(hits.len, 8, "eight hits")
+            spec.assert_str_eq((entries[hits[0].index] as *paths.Entry).path, "File00", "first")
+            spec.assert_str_eq((entries[hits[7].index] as *paths.Entry).path, "File07", "eighth")
+        }
+        spec.it("index lists files and directories, skips ignored paths and .git") callback {
+            // upstream calls walk.files directly (the Index's job); here the
+            // Index itself lists it, from inside the temp dir.
+            root, e0 = fs.make_temp_dir("", "nibpaths")
+            spec.assert_str_eq(e0, "", "make_temp_dir")
+            fs.mkdir_p("${root}/src/inner")
+            fs.mkdir_p("${root}/build")
+            fs.mkdir_p("${root}/.git")
+            fs.write("${root}/.gitignore", "build/\n")
+            fs.write("${root}/src/main.zig", "")
+            fs.write("${root}/build/out", "")
+            fs.write("${root}/.git/config", "")
+            ix = paths.new(root, || { return 0 as long })
+            paths.refresh(ix, null)
+            wait_listed_(ix)
+            want = [".gitignore", "src/", "src/inner/", "src/main.zig"]
+            got = listing_(ix)
+            spec.assert_eq(got.len, 4, "four entries")
+            i = 0
+            while i < got.len && i < 4 {
+                spec.assert_true(string.ends_with(got[i], want[i]) != 0, "ends with ${want[i]}: ${got[i]}")
+                i = i + 1
+            }
+            paths.free(ix)
+            fs.remove_tree(root)
+        }
+        spec.it("(extra) path prefix beats subsequence; prefix matching folds case") callback {
+            ptr[] entries = []
+            entries.push(box_("x/y", 0))
+            entries.push(box_("xy/long/path", 0))
+            found = hit_paths_(entries, "xy")
+            spec.assert_str_eq(found[0], "xy/long/path", "path prefix first")
+            spec.assert_str_eq(found[1], "x/y", "subsequence second")
+            ptr[] cased = []
+            cased.push(box_("b/zeta.txt", 0))
+            cased.push(box_("Zeta", 0))
+            f2 = hit_paths_(cased, "zet")
+            spec.assert_str_eq(f2[0], "Zeta", "folded basename prefix, shorter first")
+        }
+        spec.it("(extra) set_entries marks directories by a trailing slash and replaces the listing") callback {
+            ix = paths.new(".", || { return 0 as long })
+            spec.assert_eq(listing_(ix).len, 0, "empty before the first listing")
+            spec.assert_eq(paths.generation(ix), 0, "generation 0")
+            paths.set_entries(ix, ["src/", "src/a.zig", "b.md"])
+            got = listing_(ix)
+            spec.assert_eq(got.len, 3, "three")
+            spec.assert_str_eq(got[0], "src/", "dir")
+            spec.assert_str_eq(got[1], "src/a.zig", "file")
+            paths.set_entries(ix, ["only"])
+            spec.assert_eq(listing_(ix).len, 1, "replaced")
+            spec.assert_eq(paths.generation(ix), 2, "generation 2")
+            paths.free(ix)
+        }
+        spec.it("(extra) refresh lists in the background, wakes, and is skipped while fresh") callback {
+            root, e0 = fs.make_temp_dir("", "nibpaths")
+            spec.assert_str_eq(e0, "", "make_temp_dir")
+            fs.write("${root}/a.txt", "")
+            clock = sync.atomic_new(1000)
+            woke = sync.atomic_new(0)
+            ix = paths.new(root, || { return sync.atomic_load(clock) as long })
+            paths.set_wake(ix, || { sync.atomic_store(woke, 1) })
+            paths.refresh(ix, null)
+            wait_listed_(ix)
+            n = 0
+            while sync.atomic_load(woke) == 0 && n < 5000 {
+                sleep(2)
+                n = n + 1
+            }
+            spec.assert_eq(sync.atomic_load(woke), 1, "woke")
+            spec.assert_eq(paths.generation(ix), 1, "one listing")
+            fs.write("${root}/b.txt", "")
+            sync.atomic_store(clock, 3000)
+            paths.refresh(ix, null)
+            sleep(100)
+            spec.assert_eq(paths.generation(ix), 1, "fresh: not listed again")
+            sync.atomic_store(clock, 7000)
+            paths.refresh(ix, null)
+            n = 0
+            while paths.generation(ix) < 2 && n < 5000 {
+                sleep(2)
+                n = n + 1
+            }
+            spec.assert_eq(paths.generation(ix), 2, "stale: listed again")
+            spec.assert_eq(listing_(ix).len, 2, "two files now")
+            paths.free(ix)
+            sync.atomic_free(clock)
+            sync.atomic_free(woke)
+            fs.remove_tree(root)
+        }
+    }
+    return spec.run_summary(fw)
+}

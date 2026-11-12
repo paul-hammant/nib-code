@@ -1,0 +1,37 @@
+// tui.long_text: when a pasted/long text counts as long (upstream
+// src/tui/long_text.zig).
+// Differences from upstream: none (invalid UTF-8 falls back to the byte
+// length, as upstream's utf8CountCodepoints catch does).
+
+import std.string
+import term.screen
+
+exports(lines, chars, is_long)
+
+lines(text: string) -> int {
+    n = 1
+    i = 0
+    len = string.length(text)
+    while i < len {
+        if text[i] == 10 { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+chars(text: string) -> int {
+    len = string.length(text)
+    n = 0
+    off = 0
+    while off < len {
+        if screen.codepoint_at(text, off) < 0 { return len }
+        off = off + screen.codepoint_len(text, off)
+        n = n + 1
+    }
+    return n
+}
+
+is_long(text: string) -> int {
+    if lines(text) > 5 || chars(text) > 800 { return 1 }
+    return 0
+}

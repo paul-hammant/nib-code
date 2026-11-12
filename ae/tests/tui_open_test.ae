@@ -1,0 +1,169 @@
+// Ports the tests of upstream src/tui/open.zig. All four upstream tests are
+// ported under their exact names. Added (not upstream): launch.
+import std.spec
+import std.string
+import std.list
+import std.fs
+import term.screen
+import nib.tui.open
+
+// One Gr per codepoint, column n, width 1.
+cells_(text: string) -> open.Gr[] {
+    out = make([]open.Gr, 0)
+    off = 0
+    n = 0
+    len = string.length(text)
+    while off < len {
+        cl = screen.codepoint_len(text, off)
+        out.push(open.Gr { col: n, width: 1, text: string.substring(text, off, off + cl) })
+        off = off + cl
+        n = n + 1
+    }
+    return out
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.open") {
+        spec.it("token detection strips punctuation and reads :line[:col]") callback {
+            row = cells_("see (src/tui.zig:42:7), then `a.zig`.")
+            first, ok1 = open.token_at(row, 8)
+            spec.assert_true(ok1, "first found")
+            spec.assert_str_eq(first.token.path, "src/tui.zig", "first path")
+            spec.assert_eq(first.token.line, 42, "first line")
+            spec.assert_eq(first.x0, 5, "x0")
+            spec.assert_eq(first.x1, 20, "x1")
+            second, ok2 = open.token_at(row, 31)
+            spec.assert_true(ok2, "second found")
+            spec.assert_str_eq(second.token.path, "a.zig", "second path")
+            spec.assert_eq(second.token.line, 1, "second line")
+            _a, ok3 = open.token_at(row, 3)
+            spec.assert_false(ok3, "blank between words")
+            _b, ok4 = open.token_at(row, 4)
+            spec.assert_true(ok4, "paren column is in the word")
+            _c, ok5 = open.token_at(cells_("go to https://example.com/a.zig now"), 12)
+            spec.assert_false(ok5, "url is not a file")
+            z, okz = open.parse_token("a.zig:0")
+            spec.assert_true(okz, "a.zig:0")
+            spec.assert_str_eq(z.path, "a.zig", "a.zig:0 path")
+            spec.assert_eq(z.line, 1, "a.zig:0 line")
+            _d, ok6 = open.parse_token(":12")
+            spec.assert_false(ok6, ":12 has no path")
+        }
+        spec.it("changes rows accept only a leading path followed by counts") callback {
+            a, oka = open.change_row_at(cells_("  src/a.zig       +30 −4"), 5)
+            spec.assert_true(oka, "a")
+            spec.assert_str_eq(a.token.path, "src/a.zig", "a path")
+            b, okb = open.change_row_at(cells_("  b.zig (new) +3 −0"), 3)
+            spec.assert_true(okb, "b")
+            spec.assert_str_eq(b.token.path, "b.zig", "b path")
+            c, okc = open.change_row_at(cells_("c.zig         −5"), 0)
+            spec.assert_true(okc, "c")
+            spec.assert_str_eq(c.token.path, "c.zig", "c path")
+            _1, ok1 = open.change_row_at(cells_("  src/a.zig is changed"), 5)
+            spec.assert_false(ok1, "words after the path")
+            _2, ok2 = open.change_row_at(cells_("  see src/a.zig +3"), 8)
+            spec.assert_false(ok2, "text before the path")
+            _3, ok3 = open.change_row_at(cells_("  src/a.zig"), 5)
+            spec.assert_false(ok3, "no counts")
+        }
+        spec.it("open template splits without a shell and substitutes path and line") callback {
+            words, err = open.argv("zed  {path}:{line}", "/p/my file.zig", 12)
+            spec.assert_str_eq(err, "", "no error")
+            spec.assert_eq(words.len, 2, "two words")
+            spec.assert_str_eq(words[0], "zed", "zed")
+            spec.assert_str_eq(words[1], "/p/my file.zig:12", "path:line")
+            plain, err2 = open.argv("code --goto {path}:{line}:1", "/p/a", 1)
+            spec.assert_str_eq(err2, "", "no error 2")
+            spec.assert_str_eq(plain[2], "/p/a:1:1", "goto")
+            _w, err3 = open.argv("  ", "/p", 1)
+            spec.assert_str_eq(err3, "EmptyTemplate", "empty template")
+        }
+        spec.it("only existing regular files inside the project resolve, once per path") callback {
+            base, e0 = fs.make_temp_dir("", "nibopen")
+            spec.assert_str_eq(e0, "", "make_temp_dir")
+            fs.mkdir_p("${base}/project/src")
+            fs.write("${base}/project/src/a.zig", "x")
+            fs.write("${base}/outside.txt", "x")
+            project = "${base}/project"
+            cwd = "${project}/src"
+            files = open.files_new()
+            expected = "${project}/src/a.zig"
+            r1, k1 = open.files_find(files, cwd, project, "a.zig")
+            spec.assert_true(k1, "a.zig")
+            spec.assert_str_eq(r1, expected, "a.zig path")
+            r2, k2 = open.files_find(files, cwd, project, "../src/a.zig")
+            spec.assert_true(k2, "../src/a.zig")
+            spec.assert_str_eq(r2, expected, "../src path")
+            r3, k3 = open.files_find(files, cwd, project, expected)
+            spec.assert_true(k3, "absolute")
+            spec.assert_str_eq(r3, expected, "absolute path")
+            _m, k4 = open.files_find(files, cwd, project, "missing.zig")
+            spec.assert_false(k4, "missing")
+            _p, k5 = open.files_find(files, cwd, project, "..")
+            spec.assert_false(k5, "the project itself")
+            _o, k6 = open.files_find(files, cwd, project, "../../outside.txt")
+            spec.assert_false(k6, "outside")
+            spec.assert_true(open.files_count(files) >= 2, "cached")
+            _a, k7 = open.files_find(files, cwd, project, "a.zig")
+            spec.assert_true(k7, "again from the cache")
+            // a file that vanishes is still reported from the cache, as upstream
+            fs.unlink("${project}/src/a.zig")
+            _b, k8 = open.files_find(files, cwd, project, "a.zig")
+            spec.assert_true(k8, "cached answer kept")
+            open.files_clear(files)
+            _c2, k9 = open.files_find(files, cwd, project, "a.zig")
+            spec.assert_false(k9, "after clear it is looked up again")
+            open.files_free(files)
+            fs.remove_tree(base)
+        }
+        spec.it("(extra) edge cases: long numbers, (new) only first, trailing punctuation, directories") callback {
+            long_n, ok1 = open.parse_token("a.zig:1234567890")
+            spec.assert_true(ok1, "ten digits stay in the path")
+            spec.assert_str_eq(long_n.path, "a.zig:1234567890", "path")
+            nine, ok2 = open.parse_token("a.zig:123456789:2")
+            spec.assert_true(ok2, "nine digits")
+            spec.assert_eq(nine.line, 123456789, "line")
+            spec.assert_str_eq(nine.path, "a.zig", "nine path")
+            _r, ok3 = open.change_row_at(cells_("  x.zig +3 (new)"), 3)
+            spec.assert_false(ok3, "(new) only before the counts")
+            only_trail, ok4 = open.token_at(cells_("(a)."), 1)
+            spec.assert_true(ok4, "a")
+            spec.assert_str_eq(only_trail.token.path, "a", "stripped both sides")
+            _s, ok5 = open.token_at(cells_("(.)"), 1)
+            spec.assert_false(ok5, "only punctuation")
+            spec.assert_eq(open.count_only("+3 −1"), 1, "counts")
+            spec.assert_eq(open.count_only("+ 3"), 0, "bare plus")
+            spec.assert_eq(open.count_only(""), 0, "empty")
+            base, e0 = fs.make_temp_dir("", "nibopen")
+            spec.assert_str_eq(e0, "", "make_temp_dir")
+            fs.mkdir_p("${base}/project/src")
+            files = open.files_new()
+            _d, ok6 = open.files_find(files, "${base}/project", "${base}/project", "src")
+            spec.assert_false(ok6, "a directory is not a file")
+            open.files_free(files)
+            fs.remove_tree(base)
+        }
+        spec.it("(extra) launch starts the program detached and reports a missing one") callback {
+            base, e0 = fs.make_temp_dir("", "nibopen")
+            spec.assert_str_eq(e0, "", "make_temp_dir")
+            cmd = list.list_new()
+            list.list_add(cmd, "/usr/bin/touch")
+            list.list_add(cmd, "${base}/made")
+            spec.assert_str_eq(open.launch(cmd, null), "", "launched")
+            n = 0
+            while fs.exists("${base}/made") == 0 && n < 2000 {
+                sleep(5)
+                n = n + 1
+            }
+            spec.assert_true(fs.exists("${base}/made") != 0, "the child ran")
+            bad = list.list_new()
+            list.list_add(bad, "/nonexistent/prog")
+            spec.assert_true(open.launch(bad, null) != "", "missing program is an error")
+            list.list_free(cmd)
+            list.list_free(bad)
+            fs.remove_tree(base)
+        }
+    }
+    return spec.run_summary(fw)
+}

@@ -1,0 +1,75 @@
+// Ports the three tests of upstream src/tui/title.zig under their names. The
+// temp directory comes from fs.make_temp_dir and is removed with
+// fs.remove_tree. compose's null branch is "".
+import std.spec
+import std.string
+import std.fs
+import nib.tui.title
+
+put_(root: string, rel: string, data: string) {
+    err = fs.write("${root}/${rel}", data)
+    if err != "" { spec.fail("write ${rel}: ${err}") }
+}
+
+mk_(root: string, rel: string) {
+    err = fs.mkdir_p("${root}/${rel}")
+    if err != "" { spec.fail("mkdir ${rel}: ${err}") }
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.title") {
+        spec.it("HEAD parsing: branch, nested branch, detached, junk") callback {
+            h = title.parse_head("ref: refs/heads/main\n")
+            spec.assert_true(h.kind == title.HEAD_BRANCH, "branch kind")
+            spec.assert_str_eq(h.name, "main", "main")
+            h = title.parse_head("ref: refs/heads/feat/x\n")
+            spec.assert_str_eq(h.name, "feat/x", "nested")
+            h = title.parse_head("abcdef1234567890abcdef1234567890abcdef12\n")
+            spec.assert_true(h.kind == title.HEAD_DETACHED, "detached kind")
+            spec.assert_str_eq(h.name, "abcdef1", "short sha")
+            spec.assert_str_eq(title.parse_head("abcdef1").name, "abcdef1", "exactly 7 hex")
+            spec.assert_true(title.parse_head("abcdef").kind == title.HEAD_UNKNOWN, "6 hex")
+            spec.assert_true(title.parse_head("garbage").kind == title.HEAD_UNKNOWN, "garbage")
+            spec.assert_true(title.parse_head("").kind == title.HEAD_UNKNOWN, "empty")
+            spec.assert_true(title.parse_head("ref: refs/heads/\n").kind == title.HEAD_UNKNOWN, "empty branch")
+        }
+        spec.it("branch from a plain repository, a worktree gitdir file and no git") callback {
+            base, err = fs.make_temp_dir("", "nibtitle")
+            spec.assert_str_eq(err, "", "tmp dir")
+            mk_(base, "plain/.git")
+            put_(base, "plain/.git/HEAD", "ref: refs/heads/main\n")
+            mk_(base, "real/wt")
+            put_(base, "real/wt/HEAD", "ref: refs/heads/feat/wt\n")
+            mk_(base, "linked")
+            put_(base, "linked/.git", "gitdir: ../real/wt\n")
+            mk_(base, "detached/.git")
+            put_(base, "detached/.git/HEAD", "0123456789abcdef0123456789abcdef01234567\n")
+            mk_(base, "none")
+            b, ok = title.read_branch("${base}/plain")
+            spec.assert_true(ok, "plain found")
+            spec.assert_str_eq(b, "main", "plain")
+            b, ok = title.read_branch("${base}/linked")
+            spec.assert_true(ok, "linked found")
+            spec.assert_str_eq(b, "feat/wt", "linked")
+            b, ok = title.read_branch("${base}/detached")
+            spec.assert_true(ok, "detached found")
+            spec.assert_str_eq(b, "0123456", "detached")
+            _b, ok = title.read_branch("${base}/none")
+            spec.assert_false(ok, "none")
+            g, found = title.gitdir_of("/r", "gitdir: /abs/x\n")
+            spec.assert_true(found, "abs found")
+            spec.assert_str_eq(g, "/abs/x", "absolute gitdir")
+            _g, found = title.gitdir_of("/r", "nope")
+            spec.assert_false(found, "not a pointer")
+            fs.remove_tree(base)
+        }
+        spec.it("title composition") callback {
+            spec.assert_str_eq(title.compose("nibcode", "main", "deepseek-flash", "high"), "nibcode · main · deepseek-flash · high", "full")
+            spec.assert_str_eq(title.compose("nibcode", "", "deepseek-flash", "off"), "nibcode · deepseek-flash · off", "no branch")
+            spec.assert_str_eq(title.compose("nibcode", "main", "m", "server default"), "nibcode · main · m", "server default")
+            spec.assert_str_eq(title.compose("nibcode", "main", "m", "on (server default effort)"), "nibcode · main · m", "on default")
+        }
+    }
+    return spec.run_summary(fw)
+}

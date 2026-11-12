@@ -1,0 +1,63 @@
+// upstream src/tui/clipboard.zig has no tests, so there is nothing to port.
+// These tests are added: the reader field is replaceable per instance, and
+// the shell machinery (read_script: PNG check, exit 127, other failure,
+// deadline, size limit) is exercised with stand-in scripts, never the real
+// clipboard. The image check is the module's stand-in for nib.image.
+import std.spec
+import std.string
+import nib.tui.clipboard
+
+fake_reader_(env: ptr) -> ptr {
+    r = heap.new(clipboard.Result)
+    r.kind = clipboard.KIND_NO_TOOL
+    r.png = ""
+    r.error = ""
+    return r as ptr
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.clipboard") {
+        spec.it("(extra) the reader is a per-instance field that specs can replace") callback {
+            a = clipboard.new()
+            b = clipboard.new()
+            a.reader = |env: ptr| { return fake_reader_(env) }
+            r = clipboard.read_image(a, null) as *clipboard.Result
+            spec.assert_eq(r.kind, clipboard.KIND_NO_TOOL, "a is replaced")
+            heap.free(r)
+            // b still has the system reader: it must not return a's answer.
+            // (Not run: it would read the real clipboard.)
+            clipboard.free(a)
+            clipboard.free(b)
+        }
+        spec.it("(extra) a script printing a PNG signature gives the bytes") callback {
+            r = clipboard.read_script("printf '\\211PNG\\r\\n\\032\\nrest'", null, 2000 as long) as *clipboard.Result
+            spec.assert_eq(r.kind, clipboard.KIND_PNG, "png")
+            spec.assert_eq(string.length(r.png), 12, "12 bytes")
+            spec.assert_eq(r.png[0] & 255, 137, "first byte survives")
+            heap.free(r)
+        }
+        spec.it("(extra) non-PNG output, exit 127 and other failures") callback {
+            r1 = clipboard.read_script("printf 'hello world'", null, 2000 as long) as *clipboard.Result
+            spec.assert_eq(r1.kind, clipboard.KIND_NO_IMAGE, "not a png")
+            heap.free(r1)
+            r2 = clipboard.read_script("exit 127", null, 2000 as long) as *clipboard.Result
+            spec.assert_eq(r2.kind, clipboard.KIND_NO_TOOL, "127")
+            heap.free(r2)
+            r3 = clipboard.read_script("printf '\\211PNG\\r\\n\\032\\n'; exit 1", null, 2000 as long) as *clipboard.Result
+            spec.assert_eq(r3.kind, clipboard.KIND_NO_IMAGE, "failing tool")
+            heap.free(r3)
+        }
+        spec.it("(extra) a hung tool is killed at the deadline and counts as no image") callback {
+            r = clipboard.read_script("sleep 30", null, 300 as long) as *clipboard.Result
+            spec.assert_eq(r.kind, clipboard.KIND_NO_IMAGE, "timed out")
+            heap.free(r)
+        }
+        spec.it("(extra) output beyond the size limit is too large") callback {
+            r = clipboard.read_script("head -c 5300000 /dev/zero", null, 5000 as long) as *clipboard.Result
+            spec.assert_eq(r.kind, clipboard.KIND_TOO_LARGE, "too large")
+            heap.free(r)
+        }
+    }
+    return spec.run_summary(fw)
+}

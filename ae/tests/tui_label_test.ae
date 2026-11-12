@@ -1,0 +1,53 @@
+// Ports the one test of upstream src/tui/transcript/label.zig under its name;
+// the prompt_prefix assertions are extra (upstream has none).
+import std.spec
+import std.string
+import std.list
+import nib.session.tool_summary
+import nib.tui.label
+
+add_count_(s: *tool_summary.Summary, name: string, n: int) {
+    c = heap.new(tool_summary.Count)
+    c.name = name
+    c.count = n
+    list.list_add(s.counts, c as ptr)
+}
+
+add_file_(s: *tool_summary.Summary, tool: string, path: string) {
+    f = heap.new(tool_summary.File)
+    f.tool = tool
+    f.path = path
+    f.duration_ms = -1
+    list.list_add(s.files, f as ptr)
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.label") {
+        spec.it("path facts replace generic tools without losing fallback or omitted counts") callback {
+            a = tool_summary.empty()
+            add_count_(a, "read", 2)
+            add_count_(a, "grep", 1)
+            add_file_(a, "read", "sample.txt")
+            add_file_(a, "grep", ".")
+            a.omitted = 3
+            spec.assert_str_eq(label.actual_tool_summary(a, 0), "+3", "files replace counts")
+            b = tool_summary.empty()
+            add_count_(b, "read", 2)
+            add_count_(b, "grep", 1)
+            spec.assert_str_eq(label.actual_tool_summary(b, 0), "read ×2 · grep", "fallback")
+            c = tool_summary.empty()
+            add_count_(c, "edit", 1)
+            add_count_(c, "write", 1)
+            add_count_(c, "bash", 1)
+            spec.assert_str_eq(label.actual_tool_summary(c, 2), "edit 2 files · bash", "edits collapse")
+            spec.assert_str_eq(label.actual_tool_summary(tool_summary.empty(), 0), "", "empty")
+        }
+        spec.it("prompt prefix is the first 40 code points") callback {
+            spec.assert_str_eq(label.prompt_prefix("short"), "short", "short")
+            p = "éééééééééééééééééééééééééééééééééééééééé!!"
+            spec.assert_str_eq(label.prompt_prefix(p), "éééééééééééééééééééééééééééééééééééééééé", "40 chars")
+        }
+    }
+    return spec.run_summary(fw)
+}

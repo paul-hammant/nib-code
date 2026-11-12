@@ -1,0 +1,489 @@
+// tui.syntax: a line-at-a-time lexer for the code blocks of rendered markdown.
+// Classifies each byte of a line as plain, comment, string or keyword, carrying
+// the multi-line state (block comment, triple quote, template string) from one
+// line to the next. Upstream src/tui/syntax.zig.
+//
+// Differences from upstream:
+//  - Zig enums are ints. Lang: LANG_* (LANG_NONE = -1 stands for upstream's
+//    null `?Lang`); State: STATE_*; Class: CLASS_*.
+//  - Upstream's `Lexer` is a struct with a `next` method; here `lexer_init`
+//    makes a *Lexer and `lexer_next(lx)` returns (Token, bool) (false = the
+//    line is done). The lexer owns a copy of its text.
+//  - Zig `[]const u8` slices are strings plus offsets; byte literals are ints.
+//  - cluster_end asks term.screen's grapheme_end (a port of libvaxis's
+//    grapheme iterator) for the cluster that starts at end - 1.
+
+import std.string
+import term.screen
+
+exports(
+    LANG_NONE, LANG_ZIG, LANG_JS, LANG_PYTHON, LANG_SHELL, LANG_RUST, LANG_GO, LANG_C, LANG_CPP,
+    STATE_NONE, STATE_BLOCK_COMMENT, STATE_TRIPLE_DQ, STATE_TRIPLE_SQ, STATE_BACKTICK,
+    CLASS_PLAIN, CLASS_COMMENT, CLASS_STRING, CLASS_KEYWORD,
+    Token, Lexer, lang_from_info, lexer_init, lexer_next, advance
+)
+
+const LANG_NONE = -1
+const LANG_ZIG = 0
+const LANG_JS = 1
+const LANG_PYTHON = 2
+const LANG_SHELL = 3
+const LANG_RUST = 4
+const LANG_GO = 5
+const LANG_C = 6
+const LANG_CPP = 7
+
+// Lexer state carried from one code line to the next.
+const STATE_NONE = 0
+const STATE_BLOCK_COMMENT = 1
+const STATE_TRIPLE_DQ = 2
+const STATE_TRIPLE_SQ = 3
+const STATE_BACKTICK = 4
+
+const CLASS_PLAIN = 0
+const CLASS_COMMENT = 1
+const CLASS_STRING = 2
+const CLASS_KEYWORD = 3
+
+struct Token {
+    start: int
+    end: int
+    class: int
+}
+
+const TAB = 9
+const SPACE = 32
+const BANG = 33
+const DQUOTE = 34
+const HASH = 35
+const DOLLAR = 36
+const AMP = 38
+const SQUOTE = 39
+const LPAREN = 40
+const RPAREN = 41
+const STAR = 42
+const DASH = 45
+const DOT = 46
+const SLASH = 47
+const SEMI = 59
+const LBRACE = 123
+const PIPE = 124
+const RBRACE = 125
+const BSLASH = 92
+const UNDERSCORE = 95
+const BACKTICK = 96
+
+const ALIAS_NAMES[] = ["zig", "js", "javascript", "ts", "typescript", "jsx", "tsx", "python", "py", "sh", "bash", "shell", "zsh", "console", "rust", "rs", "go", "c", "h", "cpp", "c++"]
+const ALIAS_LANGS[] = [0, 1, 1, 1, 1, 1, 1, 2, 2, 3, 3, 3, 3, 3, 4, 4, 5, 6, 6, 7, 7]
+
+// `info` is the text after the opening fence; only its first word counts.
+// LANG_NONE when it names no known language.
+lang_from_info(info: string) -> int {
+    t = trim_blank_(info)
+    n = string.length(t)
+    end = 0
+    while end < n && t[end] != SPACE && t[end] != TAB && t[end] != LBRACE {
+        end = end + 1
+    }
+    word = string.to_lower(string.substring(t, 0, end))
+    for i in 0..ALIAS_NAMES.len {
+        if ALIAS_NAMES[i] == word {
+            return ALIAS_LANGS[i]
+        }
+    }
+    return LANG_NONE
+}
+
+// std.mem.trim(u8, s, " \t")
+trim_blank_(s: string) -> string {
+    n = string.length(s)
+    a = 0
+    while a < n && (s[a] == SPACE || s[a] == TAB) {
+        a = a + 1
+    }
+    b = n
+    while b > a && (s[b - 1] == SPACE || s[b - 1] == TAB) {
+        b = b - 1
+    }
+    return string.substring(s, a, b)
+}
+
+const ZIG_KEYWORDS[] = [
+    "addrspace", "align", "allowzero", "and", "anyframe", "anytype", "asm", "async", "await", "break",
+    "callconv", "catch", "comptime", "const", "continue", "defer", "else", "enum", "errdefer", "error",
+    "export", "extern", "fn", "for", "if", "inline", "linksection", "noalias", "noinline", "nosuspend",
+    "opaque", "or", "orelse", "packed", "pub", "resume", "return", "struct", "suspend", "switch",
+    "test", "threadlocal", "try", "union", "unreachable", "usingnamespace", "var", "volatile", "while"
+]
+
+const JS_KEYWORDS[] = [
+    "abstract", "async", "await", "break", "case", "catch", "class", "const", "continue", "debugger",
+    "declare", "default", "delete", "do", "else", "enum", "export", "extends", "finally", "for",
+    "function", "if", "implements", "import", "in", "instanceof", "interface", "let", "namespace", "new",
+    "private", "protected", "public", "readonly", "return", "static", "super", "switch", "this", "throw",
+    "try", "typeof", "var", "void", "while", "with", "yield"
+]
+
+const PYTHON_KEYWORDS[] = [
+    "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del",
+    "elif", "else", "except", "finally", "for", "from", "global", "if", "import", "in",
+    "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while",
+    "with", "yield"
+]
+
+const SHELL_KEYWORDS[] = [
+    "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done",
+    "case", "esac", "in", "function", "select", "return", "break", "continue", "local", "export",
+    "readonly", "declare"
+]
+
+const RUST_KEYWORDS[] = [
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum",
+    "extern", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod",
+    "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super",
+    "trait", "type", "unsafe", "use", "where", "while"
+]
+
+const GO_KEYWORDS[] = [
+    "break", "case", "chan", "const", "continue", "default", "defer", "else", "fallthrough", "for",
+    "func", "go", "goto", "if", "import", "interface", "map", "package", "range", "return",
+    "select", "struct", "switch", "type", "var"
+]
+
+const C_KEYWORDS[] = [
+    "auto", "break", "case", "const", "continue", "default", "do", "else", "enum", "extern",
+    "for", "goto", "if", "inline", "register", "restrict", "return", "sizeof", "static", "struct",
+    "switch", "typedef", "union", "volatile", "while"
+]
+
+const CPP_EXTRA_KEYWORDS[] = [
+    "catch", "class", "constexpr", "delete", "explicit", "final", "friend", "mutable", "namespace", "new",
+    "noexcept", "nullptr", "operator", "override", "private", "protected", "public", "template", "this", "throw",
+    "try", "typename", "using", "virtual"
+]
+
+is_keyword_(lang: int, word: string) -> bool {
+    n = string.length(word)
+    if n < 2 || n > 12 {
+        return false
+    }
+    if lang == LANG_ZIG {
+        return in_list_(ZIG_KEYWORDS, word)
+    }
+    if lang == LANG_JS {
+        return in_list_(JS_KEYWORDS, word)
+    }
+    if lang == LANG_PYTHON {
+        return in_list_(PYTHON_KEYWORDS, word)
+    }
+    if lang == LANG_SHELL {
+        return in_list_(SHELL_KEYWORDS, word)
+    }
+    if lang == LANG_RUST {
+        return in_list_(RUST_KEYWORDS, word)
+    }
+    if lang == LANG_GO {
+        return in_list_(GO_KEYWORDS, word)
+    }
+    if lang == LANG_C {
+        return in_list_(C_KEYWORDS, word)
+    }
+    return in_list_(C_KEYWORDS, word) || in_list_(CPP_EXTRA_KEYWORDS, word)
+}
+
+in_list_(list: string[], word: string) -> bool {
+    for i in 0..list.len {
+        if list[i] == word {
+            return true
+        }
+    }
+    return false
+}
+
+has_block_comments_(lang: int) -> bool {
+    return lang == LANG_JS || lang == LANG_RUST || lang == LANG_GO || lang == LANG_C || lang == LANG_CPP
+}
+
+is_alpha_(c: int) -> bool { return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) }
+is_digit_(c: int) -> bool { return c >= 48 && c <= 57 }
+
+is_ident_start_(c: int) -> bool {
+    return is_alpha_(c) || c == UNDERSCORE || c == DOLLAR || c >= 0x80
+}
+
+is_ident_cont_(lang: int, c: int) -> bool {
+    return is_ident_start_(c) || is_digit_(c) || (lang == LANG_SHELL && (c == DASH || c == DOT || c == SLASH))
+}
+
+// " \t;|&(){}!"
+is_shell_boundary_(c: int) -> bool {
+    return c == SPACE || c == TAB || c == SEMI || c == PIPE || c == AMP || c == LPAREN || c == RPAREN || c == LBRACE || c == RBRACE || c == BANG
+}
+
+// Scans a quoted string starting at `at`; -1 when it does not close on this line.
+quoted_(text: string, at: int, quote: int, escapes: bool) -> int {
+    n = string.length(text)
+    j = at + 1
+    while j < n {
+        if escapes && text[j] == BSLASH {
+            j = j + 2
+        } else if text[j] == quote {
+            return j + 1
+        } else {
+            j = j + 1
+        }
+    }
+    return -1
+}
+
+// std.unicode.utf8ByteSequenceLength: 0 for an invalid first byte.
+utf8_seq_len_(b: int) -> int {
+    if b < 0x80 {
+        return 1
+    }
+    if b >= 0xC2 && b <= 0xDF {
+        return 2
+    }
+    if b >= 0xE0 && b <= 0xEF {
+        return 3
+    }
+    if b >= 0xF0 && b <= 0xF4 {
+        return 4
+    }
+    return 0
+}
+
+// Rust `'x'` and `'\n'`; lifetimes like `'a` are not strings. -1 when not a char.
+rust_char_(text: string, at: int) -> int {
+    n = string.length(text)
+    if at + 2 >= n {
+        return -1
+    }
+    if text[at + 1] == BSLASH {
+        j = at + 3
+        while j < n && j < at + 12 {
+            if text[j] == SQUOTE {
+                return j + 1
+            }
+            j = j + 1
+        }
+        return -1
+    }
+    sl = utf8_seq_len_(text[at + 1])
+    if sl == 0 {
+        return -1
+    }
+    close = at + 1 + sl
+    if close < n && text[close] == SQUOTE {
+        return close + 1
+    }
+    return -1
+}
+
+// text[j..] starts with delim
+starts_at_(text: string, j: int, delim: string) -> bool {
+    n = string.length(text)
+    m = string.length(delim)
+    if j + m > n {
+        return false
+    }
+    for k in 0..m {
+        if text[j + k] != delim[k] {
+            return false
+        }
+    }
+    return true
+}
+
+// Continuation of a multi-line construct from the start of a line.
+// Returns (end, class, state).
+resume_(lang: int, state: int, text: string, from: int) -> (int, int, int) {
+    n = string.length(text)
+    if state == STATE_BLOCK_COMMENT {
+        at = -1
+        if from <= n {
+            at = string.index_of_from(text, "*/", from)
+        }
+        if at < 0 {
+            return n, CLASS_COMMENT, STATE_BLOCK_COMMENT
+        }
+        return at + 2, CLASS_COMMENT, STATE_NONE
+    }
+    if state == STATE_TRIPLE_DQ || state == STATE_TRIPLE_SQ {
+        delim = if state == STATE_TRIPLE_DQ { "\"\"\"" } else { "'''" }
+        j = from
+        while j < n {
+            if text[j] == BSLASH {
+                j = j + 2
+            } else if starts_at_(text, j, delim) {
+                return j + 3, CLASS_STRING, STATE_NONE
+            } else {
+                j = j + 1
+            }
+        }
+        return n, CLASS_STRING, state
+    }
+    // STATE_BACKTICK (STATE_NONE is unreachable upstream)
+    j = from
+    while j < n {
+        if lang == LANG_JS && text[j] == BSLASH {
+            j = j + 2
+        } else if text[j] == BACKTICK {
+            return j + 1, CLASS_STRING, STATE_NONE
+        } else {
+            j = j + 1
+        }
+    }
+    return n, CLASS_STRING, STATE_BACKTICK
+}
+
+// A token starting at i: (end, class, state, found).
+token_at_(lang: int, text: string, i: int) -> (int, int, int, bool) {
+    n = string.length(text)
+    c = text[i]
+    next = if i + 1 < n { text[i + 1] } else { 0 }
+    if c == SLASH {
+        if lang == LANG_PYTHON || lang == LANG_SHELL {
+            return 0, 0, 0, false
+        }
+        if next == SLASH {
+            return n, CLASS_COMMENT, STATE_NONE, true
+        }
+        if next == STAR && has_block_comments_(lang) {
+            e, _cl, st = resume_(lang, STATE_BLOCK_COMMENT, text, i + 2)
+            return e, CLASS_COMMENT, st, true
+        }
+        return 0, 0, 0, false
+    }
+    if c == HASH {
+        if lang == LANG_PYTHON || (lang == LANG_SHELL && (i == 0 || is_shell_boundary_(text[i - 1]) || text[i - 1] == SPACE || text[i - 1] == TAB)) {
+            return n, CLASS_COMMENT, STATE_NONE, true
+        }
+        return 0, 0, 0, false
+    }
+    if c == BSLASH {
+        if lang == LANG_ZIG && next == BSLASH && string.length(trim_blank_(string.substring(text, 0, i))) == 0 {
+            return n, CLASS_STRING, STATE_NONE, true
+        }
+        return 0, 0, 0, false
+    }
+    if c == DQUOTE || c == SQUOTE {
+        if lang == LANG_PYTHON && next == c && i + 2 < n && text[i + 2] == c {
+            st0 = if c == DQUOTE { STATE_TRIPLE_DQ } else { STATE_TRIPLE_SQ }
+            e, _cl, st = resume_(lang, st0, text, i + 3)
+            return e, CLASS_STRING, st, true
+        }
+        if lang == LANG_RUST && c == SQUOTE {
+            e = rust_char_(text, i)
+            if e < 0 {
+                return 0, 0, 0, false
+            }
+            return e, CLASS_STRING, STATE_NONE, true
+        }
+        escapes = !(lang == LANG_SHELL && c == SQUOTE)
+        e = quoted_(text, i, c, escapes)
+        if e < 0 {
+            return 0, 0, 0, false
+        }
+        return e, CLASS_STRING, STATE_NONE, true
+    }
+    if c == BACKTICK {
+        if lang != LANG_JS && lang != LANG_GO {
+            return 0, 0, 0, false
+        }
+        e, _cl, st = resume_(lang, STATE_BACKTICK, text, i + 1)
+        return e, CLASS_STRING, st, true
+    }
+    if !is_ident_start_(c) {
+        return 0, 0, 0, false
+    }
+    if i > 0 && (is_ident_cont_(lang, text[i - 1]) || text[i - 1] == DOT || (lang == LANG_SHELL && !is_shell_boundary_(text[i - 1]))) {
+        return 0, 0, 0, false
+    }
+    e = i + 1
+    while e < n && is_ident_cont_(lang, text[e]) {
+        e = e + 1
+    }
+    if !is_keyword_(lang, string.substring(text, i, e)) {
+        return 0, 0, 0, false
+    }
+    if lang == LANG_SHELL && e < n && !is_shell_boundary_(text[e]) {
+        return 0, 0, 0, false
+    }
+    return e, CLASS_KEYWORD, STATE_NONE, true
+}
+
+// Extends a token end so that it never splits a grapheme cluster.
+cluster_end_(text: string, end: int) -> int {
+    n = string.length(text)
+    if end == 0 || end >= n || text[end] < 0x80 {
+        return end
+    }
+    ge = screen.grapheme_end(text, end - 1)
+    return if ge > end { ge } else { end }
+}
+
+// Tokens cover the whole line; adjacent plain text is one token.
+struct Lexer {
+    lang: int
+    state: int
+    text: string
+    pos: int
+}
+
+lexer_init(lang: int, state: int, text: string) -> *Lexer {
+    lx = heap.new(Lexer)
+    lx.lang = lang
+    lx.state = state
+    lx.text = text
+    lx.pos = 0
+    return lx
+}
+
+// The next token, and false at the end of the line.
+lexer_next(lx: *Lexer) -> (Token, bool) {
+    n = string.length(lx.text)
+    if lx.pos >= n {
+        return Token { start: 0, end: 0, class: 0 }, false
+    }
+    start = lx.pos
+    found = false
+    fe = 0
+    fc = 0
+    fs = 0
+    if lx.state != STATE_NONE {
+        fe, fc, fs = resume_(lx.lang, lx.state, lx.text, start)
+        found = true
+    } else {
+        fe, fc, fs, found = token_at_(lx.lang, lx.text, start)
+    }
+    if found {
+        lx.state = fs
+        lx.pos = cluster_end_(lx.text, fe)
+        return Token { start: start, end: lx.pos, class: fc }, true
+    }
+    i = start + 1
+    while i < n {
+        _e2, _c2, _s2, f2 = token_at_(lx.lang, lx.text, i)
+        if f2 {
+            break
+        }
+        i = i + 1
+    }
+    lx.pos = cluster_end_(lx.text, i)
+    return Token { start: start, end: lx.pos, class: CLASS_PLAIN }, true
+}
+
+// The state after `text`, for the next line.
+advance(lang: int, state: int, text: string) -> int {
+    lx = lexer_init(lang, state, text)
+    while true {
+        _t, ok = lexer_next(lx)
+        if !ok {
+            break
+        }
+    }
+    st = lx.state
+    heap.free(lx)
+    return st
+}

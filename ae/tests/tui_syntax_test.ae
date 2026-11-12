@@ -1,0 +1,172 @@
+// Ports the tests of upstream src/tui/syntax.zig under their exact names (all
+// 11). Upstream's `expectTokens` takes `.{ .class, .text }` pairs; here `want`
+// is a flat list of (class letter, text) strings: p plain, c comment, s string,
+// k keyword.
+import std.spec
+import std.string
+import nib.tui.syntax
+
+class_letter_(c: int) -> string {
+    if c == syntax.CLASS_PLAIN {
+        return "p"
+    }
+    if c == syntax.CLASS_COMMENT {
+        return "c"
+    }
+    if c == syntax.CLASS_STRING {
+        return "s"
+    }
+    return "k"
+}
+
+expect_tokens_(lang: int, state: int, text: string, want: string[]) {
+    lx = syntax.lexer_init(lang, state, text)
+    i = 0
+    while i < want.len {
+        t, ok = syntax.lexer_next(lx)
+        if !ok {
+            spec.fail("lexer ended early before ${want[i + 1]}")
+            return
+        }
+        spec.assert_str_eq(class_letter_(t.class), want[i], "class of ${want[i + 1]}")
+        spec.assert_str_eq(string.substring(text, t.start, t.end), want[i + 1], "text")
+        i = i + 2
+    }
+    _t2, ok2 = syntax.lexer_next(lx)
+    spec.assert_false(ok2, "lexer has more tokens than expected in ${text}")
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.syntax") {
+        spec.it("info strings map aliases and ignore unknown languages") callback {
+            spec.assert_eq(syntax.lang_from_info("zig"), syntax.LANG_ZIG, "zig")
+            spec.assert_eq(syntax.lang_from_info("  ZIG title=x"), syntax.LANG_ZIG, "ZIG")
+            spec.assert_eq(syntax.lang_from_info("tsx"), syntax.LANG_JS, "tsx")
+            spec.assert_eq(syntax.lang_from_info("javascript"), syntax.LANG_JS, "javascript")
+            spec.assert_eq(syntax.lang_from_info("py"), syntax.LANG_PYTHON, "py")
+            spec.assert_eq(syntax.lang_from_info("console"), syntax.LANG_SHELL, "console")
+            spec.assert_eq(syntax.lang_from_info("rs{1}"), syntax.LANG_RUST, "rs{1}")
+            spec.assert_eq(syntax.lang_from_info("c++"), syntax.LANG_CPP, "c++")
+            spec.assert_eq(syntax.lang_from_info("h"), syntax.LANG_C, "h")
+            spec.assert_eq(syntax.lang_from_info(""), syntax.LANG_NONE, "empty")
+            spec.assert_eq(syntax.lang_from_info("text"), syntax.LANG_NONE, "text")
+            spec.assert_eq(syntax.lang_from_info("zigg"), syntax.LANG_NONE, "zigg")
+        }
+
+        spec.it("zig: keywords, strings with escapes, comments, multiline strings") callback {
+            Z = syntax.LANG_ZIG
+            N = syntax.STATE_NONE
+            expect_tokens_(Z, N, "pub fn main() void { // hi", ["k", "pub", "p", " ", "k", "fn", "p", " main() void { ", "c", "// hi"])
+            expect_tokens_(Z, N, "const s = \"a\\\"b\"; const c = '\\'';", [
+                "k", "const", "p", " s = ", "s", "\"a\\\"b\"", "p", "; ",
+                "k", "const", "p", " c = ", "s", "'\\''", "p", ";"
+            ])
+            expect_tokens_(Z, N, "    \\\\line one // not a comment", ["p", "    ", "s", "\\\\line one // not a comment"])
+            expect_tokens_(Z, N, "x.error y", ["p", "x.error y"])
+            expect_tokens_(Z, N, "iffy elsewhere", ["p", "iffy elsewhere"])
+        }
+
+        spec.it("unterminated single-line strings stay plain") callback {
+            expect_tokens_(syntax.LANG_ZIG, syntax.STATE_NONE, "say \"oops", ["p", "say \"oops"])
+            expect_tokens_(syntax.LANG_SHELL, syntax.STATE_NONE, "echo don't", ["p", "echo don't"])
+        }
+
+        spec.it("block comments carry across lines") callback {
+            C = syntax.LANG_C
+            N = syntax.STATE_NONE
+            B = syntax.STATE_BLOCK_COMMENT
+            expect_tokens_(C, N, "a /* b", ["p", "a ", "c", "/* b"])
+            spec.assert_eq(syntax.advance(C, N, "a /* b"), B, "open")
+            expect_tokens_(C, B, "still */ return x; /* y */ z", [
+                "c", "still */", "p", " ", "k", "return", "p", " x; ", "c", "/* y */", "p", " z"
+            ])
+            spec.assert_eq(syntax.advance(C, B, "end */"), N, "close")
+            spec.assert_eq(syntax.advance(syntax.LANG_RUST, B, "no end"), B, "still open")
+            spec.assert_eq(syntax.advance(syntax.LANG_ZIG, N, "/* not zig"), N, "zig has none")
+            spec.assert_eq(syntax.advance(syntax.LANG_PYTHON, N, "/* not python"), N, "python has none")
+        }
+
+        spec.it("javascript: template strings span lines, keywords, comments") callback {
+            J = syntax.LANG_JS
+            N = syntax.STATE_NONE
+            T = syntax.STATE_BACKTICK
+            expect_tokens_(J, N, "const t = `a\${b}", ["k", "const", "p", " t = ", "s", "`a\${b}"])
+            spec.assert_eq(syntax.advance(J, N, "const t = `a\${b}"), T, "open")
+            expect_tokens_(J, T, "mid \\` still` + 1 // c", ["s", "mid \\` still`", "p", " + 1 ", "c", "// c"])
+            spec.assert_eq(syntax.advance(J, T, "mid \\` still`"), N, "closed")
+            expect_tokens_(syntax.LANG_GO, N, "x := `C:\\`", ["p", "x := ", "s", "`C:\\`"])
+        }
+
+        spec.it("python: hash comments, triple quotes across lines, strings") callback {
+            P = syntax.LANG_PYTHON
+            N = syntax.STATE_NONE
+            DQ = syntax.STATE_TRIPLE_DQ
+            expect_tokens_(P, N, "def f(): # note 'x'", ["k", "def", "p", " f(): ", "c", "# note 'x'"])
+            expect_tokens_(P, N, "s = \"\"\"doc", ["p", "s = ", "s", "\"\"\"doc"])
+            spec.assert_eq(syntax.advance(P, N, "s = \"\"\"doc"), DQ, "open dq")
+            expect_tokens_(P, DQ, "more # not comment \"\"\" and 'q' # c", [
+                "s", "more # not comment \"\"\"", "p", " ", "k", "and", "p", " ", "s", "'q'", "p", " ", "c", "# c"
+            ])
+            spec.assert_eq(syntax.advance(P, N, "'''x"), syntax.STATE_TRIPLE_SQ, "open sq")
+            spec.assert_eq(syntax.advance(P, N, "'''x''' + ''"), N, "closed sq")
+            spec.assert_eq(syntax.advance(P, DQ, "no close \\\"\"\""), DQ, "escaped quote stays open")
+        }
+
+        spec.it("shell: comments only at word start, quotes, keywords") callback {
+            S = syntax.LANG_SHELL
+            N = syntax.STATE_NONE
+            expect_tokens_(S, N, "echo $# a#b # c", ["p", "echo $# a#b ", "c", "# c"])
+            expect_tokens_(S, N, "if x; then echo 'a\\' \"b\\\"c\"", [
+                "k", "if", "p", " x; ", "k", "then", "p", " echo ", "s", "'a\\'", "p", " ", "s", "\"b\\\"c\""
+            ])
+            expect_tokens_(S, N, "git --for x-if in", ["p", "git --for x-if ", "k", "in"])
+        }
+
+        spec.it("rust: lifetimes are not chars, char literals and keywords") callback {
+            R = syntax.LANG_RUST
+            N = syntax.STATE_NONE
+            expect_tokens_(R, N, "fn f<'a>(x: &'a str) -> char { 'x' }", [
+                "k", "fn", "p", " f<'a>(x: &'a str) -> char { ", "s", "'x'", "p", " }"
+            ])
+            expect_tokens_(R, N, "let c = '\\n'; let e = 'é';", [
+                "k", "let", "p", " c = ", "s", "'\\n'", "p", "; ", "k", "let", "p", " e = ", "s", "'é'", "p", ";"
+            ])
+        }
+
+        spec.it("c and cpp: preprocessor is plain, cpp adds keywords") callback {
+            N = syntax.STATE_NONE
+            expect_tokens_(syntax.LANG_C, N, "#include <a.h> // x", ["p", "#include <a.h> ", "c", "// x"])
+            expect_tokens_(syntax.LANG_C, N, "class", ["p", "class"])
+            expect_tokens_(syntax.LANG_CPP, N, "class", ["k", "class"])
+            expect_tokens_(syntax.LANG_CPP, N, "return 0;", ["k", "return", "p", " 0;"])
+        }
+
+        spec.it("go keywords") callback {
+            expect_tokens_(syntax.LANG_GO, syntax.STATE_NONE, "func main() { go f() }", [
+                "k", "func", "p", " main() { ", "k", "go", "p", " f() }"
+            ])
+        }
+
+        spec.it("tokens never split a grapheme cluster and cover the line") callback {
+            text = "x = \"a\"\xcc\x81 y // é"
+            lx = syntax.lexer_init(syntax.LANG_PYTHON, syntax.STATE_NONE, text)
+            at = 0
+            while true {
+                t, ok = syntax.lexer_next(lx)
+                if !ok {
+                    break
+                }
+                spec.assert_eq(t.start, at, "contiguous")
+                spec.assert_true(t.end > t.start, "non-empty")
+                at = t.end
+            }
+            spec.assert_eq(at, string.length(text), "covers the line")
+            lx2 = syntax.lexer_init(syntax.LANG_PYTHON, syntax.STATE_NONE, text)
+            _f, _ok1 = syntax.lexer_next(lx2)
+            second, ok2 = syntax.lexer_next(lx2)
+            spec.assert_true(ok2, "second token")
+            spec.assert_str_eq(string.substring(text, second.start, second.end), "\"a\"\xcc\x81", "string keeps its combining mark")
+        }
+    }
+}

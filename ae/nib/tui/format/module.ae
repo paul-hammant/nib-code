@@ -1,0 +1,59 @@
+// tui.format: UI vocabulary, durations, decimal units, single-line fitting
+// (upstream src/tui/format.zig).
+// Differences from upstream: functions that fill a caller buffer return a
+// new string; u64/u128 counts are long; fit() returns a Fitted value.
+
+import std.string
+import term.screen
+
+exports(Fitted, `state`, duration, number, bytes, fit)
+
+struct Fitted {
+    text: string
+    suffix: string
+}
+
+`state`(raw: string) -> string {
+    if raw == "working" { return "running" }
+    if raw == "done" || raw == "ok" { return "completed" }
+    if raw == "timed_out" { return "timed out" }
+    return raw
+}
+
+duration(ms: long) -> string {
+    s = ms / 1000
+    if s == 0 { return "<1s" }
+    if s >= 3600 { return "${s / 3600}h${s % 3600 / 60}m${s % 60}s" }
+    if s >= 60 { return "${s / 60}m${s % 60}s" }
+    return "${s}s"
+}
+
+number(n: long) -> string {
+    unit = 1 as long
+    if n >= 1000000 { unit = 1000000 } else if n >= 1000 { unit = 1000 }
+    if unit == 1 { return "${n}" }
+    suffix = "M"
+    if unit == 1000 { suffix = "k" }
+    tenths = n % unit * 10 / unit
+    if tenths == 0 { return "${n / unit}${suffix}" }
+    return "${n / unit}.${tenths}${suffix}"
+}
+
+bytes(n: long) -> string {
+    return "${number(n)}B"
+}
+
+fit(text: string, columns: int) -> Fitted {
+    if screen.gwidth(text, screen.WIDTH_UNICODE) <= columns {
+        return Fitted { text: text, suffix: "" }
+    }
+    if columns == 0 { return Fitted { text: "", suffix: "" } }
+    len = string.length(text)
+    end = 0
+    while end < len {
+        next = screen.grapheme_end(text, end)
+        if screen.gwidth(string.substring(text, 0, next), screen.WIDTH_UNICODE) > columns - 1 { break }
+        end = next
+    }
+    return Fitted { text: string.substring(text, 0, end), suffix: "…" }
+}
