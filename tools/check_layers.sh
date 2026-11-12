@@ -60,6 +60,7 @@ expect_imports ae/nib/session/hooks/module.ae "nib.jsonx|nib.session.instruction
 expect_imports ae/nib/build_info/module.ae ""
 expect_imports ae/nib/session/fork_history/module.ae "nib.msg|nib.provider.types|std.list|std.string"
 expect_imports $T/llm_call/module.ae "nib.jsonx|nib.lock|nib.msg|nib.provider|nib.provider.sink|nib.provider.types|std.json|std.list|std.strbuilder|std.string|std.sync"
+expect_imports $T/web_search/module.ae "nib.jsonx|nib.lock|nib.provider.sse|nib.provider.types|std.http.client|std.json|std.list|std.string|std.sync|std.time|std.worker"
 expect_imports $T/module.ae "nib.jsonx|nib.lock|nib.provider.types|nib.sandbox|nib.tools.agent|nib.tools.agent_input|nib.tools.agent_sessions|nib.tools.atomic_file|nib.tools.background|nib.tools.bash|nib.tools.changes|nib.tools.file_state|nib.tools.files|nib.tools.jail|nib.tools.llm_call|nib.tools.mcp_tool|nib.tools.progress|nib.tools.registry|nib.tools.search|nib.tools.undo|std.list|std.os|std.strbuilder|std.string|std.sync"
 
 # The Session + provider slice.
@@ -115,8 +116,8 @@ rule "the file stand-in is used only by the file, undo and process tools, the Se
     '^import nib\.sysgap' "$T/atomic_file/|$T/file_state/|$T/files/|$T/undo/|$T/process/|$T/bash/|ae/nib/session/log/|ae/nib/config/env/|ae/main.ae|ae/nib/tui/reflect/"
 rule "the QuickJS stand-in is used only by the sandbox" \
     '^import nib\.qjsgap' "ae/nib/sandbox/module.ae"
-rule "only provider/http (the model request), auth/models (the /model listing) and mcp_transport (Streamable HTTP MCP servers) reach the network" \
-    '^import std\.(http|net|tcp|udp)' "ae/nib/provider/http/|ae/nib/auth/models/|ae/nib/mcp/mcp_transport/"
+rule "only provider/http (the model request), auth/models (the /model listing), mcp_transport (Streamable HTTP MCP servers) and tools/web_search (the search request) reach the network" \
+    '^import std\.(http|net|tcp|udp)' "ae/nib/provider/http/|ae/nib/auth/models/|ae/nib/mcp/mcp_transport/|$T/web_search/"
 rule "the TUI reaches the Session only through its live port" \
     '^import nib\.session$' "ae/nib/tui/live/|ae/main.ae|ae/nib/tools/agent/|ae/nib/session/"
 

@@ -61,6 +61,10 @@ aeb(cap) {
             lib("ae")
         }
         aether.program_test() {
+            source("ae/tests/web_search_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
             source("ae/tests/atomic_file_test.ae")
             lib("ae")
         }

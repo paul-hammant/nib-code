@@ -1,0 +1,631 @@
+// tools.web_search: tools.search (upstream src/tools/web_search.zig): web
+// search through the Session's provider.
+//
+//   tools.search({ query, count? }) -> { ok, answer?, results: [{ title, url, date?, summary }] }
+//
+// OpenAI: a Responses request with the web_search tool (SSE reply). Anthropic:
+// a Messages request with web_search_20250305 (JSON reply). DeepSeek: its
+// /v1/tools/search (JSON reply). Cited results rank before other sources,
+// duplicates by URL merge. Argument errors reject (0, message), as upstream's
+// tools.fail; everything after the arguments, including a provider that has
+// no search, is data: (1, {"ok":false,"error":...}).
+//
+// Not ported: Codex (the codex route, its sign-in headers and the 401 retry
+// with a refreshed login) by policy; `codex` is not a provider here. The
+// error name of a transport failure is std.http.client's text where upstream
+// has a Zig error name. No proxy from the environment is applied (as
+// provider.http).
+//
+// The POST runs on a worker thread; the caller polls the cancel cell every
+// 50 ms and enforces the 60 s timeout, as upstream's Select of post and watch.
+// An abandoned request keeps its thread until the client's own timeout.
+
+import std.http.client
+import std.json
+import std.list
+import std.string
+import std.sync
+import std.time
+import std.worker
+import nib.jsonx
+import nib.lock
+import nib.provider.sse
+import nib.provider.types
+
+exports(Item, Outcome, Exch, TIMEOUT_MS, MAX_BODY, MAX_COUNT, DEEPSEEK_QUERY_CHARS, USAGE_TEXT,
+        search, search_with, supported, route, build_url, build_body, clip, codepoints,
+        parse_responses, parse_anthropic, parse_deepseek, outcome_json)
+
+const TIMEOUT_MS = 60000
+const MAX_BODY = 8388608
+const MAX_COUNT = 50
+const DEEPSEEK_QUERY_CHARS = 128
+const ANTHROPIC_TOOL = "web_search_20250305"
+const INSTRUCTIONS = "Search the web and answer concisely, citing sources."
+const USAGE_TEXT = "expected { query: string, count?: number }"
+
+struct Item {
+    title: string
+    url: string
+    date: string
+    has_date: int
+    summary: string
+}
+
+// One parsed reply: failure (has_failure 1), or answer (has_answer 1) + results.
+struct Outcome {
+    failure: string
+    has_failure: int
+    answer: string
+    has_answer: int
+    results: ptr       // list of *Item
+}
+
+struct Coll {
+    cited: ptr
+    other: ptr
+    text: string
+    searched: int
+    failed: string
+    has_failed: int
+}
+
+// The exchange the worker thread fills.
+struct Exch {
+    guard: ptr
+    buf: string
+    status: int
+    done: ptr          // std.sync cell: 1 once the worker ended
+    err: string
+}
+
+// The route of a provider id: "openai", "anthropic", "deepseek", or "".
+route(provider_id: string) -> string {
+    if provider_id == "openai" || provider_id == "anthropic" || provider_id == "deepseek" { return provider_id }
+    return ""
+}
+
+supported(cfg: ptr) -> int {
+    if cfg == null { return 0 }
+    if route((cfg as *types.Config).provider) == "" { return 0 }
+    return 1
+}
+
+// (1, {"ok":false,"error":...}): a failed search is data.
+failure_(text: string) -> (int, string) {
+    return 1, "{\"ok\":false,\"error\":${jsonx.quote(text)}}"
+}
+
+reject_(text: string) -> (int, string) { return 0, text }
+
+// ---- text helpers ----
+
+// `text` backed up to at most `limit` bytes, on a UTF-8 boundary.
+clip(text: string, limit: int) -> string {
+    n = string.length(text)
+    if n <= limit { return text }
+    end = limit
+    while end > 0 && (string.char_at(text, end) & 192) == 128 { end = end - 1 }
+    return string.substring(text, 0, end)
+}
+
+// The number of code points of `text`, or -1 if it is not valid UTF-8.
+codepoints(text: string) -> int {
+    n = string.length(text)
+    i = 0
+    count = 0
+    while i < n {
+        b = string.char_at(text, i) & 255
+        need = 0
+        if b < 128 {
+            need = 0
+        } else if b >= 194 && b <= 223 {
+            need = 1
+        } else if b >= 224 && b <= 239 {
+            need = 2
+        } else if b >= 240 && b <= 244 {
+            need = 3
+        } else {
+            return -1
+        }
+        if need > 0 && i + need >= n { return -1 }
+        j = 1
+        while j <= need {
+            c = string.char_at(text, i + j) & 255
+            if (c & 192) != 128 { return -1 }
+            j = j + 1
+        }
+        if need == 2 {
+            b1 = string.char_at(text, i + 1) & 255
+            if b == 224 && b1 < 160 { return -1 }
+            if b == 237 && b1 > 159 { return -1 }
+        }
+        if need == 3 {
+            b1 = string.char_at(text, i + 1) & 255
+            if b == 240 && b1 < 144 { return -1 }
+            if b == 244 && b1 > 143 { return -1 }
+        }
+        i = i + 1 + need
+        count = count + 1
+    }
+    return count
+}
+
+blank_(text: string) -> int {
+    i = 0
+    while i < string.length(text) {
+        c = string.char_at(text, i) & 255
+        if c != 32 && c != 9 && c != 13 && c != 10 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// ---- the request ----
+
+// The base URL without trailing slashes, then the route's path.
+build_url(base: string, kind: string) -> string {
+    b = base
+    while string.length(b) > 0 && string.ends_with(b, "/") == 1 {
+        b = string.substring(b, 0, string.length(b) - 1)
+    }
+    path = "v1/tools/search"
+    if kind == "openai" { path = "responses" }
+    if kind == "anthropic" { path = "v1/messages" }
+    return "${b}/${path}"
+}
+
+build_body(kind: string, provider_id: string, query: string, count: int) -> string {
+    q = jsonx.quote(query)
+    if kind == "openai" {
+        return "{\"model\":${jsonx.quote(types.small_model(provider_id))},\"instructions\":${jsonx.quote(INSTRUCTIONS)},\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":${q}}]}],\"tools\":[{\"type\":\"web_search\",\"search_context_size\":\"high\"}],\"tool_choice\":\"required\",\"include\":[\"web_search_call.action.sources\"],\"store\":false,\"stream\":true}"
+    }
+    if kind == "anthropic" {
+        return "{\"model\":${jsonx.quote(types.small_model(provider_id))},\"max_tokens\":4096,\"messages\":[{\"role\":\"user\",\"content\":${q}}],\"tools\":[{\"type\":\"${ANTHROPIC_TOOL}\",\"name\":\"web_search\",\"max_uses\":5}]}"
+    }
+    return "{\"query\":${q},\"count\":${count}}"
+}
+
+// Starts the POST on a worker thread; the Exch fills as it goes.
+post_(url: string, names: @keep ptr, values: @keep ptr, body: string) -> ptr {
+    ex = heap.new(Exch)
+    ex.guard = lock.new()
+    ex.buf = ""
+    ex.status = 0
+    ex.done = sync.atomic_new(0)
+    ex.err = ""
+    xp = ex as ptr
+    u = string.copy(url)
+    b = string.copy(body)
+    hn = names
+    hv = values
+    worker.run_detached(|| {
+        s = xp as *Exch
+        req = client.request("POST", u)
+        if req == null {
+            lock.acquire(s.guard)
+            s.err = "InvalidUri"
+            lock.release(s.guard)
+            sync.atomic_store(s.done, 1)
+            return null
+        }
+        i = 0
+        while i < list.list_size(hn) {
+            n, _a = list.get_string(hn, i)
+            v, _b = list.get_string(hv, i)
+            client.set_header(req, n, v)
+            i = i + 1
+        }
+        client.set_body(req, string.bytes(b), "application/json")
+        client.set_follow_redirects(req, 0)
+        client.set_timeout(req, (TIMEOUT_MS as long) * 1ms)
+        resp, err = client.send_stream(req)
+        if err != "" {
+            lock.acquire(s.guard)
+            s.err = err
+            lock.release(s.guard)
+            sync.atomic_store(s.done, 1)
+            return null
+        }
+        lock.acquire(s.guard)
+        s.status = client.response_status(resp)
+        lock.release(s.guard)
+        total = 0
+        while true {
+            chunk = client.response_read(resp, 65536)
+            if string.length(chunk) == 0 { break }
+            total = total + string.length(chunk)
+            if total > MAX_BODY {
+                lock.acquire(s.guard)
+                s.err = "ResponseTooLarge"
+                lock.release(s.guard)
+                break
+            }
+            lock.acquire(s.guard)
+            s.buf = "${s.buf}${chunk}"
+            lock.release(s.guard)
+        }
+        e = client.response_error(resp)
+        if e != "" && total <= MAX_BODY {
+            lock.acquire(s.guard)
+            s.err = e
+            lock.release(s.guard)
+        }
+        client.response_free(resp)
+        sync.atomic_store(s.done, 1)
+        return null
+    })
+    return xp
+}
+
+// (status, body, error): error "" ok, "Canceled", "Timeout", or the transport text.
+exchange_(kind: string, cfg: *types.Config, url: string, body: string, cancel: ptr, timeout_ms: int) -> (int, string, string) {
+    names = list.list_new()
+    values = list.list_new()
+    list.list_add(names, "accept")
+    if kind == "openai" {
+        list.list_add(values, "text/event-stream")
+    } else {
+        list.list_add(values, "application/json")
+    }
+    if kind == "anthropic" {
+        list.list_add(names, "anthropic-version")
+        list.list_add(values, "2023-06-01")
+        if string.length(cfg.api_key) > 0 {
+            list.list_add(names, "x-api-key")
+            list.list_add(values, cfg.api_key)
+        }
+    } else if string.length(cfg.api_key) > 0 {
+        list.list_add(names, "authorization")
+        list.list_add(values, "Bearer ${cfg.api_key}")
+    }
+    xp = post_(url, names, values, body)
+    ex = xp as *Exch
+    started = time.now_ms()
+    while true {
+        if cancel != null && sync.atomic_load(cancel) != 0 { return 0, "", "Canceled" }
+        if sync.atomic_load(ex.done) != 0 { break }
+        if time.now_ms() - started >= (timeout_ms as long) { return 0, "", "Timeout" }
+        sleep(50)
+    }
+    lock.acquire(ex.guard)
+    status = ex.status
+    got = ex.buf
+    e = ex.err
+    lock.release(ex.guard)
+    return status, got, e
+}
+
+// ---- the reply ----
+
+new_item_(title: string, url: string, date: string, has_date: int, summary: string) -> *Item {
+    it = heap.new(Item)
+    it.title = string.copy(title)
+    it.url = string.copy(url)
+    it.date = string.copy(date)
+    it.has_date = has_date
+    it.summary = string.copy(summary)
+    return it
+}
+
+new_coll_() -> *Coll {
+    c = heap.new(Coll)
+    c.cited = list.list_new()
+    c.other = list.list_new()
+    c.text = ""
+    c.searched = 0
+    c.failed = ""
+    c.has_failed = 0
+    return c
+}
+
+new_outcome_() -> *Outcome {
+    o = heap.new(Outcome)
+    o.failure = ""
+    o.has_failure = 0
+    o.answer = ""
+    o.has_answer = 0
+    o.results = list.list_new()
+    return o
+}
+
+failed_outcome_(text: string) -> ptr {
+    o = new_outcome_()
+    o.failure = string.copy(text)
+    o.has_failure = 1
+    return o as ptr
+}
+
+// A string member, else `d`.
+sv_(o: ptr, key: string, d: string) -> string { return string.copy(jsonx.str_or(o, key, d)) }
+
+is_str_(o: ptr, key: string) -> int {
+    if jsonx.kind(o, key) == json.JSON_STRING { return 1 }
+    return 0
+}
+
+// Cited results rank before other sources; duplicates by URL merge; capped.
+finish_(c: *Coll, count: int) -> ptr {
+    if c.has_failed == 1 { return failed_outcome_(c.failed) }
+    if c.searched == 0 { return failed_outcome_("model answered without searching") }
+    o = new_outcome_()
+    k = 0
+    while k < 2 {
+        src = c.cited
+        if k == 1 { src = c.other }
+        i = 0
+        while i < list.list_size(src) {
+            it = list.list_get_raw(src, i) as *Item
+            found = -1
+            j = 0
+            while j < list.list_size(o.results) {
+                seen = list.list_get_raw(o.results, j) as *Item
+                if seen.url == it.url {
+                    found = j
+                    break
+                }
+                j = j + 1
+            }
+            if found >= 0 {
+                seen2 = list.list_get_raw(o.results, found) as *Item
+                if seen2.has_date == 0 {
+                    seen2.date = string.copy(it.date)
+                    seen2.has_date = it.has_date
+                }
+                if string.length(seen2.summary) == 0 { seen2.summary = string.copy(it.summary) }
+            } else if list.list_size(o.results) < count {
+                list.list_add_raw(o.results, new_item_(it.title, it.url, it.date, it.has_date, it.summary) as ptr)
+            }
+            i = i + 1
+        }
+        k = k + 1
+    }
+    if string.length(c.text) > 0 {
+        o.answer = string.copy(c.text)
+        o.has_answer = 1
+    }
+    return o as ptr
+}
+
+// The Responses SSE `body` (a whole stream), `count` results at most.
+parse_responses(body: string, count: int) -> ptr {
+    c = new_coll_()
+    p = sse.parser()
+    lines = sse.fixed(body)
+    while true {
+        line, lerr = sse.next(lines, null)
+        data, ready = sse.feed(p, line)
+        if ready == 0 && lerr == "EOF" { data, ready = sse.feed(p, "") }
+        if ready == 1 && data != "[DONE]" { responses_event_(c, data) }
+        if lerr == "EOF" { break }
+    }
+    return finish_(c, count)
+}
+
+responses_event_(c: *Coll, data: string) {
+    ev = jsonx.parse(data)
+    if ev == null { return }
+    kind = jsonx.str_or(ev, "type", "")
+    if kind == "response.output_item.done" {
+        item = jsonx.field(ev, "item")
+        ik = jsonx.str_or(item, "type", "")
+        if ik == "web_search_call" {
+            c.searched = 1
+            sources = jsonx.field(jsonx.field(item, "action"), "sources")
+            n = jsonx.array_size(sources)
+            i = 0
+            while i < n {
+                src = jsonx.array_at(sources, i)
+                if is_str_(src, "url") == 1 {
+                    url = sv_(src, "url", "")
+                    list.list_add_raw(c.other, new_item_(sv_(src, "title", url), url, "", 0, "") as ptr)
+                }
+                i = i + 1
+            }
+        } else if ik == "message" {
+            parts = jsonx.field(item, "content")
+            n = jsonx.array_size(parts)
+            i = 0
+            while i < n {
+                part = jsonx.array_at(parts, i)
+                if is_str_(part, "text") == 1 { c.text = "${c.text}${jsonx.str_or(part, "text", "")}" }
+                notes = jsonx.field(part, "annotations")
+                m = jsonx.array_size(notes)
+                j = 0
+                while j < m {
+                    note = jsonx.array_at(notes, j)
+                    if jsonx.str_or(note, "type", "") == "url_citation" && is_str_(note, "url") == 1 {
+                        url = sv_(note, "url", "")
+                        list.list_add_raw(c.cited, new_item_(sv_(note, "title", url), url, "", 0, "") as ptr)
+                    }
+                    j = j + 1
+                }
+                i = i + 1
+            }
+        }
+    } else if kind == "response.failed" || kind == "error" {
+        err = ev
+        if jsonx.field(ev, "response") != null {
+            err = jsonx.field(jsonx.field(ev, "response"), "error")
+        } else if jsonx.field(ev, "error") != null {
+            err = jsonx.field(ev, "error")
+        }
+        c.failed = sv_(err, "message", "search request failed")
+        c.has_failed = 1
+    }
+    jsonx.free(ev)
+}
+
+// The Messages JSON `body`. An unparsable body is an outcome failure
+// "invalid search response: SyntaxError" (upstream raises it as an error).
+parse_anthropic(body: string, count: int) -> ptr {
+    root = jsonx.parse(body)
+    if root == null { return failed_outcome_("invalid search response: SyntaxError") }
+    c = new_coll_()
+    if jsonx.str_or(root, "type", "") == "error" {
+        c.failed = sv_(jsonx.field(root, "error"), "message", "search request failed")
+        c.has_failed = 1
+    }
+    blocks = jsonx.field(root, "content")
+    n = jsonx.array_size(blocks)
+    i = 0
+    while i < n {
+        block = jsonx.array_at(blocks, i)
+        kind = jsonx.str_or(block, "type", "")
+        if kind == "text" {
+            if is_str_(block, "text") == 1 { c.text = "${c.text}${jsonx.str_or(block, "text", "")}" }
+            cites = jsonx.field(block, "citations")
+            m = jsonx.array_size(cites)
+            j = 0
+            while j < m {
+                cite = jsonx.array_at(cites, j)
+                if is_str_(cite, "url") == 1 {
+                    url = sv_(cite, "url", "")
+                    list.list_add_raw(c.cited, new_item_(sv_(cite, "title", url), url, "", 0, sv_(cite, "cited_text", "")) as ptr)
+                }
+                j = j + 1
+            }
+        } else if kind == "server_tool_use" {
+            c.searched = 1
+        } else if kind == "web_search_tool_result" {
+            c.searched = 1
+            content = jsonx.field(block, "content")
+            if content != null && json.json_type(content) == json.JSON_OBJECT && c.has_failed == 0 {
+                c.failed = "web search failed: ${jsonx.str_or(content, "error_code", "unknown")}"
+                c.has_failed = 1
+            }
+            m = jsonx.array_size(content)
+            j = 0
+            while j < m {
+                hit = jsonx.array_at(content, j)
+                if is_str_(hit, "url") == 1 {
+                    url = sv_(hit, "url", "")
+                    list.list_add_raw(c.other, new_item_(sv_(hit, "title", url), url, sv_(hit, "page_age", ""), is_str_(hit, "page_age"), "") as ptr)
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    out = finish_(c, count)
+    jsonx.free(root)
+    return out
+}
+
+// The DeepSeek JSON `body`: summary, else snippet; no answer, no search check.
+parse_deepseek(body: string, count: int) -> ptr {
+    root = jsonx.parse(body)
+    if root == null { return failed_outcome_("invalid search response: SyntaxError") }
+    o = new_outcome_()
+    hits = jsonx.field(root, "results")
+    n = jsonx.array_size(hits)
+    i = 0
+    while i < n {
+        if list.list_size(o.results) >= count { break }
+        hit = jsonx.array_at(hits, i)
+        if is_str_(hit, "url") == 1 {
+            url = sv_(hit, "url", "")
+            summary = ""
+            if is_str_(hit, "summary") == 1 {
+                summary = sv_(hit, "summary", "")
+            } else {
+                summary = sv_(hit, "snippet", "")
+            }
+            list.list_add_raw(o.results, new_item_(sv_(hit, "title", url), url, sv_(hit, "date", ""), is_str_(hit, "date"), summary) as ptr)
+        }
+        i = i + 1
+    }
+    jsonx.free(root)
+    return o as ptr
+}
+
+item_json_(it: *Item) -> string {
+    date = ""
+    if it.has_date == 1 { date = ",\"date\":${jsonx.quote(it.date)}" }
+    return "{\"title\":${jsonx.quote(it.title)},\"url\":${jsonx.quote(it.url)}${date},\"summary\":${jsonx.quote(it.summary)}}"
+}
+
+// {"ok":true,"answer":..,"results":[..]} (with_ok 1) or the same without
+// "ok"; "answer" is left out when there is none.
+outcome_json(op: ptr, with_ok: int) -> string {
+    o = op as *Outcome
+    out = "{"
+    if with_ok == 1 { out = "${out}\"ok\":true," }
+    if o.has_answer == 1 { out = "${out}\"answer\":${jsonx.quote(o.answer)}," }
+    out = "${out}\"results\":["
+    i = 0
+    while i < list.list_size(o.results) {
+        if i > 0 { out = "${out}," }
+        out = "${out}${item_json_(list.list_get_raw(o.results, i) as *Item)}"
+        i = i + 1
+    }
+    return "${out}]}"
+}
+
+// ---- the tool ----
+
+parse_reply_(kind: string, text: string, count: int) -> ptr {
+    if kind == "openai" { return parse_responses(text, count) }
+    if kind == "anthropic" { return parse_anthropic(text, count) }
+    return parse_deepseek(text, count)
+}
+
+// (1, result JSON) or (0, rejection). `cfg` is the Session's *types.Config
+// (null: none); `cancel` a std.sync cell (null: none).
+search(cfg: ptr, args: string, cancel: ptr) -> (int, string) {
+    return search_with(cfg, args, cancel, TIMEOUT_MS)
+}
+
+// search with the exchange's timeout in milliseconds (tests shorten it).
+search_with(cfgp: ptr, args: string, cancel: ptr, timeout_ms: int) -> (int, string) {
+    v = jsonx.parse(args)
+    if v == null { return reject_(USAGE_TEXT) }
+    if json.json_type(v) != json.JSON_OBJECT || is_str_(v, "query") == 0 {
+        jsonx.free(v)
+        return reject_(USAGE_TEXT)
+    }
+    query = string.copy(jsonx.str_or(v, "query", ""))
+    cnt = 10 as long
+    if jsonx.has(v, "count") == 1 {
+        cv = jsonx.field(v, "count")
+        if json.json_type(cv) != json.JSON_NUMBER {
+            jsonx.free(v)
+            return reject_(USAGE_TEXT)
+        }
+        if json.json_is_integer(cv) == 1 {
+            cnt = json.json_get_long(cv)
+        } else {
+            f = json.json_get_number(cv)
+            cnt = f as long
+            if (cnt as float) != f {
+                jsonx.free(v)
+                return reject_(USAGE_TEXT)
+            }
+        }
+    }
+    jsonx.free(v)
+    if blank_(query) == 1 { return reject_("query must not be empty") }
+    if cnt < 1 as long || cnt > (MAX_COUNT as long) { return reject_("count must be between 1 and ${MAX_COUNT}") }
+    count = cnt as int
+    if cfgp == null { return failure_("web search needs a configured provider") }
+    cfg = cfgp as *types.Config
+    kind = route(cfg.provider)
+    if kind == "" { return failure_("web search is not available for provider ${types.name(cfgp)}") }
+    if kind == "deepseek" {
+        chars = codepoints(query)
+        if chars < 0 { return reject_("query must be valid UTF-8") }
+        if chars > DEEPSEEK_QUERY_CHARS {
+            return reject_("query is ${chars} characters; DeepSeek search accepts at most ${DEEPSEEK_QUERY_CHARS}")
+        }
+    }
+    url = build_url(cfg.base_url, kind)
+    status, resp_text, err = exchange_(kind, cfg, url, build_body(kind, cfg.provider, query, count), cancel, timeout_ms)
+    if err == "Canceled" { return reject_("canceled") }
+    if err == "Timeout" { return failure_("timed out after ${timeout_ms} ms") }
+    if err != "" { return failure_(err) }
+    if status < 200 || status >= 300 { return failure_("HTTP ${status}: ${clip(resp_text, 300)}") }
+    outcome = parse_reply_(kind, resp_text, count)
+    o = outcome as *Outcome
+    if o.has_failure == 1 { return failure_(o.failure) }
+    return 1, outcome_json(outcome, 1)
+}
