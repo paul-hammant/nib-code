@@ -1,0 +1,204 @@
+// Ports the file/bash-relevant tests of upstream src/tools.zig (a2dd439).
+//
+// Not ported (outside this slice, or about other tools):
+//  - "child API filters agent from both docs and sandbox", "fork keeps parent
+//    API bytes but rejects delegation at runtime", "fork and resume are
+//    conflicting parameters even when fork is false": the agent tool is not
+//    ported.
+//  - "llm map documentation example ...", "llm admission rejects call 101 ...",
+//    "generated llm options ...", "configured default model ...": llm is not
+//    ported.
+//  - "search is documented only for providers that support it": web search
+//    is not ported (providers/config slice).
+// Upstream's "tool descriptions stay concise ..." walks the tool table; here
+// the table is read back out of all_docs() (one block per `async name(`).
+import std.spec
+import std.fs
+import std.list
+import std.string
+import std.sync
+import std.os
+import std.worker
+import nib.sandbox
+import nib.tools
+import nib.tools.atomic_file
+
+tmp_() -> string {
+    d, _e = fs.make_temp_dir("", "nib-tools")
+    real, _k, _m = fs.realpath(d)
+    return real
+}
+
+new_tools_(d: string) -> ptr {
+    t = tools.new(d)
+    (t as *tools.Tools).data_home = "${d}/nibhome"
+    return t
+}
+
+limits_(timeout_ms: long) -> ptr {
+    l = sandbox.limits() as *sandbox.Limits
+    l.timeout_ms = timeout_ms
+    return l as ptr
+}
+
+contains_(s: string, part: string) -> int {
+    if string.index_of(s, part) >= 0 { return 1 }
+    return 0
+}
+
+// the first line of the example following `marker` in `docs`, after "Example: "
+example_(docs: string, marker: string) -> string {
+    at = string.index_of(docs, marker)
+    if at < 0 { return "" }
+    ex = string.index_of_from(docs, "Example: ", at)
+    if ex < 0 { return "" }
+    start = ex + 9
+    end = string.index_of_from(docs, "\n", start)
+    return string.substring(docs, start, end)
+}
+
+echo_host_(names: string) -> ptr {
+    return sandbox.new_host(null, names, |ctx: ptr, name: string, args: string, out: ptr| {
+        sandbox.result_set_ok(out, args)
+    })
+}
+
+// UTF-8 code points after the first "//" of a line (0 if none)
+comment_chars_(line: string) -> int {
+    at = string.index_of(line, "//")
+    if at < 0 { return 0 }
+    n = 0
+    i = at + 2
+    while i < string.length(line) {
+        c = string.char_at(line, i)
+        if c < 128 || c >= 192 { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tools") {
+        spec.it("tool docs are valid JavaScript") callback {
+            // An uncalled function: parsed, never run.
+            src = "() => {\n${tools.all_docs()}}"
+            r = sandbox.eval(src, sandbox.limits(), null, null) as *sandbox.Outcome
+            spec.assert_eq(r.ok, 1, "parses: ${r.text}")
+            // a doc with a syntax error must fail the same check
+            bad = sandbox.eval("() => {\nconst tools = { async read({ path } {}, };\n}", sandbox.limits(), null, null) as *sandbox.Outcome
+            spec.assert_eq(bad.ok, 0, "a broken doc is detected")
+        }
+        spec.it("Promise.all runs bash concurrently and await remains sequential") callback {
+            d = tmp_()
+            t = new_tools_(d)
+            s = tools.new_scope(t, 1)
+            t0 = os.now_monotonic_ms()
+            parallel = sandbox.eval("await Promise.all([tools.bash({command: \"sleep 0.3\"}), tools.bash({command: \"sleep 0.3\"})])", sandbox.limits(), tools.host(s), null) as *sandbox.Outcome
+            t1 = os.now_monotonic_ms()
+            // a scope is one Run's: its cancel cell is set when the Run ends
+            s = tools.new_scope(t, 2)
+            serial = sandbox.eval("await tools.bash({command: \"sleep 0.3\"}); await tools.bash({command: \"sleep 0.3\"})", sandbox.limits(), tools.host(s), null) as *sandbox.Outcome
+            t2 = os.now_monotonic_ms()
+            spec.assert_eq(parallel.ok, 1, "parallel ok: ${parallel.text}")
+            spec.assert_eq(serial.ok, 1, "serial ok: ${serial.text}")
+            spec.assert_true(t1 - t0 < 550, "parallel took ${t1 - t0} ms")
+            spec.assert_true(t2 - t1 >= 600, "serial took ${t2 - t1} ms")
+            fs.remove_tree(d)
+        }
+        spec.it("cancel and deadline join running tools and discard queued calls") callback {
+            d = tmp_()
+            s = tools.new_scope(new_tools_(d), 1)
+            flag = sync.atomic_new(0)
+            worker.run_detached(|| {
+                sleep(200)
+                sync.atomic_store(flag, 1)
+                return null
+            })
+            code = "await Promise.all(Array.from({length: 12}, () => tools.bash({command: 'sleep 5'})))"
+            t0 = os.now_monotonic_ms()
+            canceled = sandbox.eval(code, limits_(100), tools.host(s), flag) as *sandbox.Outcome
+            spec.assert_str_eq(canceled.text, "Error: run canceled", "canceled")
+            spec.assert_true(os.now_monotonic_ms() - t0 < 3000, "joined the running tools promptly")
+            code2 = "await Promise.all([tools.bash({command: 'true'}).then(() => { for (;;) {} }),\n"
+            code2 = "${code2}  ...Array.from({length: 12}, () => tools.bash({command: 'sleep 5'}))]);"
+            s2 = tools.new_scope(new_tools_(d), 2)
+            t1 = os.now_monotonic_ms()
+            timed = sandbox.eval(code2, limits_(80), tools.host(s2), null) as *sandbox.Outcome
+            spec.assert_str_eq(timed.text, "Error: run timed out", "timed out")
+            spec.assert_true(os.now_monotonic_ms() - t1 < 3000, "joined the running tools promptly")
+            fs.remove_tree(d)
+        }
+        spec.it("dangling symlink and target share the same path lock") callback {
+            d = tmp_()
+            spec.assert_str_eq(fs.symlink("target", "${d}/link"), "", "symlink")
+            a, ea = atomic_file.canonical_path("${d}/link")
+            b, eb = atomic_file.canonical_path("${d}/target")
+            spec.assert_str_eq(ea, "", "link resolves")
+            spec.assert_str_eq(eb, "", "target resolves")
+            spec.assert_str_eq(a, b, "same canonical path")
+            fs.remove_tree(d)
+        }
+        spec.it("Run excludes tool waits without resetting the JS budget") callback {
+            d = tmp_()
+            t = new_tools_(d)
+            s = tools.new_scope(t, 1)
+            code = "const a = await tools.bash({command: \"sleep 0.3; printf first\"});\n"
+            code = "${code}const b = await tools.bash({command: \"sleep 0.3; printf second\"});\n"
+            code = "${code}a.output + b.output"
+            waited = sandbox.eval(code, limits_(100), tools.host(s), null) as *sandbox.Outcome
+            spec.assert_eq(waited.ok, 1, "ok: ${waited.text}")
+            spec.assert_str_eq(waited.text, "\"firstsecond\"", "text")
+            code2 = "const spin = () => { const end = Date.now() + 60; while (Date.now() < end) {} };\n"
+            code2 = "${code2}spin(); await tools.bash({command: \"sleep 0.15\"}); spin();"
+            s = tools.new_scope(t, 2)
+            timed = sandbox.eval(code2, limits_(100), tools.host(s), null) as *sandbox.Outcome
+            spec.assert_str_eq(timed.text, "Error: run timed out", "timed out")
+            fs.remove_tree(d)
+        }
+        spec.it("bash documentation example keeps test output captured byte for byte") callback {
+            ex = example_(tools.all_docs(), "  // cwd; merged stderr")
+            spec.assert_true(string.length(ex) > 0, "found an example")
+            r = sandbox.eval(ex, sandbox.limits(), echo_host_("[\"bash\"]"), null) as *sandbox.Outcome
+            spec.assert_eq(r.ok, 1, "ok: ${r.text}")
+            spec.assert_str_eq(r.text, "{\"command\":\"sh checks.sh\"}", "args")
+        }
+        spec.it("grep documentation RegExp example reaches the host byte for byte") callback {
+            ex = example_(tools.all_docs(), "  // pattern: RegExp literal")
+            spec.assert_true(string.length(ex) > 0, "found an example")
+            r = sandbox.eval(ex, sandbox.limits(), echo_host_("[\"grep\"]"), null) as *sandbox.Outcome
+            spec.assert_eq(r.ok, 1, "ok: ${r.text}")
+            spec.assert_str_eq(r.text, "{\"pattern\":\"\\\\.reserve\\\\(\"}", "args")
+        }
+        spec.it("tool descriptions stay concise and delegation stays adjacent") callback {
+            docs = tools.all_docs()
+            lines = string.string_split(docs, "\n")
+            n = string.string_array_size(lines)
+            chars = 0
+            blocks = 0
+            prev = ""
+            i = 0
+            while i < n {
+                line = string.string_array_get(lines, i)
+                chars = chars + comment_chars_(line)
+                if string.starts_with(line, "  async ") == 1 {
+                    rest = string.substring(line, 8, string.length(line))
+                    p = string.index_of(rest, "(")
+                    name = string.substring(rest, 0, p)
+                    spec.assert_true(chars <= 600, "${name}: ${chars} comment characters")
+                    if prev == "llm" { spec.assert_str_eq(name, "agent", "agent follows llm") }
+                    prev = name
+                    blocks = blocks + 1
+                    chars = 0
+                }
+                i = i + 1
+            }
+            spec.assert_eq(blocks, 15, "every tool has a block")
+            names = tools.tool_names()
+            spec.assert_eq(list.list_size(names), 15, "table size")
+            spec.assert_eq(contains_(docs, "  async llm("), 1, "llm documented")
+            spec.assert_eq(contains_(docs, "  async agent("), 1, "agent documented")
+        }
+    }
+    return spec.run_summary(fw)
+}

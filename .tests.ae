@@ -61,6 +61,30 @@ aeb(cap) {
             source("ae/tests/jail_test.ae")
             lib("ae")
         }
+        aether.program_test() {
+            source("ae/tests/file_state_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/files_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/process_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/bash_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/registry_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/tools_test.ae")
+            lib("ae")
+        }
         return 0
     }
 }

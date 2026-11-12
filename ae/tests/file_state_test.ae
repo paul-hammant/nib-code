@@ -1,0 +1,140 @@
+// Ports the tests of upstream src/tools/file_state.zig (a2dd439) to the
+// Aether file_state module. Not ported: "file version import and export clean
+// up allocation failures" (Zig's checkAllAllocationFailures has no Aether
+// counterpart; ownership is the runtime's here).
+import std.spec
+import std.fs
+import std.list
+import std.string
+import std.sync
+import std.worker
+import std.os
+import nib.sysgap
+import nib.tools.file_state
+import nib.tools.atomic_file
+
+tmp_() -> string {
+    d, _e = fs.make_temp_dir("", "nib-fstate")
+    real, _k, _m = fs.realpath(d)
+    return real
+}
+
+stat_(ino: long, size: long, mtime: long) -> ptr {
+    st = sysgap.new_stat()
+    s = st as *sysgap.Stat
+    s.ino = ino
+    s.size = size
+    s.mtime_ns = mtime
+    return st
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tools.file_state") {
+        spec.it("empty file versions export and import") callback {
+            s = file_state.new()
+            v = file_state.export_versions(s)
+            spec.assert_eq(list.list_size(v), 0, "no versions")
+            file_state.import_versions(s, v)
+            spec.assert_eq(file_state.count(s), 0, "still empty")
+        }
+        spec.it("file version snapshot and imported keys outlive their sources") callback {
+            path = "/observed/file"
+            original = stat_(7, 11, 9007199254740993)
+            latest = stat_(7, 12, 9007199254740993)
+            child = file_state.new()
+            sibling = file_state.new()
+            parent = file_state.new()
+            file_state.remember_stat(parent, path, original)
+            versions = file_state.export_versions(parent)
+            file_state.remember_stat(parent, path, latest)
+            file_state.remember_stat(parent, "/observed/later", latest)
+            spec.assert_eq(list.list_size(versions), 2, "one observation (path, version)")
+            k, _ke = list.get_string(versions, 0)
+            spec.assert_str_eq(k, path, "path")
+            ver = list.list_get_raw(versions, 1) as *file_state.Version
+            spec.assert_eq_long(ver.ino, 7, "ino")
+            spec.assert_eq_long(ver.size, 11, "snapshot size is the original")
+            spec.assert_eq_long(ver.mtime_ns, 9007199254740993, "mtime beyond 2^53 kept exactly")
+            file_state.import_versions(child, versions)
+            file_state.import_versions(sibling, versions)
+            // the source state moves on; the exported copies are unaffected
+            file_state.remember_stat(parent, path, stat_(9, 99, 1))
+            spec.assert_eq(file_state.changed(child, path, original), 0, "unchanged")
+            spec.assert_eq(file_state.changed(child, path, latest), 1, "size differs")
+            spec.assert_eq(file_state.changed(child, "/observed/later", latest), 0, "unobserved path is never changed")
+            spec.assert_eq(file_state.changed(child, path, stat_(8, 11, 9007199254740993)), 1, "inode differs")
+            spec.assert_eq(file_state.changed(child, path, stat_(7, 11, 9007199254740994)), 1, "mtime differs by 1 ns")
+            file_state.remember_stat(child, path, latest)
+            spec.assert_eq(file_state.changed(child, path, latest), 0, "remembered")
+            spec.assert_eq(file_state.changed(sibling, path, latest), 1, "sibling keeps the original")
+        }
+        spec.it("file version export retains canonical alias observations after deletion") callback {
+            d = tmp_()
+            fs.mkdir_p("${d}/sub")
+            fs.write("${d}/f", "old")
+            spec.assert_str_eq(fs.symlink("f", "${d}/alias"), "", "symlink")
+            alias = "${d}/sub/../alias"
+            target = "${d}/f"
+            canonical, e1 = atomic_file.canonical_path(alias)
+            c2, e2 = atomic_file.canonical_path(target)
+            spec.assert_str_eq(e1, "", "alias resolves")
+            spec.assert_str_eq(e2, "", "target resolves")
+            spec.assert_str_eq(canonical, c2, "alias and target share a canonical path")
+            original = sysgap.new_stat()
+            sysgap.stat(target, 1, original)
+            parent = file_state.new()
+            file_state.remember_stat(parent, canonical, original)
+            fs.delete(target)
+            versions = file_state.export_versions(parent)
+            spec.assert_eq(list.list_size(versions), 2, "one observation")
+            k, _ke = list.get_string(versions, 0)
+            spec.assert_str_eq(k, canonical, "canonical path kept")
+            child = file_state.new()
+            file_state.import_versions(child, versions)
+            fs.write(target, "replacement is longer")
+            recreated = sysgap.new_stat()
+            sysgap.stat(target, 1, recreated)
+            ca, _a = atomic_file.canonical_path(alias)
+            ct, _t = atomic_file.canonical_path(target)
+            spec.assert_eq(file_state.changed(child, ca, recreated), 1, "alias sees the change")
+            spec.assert_eq(file_state.changed(child, ct, recreated), 1, "target sees the change")
+            file_state.remember_stat(child, canonical, recreated)
+            spec.assert_eq(file_state.changed(child, canonical, recreated), 0, "remembered")
+            fs.remove_tree(d)
+        }
+        spec.it("file version export is consistent with concurrent observations") callback {
+            parent = file_state.new()
+            path = "/observed/file"
+            file_state.remember_stat(parent, path, stat_(0, 0, 0))
+            done = sync.atomic_new(0)
+            worker.run_detached(|| {
+                n = 1 as long
+                while n <= 1000 {
+                    file_state.remember_stat(parent, path, stat_(n, n, n))
+                    n = n + 1
+                }
+                sync.atomic_store(done, 1)
+                return null
+            })
+            i = 0
+            while i < 100 {
+                versions = file_state.export_versions(parent)
+                spec.assert_eq(list.list_size(versions), 2, "one observation")
+                v = list.list_get_raw(versions, 1) as *file_state.Version
+                spec.assert_eq_long(v.ino, v.size, "ino == size (no torn read)")
+                spec.assert_eq_long(v.ino, v.mtime_ns, "ino == mtime (no torn read)")
+                i = i + 1
+            }
+            while sync.atomic_load(done) == 0 { sleep(1) }
+        }
+        spec.it("lock paths are per canonical path and stay under the nib home") callback {
+            a = file_state.lock_path("/h", "/p/x")
+            b = file_state.lock_path("/h", "/p/y")
+            spec.assert_true(string.starts_with(a, "/h/locks/"), "under locks")
+            spec.assert_true(a != b, "distinct paths, distinct locks")
+            spec.assert_str_eq(a, file_state.lock_path("/h", "/p/x"), "stable")
+        }
+    }
+    return spec.run_summary(fw)
+}

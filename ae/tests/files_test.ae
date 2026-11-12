@@ -1,0 +1,371 @@
+// Ports the tests of upstream src/tools/files.zig (a2dd439). Each test makes
+// a Tools with its own temp home and nib data dir (path locks live there),
+// a scope, and calls through tools.call_tool.
+// Paths are absolute temp paths (Zig used cwd-relative .zig-cache paths).
+import std.spec
+import std.fs
+import std.list
+import std.string
+import std.strbuilder
+import std.sync
+import nib.jsonx
+import nib.sandbox
+import nib.tools
+import nib.tools.diff
+import nib.tools.registry
+
+tmp_() -> string {
+    d, _e = fs.make_temp_dir("", "nib-files")
+    real, _k, _m = fs.realpath(d)
+    return real
+}
+
+new_tools_(d: string) -> ptr {
+    t = tools.new(d)
+    (t as *tools.Tools).data_home = "${d}/nibhome"
+    return t
+}
+
+call_(s: ptr, name: string, args: string) -> *sandbox.ToolResult {
+    out = sandbox.result_ok("")
+    tools.call_tool(s, name, args, out)
+    return out as *sandbox.ToolResult
+}
+
+// args object from a path plus extra JSON members ("" for none)
+pargs_(path: string, rest: string) -> string {
+    if rest == "" { return "{\"path\":${jsonx.quote(path)}}" }
+    return "{\"path\":${jsonx.quote(path)},${rest}}"
+}
+
+read_(p: string) -> string {
+    s, _e = fs.read(p)
+    return s
+}
+
+ok_(s: ptr, name: string, args: string) -> int { return call_(s, name, args).ok }
+
+contains_(s: string, part: string) -> int {
+    if string.index_of(s, part) >= 0 { return 1 }
+    return 0
+}
+
+change_(l: ptr, i: int) -> *diff.Change { return list.list_get_raw(l, i) as *diff.Change }
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tools.files") {
+        spec.it("write then edit") callback {
+            d = tmp_()
+            s = tools.new_scope(new_tools_(d), 1)
+            path = "${d}/a/b.txt"
+            wr = call_(s, "write", "{\"path\":${jsonx.quote(path)},\"content\":\"one two two\\n\"}")
+            spec.assert_eq(wr.ok, 1, "write ok")
+            spec.assert_str_eq(wr.text, "{\"bytes\":12}", "bytes")
+            amb = call_(s, "edit", "{\"path\":${jsonx.quote(path)},\"old_text\":\"two\",\"new_text\":\"2\"}")
+            spec.assert_eq(amb.ok, 0, "ambiguous refused")
+            spec.assert_true(string.starts_with(amb.text, "old_text matches 2 times"), "ambiguous text: ${amb.text}")
+            ar = call_(s, "edit", "{\"path\":${jsonx.quote(path)},\"old_text\":\"two\",\"new_text\":\"2\",\"all\":true}")
+            spec.assert_str_eq(ar.text, "{\"replaced\":2}", "replaced 2")
+            mr = call_(s, "edit", "{\"path\":${jsonx.quote(path)},\"old_text\":\"zzz\",\"new_text\":\"\"}")
+            spec.assert_eq(mr.ok, 0, "missing refused")
+            spec.assert_true(string.starts_with(mr.text, "old_text not found"), "missing text: ${mr.text}")
+            spec.assert_str_eq(read_(path), "one 2 2\n", "content")
+            fs.remove_tree(d)
+        }
+        spec.it("read slices lines and reports errors") callback {
+            d = tmp_()
+            s = tools.new_scope(new_tools_(d), 1)
+            fs.write("${d}/f.txt", "a\nb\nc\nd\n")
+            r = call_(s, "read", pargs_("${d}/f.txt", "\"offset\":2,\"limit\":2"))
+            spec.assert_str_eq(r.text, "{\"text\":\"b\\nc\\n\",\"next_offset\":4}", "slice")
+            missing = call_(s, "read", "{\"path\":\"/nonexistent/x\"}")
+            spec.assert_eq(missing.ok, 0, "missing is an error")
+            spec.assert_true(string.ends_with(missing.text, "FileNotFound"), "FileNotFound: ${missing.text}")
+            bad = call_(s, "read", "{}")
+            spec.assert_true(string.starts_with(bad.text, "expected"), "usage: ${bad.text}")
+            fs.remove_tree(d)
+        }
+        spec.it("parallel edits lock the normalized path through read and write") callback {
+            d = tmp_()
+            s = tools.new_scope(new_tools_(d), 1)
+            fs.write("${d}/f", "abcdefghijklmnop")
+            code = "await Promise.all(Array.from('abcdefghijklmnop', (letter, i) => tools.edit({\n"
+            code = "${code} path: '${d}/' + (i % 2 ? './f' : 'f'), old_text: letter, new_text: letter.toUpperCase()\n"
+            code = "${code}})))"
+            r = sandbox.eval(code, sandbox.limits(), tools.host(s), null) as *sandbox.Outcome
+            spec.assert_eq(r.ok, 1, "run ok: ${r.text}")
+            spec.assert_str_eq(read_("${d}/f"), "ABCDEFGHIJKLMNOP", "every edit landed")
+            fs.remove_tree(d)
+        }
+        spec.it("edit and write refuse paths outside the writable roots as data") callback {
+            d = tmp_()
+            fs.write("${d}/inside.txt", "old")
+            fs.symlink("/usr/share", "${d}/escape")
+            t = new_tools_(d)
+            tools.set_workspace(t, 1)
+            s = tools.new_scope(t, 1)
+            outside = ["/usr/share/nib-sandbox-test", "${d}/escape/nib-sandbox-test", "${d}/../../../../../../../../usr/share/nib-sandbox-test"]
+            names = ["edit", "write"]
+            i = 0
+            while i < 3 {
+                a = "{\"path\":${jsonx.quote(outside[i])},\"old_text\":\"a\",\"new_text\":\"b\",\"content\":\"x\"}"
+                j = 0
+                while j < 2 {
+                    r = call_(s, names[j], a)
+                    spec.assert_eq(r.ok, 0, "${names[j]} ${outside[i]} refused")
+                    spec.assert_true(contains_(r.text, "sandbox only allows writes inside the project"), "text: ${r.text}")
+                    j = j + 1
+                }
+                i = i + 1
+            }
+            ok = call_(s, "edit", pargs_("${d}/inside.txt", "\"old_text\":\"old\",\"new_text\":\"new\""))
+            spec.assert_str_eq(ok.text, "{\"replaced\":1}", "inside edit")
+            tools.set_workspace(t, 0)
+            off = call_(s, "write", "{\"path\":\"/nonexistent-nib-dir/x\",\"content\":\"x\"}")
+            spec.assert_eq(contains_(off.text, "sandbox"), 0, "sandbox off: ${off.text}")
+            fs.remove_tree(d)
+        }
+        spec.it("credential file tools deny default custom and symlink paths") callback {
+            d = tmp_()
+            fs.mkdir_p("${d}/.codex")
+            fs.mkdir_p("${d}/custom")
+            fs.write("${d}/.codex/auth.json", "fictional-default")
+            fs.write("${d}/custom/auth.json", "fictional-custom")
+            fs.symlink("custom/auth.json", "${d}/alias")
+            t = new_tools_(d)
+            (t as *tools.Tools).codex_home = "${d}/custom"
+            s = tools.new_scope(t, 1)
+            rel = [".codex/auth.json", "custom/auth.json", "alias"]
+            names = ["read", "edit", "write"]
+            i = 0
+            while i < 3 {
+                a = "{\"path\":${jsonx.quote("${d}/${rel[i]}")},\"old_text\":\"fictional\",\"new_text\":\"changed\",\"content\":\"changed\"}"
+                j = 0
+                while j < 3 {
+                    r = call_(s, names[j], a)
+                    spec.assert_eq(r.ok, 0, "${names[j]} ${rel[i]} denied")
+                    spec.assert_str_eq(r.text, "CredentialAccessDenied", "text")
+                    j = j + 1
+                }
+                i = i + 1
+            }
+            spec.assert_str_eq(read_("${d}/custom/auth.json"), "fictional-custom", "untouched")
+            fs.remove_tree(d)
+        }
+        spec.it("file tools refuse nib's own credential store") callback {
+            d = tmp_()
+            fs.mkdir_p("${d}/nibhome")
+            fs.write("${d}/nibhome/auth.json", "{\"keys\":{\"x\":\"fictional-stored\"}}")
+            fs.symlink("nibhome/auth.json", "${d}/alias")
+            t = new_tools_(d)
+            s = tools.new_scope(t, 1)
+            rel = ["nibhome/auth.json", "alias"]
+            names = ["read", "edit", "write"]
+            i = 0
+            while i < 2 {
+                a = "{\"path\":${jsonx.quote("${d}/${rel[i]}")},\"old_text\":\"fictional\",\"new_text\":\"changed\",\"content\":\"changed\"}"
+                j = 0
+                while j < 3 {
+                    r = call_(s, names[j], a)
+                    spec.assert_str_eq(r.text, "CredentialAccessDenied", "${names[j]} ${rel[i]}")
+                    j = j + 1
+                }
+                i = i + 1
+            }
+            found = 0
+            cp = tools.credential_paths(t)
+            k = 0
+            while k < list.list_size(cp) {
+                p, _e = list.get_string(cp, k)
+                if string.ends_with(p, "nibhome/auth.json") == 1 { found = 1 }
+                k = k + 1
+            }
+            spec.assert_eq(found, 1, "credential_paths lists the store")
+            fs.remove_tree(d)
+        }
+        spec.it("read and write round trip more than 16 KiB inside JS") callback {
+            d = tmp_()
+            s = tools.new_scope(new_tools_(d), 1)
+            b = strbuilder.new(65536)
+            i = 0
+            while i < 3000 {
+                strbuilder.append(b, "中文\t\"\\0123456789")
+                i = i + 1
+            }
+            strbuilder.append(b, "\r\nlast line without newline")
+            content = strbuilder.finish(b)
+            fs.write("${d}/f", content)
+            code = "const path = '${d}/f';\n"
+            code = "${code}const page = await tools.read({path});\n"
+            code = "${code}if (page.next_offset !== null) throw new Error('unexpected page');\n"
+            code = "${code}await tools.write({path, content: page.text});"
+            r = sandbox.eval(code, sandbox.limits(), tools.host(s), null) as *sandbox.Outcome
+            spec.assert_eq(r.ok, 1, "run ok: ${r.text}")
+            spec.assert_true(read_("${d}/f") == content, "bytes identical")
+            fs.remove_tree(d)
+        }
+        spec.it("read default pagination reconstructs every byte in JS") callback {
+            d = tmp_()
+            s = tools.new_scope(new_tools_(d), 1)
+            b = strbuilder.new(65536)
+            i = 0
+            while i < 1100 {
+                strbuilder.append(b, "中文\r\n\nthird\nfourth\n")
+                i = i + 1
+            }
+            strbuilder.append(b, "last without newline")
+            content = strbuilder.finish(b)
+            fs.write("${d}/f", content)
+            code = "const path = '${d}/f';\n"
+            code = "${code}let offset = 1, text = '', pages = 0;\n"
+            code = "${code}do {\n"
+            code = "${code}  const page = await tools.read({path, offset});\n"
+            code = "${code}  text += page.text;\n"
+            code = "${code}  offset = page.next_offset;\n"
+            code = "${code}  if (++pages > 3) throw new Error('pagination did not finish');\n"
+            code = "${code}  if (pages < 3 && offset !== 1 + pages * 2000) throw new Error('wrong offset');\n"
+            code = "${code}} while (offset !== null);\n"
+            code = "${code}if (pages !== 3) throw new Error('wrong default limit');\n"
+            code = "${code}await tools.write({path, content: text});"
+            r = sandbox.eval(code, sandbox.limits(), tools.host(s), null) as *sandbox.Outcome
+            spec.assert_eq(r.ok, 1, "run ok: ${r.text}")
+            spec.assert_true(read_("${d}/f") == content, "bytes identical")
+            fs.remove_tree(d)
+        }
+        spec.it("read pagination boundaries do not add text") callback {
+            d = tmp_()
+            s = tools.new_scope(new_tools_(d), 1)
+            path = "${d}/f"
+            data = ["", "a\n", "a\nb", "a\nb", "a\n", "a\n", "a"]
+            offs = [1, 1, 1, 2, 2, 100, 1]
+            lims = [2000, 1, 1, 1, 2000, 2000, 0]
+            text = ["", "a\n", "a\n", "b", "", "", ""]
+            next = ["null", "null", "2", "null", "null", "null", "1"]
+            i = 0
+            while i < 7 {
+                fs.write(path, data[i])
+                r = call_(s, "read", pargs_(path, "\"offset\":${offs[i]},\"limit\":${lims[i]}"))
+                expected = "{\"text\":${jsonx.quote(text[i])},\"next_offset\":${next[i]}}"
+                spec.assert_str_eq(r.text, expected, "case ${i}")
+                i = i + 1
+            }
+            fs.remove_tree(d)
+        }
+        spec.it("change tracking excludes other writers between and after calls") callback {
+            d = tmp_()
+            path = "${d}/f"
+            fs.write(path, "base\nother\nlast\n")
+            rt = new_tools_(d)
+            (rt as *tools.Tools).track_changes = 1
+            ct = new_tools_(d)
+            (ct as *tools.Tools).track_changes = 1
+            root = tools.new_scope(rt, 1)
+            child = tools.new_scope(ct, 2)
+            spec.assert_eq(ok_(root, "edit", pargs_(path, "\"old_text\":\"base\",\"new_text\":\"root\"")), 1, "root edit")
+            spec.assert_eq(ok_(child, "edit", pargs_(path, "\"old_text\":\"other\",\"new_text\":\"child\"")), 1, "child edit")
+            spec.assert_eq(ok_(root, "read", pargs_(path, "")), 1, "root read")
+            spec.assert_eq(ok_(root, "write", pargs_(path, "\"content\":\"root2\\nchild\\nlast\\n\"")), 1, "root write")
+            spec.assert_eq(ok_(child, "read", pargs_(path, "")), 1, "child read")
+            spec.assert_eq(ok_(child, "write", pargs_(path, "\"content\":\"root2\\nchild\\ntail\\n\"")), 1, "child write")
+            fs.delete(path)
+            cs = tools.take_changes(root)
+            spec.assert_eq(list.list_size(cs), 1, "one change")
+            c = change_(cs, 0)
+            spec.assert_str_eq(c.path, path, "path")
+            spec.assert_eq(c.added, 2, "added")
+            spec.assert_eq(c.removed, 2, "removed")
+            spec.assert_eq(c.created, 0, "not created")
+            spec.assert_str_eq(c.diff, "-base\n+root\n other\n…\n-root\n+root2\n child\n", "root diff")
+            ccs = tools.take_changes(child)
+            spec.assert_eq(list.list_size(ccs), 1, "child one change")
+            cc = change_(ccs, 0)
+            spec.assert_eq(cc.added, 2, "child added")
+            spec.assert_eq(cc.removed, 2, "child removed")
+            spec.assert_eq(contains_(cc.diff, "+root"), 0, "no root text in child diff")
+            spec.assert_eq(contains_(cc.diff, "-base"), 0, "no base in child diff")
+            spec.assert_eq(list.list_size(tools.take_changes(root)), 0, "taken once")
+            fs.remove_tree(d)
+        }
+        spec.it("change tracking omits no-ops and failed calls but reports empty creation") callback {
+            d = tmp_()
+            path = "${d}/f"
+            t = new_tools_(d)
+            (t as *tools.Tools).track_changes = 1
+            s = tools.new_scope(t, 1)
+            reg = (t as *tools.Tools).registry
+            spec.assert_eq(ok_(s, "write", pargs_(path, "\"content\":\"\"")), 1, "create empty")
+            spec.assert_eq_long(registry.revision(reg), 1, "revision after create")
+            created = tools.take_changes(s)
+            spec.assert_eq(list.list_size(created), 1, "one change")
+            spec.assert_eq(change_(created, 0).created, 1, "created")
+            spec.assert_eq(change_(created, 0).added, 0, "no added lines")
+            spec.assert_str_eq(change_(created, 0).diff, "", "empty diff")
+            spec.assert_eq(ok_(s, "write", pargs_(path, "\"content\":\"\"")), 1, "rewrite same")
+            spec.assert_eq_long(registry.revision(reg), 1, "no-op does not advance")
+            r = call_(s, "edit", pargs_(path, "\"old_text\":\"missing\",\"new_text\":\"new\""))
+            spec.assert_eq(r.ok, 0, "failed edit")
+            spec.assert_eq_long(registry.revision(reg), 1, "failed call does not advance")
+            fs.write(path, "external\n")
+            spec.assert_eq(list.list_size(tools.take_changes(s)), 0, "external writer excluded")
+            fs.remove_tree(d)
+        }
+        spec.it("write rejects external changes after paginated read and reread permits overwrite") callback {
+            d = tmp_()
+            s = tools.new_scope(new_tools_(d), 1)
+            path = "${d}/f"
+            fs.write(path, "one\ntwo\n")
+            spec.assert_eq(ok_(s, "read", pargs_(path, "\"offset\":2,\"limit\":1")), 1, "read")
+            fs.write(path, "external change")
+            rej = call_(s, "write", pargs_(path, "\"content\":\"stale\""))
+            spec.assert_eq(rej.ok, 0, "rejected")
+            spec.assert_eq(contains_(rej.text, path), 1, "names the path")
+            spec.assert_eq(contains_(rej.text, "read it again before overwriting"), 1, "advice")
+            spec.assert_str_eq(read_(path), "external change", "file untouched")
+            spec.assert_eq(ok_(s, "read", pargs_(path, "")), 1, "reread")
+            spec.assert_eq(ok_(s, "write", pargs_(path, "\"content\":\"fresh\"")), 1, "write")
+            spec.assert_str_eq(read_(path), "fresh", "overwritten")
+            fs.remove_tree(d)
+        }
+        spec.it("write allows unseen existing files and remembers successful writes") callback {
+            d = tmp_()
+            s = tools.new_scope(new_tools_(d), 1)
+            path = "${d}/f"
+            fs.write(path, "unseen")
+            spec.assert_eq(ok_(s, "write", pargs_(path, "\"content\":\"first\"")), 1, "first")
+            spec.assert_eq(ok_(s, "write", pargs_(path, "\"content\":\"second\"")), 1, "second")
+            fs.write(path, "external longer")
+            rej = call_(s, "write", pargs_(path, "\"content\":\"third\""))
+            spec.assert_eq(rej.ok, 0, "rejected")
+            spec.assert_str_eq(read_(path), "external longer", "untouched")
+            fs.remove_tree(d)
+        }
+        spec.it("edit ignores stale state and updates the session observation") callback {
+            d = tmp_()
+            s = tools.new_scope(new_tools_(d), 1)
+            path = "${d}/f"
+            fs.write(path, "old")
+            spec.assert_eq(ok_(s, "read", pargs_(path, "")), 1, "read")
+            fs.write(path, "external")
+            spec.assert_eq(ok_(s, "edit", pargs_(path, "\"old_text\":\"external\",\"new_text\":\"edited\"")), 1, "edit")
+            spec.assert_eq(ok_(s, "write", pargs_(path, "\"content\":\"after edit\"")), 1, "write after edit")
+            spec.assert_str_eq(read_(path), "after edit", "content")
+            fs.remove_tree(d)
+        }
+        spec.it("file observations are independent per session and follow aliases") callback {
+            d = tmp_()
+            path = "${d}/f"
+            fs.write(path, "old")
+            fs.symlink("f", "${d}/alias")
+            s = tools.new_scope(new_tools_(d), 1)
+            spec.assert_eq(ok_(s, "read", pargs_("${d}/alias", "")), 1, "read via alias")
+            other = tools.new_scope(new_tools_(d), 1)
+            spec.assert_eq(ok_(other, "write", pargs_(path, "\"content\":\"other session\"")), 1, "other session writes")
+            rej = call_(s, "write", pargs_(path, "\"content\":\"stale\""))
+            spec.assert_eq(rej.ok, 0, "stale write rejected")
+            spec.assert_str_eq(read_(path), "other session", "content")
+            fs.remove_tree(d)
+        }
+    }
+    return spec.run_summary(fw)
+}

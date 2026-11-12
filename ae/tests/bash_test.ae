@@ -1,0 +1,232 @@
+// Ports the tests of upstream src/tools/bash.zig (a2dd439) to tools.call_tool.
+//
+// Not ported (outside this slice):
+//  - "foreground bash allocates only at the visibility threshold and advances
+//    once per second": the progress Tracker (progress ids/elapsed events).
+//  - "foreground bash reports terminal command facts even for short
+//    commands": the progress Tracker and sandbox RunTiming entries for it.
+//  - the second half of "bash has a finite 30 minute default ...": the
+//    executeBackground call (background bash); its Args half is ported.
+import std.spec
+import std.fs
+import std.list
+import std.string
+import std.strbuilder
+import std.sync
+import std.os
+import std.worker
+import nib.jsonx
+import nib.sandbox
+import nib.tools
+import nib.tools.bash
+import nib.tools.policy
+
+tmp_() -> string {
+    d, _e = fs.make_temp_dir("", "nib-bash")
+    real, _k, _m = fs.realpath(d)
+    return real
+}
+
+new_tools_(d: string) -> ptr {
+    t = tools.new(d)
+    (t as *tools.Tools).data_home = "${d}/nibhome"
+    return t
+}
+
+call_(s: ptr, name: string, args: string) -> *sandbox.ToolResult {
+    out = sandbox.result_ok("")
+    tools.call_tool(s, name, args, out)
+    return out as *sandbox.ToolResult
+}
+
+// A fresh Tools with a temp home (upstream's callTool).
+bash_(command: string, rest: string) -> *sandbox.ToolResult {
+    d = tmp_()
+    s = tools.new_scope(new_tools_(d), 1)
+    a = "{\"command\":${jsonx.quote(command)}}"
+    if rest != "" { a = "{\"command\":${jsonx.quote(command)},${rest}}" }
+    r = call_(s, "bash", a)
+    fs.remove_tree(d)
+    return r
+}
+
+pgrep_(pattern: string) -> int {
+    argv = list.list_new()
+    list.list_add(argv, "-f")
+    list.list_add(argv, pattern)
+    out, _st, _e = os.run_capture("pgrep", argv, null)
+    if string.length(out) == 0 { return 0 }
+    return 1
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tools.bash") {
+        spec.it("bash merges stderr and reports exit code") callback {
+            r = bash_("echo out; echo err >&2; exit 3", "")
+            spec.assert_str_eq(r.text, "{\"exit_code\":3,\"output\":\"out\\nerr\\n\"}", "result")
+        }
+        spec.it("bash refuses commands denied by policy") callback {
+            r = bash_("sudo true", "")
+            spec.assert_eq(r.ok, 0, "refused")
+            spec.assert_true(string.starts_with(r.text, "refused by nib: privileged"), "text: ${r.text}")
+        }
+        spec.it("bash executes a 300-line Python heredoc") callback {
+            b = strbuilder.new(1024)
+            strbuilder.append(b, "python3 - <<'EOF'\nx = 0\n")
+            i = 0
+            while i < 298 {
+                strbuilder.append(b, "x += 1\n")
+                i = i + 1
+            }
+            strbuilder.append(b, "print(x)\nEOF\n")
+            r = bash_(strbuilder.finish(b), "")
+            spec.assert_str_eq(r.text, "{\"exit_code\":0,\"output\":\"298\\n\"}", "result")
+        }
+        spec.it("bash rejects more than 256 shell words in the command portion") callback {
+            b = strbuilder.new(1024)
+            strbuilder.append(b, "echo")
+            i = 0
+            while i < 256 {
+                strbuilder.append(b, " x")
+                i = i + 1
+            }
+            r = bash_(strbuilder.finish(b), "")
+            spec.assert_eq(r.ok, 0, "refused")
+            spec.assert_str_eq(r.text, "refused by nib: ${policy.too_long()}", "uses policy.too_long")
+            spec.assert_str_eq(r.text, "refused by nib: command portion has more than 256 shell words; write long scripts to a file with tools.write and run that file", "literal text")
+        }
+        spec.it("bash refuses credential references inside heredoc bodies") callback {
+            r = bash_("python3 - <<'EOF'\nprint('~/.codex/auth.json')\nEOF\n", "")
+            spec.assert_eq(r.ok, 0, "refused")
+            spec.assert_str_eq(r.text, "refused by nib: access to Codex credentials", "text")
+        }
+        spec.it("bash timeout kills the whole process group") callback {
+            r = bash_("(sleep 7.3 &) ; sleep 7.3", "\"timeout_ms\":200")
+            spec.assert_eq(r.ok, 0, "error")
+            spec.assert_str_eq(r.text, "timed out after 200 ms", "timed out")
+            // SIGKILL is asynchronous: give the orphaned sleep a moment to die
+            gone = 0
+            i = 0
+            while i < 20 && gone == 0 {
+                if pgrep_("^sleep 7.3$") == 0 { gone = 1 } else { sleep(50) }
+                i = i + 1
+            }
+            spec.assert_eq(gone, 1, "no sleep 7.3 survived the group kill")
+        }
+        spec.it("bash cancel") callback {
+            d = tmp_()
+            s = tools.new_scope(new_tools_(d), 1)
+            sync.atomic_store((s as *tools.RunScope).cancel, 1)
+            r = call_(s, "bash", "{\"command\":\"sleep 5\"}")
+            spec.assert_eq(r.ok, 0, "error")
+            spec.assert_str_eq(r.text, "canceled", "canceled")
+            fs.remove_tree(d)
+        }
+        spec.it("bash timeout") callback {
+            r = bash_("sleep 5", "\"timeout_ms\":100")
+            spec.assert_str_eq(r.text, "timed out after 100 ms", "timed out")
+        }
+        spec.it("bash timeout still applies after output pipes close") callback {
+            r = bash_("exec 1>&- 2>&-; sleep 5", "\"timeout_ms\":80")
+            spec.assert_str_eq(r.text, "timed out after 80 ms", "timed out")
+        }
+        spec.it("bash receives ordinary environment without API keys") callback {
+            d = tmp_()
+            t = new_tools_(d)
+            env = list.list_new()
+            list.list_add(env, "NIB_API_KEY=fictional-secret")
+            list.list_add(env, "NIB_TEST_ORDINARY=kept")
+            list.list_add(env, "PATH=/usr/bin:/bin")
+            (t as *tools.Tools).env = env
+            s = tools.new_scope(t, 1)
+            r = call_(s, "bash", "{\"command\":\"printf '%s:%s' \\\"\${NIB_API_KEY-unset}\\\" \\\"\$NIB_TEST_ORDINARY\\\"\"}")
+            spec.assert_str_eq(r.text, "{\"exit_code\":0,\"output\":\"unset:kept\"}", "result")
+            fs.remove_tree(d)
+        }
+        spec.it("bash returns output up to 16 MiB verbatim") callback {
+            r = bash_("head -c 16777216 /dev/zero | tr '\\0' x", "")
+            spec.assert_eq(r.ok, 1, "ok")
+            prefix = "{\"exit_code\":0,\"output\":\""
+            spec.assert_eq(string.length(r.text), string.length(prefix) + 16777216 + 2, "length")
+            spec.assert_true(string.starts_with(r.text, prefix), "prefix")
+            spec.assert_true(string.ends_with(r.text, "\"}"), "suffix")
+            b = strbuilder.new(16777216 + 64)
+            strbuilder.append(b, prefix)
+            chunk = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            i = 0
+            while i < 16777216 / 64 {
+                strbuilder.append(b, chunk)
+                i = i + 1
+            }
+            strbuilder.append(b, "\"}")
+            spec.assert_true(r.text == strbuilder.finish(b), "every byte is x")
+        }
+        spec.it("bash rejects output over 16 MiB and kills the process group") callback {
+            t0 = os.now_monotonic_ms()
+            r = bash_("head -c 16777217 /dev/zero; sleep 30", "")
+            spec.assert_eq(r.ok, 0, "error")
+            spec.assert_str_eq(r.text, "output exceeds 16 MiB; redirect output to a file", "text")
+            spec.assert_true(os.now_monotonic_ms() - t0 < 5000, "did not wait for sleep 30")
+        }
+        spec.it("bash does not wait for background jobs inheriting stdout or stderr") callback {
+            t0 = os.now_monotonic_ms()
+            r = bash_("sleep 8 & echo started; echo error >&2; exit 3", "\"timeout_ms\":2000")
+            spec.assert_str_eq(r.text, "{\"exit_code\":3,\"output\":\"started\\nerror\\n\"}", "result")
+            spec.assert_true(os.now_monotonic_ms() - t0 < 1000, "returned promptly")
+        }
+        spec.it("bash returns when a silent background job holds stdout") callback {
+            r = bash_("sleep 8 & exit 0", "\"timeout_ms\":1000")
+            spec.assert_str_eq(r.text, "{\"exit_code\":0,\"output\":\"\"}", "result")
+        }
+        spec.it("bash returns once the shell exits although detached daemons keep the output pipe") callback {
+            prelude = "sd() { python3 -c 'import os,sys;os.setsid();os.execvp(sys.argv[1],sys.argv[1:])' \"$@\"; }; export -f sd; "
+            bodies = ["sd sh -c 'sleep 29.137' & echo one", "bash -c 'sd sleep 29.137 &'; echo one", "sd sh -c 'sleep 29.137 >/dev/null' 2>&1 & echo one", "(sd sleep 29.137 >/dev/null </dev/null &) ; echo one", "sd sh -c 'exec sleep 29.137 >&2' & echo one"]
+            i = 0
+            while i < 5 {
+                t0 = os.now_monotonic_ms()
+                r = bash_("${prelude}${bodies[i]}", "\"timeout_ms\":10000")
+                spec.assert_str_eq(r.text, "{\"exit_code\":0,\"output\":\"one\\n\"}", "case ${i}")
+                spec.assert_true(os.now_monotonic_ms() - t0 < 3000, "case ${i} returned promptly")
+                i = i + 1
+            }
+            os.exec("pkill -f 'sleep 29.137' >/dev/null 2>&1; true")
+        }
+        spec.it("bash validates detached and zero timeout before starting") callback {
+            args = ["{\"command\":\"true\",\"detached\":true}", "{\"command\":\"true\",\"timeout_ms\":0}", "{\"command\":\"true\",\"background\":true,\"timeout_ms\":0}", "{\"command\":\"true\",\"background\":true,\"detached\":true,\"timeout_ms\":-1}"]
+            want = ["detached requires background: true", "timeout_ms: 0 requires detached: true", "timeout_ms: 0 requires detached: true", "timeout_ms must not be negative"]
+            d = tmp_()
+            s = tools.new_scope(new_tools_(d), 1)
+            i = 0
+            while i < 4 {
+                r = call_(s, "bash", args[i])
+                spec.assert_eq(r.ok, 0, "case ${i} is an error")
+                spec.assert_str_eq(r.text, want[i], "case ${i}")
+                i = i + 1
+            }
+            fs.remove_tree(d)
+        }
+        spec.it("bash has a finite 30 minute default and honors explicit timeouts in every mode") callback {
+            bgs = ["false", "true"]
+            i = 0
+            while i < 2 {
+                bg = ""
+                if i == 1 { bg = ",\"background\":true" }
+                ordinary = bash.parse_args("{\"command\":\"true\"${bg}}")
+                spec.assert_eq_long(bash.timeout_ms_of(ordinary), 1800000, "default ${bgs[i]}")
+                spec.assert_str_eq(bash.validation_error(ordinary), "", "valid ${bgs[i]}")
+                explicit = bash.parse_args("{\"command\":\"true\"${bg},\"timeout_ms\":25}")
+                spec.assert_eq_long(bash.timeout_ms_of(explicit), 25, "explicit ${bgs[i]}")
+                spec.assert_str_eq(bash.validation_error(explicit), "", "explicit valid ${bgs[i]}")
+                i = i + 1
+            }
+            det = bash.parse_args("{\"command\":\"true\",\"background\":true,\"detached\":true}")
+            spec.assert_eq_long(bash.timeout_ms_of(det), 0, "detached has none")
+            spec.assert_str_eq(bash.validation_error(det), "", "detached valid")
+            dex = bash.parse_args("{\"command\":\"true\",\"background\":true,\"detached\":true,\"timeout_ms\":25}")
+            spec.assert_eq_long(bash.timeout_ms_of(dex), 25, "detached explicit")
+            spec.assert_str_eq(bash.validation_error(dex), "", "detached explicit valid")
+        }
+    }
+    return spec.run_summary(fw)
+}

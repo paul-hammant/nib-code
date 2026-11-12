@@ -1,0 +1,141 @@
+// Ports the tests of upstream src/tools/process.zig (a2dd439).
+//
+// Credential stripping lives in bash.child_env here (process.run takes the
+// environment it is given), so the two environment tests exercise
+// child_env followed by process.run.
+//
+// Not ported, each because the feature is outside this slice:
+//  - "process deadline covers a blocked stdin writer": process.run has no
+//    stdin input.
+//  - "process observes complete lines before exit without changing collected
+//    output": no on_line observer; output is captured whole into a file.
+//    (The collected-output half is checked by the drain test below.)
+//  - "process drains buffered output and final lines after shell exit": the
+//    on_line count half is skipped for the same reason; the output, exit
+//    code and tail half runs as "process drains buffered output ... (no
+//    observer)".
+//  - "only the selected API key reaches nib children ...": the inherit_api_key
+//    half has no counterpart; the strip half runs as "custom keys are
+//    stripped from bash".
+// .cwd is expressed as `cd <tmp>` inside the script (process.run has no cwd).
+import std.spec
+import std.fs
+import std.list
+import std.string
+import std.sync
+import std.worker
+import std.os
+import nib.tools.process
+import nib.tools.bash
+import nib.tools.secrets
+import nib.tools.registry
+
+tmp_() -> string {
+    d, _e = fs.make_temp_dir("", "nib-process")
+    real, _k, _m = fs.realpath(d)
+    return real
+}
+
+contains_(s: string, part: string) -> int {
+    if string.index_of(s, part) >= 0 { return 1 }
+    return 0
+}
+
+argv_(prog: string, a: string, b: string) -> ptr {
+    l = list.list_new()
+    list.list_add(l, prog)
+    if a != "" { list.list_add(l, a) }
+    if b != "" { list.list_add(l, b) }
+    return l
+}
+
+sh_(script: string) -> ptr { return argv_("bash", "-c", script) }
+
+run_(argv: ptr, env: ptr, cancel: ptr, timeout_ms: long) -> *process.Result {
+    return process.run(argv, env, cancel, null, timeout_ms, 16777216) as *process.Result
+}
+
+bash_ctx_(env: @keep ptr) -> ptr {
+    c = bash.new_ctx("/home/nobody", sync.atomic_new(0), registry.new(), sync.atomic_new(0))
+    (c as *bash.Ctx).env = env
+    return c
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tools.process") {
+        spec.it("process strips credentials and preserves ordinary environment") callback {
+            env = list.list_new()
+            names = secrets.environment_names()
+            i = 0
+            while i < list.list_size(names) {
+                n, _e = list.get_string(names, i)
+                list.list_add(env, "${n}=fictional-secret")
+                i = i + 1
+            }
+            list.list_add(env, "NIB_TEST_ORDINARY=kept")
+            child = bash.child_env(bash_ctx_(env))
+            r = run_(argv_("env", "", ""), child, null, 1000)
+            spec.assert_eq(r.exit_code, 0, "success")
+            spec.assert_eq(contains_(r.output, "fictional-secret"), 0, "no secrets reach the child")
+            spec.assert_eq(contains_(r.output, "NIB_TEST_ORDINARY=kept"), 1, "ordinary kept")
+            spec.assert_true(list.list_size(env) == list.list_size(names) + 1, "the base list is untouched")
+        }
+        spec.it("custom keys are stripped from bash") callback {
+            env = list.list_new()
+            list.list_add(env, "SITE_KEY=fake-custom-secret")
+            list.list_add(env, "OPENAI_API_KEY=other-fake-secret")
+            c = bash_ctx_(env)
+            (c as *bash.Ctx).strip_env = "SITE_KEY"
+            r = run_(argv_("env", "", ""), bash.child_env(c), null, 1000)
+            spec.assert_eq(contains_(r.output, "fake-custom-secret"), 0, "custom key stripped")
+            spec.assert_eq(contains_(r.output, "other-fake-secret"), 0, "other key stripped")
+        }
+        spec.it("process returns on shell exit and kills descendants holding stdout") callback {
+            d = tmp_()
+            t0 = os.now_monotonic_ms()
+            r = run_(sh_("cd '${d}'; (sleep 0.5; echo survived > survived) & printf 'started\\n'; exit 7"), null, null, 2000)
+            spec.assert_str_eq(r.stop, "", "no stop")
+            spec.assert_eq(r.exit_code, 7, "exit 7")
+            spec.assert_str_eq(r.output, "started\n", "output")
+            spec.assert_true(os.now_monotonic_ms() - t0 < 1000, "returned promptly")
+            sleep(600)
+            spec.assert_eq(fs.exists("${d}/survived"), 0, "the background job was killed with the group")
+            fs.remove_tree(d)
+        }
+        spec.it("process returns on shell exit when a setsid daemon holds the pipe") callback {
+            // macOS has no setsid(1): python's os.setsid + exec does the same
+            sd = "sd() { python3 -c 'import os,sys;os.setsid();os.execvp(sys.argv[1],sys.argv[1:])' \"$@\"; }; "
+            t0 = os.now_monotonic_ms()
+            r = run_(sh_("${sd}sd sh -c 'sleep 30' & echo before; exit 0"), null, null, 10000)
+            spec.assert_str_eq(r.output, "before\n", "output")
+            spec.assert_true(os.now_monotonic_ms() - t0 < 3000, "returned promptly")
+            os.exec("pkill -f 'sleep 30' >/dev/null 2>&1; true")
+        }
+        spec.it("process drains buffered output and final lines after shell exit (no observer)") callback {
+            r = run_(sh_("sleep 5 & printf 'line\\n%.0s' {1..20000}; printf tail; exit 9"), null, null, 2000)
+            spec.assert_str_eq(r.stop, "", "no stop")
+            spec.assert_eq(r.exit_code, 9, "exit 9")
+            spec.assert_eq(string.length(r.output), 100004, "length")
+            spec.assert_true(string.ends_with(r.output, "line\ntail") == 1, "ends with the tail")
+        }
+        spec.it("process zero timeout has no deadline even after output pipes close") callback {
+            r = run_(sh_("exec 1>&- 2>&-; sleep 0.05"), null, null, 0)
+            spec.assert_eq(r.exit_code, 0, "success")
+            spec.assert_str_eq(r.stop, "", "no stop")
+        }
+        spec.it("process zero timeout still honors cancellation") callback {
+            cancel = sync.atomic_new(0)
+            worker.run_detached(|| {
+                sleep(100)
+                sync.atomic_store(cancel, 1)
+                return null
+            })
+            t0 = os.now_monotonic_ms()
+            r = run_(sh_("sleep 5"), null, cancel, 0)
+            spec.assert_str_eq(r.stop, process.STOP_CANCELED, "canceled")
+            spec.assert_true(os.now_monotonic_ms() - t0 < 3000, "did not wait for the sleep")
+        }
+    }
+    return spec.run_summary(fw)
+}

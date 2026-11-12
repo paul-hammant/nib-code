@@ -1,0 +1,76 @@
+// Ports the tests of upstream src/tools/bash/registry.zig (a2dd439).
+import std.spec
+import std.list
+import std.sync
+import nib.tools.registry
+
+cmd_(id: string, run: int, command: string, cwd: string) -> *registry.Command {
+    return registry.new_command(id, run, command, cwd, 0) as *registry.Command
+}
+
+canceled_(c: *registry.Command) -> int {
+    if sync.atomic_load(c.cancel) != 0 { return 1 }
+    return 0
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tools.registry") {
+        spec.it("replacement requires an earlier Run, changed revision, exact command and cwd, and neither detached") callback {
+            old = cmd_("b1", 1, "arbitrary check", "/a")
+            nw = cmd_("b2", 2, "arbitrary check", "/a")
+            nw.revision = 1
+            spec.assert_eq(registry.replaces(old, nw), 1, "baseline replaces")
+            nw.revision = 0
+            spec.assert_eq(registry.replaces(old, nw), 0, "same revision")
+            nw.revision = 1
+            nw.run = 1
+            spec.assert_eq(registry.replaces(old, nw), 0, "same run")
+            nw.run = 0
+            spec.assert_eq(registry.replaces(old, nw), 0, "earlier run")
+            nw.run = 2
+            nw.cwd = "/b"
+            spec.assert_eq(registry.replaces(old, nw), 0, "other cwd")
+            nw.cwd = "/a"
+            nw.command = "arbitrary check "
+            spec.assert_eq(registry.replaces(old, nw), 0, "other command")
+            nw.command = old.command
+            old.detached = 1
+            spec.assert_eq(registry.replaces(old, nw), 0, "old detached")
+            old.detached = 0
+            nw.detached = 1
+            spec.assert_eq(registry.replaces(old, nw), 0, "new detached")
+            nw.detached = 0
+            old.superseded_by = "b3"
+            spec.assert_eq(registry.replaces(old, nw), 0, "already superseded")
+            old.superseded_by = ""
+            sync.atomic_store(old.cancel, 1)
+            spec.assert_eq(registry.replaces(old, nw), 0, "already canceled")
+        }
+        spec.it("registry replaces every stale matching command once and removes joined commands") callback {
+            r = registry.new()
+            c0 = cmd_("b1", 1, "check", "/a")
+            c1 = cmd_("b2", 1, "check", "/a")
+            c2 = cmd_("b3", 1, "check", "/a")
+            c3 = cmd_("b4", 1, "check", "/a")
+            registry.start(r, c0 as ptr)
+            registry.changed(r)
+            registry.start(r, c1 as ptr)
+            spec.assert_eq(canceled_(c0), 0, "same run does not supersede")
+            c2.run = 2
+            registry.start(r, c2 as ptr)
+            spec.assert_eq(canceled_(c0), 1, "b1 canceled by b3")
+            spec.assert_eq(canceled_(c1), 0, "b2 started at the new revision")
+            registry.changed(r)
+            c3.run = 3
+            registry.start(r, c3 as ptr)
+            spec.assert_str_eq(registry.finish(r, c0 as ptr), "b3", "b1 superseded by b3 once")
+            spec.assert_str_eq(registry.finish(r, c1 as ptr), "b4", "b2 superseded by b4")
+            spec.assert_str_eq(registry.finish(r, c2 as ptr), "b4", "b3 superseded by b4")
+            spec.assert_str_eq(registry.finish(r, c3 as ptr), "", "b4 is not superseded")
+            rg = r as *registry.Registry
+            spec.assert_eq(list.list_size(rg.active), 0, "all removed")
+        }
+    }
+    return spec.run_summary(fw)
+}

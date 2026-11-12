@@ -9,7 +9,7 @@ import std.sync
 import std.os
 import nib.lock
 
-exports(Registry, Command, new, new_command, changed, revision, start, finish)
+exports(Registry, Command, new, new_command, changed, revision, replaces, start, finish)
 
 struct Command {
     id: string
@@ -60,7 +60,7 @@ changed(rp: ptr) {
 
 revision(rp: ptr) -> long { return (rp as *Registry).revision }
 
-replaces_(old: *Command, nw: *Command) -> int {
+replaces(old: *Command, nw: *Command) -> int {
     if old.detached == 1 || nw.detached == 1 { return 0 }
     if old.superseded_by != "" { return 0 }
     if sync.atomic_load(old.cancel) != 0 { return 0 }
@@ -79,7 +79,7 @@ start(rp: ptr, cp: @keep ptr) {
     i = 0
     while i < n {
         old = list.list_get_raw(r.active, i) as *Command
-        if replaces_(old, c) == 1 {
+        if replaces(old, c) == 1 {
             old.superseded_by = c.id
             sync.atomic_store(old.cancel, 1)
         }
