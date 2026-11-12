@@ -1,0 +1,29 @@
+// tools.agent_sessions (upstream src/tools/agent/sessions.zig). Left out:
+// the Zig allocator/io arguments and defer deinit, which the port has no
+// counterpart for (a Registry is a heap value with a lock).
+import std.spec
+import nib.tools.agent_sessions
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "agent sessions") {
+        spec.it("agent reservations survive failure and reject busy or foreign task IDs") callback {
+            r = agent_sessions.new()
+            agent_sessions.add(r, "a1", "", 1)
+            spec.assert_str_eq(agent_sessions.reserve(r, "a1"), "AgentBusy", "busy at add")
+            spec.assert_str_eq(agent_sessions.bind(r, "a1", "child-session"), "", "bind")
+            agent_sessions.release(r, "a1")
+            spec.assert_str_eq(agent_sessions.reserve(r, "a1"), "", "reserve ok")
+            spec.assert_str_eq(agent_sessions.session(r, "a1"), "child-session", "session")
+            spec.assert_str_eq(agent_sessions.reserve(r, "a1"), "AgentBusy", "busy after reserve")
+            spec.assert_str_eq(agent_sessions.reserve(r, "b1"), "NotSessionAgent", "foreign")
+            spec.assert_str_eq(agent_sessions.reserve(r, "a2"), "AgentNotFound", "unknown")
+            spec.assert_str_eq(agent_sessions.bind(r, "a1", "other"), "AgentSessionMismatch", "mismatch")
+            agent_sessions.release(r, "a1")
+            spec.assert_str_eq(agent_sessions.reserve(r, "a1"), "", "reserve again")
+            agent_sessions.add(r, "a2", "", 0)
+            spec.assert_str_eq(agent_sessions.reserve(r, "a2"), "AgentSessionUnavailable", "unavailable")
+        }
+    }
+    return spec.run_summary(fw)
+}

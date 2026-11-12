@@ -1,10 +1,8 @@
 // Ports the file/bash-relevant tests of upstream src/tools.zig (a2dd439).
 //
 // Not ported (outside this slice, or about other tools):
-//  - "child API filters agent from both docs and sandbox", "fork keeps parent
-//    API bytes but rejects delegation at runtime", "fork and resume are
-//    conflicting parameters even when fork is false": the agent tool is not
-//    ported.
+//  - "child API filters agent from both docs and sandbox": not ported yet
+//    (the agent tool's two fork tests are ported below).
 //  - "llm map documentation example ...", "llm admission rejects call 101 ...",
 //    "generated llm options ...", "configured default model ...": these live in
 //    ae/tests/llm_test.ae with the llm port.
@@ -198,6 +196,32 @@ main() {
             spec.assert_eq(list.list_size(names), 15, "table size")
             spec.assert_eq(contains_(docs, "  async llm("), 1, "llm documented")
             spec.assert_eq(contains_(docs, "  async agent("), 1, "agent documented")
+        }
+        spec.it("fork keeps parent API bytes but rejects delegation at runtime") callback {
+            root = tools.new("/unused")
+            child = tools.new("/unused")
+            (child as *tools.Tools).depth = 1
+            (child as *tools.Tools).forked = 1
+            spec.assert_str_eq(tools.docs(child), tools.docs(root), "same docs")
+            spec.assert_str_eq(tools.names_json(child), tools.names_json(root), "same names")
+            s = tools.new_scope(child, 1)
+            o = sandbox.eval("await tools.agent({prompt: 'nested'})", sandbox.limits(), tools.host(s), null) as *sandbox.Outcome
+            spec.assert_eq(o.ok, 0, "rejected")
+            spec.assert_eq(contains_(o.text, "agent is unavailable inside a forked sub-agent"), 1, "message: ${o.text}")
+        }
+        spec.it("fork and resume are conflicting parameters even when fork is false") callback {
+            t = tools.new("/unused")
+            s = tools.new_scope(t, 1)
+            flags = ["true", "false"]
+            k = 0
+            while k < 2 {
+                out = sandbox.result_ok("")
+                tools.call_tool(s, "agent", "{\"prompt\":\"task\",\"fork\":${flags[k]},\"resume\":\"a1\"}", out)
+                r = out as *sandbox.ToolResult
+                spec.assert_eq(r.ok, 0, "rejects ${flags[k]}")
+                spec.assert_str_eq(r.text, "fork and resume cannot be passed together", "message ${flags[k]}")
+                k = k + 1
+            }
         }
     }
     return spec.run_summary(fw)

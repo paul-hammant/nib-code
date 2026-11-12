@@ -1,0 +1,78 @@
+// session.fork_history (upstream src/session/history.zig). Left out: the
+// arena allocator and the `.ptr !=` identity checks of "inherit deep copies
+// ...": Aether strings are values with no observable address, so the deep
+// copy is checked by value only (and, for snapshot, by mutating the source
+// lists afterwards); expectEqualDeep becomes message-text equality.
+import std.spec
+import std.list
+import std.string
+import nib.msg
+import nib.provider.types
+import nib.session.fork_history
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "fork history") {
+        spec.it("snapshot retains the complete assistant prefix across array reuse") callback {
+            committed = list.list_new()
+            list.list_add(committed, msg.system(string.copy("system bytes")))
+            pending = list.list_new()
+            list.list_add(pending, msg.user("prompt"))
+            calls = list.list_new()
+            list.list_add(calls, types.tool_call_new("one", "run", "{}"))
+            list.list_add(calls, types.tool_call_new("two", "run", "{}"))
+            assistant = msg.assistant("", calls, "codex", string.copy("opaque reasoning"), 0, "", -1, "")
+            list.list_add(pending, assistant)
+            prefix = fork_history.snapshot(committed, pending)
+            spec.assert_eq(list.list_size(prefix), 3, "three messages")
+            p2, _e = list.get_string(prefix, 2)
+            spec.assert_str_eq(p2, assistant, "assistant message equal")
+            list.list_set(committed, 0, msg.system("replacement"))
+            list.list_set(pending, 1, msg.tool("one", "Run result", ""))
+            p0, _e0 = list.get_string(prefix, 0)
+            spec.assert_str_eq(msg.content(p0), "system bytes", "system bytes")
+            p2b, _e2 = list.get_string(prefix, 2)
+            spec.assert_str_eq(msg.role(p2b), "assistant", "role")
+            spec.assert_str_eq(msg.reasoning_data(p2b), "opaque reasoning", "reasoning data")
+            spec.assert_eq(msg.tool_call_count(p2b), 2, "two calls")
+        }
+        spec.it("inherit deep copies messages and completes only unpaired tool calls") callback {
+            original = list.list_new()
+            list.list_add(original, msg.system("exact system"))
+            u = msg.user_from("compacted summary", "background")
+            u = msg.set_raw(u, "background_id", "\"b1\"")
+            u = msg.set_raw(u, "background_ok", "true")
+            u = msg.set_raw(u, "background_kind", "\"bash\"")
+            list.list_add(original, u)
+            calls = list.list_new()
+            list.list_add(calls, types.tool_call_new("one", "run", "{}"))
+            list.list_add(calls, types.tool_call_new("two", "run", "{}"))
+            list.list_add(calls, types.tool_call_new("three", "run", "{}"))
+            list.list_add(original, msg.assistant("launch", calls, "codex", "opaque reasoning", 0, "commentary", -1, "high"))
+            list.list_add(original, msg.tool("one", "real result", ",\"tool_summary\":{\"counts\":[{\"name\":\"read\",\"count\":1}]},\"step_calls_omitted\":4"))
+            copied, err = fork_history.inherit(original, list.list_size(original), "a7", "parent")
+            spec.assert_str_eq(err, "", "inherit ok")
+            spec.assert_eq(list.list_size(copied), 6, "six messages")
+            i = 0
+            while i < 4 {
+                a, _e1 = list.get_string(original, i)
+                b, _e2 = list.get_string(copied, i)
+                spec.assert_str_eq(b, a, "message ${i} equal")
+                i = i + 1
+            }
+            ids = ["two", "three"]
+            k = 0
+            while k < 2 {
+                m, _e3 = list.get_string(copied, 4 + k)
+                spec.assert_str_eq(msg.role(m), "tool", "tool role ${k}")
+                spec.assert_str_eq(msg.str_or(m, "tool_call_id", ""), ids[k], "tool id ${k}")
+                spec.assert_true(string.index_of(msg.content(m), "child agent a7") >= 0, "mentions child agent")
+                spec.assert_true(string.index_of(msg.content(m), "independently in the parent") >= 0, "mentions parent")
+                k = k + 1
+            }
+            _bad, berr = fork_history.inherit(original, list.list_size(original) + 1, "a7", "parent")
+            spec.assert_str_eq(berr, "InvalidForkHistory", "count mismatch")
+        }
+    }
+    return spec.run_summary(fw)
+}

@@ -1,0 +1,187 @@
+// tools.agent (the five inline tests at the bottom of upstream
+// src/tools/agent.zig). Left out: "agent output retains only returned data
+// ..." drops its `arena.queryCapacity() == 0` check after 500 ignored
+// reasoning deltas (a Zig allocator measurement; the port has no arena), and
+// the Zig `defer ...deinit(allocator)` cleanups. Upstream's `t.cancel` is
+// the Ctx's cancel cell for direct agent.agent / agent.execute calls.
+import std.spec
+import std.list
+import std.string
+import std.sync
+import std.fs
+import nib.jsonx
+import nib.sandbox
+import nib.sandbox.timing
+import nib.provider.types
+import nib.tools
+import nib.tools.agent
+import nib.tools.progress
+import nib.tools.agent_sessions
+
+tools_() -> ptr {
+    d, _e = fs.make_temp_dir("", "nib-agent")
+    t = tools.new(d)
+    (t as *tools.Tools).cfg = types.new_config("chat_completions", "", "", "m")
+    return t
+}
+
+ctx_for_(t: @keep ptr) -> ptr {
+    tt = t as *tools.Tools
+    cp = agent.new_ctx(tt.progress, tt.agent_sessions, tt.agent_gate)
+    (cp as *agent.Ctx).cfg = tt.cfg
+    return cp
+}
+
+observe_(tr: ptr, line: string) {
+    agent.tracker_observe(tr, line)
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tools.agent") {
+        spec.it("child progress counts Steps rather than Runs and ignores compaction snapshots") callback {
+            t = tools_()
+            tt = t as *tools.Tools
+            id = progress.add_agent(tt.progress, "child", 0, 0, 0)
+            vp = progress.new_value(id, progress.KIND_AGENT, "child", 0)
+            v = vp as *progress.Progress
+            tr = agent.new_tracker(ctx_for_(t), vp, agent.new_output(id, ""))
+            observe_(tr, "{\"delta\":{}}")
+            observe_(tr, "{\"delta\":{}}")
+            observe_(tr, "{\"usage\":{\"prompt_tokens\":100}}")
+            observe_(tr, "{\"run_start\":\"await tools.edit({}); await tools.edit({}); await tools.read({}); typeof tools.agent\"}")
+            spec.assert_eq(v.step, 1, "step 1")
+            spec.assert_eq(list.list_size(v.tools), 2, "two tools")
+            t0, _e0 = list.get_string(v.tools, 0)
+            spec.assert_str_eq(t0, "edit", "first tool")
+            observe_(tr, "{\"run_end\":{\"changes\":[{\"path\":\"a.zig\",\"diff\":\"unused\"}]}}")
+            f0, _e1 = list.get_string(v.files, 0)
+            spec.assert_str_eq(f0, "a.zig", "file")
+            observe_(tr, "{\"usage\":{\"prompt_tokens\":100}}")
+            observe_(tr, "{\"run_start\":\"await tools.bash({})\"}")
+            spec.assert_eq(v.step, 1, "still step 1")
+            spec.assert_eq(list.list_size(v.files), 0, "files cleared")
+            observe_(tr, "{\"run_end\":{}}")
+            observe_(tr, "{\"usage\":{\"prompt_tokens\":100}}")
+            observe_(tr, "{\"usage\":{\"prompt_tokens\":150}}")
+            observe_(tr, "{\"notice\":\"compacted\"}")
+            observe_(tr, "{\"delta\":{}}")
+            spec.assert_eq(v.step, 2, "step 2")
+            observe_(tr, "{\"usage\":{\"prompt_tokens\":250}}")
+            observe_(tr, "{\"run_start\":\"tools.read({})\"}")
+            observe_(tr, "{\"run_end\":{}}")
+            observe_(tr, "{\"usage\":{\"prompt_tokens\":250}}")
+            observe_(tr, "{\"usage\":{\"prompt_tokens\":350}}")
+            observe_(tr, "{\"run_start\":\"tools.read({})\"}")
+            spec.assert_eq(v.step, 3, "step 3")
+            spec.assert_true(string.index_of(v.usage, "\"prompt_tokens\":350") >= 0, "usage 350: ${v.usage}")
+        }
+        spec.it("agent output retains only returned data and terminal text overrides deltas") callback {
+            op = agent.new_output("a1", "")
+            o = op as *agent.Output
+            i = 0
+            while i < 500 {
+                spec.assert_str_eq(agent.observe(op, "{\"delta\":{\"kind\":\"reasoning\",\"text\":\"ignored reasoning\"}}"), "", "reasoning")
+                i = i + 1
+            }
+            spec.assert_str_eq(o.text, "", "reasoning is not retained")
+            agent.observe(op, "{\"delta\":{\"kind\":\"text\",\"text\":\"partial\"}}")
+            spec.assert_str_eq(o.text, "partial", "partial")
+            agent.observe(op, "{\"run_end\":{\"changes\":[{\"path\":\"a\",\"added\":2,\"removed\":1,\"created\":true,\"diff\":\"not retained\"}]}}")
+            c0 = list.list_get_raw(o.changes, 0) as *agent.Change
+            spec.assert_str_eq(c0.path, "a", "change path")
+            agent.observe(op, "{\"background\":{\"kind\":\"run\",\"completion\":{\"changes\":[{\"path\":\"a\",\"added\":3,\"removed\":0}]}}}")
+            spec.assert_eq(list.list_size(o.changes), 1, "merged into one change")
+            spec.assert_eq_long(c0.added, 5, "added merged")
+            spec.assert_eq_long(c0.removed, 1, "removed kept")
+            spec.assert_eq(c0.created, 1, "created kept")
+            agent.observe(op, "{\"start\":{\"session_id\":\"0123456789abcdef0123456789abcdef\"}}")
+            agent.observe(op, "{\"end\":{\"text\":\"final\",\"usage\":{\"prompt_tokens\":10},\"steps\":2}}")
+            spec.assert_str_eq(o.text, "final", "final text")
+            spec.assert_eq_long((o.usage as *types.Usage).prompt_tokens, 10, "usage")
+            res = agent.result(op, 1 as long, "", -1 as long)
+            v = jsonx.parse(res)
+            spec.assert_eq(jsonx.bool_or(v, "ok", 0), 1, "ok true")
+            spec.assert_str_eq(jsonx.str_or(v, "id", ""), "a1", "id")
+            spec.assert_eq(jsonx.has(v, "session"), 0, "no session member")
+        }
+        spec.it("agent failure without output is data and queued user cancellation rejects") callback {
+            res = agent.result(agent.new_output("", ""), 12 as long, "AgentFailed", -1 as long)
+            v = jsonx.parse(res)
+            spec.assert_eq(jsonx.bool_or(v, "ok", 1), 0, "ok false")
+            spec.assert_str_eq(jsonx.str_or(v, "text", "x"), "", "empty text")
+            spec.assert_eq(jsonx.has(v, "session"), 0, "no session member")
+            t = tools_()
+            tt = t as *tools.Tools
+            (tt.agent_gate as *agent.Gate).active = 4
+            cp = ctx_for_(t)
+            sync.atomic_store((cp as *agent.Ctx).cancel, 1)
+            ids = list.list_new()
+            ok, text = agent.agent(cp, "{\"prompt\":\"cancelled\"}", ids)
+            spec.assert_eq(ok, 0, "rejects")
+            spec.assert_str_eq(text, "Canceled", "Canceled")
+            spec.assert_eq((tt.agent_gate as *agent.Gate).active, 4, "gate untouched")
+        }
+        spec.it("foreground agent records its ID even when startup fails and continues across Runs") callback {
+            t = tools_()
+            tt = t as *tools.Tools
+            s = tools.new_scope(t, 0)
+            h = tools.host(s)
+            run = timing.new()
+            sandbox.host_set_timing(h, run)
+            n = 0
+            while n < 2 {
+                sync.atomic_store((s as *tools.RunScope).cancel, 0)
+                o = sandbox.eval("await tools.agent({prompt: 'child'})", sandbox.limits(), h, null) as *sandbox.Outcome
+                spec.assert_eq(o.ok, 0, "fails ${n}")
+                spec.assert_str_eq((progress.slot_at(tt.progress, 0) as *progress.Progress).state, "failed", "state ${n}")
+                progress.clear(tt.progress)
+                n = n + 1
+            }
+            e0 = timing.entry(run, 0) as *timing.Call
+            e1 = timing.entry(run, 1) as *timing.Call
+            spec.assert_str_eq(e0.id, "a1", "first id")
+            spec.assert_str_eq(e1.id, "a2", "second id")
+            spec.assert_eq(e0.background, 0, "foreground")
+            spec.assert_eq_long((tt.progress as *progress.Queue).next_bash_id, 1, "no bash id spent")
+        }
+        spec.it("execute publishes the reserved invocation on foreground and background cancellation") callback {
+            t = tools_()
+            tt = t as *tools.Tools
+            cp = ctx_for_(t)
+            c = cp as *agent.Ctx
+            c.run_id = 1
+            id = progress.add_agent(tt.progress, "first", 1, 0, 0)
+            agent_sessions.add(tt.agent_sessions, id, "child-session", 1)
+            first = progress.current_invocation(tt.progress, id)
+            cancel = sync.atomic_new(1)
+            ok1, text1 = agent.execute(cp, "{\"prompt\":\"first\"}", cancel, id, 1, 0, "")
+            spec.assert_eq(ok1, 0, "first rejects")
+            spec.assert_str_eq(text1, "Canceled", "first Canceled")
+            nv = progress.new_value(id, progress.KIND_AGENT, "second", 1) as *progress.Progress
+            nv.background = 1
+            nv.state = "queued"
+            progress.restart(tt.progress, nv as ptr)
+            spec.assert_str_eq(agent_sessions.reserve(tt.agent_sessions, id), "", "reserve")
+            second = progress.current_invocation(tt.progress, id)
+            spec.assert_true(second > first, "second invocation is newer")
+            ok2, text2 = agent.execute(cp, "{\"prompt\":\"second\",\"resume\":\"a1\",\"background\":true}", cancel, id, 1, 1, "")
+            spec.assert_eq(ok2, 0, "second rejects")
+            spec.assert_str_eq(text2, "Canceled", "second Canceled")
+            agent_sessions.release(tt.agent_sessions, id)
+            spec.assert_eq(progress.slot_count(tt.progress), 2, "two slots")
+            invs = [first, second]
+            bgs = [0, 1]
+            k = 0
+            while k < 2 {
+                v = progress.slot_at(tt.progress, k) as *progress.Progress
+                spec.assert_str_eq(v.id, "a1", "id ${k}")
+                spec.assert_eq(v.invocation, invs[k], "invocation ${k}")
+                spec.assert_eq(v.background, bgs[k], "background ${k}")
+                spec.assert_str_eq(v.state, "canceled", "state ${k}")
+                k = k + 1
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

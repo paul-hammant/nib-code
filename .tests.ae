@@ -223,6 +223,20 @@ aeb(cap) {
         }
         aether.program_test() {
             source("ae/tests/tui_title_test.ae")
+        aether.program_test() {
+            source("ae/tests/agent_sessions_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/agent_input_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/fork_history_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/agent_test.ae")
             lib("ae")
         }
         // Workspace mode end to end, through the built binary.

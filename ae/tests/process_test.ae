@@ -5,15 +5,6 @@
 // child_env followed by process.run.
 //
 // Not ported, each because the feature is outside this slice:
-//  - "process deadline covers a blocked stdin writer": process.run has no
-//    stdin input.
-//  - "process observes complete lines before exit without changing collected
-//    output": no on_line observer; output is captured whole into a file.
-//    (The collected-output half is checked by the drain test below.)
-//  - "process drains buffered output and final lines after shell exit": the
-//    on_line count half is skipped for the same reason; the output, exit
-//    code and tail half runs as "process drains buffered output ... (no
-//    observer)".
 //  - "only the selected API key reaches nib children ...": the inherit_api_key
 //    half has no counterpart; the strip half runs as "custom keys are
 //    stripped from bash".
@@ -29,6 +20,22 @@ import nib.tools.process
 import nib.tools.bash
 import nib.tools.secrets
 import nib.tools.registry
+
+struct Capture {
+    first_ms: long
+    output: string
+    lines: int
+    wrong: int
+}
+
+new_capture_() -> ptr {
+    c = heap.new(Capture)
+    c.first_ms = 0 as long
+    c.output = ""
+    c.lines = 0
+    c.wrong = 0
+    return c as ptr
+}
 
 tmp_() -> string {
     d, _e = fs.make_temp_dir("", "nib-process")
@@ -112,6 +119,39 @@ main() {
             spec.assert_true(os.now_monotonic_ms() - t0 < 3000, "returned promptly")
             os.exec("pkill -f 'sleep 30' >/dev/null 2>&1; true")
         }
+        spec.it("process observes complete lines before exit without changing collected output") callback {
+            cap = new_capture_()
+            cancel = sync.atomic_new(0)
+            rp = process.run_lines(sh_("printf fir; sleep 0.05; printf 'st\\nsec'; sleep 0.25; printf 'ond\\ntrailing'"), null, "", cancel, 2000 as long, 500 as long, 16777216 as long, cap, |ctx: ptr, line: string| {
+                c = ctx as *Capture
+                if c.first_ms == 0 { c.first_ms = os.now_monotonic_ms() }
+                c.output = "${c.output}${line}|"
+            })
+            r = rp as *process.Result
+            c = cap as *Capture
+            spec.assert_eq(r.exit_code, 0, "success")
+            spec.assert_str_eq(r.stop, "", "no stop")
+            spec.assert_str_eq(c.output, "first|second|", "complete lines only")
+            spec.assert_str_eq(r.output, "first\nsecond\ntrailing", "collected output")
+            spec.assert_true(os.now_monotonic_ms() - c.first_ms >= 200, "first line arrived before exit")
+        }
+        spec.it("process drains buffered output and final lines after shell exit") callback {
+            cap = new_capture_()
+            cancel = sync.atomic_new(0)
+            rp = process.run_lines(sh_("sleep 5 & printf 'line\\n%.0s' {1..20000}; printf tail; exit 9"), null, "", cancel, 2000 as long, 500 as long, 16777216 as long, cap, |ctx: ptr, line: string| {
+                c = ctx as *Capture
+                if line != "line" { c.wrong = c.wrong + 1 }
+                c.lines = c.lines + 1
+            })
+            r = rp as *process.Result
+            c = cap as *Capture
+            spec.assert_str_eq(r.stop, "", "no stop")
+            spec.assert_eq(r.exit_code, 9, "exit 9")
+            spec.assert_eq(c.wrong, 0, "every line is 'line'")
+            spec.assert_eq(c.lines, 20000, "20000 lines")
+            spec.assert_eq(string.length(r.output), 100004, "length")
+            spec.assert_true(string.ends_with(r.output, "line\ntail") == 1, "ends with the tail")
+        }
         spec.it("process drains buffered output and final lines after shell exit (no observer)") callback {
             r = run_(sh_("sleep 5 & printf 'line\\n%.0s' {1..20000}; printf tail; exit 9"), null, null, 2000)
             spec.assert_str_eq(r.stop, "", "no stop")
@@ -135,6 +175,21 @@ main() {
             r = run_(sh_("sleep 5"), null, cancel, 0)
             spec.assert_str_eq(r.stop, process.STOP_CANCELED, "canceled")
             spec.assert_true(os.now_monotonic_ms() - t0 < 3000, "did not wait for the sleep")
+        }
+        spec.it("process deadline covers a blocked stdin writer") callback {
+            input = "x"
+            n = 0
+            while n < 17 {
+                input = "${input}${input}"
+                n = n + 1
+            }
+            spec.assert_eq(string.length(input), 131072, "128 KiB input")
+            cancel = sync.atomic_new(0)
+            t0 = os.now_monotonic_ms()
+            rp = process.run_lines(sh_("sleep 5"), null, input, cancel, 50 as long, 500 as long, 16777216 as long, null, |ctx: ptr, line: string| {})
+            r = rp as *process.Result
+            spec.assert_str_eq(r.stop, process.STOP_TIMED_OUT, "timed out")
+            spec.assert_true(os.now_monotonic_ms() - t0 < 1000, "returned within a second")
         }
     }
     return spec.run_summary(fw)

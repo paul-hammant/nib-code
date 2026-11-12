@@ -1,0 +1,137 @@
+// tools.agent_input (upstream src/tools/agent/input.zig). "Round trip
+// preserves" is encode (input_json) -> parse -> the compared fields equal,
+// since the port's Config is a heap struct without a deep-equality. Left
+// out: std.testing.expectEqualDeep over every field (the helpers compare
+// the fields each upstream test sets); the Codex provider is not ported, so
+// the provider/reasoning id "codex" is only an opaque string here.
+import std.spec
+import std.list
+import std.string
+import nib.msg
+import nib.provider.types
+import nib.tools.agent_input
+
+cfg_(p: @into ptr) -> *types.Config { return p as *types.Config }
+
+same_strings_(a: ptr, b: ptr) -> int {
+    if list.list_size(a) != list.list_size(b) { return 0 }
+    i = 0
+    while i < list.list_size(a) {
+        x, _e1 = list.get_string(a, i)
+        y, _e2 = list.get_string(b, i)
+        if x != y { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+check_config_(a: ptr, b: ptr, why: string) {
+    x = cfg_(a)
+    y = cfg_(b)
+    spec.assert_str_eq(y.provider, x.provider, "${why}: provider")
+    spec.assert_str_eq(y.base_url, x.base_url, "${why}: base_url")
+    spec.assert_str_eq(y.api_key, x.api_key, "${why}: api_key")
+    spec.assert_str_eq(y.model, x.model, "${why}: model")
+    spec.assert_eq(same_strings_(x.enabled_skills, y.enabled_skills), 1, "${why}: enabled_skills")
+    lx = x.limits as *types.Limits
+    ly = y.limits as *types.Limits
+    spec.assert_eq(ly.llm_concurrency, lx.llm_concurrency, "${why}: llm_concurrency")
+    spec.assert_eq(ly.max_steps, lx.max_steps, "${why}: max_steps")
+}
+
+base_cfg_() -> ptr { return types.new_config("chat_completions", "", "", "mock") }
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "agent stdin input") {
+        spec.it("agent stdin round trip preserves unset and explicit step limits") callback {
+            steps = [-1, 1, 50, 100000]
+            k = 0
+            while k < 4 {
+                cp = types.new_config("chat_completions", "https://example.com", "mock-key", "mock-model")
+                list.list_add(cfg_(cp).enabled_skills, "hallmark")
+                l = cfg_(cp).limits as *types.Limits
+                l.llm_concurrency = 8
+                l.max_steps = steps[k]
+                ip = agent_input.new_input("child prompt", cp)
+                data = agent_input.input_json(ip)
+                parsed, err = agent_input.parse(data)
+                spec.assert_str_eq(err, "", "parse ${k}")
+                pi = parsed as *agent_input.Input
+                spec.assert_str_eq(pi.prompt, "child prompt", "prompt ${k}")
+                check_config_(cp, pi.config, "steps ${k}")
+                spec.assert_true(pi.fork == null, "no fork")
+                k = k + 1
+            }
+        }
+        spec.it("agent stdin defaults omitted step limits to null") callback {
+            tails = ["", ",\"limits\":{}", ",\"limits\":{\"llm_concurrency\":8}"]
+            k = 0
+            while k < 3 {
+                data = "{\"prompt\":\"child\",\"config\":{\"base_url\":\"\",\"api_key\":\"\",\"model\":\"mock\"${tails[k]}}}"
+                parsed, err = agent_input.parse(data)
+                spec.assert_str_eq(err, "", "parse ${k}")
+                pi = parsed as *agent_input.Input
+                l = cfg_(pi.config).limits as *types.Limits
+                spec.assert_eq(l.max_steps, -1, "max_steps ${k}")
+                k = k + 1
+            }
+        }
+        spec.it("agent stdin defaults omitted fork file versions to empty") callback {
+            data = "{\"prompt\":\"child\",\"config\":{\"base_url\":\"\",\"api_key\":\"mock\",\"model\":\"mock\"},\"fork\":{\"session\":\"parent\",\"message_count\":1,\"history\":[{\"role\":\"system\",\"content\":\"system\"}],\"cache_key\":\"parent-cache\",\"id\":\"a1\",\"provider\":\"chat_completions\",\"model\":\"mock\"}}"
+            parsed, err = agent_input.parse(data)
+            spec.assert_str_eq(err, "", "parse")
+            f = (parsed as *agent_input.Input).fork as *agent_input.Fork
+            spec.assert_eq(list.list_size(f.file_versions), 0, "no file versions")
+        }
+        spec.it("agent stdin round trip preserves fork history reasoning and file versions") callback {
+            cp = types.new_config("codex", "", "mock", "mock")
+            ip = agent_input.new_input("child prompt", cp)
+            fp = agent_input.new_fork()
+            f = fp as *agent_input.Fork
+            f.session = "parent-session"
+            f.message_count = 2
+            list.list_add(f.history, msg.system("system\nbytes"))
+            calls = list.list_new()
+            list.list_add(calls, types.tool_call_new("run-id", "run", "{\"code\":\"console.log(1)\"}"))
+            list.list_add(f.history, msg.assistant("", calls, "codex", "[{\"encrypted_content\":\"opaque\"}]", 0, "", -1, ""))
+            f.cache_key = "root-session"
+            f.id = "a5"
+            f.provider = "codex"
+            f.model = "mock"
+            list.list_add(f.file_versions, agent_input.new_observation("/canonical/file", 9007199254740993 as long, 17 as long, -9007199254740993 as long))
+            (ip as *agent_input.Input).fork = fp
+            data = agent_input.input_json(ip)
+            parsed, err = agent_input.parse(data)
+            spec.assert_str_eq(err, "", "parse")
+            pi = parsed as *agent_input.Input
+            spec.assert_str_eq(pi.prompt, "child prompt", "prompt")
+            check_config_(cp, pi.config, "fork")
+            g = pi.fork as *agent_input.Fork
+            spec.assert_str_eq(g.session, "parent-session", "session")
+            spec.assert_eq(g.message_count, 2, "message_count")
+            spec.assert_eq(list.list_size(g.history), 2, "history size")
+            i = 0
+            while i < 2 {
+                a, _e1 = list.get_string(f.history, i)
+                b, _e2 = list.get_string(g.history, i)
+                spec.assert_str_eq(b, a, "history ${i}")
+                i = i + 1
+            }
+            m1, _e3 = list.get_string(g.history, 1)
+            spec.assert_str_eq(msg.reasoning_provider(m1), "codex", "reasoning provider")
+            spec.assert_str_eq(msg.reasoning_data(m1), "[{\"encrypted_content\":\"opaque\"}]", "reasoning data")
+            spec.assert_str_eq(g.cache_key, "root-session", "cache_key")
+            spec.assert_str_eq(g.id, "a5", "id")
+            spec.assert_str_eq(g.provider, "codex", "provider")
+            spec.assert_str_eq(g.model, "mock", "model")
+            spec.assert_eq(list.list_size(g.file_versions), 1, "one file version")
+            o = list.list_get_raw(g.file_versions, 0) as *agent_input.Observation
+            spec.assert_str_eq(o.path, "/canonical/file", "path")
+            spec.assert_true(o.inode == 9007199254740993 as long, "inode exact")
+            spec.assert_true(o.size == 17 as long, "size")
+            spec.assert_true(o.mtime == -9007199254740993 as long, "mtime exact")
+        }
+    }
+    return spec.run_summary(fw)
+}
