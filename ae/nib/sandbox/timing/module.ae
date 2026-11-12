@@ -1,0 +1,170 @@
+// sandbox.timing: tool-call durations and result bytes for one Run
+// (upstream src/sandbox/timing.zig). Bounded to 200 entries in dispatch
+// order; further calls only count as omitted. Only the Run's own thread
+// touches a Run.
+
+import std.list
+import std.string
+import std.os
+import nib.jsonx
+
+exports(MAX_ENTRIES, new, elapsed, reserve, reserve_entry, describe, undo_reservation, result, complete,
+        entry, count, omitted, llm_calls, agent_calls, tool_bytes, set_run_index, restart, set_detail,
+        stable_name, now_epoch_ms, Run, Call)
+
+const MAX_ENTRIES = 200
+
+struct Call {
+    name: string
+    start_ms: long
+    end_ms: long
+    ok: int
+    run_index: int
+    path: string        // "" when none
+    result_bytes: long  // -1 when none
+    dispatched: int
+    background: int     // -1 unknown, 0, 1
+    id: string          // "" when none
+}
+
+struct Run {
+    started_ms: long    // monotonic
+    run_index: int
+    detail: int         // 1: describe() records paths
+    entries: ptr        // list of *Call
+    omitted: long
+    llm_calls: long
+    agent_calls: long
+    tool_bytes: long
+    output_bytes: long
+}
+
+now_epoch_ms() -> long { return os.now_unix_ms() }
+
+new() -> ptr {
+    r = heap.new(Run)
+    r.started_ms = os.now_monotonic_ms()
+    r.run_index = 0
+    r.detail = 0
+    r.entries = list.list_new()
+    r.omitted = 0
+    r.llm_calls = 0
+    r.agent_calls = 0
+    r.tool_bytes = 0
+    r.output_bytes = 0
+    return r as ptr
+}
+
+restart(rp: ptr) { (rp as *Run).started_ms = os.now_monotonic_ms() }
+set_run_index(rp: ptr, i: int) { (rp as *Run).run_index = i }
+set_detail(rp: ptr, on: int) { (rp as *Run).detail = on }
+count(rp: ptr) -> int { return list.list_size((rp as *Run).entries) }
+omitted(rp: ptr) -> long { return (rp as *Run).omitted }
+llm_calls(rp: ptr) -> long { return (rp as *Run).llm_calls }
+agent_calls(rp: ptr) -> long { return (rp as *Run).agent_calls }
+tool_bytes(rp: ptr) -> long { return (rp as *Run).tool_bytes }
+entry(rp: ptr, i: int) -> ptr { return list.list_get_raw((rp as *Run).entries, i) }
+
+elapsed(rp: ptr) -> long {
+    d = os.now_monotonic_ms() - (rp as *Run).started_ms
+    if d < 0 { return 0 }
+    return d
+}
+
+stable_name(name: string) -> string {
+    match name {
+        "mcp" -> { return "mcp" }
+        "mcp_schema" -> { return "mcp_schema" }
+        "read" -> { return "read" }
+        "view" -> { return "view" }
+        "write" -> { return "write" }
+        "edit" -> { return "edit" }
+        "grep" -> { return "grep" }
+        "glob" -> { return "glob" }
+        "bash" -> { return "bash" }
+        "stop" -> { return "stop" }
+        "fetch" -> { return "fetch" }
+        "search" -> { return "search" }
+        "agent" -> { return "agent" }
+        "llm" -> { return "llm" }
+        "sleep" -> { return "sleep" }
+        _ -> { return "unknown" }
+    }
+}
+
+// Index of the reserved entry, or -1 once full (counted as omitted).
+reserve(rp: ptr, name: string) -> int {
+    r = rp as *Run
+    if name == "llm" { r.llm_calls = r.llm_calls + 1 }
+    if name == "agent" { r.agent_calls = r.agent_calls + 1 }
+    return reserve_entry(rp, name)
+}
+
+reserve_entry(rp: ptr, name: string) -> int {
+    r = rp as *Run
+    n = list.list_size(r.entries)
+    if n == MAX_ENTRIES {
+        r.omitted = r.omitted + 1
+        return -1
+    }
+    c = heap.new(Call)
+    c.name = stable_name(name)
+    c.start_ms = 0
+    c.end_ms = 0
+    c.ok = 0
+    c.run_index = r.run_index
+    c.path = ""
+    c.result_bytes = 0
+    c.dispatched = 1
+    c.background = -1
+    c.id = ""
+    list.list_add(r.entries, c as ptr)
+    return n
+}
+
+describe(rp: ptr, index: int, name: string, args: string) {
+    r = rp as *Run
+    if r.detail == 0 { return }
+    if index < 0 { return }
+    c = entry(rp, index) as *Call
+    if name == "mcp" || name == "mcp_schema" {
+        v = jsonx.parse(args)
+        if jsonx.kind(v, "name") == 3 { c.path = jsonx.str_or(v, "name", "") }
+        jsonx.free(v)
+        return
+    }
+    if name != "read" && name != "view" && name != "grep" && name != "glob" { return }
+    v = jsonx.parse(args)
+    if v == null { return }
+    if jsonx.kind(v, "path") == 3 {
+        c.path = jsonx.str_or(v, "path", "")
+    } else if name == "grep" || name == "glob" {
+        c.path = "."
+    }
+    jsonx.free(v)
+}
+
+undo_reservation(rp: ptr, index: int, name: string) {
+    r = rp as *Run
+    if name == "llm" { r.llm_calls = r.llm_calls - 1 }
+    if name == "agent" { r.agent_calls = r.agent_calls - 1 }
+    if index >= 0 {
+        list.list_remove(r.entries, index)
+    } else {
+        r.omitted = r.omitted - 1
+    }
+}
+
+result(rp: ptr, index: int, n: long) {
+    r = rp as *Run
+    r.tool_bytes = r.tool_bytes + n
+    if index >= 0 { (entry(rp, index) as *Call).result_bytes = n }
+}
+
+complete(rp: ptr, index: int, start_ms: long, end_ms: long, ok: int) {
+    if index < 0 { return }
+    c = entry(rp, index) as *Call
+    c.start_ms = start_ms
+    c.end_ms = end_ms
+    c.ok = ok
+}

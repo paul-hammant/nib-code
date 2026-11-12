@@ -1,0 +1,65 @@
+// Ports src/sandbox/timing.zig's tests.
+import std.spec
+import nib.sandbox.timing
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "sandbox.timing") {
+        spec.it("bounded calls retain dispatch order and count omitted invocations") callback {
+            r = timing.new()
+            i = 0
+            while i < 203 {
+                timing.set_run_index(r, i / 100)
+                idx = timing.reserve(r, "bash")
+                ok = 0
+                if i % 2 == 0 { ok = 1 }
+                timing.complete(r, idx, i as long, (i + 10) as long, ok)
+                i = i + 1
+            }
+            spec.assert_eq(timing.count(r), 200, "count")
+            spec.assert_eq_long(timing.omitted(r), 3, "omitted")
+            last = timing.entry(r, 199) as *timing.Call
+            spec.assert_eq(last.run_index, 1, "run index")
+            spec.assert_eq_long(last.end_ms, 209, "end")
+            spec.assert_eq(last.ok, 0, "odd not ok")
+            spec.assert_eq((timing.entry(r, 0) as *timing.Call).ok, 1, "even ok")
+        }
+        spec.it("names are stable and unknown tools are unknown") callback {
+            r = timing.new()
+            name = "read"
+            timing.reserve(r, name)
+            timing.reserve(r, "custom")
+            spec.assert_str_eq((timing.entry(r, 0) as *timing.Call).name, "read", "known")
+            spec.assert_str_eq((timing.entry(r, 1) as *timing.Call).name, "unknown", "unknown")
+        }
+        spec.it("failed dispatch releases its reservation including overflow") callback {
+            r = timing.new()
+            timing.undo_reservation(r, timing.reserve(r, "read"), "read")
+            spec.assert_eq(timing.count(r), 0, "released")
+            i = 0
+            while i < 200 {
+                timing.reserve(r, "read")
+                i = i + 1
+            }
+            timing.undo_reservation(r, timing.reserve(r, "read"), "read")
+            spec.assert_eq(timing.count(r), 200, "still full")
+            spec.assert_eq_long(timing.omitted(r), 0, "overflow released")
+        }
+        spec.it("delegation counts include overflow and exclude failed dispatch") callback {
+            r = timing.new()
+            timing.undo_reservation(r, timing.reserve(r, "agent"), "agent")
+            spec.assert_eq_long(timing.agent_calls(r), 0, "agent released")
+            i = 0
+            while i < 205 {
+                timing.reserve(r, "agent")
+                i = i + 1
+            }
+            timing.reserve(r, "llm")
+            timing.undo_reservation(r, timing.reserve(r, "llm"), "llm")
+            spec.assert_eq_long(timing.agent_calls(r), 205, "agents")
+            spec.assert_eq_long(timing.llm_calls(r), 1, "llm")
+            spec.assert_eq_long(timing.omitted(r), 6, "omitted")
+        }
+    }
+    return spec.run_summary(fw)
+}

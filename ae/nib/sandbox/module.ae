@@ -1,0 +1,824 @@
+// sandbox: one Run, model-written JS in a fresh QuickJS runtime
+// (upstream src/sandbox.zig, scheduler.zig, native.zig, timer.zig).
+//
+// The script reaches nothing of the host but `tools.*` (the Host's names)
+// and console. Tool calls return promises at once; up to TOOL_CONCURRENCY
+// run at a time, each on its own thread, and settle back on the Run's
+// thread, the only one that touches QuickJS. `tools.sleep(ms)` is a timer
+// of this loop, not a thread. The JS budget (Limits.timeout_ms) counts only
+// time spent in JS, across every entry, and pauses while tools run.
+//
+// Nothing here is module state: a Run is a *State, a host a *Host, and the
+// tool-call identity upstream keeps in a threadlocal travels on the
+// *ToolResult the tool fills in.
+
+import contrib.quickjs
+import std.string
+import std.strbuilder
+import std.list
+import std.sync
+import std.worker
+import std.os
+import nib.sandbox.console
+import nib.sandbox.timing
+import nib.qjsgap
+import nib.jsonx
+
+exports(TOOL_CONCURRENCY, MAX_STOPPED_BYTES, Limits, ToolResult, Host, Outcome,
+        limits, new_host, host_set_admit, host_set_cancel, host_set_timing,
+        result_ok, result_err, result_set_ok, result_set_err, result_set_identity,
+        eval, syntax_context)
+
+const TOOL_CONCURRENCY = 8
+const MAX_STOPPED_BYTES = 4096
+
+struct Limits {
+    memory_bytes: long
+    stack_bytes: long
+    timeout_ms: long
+    max_log_bytes: long
+}
+
+// What a tool hands back: ok with JSON text, or an error message. id and
+// background are the call's Session task identity, if it has one.
+struct ToolResult {
+    ok: int
+    text: string
+    id: string
+    background: int
+    rejected: int
+}
+
+struct Host {
+    ctx: ptr
+    names_json: string
+    // |ctx: ptr, name: string, args: string, out: ptr| fills out (*ToolResult)
+    call: fn
+    // |ctx: ptr, name: string, out: ptr| sets out.rejected = 1 to refuse
+    admit: fn
+    has_admit: int
+    cancel: ptr        // std.sync cell set when the Run stops its tools; may be null
+    timing: ptr        // *timing.Run, or null
+}
+
+struct Outcome {
+    ok: int
+    // The completion value as JSON when ok, else the error message and stack.
+    text: string
+    logs: string
+    log_entries: ptr   // list of *console.Entry
+    log_bytes: long
+    log_head_bytes: long
+    log_tail_start: long
+    log_truncated: int
+    tool_bytes: long
+    stopped: string
+}
+
+struct Call {
+    creation_index: int
+    name: string
+    args: string
+    pending: int       // quickjs handle: { promise, resolve, reject }
+    timer: int
+    deadline_ns: long
+    dispatched: int
+    done: ptr          // std.sync cell: 1 once result is set
+    seq: long          // completion order
+    result: ptr        // *ToolResult
+    timing_index: int
+    start_ms: long     // monotonic, set by the worker
+    end_ms: long
+}
+
+struct State {
+    q: ptr
+    w: ptr
+    host: ptr
+    logs: ptr
+    js_remaining_ns: long
+    js_started_ns: long
+    js_running: int
+    cancel: ptr
+    calls: ptr         // list of *Call, creation order, delivered ones removed
+    creation_index: int
+    tool_bytes: long
+    promise: int
+    completions: ptr   // std.sync cell, completion counter
+    active: int
+    error_ctor: int
+}
+
+limits() -> ptr {
+    l = heap.new(Limits)
+    l.memory_bytes = 64 * 1024 * 1024
+    l.stack_bytes = 1024 * 1024
+    l.timeout_ms = 5 * 60 * 1000
+    l.max_log_bytes = 64 * 1024
+    return l as ptr
+}
+
+// A host offering `names_json` (a JSON array of tool names) through `call`.
+new_host(ctx: @keep ptr, names_json: string, call_fn: @keep fn) -> ptr {
+    h = heap.new(Host)
+    h.ctx = ctx
+    h.names_json = names_json
+    h.call = call_fn
+    h.has_admit = 0
+    h.cancel = null
+    h.timing = null
+    return h as ptr
+}
+
+host_set_admit(hp: ptr, admit_fn: @keep fn) {
+    h = hp as *Host
+    h.admit = admit_fn
+    h.has_admit = 1
+}
+
+host_set_cancel(hp: ptr, cell: @keep ptr) { (hp as *Host).cancel = cell }
+host_set_timing(hp: ptr, t: @keep ptr) { (hp as *Host).timing = t }
+
+new_result_() -> ptr {
+    r = heap.new(ToolResult)
+    r.ok = 1
+    r.text = ""
+    r.id = ""
+    r.background = 0
+    r.rejected = 0
+    return r as ptr
+}
+
+result_ok(text: string) -> ptr {
+    r = new_result_() as *ToolResult
+    r.text = text
+    return r as ptr
+}
+
+result_err(text: string) -> ptr {
+    r = new_result_() as *ToolResult
+    r.ok = 0
+    r.text = text
+    return r as ptr
+}
+
+result_set_ok(out: ptr, text: string) {
+    r = out as *ToolResult
+    r.ok = 1
+    r.text = text
+}
+
+result_set_err(out: ptr, text: string) {
+    r = out as *ToolResult
+    r.ok = 0
+    r.text = text
+}
+
+result_set_identity(out: ptr, id: string, background: int) {
+    r = out as *ToolResult
+    r.id = id
+    r.background = background
+}
+
+const PRELUDE = <<JS
+(() => {
+  const host = globalThis.__host, log = globalThis.__log, names = JSON.parse(globalThis.__names);
+  delete globalThis.__host; delete globalThis.__log; delete globalThis.__names;
+  const fmt = (x) => {
+    if (typeof x === "string") return x;
+    try { const s = JSON.stringify(x); return s === undefined ? String(x) : s; } catch { return String(x); }
+  };
+  const out = (...a) => log(a.map(fmt).join(" ") + "\n");
+  globalThis.console = Object.freeze({ log: out, info: out, warn: out, error: out });
+  const call = async (name, args) => {
+    if (name === "sleep" && (!Number.isInteger(args) || args < 0 || args > 2147483647))
+      throw new Error("sleep: ms must be an integer in 0..2147483647");
+    if (name === "grep" && args?.pattern instanceof RegExp) {
+      const re = args.pattern;
+      args = { ...args, pattern: re.source, ...(re.ignoreCase && !Object.hasOwn(args, "ignore_case") ? { ignore_case: true } : {}) };
+    }
+    let r;
+    try { r = await host(name, JSON.stringify(args ?? {})); } catch (e) { throw new Error(name + ": " + e.message); }
+    return r;
+  };
+  globalThis.tools = Object.freeze(Object.fromEntries(names.map((n) => [n, (a, b) => call(n, n === "mcp" ? {name: a, arguments: b === undefined ? {} : b} : n === "mcp_schema" ? {name: a} : a)])));
+})();
+JS
+
+// ---- the JS budget ----
+
+begin_js_(st: *State) {
+    st.js_started_ns = qjsgap.now_ns()
+    st.js_running = 1
+    qjsgap.begin(st.w, st.js_remaining_ns)
+}
+
+end_js_(st: *State) {
+    qjsgap.end(st.w)
+    st.js_remaining_ns = st.js_remaining_ns - (qjsgap.now_ns() - st.js_started_ns)
+    st.js_running = 0
+}
+
+canceled_(st: *State) -> int {
+    if st.cancel == null { return 0 }
+    if sync.atomic_load(st.cancel) != 0 { return 1 }
+    return 0
+}
+
+interrupted_(st: *State) -> int {
+    if canceled_(st) == 1 { return 1 }
+    elapsed = 0 as long
+    if st.js_running == 1 { elapsed = qjsgap.now_ns() - st.js_started_ns }
+    if elapsed >= st.js_remaining_ns { return 1 }
+    return 0
+}
+
+stop_(st: *State) {
+    if st.host == null { return }
+    h = st.host as *Host
+    if h.cancel != null { sync.atomic_store(h.cancel, 1) }
+}
+
+timing_(st: *State) -> ptr {
+    if st.host == null { return null }
+    return (st.host as *Host).timing
+}
+
+// ---- values to text ----
+
+to_str_(st: *State, h: int) -> string {
+    if quickjs.type_of(st.q, h) == "string" { return quickjs.to_string(st.q, h) }
+    s = quickjs.to_string(st.q, h)
+    if s == "" {
+        if quickjs.last_error(st.q) != "" { return "<unprintable>" }
+    }
+    return s
+}
+
+trim_newlines_end_(s: string) -> string {
+    n = string.length(s)
+    while n > 0 && string.char_at(s, n - 1) == 10 { n = n - 1 }
+    return string.substring(s, 0, n)
+}
+
+describe_error_(st: *State, h: int) -> string {
+    msg = to_str_(st, h)
+    t = quickjs.type_of(st.q, h)
+    if t != "object" && t != "error" && t != "function" && t != "array" && t != "promise" { return msg }
+    stack, err = quickjs.get(st.q, h, "stack")
+    if err != "" { return msg }
+    if quickjs.type_of(st.q, stack) == "undefined" {
+        quickjs.release(st.q, stack)
+        return msg
+    }
+    s = to_str_(st, stack)
+    quickjs.release(st.q, stack)
+    return "${msg}\n${trim_newlines_end_(s)}"
+}
+
+to_json_(st: *State, h: int) -> string {
+    if quickjs.type_of(st.q, h) == "undefined" { return "undefined" }
+    s = quickjs.to_json(st.q, h)
+    if s == "" { return to_str_(st, h) }
+    return s
+}
+
+// ---- tool calls ----
+
+enqueue_(st: *State, name: string, args: string) -> int {
+    q = st.q
+    if st.host == null { return quickjs.throw_error(q, "Error", "no host") }
+    h = st.host as *Host
+    c = heap.new(Call)
+    c.creation_index = st.creation_index
+    c.name = name
+    c.args = args
+    c.pending = quickjs.new_promise(q)
+    c.timer = 0
+    c.deadline_ns = 0
+    c.dispatched = 0
+    c.done = sync.atomic_new(0)
+    c.seq = 0
+    c.result = null
+    c.timing_index = -1
+    c.start_ms = 0
+    c.end_ms = 0
+    t = timing_(st)
+    if h.has_admit == 1 {
+        r = new_result_()
+        call(h.admit, h.ctx, name, r)
+        if (r as *ToolResult).rejected == 1 {
+            (r as *ToolResult).ok = 0
+            c.result = r
+            if t != null {
+                c.timing_index = timing.reserve_entry(t, name)
+                if c.timing_index >= 0 {
+                    ms = timing.elapsed(t)
+                    timing.complete(t, c.timing_index, ms, ms, 0)
+                    (timing.entry(t, c.timing_index) as *timing.Call).dispatched = 0
+                }
+            }
+        }
+    }
+    if c.result == null && name == "sleep" {
+        ms = jsonx.long_of(args)
+        c.timer = 1
+        c.deadline_ns = qjsgap.now_ns() + ms * 1000000
+    }
+    st.creation_index = st.creation_index + 1
+    list.list_add(st.calls, c as ptr)
+    if c.timer == 1 && t != null {
+        c.timing_index = timing.reserve(t, name)
+        if c.timing_index >= 0 {
+            ms = timing.elapsed(t)
+            timing.complete(t, c.timing_index, ms, ms, 0)
+        }
+    }
+    p, _e = quickjs.get(q, c.pending, "promise")
+    return p
+}
+
+work_(hp: ptr, cp: ptr, completions: ptr) {
+    h = hp as *Host
+    c = cp as *Call
+    c.start_ms = os.now_monotonic_ms()
+    r = new_result_()
+    call(h.call, h.ctx, c.name, c.args, r)
+    c.end_ms = os.now_monotonic_ms()
+    c.result = r
+    c.seq = sync.atomic_add(completions, 1)
+    sync.atomic_store(c.done, 1)
+}
+
+dispatch_(st: *State, c: *Call) {
+    c.dispatched = 1
+    t = timing_(st)
+    if c.result != null {
+        // Refused at admission: delivered in turn like a completion.
+        c.seq = sync.atomic_add(st.completions, 1)
+        sync.atomic_store(c.done, 1)
+        return
+    }
+    if t != null {
+        c.timing_index = timing.reserve(t, c.name)
+        timing.describe(t, c.timing_index, c.name, c.args)
+    }
+    hp = st.host
+    cp = c as ptr
+    comp = st.completions
+    worker.run_detached(|| {
+        work_(hp, cp, comp)
+        return null
+    })
+}
+
+call_with_(st: *State, f: int, v: int) {
+    a = quickjs.new_array(st.q)
+    quickjs.set_index(st.q, a, 0, v)
+    r, _e = quickjs.call(st.q, f, 0, a)
+    if r != 0 { quickjs.release(st.q, r) }
+    quickjs.release(st.q, a)
+}
+
+release_call_(st: *State, c: *Call) {
+    quickjs.release(st.q, c.pending)
+    sync.atomic_free(c.done)
+}
+
+remove_call_(st: *State, c: *Call) {
+    n = list.list_size(st.calls)
+    i = 0
+    while i < n {
+        if list.list_get_raw(st.calls, i) == (c as ptr) {
+            list.list_remove(st.calls, i)
+            return
+        }
+        i = i + 1
+    }
+}
+
+deliver_(st: *State, c: *Call) {
+    q = st.q
+    r = c.result as *ToolResult
+    n = string.length(r.text) as long
+    st.tool_bytes = st.tool_bytes + n
+    t = timing_(st)
+    if t != null { timing.result(t, c.timing_index, n) }
+    begin_js_(st)
+    rejected = 0
+    value = 0
+    if r.ok == 1 {
+        v, err = quickjs.parse_json(q, r.text)
+        if err != "" {
+            rejected = 1
+            msg = quickjs.new_string(q, err)
+            a = quickjs.new_array(q)
+            quickjs.set_index(q, a, 0, msg)
+            quickjs.release(q, msg)
+            ev, _e = quickjs.call(q, st.error_ctor, 0, a)
+            value = ev
+            quickjs.release(q, a)
+        } else {
+            value = v
+        }
+    } else {
+        rejected = 1
+        msg = quickjs.new_string(q, r.text)
+        a = quickjs.new_array(q)
+        quickjs.set_index(q, a, 0, msg)
+        quickjs.release(q, msg)
+        ev2, _e3 = quickjs.call(q, st.error_ctor, 0, a)
+        value = ev2
+        quickjs.release(q, a)
+    }
+    settle_name = "resolve"
+    if rejected == 1 { settle_name = "reject" }
+    f, _e2 = quickjs.get(q, c.pending, settle_name)
+    call_with_(st, f, value)
+    quickjs.release(q, f)
+    if value != 0 { quickjs.release(q, value) }
+    end_js_(st)
+    remove_call_(st, c)
+    release_call_(st, c)
+}
+
+// The settled call with the lowest completion number, or null.
+ready_(st: *State) -> ptr {
+    best = null
+    best_seq = 0 as long
+    n = list.list_size(st.calls)
+    i = 0
+    while i < n {
+        c = list.list_get_raw(st.calls, i) as *Call
+        if c.dispatched == 1 && c.timer == 0 {
+            if sync.atomic_load(c.done) == 1 {
+                if best == null || c.seq < best_seq {
+                    best = c as ptr
+                    best_seq = c.seq
+                }
+            }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+any_done_(st: *State) -> int {
+    n = list.list_size(st.calls)
+    i = 0
+    while i < n {
+        c = list.list_get_raw(st.calls, i) as *Call
+        if c.dispatched == 1 && c.timer == 0 {
+            if sync.atomic_load(c.done) == 1 { return 1 }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+has_timers_(st: *State) -> int {
+    n = list.list_size(st.calls)
+    i = 0
+    while i < n {
+        if (list.list_get_raw(st.calls, i) as *Call).timer == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// Runs jobs, settles tool calls and timers until nothing is left to do.
+// 1 when it drained normally, 0 when stopped (interrupt, a failed job).
+jobs_(st: *State) -> int {
+    q = st.q
+    while true {
+        if interrupted_(st) == 1 {
+            stop_(st)
+            return 0
+        }
+        begin_js_(st)
+        n, err = quickjs.run_jobs(q)
+        end_js_(st)
+        if err != "" { return 0 }
+        if n > 0 { continue }
+        rp = ready_(st)
+        if rp != null {
+            st.active = st.active - 1
+            rc = rp as *Call
+            t = timing_(st)
+            if t != null && rc.timing_index >= 0 && rc.start_ms != 0 {
+                base = (t as *timing.Run).started_ms
+                timing.complete(t, rc.timing_index, rc.start_ms - base, rc.end_ms - base, (rc.result as *ToolResult).ok)
+                ident = rc.result as *ToolResult
+                if ident.id != "" {
+                    e = timing.entry(t, rc.timing_index) as *timing.Call
+                    e.id = ident.id
+                    e.background = ident.background
+                }
+            }
+            deliver_(st, rc)
+            continue
+        }
+        // Start queued calls in creation order, up to the concurrency bound.
+        total = list.list_size(st.calls)
+        i = 0
+        while i < total && st.active < TOOL_CONCURRENCY {
+            c = list.list_get_raw(st.calls, i) as *Call
+            if c.dispatched == 0 && c.timer == 0 {
+                dispatch_(st, c)
+                st.active = st.active + 1
+            }
+            i = i + 1
+        }
+        failed = 0
+        if st.promise != 0 {
+            if qjsgap.promise_state(st.w, st.promise) == 2 { failed = 1 }
+        }
+        wait_ms = 20 as long
+        expired = null
+        if failed == 0 {
+            now = qjsgap.now_ns()
+            total = list.list_size(st.calls)
+            i = 0
+            while i < total {
+                c = list.list_get_raw(st.calls, i) as *Call
+                if c.timer == 1 {
+                    rem_ns = c.deadline_ns - now
+                    if rem_ns < 0 { rem_ns = 0 }
+                    rem_ms = (rem_ns + 999999) / 1000000
+                    if rem_ms < wait_ms { wait_ms = rem_ms }
+                    if rem_ms == 0 {
+                        if expired == null || c.deadline_ns < (expired as *Call).deadline_ns { expired = c as ptr }
+                    }
+                }
+                i = i + 1
+            }
+        }
+        if expired != null {
+            ec = expired as *Call
+            ec.result = result_ok("null")
+            t = timing_(st)
+            if t != null && ec.timing_index >= 0 {
+                e = timing.entry(t, ec.timing_index) as *timing.Call
+                timing.complete(t, ec.timing_index, e.start_ms, timing.elapsed(t), 1)
+            }
+            deliver_(st, ec)
+            continue
+        }
+        if st.active == 0 {
+            if failed == 1 || has_timers_(st) == 0 { return 1 }
+        }
+        // Wait for a completion, a timer, or the next cancellation check.
+        deadline = os.now_monotonic_ms() + wait_ms
+        while any_done_(st) == 0 && os.now_monotonic_ms() < deadline {
+            if canceled_(st) == 1 { break }
+            sleep(1)
+        }
+    }
+}
+
+stopped_calls_(st: *State) -> string {
+    b = strbuilder.new(64)
+    remaining = 0
+    n = list.list_size(st.calls)
+    i = 0
+    while i < n {
+        c = list.list_get_raw(st.calls, i) as *Call
+        if remaining > 0 || strbuilder.length(b) + string.length(c.name) + 64 > MAX_STOPPED_BYTES {
+            remaining = remaining + 1
+        } else {
+            if strbuilder.length(b) == 0 { strbuilder.append(b, "[stopped before completion: ") }
+            else { strbuilder.append(b, ", ") }
+            strbuilder.append(b, "${c.name} #${c.creation_index}")
+        }
+        i = i + 1
+    }
+    if remaining > 0 {
+        if strbuilder.length(b) == 0 { strbuilder.append(b, "[stopped before completion: ") }
+        else { strbuilder.append(b, ", ") }
+        strbuilder.append(b, "..., ${remaining} more")
+    }
+    if strbuilder.length(b) > 0 { strbuilder.append(b, "]") }
+    return strbuilder.finish(b)
+}
+
+// Stop the tools, wait for every worker, release everything.
+teardown_(st: *State) {
+    stop_(st)
+    n = list.list_size(st.calls)
+    i = 0
+    while i < n {
+        c = list.list_get_raw(st.calls, i) as *Call
+        if c.dispatched == 1 && c.timer == 0 {
+            while sync.atomic_load(c.done) == 0 { sleep(1) }
+        }
+        i = i + 1
+    }
+    t = timing_(st)
+    i = 0
+    while i < n {
+        c = list.list_get_raw(st.calls, i) as *Call
+        if c.timer == 1 && t != null && c.timing_index >= 0 {
+            e = timing.entry(t, c.timing_index) as *timing.Call
+            timing.complete(t, c.timing_index, e.start_ms, timing.elapsed(t), 0)
+        }
+        release_call_(st, c)
+        i = i + 1
+    }
+    list.list_clear(st.calls)
+}
+
+// The SyntaxError message with the offending source line, bounded to about
+// 200 bytes around the column without splitting a UTF-8 sequence.
+syntax_context(msg_text: string, code: string) -> string {
+    marker = "<run>:"
+    at = string.index_of(msg_text, marker)
+    if at < 0 { return msg_text }
+    rest = string.substring(msg_text, at + string.length(marker), string.length(msg_text))
+    // line ":" column, ended by ":", newline, space or ")"
+    line = 0
+    k = 0
+    rn = string.length(rest)
+    while k < rn && string.char_at(rest, k) >= 48 && string.char_at(rest, k) <= 57 {
+        line = line * 10 + (string.char_at(rest, k) - 48)
+        k = k + 1
+    }
+    if k == 0 { return msg_text }
+    column = 1
+    if k < rn && string.char_at(rest, k) == 58 {
+        k = k + 1
+        col = 0
+        digits = 0
+        while k < rn && string.char_at(rest, k) >= 48 && string.char_at(rest, k) <= 57 {
+            col = col * 10 + (string.char_at(rest, k) - 48)
+            k = k + 1
+            digits = digits + 1
+        }
+        if digits > 0 { column = col }
+    }
+    // the source line
+    cn = string.length(code)
+    number = 1
+    start = 0
+    i = 0
+    while number < line && i < cn {
+        if string.char_at(code, i) == 10 {
+            number = number + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if number != line { return msg_text }
+    stop = start
+    while stop < cn && string.char_at(code, stop) != 10 { stop = stop + 1 }
+    source = string.substring(code, start, stop)
+    sn = stop - start
+    first = column - 1
+    if first < 0 { first = 0 }
+    if first > sn { first = sn }
+    first = first - 80
+    if first < 0 { first = 0 }
+    while first < sn && (string.char_at(source, first) & 192) == 128 { first = first + 1 }
+    last = first + 200
+    if last > sn { last = sn }
+    while last > first && last < sn && (string.char_at(source, last) & 192) == 128 { last = last - 1 }
+    pre = ""
+    if first > 0 { pre = "…" }
+    post = ""
+    if last < sn { post = "…" }
+    return "${msg_text}\nsource line ${line}: ${pre}${string.substring(source, first, last)}${post}"
+}
+
+install_(st: *State) {
+    q = st.q
+    stp = st as ptr
+    log_fn = quickjs.function(q, "__log", 1, |q: @keep ptr, this_h: int, args: int| {
+        s = stp as *State
+        if quickjs.arg_count(q, args) < 1 { return 0 }
+        console.append(s.logs, quickjs.arg_string(q, args, 0))
+        return 0
+    })
+    quickjs.set_global(q, "__log", log_fn)
+    quickjs.release(q, log_fn)
+    host_fn = quickjs.function(q, "__host", 2, |q: @keep ptr, this_h: int, args: int| {
+        s = stp as *State
+        if s.host == null || quickjs.arg_count(q, args) < 2 {
+            return quickjs.throw_error(q, "Error", "invalid host call")
+        }
+        return enqueue_(s, quickjs.arg_string(q, args, 0), quickjs.arg_string(q, args, 1))
+    })
+    quickjs.set_global(q, "__host", host_fn)
+    quickjs.release(q, host_fn)
+    names = "[]"
+    if st.host != null { names = (st.host as *Host).names_json }
+    ns = quickjs.new_string(q, names)
+    quickjs.set_global(q, "__names", ns)
+    quickjs.release(q, ns)
+}
+
+take_global_(st: *State, name: string) -> int {
+    h, _e = quickjs.get_global(st.q, name)
+    r, _e2 = quickjs.eval(st.q, "delete globalThis.${name}", "<nib>")
+    if r != 0 { quickjs.release(st.q, r) }
+    return h
+}
+
+// Run `code` once in a fresh runtime. host may be null (no tools); cancel
+// is a std.sync cell the caller sets to cancel the Run, or null.
+eval(code: string, lp: ptr, host: @keep ptr, cancel: @keep ptr) -> ptr {
+    l = lp as *Limits
+    st = heap.new(State)
+    st.host = host
+    st.logs = console.new(l.max_log_bytes)
+    st.js_remaining_ns = l.timeout_ms * 1000000
+    st.js_started_ns = 0
+    st.js_running = 0
+    st.cancel = cancel
+    st.calls = list.list_new()
+    st.creation_index = 0
+    st.tool_bytes = 0
+    st.promise = 0
+    st.completions = sync.atomic_new(0)
+    st.active = 0
+    st.q = quickjs.runtime((l.memory_bytes / 1024) as int, (l.stack_bytes / 1024) as int)
+    st.w = qjsgap.watch(st.q, cancel)
+    q = st.q
+    ec, _ee = quickjs.get_global(q, "Error")
+    st.error_ctor = ec
+
+    install_(st)
+    pv, perr = quickjs.eval(q, PRELUDE, "<prelude>")
+    if perr != "" {
+        println("nib: sandbox prelude failed: ${perr}")
+    } else {
+        quickjs.release(q, pv)
+    }
+
+    ok = 0
+    jobs_drained = 1
+    text = ""
+    begin_js_(st)
+    rc = qjsgap.eval_async(st.w, code, "<run>", "__nib_run", "__nib_exc")
+    end_js_(st)
+    if rc < 0 {
+        exc = take_global_(st, "__nib_exc")
+        begin_js_(st)
+        text = describe_error_(st, exc)
+        end_js_(st)
+        quickjs.release(q, exc)
+    } else {
+        st.promise = take_global_(st, "__nib_run")
+        jobs_drained = jobs_(st)
+        begin_js_(st)
+        state = qjsgap.promise_state(st.w, st.promise)
+        if state == 1 {
+            qjsgap.promise_result_to_global(st.w, st.promise, "__nib_settled")
+            res = take_global_(st, "__nib_settled")
+            // Async global eval resolves to { value: <completion value> }.
+            value, _ve = quickjs.get(q, res, "value")
+            text = to_json_(st, value)
+            quickjs.release(q, value)
+            quickjs.release(q, res)
+            ok = 1
+        } else if state == 2 {
+            qjsgap.promise_result_to_global(st.w, st.promise, "__nib_settled")
+            err = take_global_(st, "__nib_settled")
+            text = describe_error_(st, err)
+            quickjs.release(q, err)
+        } else {
+            text = "Error: script is still awaiting something that can never settle"
+        }
+        end_js_(st)
+    }
+    if ok == 0 && string.starts_with(text, "SyntaxError:") {
+        text = syntax_context(text, code)
+    }
+    if jobs_drained == 1 { jobs_(st) }
+
+    stopped = ""
+    if interrupted_(st) == 1 {
+        ok = 0
+        if canceled_(st) == 1 { text = "Error: run canceled" } else { text = "Error: run timed out" }
+        stopped = stopped_calls_(st)
+    }
+    teardown_(st)
+    if st.promise != 0 { quickjs.release(q, st.promise) }
+    quickjs.release(q, st.error_ctor)
+    qjsgap.unwatch(st.w)
+    quickjs.dispose(q)
+    sync.atomic_free(st.completions)
+
+    snap = console.snapshot(st.logs) as *console.Snapshot
+    o = heap.new(Outcome)
+    o.ok = ok
+    o.text = text
+    o.logs = snap.logs
+    o.log_entries = snap.entries
+    o.log_bytes = console.bytes(st.logs)
+    o.log_head_bytes = snap.head_bytes
+    o.log_tail_start = snap.tail_start
+    o.log_truncated = 0
+    if console.bytes(st.logs) > l.max_log_bytes { o.log_truncated = 1 }
+    o.tool_bytes = st.tool_bytes
+    o.stopped = stopped
+    return o as ptr
+}

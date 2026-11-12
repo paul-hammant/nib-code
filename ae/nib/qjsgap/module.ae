@@ -1,0 +1,30 @@
+// qjsgap: a marked STAND-IN for three contrib.quickjs gaps (async global
+// eval, a host-controlled interrupt, promise state), until
+// asks/aether-quickjs-async-eval-and-interrupt.md is answered upstream.
+// qjsgap.c says what it mirrors. Only the sandbox imports this.
+
+@source("qjsgap.c")
+
+exports(watch, unwatch, begin, end, reason, now_ns, eval_async, promise_state, promise_result_to_global)
+
+extern nibqjs_watch(q: ptr, cancel_cell: ptr) -> ptr
+extern nibqjs_unwatch(w: ptr)
+extern nibqjs_begin(w: ptr, remaining_ns: long)
+extern nibqjs_end(w: ptr)
+extern nibqjs_reason(w: ptr) -> int
+extern nibqjs_now_ns() -> long
+extern nibqjs_eval_async(w: ptr, code: string, filename: string, result_name: string, exc_name: string) -> int
+extern nibqjs_promise_state(w: ptr, h: int) -> int
+extern nibqjs_promise_result_to_global(w: ptr, h: int, name: string)
+
+watch(q: ptr, cancel_cell: ptr) -> ptr { return nibqjs_watch(q, cancel_cell) }
+unwatch(w: ptr) { nibqjs_unwatch(w) }
+begin(w: ptr, remaining_ns: long) { nibqjs_begin(w, remaining_ns) }
+end(w: ptr) { nibqjs_end(w) }
+reason(w: ptr) -> int { return nibqjs_reason(w) }
+now_ns() -> long { return nibqjs_now_ns() }
+eval_async(w: ptr, code: string, filename: string, result_name: string, exc_name: string) -> int {
+    return nibqjs_eval_async(w, code, filename, result_name, exc_name)
+}
+promise_state(w: ptr, h: int) -> int { return nibqjs_promise_state(w, h) }
+promise_result_to_global(w: ptr, h: int, name: string) { nibqjs_promise_result_to_global(w, h, name) }

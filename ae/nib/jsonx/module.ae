@@ -1,0 +1,109 @@
+// jsonx: the few JSON reads and writes tool arguments and results need,
+// over std.json. A parsed document is a ptr; free it with jsonx.free.
+
+import std.json
+import std.string
+
+exports(parse, free, kind, has, field, str_or, str_field, int_or, long_or, bool_or, num_or,
+        is_integer, long_of, quote, encode, KIND_MISSING)
+
+const KIND_MISSING = -1
+
+// The document, or null if `text` is not JSON.
+parse(text: string) -> ptr {
+    v, err = json.parse(text)
+    if err != "" { return null }
+    return v
+}
+
+free(v: ptr) { if v != null { json.json_free(v) } }
+
+// The member `key` of object `o` (borrowed), or null.
+field(o: ptr, key: string) -> ptr {
+    if o == null { return null }
+    if json.json_type(o) != json.JSON_OBJECT { return null }
+    if json.json_object_has(o, key) == 0 { return null }
+    return json.json_object_get_raw(o, key)
+}
+
+has(o: ptr, key: string) -> int {
+    if field(o, key) == null { return 0 }
+    return 1
+}
+
+// json.JSON_* of member `key`, or KIND_MISSING.
+kind(o: ptr, key: string) -> int {
+    v = field(o, key)
+    if v == null { return KIND_MISSING }
+    return json.json_type(v)
+}
+
+str_field(v: ptr) -> string {
+    out, err = json.get_string(v)
+    if err != "" { return "" }
+    return out
+}
+
+str_or(o: ptr, key: string, d: string) -> string {
+    v = field(o, key)
+    if v == null { return d }
+    if json.json_type(v) != json.JSON_STRING { return d }
+    return str_field(v)
+}
+
+int_or(o: ptr, key: string, d: int) -> int {
+    v = field(o, key)
+    if v == null { return d }
+    if json.json_type(v) != json.JSON_NUMBER { return d }
+    return json.json_get_int(v)
+}
+
+long_or(o: ptr, key: string, d: long) -> long {
+    v = field(o, key)
+    if v == null { return d }
+    if json.json_type(v) != json.JSON_NUMBER { return d }
+    return json.json_get_long(v)
+}
+
+num_or(o: ptr, key: string, d: float) -> float {
+    v = field(o, key)
+    if v == null { return d }
+    if json.json_type(v) != json.JSON_NUMBER { return d }
+    return json.json_get_number(v)
+}
+
+is_integer(v: ptr) -> int {
+    if v == null { return 0 }
+    if json.json_type(v) != json.JSON_NUMBER { return 0 }
+    return json.json_is_integer(v)
+}
+
+bool_or(o: ptr, key: string, d: int) -> int {
+    v = field(o, key)
+    if v == null { return d }
+    if json.json_type(v) != json.JSON_BOOL { return d }
+    return json.json_get_bool(v)
+}
+
+// `s` as a JSON string literal.
+quote(s: string) -> string {
+    v = json.str(s)
+    out, _e = json.encode(v)
+    json.json_free(v)
+    return out
+}
+
+encode(v: ptr) -> string {
+    out, _e = json.encode(v)
+    return out
+}
+
+// The number `text` holds, as a long (0 if it is not one).
+long_of(text: string) -> long {
+    v = parse(text)
+    if v == null { return 0 }
+    n = 0 as long
+    if json.json_type(v) == json.JSON_NUMBER { n = json.json_get_long(v) }
+    free(v)
+    return n
+}

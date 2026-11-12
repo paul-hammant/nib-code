@@ -1,0 +1,16 @@
+# The toolchain the Aether port is built and tested against. Pins are what
+# was last verified, not "latest"; bump one in the commit that needs it (or
+# that re-verified the port against it), as the other Aether repos do.
+#
+# Install both in one step (aeb's get.sh, pinned):
+#   curl -fsSL https://raw.githubusercontent.com/aether-lang-dev/aeb/main/get.sh \
+#     | AE_PIN=$AE_PIN AEB_REF=$AEB_REF sh
+#
+# 0.909.0 (2026-11-12): the first pin. contrib.quickjs (quickjs-ng 0.17.0)
+# is the engine; std.worker's run_detached gives a tool call its thread,
+# std.sync its completion flag, std.os's spawn_proc_to a bash process group.
+# Verified: aeb .tests.ae on macOS arm64 and Linux x86_64 (ae-x64).
+AE_PIN=0.909.0
+
+# v0.344 (2026-11-12): aether.program and aether.program_test with lib().
+AEB_REF=v0.344

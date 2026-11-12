@@ -1,0 +1,90 @@
+// Ports src/sandbox/console.zig's tests.
+import std.spec
+import std.string
+import std.list
+import nib.sandbox.console
+
+entry_bytes_(call: long) -> long { return (call - 1) % 10 + 1 }
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "sandbox.console") {
+        spec.it("rolling tail matches original stream across wrap and large writes") callback {
+            chunks = ["AB", "CDE", "FG", "HI", "J", "K", "LMN", "OPQR", "STUVWXYZ", "0", "123456789"]
+            limit = 0
+            while limit < 20 {
+                cap = console.new(limit as long)
+                original = ""
+                k = 0
+                while k < 11 {
+                    chunk = chunks[k]
+                    console.append(cap, chunk)
+                    original = "${original}${chunk}"
+                    snap = console.snapshot(cap) as *console.Snapshot
+                    on = string.length(original)
+                    if on <= limit {
+                        spec.assert_str_eq(snap.logs, original, "small stream unchanged")
+                    } else {
+                        head_len = limit - limit / 2
+                        tail_len = limit / 2
+                        spec.assert_str_eq(string.substring(snap.logs, 0, snap.head_bytes as int), string.substring(original, 0, head_len), "head")
+                        spec.assert_str_eq(string.substring(snap.logs, snap.tail_start as int, string.length(snap.logs)), string.substring(original, on - tail_len, on), "tail")
+                        marker = "\n[console output truncated: ${on - limit} of ${on} bytes omitted]\n"
+                        spec.assert_str_eq(string.substring(snap.logs, snap.head_bytes as int, snap.tail_start as int), marker, "marker")
+                    }
+                    k = k + 1
+                }
+                limit = limit + 1
+            }
+        }
+        spec.it("metadata keeps first and last calls with exact intervening byte range") callback {
+            digits = "0123456789"
+            counts = [64, 65, 66, 10000]
+            ci = 0
+            while ci < 4 {
+                calls = counts[ci] as long
+                cap = console.new(7)
+                expected_end = 0 as long
+                i = 0 as long
+                while i < calls {
+                    text = string.substring(digits, 0, (i % 10 + 1) as int)
+                    console.append(cap, text)
+                    expected_end = expected_end + string.length(text)
+                    i = i + 1
+                }
+                snap = console.snapshot(cap) as *console.Snapshot
+                want = calls
+                if want > 65 { want = 65 }
+                spec.assert_eq(list.list_size(snap.entries), want as int, "entry count")
+                next_call = 1 as long
+                next_byte = 0 as long
+                n = list.list_size(snap.entries)
+                j = 0
+                while j < n {
+                    e = list.list_get_raw(snap.entries, j)
+                    spec.assert_eq_long(console.entry_first(e), next_call, "first")
+                    spec.assert_eq_long(console.entry_start(e), next_byte, "start")
+                    b = 0 as long
+                    c = console.entry_first(e)
+                    while c <= console.entry_last(e) {
+                        b = b + entry_bytes_(c)
+                        c = c + 1
+                    }
+                    spec.assert_eq_long(console.entry_end(e) - console.entry_start(e), b, "bytes")
+                    next_call = console.entry_last(e) + 1
+                    next_byte = console.entry_end(e)
+                    j = j + 1
+                }
+                spec.assert_eq_long(next_call, calls + 1, "all calls covered")
+                spec.assert_eq_long(next_byte, expected_end, "all bytes covered")
+                if calls > 64 {
+                    middle = list.list_get_raw(snap.entries, 32)
+                    spec.assert_eq_long(console.entry_first(middle), 33, "middle first")
+                    spec.assert_eq_long(console.entry_last(middle), calls - 32, "middle last")
+                }
+                ci = ci + 1
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}

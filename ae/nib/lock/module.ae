@@ -1,0 +1,19 @@
+// lock: a mutual-exclusion lock owned by whoever creates it (one cell of
+// std.sync per lock, never a shared global). Held only around short
+// critical sections; a waiter yields a millisecond at a time.
+
+import std.sync
+
+exports(new, acquire, try_acquire, release, free)
+
+new() -> ptr { return sync.atomic_new(0) }
+
+acquire(l: ptr) {
+    while sync.atomic_cas(l, 0, 1) == 0 { sleep(0) }
+}
+
+try_acquire(l: ptr) -> int { return sync.atomic_cas(l, 0, 1) }
+
+release(l: ptr) { sync.atomic_store(l, 0) }
+
+free(l: ptr) { sync.atomic_free(l) }

@@ -16,6 +16,28 @@ Ported through upstream commit: **none yet** (branch created at `a2dd439`, Relea
 - The parity gate is upstream's own Python tests and mocks (`tests/`), unchanged,
   run against the Aether binary. Fixtures of ours sit beside them, never inside them.
 
+## Layout
+
+The Aether sources live under `ae/`, beside the Zig originals, which stay
+untouched so `main` merges in cleanly:
+
+```
+ae/main.ae               the binary's entry (name set once, in .build.ae's output())
+ae/nib/<concept>/        one module per upstream file or concept, imported as nib.<concept>
+                         (the nib. prefix keeps them clear of std and aeb module names,
+                         e.g. aeb's own `sandbox` SDK)
+ae/nib/sandbox/          src/sandbox.zig, scheduler, native, timer -> module.ae;
+                         console.zig, timing.zig -> sandbox/console, sandbox/timing
+ae/nib/tools/            src/tools.zig and src/tools/*: one service module per tool family
+ae/nib/qjsgap/           marked stand-in for contrib.quickjs gaps (asks/)
+ae/term/                 the TUI's terminal layer (another slice)
+ae/tests/<name>_test.ae  std.spec suites; upstream's inline Zig tests ported by name
+tools/                   port maintenance scripts (upstream-diff.sh, check_layers.sh)
+asks/                    what the port needs from Aether, written up for upstream
+.build.ae, .tests.ae     aeb: `aeb .build.ae` builds target/build/bin/nib, `aeb .tests.ae` runs the suites
+pins                     AE_PIN / AEB_REF the port is verified against
+```
+
 ## Decisions (Paul, 2026-11-12)
 
 - **Providers use API keys only**, as each vendor documents. Not ported, by

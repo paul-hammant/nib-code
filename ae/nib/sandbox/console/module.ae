@@ -1,0 +1,191 @@
+// sandbox.console: the Run's console capture (upstream src/sandbox/console.zig).
+// One body budget shared across the Run: a fixed head of limit - limit/2
+// bytes and a rolling tail of limit/2. Call details are kept for at most 64
+// calls: all of them up to 64, otherwise the first and last 32 with the
+// middle merged into one range carrying its original byte positions.
+
+import std.string
+import std.strbuilder
+import std.list
+
+exports(MAX_ENTRIES, new, append, snapshot, bytes, calls, limit, entry_first, entry_last, entry_start,
+        entry_end, trim_end_utf8, trim_start_utf8, Entry, Capture, Snapshot)
+
+const MAX_ENTRIES = 64
+
+struct Entry {
+    first: long
+    last: long
+    // Offsets in the original console stream, not the captured buffer.
+    start: long
+    end: long
+}
+
+struct Capture {
+    limit: long
+    head: ptr          // strbuilder, at most limit - limit/2 bytes
+    tail: ptr          // strbuilder; its last limit/2 bytes are the tail
+    bytes: long
+    calls: long
+    entries: ptr       // list of *Entry, at most MAX_ENTRIES
+}
+
+struct Snapshot {
+    logs: string
+    entries: ptr       // list of *Entry, gaps filled with merged ranges
+    head_bytes: long
+    tail_start: long
+}
+
+new(limit: long) -> ptr {
+    c = heap.new(Capture)
+    c.limit = limit
+    c.head = strbuilder.new(64)
+    c.tail = strbuilder.new(64)
+    c.bytes = 0
+    c.calls = 0
+    c.entries = list.list_new()
+    return c as ptr
+}
+
+bytes(cp: ptr) -> long { return (cp as *Capture).bytes }
+calls(cp: ptr) -> long { return (cp as *Capture).calls }
+limit(cp: ptr) -> long { return (cp as *Capture).limit }
+
+entry_first(e: ptr) -> long { return (e as *Entry).first }
+entry_last(e: ptr) -> long { return (e as *Entry).last }
+entry_start(e: ptr) -> long { return (e as *Entry).start }
+entry_end(e: ptr) -> long { return (e as *Entry).end }
+
+new_entry_(first: long, last: long, start: long, end: long) -> ptr {
+    e = heap.new(Entry)
+    e.first = first
+    e.last = last
+    e.start = start
+    e.end = end
+    return e as ptr
+}
+
+tail_len_(c: *Capture) -> long {
+    n = strbuilder.length(c.tail) as long
+    cap = c.limit / 2
+    if n < cap { return n }
+    return cap
+}
+
+append(cp: ptr, text: string) {
+    c = cp as *Capture
+    n = string.length(text) as long
+    c.calls = c.calls + 1
+    e = new_entry_(c.calls, c.calls, c.bytes, c.bytes + n)
+    c.bytes = c.bytes + n
+    if list.list_size(c.entries) == MAX_ENTRIES {
+        list.list_remove(c.entries, MAX_ENTRIES / 2)
+    }
+    list.list_add(c.entries, e)
+
+    head_room = (c.limit - c.limit / 2) - (strbuilder.length(c.head) as long)
+    head_len = n
+    if head_room < head_len { head_len = head_room }
+    if head_len > 0 { strbuilder.append(c.head, string.substring(text, 0, head_len as int)) }
+    cap = c.limit / 2
+    rest_len = n - head_len
+    if rest_len <= 0 { return }
+    if cap == 0 { return }
+    rest = string.substring(text, head_len as int, n as int)
+    if rest_len >= cap {
+        strbuilder.clear(c.tail)
+        strbuilder.append(c.tail, string.substring(rest, (rest_len - cap) as int, rest_len as int))
+        return
+    }
+    strbuilder.append(c.tail, rest)
+    // Amortised: keep at most 2 * cap bytes buffered.
+    have = strbuilder.length(c.tail) as long
+    if have > 2 * cap {
+        all = strbuilder.finish(c.tail)
+        c.tail = strbuilder.new(64)
+        strbuilder.append(c.tail, string.substring(all, (have - cap) as int, have as int))
+    }
+}
+
+tail_text_(c: *Capture) -> string {
+    // finish() consumes the builder: read it, then put it back.
+    have = strbuilder.length(c.tail) as long
+    all = strbuilder.finish(c.tail)
+    c.tail = strbuilder.new(64)
+    strbuilder.append(c.tail, all)
+    keep = tail_len_(c)
+    return string.substring(all, (have - keep) as int, have as int)
+}
+
+head_text_(c: *Capture) -> string {
+    all = strbuilder.finish(c.head)
+    c.head = strbuilder.new(64)
+    strbuilder.append(c.head, all)
+    return all
+}
+
+// `s` without a trailing incomplete UTF-8 sequence.
+trim_end_utf8(s: string) -> string {
+    n = string.length(s)
+    j = n
+    while j > 0 && n - j < 3 && (string.char_at(s, j - 1) & 192) == 128 { j = j - 1 }
+    if j == 0 { return "" }
+    lead = j - 1
+    b = string.char_at(s, lead)
+    len = 0
+    if b < 128 { len = 1 }
+    else if (b & 224) == 192 { len = 2 }
+    else if (b & 240) == 224 { len = 3 }
+    else if (b & 248) == 240 { len = 4 }
+    if len == 0 { return string.substring(s, 0, lead) }
+    if lead + len <= n { return s }
+    return string.substring(s, 0, lead)
+}
+
+// `s` without leading continuation bytes (at most 3).
+trim_start_utf8(s: string) -> string {
+    n = string.length(s)
+    i = 0
+    while i < n && i < 3 && (string.char_at(s, i) & 192) == 128 { i = i + 1 }
+    return string.substring(s, i, n)
+}
+
+snapshot(cp: ptr) -> ptr {
+    c = cp as *Capture
+    head = head_text_(c)
+    tail = tail_text_(c)
+    raw_len = (string.length(head) + string.length(tail)) as long
+    s = heap.new(Snapshot)
+    s.head_bytes = raw_len
+    s.tail_start = raw_len
+    if c.bytes > c.limit {
+        h = trim_end_utf8(head)
+        t = trim_start_utf8(tail)
+        hn = string.length(h) as long
+        tn = string.length(t) as long
+        omitted = c.bytes - hn - tn
+        marker = "\n[console output truncated: ${omitted} of ${c.bytes} bytes omitted]\n"
+        s.logs = "${h}${marker}${t}"
+        s.head_bytes = hn
+        s.tail_start = hn + (string.length(marker) as long)
+    } else {
+        s.logs = "${head}${tail}"
+    }
+    out = list.list_new()
+    n = list.list_size(c.entries)
+    i = 0
+    while i < n {
+        e = list.list_get_raw(c.entries, i) as *Entry
+        if list.list_size(out) > 0 {
+            prev = list.list_get_raw(out, list.list_size(out) - 1) as *Entry
+            if e.first > prev.last + 1 {
+                list.list_add(out, new_entry_(prev.last + 1, e.first - 1, prev.end, e.start))
+            }
+        }
+        list.list_add(out, new_entry_(e.first, e.last, e.start, e.end))
+        i = i + 1
+    }
+    s.entries = out
+    return s as ptr
+}

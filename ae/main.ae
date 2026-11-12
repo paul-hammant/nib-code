@@ -1,0 +1,40 @@
+// The nib binary (its name is set once, in .build.ae's output()).
+// This slice has `nib js '<code>'`: one Run in a fresh Sandbox with the
+// ported Tools, its console and result printed. `ask`, the TUI and the
+// Session come with later slices.
+
+import std.os
+import std.string
+import nib.sandbox
+
+const VERSION = "0.13.0-ae"
+
+usage_() {
+    println("usage: nib js '<code>'")
+    println("       nib --version")
+}
+
+main() {
+    n = os.args_count()
+    if n < 2 {
+        usage_()
+        exit(2)
+    }
+    cmd = os.args_get(1)
+    if cmd == "--version" {
+        println("nib ${VERSION}")
+        return
+    }
+    if cmd == "js" && n >= 3 {
+        o = sandbox.eval(os.args_get(2), sandbox.limits(), null, null) as *sandbox.Outcome
+        print(o.logs)
+        if o.ok == 1 {
+            if o.text != "undefined" { println(o.text) }
+            return
+        }
+        println(o.text)
+        exit(1)
+    }
+    usage_()
+    exit(2)
+}

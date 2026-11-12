@@ -1,0 +1,410 @@
+// Ports the tests of upstream src/sandbox.zig (a2dd439), less the record and
+// replay ones (that slice is not ported yet) and the half of one test that
+// formats model output (session/output.zig, the session slice).
+
+import std.spec
+import std.string
+import std.sync
+import std.worker
+import std.os
+import nib.sandbox
+import nib.sandbox.timing
+
+limits_(timeout_ms: long) -> ptr {
+    l = sandbox.limits() as *sandbox.Limits
+    l.timeout_ms = timeout_ms
+    return l as ptr
+}
+
+run_(code: string, host: @keep ptr) -> *sandbox.Outcome {
+    return sandbox.eval(code, sandbox.limits(), host, null) as *sandbox.Outcome
+}
+
+starts_(s: string, prefix: string) -> int { return string.starts_with(s, prefix) }
+contains_(s: string, part: string) -> int {
+    if string.index_of(s, part) >= 0 { return 1 }
+    return 0
+}
+
+// EchoHost: echoes { tool, args }; "fail" errors with "nope".
+echo_host_(names: string) -> ptr {
+    return sandbox.new_host(null, names, |ctx: ptr, name: string, args: string, out: ptr| {
+        if name == "fail" {
+            sandbox.result_set_err(out, "nope")
+        } else {
+            sandbox.result_set_ok(out, "{\"tool\":\"${name}\",\"args\":${args}}")
+        }
+    })
+}
+
+struct Gate {
+    fetched: ptr
+    fail_fetch: int
+    active: ptr
+    peak: ptr
+    started: ptr
+    stopped: ptr
+    cancel: ptr
+    user_cancel: ptr
+    calls: ptr
+}
+
+new_gate_() -> *Gate {
+    g = heap.new(Gate)
+    g.fetched = sync.atomic_new(0)
+    g.fail_fetch = 0
+    g.active = sync.atomic_new(0)
+    g.peak = sync.atomic_new(0)
+    g.started = sync.atomic_new(0)
+    g.stopped = sync.atomic_new(0)
+    g.cancel = sync.atomic_new(0)
+    g.user_cancel = sync.atomic_new(0)
+    g.calls = sync.atomic_new(0)
+    return g
+}
+
+// TimingHost: read waits for fetch then 40 ms; fetch 10 ms (and may fail).
+timing_host_(g: *Gate, names: string, t: @keep ptr) -> ptr {
+    gp = g as ptr
+    h = sandbox.new_host(gp, names, |ctx: ptr, name: string, args: string, out: ptr| {
+        gg = ctx as *Gate
+        if name == "read" {
+            while sync.atomic_load(gg.fetched) == 0 { sleep(0) }
+            sleep(40)
+        } else if name == "fetch" {
+            sync.atomic_store(gg.fetched, 1)
+            sleep(10)
+            if gg.fail_fetch == 1 {
+                sandbox.result_set_err(out, "fetch failed")
+                return
+            }
+        }
+        sandbox.result_set_ok(out, "{\"exit_code\":7}")
+    })
+    if t != null { sandbox.host_set_timing(h, t) }
+    return h
+}
+
+entry_(t: ptr, i: int) -> *timing.Call { return timing.entry(t, i) as *timing.Call }
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "sandbox") {
+        spec.it("syntax errors include original source location and a bounded UTF-8 line") callback {
+            r = run_("const ok = 1;\nconst broken = \"oops\n\";", null)
+            spec.assert_eq(r.ok, 0, "not ok")
+            spec.assert_true(contains_(r.text, "<run>:2:"), "location: ${r.text}")
+            spec.assert_true(contains_(r.text, "source line 2: const broken = \"oops"), "source line")
+            code = ""
+            i = 0
+            while i < 300 {
+                code = "${code}你"
+                i = i + 1
+            }
+            bounded = sandbox.syntax_context("SyntaxError: bad\n    at <run>:1:500", code)
+            spec.assert_true(string.length(bounded) < 300, "bounded: ${string.length(bounded)}")
+            // whole characters only: every 你 is 3 bytes after the prefix
+            line_at = string.index_of(bounded, "source line 1: …")
+            spec.assert_true(line_at >= 0, "ellipsis prefix")
+        }
+        spec.it("completion value is returned as json") callback {
+            r = run_("const x = [1, 2].map(v => v * 2); ({ a: x })", null)
+            spec.assert_eq(r.ok, 1, "ok")
+            spec.assert_str_eq(r.text, "{\"a\":[2,4]}", "value")
+        }
+        spec.it("top-level await and console capture") callback {
+            r = run_("console.log('hi', {n: 1}); await Promise.resolve(7)", null)
+            spec.assert_eq(r.ok, 1, "ok")
+            spec.assert_str_eq(r.text, "7", "value")
+            spec.assert_str_eq(r.logs, "hi {\"n\":1}\n", "logs")
+        }
+        spec.it("errors are reported, sync and async") callback {
+            a = run_("throw new TypeError('boom')", null)
+            spec.assert_eq(a.ok, 0, "sync not ok")
+            spec.assert_true(starts_(a.text, "TypeError: boom"), "sync: ${a.text}")
+            b = run_("await Promise.reject(new Error('later'))", null)
+            spec.assert_eq(b.ok, 0, "async not ok")
+            spec.assert_true(starts_(b.text, "Error: later"), "async: ${b.text}")
+        }
+        spec.it("sandbox has no host capabilities") callback {
+            r = run_("[typeof require, typeof process, typeof std, typeof os, typeof fetch, typeof __host]", null)
+            spec.assert_str_eq(r.text, "[\"undefined\",\"undefined\",\"undefined\",\"undefined\",\"undefined\",\"undefined\"]", "nothing")
+        }
+        spec.it("memory limit is enforced") callback {
+            l = sandbox.limits() as *sandbox.Limits
+            l.memory_bytes = 8 * 1024 * 1024
+            r = sandbox.eval("let a = []; for (;;) a.push(new Array(1e5).fill(1));", l as ptr, null, null) as *sandbox.Outcome
+            spec.assert_eq(r.ok, 0, "stopped")
+        }
+        spec.it("timeout interrupts an infinite loop") callback {
+            r = sandbox.eval("for (;;) {}", limits_(50), null, null) as *sandbox.Outcome
+            spec.assert_eq(r.ok, 0, "not ok")
+            spec.assert_str_eq(r.text, "Error: run timed out", "timed out")
+            spec.assert_str_eq(r.stopped, "", "nothing stopped")
+        }
+        spec.it("timeout also covers JS invoked by result and error conversion") callback {
+            codes = ["({ get x() { for (;;) {} } })", "throw { toString() { for (;;) {} } }", "throw { toString() { return 'bad' }, get stack() { for (;;) {} } }"]
+            i = 0
+            while i < 3 {
+                r = sandbox.eval(codes[i], limits_(50), null, null) as *sandbox.Outcome
+                spec.assert_eq(r.ok, 0, "not ok ${i}")
+                spec.assert_str_eq(r.text, "Error: run timed out", "timed out ${i}")
+                i = i + 1
+            }
+        }
+        spec.it("tools route through the host, errors become exceptions") callback {
+            r = run_("const [a, b] = await Promise.all([tools.echo({x: 1}), tools.echo()]);\nlet msg = \"\";\ntry { await tools.fail({}); } catch (e) { msg = e.message; }\n({ a, b, msg, keys: Object.keys(tools) })", echo_host_("[\"echo\",\"fail\"]"))
+            spec.assert_eq(r.ok, 1, "ok: ${r.text}")
+            spec.assert_str_eq(r.text, "{\"a\":{\"tool\":\"echo\",\"args\":{\"x\":1}},\"b\":{\"tool\":\"echo\",\"args\":{}},\"msg\":\"fail: nope\",\"keys\":[\"echo\",\"fail\"]}", "routed")
+        }
+        spec.it("result and rejection conversion callbacks drain their tool calls") callback {
+            codes = ["({ toJSON() { tools.echo({x:1}).then(r => console.log('converted', r.args.x)); return 7; } })", "throw { toString() { tools.echo({x:1}).then(r => console.log('converted', r.args.x)); return 'original'; } }"]
+            oks = [1, 0]
+            texts = ["7", "original"]
+            i = 0
+            while i < 2 {
+                r = run_(codes[i], echo_host_("[\"echo\"]"))
+                spec.assert_eq(r.ok, oks[i], "ok ${i}")
+                spec.assert_str_eq(r.text, texts[i], "text ${i}")
+                spec.assert_str_eq(r.logs, "converted 1\n", "drained ${i}")
+                spec.assert_true(r.tool_bytes > 0, "billed ${i}")
+                spec.assert_str_eq(r.stopped, "", "nothing stopped ${i}")
+                i = i + 1
+            }
+        }
+        spec.it("tool concurrency is bounded while excess calls queue") callback {
+            g = new_gate_()
+            h = sandbox.new_host(g as ptr, "[\"slow\"]", |ctx: ptr, name: string, args: string, out: ptr| {
+                gg = ctx as *Gate
+                active = sync.atomic_add(gg.active, 1)
+                peak = sync.atomic_load(gg.peak)
+                while active > peak {
+                    if sync.atomic_cas(gg.peak, peak, active) == 1 { break }
+                    peak = sync.atomic_load(gg.peak)
+                }
+                sleep(20)
+                sync.atomic_sub(gg.active, 1)
+                sandbox.result_set_ok(out, "1")
+            })
+            r = run_("(await Promise.all(Array.from({length: 24}, () => tools.slow()))).length", h)
+            spec.assert_eq(r.ok, 1, "ok")
+            spec.assert_str_eq(r.text, "24", "all")
+            peak = sync.atomic_load(g.peak)
+            spec.assert_true(peak > 1, "concurrent: ${peak}")
+            spec.assert_true(peak <= sandbox.TOOL_CONCURRENCY, "bounded: ${peak}")
+            spec.assert_eq_long(sync.atomic_load(g.active), 0, "none left")
+        }
+        spec.it("native timings span evals and count omitted calls without treating exit codes as errors") callback {
+            t = timing.new()
+            g = new_gate_()
+            h = timing_host_(g, "[\"bash\"]", t)
+            first = run_("await tools.bash()", h)
+            spec.assert_eq(first.ok, 1, "first ok")
+            timing.restart(t)
+            timing.set_run_index(t, 1)
+            second = run_("await Promise.all(Array.from({length: 204}, () => tools.bash()))", h)
+            spec.assert_eq(second.ok, 1, "second ok")
+            spec.assert_eq(timing.count(t), 200, "count")
+            spec.assert_eq_long(timing.omitted(t), 5, "omitted")
+            size = 15 as long
+            spec.assert_eq_long(timing.tool_bytes(t), 205 * size, "timing bytes")
+            spec.assert_eq_long(first.tool_bytes, size, "first bytes")
+            spec.assert_eq_long(second.tool_bytes, 204 * size, "second bytes")
+            i = 0
+            while i < 200 {
+                spec.assert_eq_long(entry_(t, i).result_bytes, size, "entry bytes")
+                i = i + 1
+            }
+            spec.assert_eq(entry_(t, 0).run_index, 0, "first run index")
+            i = 1
+            while i < 200 {
+                e = entry_(t, i)
+                spec.assert_eq(e.run_index, 1, "run index")
+                spec.assert_str_eq(e.name, "bash", "name")
+                spec.assert_true(e.end_ms >= e.start_ms, "ordered")
+                spec.assert_eq(e.ok, 1, "exit codes are not errors")
+                i = i + 1
+            }
+        }
+        spec.it("parallel native timings retain dispatch order and survive rejected JS with outstanding workers") callback {
+            fails = [0, 1]
+            k = 0
+            while k < 2 {
+                t = timing.new()
+                g = new_gate_()
+                g.fail_fetch = fails[k]
+                r = run_("await Promise.all([tools.read(), tools.fetch()])", timing_host_(g, "[\"read\",\"fetch\"]", t))
+                spec.assert_eq(r.ok, 1 - fails[k], "ok")
+                spec.assert_eq(timing.count(t), 2, "count")
+                spec.assert_eq_long(timing.omitted(t), 0, "omitted")
+                read = entry_(t, 0)
+                fetch = entry_(t, 1)
+                spec.assert_str_eq(read.name, "read", "read first")
+                spec.assert_str_eq(fetch.name, "fetch", "fetch second")
+                spec.assert_eq(read.ok, 1, "read ok")
+                spec.assert_eq(fetch.ok, 1 - fails[k], "fetch ok")
+                spec.assert_true(read.end_ms - read.start_ms >= 40, "read took 40")
+                spec.assert_true(fetch.end_ms - fetch.start_ms >= 10, "fetch took 10")
+                spec.assert_true(read.start_ms <= fetch.end_ms, "overlap 1")
+                spec.assert_true(fetch.start_ms <= read.end_ms, "overlap 2")
+                k = k + 1
+            }
+        }
+        spec.it("tools queued before a top-level throw are still dispatched and billed") callback {
+            t = timing.new()
+            g = new_gate_()
+            r = run_("tools.bash(); throw new Error('before dispatch')", timing_host_(g, "[\"bash\"]", t))
+            spec.assert_eq(r.ok, 0, "not ok")
+            spec.assert_eq(timing.count(t), 1, "dispatched")
+            spec.assert_eq_long(r.tool_bytes, 15, "billed")
+            spec.assert_eq_long(timing.tool_bytes(t), r.tool_bytes, "same bytes")
+        }
+        spec.it("rejected and unawaited settled calls contribute their UTF-8 result bytes") callback {
+            missing = "missing: 文件🙂"
+            found = "{\"text\":\"unused🙂\",\"next_offset\":null}"
+            h = sandbox.new_host(null, "[\"read\"]", |ctx: ptr, name: string, args: string, out: ptr| {
+                if string.index_of(args, "missing") >= 0 {
+                    sandbox.result_set_err(out, "missing: 文件🙂")
+                } else {
+                    sandbox.result_set_ok(out, "{\"text\":\"unused🙂\",\"next_offset\":null}")
+                }
+            })
+            codes = ["tools.read({path:'a'}); 'ok'", "try { await tools.read({path:'missing'}); } catch (_) {} 'ok'"]
+            expected = [string.length(found), string.length(missing)]
+            i = 0
+            while i < 2 {
+                t = timing.new()
+                sandbox.host_set_timing(h, t)
+                r = run_(codes[i], h)
+                spec.assert_eq(r.ok, 1, "ok")
+                spec.assert_eq_long(r.tool_bytes, expected[i] as long, "bytes ${i}")
+                spec.assert_eq_long(timing.tool_bytes(t), expected[i] as long, "timing bytes ${i}")
+                spec.assert_eq_long(entry_(t, 0).result_bytes, expected[i] as long, "entry bytes ${i}")
+                i = i + 1
+            }
+        }
+        spec.it("admission rejections count only the returned error text") callback {
+            t = timing.new()
+            h = sandbox.new_host(null, "[\"llm\"]", |ctx: ptr, name: string, args: string, out: ptr| {
+                sandbox.result_set_ok(out, "\"unreachable\"")
+            })
+            sandbox.host_set_admit(h, |ctx: ptr, name: string, out: ptr| {
+                r = out as *sandbox.ToolResult
+                r.rejected = 1
+                r.text = "denied🙂"
+            })
+            sandbox.host_set_timing(h, t)
+            r = run_("await tools.llm().catch(() => 'caught')", h)
+            spec.assert_eq(r.ok, 1, "ok")
+            n = string.length("denied🙂") as long
+            spec.assert_eq_long(r.tool_bytes, n, "bytes")
+            spec.assert_eq_long(timing.tool_bytes(t), n, "timing bytes")
+            spec.assert_eq_long(entry_(t, 0).result_bytes, n, "entry bytes")
+            spec.assert_eq(entry_(t, 0).ok, 0, "not ok")
+            spec.assert_eq(entry_(t, 0).dispatched, 0, "not dispatched")
+            spec.assert_eq_long(timing.llm_calls(t), 0, "no llm call counted")
+        }
+        spec.it("top-level rejection drains slow results and their continuations") callback {
+            g = new_gate_()
+            t = timing.new()
+            gp = g as ptr
+            h = sandbox.new_host(gp, "[\"read\",\"fetch\",\"bash\"]", |ctx: ptr, name: string, args: string, out: ptr| {
+                gg = ctx as *Gate
+                if name == "fetch" {
+                    sync.atomic_store(gg.fetched, 1)
+                    sandbox.result_set_err(out, "fetch failed")
+                    return
+                }
+                if name == "read" {
+                    while sync.atomic_load(gg.fetched) == 0 { sleep(0) }
+                    sleep(40)
+                }
+                sandbox.result_set_ok(out, "{\"exit_code\":7}")
+            })
+            sandbox.host_set_timing(h, t)
+            r = run_("const slow = tools.read().then(async r => {\n  console.log('slow delivered', r.exit_code);\n  const next = await tools.bash();\n  console.log('continuation delivered', next.exit_code);\n});\nawait Promise.all([slow, tools.fetch()]);", h)
+            spec.assert_eq(r.ok, 0, "not ok")
+            spec.assert_true(starts_(r.text, "Error: fetch: fetch failed"), "original reason: ${r.text}")
+            spec.assert_str_eq(r.logs, "slow delivered 7\ncontinuation delivered 7\n", "drained")
+            spec.assert_str_eq(r.stopped, "", "nothing stopped")
+            spec.assert_eq(timing.count(t), 3, "three calls")
+            spec.assert_eq_long(r.tool_bytes, 2 * 15 + 12, "bytes")
+            spec.assert_eq_long(timing.tool_bytes(t), r.tool_bytes, "timing bytes")
+        }
+        spec.it("cancel and timeout stop only undelivered calls and preserve their creation indices") callback {
+            modes = [0, 1]
+            k = 0
+            while k < 2 {
+                timeout = modes[k]
+                g = new_gate_()
+                gp = g as ptr
+                h = sandbox.new_host(gp, "[\"bash\",\"read\",\"agent\"]", |ctx: ptr, name: string, args: string, out: ptr| {
+                    gg = ctx as *Gate
+                    if name == "read" {
+                        if string.index_of(args, "barrier") >= 0 {
+                            while sync.atomic_load(gg.started) < 2 && sync.atomic_load(gg.cancel) == 0 { sleep(0) }
+                        }
+                        sandbox.result_set_ok(out, "1")
+                        return
+                    }
+                    sync.atomic_add(gg.started, 1)
+                    while sync.atomic_load(gg.cancel) == 0 { sleep(0) }
+                    sync.atomic_add(gg.stopped, 1)
+                    sandbox.result_set_err(out, "not delivered")
+                })
+                sandbox.host_set_cancel(h, g.cancel)
+                t = timing.new()
+                sandbox.host_set_timing(h, t)
+                if timeout == 0 {
+                    worker.run_detached(|| {
+                        while sync.atomic_load(g.started) < 2 && sync.atomic_load(g.cancel) == 0 { sleep(0) }
+                        if sync.atomic_load(g.cancel) == 0 {
+                            sleep(50)
+                            sync.atomic_store(g.user_cancel, 1)
+                        }
+                        return null
+                    })
+                }
+                setup = "tools.bash(); await tools.read(); tools.agent(); await tools.read({barrier:true});"
+                code = "${setup}await new Promise(() => {});"
+                tm = 5000 as long
+                if timeout == 1 {
+                    code = "${setup}for (;;) {}"
+                    tm = 50
+                }
+                r = sandbox.eval(code, limits_(tm), h, g.user_cancel) as *sandbox.Outcome
+                spec.assert_eq(r.ok, 0, "not ok")
+                if timeout == 1 {
+                    spec.assert_str_eq(r.text, "Error: run timed out", "timed out")
+                } else {
+                    spec.assert_str_eq(r.text, "Error: run canceled", "canceled")
+                }
+                spec.assert_str_eq(r.stopped, "[stopped before completion: bash #0, agent #2]", "stopped")
+                spec.assert_eq_long(sync.atomic_load(g.stopped), 2, "both stopped")
+                spec.assert_eq_long(r.tool_bytes, 2, "only delivered bytes")
+                spec.assert_eq_long(timing.tool_bytes(t), r.tool_bytes, "timing bytes")
+                spec.assert_eq_long(entry_(t, 0).result_bytes, 0, "bash undelivered")
+                spec.assert_eq_long(entry_(t, 2).result_bytes, 0, "agent undelivered")
+                k = k + 1
+            }
+        }
+        spec.it("stopped facts include queued calls and bound oversized lists explicitly") callback {
+            r = sandbox.eval("for (let i = 0; i < 1000; i++) tools.bash(); for (;;) {}", limits_(2000), echo_host_("[\"bash\"]"), null) as *sandbox.Outcome
+            spec.assert_eq(r.ok, 0, "not ok")
+            spec.assert_eq_long(r.tool_bytes, 0, "nothing delivered")
+            spec.assert_true(string.length(r.stopped) <= sandbox.MAX_STOPPED_BYTES, "bounded")
+            spec.assert_true(starts_(r.stopped, "[stopped before completion: bash #0, bash #1, "), "listed: ${string.substring(r.stopped, 0, 60)}")
+            listed = 0
+            at = 0
+            while true {
+                j = string.index_of_from(r.stopped, "bash #", at)
+                if j < 0 { break }
+                listed = listed + 1
+                at = j + 1
+            }
+            suffix = ", ..., ${1000 - listed} more]"
+            spec.assert_true(string.ends_with(r.stopped, suffix), "suffix ${suffix}")
+        }
+    }
+    return spec.run_summary(fw)
+}

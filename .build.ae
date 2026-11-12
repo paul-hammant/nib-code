@@ -1,0 +1,17 @@
+// The nib binary, built from the Aether port under ae/. The binary's name
+// is set here and nowhere else (the port may become `naeb`).
+
+import bldr
+import aether
+import aether (source, output, lib)
+
+aeb(cap) {
+    bldr.build() {
+        aether.program() {
+            source("ae/main.ae")
+            lib("ae")
+            output("nib")
+        }
+        return 0
+    }
+}

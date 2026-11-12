@@ -1,0 +1,179 @@
+// Ports upstream src/sandbox/timer_test.zig (a2dd439), less the replay test.
+
+import std.spec
+import std.string
+import std.sync
+import std.worker
+import std.os
+import nib.sandbox
+import nib.sandbox.timing
+
+struct Counter {
+    calls: ptr
+    released: ptr
+}
+
+new_counter_() -> *Counter {
+    c = heap.new(Counter)
+    c.calls = sync.atomic_new(0)
+    c.released = sync.atomic_new(0)
+    return c
+}
+
+// The upstream Host: block waits for release; release (at admission) frees it.
+host_(c: *Counter) -> ptr {
+    h = sandbox.new_host(c as ptr, "[\"sleep\",\"echo\",\"block\",\"release\"]", |ctx: ptr, name: string, args: string, out: ptr| {
+        cc = ctx as *Counter
+        sync.atomic_add(cc.calls, 1)
+        if name == "block" {
+            while sync.atomic_load(cc.released) == 0 { sleep(1) }
+        }
+        sandbox.result_set_ok(out, "true")
+    })
+    sandbox.host_set_admit(h, |ctx: ptr, name: string, out: ptr| {
+        cc = ctx as *Counter
+        if name == "release" { sync.atomic_store(cc.released, 1) }
+    })
+    sandbox.host_set_cancel(h, c.released)
+    return h
+}
+
+run_(code: string, timeout_ms: long, host: @keep ptr) -> *sandbox.Outcome {
+    l = sandbox.limits() as *sandbox.Limits
+    l.timeout_ms = timeout_ms
+    return sandbox.eval(code, l as ptr, host, null) as *sandbox.Outcome
+}
+
+contains_(s: string, part: string) -> int {
+    if string.index_of(s, part) >= 0 { return 1 }
+    return 0
+}
+
+main() {
+    fw = spec.init()
+    default_ms = 5 * 60 * 1000 as long
+    spec.describe(fw, "sandbox timers (tools.sleep)") {
+        spec.it("sleep validates milliseconds without coercion or host dispatch") callback {
+            c = new_counter_()
+            r = run_("const bad = [undefined, null, true, '1', {}, [], NaN, Infinity, -Infinity, -1, .5, 2147483648];\nconst errors = await Promise.all(bad.map(ms => tools.sleep(ms).then(() => false, e => e.message === 'sleep: ms must be an integer in 0..2147483647')));\n[errors.every(Boolean), await tools.sleep(0), await tools.sleep(-0), await tools.sleep(1.0)];", default_ms, host_(c))
+            spec.assert_eq(r.ok, 1, "ok: ${r.text}")
+            spec.assert_str_eq(r.text, "[true,null,null,null]", "validated")
+            spec.assert_eq_long(sync.atomic_load(c.calls), 0, "no host dispatch")
+        }
+        spec.it("sleep waits asynchronously and excludes waiting from JS budget") callback {
+            c = new_counter_()
+            start = os.now_monotonic_ms()
+            r = run_("let settled = false;\nconst pending = tools.sleep(120).then(value => { settled = true; return value; });\nconst before = settled;\nconst value = await pending;\nawait tools.sleep(120);\n[before, settled, value];", 50, host_(c))
+            spec.assert_eq(r.ok, 1, "ok: ${r.text}")
+            spec.assert_str_eq(r.text, "[false,true,null]", "async")
+            spec.assert_true(os.now_monotonic_ms() - start >= 240, "waited")
+        }
+        spec.it("sleep does not reset accumulated JS budget") callback {
+            c = new_counter_()
+            r = run_("const spin = () => { const start = Date.now(); while (Date.now() - start < 65) {} };\nspin(); await tools.sleep(120); spin();", 100, host_(c))
+            spec.assert_eq(r.ok, 0, "not ok")
+            spec.assert_str_eq(r.text, "Error: run timed out", "timed out")
+        }
+        spec.it("sleep timers run concurrently with each other and host calls") callback {
+            c = new_counter_()
+            t = timing.new()
+            h = host_(c)
+            sandbox.host_set_timing(h, t)
+            r = run_("const order = [];\nconst slow = tools.sleep(120).then(() => order.push('slow'));\nconst fast = tools.sleep(10).then(() => order.push('fast'));\nconst echo = await tools.echo();\nawait Promise.all([slow, fast]);\n[echo, order];", default_ms, h)
+            spec.assert_eq(r.ok, 1, "ok: ${r.text}")
+            spec.assert_str_eq(r.text, "[true,[\"fast\",\"slow\"]]", "order")
+            spec.assert_eq_long(sync.atomic_load(c.calls), 1, "one host call")
+            spec.assert_eq(timing.count(t), 3, "three entries")
+            i = 0
+            while i < 2 {
+                e = timing.entry(t, i) as *timing.Call
+                spec.assert_str_eq(e.name, "sleep", "name")
+                spec.assert_eq(e.ok, 1, "ok")
+                spec.assert_eq(e.dispatched, 1, "dispatched")
+                spec.assert_eq_long(e.result_bytes, 4, "null")
+                spec.assert_true(e.end_ms >= e.start_ms, "ordered")
+                i = i + 1
+            }
+            spec.assert_eq_long(timing.tool_bytes(t), 12, "bytes")
+        }
+        spec.it("sleep cancellation and rejection discard long timers promptly") callback {
+            c = new_counter_()
+            flag = sync.atomic_new(0)
+            worker.run_detached(|| {
+                sleep(40)
+                sync.atomic_store(flag, 1)
+                return null
+            })
+            start = os.now_monotonic_ms()
+            canceled = sandbox.eval("await tools.sleep(2147483647)", sandbox.limits(), host_(c), flag) as *sandbox.Outcome
+            spec.assert_str_eq(canceled.text, "Error: run canceled", "canceled")
+            spec.assert_true(os.now_monotonic_ms() - start < 1000, "promptly")
+            t = timing.new()
+            h = host_(new_counter_())
+            sandbox.host_set_timing(h, t)
+            rejected = run_("tools.sleep(2147483647); throw new Error('stop')", default_ms, h)
+            spec.assert_eq(rejected.ok, 0, "not ok")
+            spec.assert_true(contains_(rejected.text, "stop"), "reason")
+            spec.assert_eq(timing.count(t), 1, "one entry")
+            e = timing.entry(t, 0) as *timing.Call
+            spec.assert_eq(e.ok, 0, "not ok entry")
+            spec.assert_eq_long(e.result_bytes, 0, "no bytes")
+            spec.assert_eq_long(rejected.tool_bytes, 0, "no tool bytes")
+        }
+        spec.it("normal completion drains unawaited sleep timers") callback {
+            r = run_("tools.sleep(10).then(() => console.log('settled')); 7", default_ms, host_(new_counter_()))
+            spec.assert_eq(r.ok, 1, "ok")
+            spec.assert_str_eq(r.text, "7", "value")
+            spec.assert_str_eq(r.logs, "settled\n", "drained")
+        }
+        spec.it("sleep remains live when all tool slots are blocked") callback {
+            g = new_counter_()
+            h = sandbox.new_host(g as ptr, "[\"sleep\",\"block\",\"release\"]", |ctx: ptr, name: string, args: string, out: ptr| {
+                cc = ctx as *Counter
+                if name == "block" {
+                    start = os.now_monotonic_ms()
+                    while sync.atomic_load(cc.released) == 0 {
+                        if os.now_monotonic_ms() - start >= 1000 {
+                            sandbox.result_set_ok(out, "false")
+                            return
+                        }
+                        sleep(1)
+                    }
+                }
+                sandbox.result_set_ok(out, "true")
+            })
+            sandbox.host_set_admit(h, |ctx: ptr, name: string, out: ptr| {
+                cc = ctx as *Counter
+                if name == "release" { sync.atomic_store(cc.released, 1) }
+            })
+            r = run_("const pending = Array.from({length: 8}, () => tools.block());\nawait tools.sleep(30);\nawait tools.release();\n(await Promise.all(pending)).every(Boolean);", default_ms, h)
+            spec.assert_eq(r.ok, 1, "ok: ${r.text}")
+            spec.assert_str_eq(r.text, "true", "released in time")
+        }
+        spec.it("pending sleeps do not occupy slots needed by a tool") callback {
+            c = new_counter_()
+            start = os.now_monotonic_ms()
+            r = run_("const pending = Array.from({length: 16}, () => tools.sleep(2000));\nawait tools.echo();\nthrow new Error('tool ran');", default_ms, host_(c))
+            spec.assert_eq(r.ok, 0, "not ok")
+            spec.assert_true(contains_(r.text, "tool ran"), "tool ran")
+            spec.assert_eq_long(sync.atomic_load(c.calls), 1, "one call")
+            spec.assert_true(os.now_monotonic_ms() - start < 1000, "timers dropped")
+        }
+        spec.it("zero sleeps do not starve queued or ready host calls") callback {
+            r = run_("let done = false;\nconst pending = tools.echo().then(() => { done = true; });\nwhile (!done) await tools.sleep(0);\nawait pending; done;", 250, host_(new_counter_()))
+            spec.assert_eq(r.ok, 1, "ok: ${r.text}")
+            spec.assert_str_eq(r.text, "true", "done")
+        }
+        spec.it("serial zero sleeps keep native bookkeeping bounded with an active worker") callback {
+            r = run_("const pending = tools.block();\nfor (let i = 0; i < 10000; i++) await tools.sleep(0);\nawait tools.release(); await pending; 'done';", 15000, host_(new_counter_()))
+            spec.assert_eq(r.ok, 1, "ok: ${r.text}")
+            spec.assert_str_eq(r.text, "\"done\"", "done")
+        }
+        spec.it("overdue sleeps settle by deadline rather than creation order") callback {
+            r = run_("const order = [];\nconst slow = tools.sleep(20).then(() => order.push('slow'));\nconst fast = tools.sleep(0).then(() => order.push('fast'));\nconst start = Date.now(); while (Date.now() - start < 40) {}\nawait Promise.all([slow, fast]); order;", default_ms, host_(new_counter_()))
+            spec.assert_eq(r.ok, 1, "ok: ${r.text}")
+            spec.assert_str_eq(r.text, "[\"fast\",\"slow\"]", "by deadline")
+        }
+    }
+    return spec.run_summary(fw)
+}
