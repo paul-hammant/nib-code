@@ -5,8 +5,9 @@
 //
 // Differences: the Session is a nib.tui.port.Port; the index is created by
 // the app with its clock and wake (paths.new(root, now)) and handed in with
-// set_index. Skills (`$` mentions) are not ported (src/session/skills.zig):
-// sync lists none for a `$` mention, marked; the mention state machine is kept.
+// set_index. The skills a `$` mention lists come from `skill_source`, a
+// closure the app sets (upstream Session.discoverSkills): || -> std.list of
+// *skills.Skill; none when unset.
 // Choices that upstream reads from the Session (tasks, sessions) come from the
 // port as JSON.
 
@@ -19,6 +20,7 @@ import nib.tui.commands
 import nib.tui.editor
 import nib.tui.paths
 import nib.tui.port
+import nib.session.skills
 
 exports(Menu, MENTION_NONE, MENTION_FILE, MENTION_SKILL, new, free, is_pinned, pin, unpin, items,
         sync, selected, move, input_changed, forget_sessions, load, resolve_session, set_index,
@@ -47,6 +49,9 @@ struct Menu {
     reflect_enabled: int
     services_fn: fn          // |input_arg: string| -> commands.Choice[] (the app's providers.service_choices)
     has_services_fn: int
+    skill_source: fn         // || -> ptr: std.list of *skills.Skill
+    has_skill_source: int
+    skill_list: ptr          // listed when a `$` mention starts
 }
 
 new() -> *Menu {
@@ -180,13 +185,38 @@ rank_(r: *RankCtx, entries: ptr[]) {
     }
 }
 
-// Skills are not ported: a `$` mention lists nothing yet (marked stand-in).
+// Lists discovered skills whose names start with `query`; they reuse the
+// `@` rows.
 sync_skills_(m: *Menu, query: string) {
     if m.mention != MENTION_SKILL {
         m.mention = MENTION_SKILL
+        m.skill_list = null
+        if m.has_skill_source != 0 {
+            ptr found = call(m.skill_source)
+            m.skill_list = found
+        }
     }
     m.file_fresh = 0
-    m.file_buf = make([]commands.Candidate, 0)
+    out = make([]commands.Candidate, 0)
+    if m.skill_list != null {
+        n = list.list_size(m.skill_list)
+        ql = string.to_lower(query)
+        for i in 0..n {
+            if out.len == paths.MAX_HITS {
+                break
+            }
+            sk = list.list_get_raw(m.skill_list, i) as *skills.Skill
+            if string.length(query) > string.length(sk.name) || string.starts_with(string.to_lower(sk.name), ql) == 0 {
+                continue
+            }
+            nl = string.index_of(sk.description, "\n")
+            line = if nl >= 0 { string.substring(sk.description, 0, nl) } else { sk.description }
+            value = "\$${sk.name} "
+            c = commands.Candidate { command: commands.CMD_HELP, has_value: 1, value: value, label: sk.name, detail: line, is_path: 1 }
+            out.push(c)
+        }
+    }
+    m.file_buf = out
     if m.sel >= m.file_buf.len {
         m.sel = 0
     }

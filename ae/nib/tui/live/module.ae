@@ -24,6 +24,9 @@ import nib.provider.types
 import nib.provider.sink as psink
 import nib.msg
 import nib.tui.prediction
+import nib.config
+import nib.session.skills
+import nib.session.instructions
 import nib.session
 import nib.session.log
 import nib.tools
@@ -47,6 +50,7 @@ struct Live {
     stage: ptr               // std.sync cell: 1 once a Run started (failure stage tool)
     stops: ptr               // std.list of ids whose stop waits for the Turn's end
     q: ptr                   // the app queue of the last Turn
+    skills: string           // the skills summary of the Session's start (upstream log.skills)
 }
 
 session_of(p: *port.Port) -> ptr { return (p.ctx as *Live).sp }
@@ -97,6 +101,7 @@ new(sp: @keep ptr, cfg: @keep ptr, op: @keep ptr, home: string) -> *port.Port {
     l.stage = sync.atomic_new(0)
     l.stops = list.list_new()
     (tools_(l).recovery as *changes.Recovery).enabled = 1
+    l.skills = skills_json_(l)
     p = heap.new(port.Port)
     p.ctx = l as ptr
     p.start_turn = |ctx: @keep ptr, text: string, compact: int, qp: @keep ptr, cancel: @keep ptr| {
@@ -313,6 +318,10 @@ new(sp: @keep ptr, cfg: @keep ptr, op: @keep ptr, home: string) -> *port.Port {
         ptr out = list.list_new()
         return out
     }
+    p.skills_summary = |ctx: ptr| {
+        string out = (ctx as *Live).skills
+        return out
+    }
     p.predict = |ctx: ptr, instruction: string, input_text: string, cancel: ptr| {
         string out = predict_(ctx as *Live, instruction, input_text, cancel)
         return out
@@ -367,6 +376,13 @@ reopen_(l: *Live, id: string, cfg: @keep ptr) -> string {
     o2.patches_off = o.patches_off
     o2.self_exe = o.self_exe
     o2.undo_enabled = o.undo_enabled
+    if id == "" {
+        // a new Session reads the [skills] settings again (upstream reopen)
+        st, serr = config.load_skills(o.home)
+        if serr == "" && st != null {
+            (cfg as *types.Config).enabled_skills = config.enabled_skills(st)
+        }
+    }
     sp2, err, detail = session.init(cfg, op2)
     if err != "" {
         return if detail != "" { detail } else { err }
@@ -376,7 +392,19 @@ reopen_(l: *Live, id: string, cfg: @keep ptr) -> string {
     l.cfg = cfg
     l.op = op2
     (tools_(l).recovery as *changes.Recovery).enabled = 1
+    l.skills = skills_json_(l)
     return ""
+}
+
+// The Session's skills summary as /status reads it: the found skills
+// selected by the config's enabled ones.
+skills_json_(l: *Live) -> string {
+    o = l.op as *session.Options
+    c = l.cfg as *types.Config
+    enabled = if c.enabled_skills == null { list.list_new() } else { c.enabled_skills }
+    sel = skills.select(skills.load(o.home, o.user_home, instructions.project_root(os.getcwd())), enabled)
+    sm = sel.summary
+    return "{\"count\":${sm.count},\"found\":${sm.found},\"skipped\":${list.list_size(sm.skipped)},\"missing\":${sm.missing}}"
 }
 
 sessions_json_(l: *Live) -> string {

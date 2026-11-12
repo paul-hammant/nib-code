@@ -16,8 +16,8 @@
 // ticker thread is the poll timeout (an empty poll while busy is a tick);
 // events are handled one at a time with the same frame pacing (frames.due).
 // Images (src/image.zig) are not ported: Ctrl+V, an empty paste and pasted
-// image paths say images are not available yet (marked stand-in). Skills,
-// MCP and hooks have their commands with the data source stubbed (marked).
+// image paths say images are not available yet (marked stand-in). MCP has
+// its command with the data source stubbed (marked).
 
 import std.string
 import std.strbuilder
@@ -67,6 +67,7 @@ import nib.tui.prediction
 import nib.tui.provider_flow
 import nib.tui.reflect
 import nib.tui.long_text
+import nib.session.skills
 
 exports(App, new, free, start, run, step, settle, handle_input, handle_app, on_key, submit, render,
         report, toggle_simple, toggle_entry, click_entry, append_bill, finish_queued, execute,
@@ -331,6 +332,14 @@ new(t: @keep ptr, p: @keep ptr, clk: @keep ptr, envp: @keep ptr) -> *App {
         app_queue.post(qq, "{\"paths_ready\":{}}")
     })
     menu.set_index(a.menu, ix as ptr)
+    sk_home = a.home
+    sk_user = env_get_(a, "HOME")
+    sk_cwd = a.cwd
+    a.menu.skill_source = || {
+        ptr found = skills.load(sk_home, sk_user, project_root_(sk_cwd)).skills
+        return found
+    }
+    a.menu.has_skill_source = 1
     refresh_credentials(a)
     return a
 }
@@ -1679,8 +1688,15 @@ execute(a: *App, c: int, arg: string, line: string) {
     if c == commands.CMD_SIMPLE {
         toggle_simple(a)
     } else if c == commands.CMD_STATUS {
-        // Skills are not ported: their line reads the stub.
-        report(a, entry.KIND_INFO, "Skills: 0 on · 0 found")
+        string skj = call(a.p.skills_summary, a.p.ctx)
+        sv = jsonx.parse(skj)
+        skipped = jsonx.int_or(sv, "skipped", 0)
+        missing = jsonx.int_or(sv, "missing", 0)
+        suffix = ""
+        if skipped > 0 { suffix = "${suffix} · ${skipped} invalid/skipped" }
+        if missing > 0 { suffix = "${suffix} · ${missing} missing" }
+        report(a, entry.KIND_INFO, "Skills: ${jsonx.int_or(sv, "count", 0)} on · ${jsonx.int_or(sv, "found", 0)} found${suffix}")
+        jsonx.free(sv)
         hc = a.cfg as *types.Config
         after = if hc.hooks_after_edit == null { 0 } else { list.list_size(hc.hooks_after_edit) }
         ended = if hc.hooks_turn_end == null { 0 } else { list.list_size(hc.hooks_turn_end) }
@@ -1697,8 +1713,7 @@ execute(a: *App, c: int, arg: string, line: string) {
         // MCP (src/mcp*) is not ported: the listing reads config only (stub).
         transcript.add(a.transcript, entry.KIND_INFO, "No MCP servers configured.\nApplies to new sessions.")
     } else if c == commands.CMD_SKILLS {
-        // Skills (src/session/skills.zig) are not ported (stub).
-        transcript.add(a.transcript, entry.KIND_INFO, "No skills found.\nApplies to new sessions.")
+        skills_command_(a, arg)
     } else if c == commands.CMD_TASKS {
         string tj = call(a.p.tasks, a.p.ctx)
         transcript.add(a.transcript, entry.KIND_INFO, tasks.format(tasks_of_(tj), clock.now(a.clk)))
@@ -1846,6 +1861,103 @@ execute(a: *App, c: int, arg: string, line: string) {
         a.reflecting = arg
         a.has_reflecting = 1
     }
+}
+
+// The [skills] switches of config.toml (a list of *config.Switch).
+skills_settings_(a: *App) -> ptr {
+    st, err = config.load_skills(a.home)
+    if err != "" || st == null {
+        return list.list_new()
+    }
+    return st
+}
+
+// /skills [on|off <name>] (upstream commands.zig .skills).
+skills_command_(a: *App, arg: string) {
+    user_home = env_get_(a, "HOME")
+    root = project_root_(a.cwd)
+    found = skills.load(a.home, user_home, root)
+    settings = skills_settings_(a)
+    if string.length(arg) > 0 {
+        words = words_(arg)
+        if words.len < 2 {
+            transcript.add(a.transcript, entry.KIND_ERR, "usage: /skills [on|off <name>]")
+            return
+        }
+        action = words[0]
+        name = words[1]
+        if words.len > 2 || (action != "on" && action != "off") {
+            transcript.add(a.transcript, entry.KIND_ERR, "usage: /skills [on|off <name>]")
+            return
+        }
+        enabled = action == "on"
+        hit = -1
+        n = list.list_size(found.skills)
+        for i in 0..n {
+            if (list.list_get_raw(found.skills, i) as *skills.Skill).name == name {
+                hit = i
+                break
+            }
+        }
+        if enabled && hit < 0 {
+            report(a, entry.KIND_ERR, "skill not found: ${name}")
+            return
+        }
+        if enabled && (list.list_get_raw(found.skills, hit) as *skills.Skill).disabled != 0 {
+            report(a, entry.KIND_ERR, "skill disables model invocation: ${name}")
+            return
+        }
+        err = config.save_skill(a.home, name, if enabled { 1 } else { 0 })
+        if err != "" {
+            report(a, entry.KIND_ERR, "could not save skills: ${err}")
+            return
+        }
+        report(a, entry.KIND_INFO, "${name}: ${action} · Applies to new sessions.")
+        return
+    }
+    text = ""
+    n = list.list_size(found.skills)
+    for i in 0..n {
+        sk = list.list_get_raw(found.skills, i) as *skills.Skill
+        src = skills.source(sk.location, a.home, user_home, root)
+        on = sk.disabled == 0 && config.skill_enabled(settings, sk.name) != 0
+        description = flatten_ws_(sk.description)
+        preview = format.fit(description, 48)
+        text = "${text}${sk.name} · ${src} · ${if on { "on" } else { "off" }}\n  ${preview.text}${preview.suffix}\n"
+    }
+    if n == 0 {
+        text = "${text}No skills found.\n"
+    }
+    sn = list.list_size(settings)
+    for i in 0..sn {
+        sw = list.list_get_raw(settings, i) as *config.Switch
+        if sw.enabled == 0 {
+            continue
+        }
+        exists = false
+        for k in 0..n {
+            if (list.list_get_raw(found.skills, k) as *skills.Skill).name == sw.name {
+                exists = true
+            }
+        }
+        if !exists {
+            text = "${text}${sw.name} · missing · on\n"
+        }
+    }
+    transcript.add(a.transcript, entry.KIND_INFO, "${text}Applies to new sessions.")
+}
+
+flatten_ws_(s: string) -> string {
+    sb = strbuilder.new(string.length(s) + 1)
+    for i in 0..string.length(s) {
+        ch = s[i]
+        if ch == 9 || ch == 10 || ch == 11 || ch == 12 || ch == 13 {
+            strbuilder.append_byte(sb, 32)
+        } else {
+            strbuilder.append_byte(sb, ch)
+        }
+    }
+    return strbuilder.finish(sb)
 }
 
 trim_end_nl_(s: string) -> string {

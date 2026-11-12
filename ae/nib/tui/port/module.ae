@@ -52,6 +52,7 @@ exports(Port, Script, scripted, script_of, emit, end_turn, fail_turn, play_next,
 //   sandbox_status(ctx) -> string
 //   drain_progress(ctx) -> ptr        std.list of progress JSON objects due while idle
 //   predict(ctx, instruction, input, cancel) -> string   the model's reply, "" on failure
+//   skills_summary(ctx) -> string     {"count","found","skipped","missing"} of the Session's start
 struct Port {
     ctx: ptr
     start_turn: fn
@@ -79,6 +80,7 @@ struct Port {
     sandbox_status: fn
     drain_progress: fn
     predict: fn
+    skills_summary: fn
 }
 
 // ---------------------------------------------------------------- scripted
@@ -192,6 +194,7 @@ scripted(cfg: @keep ptr, home: string) -> *Port {
         sc.predictions = sc.predictions + 1
         return sc.prediction
     }
+    p.skills_summary = |ctx: ptr| { return "{\"count\":0,\"found\":0,\"skipped\":0,\"missing\":0}" }
     return p
 }
 

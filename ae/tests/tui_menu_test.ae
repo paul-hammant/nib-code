@@ -1,11 +1,11 @@
-// Ports the tests of upstream src/tui/menu.zig under their names. "moving
-// straight from an @ mention to a $ mention loads skills" is ported as far as
-// its backing exists: skills (src/session/skills.zig) are not ported, so it
-// checks the move to the skill mention state, and that the skill list is
-// empty (marked stand-in in nib.tui.menu).
+// Ports the tests of upstream src/tui/menu.zig under their names. The skills
+// a `$` mention lists come from the menu's skill_source (the app sets it to
+// session.skills.load over the four roots, as upstream discoverSkills).
 import std.spec
 import nib.tui.menu
 import nib.tui.editor
+import nib.session.skills
+import std.fs
 
 label_(m: *menu.Menu, input: string) -> string {
     c, ok = menu.selected(m, input)
@@ -37,13 +37,24 @@ main() {
             spec.assert_str_eq(menu.items(m, "/ref")[0].label, "/reflect", "shown")
         }
         spec.it("moving straight from an @ mention to a $ mention loads skills") callback {
+            root, _e = fs.make_temp_dir("", "nibmenu")
+            fs.mkdir_p("${root}/skills/review")
+            fs.write("${root}/skills/review/SKILL.md", "---\nname: review\ndescription: Review a change.\n---\nBody\n")
             m = menu.new()
+            m.skill_source = || {
+                ptr found = skills.load(root, root, root).skills
+                return found
+            }
+            m.has_skill_source = 1
             m.mention = menu.MENTION_FILE
             e = editor.new()
             editor.replace(e, "$re")
             menu.sync(m, e)
             spec.assert_eq(m.mention, menu.MENTION_SKILL, "skill mention")
-            spec.assert_eq(menu.items(m, "$re").len, 0, "skills are not ported: none listed")
+            c, ok = menu.selected(m, "$re")
+            spec.assert_true(ok, "listed")
+            spec.assert_str_eq(c.label, "review", "review")
+            spec.assert_str_eq(c.value, "$review ", "inserts the mention")
         }
     }
 }
