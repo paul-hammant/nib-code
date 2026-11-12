@@ -1,0 +1,623 @@
+// tui.editor: the prompt's multi-line input editor: UTF-8 cursor movement,
+// kill/delete keys, atomic paste ([Pasted #N ...]) and image ([Image #N])
+// blocks, input history with a draft, `@` and `$` mention parsing, scrolling
+// draw (upstream src/tui/editor.zig).
+//
+// Differences from upstream:
+//  - An Editor is a heap struct made by new(); methods are functions taking
+//    it first (editor.insert(e, s), editor.key(e, k) -> bool, ...). free(e)
+//    is upstream's deinit. No allocator parameters; nothing returns an error.
+//  - Optionals become values: file_mention/skill_mention return
+//    (start, query) with start -1 for "no mention"; history_index is -1 for
+//    "none"; draft is a null ptr when there is none.
+//  - blocks, history and sent_images are `ptr[]` of heap boxes (*Block,
+//    *Snapshot, *Image). Offsets, cursor and top_row are ints.
+//  - Image is a STAND-IN for upstream's src/image.zig Image (the fields the
+//    editor needs: path, name, media_type, bytes, width, height); replace
+//    with nib.image when that is ported. image_new() builds one.
+//  - skill_mention carries the parsing of src/session/skills.zig mentionAt
+//    (skills are not ported; it only parses text).
+//  - draw/rows/column/at_column are as upstream; column/at_column/prev/next/
+//    line_start/line_end are exported for tests.
+
+import std.string
+import std.strbuilder
+import term.screen
+import term.input
+import nib.tui.long_text
+import nib.tui.paths
+import nib.tui.format
+
+exports(Image, Block, Snapshot, Editor, DEFAULT_PLACEHOLDER, image_new,
+        new, free, text, image_count, expanded, take, replace, remember, insert,
+        file_mention, skill_mention, complete_mention, paste, attach, key, rows,
+        draw, column, at_column, prev, next, line_start, line_end)
+
+const DEFAULT_PLACEHOLDER = "Ask about this project · / for commands"
+const MAX_U16 = 65535
+
+// Stand-in for nib.image's Image.
+struct Image {
+    path: string
+    name: string
+    media_type: string
+    bytes: long
+    width: int
+    height: int
+}
+
+struct Block {
+    start: int
+    end: int
+    original: string
+    image: ptr          // *Image for [Image #N] blocks (original is then the label), else null
+    number: int
+}
+
+struct Snapshot {
+    text: string
+    blocks: ptr[]       // of *Block
+    number: int
+}
+
+struct Editor {
+    buf: string
+    cursor: int         // byte offset, always on a UTF-8 codepoint boundary
+    blocks: ptr[]       // of *Block
+    sent_images: ptr[]  // of *Image: the most recent take, until the next one
+    number: int
+    history: ptr[]      // of *Snapshot
+    history_index: int  // -1 when not browsing
+    draft: ptr          // *Snapshot or null
+    draft_cursor: int
+    top_row: int
+    placeholder: string
+    ghost: string       // dim text drawn instead of the placeholder while empty
+}
+
+image_new(path: string, name: string, media_type: string, bytes: long, width: int, height: int) -> *Image {
+    i = heap.new(Image)
+    i.path = string.copy(path)
+    i.name = string.copy(name)
+    i.media_type = string.copy(media_type)
+    i.bytes = bytes
+    i.width = width
+    i.height = height
+    return i
+}
+
+clone_image_(i: *Image) -> *Image {
+    return image_new(i.path, i.name, i.media_type, i.bytes, i.width, i.height)
+}
+
+clone_block_(b: *Block) -> *Block {
+    c = heap.new(Block)
+    c.start = b.start
+    c.end = b.end
+    c.original = string.copy(b.original)
+    c.image = null
+    if b.image != null { c.image = clone_image_(b.image as *Image) as ptr }
+    c.number = b.number
+    return c
+}
+
+free_block_(b: *Block) {
+    if b.image != null { heap.free(b.image as *Image) }
+    heap.free(b)
+}
+
+free_snapshot_(s: *Snapshot) {
+    i = 0
+    while i < s.blocks.len {
+        free_block_(s.blocks[i] as *Block)
+        i = i + 1
+    }
+    heap.free(s)
+}
+
+new(placeholder: string = "Ask about this project · / for commands") -> *Editor {
+    e = heap.new(Editor)
+    e.buf = ""
+    e.cursor = 0
+    e.number = 1
+    e.history_index = -1
+    e.draft = null
+    e.draft_cursor = 0
+    e.top_row = 0
+    e.placeholder = string.copy(placeholder)
+    e.ghost = ""
+    return e
+}
+
+// upstream deinit.
+free(e: *Editor) {
+    i = 0
+    while i < e.history.len {
+        free_snapshot_(e.history[i] as *Snapshot)
+        i = i + 1
+    }
+    clear_blocks_(e)
+    clear_sent_(e)
+    if e.draft != null { free_snapshot_(e.draft as *Snapshot) }
+    heap.free(e)
+}
+
+text(e: *Editor) -> string {
+    return e.buf
+}
+
+clear_blocks_(e: *Editor) {
+    i = 0
+    while i < e.blocks.len {
+        free_block_(e.blocks[i] as *Block)
+        i = i + 1
+    }
+    ptr[] none_ = []
+    e.blocks = none_
+}
+
+clear_sent_(e: *Editor) {
+    i = 0
+    while i < e.sent_images.len {
+        heap.free(e.sent_images[i] as *Image)
+        i = i + 1
+    }
+    ptr[] none_ = []
+    e.sent_images = none_
+}
+
+image_count(e: *Editor) -> int {
+    count = 0
+    i = 0
+    while i < e.blocks.len {
+        if (e.blocks[i] as *Block).image != null { count = count + 1 }
+        i = i + 1
+    }
+    return count
+}
+
+snapshot_(e: *Editor) -> *Snapshot {
+    s = heap.new(Snapshot)
+    s.text = string.copy(e.buf)
+    ptr[] bs = []
+    i = 0
+    while i < e.blocks.len {
+        bs.push(clone_block_(e.blocks[i] as *Block) as ptr)
+        i = i + 1
+    }
+    s.blocks = bs
+    s.number = e.number
+    return s
+}
+
+load_(e: *Editor, s: *Snapshot) {
+    clear_blocks_(e)
+    e.buf = string.copy(s.text)
+    ptr[] bs = []
+    i = 0
+    while i < s.blocks.len {
+        bs.push(clone_block_(s.blocks[i] as *Block) as ptr)
+        i = i + 1
+    }
+    e.blocks = bs
+    e.number = s.number
+    e.top_row = 0
+}
+
+// The text with every paste block replaced by its original payload.
+expanded(e: *Editor) -> string {
+    sb = strbuilder.new(64)
+    n = string.length(e.buf)
+    i = 0
+    while i < n {
+        bi = block_at_(e, i)
+        if bi >= 0 {
+            b = e.blocks[bi] as *Block
+            strbuilder.append(sb, b.original)
+            i = b.end
+        } else {
+            next_i = next(e, i)
+            strbuilder.append(sb, string.substring(e.buf, i, next_i))
+            i = next_i
+        }
+    }
+    return strbuilder.finish(sb)
+}
+
+// Insertion sort of blocks by number (numbers are unique).
+sort_blocks_(e: *Editor) {
+    i = 1
+    while i < e.blocks.len {
+        j = i
+        while j > 0 && (e.blocks[j - 1] as *Block).number > (e.blocks[j] as *Block).number {
+            t = e.blocks[j - 1]
+            e.blocks[j - 1] = e.blocks[j]
+            e.blocks[j] = t
+            j = j - 1
+        }
+        i = i + 1
+    }
+}
+
+// The sent text (blocks expanded); keeps the images in sent_images, pushes the
+// text onto the history and clears the editor.
+take(e: *Editor) -> string {
+    out = expanded(e)
+    clear_sent_(e)
+    sort_blocks_(e)
+    ptr[] sent = []
+    i = 0
+    while i < e.blocks.len {
+        b = e.blocks[i] as *Block
+        if b.image != null { sent.push(clone_image_(b.image as *Image) as ptr) }
+        i = i + 1
+    }
+    e.sent_images = sent
+    if string.length(e.buf) > 0 {
+        e.history.push(snapshot_(e) as ptr)
+    }
+    replace(e, "")
+    return out
+}
+
+replace(e: *Editor, value: string) {
+    clear_blocks_(e)
+    e.buf = string.copy(value)
+    e.number = 1
+    e.cursor = string.length(value)
+    e.top_row = 0
+    e.history_index = -1
+    if e.draft != null { free_snapshot_(e.draft as *Snapshot) }
+    e.draft = null
+}
+
+// Adds `value` to the history as if it had been pasted into a fresh editor.
+remember(e: *Editor, value: string) {
+    restored = new()
+    paste(restored, value)
+    e.history.push(snapshot_(restored) as ptr)
+    free(restored)
+}
+
+recall_(e: *Editor, older: bool) {
+    if e.history.len == 0 { return }
+    index = e.history_index
+    if e.history_index < 0 { index = e.history.len }
+    if (!older && e.history_index < 0) || (older && index == 0) { return }
+    if e.history_index < 0 {
+        saved = snapshot_(e)
+        if e.draft != null { free_snapshot_(e.draft as *Snapshot) }
+        e.draft = saved as ptr
+        e.draft_cursor = e.cursor
+    }
+    target = index + 1
+    if older { target = index - 1 }
+    if target == e.history.len {
+        load_(e, e.draft as *Snapshot)
+        e.cursor = e.draft_cursor
+        e.history_index = -1
+    } else {
+        load_(e, e.history[target] as *Snapshot)
+        if older { e.cursor = line_end(e, 0) } else { e.cursor = string.length(e.buf) }
+        e.history_index = target
+    }
+}
+
+insert(e: *Editor, s: string) {
+    n = string.length(s)
+    e.buf = "${string.substring(e.buf, 0, e.cursor)}${s}${string.substring(e.buf, e.cursor, string.length(e.buf))}"
+    i = 0
+    while i < e.blocks.len {
+        b = e.blocks[i] as *Block
+        if b.start >= e.cursor {
+            b.start = b.start + n
+            b.end = b.end + n
+        }
+        i = i + 1
+    }
+    e.cursor = e.cursor + n
+}
+
+// The `@` mention ending at the cursor, unless it touches an atomic paste
+// block. Returns (start, query); start is -1 for none.
+file_mention(e: *Editor) -> (int, string) {
+    start, query = paths.mention(e.buf, e.cursor)
+    if start < 0 { return -1, "" }
+    i = 0
+    while i < e.blocks.len {
+        b = e.blocks[i] as *Block
+        if b.end > start && b.start < e.cursor { return -1, "" }
+        i = i + 1
+    }
+    return start, query
+}
+
+is_name_char_(c: int) -> bool {
+    return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c == 45
+}
+
+// std.ascii.isWhitespace
+is_ascii_space_(c: int) -> bool {
+    return c == 32 || (c >= 9 && c <= 13)
+}
+
+// skills.mentionAt: a `$name` word ending at `cursor`: `$` at the start or
+// after whitespace, then name characters. (start, query); start -1 for none.
+mention_at_(t: string, cursor: int) -> (int, string) {
+    w = cursor
+    while w > 0 && is_name_char_(t[w - 1]) { w = w - 1 }
+    if w == 0 || t[w - 1] != 36 { return -1, "" }
+    start = w - 1
+    if start > 0 && !is_ascii_space_(t[start - 1]) { return -1, "" }
+    return start, string.substring(t, w, cursor)
+}
+
+// The `$` skill mention ending at the cursor, unless it touches an atomic
+// paste block. (start, query); start is -1 for none.
+skill_mention(e: *Editor) -> (int, string) {
+    start, query = mention_at_(e.buf, e.cursor)
+    if start < 0 { return -1, "" }
+    i = 0
+    while i < e.blocks.len {
+        b = e.blocks[i] as *Block
+        if b.end > start && b.start < e.cursor { return -1, "" }
+        i = i + 1
+    }
+    return start, query
+}
+
+// Replaces the text from `start` to the cursor with `s`.
+complete_mention(e: *Editor, start: int, s: string) {
+    remove_(e, start, e.cursor)
+    insert(e, s)
+}
+
+index_of_nl_(s: string) -> int {
+    i = 0
+    n = string.length(s)
+    while i < n {
+        if s[i] == 13 || s[i] == 10 { return i }
+        i = i + 1
+    }
+    return n
+}
+
+paste(e: *Editor, s: string) {
+    if long_text.is_long(s) == 0 {
+        insert(e, s)
+        return
+    }
+    n = long_text.lines(s)
+    first = string.substring(s, 0, index_of_nl_(s))
+    preview = format.fit(first, 32)
+    count = n
+    unit = "lines"
+    if n < 2 {
+        count = long_text.chars(s)
+        unit = "chars"
+    }
+    shown = "[Pasted #${e.number} · ${count} ${unit} · ${preview.text}${preview.suffix}]"
+    start = e.cursor
+    insert(e, shown)
+    b = heap.new(Block)
+    b.start = start
+    b.end = e.cursor
+    b.original = string.copy(s)
+    b.image = null
+    b.number = e.number
+    e.blocks.push(b as ptr)
+    e.number = e.number + 1
+}
+
+// Inserts an atomic `[Image #N]` block at the cursor, taking a copy of `attached`.
+attach(e: *Editor, attached: *Image) {
+    shown = "[Image #${e.number}]"
+    start = e.cursor
+    insert(e, shown)
+    b = heap.new(Block)
+    b.start = start
+    b.end = e.cursor
+    b.original = string.copy(shown)
+    b.image = clone_image_(attached) as ptr
+    b.number = e.number
+    e.blocks.push(b as ptr)
+    e.number = e.number + 1
+}
+
+// Index into e.blocks of the block starting at `i`, or -1.
+block_at_(e: *Editor, i: int) -> int {
+    j = 0
+    while j < e.blocks.len {
+        if (e.blocks[j] as *Block).start == i { return j }
+        j = j + 1
+    }
+    return -1
+}
+
+// Returns false for keys that are not editing keys.
+key(e: *Editor, k: input.Key) -> bool {
+    if input.matches(k, input.BACKSPACE, 0) {
+        remove_(e, prev(e, e.cursor), e.cursor)
+    } else if input.matches(k, input.DELETE, 0) || input.matches(k, 100, input.ALT) {
+        remove_(e, e.cursor, next(e, e.cursor))
+    } else if input.matches(k, input.LEFT, 0) || input.matches(k, 98, input.CTRL) {
+        e.cursor = prev(e, e.cursor)
+    } else if input.matches(k, input.RIGHT, 0) || input.matches(k, 102, input.CTRL) {
+        e.cursor = next(e, e.cursor)
+    } else if input.matches(k, input.HOME, 0) || input.matches(k, 97, input.CTRL) {
+        e.cursor = line_start(e, e.cursor)
+    } else if input.matches(k, input.END, 0) || input.matches(k, 101, input.CTRL) {
+        e.cursor = line_end(e, e.cursor)
+    } else if input.matches(k, input.UP, 0) {
+        start = line_start(e, e.cursor)
+        if start == 0 {
+            recall_(e, true)
+        } else {
+            e.cursor = at_column(e, line_start(e, start - 1), column(e, e.cursor))
+        }
+    } else if input.matches(k, input.DOWN, 0) {
+        end = line_end(e, e.cursor)
+        if end == string.length(e.buf) {
+            recall_(e, false)
+        } else {
+            e.cursor = at_column(e, end + 1, column(e, e.cursor))
+        }
+    } else if input.matches(k, 117, input.CTRL) {
+        remove_(e, line_start(e, e.cursor), e.cursor)
+    } else if input.matches(k, 107, input.CTRL) {
+        end = line_end(e, e.cursor)
+        to = end
+        if end == e.cursor { to = next(e, end) }
+        remove_(e, e.cursor, to)
+    } else if input.matches(k, 119, input.CTRL) || input.matches(k, input.BACKSPACE, input.ALT) {
+        remove_(e, word_start_(e, e.cursor), e.cursor)
+    } else if string.length(k.text) > 0 {
+        insert(e, k.text)
+    } else {
+        return false
+    }
+    return true
+}
+
+// Rows the text needs at the window's width.
+rows(e: *Editor, win: screen.Window) -> int {
+    measure = win
+    measure.height = MAX_U16
+    r = screen.draw(measure, [screen.seg(e.buf, screen.style())], wrap: screen.WRAP_GRAPHEME, commit: false)
+    n = r.row + 1
+    if n > MAX_U16 { n = MAX_U16 }
+    return n
+}
+
+draw(e: *Editor, win: screen.Window) {
+    measure = win
+    measure.height = MAX_U16
+    before = string.substring(e.buf, 0, e.cursor)
+    at = screen.draw(measure, [screen.seg(before, screen.style())], wrap: screen.WRAP_GRAPHEME, commit: false)
+    if at.row < e.top_row { e.top_row = at.row }
+    if at.row >= e.top_row + win.height { e.top_row = at.row - win.height + 1 }
+    if string.length(e.buf) == 0 {
+        t = e.placeholder
+        if string.length(e.ghost) > 0 { t = e.ghost }
+        screen.draw(win, [screen.seg(t, screen.style(attrs: screen.DIM))], wrap: screen.WRAP_NONE)
+    } else {
+        shifted = screen.child(win, y_off: 0 - e.top_row)
+        screen.draw(shifted, [screen.seg(e.buf, screen.style())], wrap: screen.WRAP_GRAPHEME)
+    }
+    screen.show_cursor(win, at.col, at.row - e.top_row)
+}
+
+remove_(e: *Editor, from: int, to: int) {
+    if to <= from { return }
+    ptr[] kept = []
+    i = 0
+    while i < e.blocks.len {
+        b = e.blocks[i] as *Block
+        if b.start >= from && b.end <= to {
+            free_block_(b)
+        } else {
+            if b.start >= to {
+                b.start = b.start - (to - from)
+                b.end = b.end - (to - from)
+            }
+            kept.push(b as ptr)
+        }
+        i = i + 1
+    }
+    e.blocks = kept
+    e.buf = "${string.substring(e.buf, 0, from)}${string.substring(e.buf, to, string.length(e.buf))}"
+    e.cursor = from
+}
+
+prev(e: *Editor, i: int) -> int {
+    j = 0
+    while j < e.blocks.len {
+        b = e.blocks[j] as *Block
+        if b.end == i { return b.start }
+        j = j + 1
+    }
+    j = i
+    while j > 0 {
+        j = j - 1
+        if (e.buf[j] & 192) != 128 { break }
+    }
+    return j
+}
+
+// std.unicode.utf8ByteSequenceLength, 1 for an invalid lead byte.
+seq_len_(c: int) -> int {
+    if c < 128 { return 1 }
+    if c >= 194 && c <= 223 { return 2 }
+    if c >= 224 && c <= 239 { return 3 }
+    if c >= 240 && c <= 244 { return 4 }
+    return 1
+}
+
+next(e: *Editor, i: int) -> int {
+    bi = block_at_(e, i)
+    if bi >= 0 { return (e.blocks[bi] as *Block).end }
+    n = string.length(e.buf)
+    if i >= n { return i }
+    r = i + seq_len_(e.buf[i])
+    if r > n { r = n }
+    return r
+}
+
+line_start(e: *Editor, i: int) -> int {
+    j = i
+    while j > 0 {
+        if e.buf[j - 1] == 10 { return j }
+        j = j - 1
+    }
+    return 0
+}
+
+line_end(e: *Editor, i: int) -> int {
+    n = string.length(e.buf)
+    j = i
+    while j < n {
+        if e.buf[j] == 10 { return j }
+        j = j + 1
+    }
+    return n
+}
+
+display_width_(s: string) -> int {
+    return screen.gwidth(s, screen.WIDTH_UNICODE)
+}
+
+column(e: *Editor, i: int) -> int {
+    c = 0
+    j = line_start(e, i)
+    while j < i {
+        n = next(e, j)
+        c = c + display_width_(string.substring(e.buf, j, n))
+        j = n
+    }
+    return c
+}
+
+at_column(e: *Editor, ls: int, col: int) -> int {
+    end = line_end(e, ls)
+    j = ls
+    c = 0
+    while c < col && j < end {
+        n = next(e, j)
+        w = display_width_(string.substring(e.buf, j, n))
+        if c + w > col { break }
+        c = c + w
+        j = n
+    }
+    return j
+}
+
+is_space_(c: int) -> bool {
+    return c == 32 || c == 9 || c == 10
+}
+
+word_start_(e: *Editor, i: int) -> int {
+    j = i
+    while j > 0 && is_space_(e.buf[j - 1]) { j = j - 1 }
+    while j > 0 && !is_space_(e.buf[j - 1]) { j = prev(e, j) }
+    return j
+}

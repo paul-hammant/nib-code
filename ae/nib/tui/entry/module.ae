@@ -1,0 +1,625 @@
+// tui.entry: one block of the transcript (a user message, an answer, a Run
+// and its agent tree, a notice, ...): its text, its folded/open drawing and
+// its measured height (upstream src/tui/transcript/entry.zig).
+//
+// An Entry is a heap box (`new_entry(kind)`), so a Transcript can hold them in
+// a ptr[] and hand out stable pointers. Every upstream field is kept.
+//
+// Differences from upstream:
+//  - Kinds and run states are int constants (KIND_*, RUN_*), in upstream's
+//    order. Optionals are sentinels: `queued` is a long id, -1 for none;
+//    `task_id` and `step_effort` are "" for none (`has_step_effort` says
+//    whether an effort was set); `smooth` is always allocated and
+//    `has_smooth` says whether it is in use; `cached` is the five fields
+//    `has_cached`, `cached_width`, `cached_len`, `cached_open`, `cached_rows`
+//    (upstream's `e.cached = null` is `invalidate(e)`).
+//  - `allocator != null` is `use_cache`: the assistant text is drawn through
+//    the per-entry markdown Cache (Transcript sets it; a bare entry draws
+//    uncached).
+//  - Strings are plain strings (upstream's ArrayList(u8)s); `agents` is a
+//    ptr[] of *agent_tree.Agent, `invocations` a ptr[] of *Invocation.
+//  - tool_summary is a *tool_summary.Summary with `has_tool_summary`.
+//  - `Entry.print` is `draw(e, win, commit)` (`print` is reserved); the
+//    colours user_bg/code_bg are term.screen colour ints.
+//  - Heights, widths and rows are ints (upstream u16, saturating); the
+//    measuring window's height is 65535 as upstream's maxInt(u16).
+//  - segments(e) returns a fresh screen.Segment[] (upstream fills a caller's
+//    [max_segments] buffer); the indexes are upstream's, which the tests and
+//    the Run drawing rely on.
+//  - `free_entry` releases an entry (upstream deinit); the MAX_DIFF_LINES
+//    constant is defined in nib.tui.turn_changes (a circular import
+//    otherwise) and re-exported here.
+
+import std.string
+import std.strbuilder
+import std.list
+import term.screen
+import nib.session.tool_summary
+import nib.tui.agent_tree
+import nib.tui.turn_changes
+import nib.tui.long_text
+import nib.tui.markdown
+import nib.tui.bill
+import nib.tui.label
+import nib.tui.intraline
+import nib.tui.format
+import nib.tui.smooth
+
+exports(MAX_DIFF_LINES, MAX_SEGMENTS,
+        KIND_USER, KIND_ASSISTANT, KIND_RUN, KIND_BACKGROUND, KIND_INFO, KIND_ERR, KIND_BILL,
+        KIND_FAILURE, KIND_CHANGES,
+        RUN_RUNNING, RUN_BACKGROUND, RUN_SUPERSEDED, RUN_OK, RUN_FAILED, RUN_WARNING, RUN_LOST,
+        RUN_TIMED_OUT, RUN_CANCELED,
+        Invocation, Entry, new_entry, free_entry, invalidate, display_text, refresh_label,
+        has_warning, is_live, refresh_agents, collapsible, toggle_rows, draw, extent, height,
+        segments)
+
+const MAX_DIFF_LINES = 60
+const MAX_SEGMENTS = 196
+
+const KIND_USER = 0
+const KIND_ASSISTANT = 1
+const KIND_RUN = 2
+const KIND_BACKGROUND = 3
+const KIND_INFO = 4
+const KIND_ERR = 5
+const KIND_BILL = 6
+const KIND_FAILURE = 7
+const KIND_CHANGES = 8
+
+const RUN_RUNNING = 0
+const RUN_BACKGROUND = 1
+const RUN_SUPERSEDED = 2
+const RUN_OK = 3
+const RUN_FAILED = 4
+const RUN_WARNING = 5
+const RUN_LOST = 6
+const RUN_TIMED_OUT = 7
+const RUN_CANCELED = 8
+
+// One registered call of a background-capable task in a Run.
+struct Invocation {
+    id: string
+    kind: int          // agent_tree.BK_
+    invocation: int
+    background: int
+    result: int        // -1: none yet, 0: failed, 1: ok
+}
+
+struct Entry {
+    kind: int
+    simple: int
+    gap: int
+    use_cache: int
+    markdown_cache: *markdown.Cache
+    has_smooth: int
+    smooth: *smooth.Smooth
+    user_bg: int
+    code_bg: int
+    queued: long       // -1: not queued
+    attempt: int
+    retry_placeholder: int
+    // For KIND_RUN: the script.
+    text: string
+    // For KIND_RUN: the complete result delivered by Session.
+    output: string
+    hook_notice: string
+    changes: *turn_changes.ChangeText
+    agents: ptr[]
+    invocations: ptr[]
+    run_number: int
+    has_tool_summary: int
+    tool_summary: *tool_summary.Summary
+    task_id: string    // "": none
+    agent_tree: *agent_tree.Tree
+    // One-line summary of a collapsible entry; see refresh_label.
+    label: string
+    files: string
+    // Simple-mode title facts, spliced into `label` at `title_files_at`.
+    title_files: string
+    title_files_at: int
+    run: int           // RUN_
+    elapsed_ms: long
+    has_step_effort: int
+    step_effort: string
+    // Collapsible entries share the transcript ctrl+o state.
+    open: int
+    has_cached: int
+    cached_width: int
+    cached_len: int
+    cached_open: int
+    cached_rows: int
+}
+
+new_entry(kind: int) -> *Entry {
+    e = heap.new(Entry)
+    e.kind = kind
+    e.gap = 1
+    e.markdown_cache = markdown.cache_new()
+    e.smooth = smooth.new()
+    e.queued = -1
+    e.text = ""
+    e.output = ""
+    e.hook_notice = ""
+    e.changes = turn_changes.change_text_empty()
+    e.agents = make([]ptr, 0)
+    e.invocations = make([]ptr, 0)
+    e.task_id = ""
+    e.agent_tree = agent_tree.tree_new()
+    e.label = ""
+    e.files = ""
+    e.title_files = ""
+    e.step_effort = ""
+    e.tool_summary = tool_summary.empty()
+    return e
+}
+
+// Releases an entry (upstream deinit). The Agent and Invocation boxes it
+// held are released with it.
+free_entry(e: *Entry) {
+    markdown.cache_free(e.markdown_cache)
+    heap.free(e.smooth)
+    heap.free(e.tool_summary)
+    heap.free(e.changes)
+    heap.free(e.agent_tree)
+    for i in 0..e.agents.len {
+        heap.free(e.agents[i] as *agent_tree.Agent)
+    }
+    for i in 0..e.invocations.len {
+        heap.free(e.invocations[i] as *Invocation)
+    }
+    heap.free(e)
+}
+
+// Upstream's `e.cached = null`.
+invalidate(e: *Entry) {
+    e.has_cached = 0
+}
+
+display_text(e: *Entry) -> string {
+    if e.has_smooth != 0 { return string.substring(e.text, 0, e.smooth.visible) }
+    return e.text
+}
+
+min_(a: int, b: int) -> int {
+    if a < b { return a }
+    return b
+}
+
+max_(a: int, b: int) -> int {
+    if a > b { return a }
+    return b
+}
+
+dim_() -> screen.Style {
+    return screen.style(attrs: screen.DIM)
+}
+
+fg_(index: int) -> screen.Style {
+    return screen.style(fg: screen.color_index(index))
+}
+
+// Collects segments; every one is bound to a local before it is stored.
+struct Segs {
+    items: screen.Segment[]
+}
+
+segs_new_() -> *Segs {
+    b = heap.new(Segs)
+    b.items = make([]screen.Segment, 0)
+    return b
+}
+
+add_(b: *Segs, text: string, st: screen.Style) {
+    s = screen.Segment { text: text, style: st, link: "", link_params: "" }
+    b.items.push(s)
+}
+
+failed_like_(s: int) -> bool {
+    return s == agent_tree.PS_FAILED || s == agent_tree.PS_TIMED_OUT || s == agent_tree.PS_CANCELED
+}
+
+refresh_label(e: *Entry) {
+    e.label = ""
+    e.files = ""
+    e.title_files = ""
+    e.title_files_at = 0
+    if e.kind == KIND_RUN {
+        lab = "Run"
+        for i in 0..e.agents.len {
+            p = e.agents[i] as *agent_tree.Agent
+            if p.kind == agent_tree.BK_RUN || p.superseded_by != "" { continue }
+            if failed_like_(p.`state`) {
+                lab = "${lab} · ${p.id} ${format.state(agent_tree.state_name(p.`state`))}"
+            }
+        }
+        if e.task_id != "" {
+            word = "completed"
+            if e.run == RUN_BACKGROUND || e.run == RUN_RUNNING {
+                word = "running"
+            } else if e.run == RUN_FAILED {
+                word = "failed"
+            } else if e.run == RUN_LOST {
+                word = "lost"
+            } else if e.run == RUN_TIMED_OUT {
+                word = "timed out"
+            } else if e.run == RUN_CANCELED {
+                word = "canceled"
+            }
+            lab = "${lab} · ${e.task_id} ${word}"
+        }
+        used = ""
+        files = ""
+        title_files = ""
+        if e.has_tool_summary != 0 {
+            used = label.actual_tool_summary(e.tool_summary, e.changes.file_count)
+            n = list.list_size(e.tool_summary.files)
+            for i in 0..n {
+                file = list.list_get_raw(e.tool_summary.files, i) as *tool_summary.File
+                if i > 0 {
+                    prev = list.list_get_raw(e.tool_summary.files, i - 1) as *tool_summary.File
+                    if file.duration_ms >= 0 || prev.duration_ms >= 0 {
+                        files = "${files}\n"
+                    } else {
+                        files = "${files} · "
+                    }
+                }
+                files = "${files}${file.tool} ${file.path}"
+                title_files = "${title_files} · ${file.tool} ${file.path}"
+                if file.duration_ms >= 0 {
+                    ms = file.duration_ms
+                    files = "${files} · ${ms / 1000}.${ms % 1000 / 100}s"
+                    if file.failed != 0 { files = "${files} · failed" }
+                }
+            }
+        }
+        e.title_files_at = string.length(lab)
+        if used != "" { lab = "${lab} · ${used}" }
+        for i in 0..e.agents.len {
+            p = e.agents[i] as *agent_tree.Agent
+            if p.background == 0 || p.kind == agent_tree.BK_RUN || failed_like_(p.`state`) { continue }
+            word = "waiting"
+            if p.`state` == agent_tree.PS_QUEUED {
+                word = "queued"
+            } else if p.`state` == agent_tree.PS_WORKING {
+                word = "running"
+            }
+            lab = "${lab} · ${p.id} ${word}"
+        }
+        if e.run == RUN_RUNNING { lab = "${lab} · running" }
+        e.label = lab
+        e.files = files
+        e.title_files = title_files
+    } else if e.kind == KIND_USER {
+        e.label = " … +${long_text.lines(e.text) - 1} lines"
+    }
+}
+
+has_warning(e: *Entry) -> bool {
+    if string.length(e.hook_notice) > 0 { return true }
+    for i in 0..e.agents.len {
+        p = e.agents[i] as *agent_tree.Agent
+        if p.superseded_by == "" && failed_like_(p.`state`) { return true }
+    }
+    return false
+}
+
+// Rows keep their last state; a row is live while its Run runs or its
+// background result is undelivered.
+is_live(e: *Entry, p: *agent_tree.Agent) -> bool {
+    return e.run == RUN_RUNNING || p.background != 0
+}
+
+refresh_agents(e: *Entry) {
+    agent_tree.update(e.agent_tree, e.agents)
+}
+
+collapsible(e: *Entry) -> bool {
+    if e.kind == KIND_RUN || e.kind == KIND_BACKGROUND || e.kind == KIND_FAILURE || e.kind == KIND_CHANGES { return true }
+    return e.kind == KIND_USER && long_text.is_long(e.text) != 0
+}
+
+// The rows the entry takes folded, whatever its open state.
+toggle_rows(e: *Entry, win: screen.Window) -> int {
+    if !collapsible(e) { return 0 }
+    open = e.open
+    e.open = 0
+    rows = draw(e, win, false)
+    e.open = open
+    return rows
+}
+
+trim_nl_(s: string) -> string {
+    end = string.length(s)
+    while end > 0 && s[end - 1] == 10 { end = end - 1 }
+    return string.substring(s, 0, end)
+}
+
+// Byte length of the longest prefix of `text` whose width is at most
+// `available`, stepping a UTF-8 sequence at a time.
+fit_prefix_(win: screen.Window, text: string, available: int) -> int {
+    n = string.length(text)
+    end = 0
+    while end < n {
+        step = screen.codepoint_len(text, end)
+        next = end + step
+        if next > n { next = n }
+        if screen.win_gwidth(win, string.substring(text, 0, next)) > available { break }
+        end = next
+    }
+    return end
+}
+
+rows_of_(r: screen.PrintResult) -> int {
+    extra = 0
+    if r.col > 0 { extra = 1 }
+    return max_(1, r.row + extra)
+}
+
+// Draws the entry into `win` and returns the rows it takes (upstream
+// Entry.print). With commit false nothing is written: it only measures.
+draw(e: *Entry, win: screen.Window, commit: bool) -> int {
+    if e.simple != 0 && (e.kind == KIND_BILL || e.kind == KIND_CHANGES) { return 0 }
+    if e.kind == KIND_CHANGES { return draw_changes_(e, win, commit) }
+    if e.kind == KIND_ASSISTANT {
+        th = markdown.theme(e.code_bg, screen.color_index(6))
+        if e.use_cache != 0 { return markdown.cache_draw(e.markdown_cache, win, display_text(e), th, commit) }
+        return markdown.`print`(win, display_text(e), th, commit)
+    }
+    if e.kind == KIND_USER && win.width >= 4 { return draw_user_(e, win, commit) }
+    if e.kind == KIND_BILL {
+        segs = make([]screen.Segment, 0)
+        s = screen.Segment { text: bill.fit(e.text, win.width), style: dim_(), link: "", link_params: "" }
+        segs.push(s)
+        screen.draw(win, segs, wrap: screen.WRAP_NONE, commit: commit)
+        return 1
+    }
+    folded = collapsible(e) && e.open == 0
+    wrap = screen.WRAP_WORD
+    if folded {
+        wrap = screen.WRAP_NONE
+    } else if e.kind == KIND_RUN || e.kind == KIND_BACKGROUND || e.kind == KIND_FAILURE {
+        wrap = screen.WRAP_GRAPHEME
+    }
+    shown = segments(e)
+    if e.kind == KIND_RUN {
+        if e.simple != 0 && e.open == 0 && string.length(e.title_files) > 0 {
+            at = min_(e.title_files_at, string.length(e.label))
+            title = make([]screen.Segment, 0)
+            t0 = screen.Segment { text: shown[0].text, style: shown[0].style, link: "", link_params: "" }
+            title.push(t0)
+            t1 = screen.Segment { text: shown[1].text, style: shown[1].style, link: "", link_params: "" }
+            title.push(t1)
+            t2 = screen.Segment { text: string.substring(e.label, 0, at), style: screen.style(), link: "", link_params: "" }
+            title.push(t2)
+            t3 = screen.Segment { text: e.title_files, style: screen.style(), link: "", link_params: "" }
+            title.push(t3)
+            t4 = screen.Segment { text: string.substring(e.label, at, string.length(e.label)), style: screen.style(), link: "", link_params: "" }
+            title.push(t4)
+            screen.draw(win, title, wrap: screen.WRAP_NONE, commit: commit)
+        } else {
+            screen.draw(win, shown[0..3], wrap: screen.WRAP_NONE, commit: commit)
+        }
+        if e.simple != 0 && e.open == 0 && e.run != RUN_RUNNING { return 1 }
+        if e.simple != 0 && e.open == 0 {
+            return 1 + agent_tree.draw(e.agent_tree, screen.child(win, y_off: 1), commit)
+        }
+        rows = 1
+        if string.length(e.changes.summary) > 0 {
+            r = screen.draw_segment(screen.child(win, x_off: 2, y_off: rows), screen.seg(e.changes.summary, dim_()), wrap: screen.WRAP_WORD, commit: commit)
+            rows = rows + rows_of_(r)
+        }
+        if string.length(e.files) > 0 {
+            r = screen.draw_segment(screen.child(win, x_off: 2, y_off: rows), screen.seg(e.files, dim_()), wrap: screen.WRAP_WORD, commit: commit)
+            rows = rows + rows_of_(r)
+        }
+        if string.length(e.hook_notice) > 0 {
+            screen.draw_segment(screen.child(win, x_off: 2, y_off: rows), screen.seg(e.hook_notice, fg_(3)), wrap: screen.WRAP_NONE, commit: commit)
+            rows = rows + 1
+        }
+        rows = rows + agent_tree.draw(e.agent_tree, screen.child(win, y_off: rows), commit)
+        if e.open == 0 { return rows }
+        details = screen.draw(screen.child(win, y_off: rows), shown[4..shown.len], wrap: screen.WRAP_GRAPHEME, commit: commit)
+        return rows + rows_of_(details)
+    }
+    if folded && e.kind == KIND_USER {
+        suffix_width = screen.win_gwidth(win, e.label)
+        if e.queued >= 0 { suffix_width = suffix_width + 9 }
+        available = max_(0, win.width - suffix_width)
+        end = fit_prefix_(win, shown[1].text, available)
+        shown[1].text = string.substring(shown[1].text, 0, end)
+    }
+    r = screen.draw(win, shown, wrap: wrap, commit: commit)
+    if folded { return 1 }
+    return rows_of_(r)
+}
+
+// `label` is the summary line, `text` one row per file while open.
+draw_changes_(e: *Entry, win: screen.Window, commit: bool) -> int {
+    screen.draw_segment(win, screen.seg(e.label, dim_()), wrap: screen.WRAP_NONE, commit: commit)
+    if e.open == 0 { return 1 }
+    rows = 1
+    text = e.text
+    n = string.length(text)
+    start = 0
+    while true {
+        nl = string.index_of_from(text, "\n", start)
+        stop = nl
+        if nl < 0 { stop = n }
+        screen.draw_segment(screen.child(win, y_off: rows), screen.seg(string.substring(text, start, stop), dim_()), wrap: screen.WRAP_NONE, commit: commit)
+        rows = rows + 1
+        if nl < 0 { break }
+        start = nl + 1
+    }
+    return rows
+}
+
+draw_user_(e: *Entry, win: screen.Window, commit: bool) -> int {
+    shown = segments(e)
+    body = screen.child(win, x_off: 2, width: win.width - 3)
+    folded = collapsible(e) && e.open == 0
+    if folded {
+        suffix_width = screen.win_gwidth(body, e.label)
+        if e.queued >= 0 { suffix_width = suffix_width + 9 }
+        available = max_(0, body.width - suffix_width)
+        end = fit_prefix_(body, shown[1].text, available)
+        shown[1].text = string.substring(shown[1].text, 0, end)
+    }
+    wrap = screen.WRAP_WORD
+    if folded { wrap = screen.WRAP_NONE }
+    r = screen.draw(body, shown, wrap: wrap, commit: commit)
+    rows = 1
+    if !folded { rows = rows_of_(r) }
+    if commit {
+        first = min_(rows, max_(0, 0 - win.y_off))
+        last = min_(rows, max_(0, win.surf.height - win.y_off))
+        row = first
+        while row < last {
+            for col in 0..win.width {
+                cell, ok = screen.win_read(win, col, row)
+                if !ok { continue }
+                cell.style.bg = e.user_bg
+                cell.is_default = false
+                screen.win_write(win, col, row, cell)
+            }
+            marker = screen.Cell { grapheme: "▎", width: 1, style: screen.style(fg: screen.color_index(4), bg: e.user_bg), link: "", link_params: "", is_default: false, wrapped: false }
+            screen.win_write(win, 0, row, marker)
+            row = row + 1
+        }
+    }
+    return rows
+}
+
+extent(e: *Entry, win: screen.Window) -> int {
+    return height(e, win) + e.gap
+}
+
+height(e: *Entry, win: screen.Window) -> int {
+    len = string.length(display_text(e)) + string.length(e.output) + string.length(e.changes.diff)
+    if e.simple == 0 && e.has_cached != 0 {
+        if e.cached_width == win.width && e.cached_len == len && e.cached_open == e.open { return e.cached_rows }
+    }
+    measure = win
+    measure.height = 65535
+    rows = draw(e, measure, false)
+    e.has_cached = 1
+    e.cached_width = win.width
+    e.cached_len = len
+    e.cached_open = e.open
+    e.cached_rows = rows
+    return rows
+}
+
+// The entry as styled segments; folded entries return only the title ones.
+segments(e: *Entry) -> screen.Segment[] {
+    b = segs_new_()
+    d = dim_()
+    plain = screen.style()
+    if e.kind == KIND_USER {
+        add_(b, "", plain)
+        folded = collapsible(e) && e.open == 0
+        body = e.text
+        if folded {
+            nl = string.index_of(e.text, "\n")
+            if nl >= 0 { body = string.substring(e.text, 0, nl) }
+        }
+        add_(b, body, plain)
+        if folded { add_(b, e.label, d) }
+        if e.queued >= 0 { add_(b, " · queued", d) }
+        return b.items
+    }
+    if e.kind == KIND_ASSISTANT {
+        add_(b, e.text, plain)
+        return b.items
+    }
+    if e.kind == KIND_RUN {
+        if e.run == RUN_FAILED {
+            add_(b, "✗ ", fg_(1))
+        } else if e.run == RUN_WARNING || e.run == RUN_LOST || e.run == RUN_TIMED_OUT || e.run == RUN_CANCELED || has_warning(e) {
+            add_(b, "! ", fg_(3))
+        } else {
+            add_(b, "  ", d)
+        }
+        add_(b, "", d)
+        add_(b, e.label, plain)
+        if e.open == 0 { return b.items }
+        add_(b, "\n", plain)
+        add_(b, "Changes\n", screen.style(attrs: screen.BOLD | screen.DIM))
+        add_(b, e.changes.preview, d)
+        n = 6
+        diff = e.changes.diff
+        if string.length(diff) == 0 {
+            add_(b, "No file changes\n", d)
+            n = n + 1
+        }
+        lines = intraline.lines_new(diff)
+        while n + 3 <= MAX_SEGMENTS - 5 {
+            item, ok = intraline.next(lines)
+            if !ok { break }
+            line = item.line
+            c = line[0]
+            st = screen.style(attrs: screen.BOLD | screen.DIM)
+            if c == 43 {
+                st = fg_(2)
+            } else if c == 45 {
+                st = fg_(1)
+            } else if c == 32 {
+                st = d
+            }
+            if item.has_emphasis != 0 {
+                strong = st
+                strong.attrs = strong.attrs | screen.BOLD
+                add_(b, string.substring(line, 0, item.emphasis.start), st)
+                add_(b, string.substring(line, item.emphasis.start, item.emphasis.end), strong)
+                add_(b, string.substring(line, item.emphasis.end, string.length(line)), st)
+                n = n + 3
+            } else {
+                add_(b, line, st)
+                n = n + 1
+            }
+        }
+        heap.free(lines)
+        add_(b, "Result\n", screen.style(attrs: screen.BOLD | screen.DIM))
+        result = "No result"
+        if string.length(e.output) > 0 { result = trim_nl_(e.output) }
+        rst = d
+        if e.run == RUN_FAILED { rst = screen.style(fg: screen.color_index(1), attrs: screen.DIM) }
+        add_(b, result, rst)
+        add_(b, "\nScript\n", screen.style(attrs: screen.BOLD | screen.DIM))
+        add_(b, e.text, d)
+        return b.items
+    }
+    if e.kind == KIND_BACKGROUND {
+        if e.run == RUN_WARNING {
+            add_(b, "! ", fg_(3))
+        } else if e.run == RUN_SUPERSEDED {
+            add_(b, "  ", d)
+        } else if e.run == RUN_OK {
+            add_(b, "✓ ", fg_(2))
+        } else {
+            add_(b, "✗ ", fg_(1))
+        }
+        add_(b, e.label, plain)
+        if e.open == 0 { return b.items }
+        add_(b, "\n", plain)
+        add_(b, e.text, d)
+        return b.items
+    }
+    if e.kind == KIND_FAILURE {
+        c = 1
+        if e.run == RUN_WARNING { c = 3 }
+        add_(b, e.label, fg_(c))
+        if e.open == 0 { return b.items }
+        add_(b, "\nDetails\n", d)
+        add_(b, e.text, d)
+        return b.items
+    }
+    if e.kind == KIND_INFO || e.kind == KIND_BILL {
+        add_(b, e.text, d)
+    } else if e.kind == KIND_CHANGES {
+        add_(b, e.label, d)
+    } else {
+        add_(b, e.text, fg_(1))
+    }
+    return b.items
+}

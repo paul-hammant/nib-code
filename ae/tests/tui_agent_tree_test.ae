@@ -1,0 +1,186 @@
+// Ports the 9 tests of upstream src/tui/agent_tree.zig under their names, plus
+// a from_progress check (new here). All ported in full.
+import std.spec
+import std.string
+import std.list
+import nib.tui.agent_tree
+import nib.tools.progress
+import term.screen
+
+// Each grapheme of `expected` is at its cell and dim; the rest of the row is blank.
+expect_line(surf: *screen.Surface, y: int, expected: string) {
+    x = 0
+    off = 0
+    n = string.length(expected)
+    while off < n {
+        end = screen.grapheme_end(expected, off)
+        g = string.substring(expected, off, end)
+        c, ok = screen.read_cell(surf, x, y)
+        spec.assert_true(ok, "cell ${x},${y} exists")
+        spec.assert_str_eq(c.grapheme, g, "row ${y} col ${x} of '${expected}'")
+        spec.assert_true(screen.has_attr(c.style, screen.DIM), "dim at ${x},${y}")
+        x = x + screen.gwidth(g, surf.width_method)
+        off = end
+    }
+    while x < surf.width {
+        c, ok = screen.read_cell(surf, x, y)
+        spec.assert_str_eq(c.grapheme, " ", "blank at ${x},${y} after '${expected}'")
+        x = x + 1
+    }
+}
+
+list_(a: ptr) -> ptr[] {
+    out = make([]ptr, 0)
+    out.push(a)
+    return out
+}
+
+row_text_(t: *agent_tree.Tree, i: int) -> string {
+    return t.rows[i].text
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.agent_tree") {
+        spec.it("tree rows fit Unicode prompts and files around state step and tools") callback {
+            surf = screen.surface(120, 4)
+            win = screen.window(surf)
+            tree = agent_tree.tree_new()
+            xs = make([]ptr, 0)
+            xs.push(agent_tree.new_agent("a1", "修复登录流程，补充测试", step: 56, tools: ["edit", "bash"], files: ["src/auth.zig"]) as ptr)
+            xs.push(agent_tree.new_agent("a2", "check config", `state`: agent_tree.PS_DONE, step: 27, tools: ["grep", "read"]) as ptr)
+            xs.push(agent_tree.new_agent("a3", "test", `state`: agent_tree.PS_FAILED, step: 38, files: ["docs/config.md"]) as ptr)
+            agent_tree.update(tree, xs)
+            spec.assert_eq(agent_tree.draw(tree, win, true), 3, "three rows")
+            expect_line(surf, 0, "  ├─ a1 修复登录流程，补充测试 · running · step 56 · edit, bash src/auth.zig")
+            expect_line(surf, 1, "  ├─ a2 check config · completed · step 27 · grep, read")
+            expect_line(surf, 2, "  └─ a3 test · failed · step 38 · docs/config.md")
+            expect_line(surf, 3, "")
+
+            screen.clear(win)
+            win.width = 48
+            agent_tree.draw(tree, win, true)
+            expect_line(surf, 0, "  ├─ a1 修复登… · running · step 56 · edit, bash")
+            win.width = 120
+            screen.clear(win)
+            win.width = 75
+            agent_tree.draw(tree, win, true)
+            expect_line(surf, 0, "  ├─ a1 修复登录流程，补充测试 · running · step 56 · edit, bash src/auth.z…")
+        }
+        spec.it("tree previews sanitize control bytes and cap prompts without wrapping") callback {
+            surf = screen.surface(120, 3)
+            win = screen.window(surf)
+            tree = agent_tree.tree_new()
+            xs = make([]ptr, 0)
+            xs.push(agent_tree.new_agent("a1", "line\nnext\r\t\x1b", `state`: agent_tree.PS_QUEUED, files: ["a\nb"]) as ptr)
+            xs.push(agent_tree.new_agent("a2", "12345678901234567890123456789012345678901234567890", `state`: agent_tree.PS_TIMED_OUT, step: 4) as ptr)
+            agent_tree.update(tree, xs)
+            agent_tree.draw(tree, win, true)
+            expect_line(surf, 0, "  ├─ a1 line next    · queued · step 0 · a b")
+            expect_line(surf, 1, "  └─ a2 1234567890123456789012345678901234567890… · timed out · step 4")
+            expect_line(surf, 2, "")
+            for columns in 0..121 {
+                win.width = 120
+                screen.clear(win)
+                win.width = columns
+                spec.assert_eq(agent_tree.draw(tree, win, false), 2, "rows uncommitted")
+                spec.assert_eq(agent_tree.draw(tree, win, true), 2, "rows committed")
+                expect_line(surf, 2, "")
+            }
+        }
+        spec.it("truncation preserves complete graphemes") callback {
+            surf = screen.surface(8, 1)
+            surf.width_method = screen.WIDTH_UNICODE
+            win = screen.window(surf)
+            text = "á👩‍💻xyz"
+            fitted = agent_tree.fit(win, text, 4, false)
+            spec.assert_str_eq(fitted.text, "á👩‍💻", "text")
+            spec.assert_str_eq(fitted.suffix, "…", "suffix")
+        }
+        spec.it("mixed task ids retain input order and background hides terminal states until delivery") callback {
+            tree = agent_tree.tree_new()
+            xs = make([]ptr, 0)
+            xs.push(agent_tree.new_agent("a10", "first", step: 2) as ptr)
+            xs.push(agent_tree.new_agent("b2", "echo ready", kind: agent_tree.BK_BASH, background: 1, `state`: agent_tree.PS_DONE, elapsed_ms: 192900) as ptr)
+            xs.push(agent_tree.new_agent("a2", "last", background: 1, `state`: agent_tree.PS_FAILED, step: 7) as ptr)
+            agent_tree.update(tree, xs)
+            spec.assert_str_eq(row_text_(tree, 0), "  ├─ a10 first · running · step 2", "a10")
+            spec.assert_str_eq(row_text_(tree, 1), "  ├─ b2 bash echo ready · 3m12s · waiting", "b2")
+            spec.assert_str_eq(row_text_(tree, 2), "  └─ a2 last · failed · step 7", "a2")
+        }
+        spec.it("bash elapsed formatting at the minute boundary") callback {
+            spec.assert_str_eq(agent_tree.append_elapsed("", 0), "<1s", "0")
+            spec.assert_str_eq(agent_tree.append_elapsed("", 42399), "42s", "42s")
+            spec.assert_str_eq(agent_tree.append_elapsed("", 59999), "59s", "59s")
+            spec.assert_str_eq(agent_tree.append_elapsed("", 60000), "1m0s", "1m")
+            spec.assert_str_eq(agent_tree.append_elapsed("", 192999), "3m12s", "3m12s")
+            spec.assert_str_eq(agent_tree.append_elapsed("", 3600000), "1h0m0s", "1h")
+            spec.assert_str_eq(agent_tree.append_elapsed("x ", 1000), "x 1s", "appends")
+        }
+        spec.it("narrow bash rows preserve id duration and delivery state before command") callback {
+            surf = screen.surface(60, 3)
+            win = screen.window(surf)
+            win.width = 36
+            tree = agent_tree.tree_new()
+            xs = make([]ptr, 0)
+            xs.push(agent_tree.new_agent("b2", "abcdefghijklmnopqrstuvwxyz", kind: agent_tree.BK_BASH, background: 1, elapsed_ms: 42300) as ptr)
+            xs.push(agent_tree.new_agent("b3", "abcdefghijklmnopqrstuvwxyz", kind: agent_tree.BK_BASH, background: 1, `state`: agent_tree.PS_DONE, elapsed_ms: 192000) as ptr)
+            agent_tree.update(tree, xs)
+            agent_tree.draw(tree, win, true)
+            expect_line(surf, 0, "  ├─ b2 bash abcdef… · 42s · running")
+            expect_line(surf, 1, "  └─ b3 bash abcd… · 3m12s · waiting")
+            expect_line(surf, 2, "")
+        }
+        spec.it("narrow agent rows reserve state and step before long tool and file names") callback {
+            surf = screen.surface(60, 2)
+            win = screen.window(surf)
+            win.width = 32
+            tree = agent_tree.tree_new()
+            agent_tree.update(tree, list_(agent_tree.new_agent("a2", "a long prompt", step: 12, tools: ["read", "edit", "write"], files: ["src/a_very_long_path.zig"]) as ptr))
+            agent_tree.draw(tree, win, true)
+            expect_line(surf, 0, "  └─ a2  · running · step 12 · …")
+            screen.clear(win)
+            win.width = 28
+            agent_tree.draw(tree, win, true)
+            expect_line(surf, 0, "  └─ a2  · running · step 12")
+            expect_line(surf, 1, "")
+        }
+        spec.it("detached shows terminal states while ordinary background waits for delivery") callback {
+            tree = agent_tree.tree_new()
+            xs = make([]ptr, 0)
+            xs.push(agent_tree.new_agent("b1", "server", kind: agent_tree.BK_BASH, background: 1, detached: 1) as ptr)
+            xs.push(agent_tree.new_agent("b2", "test", kind: agent_tree.BK_BASH, background: 1) as ptr)
+            xs.push(agent_tree.new_agent("b3", "exit", kind: agent_tree.BK_BASH, background: 1, detached: 1, `state`: agent_tree.PS_DONE) as ptr)
+            xs.push(agent_tree.new_agent("b4", "stop", kind: agent_tree.BK_BASH, background: 1, detached: 1, `state`: agent_tree.PS_CANCELED) as ptr)
+            agent_tree.update(tree, xs)
+            spec.assert_str_eq(row_text_(tree, 0), "  ├─ b1 bash server · <1s · running · detached", "b1")
+            spec.assert_str_eq(row_text_(tree, 1), "  ├─ b2 bash test · <1s · running", "b2")
+            spec.assert_str_eq(row_text_(tree, 2), "  ├─ b3 bash exit · <1s · completed · detached", "b3")
+            spec.assert_str_eq(row_text_(tree, 3), "  └─ b4 bash stop · <1s · canceled · detached", "b4")
+        }
+        spec.it("fork label follows task id") callback {
+            tree = agent_tree.tree_new()
+            agent_tree.update(tree, list_(agent_tree.new_agent("a3", "child", fork: 1) as ptr))
+            spec.assert_str_eq(row_text_(tree, 0), "  └─ a3 fork child · running · step 0", "fork")
+        }
+        spec.it("from_progress converts a tools.progress.Progress (new)") callback {
+            vp = progress.new_value("b7", "bash", "make", 2)
+            p = vp as *progress.Progress
+            p.state = "done"
+            p.exit_code = 0
+            p.background = 1
+            p.elapsed_ms = 5000
+            list.list_add(p.files, "a.c")
+            a = agent_tree.from_progress(vp)
+            spec.assert_eq(a.kind, agent_tree.BK_BASH, "kind")
+            spec.assert_eq(a.`state`, agent_tree.PS_DONE, "state")
+            spec.assert_eq(a.run, 2, "run")
+            spec.assert_eq(a.exit_code, 0, "exit")
+            spec.assert_eq(a.files.len, 1, "files")
+            tree = agent_tree.tree_new()
+            agent_tree.update(tree, list_(a as ptr))
+            spec.assert_str_eq(row_text_(tree, 0), "  └─ b7 bash make · 5s · waiting ✓ exit 0 · a.c", "row")
+        }
+    }
+    return spec.run_summary(fw)
+}

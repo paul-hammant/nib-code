@@ -1,0 +1,82 @@
+// Ports the 1 test of upstream src/tui/transcript/changes.zig under its name,
+// plus ChangeText checks (new here: upstream covers ChangeText only through
+// transcript.zig's tests).
+import std.spec
+import std.list
+import nib.tui.turn_changes
+import nib.tools.changes
+import nib.tools.diff
+
+file_(path: string, added: int, removed: int) -> ptr {
+    f = heap.new(changes.File)
+    f.path = path
+    f.added = added
+    f.removed = removed
+    return f as ptr
+}
+
+change_(path: string, added: int, removed: int, created: int, text: string) -> ptr {
+    c = heap.new(diff.Change)
+    c.path = path
+    c.added = added
+    c.removed = removed
+    c.created = created
+    c.diff = text
+    return c as ptr
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.turn_changes") {
+        spec.it("turn changes line: singular, zero parts omitted, aligned rows") callback {
+            one = list.list_new()
+            list.list_add_raw(one, file_("a.zig", 3, 0))
+            c, ok = turn_changes.turn_changes(one)
+            spec.assert_true(ok, "one")
+            spec.assert_str_eq(c.head, "1 file changed · +3", "head")
+            spec.assert_str_eq(c.rows, "  a.zig  +3", "rows")
+            many = list.list_new()
+            list.list_add_raw(many, file_("src/tui.zig", 30, 4))
+            list.list_add_raw(many, file_("src/tui/prediction.zig", 10, 3))
+            list.list_add_raw(many, file_("docs/ui-style.md", 2, 0))
+            list.list_add_raw(many, file_("old.txt", 0, 5))
+            m, mok = turn_changes.turn_changes(many)
+            spec.assert_true(mok, "many")
+            spec.assert_str_eq(m.head, "4 files changed · +42 −12", "many head")
+            spec.assert_str_eq(m.rows, "  src/tui.zig             +30 −4\n  src/tui/prediction.zig  +10 −3\n  docs/ui-style.md         +2\n  old.txt                     −5", "many rows")
+            _e, eok = turn_changes.turn_changes(list.list_new())
+            spec.assert_false(eok, "empty is none")
+            rem = list.list_new()
+            list.list_add_raw(rem, file_("x", 0, 2))
+            r, rok = turn_changes.turn_changes(rem)
+            spec.assert_true(rok, "removed")
+            spec.assert_str_eq(r.head, "1 file changed · −2", "removed head")
+        }
+        spec.it("ChangeText summarizes, bounds the diff and clones (new)") callback {
+            cs = list.list_new()
+            list.list_add_raw(cs, change_("src/a.zig", 1, 1, 0, " keep\n-old\n+new\n"))
+            list.list_add_raw(cs, change_("b.md", 1, 0, 1, "+hi\n"))
+            t = turn_changes.change_text_new(cs)
+            spec.assert_str_eq(t.summary, "src/a.zig +1 −1 · b.md (new) +1 −0", "summary")
+            spec.assert_eq(t.file_count, 2, "count")
+            spec.assert_str_eq(t.diff, "src/a.zig +1 −1\n keep\n-old\n+new\nb.md (new) +1 −0\n+hi\n", "diff")
+            spec.assert_str_eq(t.preview, "", "no preview")
+            cl = turn_changes.change_text_clone(t)
+            spec.assert_str_eq(cl.diff, t.diff, "clone")
+            big = ""
+            i = 0
+            while i < 240 {
+                big = "${big}+line ${i}\n"
+                i = i + 1
+            }
+            bl = list.list_new()
+            list.list_add_raw(bl, change_("a", 240, 0, 0, big))
+            bt = turn_changes.change_text_new(bl)
+            spec.assert_str_eq(bt.preview, "Diff preview · 60 of 241 lines\n", "preview")
+            e = turn_changes.change_text_new(list.list_new())
+            spec.assert_str_eq(e.summary, "", "empty")
+            spec.assert_eq(e.file_count, 0, "empty count")
+        }
+    }
+    return spec.run_summary(fw)
+}

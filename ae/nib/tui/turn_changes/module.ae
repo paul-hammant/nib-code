@@ -1,0 +1,190 @@
+// tui.turn_changes: the line under a Turn footer and its opened per-file rows,
+// and the changed-file text of one Run (upstream
+// src/tui/transcript/changes.zig; renamed because the module basename
+// `changes` is taken by nib.tools.changes).
+//
+// Differences from upstream:
+//  - `turn_changes(files)` takes the list (std.list of *changes.File, what
+//    changes.recovery_files returns) and returns (TurnChanges, bool): the bool
+//    is false when no file changed (upstream's null).
+//  - ChangeText is a heap box (`change_text_new`, `change_text_empty`,
+//    `change_text_clone`); `change_text_new` takes the list of *diff.Change
+//    that changes.take returns. No deinit (strings are owned by the box).
+//  - MAX_DIFF_LINES lives here (upstream: entry.zig, which would be a circular
+//    import); nib.tui.entry re-exports it.
+
+import std.string
+import std.strbuilder
+import std.list
+import nib.tools.changes
+import nib.tools.diff
+import nib.tui.long_text
+
+exports(MAX_DIFF_LINES, TurnChanges, ChangeText, turn_changes,
+        change_text_empty, change_text_new, change_text_clone)
+
+const MAX_DIFF_LINES = 60
+
+struct TurnChanges {
+    head: string
+    rows: string
+}
+
+// "+3", "−4", or "+3 −4" (U+2212 for the minus).
+counts_(sb: ptr, added: int, removed: int) {
+    if added > 0 { strbuilder.append(sb, "+${added}") }
+    if added > 0 && removed > 0 { strbuilder.append(sb, " ") }
+    if removed > 0 { strbuilder.append(sb, "−${removed}") }
+}
+
+digits_(n: int) -> int {
+    return string.length(string.from_int(n))
+}
+
+spaces_(sb: ptr, n: int) {
+    i = 0
+    while i < n {
+        strbuilder.append(sb, " ")
+        i = i + 1
+    }
+}
+
+max_(a: int, b: int) -> int {
+    if a > b { return a }
+    return b
+}
+
+// (TurnChanges, false) when no file changed.
+turn_changes(files: ptr) -> (TurnChanges, bool) {
+    n = list.list_size(files)
+    if n == 0 { return TurnChanges { head: "", rows: "" }, false }
+    added = 0
+    removed = 0
+    path_width = 0
+    added_width = 0
+    i = 0
+    while i < n {
+        f = list.list_get_raw(files, i) as *changes.File
+        added = added + f.added
+        removed = removed + f.removed
+        path_width = max_(path_width, long_text.chars(f.path))
+        if f.added > 0 { added_width = max_(added_width, 1 + digits_(f.added)) }
+        i = i + 1
+    }
+    head = strbuilder.new(64)
+    plural = "s"
+    if n == 1 { plural = "" }
+    strbuilder.append(head, "${n} file${plural} changed")
+    if added > 0 || removed > 0 {
+        strbuilder.append(head, " · ")
+        counts_(head, added, removed)
+    }
+    rows = strbuilder.new(128)
+    i = 0
+    while i < n {
+        f = list.list_get_raw(files, i) as *changes.File
+        if i > 0 { strbuilder.append(rows, "\n") }
+        shown = long_text.chars(f.path)
+        strbuilder.append(rows, "  ${f.path}")
+        i = i + 1
+        if f.added == 0 && f.removed == 0 { continue }
+        spaces_(rows, path_width - shown + 2)
+        used = 0
+        if f.added > 0 { used = 1 + digits_(f.added) }
+        spaces_(rows, added_width - used)
+        if f.added > 0 { strbuilder.append(rows, "+${f.added}") }
+        if f.removed > 0 {
+            if added_width > 0 { strbuilder.append(rows, " ") }
+            strbuilder.append(rows, "−${f.removed}")
+        }
+    }
+    return TurnChanges { head: strbuilder.finish(head), rows: strbuilder.finish(rows) }, true
+}
+
+struct ChangeText {
+    // "src/a.zig +3 −1", or "4 files +20 −5"; empty when nothing changed.
+    summary: string
+    file_count: int
+    // Per file a header line, then its diff lines; at most MAX_DIFF_LINES in all.
+    diff: string
+    preview: string
+}
+
+change_text_empty() -> *ChangeText {
+    c = heap.new(ChangeText)
+    c.summary = ""
+    c.file_count = 0
+    c.diff = ""
+    c.preview = ""
+    return c
+}
+
+change_header_(c: *diff.Change) -> string {
+    new_ = ""
+    if c.created != 0 { new_ = " (new)" }
+    return "${c.path}${new_} +${c.added} −${c.removed}"
+}
+
+// From a list of *diff.Change (what changes.take returns).
+change_text_new(cs: ptr) -> *ChangeText {
+    out = change_text_empty()
+    n = list.list_size(cs)
+    if n == 0 { return out }
+    summary = strbuilder.new(64)
+    i = 0
+    while i < n {
+        c = list.list_get_raw(cs, i) as *diff.Change
+        if i > 0 { strbuilder.append(summary, " · ") }
+        strbuilder.append(summary, change_header_(c))
+        i = i + 1
+    }
+    dsb = strbuilder.new(256)
+    shown = 0
+    hidden = 0
+    i = 0
+    while i < n {
+        c = list.list_get_raw(cs, i) as *diff.Change
+        i = i + 1
+        // lines of the diff with trailing newlines trimmed, empty lines skipped
+        text = c.diff
+        end = string.length(text)
+        while end > 0 && text[end - 1] == 10 { end = end - 1 }
+        if shown < MAX_DIFF_LINES {
+            strbuilder.append(dsb, change_header_(c))
+            strbuilder.append(dsb, "\n")
+            shown = shown + 1
+        } else {
+            hidden = hidden + 1
+        }
+        start = 0
+        while start <= end {
+            nl = string.index_of_from(text, "\n", start)
+            stop = nl
+            if nl < 0 || nl > end { stop = end }
+            if stop > start {
+                if shown < MAX_DIFF_LINES {
+                    strbuilder.append(dsb, string.substring(text, start, stop))
+                    strbuilder.append(dsb, "\n")
+                    shown = shown + 1
+                } else {
+                    hidden = hidden + 1
+                }
+            }
+            start = stop + 1
+        }
+    }
+    out.file_count = n
+    out.summary = strbuilder.finish(summary)
+    out.diff = strbuilder.finish(dsb)
+    if hidden > 0 { out.preview = "Diff preview · ${shown} of ${shown + hidden} lines\n" }
+    return out
+}
+
+change_text_clone(c: *ChangeText) -> *ChangeText {
+    out = heap.new(ChangeText)
+    out.summary = string.copy(c.summary)
+    out.file_count = c.file_count
+    out.diff = string.copy(c.diff)
+    out.preview = string.copy(c.preview)
+    return out
+}

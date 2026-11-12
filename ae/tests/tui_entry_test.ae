@@ -1,0 +1,149 @@
+// New tests (upstream has none in entry.zig; its entries are covered through
+// transcript.zig's tests, ported in tui_transcript_test.ae). These cover what
+// those leave unchecked: folded queued users, simple-mode caching and
+// visibility, assistant tint, the changes entry, notice kinds, toggle_rows,
+// revision counting, add_changes and Run rows in the agent tree.
+import std.spec
+import std.string
+import std.list
+import nib.tui.entry
+import nib.tui.transcript
+import nib.tui.agent_tree
+import nib.tui.turn_changes
+import nib.tools.diff
+import term.screen
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.entry") {
+        spec.it("a folded queued user leaves room for its marker") callback {
+            surf = screen.surface(30, 4)
+            win = screen.window(surf)
+            e = entry.new_entry(entry.KIND_USER)
+            e.text = "0123456789012345678901234567890123456789\n2\n3\n4\n5\n6"
+            entry.refresh_label(e)
+            e.queued = 7
+            spec.assert_eq(entry.draw(e, win, true), 1, "one row")
+            // body is 27 wide: label " … +5 lines" (11) and " · queued" (9) are reserved
+            line = screen.row_text(surf, 0)
+            spec.assert_str_eq(line, "▎ 0123456 … +5 lines · queued", "first row")
+        }
+        spec.it("simple entries are never height-cached; simple bills and changes take no rows") callback {
+            win = screen.window(screen.surface(20, 4))
+            e = entry.new_entry(entry.KIND_ASSISTANT)
+            e.text = "abc"
+            entry.height(e, win)
+            e.cached_rows = 99
+            spec.assert_eq(entry.height(e, win), 99, "cached when not simple")
+            e.simple = 1
+            spec.assert_eq(entry.height(e, win), 1, "remeasured when simple")
+            b = entry.new_entry(entry.KIND_BILL)
+            b.text = "2 Runs"
+            spec.assert_eq(entry.height(b, win), 1, "bill")
+            b.simple = 1
+            spec.assert_eq(entry.height(b, win), 0, "simple bill")
+            spec.assert_eq(entry.extent(b, win), 1, "extent adds the gap")
+            c = entry.new_entry(entry.KIND_CHANGES)
+            c.simple = 1
+            spec.assert_eq(entry.height(c, win), 0, "simple changes")
+        }
+        spec.it("assistant code blocks take the entry's code_bg tint") callback {
+            surf = screen.surface(20, 6)
+            win = screen.window(surf)
+            e = entry.new_entry(entry.KIND_ASSISTANT)
+            e.text = "```\nx = 1\n```"
+            e.code_bg = screen.color_rgb(1, 2, 3)
+            e.use_cache = 1
+            rows = entry.draw(e, win, true)
+            spec.assert_true(rows >= 1, "rows")
+            found = 0
+            for y in 0..rows {
+                for x in 0..20 {
+                    c, _ok = screen.read_cell(surf, x, y)
+                    if c.style.bg == e.code_bg { found = found + 1 }
+                }
+            }
+            spec.assert_true(found > 0, "tinted cells")
+        }
+        spec.it("the changes entry shows its label folded and one row per file open") callback {
+            surf = screen.surface(40, 6)
+            win = screen.window(surf)
+            t = transcript.new()
+            transcript.add_changes(t, turn_changes.TurnChanges { head: "", rows: "" })
+            spec.assert_eq(transcript.count(t), 0, "empty adds nothing")
+            transcript.add_changes(t, turn_changes.TurnChanges { head: "2 files changed · +3", rows: "  a.zig  +3\n  b.zig  +0" })
+            e = transcript.at(t, 0)
+            spec.assert_eq(entry.draw(e, win, true), 1, "folded")
+            spec.assert_str_eq(screen.row_text(surf, 0), "2 files changed · +3", "label")
+            spec.assert_eq(transcript.latest_details(t), 0, "latest details")
+            e.simple = 1
+            spec.assert_eq(transcript.latest_details(t), -1, "simple excluded")
+            e.simple = 0
+            transcript.toggle(t, 0)
+            screen.clear(win)
+            spec.assert_eq(entry.draw(e, win, true), 3, "open")
+            spec.assert_str_eq(screen.row_text(surf, 1), "  a.zig  +3", "file row")
+            spec.assert_eq(entry.toggle_rows(e, win), 1, "toggle_rows folded count")
+            spec.assert_eq(e.open, 1, "open restored")
+        }
+        spec.it("notice kinds colour their text; failure and background open to details") callback {
+            e = entry.new_entry(entry.KIND_ERR)
+            e.text = "boom"
+            s = entry.segments(e)
+            spec.assert_eq(screen.color_value(s[0].style.fg), 1, "err red")
+            i = entry.new_entry(entry.KIND_INFO)
+            i.text = "note"
+            si = entry.segments(i)
+            spec.assert_true(screen.has_attr(si[0].style, screen.DIM), "info dim")
+            f = entry.new_entry(entry.KIND_FAILURE)
+            f.label = "The Run failed."
+            f.text = "detail"
+            f.run = entry.RUN_WARNING
+            spec.assert_eq(screen.color_value(entry.segments(f)[0].style.fg), 3, "warning yellow")
+            f.open = 1
+            sf = entry.segments(f)
+            spec.assert_eq(sf.len, 3, "open failure")
+            spec.assert_str_eq(sf[1].text, "\nDetails\n", "details marker")
+        }
+        spec.it("revision counts changes; add and progress bump it, an unchanged heartbeat does not") callback {
+            t = transcript.new()
+            spec.assert_eq_long(t.revision, 0, "start")
+            transcript.add(t, entry.KIND_INFO, "x")
+            spec.assert_eq_long(t.revision, 1, "add")
+            transcript.start_run(t, "r")
+            spec.assert_eq_long(t.revision, 2, "start_run")
+            transcript.progress(t, agent_tree.new_agent("a1", "p", step: 1))
+            spec.assert_eq_long(t.revision, 3, "new progress")
+            transcript.progress(t, agent_tree.new_agent("a1", "p", step: 1, elapsed_ms: 500))
+            spec.assert_eq_long(t.revision, 3, "heartbeat")
+            transcript.progress(t, agent_tree.new_agent("a1", "p", step: 2))
+            spec.assert_eq_long(t.revision, 4, "step")
+        }
+        spec.it("Run-kind tasks do not appear in the agent tree") callback {
+            tree = agent_tree.tree_new()
+            xs = make([]ptr, 0)
+            xs.push(agent_tree.new_agent("a1", "x") as ptr)
+            xs.push(agent_tree.new_agent("r1", "Run", kind: agent_tree.BK_RUN) as ptr)
+            agent_tree.update(tree, xs)
+            spec.assert_eq(tree.rows.len, 1, "one row")
+            spec.assert_str_eq(tree.rows[0].text, "  └─ a1 x · running · step 0", "last branch skips the Run task")
+        }
+        spec.it("from_json reads the progress event the queue writes") callback {
+            a = agent_tree.from_json("{\"id\":\"b2\",\"run\":3,\"invocation\":4,\"kind\":\"bash\",\"exit_code\":1,\"output_bytes\":9,\"elapsed_ms\":1500,\"superseded_by\":\"b3\",\"background\":true,\"detached\":true,\"fork\":false,\"prompt\":\"ls\",\"state\":\"failed\",\"step\":2,\"tools\":[\"read\"],\"files\":[\"a\",\"b\"],\"usage\":{}}")
+            spec.assert_str_eq(a.id, "b2", "id")
+            spec.assert_eq(a.run, 3, "run")
+            spec.assert_eq(a.invocation, 4, "invocation")
+            spec.assert_eq(a.kind, agent_tree.BK_BASH, "kind")
+            spec.assert_eq(a.exit_code, 1, "exit")
+            spec.assert_eq_long(a.elapsed_ms, 1500, "elapsed")
+            spec.assert_str_eq(a.superseded_by, "b3", "superseded")
+            spec.assert_eq(a.background, 1, "background")
+            spec.assert_eq(a.detached, 1, "detached")
+            spec.assert_eq(a.fork, 0, "fork")
+            spec.assert_eq(a.`state`, agent_tree.PS_FAILED, "state")
+            spec.assert_eq(a.tools.len, 1, "tools")
+            spec.assert_eq(a.files.len, 2, "files")
+        }
+    }
+    return spec.run_summary(fw)
+}

@@ -1,0 +1,394 @@
+// tui.agent_tree: the tree of child agents and background tasks under a Run
+// entry, one dim row each (upstream src/tui/agent_tree.zig).
+//
+// Differences from upstream:
+//  - Upstream's session `Progress` event (src/session/events.zig) is the
+//    TUI-side struct `Agent` here, a heap box made by `new_agent`: kinds
+//    (`Background.Kind`) are the BK_ ints, states are the PS_ ints, optionals
+//    are sentinels (exit_code -1 and superseded_by "" for none), bools are
+//    ints, tools and files are string[]. `usage` is not kept (the TUI never
+//    reads it). `from_progress` converts a tools.progress.Progress.
+//  - A Tree is a heap struct made by `tree_new()` with `rows: Row[]`; there is
+//    no deinit (rows are values, update replaces the slice).
+//  - `Tree.print` is `draw(tree, win, commit)`: `print` is reserved in Aether.
+//  - Widths are ints, not u16 (no saturation; max_(0, ..) where upstream uses -|).
+//  - append_elapsed(text, ms) returns the extended string.
+
+import std.string
+import std.strbuilder
+import std.list
+import nib.tui.format
+import nib.tui.long_text
+import std.json
+import nib.jsonx
+import nib.tools.progress
+import term.screen
+
+exports(Agent, Row, Tree, BK_AGENT, BK_BASH, BK_RUN,
+        PS_QUEUED, PS_WORKING, PS_DONE, PS_FAILED, PS_CANCELED, PS_TIMED_OUT,
+        new_agent, clone_agent, from_progress, from_json, state_name, kind_name,
+        tree_new, update, draw, append_elapsed, fit, same_strings)
+
+// Background.Kind
+const BK_AGENT = 0
+const BK_BASH = 1
+const BK_RUN = 2
+
+// Progress.state
+const PS_QUEUED = 0
+const PS_WORKING = 1
+const PS_DONE = 2
+const PS_FAILED = 3
+const PS_CANCELED = 4
+const PS_TIMED_OUT = 5
+
+// A snapshot of one task: upstream's Progress.
+struct Agent {
+    id: string
+    run: int
+    invocation: int
+    kind: int            // BK_
+    exit_code: int       // -1: none
+    output_bytes: long
+    elapsed_ms: long
+    superseded_by: string  // "": none
+    background: int
+    detached: int
+    fork: int
+    prompt: string
+    `state`: int         // PS_
+    step: int
+    tools: string[]
+    files: string[]
+}
+
+struct Row {
+    text: string
+    prompt_start: int
+    prompt_end: int
+    status_end: int
+    tools_end: int
+    prompt_omitted: int
+    status_style: screen.Style
+}
+
+struct Tree {
+    rows: Row[]
+}
+
+// Upstream's `.{ .id = .., .prompt = .. }` with every other field defaulted
+// (state working, kind agent); pass the ones that differ by name.
+new_agent(id: string, prompt: string, run: int = 0, invocation: int = 0, kind: int = 0,
+          exit_code: int = -1, output_bytes: long = 0, elapsed_ms: long = 0,
+          superseded_by: string = "", background: int = 0, detached: int = 0, fork: int = 0,
+          `state`: int = 1, step: int = 0, tools: string[] = [], files: string[] = []) -> *Agent {
+    a = heap.new(Agent)
+    a.id = string.copy(id)
+    a.run = run
+    a.invocation = invocation
+    a.kind = kind
+    a.exit_code = exit_code
+    a.output_bytes = output_bytes
+    a.elapsed_ms = elapsed_ms
+    a.superseded_by = string.copy(superseded_by)
+    a.background = background
+    a.detached = detached
+    a.fork = fork
+    a.prompt = string.copy(prompt)
+    a.`state` = `state`
+    a.step = step
+    a.tools = copy_strings_(tools)
+    a.files = copy_strings_(files)
+    return a
+}
+
+copy_strings_(xs: string[]) -> string[] {
+    out = make([]string, 0)
+    for i in 0..xs.len {
+        out.push(string.copy(xs[i]))
+    }
+    return out
+}
+
+// Upstream's Progress.clone: a deep copy.
+clone_agent(p: *Agent) -> *Agent {
+    return new_agent(p.id, p.prompt, run: p.run, invocation: p.invocation, kind: p.kind,
+        exit_code: p.exit_code, output_bytes: p.output_bytes, elapsed_ms: p.elapsed_ms,
+        superseded_by: p.superseded_by, background: p.background, detached: p.detached,
+        fork: p.fork, `state`: p.`state`, step: p.step, tools: p.tools, files: p.files)
+}
+
+state_name(s: int) -> string {
+    if s == PS_QUEUED { return "queued" }
+    if s == PS_WORKING { return "working" }
+    if s == PS_DONE { return "done" }
+    if s == PS_FAILED { return "failed" }
+    if s == PS_CANCELED { return "canceled" }
+    return "timed_out"
+}
+
+// @tagName of the Background.Kind.
+kind_name(k: int) -> string {
+    if k == BK_AGENT { return "agent" }
+    if k == BK_BASH { return "bash" }
+    return "run"
+}
+
+state_from_(s: string) -> int {
+    if s == "queued" { return PS_QUEUED }
+    if s == "done" { return PS_DONE }
+    if s == "failed" { return PS_FAILED }
+    if s == "canceled" { return PS_CANCELED }
+    if s == "timed_out" { return PS_TIMED_OUT }
+    return PS_WORKING
+}
+
+// An Agent from a tools.progress.Progress (strings for kind and state).
+from_progress(vp: ptr) -> *Agent {
+    v = vp as *progress.Progress
+    k = BK_AGENT
+    if v.kind == "bash" { k = BK_BASH } else if v.kind == "run" { k = BK_RUN }
+    tools = make([]string, 0)
+    i = 0
+    while i < list.list_size(v.tools) {
+        s, _g = list.get_string(v.tools, i)
+        tools.push(string.copy(s))
+        i = i + 1
+    }
+    files = make([]string, 0)
+    i = 0
+    while i < list.list_size(v.files) {
+        s, _g = list.get_string(v.files, i)
+        files.push(string.copy(s))
+        i = i + 1
+    }
+    return new_agent(v.id, v.prompt, run: v.run, invocation: v.invocation, kind: k,
+        exit_code: v.exit_code, output_bytes: v.output_bytes, elapsed_ms: v.elapsed_ms,
+        superseded_by: v.superseded_by, background: v.background, detached: v.detached,
+        fork: v.fork, `state`: state_from_(v.`state`), step: v.step, tools: tools, files: files)
+}
+
+// An Agent from the JSON object inside a {"progress":{...}} event (the text
+// tools.progress.to_json writes), or (null-less) defaults for absent fields.
+from_json(text: string) -> *Agent {
+    v = jsonx.parse(text)
+    k = BK_AGENT
+    ks = jsonx.str_or(v, "kind", "agent")
+    if ks == "bash" { k = BK_BASH } else if ks == "run" { k = BK_RUN }
+    tools = make([]string, 0)
+    tv = jsonx.field(v, "tools")
+    if tv != null && json.json_type(tv) == json.JSON_ARRAY {
+        for i in 0..json.json_array_size(tv) {
+            tools.push(string.copy(jsonx.str_field(json.json_array_get_raw(tv, i))))
+        }
+    }
+    files = make([]string, 0)
+    fv = jsonx.field(v, "files")
+    if fv != null && json.json_type(fv) == json.JSON_ARRAY {
+        for i in 0..json.json_array_size(fv) {
+            files.push(string.copy(jsonx.str_field(json.json_array_get_raw(fv, i))))
+        }
+    }
+    a = new_agent(string.copy(jsonx.str_or(v, "id", "")), string.copy(jsonx.str_or(v, "prompt", "")),
+        run: jsonx.int_or(v, "run", 0), invocation: jsonx.int_or(v, "invocation", 0), kind: k,
+        exit_code: jsonx.int_or(v, "exit_code", -1), output_bytes: jsonx.long_or(v, "output_bytes", 0 as long),
+        elapsed_ms: jsonx.long_or(v, "elapsed_ms", 0 as long),
+        superseded_by: string.copy(jsonx.str_or(v, "superseded_by", "")),
+        background: jsonx.bool_or(v, "background", 0), detached: jsonx.bool_or(v, "detached", 0),
+        fork: jsonx.bool_or(v, "fork", 0), `state`: state_from_(jsonx.str_or(v, "state", "working")),
+        step: jsonx.int_or(v, "step", 0), tools: tools, files: files)
+    jsonx.free(v)
+    return a
+}
+
+same_strings(a: string[], b: string[]) -> bool {
+    if a.len != b.len { return false }
+    for i in 0..a.len {
+        if a[i] != b[i] { return false }
+    }
+    return true
+}
+
+tree_new() -> *Tree {
+    t = heap.new(Tree)
+    t.rows = make([]Row, 0)
+    return t
+}
+
+// Rebuilds the rows from `agents` (a ptr[] of *Agent), skipping Run tasks.
+update(tree: *Tree, agents: ptr[]) {
+    count = 0
+    for i in 0..agents.len {
+        if (agents[i] as *Agent).kind != BK_RUN { count = count + 1 }
+    }
+    next = make([]Row, 0)
+    n = 0
+    for i in 0..agents.len {
+        p = agents[i] as *Agent
+        if p.kind == BK_RUN { continue }
+        // workaround: xs.push(f()) of a struct with a string field loses the
+        // string in Aether 0.909.0; bind the value first
+        row = row_init_(p, n + 1 == count)
+        next.push(row)
+        n = n + 1
+    }
+    tree.rows = next
+}
+
+// Draws one row per line from the window's top; returns the row count.
+draw(tree: *Tree, win: screen.Window, commit: bool) -> int {
+    for i in 0..tree.rows.len {
+        row_draw_(tree.rows[i], screen.child(win, y_off: i, height: 1), commit)
+    }
+    return tree.rows.len
+}
+
+dim_() -> screen.Style {
+    return screen.style(attrs: screen.DIM)
+}
+
+row_init_(p: *Agent, last: bool) -> Row {
+    branch = "├─"
+    if last { branch = "└─" }
+    fork = ""
+    if p.fork != 0 { fork = " fork" }
+    bash = ""
+    if p.kind == BK_BASH { bash = "bash " }
+    text = "  ${branch} ${p.id}${fork} ${bash}"
+    prompt_start = string.length(text)
+    prompt = p.prompt
+    if p.kind == BK_RUN && p.prompt == "Run" { prompt = "" }
+    plen = string.length(prompt)
+    end = 0
+    chars = 0
+    while end < plen {
+        gend = screen.grapheme_end(prompt, end)
+        count = long_text.chars(string.substring(prompt, end, gend))
+        if chars + count > 40 { break }
+        chars = chars + count
+        end = gend
+    }
+    text = "${text}${string.substring(prompt, 0, end)}"
+    prompt_end = string.length(text)
+    live = p.`state` == PS_QUEUED || p.`state` == PS_WORKING
+    st = format.state(state_name(p.`state`))
+    if p.detached != 0 {
+        if live { st = "running" }
+    } else if p.background != 0 && !live && p.`state` == PS_DONE {
+        st = "waiting"
+    }
+    if p.kind != BK_AGENT {
+        text = append_elapsed("${text} · ", p.elapsed_ms)
+        if p.superseded_by != "" {
+            text = "${text} · superseded by ${p.superseded_by}"
+        } else {
+            text = "${text} · ${st}"
+        }
+    } else {
+        text = "${text} · ${st} · step ${p.step}"
+    }
+    if p.exit_code >= 0 {
+        mark = "✗"
+        if p.exit_code == 0 { mark = "✓" }
+        text = "${text} ${mark} exit ${p.exit_code}"
+    }
+    if p.detached != 0 { text = "${text} · detached" }
+    status_end = string.length(text)
+    for i in 0..p.tools.len {
+        sep = ", "
+        if i == 0 { sep = " · " }
+        text = "${text}${sep}${p.tools[i]}"
+    }
+    tools_end = string.length(text)
+    for i in 0..p.files.len {
+        sep = ", "
+        if i == 0 {
+            sep = " · "
+            if p.tools.len > 0 { sep = " " }
+        }
+        text = "${text}${sep}${p.files[i]}"
+    }
+    stst = dim_()
+    if p.`state` == PS_FAILED {
+        stst = screen.style(fg: screen.color_index(1), attrs: screen.DIM)
+    } else if p.`state` == PS_TIMED_OUT || p.`state` == PS_CANCELED {
+        stst = screen.style(fg: screen.color_index(3), attrs: screen.DIM)
+    }
+    omitted = 0
+    if end < plen { omitted = 1 }
+    return Row { text: sanitize_(text), prompt_start: prompt_start, prompt_end: prompt_end,
+        status_end: status_end, tools_end: tools_end, prompt_omitted: omitted, status_style: stst }
+}
+
+// Control bytes (below 0x20, and 0x7f) become spaces.
+sanitize_(text: string) -> string {
+    n = string.length(text)
+    sb = strbuilder.new(n + 8)
+    start = 0
+    i = 0
+    while i < n {
+        b = text[i]
+        if b < 32 || b == 127 {
+            if i > start { strbuilder.append(sb, string.substring(text, start, i)) }
+            strbuilder.append(sb, " ")
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if n > start { strbuilder.append(sb, string.substring(text, start, n)) }
+    return strbuilder.finish(sb)
+}
+
+max_(a: int, b: int) -> int {
+    if a > b { return a }
+    return b
+}
+
+width_(win: screen.Window, text: string) -> int {
+    return screen.win_gwidth(win, text)
+}
+
+row_draw_(row: Row, win: screen.Window, commit: bool) {
+    prefix = string.substring(row.text, 0, row.prompt_start)
+    status = string.substring(row.text, row.prompt_end, row.status_end)
+    used = fit(win, string.substring(row.text, row.status_end, row.tools_end),
+        max_(0, win.width - (width_(win, prefix) + width_(win, status))), false)
+    fixed = width_(win, prefix) + width_(win, status) + width_(win, used.text) + width_(win, used.suffix)
+    omitted = row.prompt_omitted != 0
+    prompt = fit(win, string.substring(row.text, row.prompt_start, row.prompt_end),
+        max_(0, win.width - fixed), omitted)
+    files = fit(win, string.substring(row.text, row.tools_end, string.length(row.text)),
+        max_(0, win.width - (fixed + width_(win, prompt.text) + width_(win, prompt.suffix))), false)
+    d = dim_()
+    segs = make([]screen.Segment, 0)
+    segs.push(screen.seg(prefix, d))
+    segs.push(screen.seg(prompt.text, d))
+    segs.push(screen.seg(prompt.suffix, d))
+    segs.push(screen.seg(status, row.status_style))
+    segs.push(screen.seg(used.text, d))
+    segs.push(screen.seg(used.suffix, d))
+    segs.push(screen.seg(files.text, d))
+    segs.push(screen.seg(files.suffix, d))
+    screen.draw(win, segs, wrap: screen.WRAP_NONE, commit: commit)
+}
+
+// `text` cut to `columns` whole graphemes with an ellipsis suffix, unless it
+// fits and `omitted` (text already cut upstream of here) is false.
+fit(win: screen.Window, text: string, columns: int, omitted: bool) -> format.Fitted {
+    if !omitted && width_(win, text) <= columns { return format.Fitted { text: text, suffix: "" } }
+    if columns == 0 { return format.Fitted { text: "", suffix: "" } }
+    available = max_(0, columns - width_(win, "…"))
+    len = string.length(text)
+    end = 0
+    while end < len {
+        next = screen.grapheme_end(text, end)
+        if width_(win, string.substring(text, 0, next)) > available { break }
+        end = next
+    }
+    return format.Fitted { text: string.substring(text, 0, end), suffix: "…" }
+}
+
+// `text` followed by the elapsed duration ("<1s", "42s", "3m12s", "1h0m0s").
+append_elapsed(text: string, elapsed_ms: long) -> string {
+    return "${text}${format.duration(elapsed_ms)}"
+}

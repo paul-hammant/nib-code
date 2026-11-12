@@ -1,0 +1,311 @@
+// Ports the tests of upstream src/tui/editor.zig under their names.
+// Not ported: the anonymous `test { _ = @import("../tui.zig"); }` (a Zig
+// test-discovery hook, no behaviour).
+// Image is the editor's stand-in struct (editor.image_new), see the module.
+// Extra tests at the end (not upstream): mention parsing, ghost/placeholder.
+import std.spec
+import std.string
+import std.strbuilder
+import term.screen
+import term.input
+import nib.tui.editor
+
+press_(e: *editor.Editor, cp: int, mods: int) {
+    editor.key(e, input.key(cp, mods: mods))
+}
+
+shot_() -> *editor.Image {
+    return editor.image_new("/tmp/a.png", "a.png", "image/png", 1 as long, 4, 3)
+}
+
+repeat_(s: string, n: int) -> string {
+    sb = strbuilder.new(64)
+    for i in 0..n { strbuilder.append(sb, s) }
+    return strbuilder.finish(sb)
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.editor") {
+        spec.it("multi-line editing with UTF-8") callback {
+            e = editor.new()
+            editor.insert(e, "你好\nabcd")
+            press_(e, input.UP, 0)
+            spec.assert_eq(e.cursor, string.length("你好"), "up lands after 你好")
+            press_(e, input.BACKSPACE, 0)
+            spec.assert_str_eq(editor.text(e), "你\nabcd", "backspace removes 好")
+            press_(e, input.DOWN, 0)
+            press_(e, input.END, 0)
+            editor.insert(e, "c")
+            spec.assert_str_eq(editor.text(e), "你\nabcdc", "append c")
+            press_(e, 119, input.CTRL)
+            spec.assert_str_eq(editor.text(e), "你\n", "ctrl-w")
+            press_(e, input.BACKSPACE, 0)
+            press_(e, input.LEFT, 0)
+            press_(e, 107, input.CTRL)
+            spec.assert_str_eq(editor.text(e), "", "ctrl-k")
+            taken = editor.take(e)
+            spec.assert_eq(e.cursor, 0, "cursor after take")
+        }
+
+        spec.it("input history keeps multiline entries and restores draft cursor") callback {
+            e = editor.new()
+            editor.insert(e, "first\nsecond")
+            _first = editor.take(e)
+            editor.insert(e, "next")
+            next_input = editor.take(e)
+            editor.insert(e, "draft")
+            press_(e, input.LEFT, 0)
+            press_(e, input.UP, 0)
+            spec.assert_str_eq(editor.text(e), "next", "up 1")
+            press_(e, input.UP, 0)
+            spec.assert_str_eq(editor.text(e), "first\nsecond", "up 2")
+            press_(e, input.UP, 0)
+            spec.assert_str_eq(editor.text(e), "first\nsecond", "up 3 stays")
+            editor.insert(e, " edited")
+            press_(e, input.DOWN, 0)
+            spec.assert_str_eq(editor.text(e), "first edited\nsecond", "down moves within the entry")
+            press_(e, input.DOWN, 0)
+            spec.assert_str_eq(editor.text(e), "next", "down to next")
+            press_(e, input.DOWN, 0)
+            spec.assert_str_eq(editor.text(e), "draft", "down to draft")
+            spec.assert_eq(e.cursor, 4, "draft cursor restored")
+            press_(e, input.UP, 0)
+            press_(e, input.UP, 0)
+            spec.assert_str_eq(editor.text(e), "first\nsecond", "back up")
+        }
+
+        spec.it("editor scrolls internally to keep cursor visible") callback {
+            surf = screen.surface(10, 3)
+            win = screen.window(surf)
+            e = editor.new()
+            editor.insert(e, "zero\none\ntwo\nthree\nfour")
+            editor.draw(e, win)
+            spec.assert_eq(e.top_row, 2, "top_row 2")
+            spec.assert_true(surf.cursor_vis, "cursor visible")
+            spec.assert_eq(surf.cursor_row, 2, "cursor row 2")
+            c, _ok = screen.win_read(win, 0, 2)
+            spec.assert_str_eq(c.grapheme, "f", "f at row 2")
+            for i in 0..4 { press_(e, input.UP, 0) }
+            editor.draw(e, win)
+            spec.assert_eq(e.top_row, 0, "top_row 0")
+            spec.assert_eq(surf.cursor_row, 0, "cursor row 0")
+            c0, _ok0 = screen.win_read(win, 0, 0)
+            spec.assert_str_eq(c0.grapheme, "z", "z at row 0")
+            e.cursor = string.length(editor.text(e))
+            editor.insert(e, "123456")
+            editor.draw(e, win)
+            spec.assert_eq(e.top_row, 3, "top_row 3")
+            spec.assert_eq(surf.cursor_col, 0, "cursor col 0")
+            spec.assert_eq(surf.cursor_row, 2, "cursor row 2 again")
+        }
+
+        spec.it("paste thresholds count characters and keep literal private-use codepoints") callback {
+            e = editor.new()
+            editor.paste(e, "a\nb\nc\nd\ne")
+            spec.assert_eq(e.blocks.len, 0, "5 lines is not long")
+            editor.replace(e, "")
+            exact = repeat_("x", 800)
+            editor.paste(e, exact)
+            spec.assert_eq(e.blocks.len, 0, "800 chars is not long")
+            editor.replace(e, "")
+            unicode_text = repeat_("你", 800)
+            editor.paste(e, unicode_text)
+            spec.assert_eq(e.blocks.len, 0, "800 wide chars is not long")
+            sb = strbuilder.new(64)
+            strbuilder.append(sb, unicode_text)
+            strbuilder.append_codepoint(sb, 0xE000)
+            strbuilder.append_codepoint(sb, 0xF0000)
+            long_text = strbuilder.finish(sb)
+            pua = strbuilder.new(8)
+            strbuilder.append_codepoint(pua, 0xE000)
+            private = strbuilder.finish(pua)
+            editor.replace(e, "${private} ")
+            editor.paste(e, long_text)
+            spec.assert_str_eq(editor.text(e), "${private} [Pasted #1 · 802 chars · 你你你你你你你你你你你你你你你…]", "label")
+            ex = editor.expanded(e)
+            spec.assert_true(string.ends_with(ex, long_text) != 0, "expanded ends with payload")
+            spec.assert_true(string.starts_with(ex, "${private} ") != 0, "expanded starts with prefix")
+        }
+
+        spec.it("paste blocks are atomic and offsets survive insertion and deletion") callback {
+            e = editor.new()
+            raw = "1\n2\n3\n4\n5\n6"
+            editor.insert(e, "a")
+            editor.paste(e, raw)
+            end = e.cursor
+            editor.insert(e, "b")
+            press_(e, input.LEFT, 0)
+            press_(e, input.LEFT, 0)
+            spec.assert_eq(e.cursor, 1, "left over the block")
+            editor.insert(e, "z")
+            press_(e, input.RIGHT, 0)
+            spec.assert_eq(e.cursor, end + 1, "right over the block")
+            press_(e, input.BACKSPACE, 0)
+            spec.assert_str_eq(editor.text(e), "azb", "backspace removes the block whole")
+            spec.assert_eq(e.blocks.len, 0, "no blocks")
+            editor.paste(e, raw)
+            spec.assert_true(string.contains(editor.text(e), "#2") != 0, "numbering continues")
+            press_(e, input.LEFT, 0)
+            press_(e, input.DELETE, 0)
+            spec.assert_str_eq(editor.text(e), "azb", "delete removes the block whole")
+            editor.paste(e, raw)
+            press_(e, 119, input.CTRL)
+            spec.assert_str_eq(editor.text(e), "b", "ctrl-w removes block and word")
+            spec.assert_eq(e.blocks.len, 0, "no blocks at the end")
+        }
+
+        spec.it("send expands blocks and history restores process drafts or folds log text") callback {
+            e = editor.new()
+            raw = "1\n2\n3\n4\n5\n6"
+            editor.insert(e, "prefix ")
+            editor.paste(e, raw)
+            editor.insert(e, " suffix")
+            shown = string.copy(editor.text(e))
+            sent = editor.take(e)
+            spec.assert_str_eq(sent, "prefix 1\n2\n3\n4\n5\n6 suffix", "sent expanded")
+            spec.assert_eq(e.number, 1, "number reset")
+            editor.paste(e, raw)
+            draft_end = e.cursor
+            press_(e, input.UP, 0)
+            spec.assert_str_eq(editor.text(e), shown, "history restores the shown text")
+            spec.assert_eq(e.blocks.len, 1, "one block")
+            spec.assert_eq(e.number, 2, "number 2")
+            press_(e, input.DOWN, 0)
+            spec.assert_str_eq(editor.text(e), "[Pasted #1 · 6 lines · 1]", "draft back")
+            spec.assert_eq(e.cursor, draft_end, "draft cursor")
+            editor.remember(e, sent)
+            press_(e, input.UP, 0)
+            spec.assert_str_eq(editor.text(e), "[Pasted #1 · 6 lines · prefix 1]", "remembered folds")
+            restored = editor.expanded(e)
+            spec.assert_str_eq(restored, sent, "expands back")
+        }
+
+        spec.it("block columns use label width and drawing wraps labels not payload") callback {
+            e = editor.new()
+            editor.insert(e, "你")
+            editor.paste(e, "1\n2\n3\n4\n5\n6")
+            end = e.cursor
+            spec.assert_eq(editor.column(e, end), 27, "column of block end")
+            spec.assert_eq(editor.at_column(e, 0, 10), string.length("你"), "at_column")
+            editor.insert(e, "\n123456789012345678901234567")
+            press_(e, input.UP, 0)
+            spec.assert_eq(e.cursor, end, "up lands at block end")
+            surf = screen.surface(12, 4)
+            win = screen.window(surf)
+            editor.draw(e, win)
+            spec.assert_eq(surf.cursor_col, 3, "cursor col")
+            spec.assert_eq(surf.cursor_row, 2, "cursor row")
+        }
+
+        spec.it("image blocks are atomic, numbered with paste blocks and sent in label order") callback {
+            e = editor.new()
+            editor.insert(e, "see ")
+            editor.attach(e, shot_())
+            editor.insert(e, " and ")
+            editor.paste(e, "1\n2\n3\n4\n5\n6")
+            second = editor.image_new("/tmp/a.png", "b.png", "image/png", 1 as long, 4, 3)
+            editor.attach(e, second)
+            spec.assert_eq(editor.image_count(e), 2, "two images")
+            spec.assert_true(string.contains(editor.text(e), "[Image #1]") != 0, "image 1")
+            spec.assert_true(string.ends_with(editor.text(e), "[Image #3]") != 0, "image 3 last")
+            press_(e, input.LEFT, 0)
+            spec.assert_eq(e.cursor, string.length(editor.text(e)) - string.length("[Image #3]"), "left over image")
+            press_(e, input.DELETE, 0)
+            spec.assert_eq(editor.image_count(e), 1, "one image after delete")
+            editor.attach(e, second)
+            spec.assert_true(string.ends_with(editor.text(e), "[Image #4]") != 0, "image 4")
+            sent = editor.take(e)
+            spec.assert_true(string.ends_with(sent, "[Image #4]") != 0, "sent ends with label")
+            spec.assert_eq(e.sent_images.len, 2, "two sent images")
+            spec.assert_str_eq((e.sent_images[0] as *editor.Image).name, "a.png", "first sent a.png")
+            spec.assert_eq(editor.image_count(e), 0, "no images left")
+        }
+
+        spec.it("image blocks survive input history and delete as a whole") callback {
+            e = editor.new()
+            editor.attach(e, shot_())
+            _first = editor.take(e)
+            editor.insert(e, "draft")
+            press_(e, input.UP, 0)
+            spec.assert_str_eq(editor.text(e), "[Image #1]", "restored")
+            spec.assert_eq(editor.image_count(e), 1, "image restored")
+            press_(e, input.BACKSPACE, 0)
+            spec.assert_str_eq(editor.text(e), "", "deleted whole")
+            spec.assert_eq(editor.image_count(e), 0, "no image")
+            press_(e, input.DOWN, 0)
+            spec.assert_str_eq(editor.text(e), "draft", "draft back")
+        }
+
+        // not upstream
+        spec.it("mentions: @ and $ end at the cursor and never touch a block") callback {
+            e = editor.new()
+            editor.insert(e, "see @src/ma")
+            s, q = editor.file_mention(e)
+            spec.assert_eq(s, 4, "@ start")
+            spec.assert_str_eq(q, "src/ma", "@ query")
+            es, _eq = editor.skill_mention(e)
+            spec.assert_eq(es, -1, "no skill mention")
+            editor.replace(e, "see $rev")
+            ks, kq = editor.skill_mention(e)
+            spec.assert_eq(ks, 4, "$ start")
+            spec.assert_str_eq(kq, "rev", "$ query")
+            editor.replace(e, "a$rev")
+            as_, _aq = editor.skill_mention(e)
+            spec.assert_eq(as_, -1, "glued $")
+            editor.replace(e, "$")
+            ds, dq = editor.skill_mention(e)
+            spec.assert_eq(ds, 0, "bare $")
+            spec.assert_str_eq(dq, "", "bare query")
+            editor.replace(e, "@")
+            editor.paste(e, "1\n2\n3\n4\n5\n6")
+            bs, _bq = editor.file_mention(e)
+            spec.assert_eq(bs, -1, "block blocks the mention")
+            editor.replace(e, "see @sr")
+            editor.complete_mention(e, 4, "@src/main.ae ")
+            spec.assert_str_eq(editor.text(e), "see @src/main.ae ", "completed")
+        }
+
+        spec.it("deleting text just before a block shifts the block (extra)") callback {
+            e = editor.new()
+            editor.insert(e, "a")
+            editor.paste(e, "1\n2\n3\n4\n5\n6")
+            e.cursor = 1
+            press_(e, input.BACKSPACE, 0)
+            spec.assert_eq((e.blocks[0] as *editor.Block).start, 0, "block start shifted")
+            press_(e, input.RIGHT, 0)
+            spec.assert_eq(e.cursor, (e.blocks[0] as *editor.Block).end, "right steps over the block")
+            editor.replace(e, "x ")
+            editor.paste(e, "1\n2\n3\n4\n5\n6")
+            e.cursor = 2
+            editor.insert(e, "$")
+            ss, _sq = editor.skill_mention(e)
+            spec.assert_eq(ss, 2, "dollar before block")
+            e.cursor = (e.blocks[0] as *editor.Block).end
+            tt, _tq = editor.skill_mention(e)
+            spec.assert_eq(tt, -1, "touching block")
+            editor.replace(e, "")
+            editor.paste(e, "$ab\n2\n3\n4\n5\n6")
+            e.cursor = string.index_of(editor.text(e), "$ab") + 3
+            ps, _pq = editor.skill_mention(e)
+            spec.assert_eq(ps, -1, "mention inside a block label")
+        }
+
+        spec.it("empty editor draws the ghost over the placeholder, dim") callback {
+            surf = screen.surface(20, 2)
+            win = screen.window(surf)
+            e = editor.new(placeholder: "ph")
+            editor.draw(e, win)
+            spec.assert_str_eq(screen.row_text(surf, 0), "ph", "placeholder")
+            c, _ok = screen.win_read(win, 0, 0)
+            spec.assert_true(screen.has_attr(c.style, screen.DIM), "dim")
+            e.ghost = "ghost"
+            editor.draw(e, win)
+            spec.assert_str_eq(screen.row_text(surf, 0), "ghost", "ghost")
+            spec.assert_eq(editor.rows(e, win), 1, "rows of empty")
+            editor.insert(e, "abc\ndef")
+            spec.assert_eq(editor.rows(e, win), 2, "rows")
+        }
+    }
+    return spec.run_summary(fw)
+}

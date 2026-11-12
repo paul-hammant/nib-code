@@ -1,0 +1,1204 @@
+// Ports the 55 tests of upstream src/tui/transcript.zig under their names.
+//
+// Partially ported (the backing is not ported yet):
+//  - "restored Run summaries follow run_index and tool_call_id and survive
+//    compaction", "legacy Step overflow is not attributed to a pure JS Run":
+//    upstream builds the summaries by replaying a session log through
+//    session/log.zig, whose tool-summary restoration is not ported
+//    (ae/nib/session/log header). Ported as far as the transcript: the
+//    messages carry the `tool_summary` / `step_calls_omitted` members the
+//    replay would attach, and the labels are checked; the log round trip
+//    ("compaction", the second loop of the Step-overflow test) is not.
+//  - "legacy logs without tool facts keep a plain Run title": the same, from
+//    a message without the members.
+//  - "endRun summary cloning failures release owned data": upstream drives
+//    std.testing.checkAllAllocationFailures; there is no allocator to fail
+//    here, so it checks the same call completes and labels the Run.
+//  - "history Run effort is copied ...": upstream mutates the source buffer
+//    after the call to prove a copy; Aether strings are immutable, so it
+//    checks the value and that the label does not show it.
+//  - Messages are JSON texts (nib.msg form), not provider.Message structs;
+//    "user" history content is added as typed (skills.typed not ported).
+import std.spec
+import std.string
+import std.list
+import nib.jsonx
+import nib.tui.transcript
+import nib.tui.entry
+import nib.tui.agent_tree
+import nib.tui.turn_changes
+import nib.tui.turn_summary
+import nib.tui.bill
+import nib.tui.label
+import nib.tools.changes
+import nib.tools.diff
+import nib.tools.progress
+import nib.session.tool_summary
+import nib.sandbox.timing
+import term.screen
+
+// ---------------------------------------------------------------- helpers
+
+e_(t: *transcript.Transcript, i: int) -> *entry.Entry { return transcript.at(t, i) }
+
+streq(a: string, b: string) { spec.assert_str_eq(a, b, "string") }
+
+seg_text_(e: *entry.Entry, i: int) -> string {
+    s = entry.segments(e)
+    return s[i].text
+}
+
+seg_count_(e: *entry.Entry) -> int {
+    s = entry.segments(e)
+    return s.len
+}
+
+row_(e: *entry.Entry, i: int) -> string { return e.agent_tree.rows[i].text }
+
+agent_(e: *entry.Entry, i: int) -> *agent_tree.Agent { return e.agents[i] as *agent_tree.Agent }
+
+changes_(path: string, added: int, removed: int, created: int, text: string) -> ptr {
+    c = heap.new(diff.Change)
+    c.path = path
+    c.added = added
+    c.removed = removed
+    c.created = created
+    c.diff = text
+    return c as ptr
+}
+
+one_change_(path: string, added: int, removed: int, text: string) -> *turn_changes.ChangeText {
+    l = list.list_new()
+    list.list_add_raw(l, changes_(path, added, removed, 0, text))
+    return turn_changes.change_text_new(l)
+}
+
+none_() -> *turn_changes.ChangeText { return turn_changes.change_text_empty() }
+
+surf_win_(cols: int, rows: int) -> screen.Window {
+    return screen.window(screen.surface(cols, rows))
+}
+
+cell_(w: screen.Window, x: int, y: int) -> screen.Cell {
+    c, _ok = screen.win_read(w, x, y)
+    return c
+}
+
+dim_(c: screen.Cell) -> bool { return screen.has_attr(c.style, screen.DIM) }
+
+// The messages of a history, as JSON texts.
+msgs_() -> ptr { return list.list_new() }
+push_(l: ptr, m: string) { list.list_add(l, m) }
+
+bg_msg_(content: string, kind: string, id: string, ok: string) -> string {
+    extra = ""
+    if ok != "" { extra = ",\"background_ok\":${ok}" }
+    return "{\"role\":\"user\",\"content\":${jsonx.quote(content)},\"source\":\"background\",\"background_id\":${jsonx.quote(id)}${extra},\"background_kind\":${jsonx.quote(kind)}}"
+}
+
+call_(id: string, code: string) -> string {
+    args = jsonx.quote("{\"code\":${jsonx.quote(code)}}")
+    return "{\"id\":${jsonx.quote(id)},\"type\":\"function\",\"function\":{\"name\":\"run\",\"arguments\":${args}}}"
+}
+
+asst_calls_(calls: string, extra: string) -> string {
+    return "{\"role\":\"assistant\",\"tool_calls\":[${calls}]${extra}}"
+}
+
+tool_msg_(id: string, content: string, extra: string) -> string {
+    return "{\"role\":\"tool\",\"content\":${jsonx.quote(content)},\"tool_call_id\":${jsonx.quote(id)}${extra}}"
+}
+
+user_msg_(content: string) -> string { return "{\"role\":\"user\",\"content\":${jsonx.quote(content)}}" }
+
+new_run_(calls: ptr) -> ptr { return timing.new() }
+
+add_call_(run: ptr, name: string, ok: int, dispatched: int, run_index: int) {
+    i = timing.reserve_entry(run, name)
+    c = timing.entry(run, i) as *timing.Call
+    c.ok = ok
+    c.dispatched = dispatched
+    c.run_index = run_index
+    c.end_ms = 1
+}
+
+// A Scroll anchored at (entry, row), or following the bottom.
+scroll_(has: int, entry_: int, row: int) -> *transcript.Scroll {
+    s = heap.new(transcript.Scroll)
+    s.has_top = has
+    s.top_entry = entry_
+    s.top_row = row
+    return s
+}
+
+const BK_AGENT = 0
+const BK_BASH = 1
+const BK_RUN = 2
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.transcript") {
+        spec.it("background results fold to task facts and expand to complete JSON") callback {
+            t = transcript.new()
+            result = "{\"ok\":true,\"text\":\"found it\\nsecond line\",\"changes\":[],\"usage\":{}}"
+            transcript.background_result(t, BK_AGENT, "bg_1", true, result)
+            e = e_(t, 0)
+            spec.assert_true(entry.collapsible(e), "collapsible")
+            spec.assert_eq(seg_count_(e), 2, "folded segments")
+            streq(seg_text_(e, 1), "bg_1 agent · completed")
+            transcript.toggle_all(t)
+            spec.assert_eq(seg_count_(e), 4, "open segments")
+            streq(seg_text_(e, 3), result)
+            _a, found = transcript.last_answer(t)
+            spec.assert_false(found, "no answer")
+            transcript.background_result(t, BK_AGENT, "bg_2", false, "{\"ok\":false,\"text\":\"failed\"}")
+            spec.assert_eq(e_(t, 1).open, 0, "second closed")
+            streq(seg_text_(e_(t, 1), 0), "✗ ")
+        }
+        spec.it("restored background results retain their kind and complete result") callback {
+            t = transcript.new()
+            result = "{\"ok\":true,\"text\":\"result\"}"
+            h = msgs_()
+            push_(h, bg_msg_("background agent bg_1 finished\n${result}", "agent", "bg_1", ""))
+            transcript.add_history(t, h)
+            spec.assert_eq(e_(t, 0).kind, entry.KIND_BACKGROUND, "kind")
+            streq(e_(t, 0).text, result)
+            streq(e_(t, 0).label, "bg_1 agent · completed")
+        }
+        spec.it("background progress stays with its Run until the matching result arrives") callback {
+            t = transcript.new()
+            transcript.start_run(t, "tools.agent({})")
+            transcript.progress(t, agent_tree.new_agent("a1", "first", run: 1, background: 1, step: 1))
+            transcript.end_run(t, true, "started", 100, none_())
+            transcript.start_run(t, "tools.read({})")
+            transcript.progress(t, agent_tree.new_agent("a1", "first", run: 1, background: 1, step: 2))
+            spec.assert_eq(e_(t, 0).agents.len, 1, "one agent")
+            spec.assert_eq(agent_(e_(t, 0), 0).step, 2, "step 2")
+            spec.assert_eq(e_(t, 1).agents.len, 0, "second run has none")
+            spec.assert_true(string.contains(e_(t, 0).label, "a1 running") != 0, "label")
+            transcript.background_result(t, BK_AGENT, "a1", true, "{\"ok\":true,\"text\":\"done\"}")
+            spec.assert_eq(e_(t, 0).agent_tree.rows.len, 1, "tree rows")
+            transcript.progress(t, agent_tree.new_agent("a1", "first", run: 1, background: 1, `state`: agent_tree.PS_DONE, step: 3))
+            spec.assert_eq(agent_(e_(t, 0), 0).background, 0, "settled")
+            streq(e_(t, 0).label, "Run")
+            spec.assert_eq(e_(t, 2).kind, entry.KIND_BACKGROUND, "result entry")
+        }
+        spec.it("turn cleanup removes background working rows without removing delivered results") callback {
+            t = transcript.new()
+            transcript.start_run(t, "tools.bash({})")
+            transcript.progress(t, agent_tree.new_agent("b1", "sleep 60", run: 1, kind: BK_BASH, background: 1))
+            transcript.progress(t, agent_tree.new_agent("b2", "echo done", run: 1, kind: BK_BASH, background: 1))
+            transcript.end_run(t, true, "started", 100, none_())
+            transcript.background_result(t, BK_BASH, "b2", true, "{\"exit_code\":0,\"output\":\"done\"}")
+            spec.assert_eq(e_(t, 0).agents.len, 2, "two agents")
+            transcript.clear_background_progress(t)
+            spec.assert_eq(e_(t, 0).agents.len, 1, "one left")
+            streq(row_(e_(t, 0), 0), "  └─ b2 bash echo done · <1s · completed")
+            streq(e_(t, 0).label, "Run")
+            streq(e_(t, 1).label, "b2 bash · completed · exit 0")
+        }
+        spec.it("truncated background result still previews text and lost result is visible") callback {
+            t = transcript.new()
+            transcript.background_result(t, BK_AGENT, "a1", false, "{\"ok\":false,\"text\":\"partial result")
+            streq(e_(t, 0).label, "a1 agent · failed")
+            transcript.lost_background(t, BK_AGENT, "a2", "[background agent a2 lost: process ended]")
+            streq(e_(t, 1).label, "a2 agent · lost")
+            streq(e_(t, 1).text, "[background agent a2 lost: process ended]")
+        }
+        spec.it("background bash shows command and elapsed time until its result arrives") callback {
+            t = transcript.new()
+            transcript.start_run(t, "tools.bash({})")
+            transcript.progress(t, agent_tree.new_agent("b1", "sleep 2\necho done", run: 1, kind: BK_BASH, background: 1, elapsed_ms: 1200))
+            transcript.end_run(t, true, "started", 100, none_())
+            streq(e_(t, 0).label, "Run · b1 running")
+            transcript.toggle_all(t)
+            streq(row_(e_(t, 0), 0), "  └─ b1 bash sleep 2 echo done · 1s · running")
+            transcript.background_result(t, BK_BASH, "b1", true, "{\"exit_code\":0,\"output\":\"done\\n\"}")
+            streq(e_(t, 0).label, "Run")
+            streq(e_(t, 1).label, "b1 bash · completed · exit 0")
+            transcript.toggle(t, 1)
+            streq(seg_text_(e_(t, 1), 3), "{\"exit_code\":0,\"output\":\"done\\n\"}")
+        }
+        spec.it("restored background bash uses its persisted kind") callback {
+            t = transcript.new()
+            h = msgs_()
+            push_(h, bg_msg_("[background bash b1 finished]\n{\"exit_code\":0,\"output\":\"ready\"}", "bash", "b1", ""))
+            transcript.add_history(t, h)
+            streq(e_(t, 0).label, "b1 bash · completed · exit 0")
+            h2 = msgs_()
+            push_(h2, bg_msg_("[background bash b2 finished]\n{\"exit_code\":1,\"output\":\"failed\"}", "bash", "b2", ""))
+            transcript.add_history(t, h2)
+            streq(e_(t, 1).label, "b2 bash · failed · exit 1")
+            h3 = msgs_()
+            push_(h3, bg_msg_("[background bash b3 finished]\n{\"output\":\"partial", "bash", "b3", "true"))
+            transcript.add_history(t, h3)
+            streq(e_(t, 2).label, "b3 bash · completed")
+        }
+        spec.it("runs fold to one line until expanded") callback {
+            win = surf_win_(60, 24)
+            t = transcript.new()
+            transcript.start_run(t, "const a = await tools.bash({});\nconst b = await tools.bash({});\nawait tools.read({})")
+            transcript.end_run(t, true, "line 1\nline 2", 1234, none_())
+            e = e_(t, 0)
+            spec.assert_eq(entry.height(e, win), 1, "folded height")
+            streq(seg_text_(e, 2), "Run")
+            transcript.toggle_all(t)
+            spec.assert_eq(entry.height(e, win), 10, "open height")
+        }
+        spec.it("entry height cache reuses measurements and invalidates on width or append") callback {
+            win = surf_win_(10, 24)
+            e = entry.new_entry(entry.KIND_ASSISTANT)
+            e.text = "1234567890"
+            spec.assert_eq(entry.height(e, win), 1, "one row")
+            e.cached_rows = 123
+            spec.assert_eq(entry.height(e, win), 123, "cached")
+            win.width = 5
+            spec.assert_eq(entry.height(e, win), 2, "narrower")
+            e.text = "${e.text}12345"
+            spec.assert_eq(entry.height(e, win), 3, "appended")
+        }
+        spec.it("thinking stays hidden in streamed and restored transcripts") callback {
+            t = transcript.new()
+            transcript.append_delta(t, transcript.DELTA_REASONING, "think")
+            spec.assert_eq(transcript.count(t), 0, "none")
+            transcript.append_delta(t, transcript.DELTA_TEXT, "an")
+            transcript.append_delta(t, transcript.DELTA_REASONING, "more thinking")
+            transcript.append_delta(t, transcript.DELTA_TEXT, "swer")
+            spec.assert_eq(transcript.count(t), 1, "one")
+            a, _f = transcript.last_answer(t)
+            streq(a, "answer")
+            transcript.clear(t)
+            h = msgs_()
+            push_(h, user_msg_("hi"))
+            push_(h, "{\"role\":\"assistant\",\"reasoning\":{\"provider\":\"codex\",\"data\":\"[{\\\"type\\\":\\\"reasoning\\\",\\\"summary\\\":[],\\\"encrypted_content\\\":\\\"opaque\\\"}]\"}}")
+            push_(h, asst_calls_(call_("1", "tools.bash({})"), ",\"reasoning\":{\"provider\":\"chat_completions\",\"data\":\"hidden thinking\"}"))
+            push_(h, tool_msg_("1", "out", ""))
+            push_(h, "{\"role\":\"assistant\",\"content\":\"answer\",\"reasoning\":{\"provider\":\"codex\",\"data\":\"[{\\\"summary\\\":[{\\\"text\\\":\\\"hidden summary\\\"}]}]\"}}")
+            transcript.add_history(t, h)
+            spec.assert_eq(transcript.count(t), 3, "three")
+            a2, _f2 = transcript.last_answer(t)
+            streq(a2, "answer")
+            streq(e_(t, 1).output, "out")
+            spec.assert_eq(e_(t, 1).run, entry.RUN_OK, "ok")
+        }
+        spec.it("restored waiting replies are notices rather than answers") callback {
+            t = transcript.new()
+            h = msgs_()
+            push_(h, "{\"role\":\"assistant\",\"content\":\"Waiting.\",\"waiting\":true}")
+            transcript.add_history(t, h)
+            spec.assert_eq(e_(t, 0).kind, entry.KIND_INFO, "info")
+            _a, found = transcript.last_answer(t)
+            spec.assert_false(found, "no answer")
+        }
+        spec.it("Run and background titles use the normal foreground while summaries stay dim") callback {
+            surf = screen.surface(60, 8)
+            win = screen.window(surf)
+            t = transcript.new()
+            transcript.start_run(t, "await tools.edit({})")
+            transcript.end_run(t, true, "", 300, one_change_("src/a.zig", 1, 1, " keep\n-old\n+new\n"))
+            e = e_(t, 0)
+            entry.draw(e, win, true)
+            streq(cell_(win, 2, 0).grapheme, "R")
+            spec.assert_false(dim_(cell_(win, 2, 0)), "title not dim")
+            spec.assert_true(dim_(cell_(win, 2, 1)), "summary dim")
+            b = entry.new_entry(entry.KIND_BACKGROUND)
+            b.run = entry.RUN_FAILED
+            b.label = "b1 failed"
+            shown = entry.segments(b)
+            spec.assert_eq(screen.color_value(shown[0].style.fg), 1, "red")
+            spec.assert_false(screen.has_attr(shown[1].style, screen.DIM), "label not dim")
+        }
+        spec.it("a Run shows changed files in its summary and a colored diff when open") callback {
+            win = surf_win_(60, 24)
+            t = transcript.new()
+            transcript.start_run(t, "await tools.edit({})")
+            cs = list.list_new()
+            list.list_add_raw(cs, changes_("src/a.zig", 1, 1, 0, " keep\n-old\n+new\n"))
+            list.list_add_raw(cs, changes_("b.md", 1, 0, 1, "+hi\n"))
+            transcript.end_run(t, true, "", 300, turn_changes.change_text_new(cs))
+            e = e_(t, 0)
+            streq(e.label, "Run")
+            spec.assert_eq(entry.height(e, win), 2, "folded height")
+            transcript.toggle_all(t)
+            shown = entry.segments(e)
+            streq(shown[8].text, "-old\n")
+            spec.assert_eq(screen.color_value(shown[8].style.fg), 1, "red")
+            streq(shown[11].text, "+hi\n")
+            spec.assert_eq(entry.height(e, win), 13, "open height")
+            many = list.list_new()
+            for i in 0..3 { list.list_add_raw(many, changes_("x", 2, 1, 0, "")) }
+            text = turn_changes.change_text_new(many)
+            streq(text.summary, "x +2 −1 · x +2 −1 · x +2 −1")
+        }
+        spec.it("an open Run emphasizes the changed middle of paired diff lines") callback {
+            surf = screen.surface(40, 20)
+            win = screen.window(surf)
+            t = transcript.new()
+            transcript.start_run(t, "x")
+            diff_text = "-let count = 10; // total\n+let count = 11; // total\n"
+            transcript.end_run(t, true, "", 300, one_change_("a.zig", 1, 1, diff_text))
+            transcript.toggle_all(t)
+            e = e_(t, 0)
+            shown = entry.segments(e)
+            streq(shown[7].text, "-let count = 1")
+            streq(shown[8].text, "0")
+            spec.assert_true(screen.has_attr(shown[8].style, screen.BOLD) && !screen.has_attr(shown[7].style, screen.BOLD), "bold middle")
+            spec.assert_eq(screen.color_value(shown[8].style.fg), 1, "red")
+            streq(shown[10].text, "+let count = 1")
+            streq(shown[11].text, "1")
+            spec.assert_eq(screen.color_value(shown[11].style.fg), 2, "green")
+            rows = entry.draw(e, win, true)
+            spec.assert_eq(entry.height(e, win), rows, "rows")
+            streq(cell_(win, 14, 4).grapheme, "0")
+            spec.assert_true(screen.has_attr(cell_(win, 14, 4).style, screen.BOLD), "bold cell")
+            spec.assert_false(screen.has_attr(cell_(win, 13, 4).style, screen.BOLD), "plain neighbour")
+        }
+        spec.it("agent tree stays visible folded, expanded and after Run ends") callback {
+            t = transcript.new()
+            transcript.start_run(t, "await tools.agent({prompt: 'fix it'})")
+            transcript.progress(t, agent_tree.new_agent("a1", "fix it", step: 3, tools: ["edit"], files: ["src/x.zig"]))
+            e = e_(t, 0)
+            streq(seg_text_(e, 2), "Run · running")
+            streq(seg_text_(e, 1), "")
+            transcript.toggle_all(t)
+            streq(row_(e, 0), "  └─ a1 fix it · running · step 3 · edit src/x.zig")
+            streq(e.text, seg_text_(e, 10))
+            transcript.progress(t, agent_tree.new_agent("a1", "fix it", `state`: agent_tree.PS_DONE, step: 3, tools: ["edit"], files: ["src/x.zig"]))
+            transcript.end_run(t, true, "done", 1234, none_())
+            streq(seg_text_(e, 2), "Run")
+            streq(seg_text_(e, 1), "")
+            streq(seg_text_(e, 8), "done")
+            streq(row_(e, 0), "  └─ a1 fix it · completed · step 3 · edit src/x.zig")
+            transcript.progress(t, agent_tree.new_agent("a1", "late"))
+            streq(e.label, "Run")
+        }
+        spec.it("multiple child progress keeps creation order, is replaced and summed without double counting cache") callback {
+            t = transcript.new()
+            transcript.start_run(t, "await Promise.all([tools.agent({}), tools.agent({}), tools.agent({})])")
+            transcript.progress(t, agent_tree.new_agent("a3", "third", step: 1))
+            transcript.progress(t, agent_tree.new_agent("a1", "first", step: 2, `state`: agent_tree.PS_DONE, tools: ["read"]))
+            transcript.progress(t, agent_tree.new_agent("a2", "second", step: 3, tools: ["edit"], files: ["a.zig"]))
+            e = e_(t, 0)
+            streq(seg_text_(e, 2), "Run · running")
+            transcript.toggle_all(t)
+            spec.assert_eq(e.agent_tree.rows.len, 3, "three rows")
+            streq(row_(e, 0), "  ├─ a3 third · running · step 1")
+            streq(row_(e, 1), "  ├─ a1 first · completed · step 2 · read")
+            streq(row_(e, 2), "  └─ a2 second · running · step 3 · edit a.zig")
+            transcript.progress(t, agent_tree.new_agent("a3", "third", `state`: agent_tree.PS_TIMED_OUT, step: 1))
+            spec.assert_eq(e.agents.len, 3, "still three")
+            streq(e.label, "Run · a3 timed out · running")
+            transcript.end_run(t, true, "out", 9000, none_())
+            streq(e.label, "Run · a3 timed out")
+        }
+        spec.it("child prompt preview uses forty Unicode characters and one logical line") callback {
+            t = transcript.new()
+            transcript.start_run(t, "tools.agent({})")
+            cjk = "中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中"
+            prompt = "${cjk}\nnot shown"
+            transcript.progress(t, agent_tree.new_agent("a1", prompt, `state`: agent_tree.PS_QUEUED))
+            e = e_(t, 0)
+            streq(row_(e, 0), "  └─ a1 ${cjk}  · queued · step 0")
+            e.has_cached = 1
+            e.cached_width = 80
+            e.cached_len = string.length(e.text)
+            e.cached_open = 0
+            e.cached_rows = 10
+            transcript.progress(t, agent_tree.new_agent("a1", prompt, `state`: agent_tree.PS_WORKING))
+            spec.assert_eq(e.has_cached, 0, "cache dropped")
+        }
+        spec.it("user cards tint wrapped rows, retain terminal foreground and leave gaps unstyled") callback {
+            surf = screen.surface(18, 8)
+            win = screen.window(surf)
+            t = transcript.new()
+            transcript.add(t, entry.KIND_USER, "hello world message\n第二行")
+            en = e_(t, 0)
+            en.user_bg = screen.color_rgb(15, 20, 28)
+            height = entry.height(en, win)
+            spec.assert_true(height >= 3, "height >= 3")
+            spec.assert_eq(entry.draw(en, win, true), height, "draw rows")
+            for row in 0..height {
+                streq(cell_(win, 0, row).grapheme, "▎")
+                spec.assert_eq(cell_(win, 17, row).style.bg, en.user_bg, "tint row ${row}")
+                body = cell_(win, 2, row)
+                spec.assert_eq(body.style.fg, screen.DEFAULT, "default fg")
+                spec.assert_false(screen.has_attr(body.style, screen.BOLD), "not bold")
+            }
+            streq(cell_(win, 2, 0).grapheme, "h")
+            streq(cell_(win, 1, 0).grapheme, " ")
+            spec.assert_eq(cell_(win, 0, height).style.bg, screen.DEFAULT, "gap unstyled")
+            screen.clear(win)
+            entry.draw(en, screen.child(win, y_off: -1, height: height), true)
+            streq(cell_(win, 0, 0).grapheme, "▎")
+            spec.assert_eq(cell_(win, 0, height - 1).style.bg, screen.DEFAULT, "clipped row unstyled")
+        }
+        spec.it("long user messages fold live and replayed, truncate the first line, and expand") callback {
+            surf = screen.surface(30, 12)
+            win = screen.window(surf)
+            t = transcript.new()
+            raw = "a very long first line that must be clipped\n2\n3\n4\n5\n6"
+            transcript.add(t, entry.KIND_USER, raw)
+            e = e_(t, 0)
+            spec.assert_eq(entry.height(e, win), 1, "folded")
+            entry.draw(e, win, true)
+            streq(cell_(win, 28, 0).grapheme, "s")
+            spec.assert_true(dim_(cell_(win, 28, 0)), "dim suffix")
+            transcript.toggle_all(t)
+            spec.assert_true(entry.height(e, win) > 5, "expanded")
+            transcript.clear(t)
+            h = msgs_()
+            push_(h, user_msg_(raw))
+            transcript.add_history(t, h)
+            e2 = e_(t, 0)
+            spec.assert_eq(entry.height(e2, win), 1, "replayed folded")
+            transcript.toggle_all(t)
+            spec.assert_true(entry.height(e2, win) > 5, "replayed expanded")
+            transcript.add(t, entry.KIND_USER, raw)
+            spec.assert_eq(e_(t, 1).open, 0, "new one closed")
+            spec.assert_eq(entry.height(e_(t, 1), win), 1, "new one folded")
+            xs800 = ""
+            for i in 0..800 { xs800 = "${xs800}x" }
+            transcript.add(t, entry.KIND_USER, "${xs800}x")
+            spec.assert_eq(entry.height(e_(t, 2), win), 1, "801 chars folds")
+            transcript.add(t, entry.KIND_USER, xs800)
+            spec.assert_true(entry.height(e_(t, 3), win) > 1, "800 chars wraps")
+        }
+        spec.it("bills stay dim and one row when resized or expanded") callback {
+            surf = screen.surface(120, 3)
+            win = screen.window(surf)
+            t = transcript.new()
+            full = bill.format_footer(turn_summary.new("completed", 12, turn_summary.usage(), turn_summary.timing(190000, 0, 0, 0, 0, 8, 1)), 2, 120)
+            transcript.add(t, entry.KIND_BILL, full)
+            en = e_(t, 0)
+            widths = [120, 40, 8, 1, 0, 120]
+            for wi in 0..widths.len {
+                width = widths[wi]
+                win.width = width
+                screen.clear(win)
+                transcript.toggle_all(t)
+                spec.assert_eq(entry.height(en, win), 1, "height at ${width}")
+                spec.assert_eq(entry.draw(en, win, true), 1, "draw at ${width}")
+                expected = bill.fit(full, width)
+                col = 0
+                off = 0
+                while off < string.length(expected) {
+                    n = screen.codepoint_len(expected, off)
+                    cell = cell_(win, col, 0)
+                    streq(cell.grapheme, string.substring(expected, off, off + n))
+                    spec.assert_true(dim_(cell), "dim")
+                    col = col + 1
+                    off = off + n
+                }
+                for x in 0..120 {
+                    c, _o = screen.read_cell(surf, x, 1)
+                    streq(c.grapheme, " ")
+                }
+            }
+        }
+        spec.it("queued users have a dim marker until their insertion event") callback {
+            t = transcript.new()
+            transcript.add(t, entry.KIND_USER, "first")
+            e_(t, 0).queued = 1
+            transcript.add(t, entry.KIND_USER, "second")
+            e_(t, 1).queued = 2
+            queued = entry.segments(e_(t, 0))
+            streq(queued[2].text, " · queued")
+            spec.assert_true(screen.has_attr(queued[2].style, screen.DIM), "dim")
+            win = surf_win_(10, 24)
+            entry.height(e_(t, 0), win)
+            transcript.user_inserted(t, 1)
+            spec.assert_eq_long(e_(t, 0).queued, -1, "not queued")
+            spec.assert_eq(e_(t, 0).has_cached, 0, "cache dropped")
+            spec.assert_eq(seg_count_(e_(t, 0)), 2, "two segments")
+            transcript.remove_queued(t)
+            spec.assert_eq(transcript.count(t), 1, "one left")
+            streq(e_(t, 0).text, "first")
+        }
+        spec.it("Run retains effort metadata without exposing it in the title") callback {
+            t = transcript.new()
+            efforts = ["low", "high", "default"]
+            for i in 0..efforts.len {
+                transcript.start_run_with_effort(t, "tools.edit({})", efforts[i])
+                e = e_(t, transcript.count(t) - 1)
+                streq(e.step_effort, efforts[i])
+                spec.assert_eq(e.has_step_effort, 1, "has effort")
+                streq(e.label, "Run · running")
+                ct = none_()
+                ct.summary = "a.zig +1 −0"
+                transcript.end_run(t, true, "output", 1234, ct)
+                streq(e.label, "Run")
+                streq(e.changes.summary, "a.zig +1 −0")
+            }
+        }
+        spec.it("history Run effort is copied from assistant metadata and absent in legacy history") callback {
+            t = transcript.new()
+            calls = call_("1", "tools.bash({})")
+            h = msgs_()
+            push_(h, asst_calls_(calls, ",\"step_effort\":{\"effort\":\"high\"}"))
+            push_(h, tool_msg_("1", "out", ""))
+            push_(h, asst_calls_(calls, ""))
+            push_(h, tool_msg_("1", "out", ""))
+            transcript.add_history(t, h)
+            streq(e_(t, 0).step_effort, "high")
+            spec.assert_eq(e_(t, 1).has_step_effort, 0, "legacy has none")
+            entry.refresh_label(e_(t, 0))
+            streq(e_(t, 0).label, "Run")
+            streq(e_(t, 1).label, "Run")
+        }
+        spec.it("agent rows have stable heights across folding resizing completion and scrolling") callback {
+            surf = screen.surface(100, 12)
+            win = screen.window(surf)
+            t = transcript.new()
+            transcript.start_run(t, "await tools.agent({})")
+            transcript.progress(t, agent_tree.new_agent("a2", "second", step: 3))
+            transcript.progress(t, agent_tree.new_agent("a1", "first", `state`: agent_tree.PS_DONE, step: 2))
+            e = e_(t, 0)
+            cols = [100, 48, 20, 1, 100]
+            for ci in 0..cols.len {
+                win.width = cols[ci]
+                spec.assert_eq(entry.height(e, win), 3, "height")
+                spec.assert_eq(entry.draw(e, win, false), 3, "draw")
+            }
+            entry.draw(e, win, true)
+            streq(cell_(win, 2, 1).grapheme, "├")
+            streq(cell_(win, 2, 2).grapheme, "└")
+            streq(cell_(win, 0, 3).grapheme, " ")
+            transcript.toggle_all(t)
+            spec.assert_eq(entry.height(e, win), 9, "open height")
+            entry.draw(e, win, true)
+            streq(cell_(win, 0, 3).grapheme, "C")
+            transcript.progress(t, agent_tree.new_agent("a2", "second", `state`: agent_tree.PS_FAILED, step: 4, tools: ["bash"]))
+            spec.assert_eq(entry.height(e, win), 9, "after failure")
+            transcript.end_run(t, true, "result", 2000, none_())
+            spec.assert_eq(entry.height(e, win), 9, "after end")
+            entry.draw(e, win, true)
+            streq(cell_(win, 0, 5).grapheme, "R")
+            streq(row_(e, 0), "  ├─ a2 second · failed · step 4 · bash")
+            transcript.toggle_all(t)
+            spec.assert_eq(entry.height(e, win), 3, "folded again")
+            screen.clear(win)
+            entry.draw(e, screen.child(win, y_off: -1), true)
+            streq(cell_(win, 2, 0).grapheme, "├")
+            streq(cell_(win, 2, 1).grapheme, "└")
+            streq(cell_(win, 0, 2).grapheme, " ")
+            transcript.start_run(t, "1 + 1")
+            spec.assert_eq(entry.height(e_(t, 1), win), 1, "second run")
+            spec.assert_eq(entry.height(e_(t, 0), win), 3, "first run")
+        }
+        spec.it("completed Run replaces source estimate with dispatched host tools") callback {
+            t = transcript.new()
+            transcript.start_run(t, "await tools.edit({new_text: 'tools.llm( tools.llm( tools.write('}); await tools.bash({})")
+            streq(e_(t, 0).label, "Run · running")
+            run = timing.new()
+            add_call_(run, "edit", 1, 1, 0)
+            add_call_(run, "llm", 0, 0, 0)
+            add_call_(run, "bash", 0, 1, 0)
+            summary = tool_summary.init(run, 0, 0)
+            transcript.end_run_with_summary(t, false, "failed bash", 200, none_(), summary as ptr)
+            streq(e_(t, 0).label, "Run · edit · bash")
+        }
+        spec.it("completed Run includes omitted calls without guessing their names") callback {
+            t = transcript.new()
+            run = timing.new()
+            for i in 0..203 { timing.reserve(run, "read") }
+            transcript.start_run(t, "for (;;) tools.read({}); tools.llm({})")
+            summary = tool_summary.init(run, 0, timing.omitted(run))
+            transcript.end_run_with_summary(t, true, "done", 0, none_(), summary as ptr)
+            streq(e_(t, 0).label, "Run · read ×200 · +3")
+            only = tool_summary.empty()
+            only.omitted = 3
+            streq(label.actual_tool_summary(only, 0), "+3")
+        }
+        spec.it("empty actual summary does not fall back to source text") callback {
+            t = transcript.new()
+            transcript.start_run(t, "// tools.llm({})")
+            transcript.end_run_with_summary(t, true, "done", 0, none_(), tool_summary.empty() as ptr)
+            streq(e_(t, 0).label, "Run")
+        }
+        spec.it("restored Run summaries follow run_index and tool_call_id and survive compaction") callback {
+            // partial: summaries ride on the messages (see the header)
+            t = transcript.new()
+            h = msgs_()
+            push_(h, asst_calls_("${call_("first", "tools.llm({})")},${call_("second", "tools.agent({})")}", ""))
+            push_(h, tool_msg_("first", "first output", ",\"tool_summary\":{\"counts\":[{\"name\":\"edit\",\"count\":1}],\"omitted\":2,\"files\":[]}"))
+            push_(h, tool_msg_("second", "second output", ",\"tool_summary\":{\"counts\":[{\"name\":\"bash\",\"count\":2}],\"omitted\":3,\"files\":[]}"))
+            transcript.add_history(t, h)
+            streq(e_(t, 0).label, "Run · edit · +2")
+            streq(e_(t, 1).label, "Run · bash ×2 · +3")
+            streq(e_(t, 0).output, "first output")
+            streq(e_(t, 1).output, "second output")
+        }
+        spec.it("legacy logs without tool facts keep a plain Run title") callback {
+            t = transcript.new()
+            h = msgs_()
+            push_(h, asst_calls_(call_("old", "tools.llm({}); tools.llm({})"), ""))
+            push_(h, tool_msg_("old", "done", ""))
+            transcript.add_history(t, h)
+            streq(e_(t, 0).label, "Run")
+        }
+        spec.it("legacy Step overflow is not attributed to a pure JS Run") callback {
+            // partial: one pass over the message form (see the header)
+            t = transcript.new()
+            h = msgs_()
+            push_(h, asst_calls_("${call_("first", "for (;;) tools.read({})")},${call_("second", "1+1")}", ",\"step_calls_omitted\":3"))
+            push_(h, tool_msg_("first", "first output", ",\"tool_summary\":{\"counts\":[{\"name\":\"read\",\"count\":200}],\"omitted\":0,\"files\":[]}"))
+            push_(h, tool_msg_("second", "second output", ""))
+            transcript.add_history(t, h)
+            streq(e_(t, 0).label, "Run · read ×200")
+            streq(e_(t, 1).label, "Run")
+            streq(e_(t, 2).text, "tools +3 · omitted calls (Run unknown)")
+        }
+        spec.it("endRun summary cloning failures release owned data") callback {
+            // adapted: no allocation failures to inject; the call completes and labels
+            t = transcript.new()
+            transcript.start_run(t, "tools.llm({})")
+            s = tool_summary.empty()
+            c = heap.new(tool_summary.Count)
+            c.name = "read"
+            c.count = 1
+            list.list_add(s.counts, c as ptr)
+            transcript.end_run_with_summary(t, true, "done", 0, none_(), s as ptr)
+            streq(e_(t, 0).label, "Run · read")
+            transcript.clear(t)
+            spec.assert_eq(transcript.count(t), 0, "cleared")
+        }
+        spec.it("mixed ids replace in creation order and settle only when delivered") callback {
+            t = transcript.new()
+            transcript.start_run(t, "Promise.all([tools.agent({}), tools.bash({}), tools.agent({})])")
+            transcript.progress(t, agent_tree.new_agent("a10", "first", run: 1, step: 1))
+            transcript.progress(t, agent_tree.new_agent("b2", "echo ready", run: 1, kind: BK_BASH, background: 1, `state`: agent_tree.PS_DONE, elapsed_ms: 192000))
+            transcript.progress(t, agent_tree.new_agent("a2", "last", run: 1, background: 1, `state`: agent_tree.PS_FAILED, step: 2))
+            transcript.progress(t, agent_tree.new_agent("a10", "updated", run: 1, step: 3))
+            spec.assert_eq(e_(t, 0).agents.len, 3, "three")
+            streq(agent_(e_(t, 0), 0).id, "a10")
+            streq(agent_(e_(t, 0), 1).id, "b2")
+            streq(agent_(e_(t, 0), 2).id, "a2")
+            streq(row_(e_(t, 0), 0), "  ├─ a10 updated · running · step 3")
+            streq(row_(e_(t, 0), 1), "  ├─ b2 bash echo ready · 3m12s · waiting")
+            streq(row_(e_(t, 0), 2), "  └─ a2 last · failed · step 2")
+            transcript.end_run(t, true, "started", 100, none_())
+            transcript.start_run(t, "tools.read({})")
+            transcript.progress(t, agent_tree.new_agent("b2", "echo ready", kind: BK_BASH, background: 1, `state`: agent_tree.PS_DONE, elapsed_ms: 192000))
+            spec.assert_eq(e_(t, 1).agents.len, 0, "not in the second run")
+            transcript.background_result(t, BK_BASH, "b2", true, "{\"exit_code\":0,\"output\":\"ready\"}")
+            streq(row_(e_(t, 0), 1), "  ├─ b2 bash echo ready · 3m12s · completed")
+            spec.assert_eq(agent_(e_(t, 0), 2).background, 1, "a2 still background")
+            transcript.lost_background(t, BK_AGENT, "a2", "[background agent a2 lost: process ended]")
+            streq(row_(e_(t, 0), 2), "  └─ a2 last · failed · step 2")
+            transcript.progress(t, agent_tree.new_agent("a2", "last", run: 1, background: 1, `state`: agent_tree.PS_DONE, step: 4))
+            spec.assert_eq(agent_(e_(t, 0), 2).background, 0, "a2 settled")
+            streq(row_(e_(t, 0), 2), "  └─ a2 last · failed · step 4")
+            streq(e_(t, 2).label, "b2 bash · completed · exit 0")
+            streq(e_(t, 3).label, "a2 agent · lost")
+        }
+        spec.it("live and restored mixed results have identical folded labels and complete details") callback {
+            live = transcript.new()
+            restored = transcript.new()
+            bash_result = "{\"exit_code\":0,\"output\":\"ready\\nmore output\"}"
+            agent_result = "{\"ok\":false,\"text\":\"failed to build\",\"error\":\"compiler error\"}"
+            lost = "[background agent a10 lost: process ended]"
+            transcript.background_result(live, BK_BASH, "b2", true, bash_result)
+            transcript.background_result(live, BK_AGENT, "a2", false, agent_result)
+            transcript.lost_background(live, BK_AGENT, "a10", lost)
+            h = msgs_()
+            push_(h, bg_msg_("[background bash b2 finished]\n${bash_result}", "bash", "b2", ""))
+            push_(h, bg_msg_("[background agent a2 finished]\n${agent_result}", "agent", "a2", ""))
+            push_(h, bg_msg_(lost, "agent", "a10", ""))
+            transcript.add_history(restored, h)
+            labels = ["b2 bash · completed · exit 0", "a2 agent · failed", "a10 agent · lost"]
+            fulls = [bash_result, agent_result, lost]
+            for i in 0..3 {
+                a = e_(live, i)
+                b = e_(restored, i)
+                streq(a.label, labels[i])
+                streq(b.label, labels[i])
+                mark = "✗ "
+                if i == 0 { mark = "✓ " } else if i == 2 { mark = "! " }
+                streq(seg_text_(a, 0), mark)
+                streq(seg_text_(a, 0), seg_text_(b, 0))
+                spec.assert_eq(seg_count_(b), 2, "folded")
+            }
+            transcript.toggle_all(live)
+            transcript.toggle_all(restored)
+            for i in 0..3 {
+                spec.assert_eq(seg_count_(e_(restored, i)), 4, "open")
+                streq(seg_text_(e_(live, i), 3), fulls[i])
+                streq(seg_text_(e_(restored, i), 3), fulls[i])
+            }
+        }
+        spec.it("delivered failures retain terminal cancellation and timeout states") callback {
+            t = transcript.new()
+            transcript.start_run(t, "tools.agent({})")
+            transcript.progress(t, agent_tree.new_agent("a1", "canceled", run: 1, background: 1, `state`: agent_tree.PS_CANCELED))
+            transcript.progress(t, agent_tree.new_agent("a2", "timed out", run: 1, background: 1, `state`: agent_tree.PS_TIMED_OUT))
+            transcript.background_result(t, BK_AGENT, "a1", false, "{}")
+            transcript.background_result(t, BK_AGENT, "a2", false, "{}")
+            streq(row_(e_(t, 0), 0), "  ├─ a1 canceled · canceled · step 0")
+            streq(row_(e_(t, 0), 1), "  └─ a2 timed out · timed out · step 0")
+        }
+        spec.it("session IDs route progress across repeated Turn Run numbers and late terminal events") callback {
+            t = transcript.new()
+            transcript.start_run(t, "tools.agent({})")
+            transcript.progress(t, agent_tree.new_agent("a1", "first", run: 1, `state`: agent_tree.PS_DONE))
+            transcript.end_run(t, true, "done", 10, none_())
+            t.next_run = 0
+            transcript.start_run(t, "tools.agent({background:true})")
+            transcript.progress(t, agent_tree.new_agent("a2", "second", run: 1, background: 1))
+            spec.assert_eq(e_(t, 0).agents.len, 1, "first run one")
+            streq(agent_(e_(t, 1), 0).id, "a2")
+            transcript.progress(t, agent_tree.new_agent("b1", "sleep 30", run: 1, kind: BK_BASH, elapsed_ms: 4000))
+            transcript.end_run(t, false, "stop", 4000, none_())
+            transcript.progress(t, agent_tree.new_agent("b1", "sleep 30", run: 1, kind: BK_BASH, elapsed_ms: 4100, `state`: agent_tree.PS_CANCELED))
+            streq(row_(e_(t, 1), 1), "  └─ b1 bash sleep 30 · 4s · canceled")
+        }
+        spec.it("background failures without output preview the error and keep complete JSON") callback {
+            t = transcript.new()
+            result = "{\"error\":\"timed out after 4000 ms\"}"
+            transcript.background_result(t, BK_BASH, "b1", false, result)
+            streq(e_(t, 0).label, "b1 bash · timed out")
+            streq(e_(t, 0).text, result)
+        }
+        spec.it("foreground agent reuse creates a new Run row and late progress stays in the old tree") callback {
+            t = transcript.new()
+            transcript.start_run(t, "tools.agent({})")
+            transcript.progress(t, agent_tree.new_agent("a1", "first", run: 1, `state`: agent_tree.PS_DONE, step: 2))
+            transcript.end_run(t, true, "done", 100, none_())
+            transcript.start_run(t, "tools.agent({resume:'a1'})")
+            transcript.progress(t, agent_tree.new_agent("a1", "resume", run: 2, step: 1))
+            spec.assert_eq(e_(t, 0).agents.len, 1, "old")
+            spec.assert_eq(e_(t, 1).agents.len, 1, "new")
+            streq(row_(e_(t, 0), 0), "  └─ a1 first · completed · step 2")
+            streq(row_(e_(t, 1), 0), "  └─ a1 resume · running · step 1")
+            transcript.progress(t, agent_tree.new_agent("a1", "first", run: 1, `state`: agent_tree.PS_DONE, step: 3))
+            streq(row_(e_(t, 0), 0), "  └─ a1 first · completed · step 3")
+            streq(row_(e_(t, 1), 0), "  └─ a1 resume · running · step 1")
+            transcript.progress(t, agent_tree.new_agent("a1", "resume", run: 2, `state`: agent_tree.PS_DONE, step: 4))
+            streq(row_(e_(t, 1), 0), "  └─ a1 resume · completed · step 4")
+        }
+        spec.it("delivered background agent results do not settle foreground or background reuse") callback {
+            flags = [0, 1]
+            for fi in 0..2 {
+                background = flags[fi]
+                t = transcript.new()
+                transcript.start_run(t, "tools.agent({background:true})")
+                transcript.progress(t, agent_tree.new_agent("a1", "first", run: 1, background: 1, `state`: agent_tree.PS_DONE, step: 2))
+                transcript.end_run(t, true, "started", 100, none_())
+                transcript.background_result(t, BK_AGENT, "a1", false, "{}")
+                transcript.start_run(t, "tools.agent({resume:'a1'})")
+                transcript.progress(t, agent_tree.new_agent("a1", "resume", run: 2, background: background, step: 1))
+                streq(row_(e_(t, 0), 0), "  └─ a1 first · failed · step 2")
+                spec.assert_eq(e_(t, 2).agents.len, 1, "one")
+                spec.assert_eq(agent_(e_(t, 2), 0).`state`, agent_tree.PS_WORKING, "working")
+                spec.assert_eq(agent_(e_(t, 2), 0).background, background, "background kept")
+                transcript.progress(t, agent_tree.new_agent("a1", "first", run: 1, background: 1, `state`: agent_tree.PS_DONE, step: 3))
+                streq(row_(e_(t, 0), 0), "  └─ a1 first · failed · step 3")
+                spec.assert_eq(agent_(e_(t, 0), 0).background, 0, "settled")
+                spec.assert_eq(agent_(e_(t, 2), 0).step, 1, "step")
+                spec.assert_eq(agent_(e_(t, 2), 0).`state`, agent_tree.PS_WORKING, "still working")
+                if background == 1 {
+                    transcript.background_result(t, BK_AGENT, "a1", true, "{}")
+                    transcript.progress(t, agent_tree.new_agent("a1", "resume", run: 2, background: 1, step: 4))
+                    streq(row_(e_(t, 2), 0), "  └─ a1 resume · completed · step 4")
+                    spec.assert_eq(agent_(e_(t, 2), 0).background, 0, "settled resume")
+                    streq(row_(e_(t, 0), 0), "  └─ a1 first · failed · step 3")
+                }
+            }
+        }
+        spec.it("delayed background results settle only the oldest undelivered invocation of a reused ID") callback {
+            t = transcript.new()
+            transcript.start_run(t, "tools.agent({background:true})")
+            transcript.progress(t, agent_tree.new_agent("a1", "first", run: 1, background: 1, `state`: agent_tree.PS_DONE, step: 2))
+            transcript.end_run(t, true, "started", 100, none_())
+            transcript.start_run(t, "tools.agent({resume:'a1',background:true})")
+            transcript.progress(t, agent_tree.new_agent("a1", "resume", run: 2, background: 1, step: 1))
+            transcript.end_run(t, true, "started", 100, none_())
+            transcript.background_result(t, BK_AGENT, "a1", false, "{}")
+            spec.assert_eq(agent_(e_(t, 0), 0).background, 0, "first settled")
+            spec.assert_eq(agent_(e_(t, 1), 0).background, 1, "second pending")
+            spec.assert_eq(agent_(e_(t, 1), 0).`state`, agent_tree.PS_WORKING, "second working")
+            transcript.progress(t, agent_tree.new_agent("a1", "first", run: 1, background: 1, `state`: agent_tree.PS_DONE, step: 3))
+            streq(row_(e_(t, 0), 0), "  └─ a1 first · failed · step 3")
+            streq(row_(e_(t, 1), 0), "  └─ a1 resume · running · step 1")
+            transcript.background_result(t, BK_AGENT, "a1", true, "{}")
+            streq(row_(e_(t, 1), 0), "  └─ a1 resume · completed · step 1")
+            streq(row_(e_(t, 0), 0), "  └─ a1 first · failed · step 3")
+            transcript.progress(t, agent_tree.new_agent("a1", "resume", run: 2, background: 1, `state`: agent_tree.PS_DONE, step: 5))
+            streq(row_(e_(t, 1), 0), "  └─ a1 resume · completed · step 5")
+        }
+        spec.it("restored background results cannot settle a reused ID in a new Run") callback {
+            t = transcript.new()
+            h = msgs_()
+            push_(h, bg_msg_("[background agent a1 finished]\n{\"ok\":true}", "agent", "a1", ""))
+            transcript.add_history(t, h)
+            transcript.start_run(t, "tools.agent({resume:'a1',background:true})")
+            transcript.progress(t, agent_tree.new_agent("a1", "resume", run: 1, background: 1))
+            spec.assert_eq(agent_(e_(t, 1), 0).background, 1, "still background")
+            spec.assert_eq(agent_(e_(t, 1), 0).`state`, agent_tree.PS_WORKING, "working")
+            streq(row_(e_(t, 1), 0), "  └─ a1 resume · running · step 0")
+        }
+        spec.it("same Run foreground and background reuse keep invocation results separate from the latest row") callback {
+            flags = [0, 1]
+            for fi in 0..2 {
+                for si in 0..2 {
+                    first_bg = flags[fi]
+                    second_bg = flags[si]
+                    t = transcript.new()
+                    transcript.start_run(t, "reuse a1")
+                    transcript.progress(t, agent_tree.new_agent("a1", "first", invocation: 1, run: 1, background: first_bg, `state`: agent_tree.PS_DONE, step: 8))
+                    transcript.progress(t, agent_tree.new_agent("a1", "second", invocation: 2, run: 1, background: second_bg, step: 1))
+                    if first_bg == 1 { transcript.background_result(t, BK_AGENT, "a1", false, "{}") }
+                    e = e_(t, 0)
+                    spec.assert_eq(e.invocations.len, 2, "two invocations")
+                    spec.assert_eq(e.agents.len, 1, "one row")
+                    spec.assert_eq(agent_(e, 0).`state`, agent_tree.PS_WORKING, "working")
+                    spec.assert_eq(agent_(e, 0).background, second_bg, "second background")
+                    transcript.progress(t, agent_tree.new_agent("a1", "late first", invocation: 1, run: 1, background: first_bg, `state`: agent_tree.PS_FAILED, step: 9))
+                    streq(agent_(e, 0).prompt, "second")
+                    if second_bg == 1 { transcript.background_result(t, BK_AGENT, "a1", true, "{}") }
+                    transcript.progress(t, agent_tree.new_agent("a1", "second", invocation: 2, run: 1, background: second_bg, `state`: agent_tree.PS_DONE, step: 2))
+                    streq(row_(e, 0), "  └─ a1 second · completed · step 2")
+                    spec.assert_eq(agent_(e, 0).background, 0, "settled")
+                }
+            }
+        }
+        spec.it("same Run background results consume a FIFO with sticky per invocation success and failure") callback {
+            oks = [0, 1]
+            for fi in 0..2 {
+                for ri in 0..2 {
+                    first_ok = oks[fi]
+                    result_first = oks[ri]
+                    second_ok = 1 - first_ok
+                    t = transcript.new()
+                    transcript.start_run(t, "two background calls")
+                    if result_first == 1 {
+                        transcript.background_result(t, BK_AGENT, "a1", first_ok == 1, "{}")
+                        transcript.background_result(t, BK_AGENT, "a1", second_ok == 1, "{}")
+                    }
+                    transcript.progress(t, agent_tree.new_agent("a1", "first", invocation: 11, run: 1, background: 1, `state`: agent_tree.PS_DONE))
+                    transcript.progress(t, agent_tree.new_agent("a1", "second", invocation: 12, run: 1, background: 1, `state`: agent_tree.PS_DONE))
+                    if result_first == 0 {
+                        transcript.background_result(t, BK_AGENT, "a1", first_ok == 1, "{}")
+                        spec.assert_eq(agent_(e_(t, 0), 0).background, 1, "still pending")
+                        transcript.background_result(t, BK_AGENT, "a1", second_ok == 1, "{}")
+                    }
+                    inv0 = e_(t, 0).invocations[0] as *entry.Invocation
+                    inv1 = e_(t, 0).invocations[1] as *entry.Invocation
+                    spec.assert_eq(inv0.result, first_ok, "first result")
+                    spec.assert_eq(inv1.result, second_ok, "second result")
+                    transcript.progress(t, agent_tree.new_agent("a1", "late first", invocation: 11, run: 1, background: 1, `state`: agent_tree.PS_DONE, step: 99))
+                    transcript.progress(t, agent_tree.new_agent("a1", "second", invocation: 12, run: 1, background: 1, `state`: agent_tree.PS_DONE, step: 3))
+                    row = agent_(e_(t, 0), 0)
+                    spec.assert_eq(row.invocation, 12, "invocation")
+                    spec.assert_eq(row.step, 3, "step")
+                    want = agent_tree.PS_DONE
+                    if first_ok == 1 { want = agent_tree.PS_FAILED }
+                    spec.assert_eq(row.`state`, want, "state")
+                    spec.assert_eq(row.background, 0, "settled")
+                    spec.assert_eq(t.pending_results.len, 0, "no pending")
+                }
+            }
+        }
+        spec.it("two coalesced background invocations in one drain register before ID only results settle") callback {
+            t = transcript.new()
+            transcript.start_run(t, "background then resume in one Run")
+            q = progress.new()
+            progress.set_sink(q, t as ptr, |ctx: ptr, json: string| {
+                tt = ctx as *transcript.Transcript
+                transcript.progress(tt, agent_tree.from_json(json))
+            })
+            id = progress.add(q, "agent", "first", 1, 1)
+            first = progress.current_invocation(q, id)
+            u1 = progress.new_value(id, "agent", "first", 1)
+            p1 = u1 as *progress.Progress
+            p1.invocation = first
+            p1.background = 1
+            p1.state = "done"
+            progress.update(q, u1)
+            r = progress.new_value(id, "agent", "second", 1)
+            p2 = r as *progress.Progress
+            p2.background = 1
+            p2.state = "queued"
+            progress.restart(q, r)
+            second = progress.current_invocation(q, id)
+            u2 = progress.new_value(id, "agent", "second", 1)
+            p3 = u2 as *progress.Progress
+            p3.invocation = second
+            p3.background = 1
+            p3.state = "failed"
+            progress.update(q, u2)
+            transcript.background_result(t, BK_AGENT, id, true, "{}")
+            progress.drain(q)
+            e = e_(t, 0)
+            spec.assert_eq(e.invocations.len, 2, "two invocations")
+            inv0 = e.invocations[0] as *entry.Invocation
+            inv1 = e.invocations[1] as *entry.Invocation
+            spec.assert_eq(inv0.result, 1, "first delivered ok")
+            spec.assert_eq(inv1.result, -1, "second pending")
+            spec.assert_eq(agent_(e, 0).background, 1, "row still background")
+            transcript.background_result(t, BK_AGENT, id, false, "{}")
+            streq(row_(e, 0), "  └─ a1 second · failed · step 0")
+            spec.assert_eq(agent_(e, 0).background, 0, "settled")
+        }
+        spec.it("automatic Run and its agent have a mixed task label") callback {
+            t = transcript.new()
+            transcript.start_run(t, "await tools.agent({prompt:'task'})")
+            transcript.progress(t, agent_tree.new_agent("a1", "task", kind: BK_AGENT))
+            transcript.progress(t, agent_tree.new_agent("r1", "Run", kind: BK_RUN, background: 1))
+            streq(e_(t, 0).label, "Run · running")
+        }
+        spec.it("background Run notifications and superseded bash stay neutral live and restored") callback {
+            t = transcript.new()
+            transcript.start_run(t, "await tools.bash({command:'check'})")
+            transcript.progress(t, agent_tree.new_agent("b1", "check", run: 1, kind: BK_BASH, background: 1))
+            transcript.background_run(t, "r3")
+            transcript.end_run(t, true, "registered", 10000, none_())
+            streq(seg_text_(e_(t, 0), 0), "  ")
+            streq(e_(t, 0).label, "Run · r3 running · b1 running")
+            transcript.background_result(t, BK_BASH, "b1", true, "{\"superseded_by\":\"b2\"}")
+            streq(e_(t, 1).label, "b1 superseded by b2")
+            streq(seg_text_(e_(t, 1), 0), "  ")
+            spec.assert_true(string.ends_with(row_(e_(t, 0), 0), "superseded by b2") != 0, "row superseded")
+            transcript.background_result(t, BK_RUN, "r3", false, "late error")
+            spec.assert_eq(transcript.count(t), 2, "no new block")
+            streq(e_(t, 0).output, "late error")
+            transcript.clear(t)
+            h = msgs_()
+            push_(h, asst_calls_(call_("call", "check"), ""))
+            push_(h, tool_msg_("call", "registered", ",\"bash_replacements\":[{\"id\":\"b1\",\"run\":1,\"state\":\"superseded\",\"superseded_by\":\"b2\"}],\"background_id\":\"r3\""))
+            push_(h, bg_msg_("[background run r3 finished]\nlate error", "run", "r3", "false"))
+            transcript.add_history(t, h)
+            streq(e_(t, 0).label, "Run · r3 failed")
+            streq(seg_text_(e_(t, 0), 0), "✗ ")
+            spec.assert_true(string.ends_with(row_(e_(t, 0), 0), "superseded by b2") != 0, "restored row superseded")
+            spec.assert_eq(transcript.count(t), 1, "one entry")
+            streq(e_(t, 0).output, "late error")
+        }
+        spec.it("elapsed heartbeats do not count as task progress and active tools show commands") callback {
+            t = transcript.new()
+            transcript.start_run(t, "await tools.bash({})")
+            p = agent_tree.new_agent("b1", "zig build test", run: 1, kind: BK_BASH, background: 1, elapsed_ms: 3000)
+            transcript.progress(t, p)
+            p.elapsed_ms = 9000
+            spec.assert_false(transcript.progress_changed(t, p), "heartbeat")
+            p.output_bytes = 10
+            spec.assert_true(transcript.progress_changed(t, p), "output changed")
+            p.background = 0
+            transcript.progress(t, p)
+            streq(transcript.activity_detail(t, "bash"), "bash zig build test")
+        }
+        spec.it("Run facts name changed files and retain warning without changing script success") callback {
+            t = transcript.new()
+            transcript.start_run(t, "ignored source")
+            transcript.progress(t, agent_tree.new_agent("a1", "verify", `state`: agent_tree.PS_TIMED_OUT))
+            s = tool_summary.empty()
+            names = ["read", "write", "edit", "bash"]
+            counts = [3, 1, 1, 1]
+            for i in 0..4 {
+                c = heap.new(tool_summary.Count)
+                c.name = names[i]
+                c.count = counts[i]
+                list.list_add(s.counts, c as ptr)
+            }
+            f = heap.new(tool_summary.File)
+            f.tool = "read"
+            f.path = "a.zig"
+            f.duration_ms = -1
+            list.list_add(s.files, f as ptr)
+            ct = none_()
+            ct.file_count = 2
+            transcript.end_run_with_summary(t, true, "result", 10, ct, s as ptr)
+            e = e_(t, 0)
+            spec.assert_eq(e.run, entry.RUN_OK, "ok")
+            streq(e.label, "Run · a1 timed out · edit 2 files · bash")
+            streq(e.files, "read a.zig")
+            streq(seg_text_(e, 0), "! ")
+            spec.assert_eq(screen.color_value(entry.segments(e)[0].style.fg), 3, "yellow")
+        }
+        spec.it("expanded Runs retain all result lines and label bounded diffs as previews") callback {
+            t = transcript.new()
+            result = ""
+            diff_text = ""
+            for i in 0..240 {
+                result = "${result}result ${i}\n"
+                diff_text = "${diff_text}+line ${i}\n"
+            }
+            transcript.start_run(t, "script")
+            transcript.end_run(t, true, result, 1, one_change_("a", 240, 0, diff_text))
+            e = e_(t, 0)
+            streq(e.output, result)
+            streq(e.changes.preview, "Diff preview · 60 of 241 lines\n")
+            spec.assert_true(string.contains(e.changes.diff, "more lines") == 0, "no more-lines text")
+            transcript.toggle_all(t)
+            shown = entry.segments(e)
+            n = shown.len
+            streq(shown[4].text, "Changes\n")
+            streq(shown[n - 4].text, "Result\n")
+            spec.assert_true(string.ends_with(shown[n - 3].text, "result 239") != 0, "last result line")
+            streq(shown[n - 2].text, "\nScript\n")
+            streq(shown[n - 1].text, "script")
+        }
+        spec.it("retry removes only the failed attempt and preserves interjections and prior answers") callback {
+            t = transcript.new()
+            transcript.add(t, entry.KIND_ASSISTANT, "previous Step")
+            transcript.begin_attempt(t)
+            transcript.append_delta(t, transcript.DELTA_TEXT, "failed draft")
+            transcript.add(t, entry.KIND_USER, "interjection")
+            e_(t, 2).queued = 1
+            transcript.append_delta(t, transcript.DELTA_TEXT, "failed tail")
+            transcript.discard_attempt(t)
+            spec.assert_eq(transcript.count(t), 2, "two left")
+            streq(e_(t, 0).text, "previous Step")
+            streq(e_(t, 1).text, "interjection")
+            transcript.begin_attempt(t)
+            transcript.append_delta(t, transcript.DELTA_TEXT, "valid answer")
+            a, _f = transcript.last_answer(t)
+            streq(a, "valid answer")
+            transcript.failure(t, "server detail", changes.REASON_MODEL)
+            e = e_(t, 3)
+            spec.assert_true(entry.collapsible(e), "collapsible")
+            streq(e.label, "The model request failed.")
+            streq(e.text, "server detail")
+        }
+        spec.it("auto-background completion updates its Run and preserves timeout state without another block") callback {
+            t = transcript.new()
+            transcript.start_run(t, "script")
+            transcript.background_run(t, "r1")
+            transcript.end_run(t, true, "registered", 500, none_())
+            transcript.progress(t, agent_tree.new_agent("r1", "Run", run: 1, kind: BK_RUN, background: 1, `state`: agent_tree.PS_TIMED_OUT))
+            transcript.background_result(t, BK_RUN, "r1", false, "timeout details")
+            spec.assert_eq(transcript.count(t), 1, "one entry")
+            e = e_(t, 0)
+            streq(e.label, "Run · r1 timed out")
+            streq(e.output, "timeout details")
+            spec.assert_eq(e.agent_tree.rows.len, 0, "no rows")
+            streq(seg_text_(e, 0), "! ")
+        }
+        spec.it("foreground command facts remain attached after their Run moves to background") callback {
+            t = transcript.new()
+            transcript.start_run(t, "await tools.bash({})")
+            transcript.background_run(t, "r1")
+            transcript.end_run(t, true, "registered", 500, none_())
+            transcript.progress(t, agent_tree.new_agent("b1", "zig build test", run: 1, kind: BK_BASH, `state`: agent_tree.PS_FAILED, exit_code: 1))
+            transcript.background_result(t, BK_RUN, "r1", true, "script returned")
+            e = e_(t, 0)
+            spec.assert_eq(e.agents.len, 1, "one")
+            streq(row_(e, 0), "  └─ b1 bash zig build test · <1s · failed ✗ exit 1")
+            spec.assert_true(entry.has_warning(e), "warning")
+        }
+        spec.it("retry placeholder survives reasoning and replaces draft without losing history anchor") callback {
+            t = transcript.new()
+            scroll = scroll_(1, 2, 1)
+            transcript.begin_attempt(t)
+            transcript.append_delta(t, transcript.DELTA_TEXT, "failed draft")
+            transcript.add(t, entry.KIND_USER, "queued")
+            transcript.append_delta(t, transcript.DELTA_TEXT, "tail")
+            transcript.retry_attempt(t, scroll)
+            spec.assert_eq(transcript.count(t), 2, "two")
+            streq(e_(t, 0).text, "Interrupted · retrying")
+            spec.assert_eq(e_(t, 0).retry_placeholder, 1, "placeholder")
+            transcript.begin_attempt(t)
+            transcript.append_delta(t, transcript.DELTA_REASONING, "hidden")
+            transcript.retry_attempt(t, scroll)
+            spec.assert_eq(transcript.count(t), 2, "still two")
+            scroll.has_top = 1
+            scroll.top_entry = 1
+            scroll.top_row = 0
+            transcript.clear_retry(t, scroll)
+            spec.assert_eq(scroll.top_entry, 0, "anchor follows")
+            transcript.append_delta(t, transcript.DELTA_TEXT, "answer")
+            a, _f = transcript.last_answer(t)
+            streq(a, "answer")
+            transcript.clear_retry(t, scroll)
+        }
+        spec.it("display smoothing keeps complete answers and resets at a new attempt") callback {
+            t = transcript.new()
+            now = 1000 as long
+            transcript.smooth_delta(t, "first", now)
+            streq(entry.display_text(e_(t, 0)), "first")
+            transcript.smooth_delta(t, " burst 中文👩‍💻", now)
+            spec.assert_true(transcript.has_backlog(t), "backlog")
+            a, _f = transcript.last_answer(t)
+            streq(a, "first burst 中文👩‍💻")
+            transcript.flush_visible(t)
+            spec.assert_false(transcript.has_backlog(t), "flushed")
+            a2, _f2 = transcript.last_answer(t)
+            streq(a2, entry.display_text(e_(t, 0)))
+            transcript.begin_attempt(t)
+            transcript.smooth_delta(t, "next", now)
+            streq(entry.display_text(e_(t, 1)), "next")
+        }
+        spec.it("latest details entry is the newest Run, background or failure") callback {
+            t = transcript.new()
+            spec.assert_eq(transcript.latest_details(t), -1, "none")
+            transcript.add(t, entry.KIND_ASSISTANT, "hi")
+            transcript.start_run(t, "a")
+            transcript.add(t, entry.KIND_ASSISTANT, "done")
+            spec.assert_eq(transcript.latest_details(t), 1, "run")
+            transcript.failure(t, "boom", changes.REASON_TOOL)
+            spec.assert_eq(transcript.latest_details(t), 3, "failure")
+            transcript.toggle(t, transcript.latest_details(t))
+            spec.assert_true(e_(t, 3).open == 1 && e_(t, 1).open == 0, "only the failure opens")
+        }
+        spec.it("Simple collapsed Run shows path facts on its title row") callback {
+            for ci in 0..2 {
+                for si in 0..2 {
+                    simple = si == 0
+                    surf = screen.surface(60, 4)
+                    win = screen.window(surf)
+                    t = transcript.new()
+                    transcript.start_run(t, "await tools.read({})")
+                    s = tool_summary.empty()
+                    changed = 0
+                    want_simple = ""
+                    want_normal = ""
+                    if ci == 0 {
+                        f = heap.new(tool_summary.File)
+                        f.tool = "glob"
+                        f.path = "**/*.md"
+                        f.duration_ms = -1
+                        list.list_add(s.files, f as ptr)
+                        c = heap.new(tool_summary.Count)
+                        c.name = "glob"
+                        c.count = 1
+                        list.list_add(s.counts, c as ptr)
+                        want_simple = "  Run · glob **/*.md"
+                        want_normal = "  Run"
+                    } else {
+                        f1 = heap.new(tool_summary.File)
+                        f1.tool = "read"
+                        f1.path = "src/a.zig"
+                        f1.duration_ms = -1
+                        list.list_add(s.files, f1 as ptr)
+                        f2 = heap.new(tool_summary.File)
+                        f2.tool = "read"
+                        f2.path = "src/b.zig"
+                        f2.duration_ms = -1
+                        list.list_add(s.files, f2 as ptr)
+                        c1 = heap.new(tool_summary.Count)
+                        c1.name = "read"
+                        c1.count = 2
+                        list.list_add(s.counts, c1 as ptr)
+                        c2 = heap.new(tool_summary.Count)
+                        c2.name = "edit"
+                        c2.count = 1
+                        list.list_add(s.counts, c2 as ptr)
+                        changed = 1
+                        want_simple = "  Run · read src/a.zig · read src/b.zig · edit 1 file"
+                        want_normal = "  Run · edit 1 file"
+                    }
+                    ct = none_()
+                    if changed == 1 { ct = one_change_("a", 1, 0, "+x\n") }
+                    transcript.end_run_with_summary(t, true, "", 10, ct, s as ptr)
+                    e = e_(t, 0)
+                    if simple { e.simple = 1 }
+                    if simple { spec.assert_eq(entry.draw(e, win, true), 1, "one row") }
+                    if !simple { entry.draw(e, win, true) }
+                    want = want_normal
+                    if simple { want = want_simple }
+                    streq(screen.row_text(surf, 0), want)
+                }
+            }
+        }
+    }
+    return spec.run_summary(fw)
+}
