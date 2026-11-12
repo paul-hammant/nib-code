@@ -1,0 +1,734 @@
+// session.skills: Agent Skills (SKILL.md files) found under the four roots,
+// selected by the settings, listed in the system prompt and expanded when a
+// message mentions them as $name (upstream src/session/skills.zig).
+//
+// Differences from upstream, all in the shapes: a Skill's `disabled` is an
+// int; lists are std.list lists of *Skill / *Diagnostic / strings; failures
+// are (value, err) with err the upstream error name ("" on success); parse
+// returns a null *Skill with its error. `mention_at` returns (start, query)
+// with start -1 where upstream returns null. discover's reasons for a root
+// that exists but cannot be listed are "NotDir" and "AccessDenied" (std.dir
+// does not report the OS error); an unreadable SKILL.md is "FileNotFound",
+// "IsDir", "AccessDenied" or "StreamTooLong" (over 64 KiB).
+//
+// The Session log header records the Summary as summary_json and reads it
+// back with summary_from.
+
+import std.string
+import std.strbuilder
+import std.list
+import std.fs
+import std.dir
+import std.os
+import nib.jsonx
+
+exports(Skill, Diagnostic, Summary, Result, MAX_SKILL_BYTES, MAX_DESCRIPTION_CHARS, mention_intro,
+        scalar, quoted_end, parse, discover, load, select, append,
+        mention_at, mentioned, typed, expand, source, summary_new, summary_json, summary_from)
+
+const MAX_SKILL_BYTES = 65536
+const MAX_DESCRIPTION_CHARS = 1024
+const mention_intro = "\n\nSkills named with $name in this message; relative paths in them resolve against the skill's directory (parent of SKILL.md)."
+
+struct Skill {
+    name: string
+    description: string
+    location: string
+    disabled: int
+}
+
+struct Diagnostic {
+    path: string
+    reason: string
+}
+
+struct Summary {
+    count: int
+    found: int
+    missing: int
+    skipped: ptr        // a list of *Diagnostic
+}
+
+struct Result {
+    skills: ptr         // a list of *Skill
+    summary: *Summary
+}
+
+new_skill_(name: string, description: string, location: string, disabled: int) -> *Skill {
+    s = heap.new(Skill)
+    s.name = name
+    s.description = description
+    s.location = location
+    s.disabled = disabled
+    return s
+}
+
+new_diag_(path: string, reason: string) -> *Diagnostic {
+    d = heap.new(Diagnostic)
+    d.path = path
+    d.reason = reason
+    return d
+}
+
+summary_new() -> *Summary {
+    s = heap.new(Summary)
+    s.count = 0
+    s.found = 0
+    s.missing = 0
+    s.skipped = list.list_new()
+    return s
+}
+
+// ---- small string helpers --------------------------------------------
+
+in_set_(c: int, set: string) -> int {
+    i = 0
+    n = string.length(set)
+    while i < n {
+        if string.char_at(set, i) == c { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// std.mem.trim(u8, s, set).
+trim_(s: string, set: string) -> string {
+    from = 0
+    to = string.length(s)
+    while from < to && in_set_(string.char_at(s, from), set) == 1 { from = from + 1 }
+    while to > from && in_set_(string.char_at(s, to - 1), set) == 1 { to = to - 1 }
+    return string.substring(s, from, to)
+}
+
+// std.mem.trimEnd(u8, s, set).
+trim_end_(s: string, set: string) -> string {
+    to = string.length(s)
+    while to > 0 && in_set_(string.char_at(s, to - 1), set) == 1 { to = to - 1 }
+    return string.substring(s, 0, to)
+}
+
+// Leading spaces of `s`.
+leading_spaces_(s: string) -> int {
+    i = 0
+    n = string.length(s)
+    while i < n && string.char_at(s, i) == 32 { i = i + 1 }
+    return i
+}
+
+// std.unicode.utf8ByteSequenceLength: 0 for a byte that starts no sequence.
+seq_len_(b: int) -> int {
+    if b < 128 { return 1 }
+    if b >= 194 && b <= 223 { return 2 }
+    if b >= 224 && b <= 239 { return 3 }
+    if b >= 240 && b <= 244 { return 4 }
+    return 0
+}
+
+cont_(b: int) -> int {
+    if b >= 128 && b <= 191 { return 1 }
+    return 0
+}
+
+// std.unicode.utf8ValidateSlice.
+valid_utf8_(s: string) -> int {
+    n = string.length(s)
+    i = 0
+    while i < n {
+        b = string.char_at(s, i)
+        k = seq_len_(b)
+        if k == 0 { return 0 }
+        if i + k > n { return 0 }
+        if k >= 2 {
+            b1 = string.char_at(s, i + 1)
+            lo = 128
+            hi = 191
+            if b == 224 { lo = 160 }
+            if b == 237 { hi = 159 }
+            if b == 240 { lo = 144 }
+            if b == 244 { hi = 143 }
+            if b1 < lo || b1 > hi { return 0 }
+            j = 2
+            while j < k {
+                if cont_(string.char_at(s, i + j)) == 0 { return 0 }
+                j = j + 1
+            }
+        }
+        i = i + k
+    }
+    return 1
+}
+
+// std.ascii.isWhitespace.
+is_space_(c: int) -> int {
+    if c == 32 || (c >= 9 && c <= 13) { return 1 }
+    return 0
+}
+
+is_name_char_(c: int) -> int {
+    if c >= 48 && c <= 57 { return 1 }
+    if c >= 65 && c <= 90 { return 1 }
+    if c >= 97 && c <= 122 { return 1 }
+    if c == 95 || c == 45 { return 1 }
+    return 0
+}
+
+// The index of `ch` in `s` at or after `from`, or -1.
+index_from_(s: string, ch: int, from: int) -> int {
+    n = string.length(s)
+    i = from
+    while i < n {
+        if string.char_at(s, i) == ch { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// ---- frontmatter -----------------------------------------------------
+
+// The end (exclusive) of the quoted scalar that starts `s`, or -1 when the
+// closing quote is missing or text other than a comment follows it.
+quoted_end(s: string) -> int {
+    n = string.length(s)
+    q = string.char_at(s, 0)
+    i = 1
+    while i < n {
+        c = string.char_at(s, i)
+        if q == 34 && c == 92 {
+            i = i + 2
+            continue
+        }
+        if c != q {
+            i = i + 1
+            continue
+        }
+        if q == 39 && i + 1 < n && string.char_at(s, i + 1) == 39 {
+            i = i + 2
+            continue
+        }
+        tail = trim_(string.substring(s, i + 1, n), " \t")
+        if string.length(tail) == 0 || string.char_at(tail, 0) == 35 { return i + 1 }
+        return -1
+    }
+    return -1
+}
+
+// A YAML scalar: plain (up to " #"), 'single' or "double" quoted.
+// ("", "InvalidScalar") for a bad quoted one.
+scalar(raw: string) -> (string, string) {
+    s = trim_(raw, " \t\r")
+    if string.length(s) == 0 { return s, "" }
+    first = string.char_at(s, 0)
+    if first == 34 {
+        end = quoted_end(s)
+        if end < 0 { return "", "InvalidScalar" }
+        doc = jsonx.parse(string.substring(s, 0, end))
+        if doc == null { return "", "InvalidScalar" }
+        v = jsonx.str_field(doc)
+        out = string.copy(v)
+        jsonx.free(doc)
+        return out, ""
+    }
+    if first == 39 {
+        end = quoted_end(s)
+        if end < 0 { return "", "InvalidScalar" }
+        return string.replace_all(string.substring(s, 1, end - 1), "''", "'"), ""
+    }
+    cut = string.index_of(s, " #")
+    if cut < 0 { cut = string.length(s) }
+    return trim_(string.substring(s, 0, cut), " \t\r"), ""
+}
+
+// The Skill `text` declares (a SKILL.md), named `fallback` when it has no
+// name, located at `path`. (null, error) with error InvalidUtf8,
+// MissingFrontmatter, MissingDescription or InvalidScalar.
+parse(text: string, fallback: string, path: string) -> (*Skill, string) {
+    if valid_utf8_(text) == 0 { return null, "InvalidUtf8" }
+    lines = string.split(text, "\n")
+    lc = string.array_size(lines)
+    if lc == 0 || trim_(string.array_get(lines, 0), "\r") != "---" {
+        string.array_free(lines)
+        return null, "MissingFrontmatter"
+    }
+    name = string.copy(fallback)
+    description = ""
+    disabled = 0
+    closed = 0
+    err = ""
+    li = 1
+    while li < lc {
+        raw = string.array_get(lines, li)
+        li = li + 1
+        line = trim_(raw, "\r")
+        if line == "---" {
+            closed = 1
+            break
+        }
+        if string.length(line) == 0 || string.char_at(line, 0) == 32 || string.char_at(line, 0) == 9 { continue }
+        colon = string.index_of(line, ":")
+        if colon < 0 { continue }
+        key = string.substring(line, 0, colon)
+        value = trim_(string.substring(line, colon + 1, string.length(line)), " \t")
+        if key == "description" {
+            vc = 0
+            if string.length(value) > 0 { vc = string.char_at(value, 0) }
+            if vc == 124 || vc == 62 {
+                b = strbuilder.new(256)
+                have = 0
+                indent = -1
+                while li < lc {
+                    next = string.array_get(lines, li)
+                    content = trim_(next, " \t\r")
+                    spaces = leading_spaces_(next)
+                    if string.length(content) > 0 && (spaces == 0 || (indent >= 0 && spaces < indent)) { break }
+                    li = li + 1
+                    if string.length(content) > 0 && indent < 0 { indent = spaces }
+                    if have == 1 {
+                        if vc == 62 { strbuilder.append(b, " ") } else { strbuilder.append(b, "\n") }
+                    }
+                    piece = ""
+                    if string.length(content) > 0 {
+                        piece = trim_end_(string.substring(next, indent, string.length(next)), "\r")
+                    }
+                    strbuilder.append(b, piece)
+                    if strbuilder.length(b) > 0 { have = 1 }
+                }
+                description = string.copy(trim_(strbuilder.finish(b), " \t\r\n"))
+            } else {
+                d, e = scalar(value)
+                if e != "" {
+                    err = e
+                    break
+                }
+                description = string.copy(d)
+            }
+        } else if key == "name" {
+            n, e = scalar(value)
+            if e != "" {
+                err = e
+                break
+            }
+            if string.length(n) > 0 { name = string.copy(n) }
+        } else if key == "disable-model-invocation" {
+            v, e = scalar(value)
+            if e != "" {
+                err = e
+                break
+            }
+            disabled = 0
+            if v == "true" { disabled = 1 }
+        }
+    }
+    string.array_free(lines)
+    if err != "" { return null, err }
+    if closed == 0 { return null, "MissingFrontmatter" }
+    if string.length(trim_(description, " \t\r\n")) == 0 { return null, "MissingDescription" }
+    // At most 1024 characters, not bytes.
+    end = 0
+    chars = 0
+    dn = string.length(description)
+    while end < dn && chars < MAX_DESCRIPTION_CHARS {
+        k = seq_len_(string.char_at(description, end))
+        if k == 0 { return null, "InvalidUtf8" }
+        end = end + k
+        if end > dn { return null, "InvalidUtf8" }
+        chars = chars + 1
+    }
+    return new_skill_(name, string.substring(description, 0, end), string.copy(path), disabled), ""
+}
+
+// ---- discovery -------------------------------------------------------
+
+// std.fs.path.resolve(a, &.{root, name, "SKILL.md"}): absolute and cleaned.
+skill_path_(root: string, name: string) -> string {
+    p = "${root}/${name}/SKILL.md"
+    if string.starts_with(p, "/") == 0 { p = "${os.getcwd()}/${p}" }
+    return fs.clean(p)
+}
+
+// SKILL.md's text, read at most MAX_SKILL_BYTES: (text, "") or ("", error name).
+read_limited_(path: string) -> (string, string) {
+    kind, size, _m, serr = fs.file_stat(path)
+    if serr != "" { return "", "FileNotFound" }
+    if kind == 2 { return "", "IsDir" }
+    if size > MAX_SKILL_BYTES { return "", "StreamTooLong" }
+    text, err = fs.read(path)
+    if err != "" { return "", "AccessDenied" }
+    return text, ""
+}
+
+find_name_(skills: ptr, name: string) -> int {
+    i = 0
+    n = list.list_size(skills)
+    while i < n {
+        s, _g = list.get(skills, i)
+        if (s as *Skill).name == name { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+skill_at_(skills: ptr, i: int) -> *Skill {
+    s, _g = list.get(skills, i)
+    return s as *Skill
+}
+
+// Insertion sort by name, byte order.
+sort_by_name_(skills: ptr) {
+    n = list.list_size(skills)
+    i = 1
+    while i < n {
+        j = i
+        while j > 0 && string.compare(skill_at_(skills, j - 1).name, skill_at_(skills, j).name) == 1 {
+            a = skill_at_(skills, j - 1)
+            b = skill_at_(skills, j)
+            list.list_set(skills, j - 1, b as ptr)
+            list.list_set(skills, j, a as ptr)
+            j = j - 1
+        }
+        i = i + 1
+    }
+}
+
+// The skills under each root (a list of directory strings), a later root
+// overriding an earlier one by name: sorted by name; the ones that could not
+// be read, and the disabled ones, are in summary.skipped.
+discover(roots: ptr) -> *Result {
+    skills = list.list_new()
+    skipped = list.list_new()
+    ri = 0
+    rn = list.list_size(roots)
+    while ri < rn {
+        root, _g = list.get_string(roots, ri)
+        ri = ri + 1
+        if fs.exists(root) == 0 { continue }
+        rkind, _s, _m, rerr = fs.file_stat(root)
+        if rerr != "" || rkind != 2 {
+            list.list_add(skipped, new_diag_(string.copy(root), "NotDir") as ptr)
+            continue
+        }
+        entries, derr = dir.list(root)
+        if derr != "" {
+            list.list_add(skipped, new_diag_(string.copy(root), "AccessDenied") as ptr)
+            continue
+        }
+        n = dir.list_count(entries)
+        i = 0
+        while i < n {
+            ename = string.copy(dir.list_get(entries, i))
+            i = i + 1
+            if string.length(ename) == 0 || string.char_at(ename, 0) == 46 { continue }
+            ekind = dir.list_kind(entries, i - 1)
+            if ekind != 2 && ekind != 3 && ekind != 0 { continue }
+            // A symlink counts when it leads to a directory.
+            ckind, _cs, _cm, cerr = fs.file_stat("${root}/${ename}")
+            if cerr == "" && ckind == 3 {
+                target, _rk, _rm = fs.realpath("${root}/${ename}")
+                ckind, _cs, _cm, cerr = fs.file_stat(target)
+            }
+            if cerr != "" || ckind != 2 { continue }
+            path = skill_path_(root, ename)
+            text, rerr2 = read_limited_(path)
+            if rerr2 != "" {
+                list.list_add(skipped, new_diag_(path, rerr2) as ptr)
+                continue
+            }
+            skill, perr = parse(text, ename, path)
+            if perr != "" {
+                list.list_add(skipped, new_diag_(path, perr) as ptr)
+                continue
+            }
+            at = find_name_(skills, skill.name)
+            if at >= 0 {
+                list.list_set(skills, at, skill as ptr)
+            } else {
+                list.list_add(skills, skill as ptr)
+            }
+        }
+        dir.list_free(entries)
+    }
+    sort_by_name_(skills)
+    k = 0
+    while k < list.list_size(skills) {
+        s = skill_at_(skills, k)
+        if s.disabled == 1 {
+            list.list_add(skipped, new_diag_(s.location, "disable-model-invocation") as ptr)
+        }
+        k = k + 1
+    }
+    sm = summary_new()
+    sm.found = list.list_size(skills)
+    sm.skipped = skipped
+    r = heap.new(Result)
+    r.skills = skills
+    r.summary = sm
+    return r
+}
+
+join_(a: string, b: string) -> string {
+    if string.length(a) == 0 { return b }
+    if string.ends_with(a, "/") == 1 { return "${a}${b}" }
+    return "${a}/${b}"
+}
+
+// The roots, in order: ~/.agents/skills, $NIB_HOME/skills, <root>/.agents/skills,
+// <root>/.nib/skills.
+roots_(home: string, user_home: string, root: string) -> ptr {
+    l = list.list_new()
+    list.list_add(l, join_(user_home, ".agents/skills"))
+    list.list_add(l, join_(home, "skills"))
+    list.list_add(l, join_(root, ".agents/skills"))
+    list.list_add(l, join_(root, ".nib/skills"))
+    return l
+}
+
+load(home: string, user_home: string, root: string) -> *Result {
+    return discover(roots_(home, user_home, root))
+}
+
+// ---- selection and the prompt ----------------------------------------
+
+// The enabled (not disabled) skills of `found` whose names are in
+// `settings` (a list of strings); summary.missing counts the settings
+// naming no found skill.
+select(found: *Result, settings: ptr) -> *Result {
+    selected = list.list_new()
+    sm = summary_new()
+    sm.found = found.summary.found
+    sm.skipped = found.summary.skipped
+    sm.missing = found.summary.missing
+    n = list.list_size(found.skills)
+    sn = list.list_size(settings)
+    i = 0
+    while i < n {
+        s = skill_at_(found.skills, i)
+        i = i + 1
+        if s.disabled == 1 { continue }
+        k = 0
+        while k < sn {
+            nm, _g = list.get_string(settings, k)
+            k = k + 1
+            if nm == s.name {
+                list.list_add(selected, s as ptr)
+                break
+            }
+        }
+    }
+    k = 0
+    while k < sn {
+        nm, _g = list.get_string(settings, k)
+        k = k + 1
+        if find_name_(found.skills, nm) < 0 { sm.missing = sm.missing + 1 }
+    }
+    sm.count = list.list_size(selected)
+    r = heap.new(Result)
+    r.skills = selected
+    r.summary = sm
+    return r
+}
+
+escape_(b: ptr, s: string) {
+    i = 0
+    n = string.length(s)
+    while i < n {
+        c = string.char_at(s, i)
+        if c == 38 { strbuilder.append(b, "&amp;") }
+        else if c == 60 { strbuilder.append(b, "&lt;") }
+        else if c == 62 { strbuilder.append(b, "&gt;") }
+        else if c == 34 { strbuilder.append(b, "&quot;") }
+        else if c == 39 { strbuilder.append(b, "&apos;") }
+        else { strbuilder.append(b, string.substring(s, i, i + 1)) }
+        i = i + 1
+    }
+}
+
+// `base` followed by the available-skills block (a list of *Skill);
+// `base` alone when there are none.
+append(base: string, skills: ptr) -> string {
+    n = list.list_size(skills)
+    if n == 0 { return base }
+    b = strbuilder.new(string.length(base) + 512)
+    strbuilder.append(b, base)
+    strbuilder.append(b, "\n\nUse tools.read to load a skill's SKILL.md when the task matches its description.\nResolve relative paths against the skill's directory (parent of SKILL.md).\n\n<available_skills>\n")
+    i = 0
+    while i < n {
+        s = skill_at_(skills, i)
+        i = i + 1
+        strbuilder.append(b, "  <skill>\n    <name>")
+        escape_(b, s.name)
+        strbuilder.append(b, "</name>\n    <description>")
+        escape_(b, s.description)
+        strbuilder.append(b, "</description>\n    <location>")
+        escape_(b, s.location)
+        strbuilder.append(b, "</location>\n  </skill>\n")
+    }
+    strbuilder.append(b, "</available_skills>")
+    return strbuilder.finish(b)
+}
+
+// ---- $name mentions --------------------------------------------------
+
+// A `$name` word ending at `cursor`: `$` at the start or after whitespace,
+// then name characters. (start, query), or (-1, "") when there is none.
+mention_at(text: string, cursor: int) -> (int, string) {
+    w = cursor
+    while w > 0 && is_name_char_(string.char_at(text, w - 1)) == 1 { w = w - 1 }
+    if w == 0 || string.char_at(text, w - 1) != 36 { return -1, "" }
+    start = w - 1
+    if start > 0 && is_space_(string.char_at(text, start - 1)) == 0 { return -1, "" }
+    return start, string.substring(text, w, cursor)
+}
+
+// The distinct skills of `found` (a list of *Skill) named by `$name`
+// tokens in `text`, in order of first mention (a list of *Skill).
+mentioned(text: string, found: ptr) -> ptr {
+    out = list.list_new()
+    n = string.length(text)
+    i = 0
+    while true {
+        at = index_from_(text, 36, i)
+        if at < 0 { break }
+        i = at + 1
+        if at > 0 && is_space_(string.char_at(text, at - 1)) == 0 { continue }
+        end = i
+        while end < n && is_name_char_(string.char_at(text, end)) == 1 { end = end + 1 }
+        if end == i { continue }
+        name = string.substring(text, i, end)
+        hit = find_name_(found, name)
+        if hit < 0 { continue }
+        if find_name_(out, name) < 0 { list.list_add(out, skill_at_(found, hit) as ptr) }
+        i = end
+    }
+    return out
+}
+
+// What follows the closing "---" of the frontmatter, trimmed of CR and LF.
+body_(text: string) -> string {
+    n = string.length(text)
+    offset = 0
+    fences = 0
+    while offset < n {
+        end = index_from_(text, 10, offset)
+        if end < 0 { end = n }
+        line = trim_(string.substring(text, offset, end), "\r")
+        offset = end + 1
+        if offset > n { offset = n }
+        if line == "---" {
+            fences = fences + 1
+            if fences == 2 { break }
+        }
+    }
+    return trim_(string.substring(text, offset, n), "\r\n")
+}
+
+// The user's own text of a message that `expand` extended.
+typed(content: string) -> string {
+    at = string.index_of(content, mention_intro)
+    if at < 0 { return content }
+    return string.substring(content, 0, at)
+}
+
+// `text` followed by one <skill> block per distinct mentioned skill of
+// `found` whose SKILL.md still reads and parses.
+expand(text: string, found: ptr) -> string {
+    used = mentioned(text, found)
+    n = list.list_size(used)
+    if n == 0 { return text }
+    b = strbuilder.new(string.length(text) + 512)
+    strbuilder.append(b, text)
+    first = 1
+    i = 0
+    while i < n {
+        s = skill_at_(used, i)
+        i = i + 1
+        raw, rerr = read_limited_(s.location)
+        if rerr != "" { continue }
+        _sk, perr = parse(raw, s.name, s.location)
+        if perr != "" { continue }
+        if first == 1 { strbuilder.append(b, mention_intro) }
+        first = 0
+        strbuilder.append(b, "\n\n<skill name=\"${s.name}\" location=\"${s.location}\">\n${body_(raw)}\n</skill>")
+    }
+    return strbuilder.finish(b)
+}
+
+// The root `path` lies under, as the prompt labels it, or `path`.
+source(path: string, home: string, user_home: string, root: string) -> string {
+    dirs = roots_(home, user_home, root)
+    labels = ["~/.agents/skills", "$NIB_HOME/skills", ".agents/skills", ".nib/skills"]
+    i = 0
+    while i < 4 {
+        d, _g = list.get_string(dirs, i)
+        if string.starts_with(path, d) == 1 && string.length(path) > string.length(d) && string.char_at(path, string.length(d)) == 47 {
+            return labels[i]
+        }
+        i = i + 1
+    }
+    return path
+}
+
+// ---- the log header's record -----------------------------------------
+
+// A JSON string literal as std.json writes it: ", \ and the control
+// characters escaped, everything else (including non-ASCII) as is.
+quote_(s: string) -> string {
+    hex = "0123456789abcdef"
+    b = strbuilder.new(string.length(s) + 8)
+    strbuilder.append(b, "\"")
+    i = 0
+    n = string.length(s)
+    while i < n {
+        c = string.char_at(s, i)
+        if c == 34 { strbuilder.append(b, "\\\"") }
+        else if c == 92 { strbuilder.append(b, "\\\\") }
+        else if c == 10 { strbuilder.append(b, "\\n") }
+        else if c == 13 { strbuilder.append(b, "\\r") }
+        else if c == 9 { strbuilder.append(b, "\\t") }
+        else if c == 8 { strbuilder.append(b, "\\b") }
+        else if c == 12 { strbuilder.append(b, "\\f") }
+        else if c < 32 {
+            strbuilder.append(b, "\\u00")
+            strbuilder.append(b, string.substring(hex, c / 16, c / 16 + 1))
+            strbuilder.append(b, string.substring(hex, c % 16, c % 16 + 1))
+        } else { strbuilder.append(b, string.substring(s, i, i + 1)) }
+        i = i + 1
+    }
+    strbuilder.append(b, "\"")
+    return strbuilder.finish(b)
+}
+
+// The Summary as the log header's "skills" member:
+// {"count":N,"found":N,"missing":N,"skipped":[{"path":"...","reason":"..."}]}
+summary_json(sm: *Summary) -> string {
+    b = strbuilder.new(128)
+    strbuilder.append(b, "{\"count\":${sm.count},\"found\":${sm.found},\"missing\":${sm.missing},\"skipped\":[")
+    n = list.list_size(sm.skipped)
+    i = 0
+    while i < n {
+        d, _g = list.get(sm.skipped, i)
+        if i > 0 { strbuilder.append(b, ",") }
+        strbuilder.append(b, "{\"path\":${quote_((d as *Diagnostic).path)},\"reason\":${quote_((d as *Diagnostic).reason)}}")
+        i = i + 1
+    }
+    strbuilder.append(b, "]}")
+    return strbuilder.finish(b)
+}
+
+// The Summary of a parsed "skills" member (borrowed, see jsonx.parse); the
+// empty one when `v` is null or not an object, as replay does for a header
+// without it. Absent members are zero / empty.
+summary_from(v: ptr) -> *Summary {
+    sm = summary_new()
+    if v == null { return sm }
+    sm.count = jsonx.int_or(v, "count", 0)
+    sm.found = jsonx.int_or(v, "found", 0)
+    sm.missing = jsonx.int_or(v, "missing", 0)
+    arr = jsonx.field(v, "skipped")
+    n = jsonx.array_size(arr)
+    i = 0
+    while i < n {
+        e = jsonx.array_at(arr, i)
+        list.list_add(sm.skipped, new_diag_(string.copy(jsonx.str_or(e, "path", "")), string.copy(jsonx.str_or(e, "reason", ""))) as ptr)
+        i = i + 1
+    }
+    return sm
+}

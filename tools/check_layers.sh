@@ -82,6 +82,7 @@ expect_imports ae/nib/session/log/module.ae "nib.jsonx|nib.lock|nib.msg|nib.prov
 expect_imports ae/nib/session/module.ae "nib.jsonx|nib.lock|nib.msg|nib.provider|nib.provider.model_timing as modeltiming|nib.provider.sink|nib.provider.types|nib.sandbox|nib.sandbox.timing|nib.session.compact|nib.build_info|nib.session.fork_history|nib.session.hooks|nib.session.instructions|nib.session.log|nib.session.output|nib.session.profile|nib.session.prompt|nib.session.tool_summary|nib.tools|nib.tools.agent_input|nib.tools.agent_sessions|nib.tools.atomic_file|nib.tools.background|nib.tools.diff|nib.tools.progress|std.cryptography|std.fs|std.json|std.list|std.os|std.string|std.sync|std.worker"
 expect_imports ae/nib/session/output/module.ae "nib.sandbox|nib.sandbox.console|std.list|std.strbuilder|std.string"
 expect_imports ae/nib/session/profile/module.ae "std.string"
+expect_imports ae/nib/session/skills/module.ae "nib.jsonx|std.dir|std.fs|std.list|std.os|std.strbuilder|std.string"
 expect_imports ae/nib/session/prompt/module.ae "nib.sandbox|nib.session.output|nib.session.profile|std.cryptography|std.list|std.strbuilder|std.string"
 expect_imports ae/nib/session/tool_summary/module.ae "nib.jsonx|nib.sandbox.timing|std.list|std.strbuilder|std.string"
 

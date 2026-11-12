@@ -109,6 +109,10 @@ aeb(cap) {
             lib("ae")
         }
         aether.program_test() {
+            source("ae/tests/skills_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
             source("ae/tests/tool_summary_test.ae")
             lib("ae")
         }

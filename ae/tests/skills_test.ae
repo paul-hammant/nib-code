@@ -1,0 +1,327 @@
+// Ports the inline tests of upstream src/session/skills.zig under their
+// names: "frontmatter forms and limits", "discovery overrides, symlinks and
+// empty prompt", "mentions need a boundary and an exact skill name" and
+// "expansion appends the body and skips unreadable skills". Paths are
+// absolute temp directories (Zig used cwd-relative .zig-cache paths); the
+// Zig `[_]Skill{...}` literals are built with sk_. The extra suite covers
+// the pieces upstream only exercises through other code: load's roots,
+// select, source, the XML escaping of every character, the character cap
+// and the log header's summary JSON.
+import std.spec
+import std.fs
+import std.list
+import std.string
+import std.json
+import nib.jsonx
+import nib.session.skills
+
+tmp_() -> string {
+    d, _e = fs.make_temp_dir("", "nib-skills")
+    real, _k, _m = fs.realpath(d)
+    return real
+}
+
+has_(s: string, part: string) -> int {
+    if string.index_of(s, part) >= 0 { return 1 }
+    return 0
+}
+
+put_(path: string, data: string) {
+    err = fs.write(path, data)
+    spec.assert_str_eq(err, "", "write ${path}")
+}
+
+sk_(name: string, location: string, disabled: int) -> *skills.Skill {
+    s = heap.new(skills.Skill)
+    s.name = name
+    s.description = ""
+    s.location = location
+    s.disabled = disabled
+    return s
+}
+
+// The parsed Skill, asserting that there is no error.
+ok_(text: string, fallback: string, path: string) -> *skills.Skill {
+    s, err = skills.parse(text, fallback, path)
+    spec.assert_str_eq(err, "", "parse error for ${text}")
+    return s
+}
+
+err_(text: string) -> string {
+    _s, err = skills.parse(text, "a", "a")
+    return err
+}
+
+skill_(l: ptr, i: int) -> *skills.Skill {
+    s, _g = list.get(l, i)
+    return s as *skills.Skill
+}
+
+strs_(a: string, b: string) -> ptr {
+    l = list.list_new()
+    list.list_add(l, a)
+    list.list_add(l, b)
+    return l
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "session.skills") {
+        spec.it("frontmatter forms and limits") callback {
+            values = ["plain", "'plain'", "\"plain\"", "|\n  plain", ">\n  plain"]
+            i = 0
+            while i < 5 {
+                s = ok_("---\ndescription: ${values[i]}\n---\n", "fallback", "/a")
+                spec.assert_str_eq(s.description, "plain", "description of ${values[i]}")
+                spec.assert_str_eq(s.name, "fallback", "fallback name")
+                i = i + 1
+            }
+            spec.assert_str_eq(err_("---\nname: x\n---"), "MissingDescription", "no description")
+            s = ok_("---\ndescription: hi\ndisable-model-invocation: true\n---", "a", "a")
+            spec.assert_eq(s.disabled, 1, "disabled")
+            spec.assert_str_eq(ok_("---\ndescription: >\n  first\n  second\n---", "a", "a").description, "first second", "folded")
+            spec.assert_str_eq(ok_("---\ndescription: |\n  first\n  second\n---", "a", "a").description, "first\nsecond", "literal")
+            spec.assert_str_eq(ok_("---\ndescription: 'it''s fine' # comment\n---", "a", "a").description, "it's fine", "single quoted with comment")
+            spec.assert_str_eq(err_("---\ndescription: \"\"\n---"), "MissingDescription", "empty quoted")
+            lng = ""
+            k = 0
+            while k < 2048 {
+                lng = "${lng}a"
+                k = k + 1
+            }
+            spec.assert_eq(string.length(ok_("---\ndescription: ${lng}\n---", "a", "a").description), 1024, "1024 cap")
+        }
+
+        spec.it("discovery overrides, symlinks and empty prompt") callback {
+            d = tmp_()
+            roots = list.list_new()
+            i = 0
+            while i < 4 {
+                rel = "${d}/${i}/same"
+                fs.mkdir_p(rel)
+                put_("${rel}/SKILL.md", "---\nname: same\ndescription: version ${i}\n---")
+                list.list_add(roots, "${d}/${i}")
+                i = i + 1
+            }
+            found = skills.discover(roots)
+            spec.assert_eq(list.list_size(found.skills), 1, "one skill")
+            spec.assert_str_eq(skill_(found.skills, 0).description, "version 3", "later root wins")
+            fs.mkdir_p("${d}/target")
+            put_("${d}/target/SKILL.md", "---\ndescription: linked\n---")
+            spec.assert_str_eq(fs.symlink("../target", "${d}/3/link"), "", "symlink")
+            fs.mkdir_p("${d}/3/.hidden")
+            put_("${d}/3/.hidden/SKILL.md", "---\ndescription: hidden\n---")
+            put_("${d}/3/loose.md", "---\ndescription: loose\n---")
+            last = list.list_new()
+            list.list_add(last, "${d}/3")
+            linked = skills.discover(last)
+            spec.assert_eq(list.list_size(linked.skills), 2, "link and same, not hidden or loose")
+            spec.assert_str_eq(skill_(linked.skills, 0).name, "link", "sorted, symlink first")
+            spec.assert_str_eq(skill_(linked.skills, 0).description, "linked", "through the link")
+            put_("${d}/3/same/SKILL.md", "---\nname: same\ndescription: disabled\ndisable-model-invocation: true\n---")
+            disabled = skills.discover(roots)
+            spec.assert_eq(list.list_size(disabled.skills), 2, "disabled stays listed")
+            spec.assert_eq(list.list_size(disabled.summary.skipped), 1, "and is reported")
+            dg, _g = list.get(disabled.summary.skipped, 0)
+            spec.assert_str_eq((dg as *skills.Diagnostic).reason, "disable-model-invocation", "reason")
+            spec.assert_str_eq((dg as *skills.Diagnostic).path, "${d}/3/same/SKILL.md", "path")
+            empty = skills.append("BASE", list.list_new())
+            spec.assert_str_eq(empty, "BASE", "no skills, no block")
+            one = list.list_new()
+            x = sk_("<&", "/x", 0)
+            x.description = "\"'"
+            list.list_add(one, x as ptr)
+            xml = skills.append("", one)
+            spec.assert_true(has_(xml, "&lt;&amp;") == 1, "name escaped")
+            fs.remove_tree(d)
+        }
+
+        spec.it("mentions need a boundary and an exact skill name") callback {
+            found = list.list_new()
+            list.list_add(found, sk_("review", "/r", 0) as ptr)
+            list.list_add(found, sk_("release", "/l", 1) as ptr)
+            list.list_add(found, sk_("HOME", "/h", 0) as ptr)
+            hits = skills.mentioned("$release go, then $review, $review again, a$review $unknown $1 $HOMEx\n$release", found)
+            spec.assert_eq(list.list_size(hits), 2, "two distinct")
+            spec.assert_str_eq(skill_(hits, 0).name, "release", "first mention first")
+            spec.assert_str_eq(skill_(hits, 1).name, "review", "second")
+            spec.assert_eq(list.list_size(skills.mentioned("use $HOME.", found)), 1, "name then punctuation")
+            spec.assert_eq(list.list_size(skills.mentioned("echo $HOMEDIR $PATH", found)), 0, "no prefix match")
+            spec.assert_eq(list.list_size(skills.mentioned("$", found)), 0, "bare dollar")
+            start, query = skills.mention_at("see $rev", 8)
+            spec.assert_eq(start, 4, "start")
+            spec.assert_str_eq(query, "rev", "query")
+            s2, _q2 = skills.mention_at("a$rev", 5)
+            spec.assert_eq(s2, -1, "no boundary")
+            s3, q3 = skills.mention_at("$", 1)
+            spec.assert_eq(s3, 0, "bare dollar start")
+            spec.assert_str_eq(q3, "", "empty query")
+        }
+
+        spec.it("expansion appends the body and skips unreadable skills") callback {
+            d = tmp_()
+            fs.mkdir_p("${d}/s/one")
+            put_("${d}/s/one/SKILL.md", "---\ndescription: d\ndisable-model-invocation: true\n---\nDo the thing.\n")
+            roots = list.list_new()
+            list.list_add(roots, "${d}/s")
+            found = skills.discover(roots)
+            spec.assert_eq(skill_(found.skills, 0).disabled, 1, "disabled")
+            out = skills.expand("go $one", found.skills)
+            spec.assert_true(string.starts_with(out, "go $one\n\n") == 1, "text first")
+            spec.assert_true(has_(out, "<skill name=\"one\" location=\"") == 1, "block")
+            spec.assert_true(string.ends_with(out, "\nDo the thing.\n</skill>") == 1, "body")
+            spec.assert_true(has_(out, "description: d") == 0, "no frontmatter")
+            spec.assert_str_eq(skills.typed(out), "go $one", "typed strips the expansion")
+            spec.assert_str_eq(skills.expand("go $none", found.skills), "go $none", "unknown name")
+            big = ""
+            k = 0
+            while k < 65 * 1024 {
+                big = "${big}a"
+                k = k + 1
+            }
+            put_("${d}/s/one/SKILL.md", big)
+            spec.assert_str_eq(skills.expand("go $one", found.skills), "go $one", "over 64 KiB is skipped")
+            fs.remove_tree(d)
+        }
+    }
+
+    spec.describe(fw, "session.skills extras") {
+        spec.it("parse errors carry the upstream error names") callback {
+            spec.assert_str_eq(err_("no frontmatter"), "MissingFrontmatter", "first line")
+            spec.assert_str_eq(err_("---\ndescription: x\n"), "MissingFrontmatter", "unclosed")
+            spec.assert_str_eq(err_("---\ndescription: \"x\n---"), "InvalidScalar", "unterminated quote")
+            spec.assert_str_eq(err_("---\ndescription: 'x' y\n---"), "InvalidScalar", "text after quote")
+            spec.assert_str_eq(err_("---\ndescription: \xff\n---"), "InvalidUtf8", "bad utf-8")
+            s = ok_("---\r\nname: \"n\\u00e9\"\r\ndescription: a # c\r\n---\r\n", "f", "/p")
+            spec.assert_str_eq(s.name, "né", "json escape in a quoted name")
+            spec.assert_str_eq(s.description, "a", "comment cut, CR trimmed")
+            spec.assert_str_eq(s.location, "/p", "location")
+            blk = ok_("---\ndescription: |\n  a\n\n    b\nname: z\n---", "f", "/p")
+            spec.assert_str_eq(blk.description, "a\n\n  b", "block keeps blank lines and deeper indent")
+            spec.assert_str_eq(blk.name, "z", "key after the block")
+        }
+
+        spec.it("the description cap counts characters, not bytes") callback {
+            lng = ""
+            k = 0
+            while k < 1100 {
+                lng = "${lng}é"
+                k = k + 1
+            }
+            s = ok_("---\ndescription: ${lng}\n---", "a", "a")
+            spec.assert_eq(string.length(s.description), 2048, "1024 two-byte characters")
+        }
+
+        spec.it("discovery reports unreadable skills and skips missing roots") callback {
+            d = tmp_()
+            fs.mkdir_p("${d}/r/bad")
+            fs.mkdir_p("${d}/r/none")
+            fs.mkdir_p("${d}/r/good")
+            put_("${d}/r/bad/SKILL.md", "no frontmatter")
+            put_("${d}/r/good/SKILL.md", "---\ndescription: ok\n---")
+            roots = list.list_new()
+            list.list_add(roots, "${d}/missing")
+            list.list_add(roots, "${d}/r")
+            found = skills.discover(roots)
+            spec.assert_eq(list.list_size(found.skills), 1, "good only")
+            spec.assert_eq(found.summary.found, 1, "found")
+            spec.assert_eq(list.list_size(found.summary.skipped), 2, "bad and none")
+            a, _g = list.get(found.summary.skipped, 0)
+            b, _h = list.get(found.summary.skipped, 1)
+            reasons = "${(a as *skills.Diagnostic).reason},${(b as *skills.Diagnostic).reason}"
+            spec.assert_true(has_(reasons, "MissingFrontmatter") == 1, "bad: ${reasons}")
+            spec.assert_true(has_(reasons, "FileNotFound") == 1, "none: ${reasons}")
+            fs.remove_tree(d)
+        }
+
+        spec.it("load reads the four roots in order") callback {
+            d = tmp_()
+            dirs = [".agents/skills", "nibhome/skills", "proj/.agents/skills", "proj/.nib/skills"]
+            i = 0
+            while i < 4 {
+                fs.mkdir_p("${d}/${dirs[i]}/s")
+                put_("${d}/${dirs[i]}/s/SKILL.md", "---\ndescription: from ${i}\n---")
+                i = i + 1
+            }
+            fs.mkdir_p("${d}/.agents/skills/only")
+            put_("${d}/.agents/skills/only/SKILL.md", "---\ndescription: user only\n---")
+            found = skills.load("${d}/nibhome", d, "${d}/proj")
+            spec.assert_eq(list.list_size(found.skills), 2, "two names")
+            spec.assert_str_eq(skill_(found.skills, 0).name, "only", "sorted")
+            spec.assert_str_eq(skill_(found.skills, 1).description, "from 3", "project .nib wins")
+            spec.assert_str_eq(skills.source("${d}/.agents/skills/only/SKILL.md", "${d}/nibhome", d, "${d}/proj"), "~/.agents/skills", "user label")
+            spec.assert_str_eq(skills.source("${d}/nibhome/skills/s/SKILL.md", "${d}/nibhome", d, "${d}/proj"), "$NIB_HOME/skills", "home label")
+            spec.assert_str_eq(skills.source("${d}/proj/.agents/skills/s/SKILL.md", "${d}/nibhome", d, "${d}/proj"), ".agents/skills", "project agents label")
+            spec.assert_str_eq(skills.source("${d}/proj/.nib/skills/s/SKILL.md", "${d}/nibhome", d, "${d}/proj"), ".nib/skills", "project nib label")
+            spec.assert_str_eq(skills.source("/elsewhere/SKILL.md", "${d}/nibhome", d, "${d}/proj"), "/elsewhere/SKILL.md", "no label")
+            spec.assert_str_eq(skills.source("${d}/.agents/skills", "${d}/nibhome", d, "${d}/proj"), "${d}/.agents/skills", "the root itself has none")
+            fs.remove_tree(d)
+        }
+
+        spec.it("select keeps enabled named skills and counts the missing") callback {
+            d = tmp_()
+            fs.mkdir_p("${d}/s/a")
+            fs.mkdir_p("${d}/s/b")
+            fs.mkdir_p("${d}/s/c")
+            put_("${d}/s/a/SKILL.md", "---\ndescription: a\n---")
+            put_("${d}/s/b/SKILL.md", "---\ndescription: b\n---")
+            put_("${d}/s/c/SKILL.md", "---\ndescription: c\ndisable-model-invocation: true\n---")
+            roots = list.list_new()
+            list.list_add(roots, "${d}/s")
+            found = skills.discover(roots)
+            sel = skills.select(found, strs_("b", "c"))
+            spec.assert_eq(list.list_size(sel.skills), 1, "b only; c is disabled")
+            spec.assert_str_eq(skill_(sel.skills, 0).name, "b", "b")
+            spec.assert_eq(sel.summary.count, 1, "count")
+            spec.assert_eq(sel.summary.missing, 0, "disabled is found, not missing")
+            spec.assert_eq(sel.summary.found, 3, "found carried over")
+            sel2 = skills.select(found, strs_("a", "zzz"))
+            spec.assert_eq(sel2.summary.count, 1, "a")
+            spec.assert_eq(sel2.summary.missing, 1, "zzz")
+            spec.assert_eq(list.list_size(sel2.summary.skipped), 1, "skipped carried over")
+            fs.remove_tree(d)
+        }
+
+        spec.it("append writes the block and escapes the five XML characters") callback {
+            l = list.list_new()
+            s = sk_("n&<>\"'", "/p&q", 0)
+            s.description = "d<&>\"'"
+            list.list_add(l, s as ptr)
+            out = skills.append("BASE", l)
+            expected = "BASE\n\nUse tools.read to load a skill's SKILL.md when the task matches its description.\nResolve relative paths against the skill's directory (parent of SKILL.md).\n\n<available_skills>\n  <skill>\n    <name>n&amp;&lt;&gt;&quot;&apos;</name>\n    <description>d&lt;&amp;&gt;&quot;&apos;</description>\n    <location>/p&amp;q</location>\n  </skill>\n</available_skills>"
+            spec.assert_str_eq(out, expected, "exact block")
+        }
+
+        spec.it("summary_json matches the log header and reads back") callback {
+            sm = skills.summary_new()
+            spec.assert_str_eq(skills.summary_json(sm), "{\"count\":0,\"found\":0,\"missing\":0,\"skipped\":[]}", "default")
+            sm.count = 1
+            sm.found = 3
+            sm.missing = 2
+            dg = heap.new(skills.Diagnostic)
+            dg.path = "/a \"b\"\né"
+            dg.reason = "NotDir"
+            list.list_add(sm.skipped, dg as ptr)
+            text = skills.summary_json(sm)
+            spec.assert_str_eq(text, "{\"count\":1,\"found\":3,\"missing\":2,\"skipped\":[{\"path\":\"/a \\\"b\\\"\\né\",\"reason\":\"NotDir\"}]}", "json")
+            doc = jsonx.parse(text)
+            back = skills.summary_from(doc)
+            spec.assert_eq(back.count, 1, "count")
+            spec.assert_eq(back.found, 3, "found")
+            spec.assert_eq(back.missing, 2, "missing")
+            spec.assert_eq(list.list_size(back.skipped), 1, "skipped")
+            bd, _g = list.get(back.skipped, 0)
+            spec.assert_str_eq((bd as *skills.Diagnostic).path, "/a \"b\"\né", "path")
+            spec.assert_str_eq((bd as *skills.Diagnostic).reason, "NotDir", "reason")
+            jsonx.free(doc)
+            absent = skills.summary_from(null)
+            spec.assert_eq(absent.found, 0, "absent is empty")
+            part = jsonx.parse("{\"found\":4}")
+            p2 = skills.summary_from(part)
+            spec.assert_eq(p2.found, 4, "partial found")
+            spec.assert_eq(list.list_size(p2.skipped), 0, "partial skipped")
+            jsonx.free(part)
+        }
+    }
+    return spec.run_summary(fw)
+}
