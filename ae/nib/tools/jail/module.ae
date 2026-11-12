@@ -27,7 +27,7 @@ home_caches_() -> ptr {
     l = list.list_new()
     names = [".cache", "Library/Caches", "Library/Developer", ".npm", ".cargo/registry", ".cargo/git", ".rustup", "go/pkg", ".gradle", ".m2", ".bun/install/cache", ".yarn", ".pnpm-store", ".local/share/pnpm", ".local/share/uv"]
     mac = 0
-    if os.platform() == "macos" { mac = 1 }
+    if is_mac_() == 1 { mac = 1 }
     i = 0
     while i < 15 {
         if mac == 1 || (i != 1 && i != 2) { list.list_add(l, names[i]) }
@@ -38,7 +38,7 @@ home_caches_() -> ptr {
 
 system_paths_() -> ptr {
     l = list.list_new()
-    if os.platform() == "macos" {
+    if is_mac_() == 1 {
         p = ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp", "/private/var/folders", "/dev/null", "/dev/zero", "/dev/tty", "/dev/ptmx", "/dev/dtracehelper", "/dev/fd"]
         i = 0
         while i < 11 {
@@ -221,7 +221,7 @@ profile(writable: ptr) -> string {
 // "" when the OS sandbox can be applied here, else why not (upstream's
 // Unavailable texts). The caller caches it per Tools.
 unavailable() -> string {
-    if os.platform() == "macos" {
+    if is_mac_() == 1 {
         if fs.exists(SANDBOX_EXEC) == 0 { return "sandbox-exec not found" }
         argv = list.list_new()
         list.list_add(argv, "-p")
@@ -249,7 +249,7 @@ unavailable_text(code: int) -> string {
 // outside `writable` fail. self_exe is this nib binary (the Linux helper).
 wrap(writable: ptr, inner: ptr, self_exe: string) -> ptr {
     argv = list.list_new()
-    if os.platform() == "macos" {
+    if is_mac_() == 1 {
         list.list_add(argv, SANDBOX_EXEC)
         list.list_add(argv, "-p")
         list.list_add(argv, profile(writable))
@@ -307,4 +307,10 @@ helper(args: ptr) -> string {
     prog, _e4 = list.get_string(command, 0)
     os.os_execv(prog, command)
     return "exec failed"
+}
+
+is_mac_() -> int {
+    p = os.platform()
+    if p == "darwin" || p == "macos" { return 1 }
+    return 0
 }

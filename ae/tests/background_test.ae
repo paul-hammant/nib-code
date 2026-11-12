@@ -1,0 +1,68 @@
+// Background bash and tools.stop (the bash half of upstream
+// src/tools/background.zig and src/tools/stop.zig; ADR 0014). Upstream's
+// background tests drive the Session inbox, progress and agents (later
+// slices); these hold the tool-level contract.
+import std.spec
+import std.string
+import std.list
+import std.os
+import std.fs
+import nib.sandbox
+import nib.tools
+import nib.tools.background
+
+tools_() -> ptr {
+    d, _e = fs.make_temp_dir("", "nib-bg")
+    t = tools.new(d)
+    (t as *tools.Tools).data_home = "${d}/nibhome"
+    return t
+}
+
+eval_(t: @keep ptr, code: string) -> *sandbox.Outcome {
+    s = tools.new_scope(t, 1)
+    return sandbox.eval(code, sandbox.limits(), tools.host(s), null) as *sandbox.Outcome
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "background bash and stop") {
+        spec.it("background bash returns its id at once and delivers its completion once") callback {
+            t = tools_()
+            start = os.now_monotonic_ms()
+            r = eval_(t, "await tools.bash({command: 'sleep 0.3; echo done', background: true})")
+            spec.assert_str_eq(r.text, "{\"id\":\"b1\"}", "id")
+            spec.assert_true(os.now_monotonic_ms() - start < 250, "returned at once")
+            bg = (t as *tools.Tools).background
+            while background.active_bash(bg) > 0 { sleep(10) }
+            msgs = background.take_inbox(bg)
+            spec.assert_eq(list.list_size(msgs), 1, "one message")
+            m, _e = list.get_string(msgs, 0)
+            spec.assert_str_eq(m, "[background bash b1 finished]\n{\"exit_code\":0,\"output\":\"done\\n\"}", "message")
+            spec.assert_eq(list.list_size(background.take_inbox(bg)), 0, "delivered once")
+        }
+        spec.it("stop requires a reason, rejects unknown ids, and stops a running task") callback {
+            t = tools_()
+            r = eval_(t, "const {id} = await tools.bash({command: 'sleep 30', background: true, detached: true});\nconst bare = await tools.stop({id}).catch(e => e.message);\nconst unknown = await tools.stop({id: 'b99', reason: 'x'}).catch(e => e.message);\nconst stopped = await tools.stop({id, reason: 'requirements changed'});\nconst again = await tools.stop({id, reason: 'again'});\n[bare.startsWith('stop: stop requires a nonempty reason'), unknown, stopped, again]")
+            spec.assert_eq(r.ok, 1, "ok: ${r.text}")
+            spec.assert_str_eq(r.text, "[true,\"stop: UnknownBackgroundTask\",{\"id\":\"b1\",\"stopped\":true,\"reason\":\"requirements changed\",\"notice\":\"Task canceled; unfinished validation has no passing result. Restarting repeats its work.\"},{\"id\":\"b1\",\"stopped\":false,\"reason\":\"again\"}]", "stop results")
+        }
+        spec.it("the background bash limit is the tool concurrency") callback {
+            t = tools_()
+            r = eval_(t, "const ids = []; for (let i = 0; i < 8; i++) ids.push((await tools.bash({command: 'sleep 30', background: true, detached: true})).id);\nconst ninth = await tools.bash({command: 'true', background: true}).catch(e => e.message);\nfor (const id of ids) await tools.stop({id, reason: 'test over'});\nninth")
+            spec.assert_str_eq(r.text, "\"bash: background bash limit is 8 running commands; retry after a background result arrives\"", "limit")
+        }
+        spec.it("finishing a Turn joins ordinary jobs and keeps detached ones") callback {
+            t = tools_()
+            r = eval_(t, "[await tools.bash({command: 'sleep 30', background: true, timeout_ms: 60000}), await tools.bash({command: 'sleep 30', background: true, detached: true})]")
+            spec.assert_eq(r.ok, 1, "ok")
+            bg = (t as *tools.Tools).background
+            start = os.now_monotonic_ms()
+            background.finish_turn(bg)
+            spec.assert_true(os.now_monotonic_ms() - start < 2000, "joined promptly")
+            spec.assert_eq(background.active_bash(bg), 1, "detached keeps running")
+            background.stop_all(bg)
+            spec.assert_eq(background.active_bash(bg), 0, "all stopped")
+        }
+    }
+    return spec.run_summary(fw)
+}

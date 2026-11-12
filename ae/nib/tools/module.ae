@@ -24,6 +24,7 @@ import nib.tools.bash
 import nib.tools.registry
 import nib.tools.changes
 import nib.tools.jail
+import nib.tools.background
 
 exports(Tools, RunScope, new, new_scope, host, call_tool, names_json, docs, all_docs, tool_names,
         is_ported, credential_paths, writable_roots, nib_home, take_changes, set_workspace,
@@ -89,6 +90,7 @@ is_ported(name: string) -> int {
         "grep" -> { return 1 }
         "glob" -> { return 1 }
         "bash" -> { return 1 }
+        "stop" -> { return 1 }
         _ -> { return 0 }
     }
 }
@@ -112,6 +114,7 @@ struct Tools {
     jail_reason: string    // "?" until probed, then "" (available) or why not
     self_exe: string
     env: ptr               // the child environment base, or null (this process's)
+    background: ptr        // *background.Background
 }
 
 struct RunScope {
@@ -143,6 +146,7 @@ new(home: string) -> ptr {
     t.jail_reason = "?"
     t.self_exe = ""
     t.env = null
+    t.background = background.new()
     return t as ptr
 }
 
@@ -312,16 +316,61 @@ bash_(s: *RunScope, args: string, out: ptr) {
         sandbox.result_set_err(out, refused)
         return
     }
+    c.roots = bash_roots_(t)
+    id = "b${sync.atomic_add(t.bash_ids, 1)}"
+    timeout = bash.timeout_ms_of(a)
     if (a as *bash.Args).background == 1 {
-        sandbox.result_set_err(out, "background bash is not ported yet")
+        detached = (a as *bash.Args).detached
+        cp = c as ptr
+        changes.recovery_note_bash(t.recovery as *changes.Recovery)
+        started, serr = background.start(t.background, id, command, detached, |cancel: ptr, job: ptr| {
+            bok, btext = bash.execute(cp, command, timeout, detached, id, cancel)
+            background.set_result(job, bok, btext)
+        })
+        if serr != "" {
+            sandbox.result_set_err(out, serr)
+            return
+        }
+        sandbox.result_set_identity(out, id, 1)
+        sandbox.result_set_ok(out, started)
         return
     }
-    c.roots = bash_roots_(t)
     changes.recovery_note_bash(t.recovery as *changes.Recovery)
-    id = "b${sync.atomic_add(t.bash_ids, 1)}"
     sandbox.result_set_identity(out, id, 0)
-    ok, text = bash.execute(c as ptr, command, bash.timeout_ms_of(a), 0, id, null)
+    ok, text = bash.execute(c as ptr, command, timeout, 0, id, null)
     if ok == 1 { sandbox.result_set_ok(out, text) } else { sandbox.result_set_err(out, text) }
+}
+
+const STOP_REASON_REQUIRED = "stop requires a nonempty reason. Canceling a running test discards its progress and prevents a completed validation result. Elapsed time or no output alone does not mean it is stuck; reply without tools to wait locally. Stop only for a concrete failure, changed requirement or user request."
+
+stop_(s: *RunScope, args: string, out: ptr) {
+    t = s.tools as *Tools
+    v = jsonx.parse(args)
+    if v == null || jsonx.kind(v, "id") != 3 {
+        sandbox.result_set_err(out, "expected { id: string, reason: string }")
+        return
+    }
+    rk = jsonx.kind(v, "reason")
+    if rk != -1 && rk != 0 && rk != 3 {
+        sandbox.result_set_err(out, "expected { id: string, reason: string }")
+        return
+    }
+    id = jsonx.str_or(v, "id", "")
+    reason = jsonx.str_or(v, "reason", "")
+    if string.length(string.trim(reason)) == 0 {
+        sandbox.result_set_err(out, STOP_REASON_REQUIRED)
+        return
+    }
+    stopped, err = background.stop_task(t.background, id)
+    if err != "" {
+        sandbox.result_set_err(out, err)
+        return
+    }
+    if stopped == 1 {
+        sandbox.result_set_ok(out, "{\"id\":${jsonx.quote(id)},\"stopped\":true,\"reason\":${jsonx.quote(reason)},\"notice\":\"Task canceled; unfinished validation has no passing result. Restarting repeats its work.\"}")
+    } else {
+        sandbox.result_set_ok(out, "{\"id\":${jsonx.quote(id)},\"stopped\":false,\"reason\":${jsonx.quote(reason)}}")
+    }
 }
 
 // One tool call, from a Run scope. out: *sandbox.ToolResult.
@@ -356,6 +405,10 @@ call_tool(sp: ptr, name: string, args: string, out: ptr) {
         }
         "bash" -> {
             bash_(s, args, out)
+            return
+        }
+        "stop" -> {
+            stop_(s, args, out)
             return
         }
         _ -> {

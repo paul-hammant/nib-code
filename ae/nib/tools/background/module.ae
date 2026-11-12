@@ -1,0 +1,200 @@
+// tools.background: Session-owned background bash (upstream
+// src/tools/background.zig, the bash half; ADR 0014). A start returns
+// {"id":"bN"} at once; the command runs on its own thread with its own
+// cancel; its completion is queued once in the inbox as
+// "[background bash bN finished]\n<result JSON>" (the Session slice formats
+// it to the Run display budget and delivers it before the next Step).
+// tools.stop cancels and joins one by id. Agents and background Runs come
+// with their slices.
+
+import std.list
+import std.string
+import std.sync
+import std.worker
+import nib.lock
+import nib.jsonx
+
+exports(Background, Job, BASH_LIMIT, new, start, stop_task, finish_turn, stop_all, take_inbox,
+        inbox_size, active_bash, set_result)
+
+const BASH_LIMIT = 8
+
+struct Job {
+    id: string
+    command: string
+    detached: int
+    cancel: ptr      // std.sync cell
+    done: ptr        // std.sync cell
+    ok: int
+    text: string
+    state: string    // working, done, failed, canceled, superseded
+    run: fn
+}
+
+struct Background {
+    guard: ptr
+    jobs: ptr        // list of *Job
+    inbox: ptr       // list of finished messages (strings)
+    stopping: ptr    // std.sync cell: set once the Session tears down
+}
+
+new() -> ptr {
+    b = heap.new(Background)
+    b.guard = lock.new()
+    b.jobs = list.list_new()
+    b.inbox = list.list_new()
+    b.stopping = sync.atomic_new(0)
+    return b as ptr
+}
+
+active_bash(bp: ptr) -> int {
+    b = bp as *Background
+    n = 0
+    lock.acquire(b.guard)
+    i = 0
+    while i < list.list_size(b.jobs) {
+        j = list.list_get_raw(b.jobs, i) as *Job
+        if sync.atomic_load(j.done) == 0 { n = n + 1 }
+        i = i + 1
+    }
+    lock.release(b.guard)
+    return n
+}
+
+state_of_(ok: int, text: string, canceled: int) -> string {
+    if canceled == 1 { return "canceled" }
+    if ok == 0 { return "failed" }
+    if string.index_of(text, "\"superseded_by\"") >= 0 { return "superseded" }
+    if string.starts_with(text, "{\"exit_code\":0,") == 1 { return "done" }
+    return "failed"
+}
+
+// Starts `run` (|cancel: ptr, out: ptr| filling out with ok/text through
+// set_result) as job `id`. (the {"id"} JSON, "") or ("", error text).
+start(bp: @keep ptr, id: string, command: string, detached: int, run: @keep fn) -> (string, string) {
+    b = bp as *Background
+    if sync.atomic_load(b.stopping) != 0 { return "", "Canceled" }
+    if active_bash(bp) >= BASH_LIMIT {
+        return "", "background bash limit is ${BASH_LIMIT} running commands; retry after a background result arrives"
+    }
+    j = heap.new(Job)
+    j.id = id
+    j.command = command
+    j.detached = detached
+    j.cancel = sync.atomic_new(0)
+    j.done = sync.atomic_new(0)
+    j.ok = 0
+    j.text = ""
+    j.state = "working"
+    j.run = run
+    lock.acquire(b.guard)
+    list.list_add(b.jobs, j as ptr)
+    lock.release(b.guard)
+    jp = j as ptr
+    worker.run_detached(|| {
+        jj = jp as *Job
+        call(jj.run, jj.cancel, jp)
+        jj.state = state_of_(jj.ok, jj.text, sync.atomic_load(jj.cancel) as int)
+        if sync.atomic_load(b.stopping) == 0 {
+            body = jj.text
+            if jj.ok == 0 { body = "{\"error\":${jsonx.quote(jj.text)}}" }
+            lock.acquire(b.guard)
+            list.list_add(b.inbox, "[background bash ${jj.id} finished]\n${body}")
+            lock.release(b.guard)
+        }
+        sync.atomic_store(jj.done, 1)
+        return null
+    })
+    return "{\"id\":${jsonx.quote(id)}}", ""
+}
+
+find_(b: *Background, id: string) -> ptr {
+    lock.acquire(b.guard)
+    found = null
+    i = list.list_size(b.jobs) - 1
+    while i >= 0 {
+        j = list.list_get_raw(b.jobs, i) as *Job
+        if j.id == id {
+            found = j as ptr
+            break
+        }
+        i = i - 1
+    }
+    lock.release(b.guard)
+    return found
+}
+
+// (1 stopped / 0 already finished, "") or (0, "UnknownBackgroundTask").
+stop_task(bp: ptr, id: string) -> (int, string) {
+    b = bp as *Background
+    jp = find_(b, id)
+    if jp == null { return 0, "UnknownBackgroundTask" }
+    j = jp as *Job
+    stopped = 1
+    if sync.atomic_load(j.done) != 0 { stopped = 0 }
+    sync.atomic_store(j.cancel, 1)
+    while sync.atomic_load(j.done) == 0 { sleep(20) }
+    return stopped, ""
+}
+
+// End of a normal Turn: non-detached jobs are canceled and joined (their
+// completions still delivered); detached ones keep running.
+finish_turn(bp: ptr) {
+    b = bp as *Background
+    lock.acquire(b.guard)
+    n = list.list_size(b.jobs)
+    lock.release(b.guard)
+    i = 0
+    while i < n {
+        lock.acquire(b.guard)
+        j = list.list_get_raw(b.jobs, i) as *Job
+        lock.release(b.guard)
+        if j.detached == 0 {
+            sync.atomic_store(j.cancel, 1)
+            while sync.atomic_load(j.done) == 0 { sleep(20) }
+        }
+        i = i + 1
+    }
+}
+
+// Session exit, switch, or an aborted Turn: everything stops, nothing is delivered.
+stop_all(bp: ptr) {
+    b = bp as *Background
+    sync.atomic_store(b.stopping, 1)
+    lock.acquire(b.guard)
+    n = list.list_size(b.jobs)
+    lock.release(b.guard)
+    i = 0
+    while i < n {
+        lock.acquire(b.guard)
+        j = list.list_get_raw(b.jobs, i) as *Job
+        lock.release(b.guard)
+        sync.atomic_store(j.cancel, 1)
+        while sync.atomic_load(j.done) == 0 { sleep(20) }
+        i = i + 1
+    }
+}
+
+inbox_size(bp: ptr) -> int {
+    b = bp as *Background
+    lock.acquire(b.guard)
+    n = list.list_size(b.inbox)
+    lock.release(b.guard)
+    return n
+}
+
+// The queued completion messages (a list of strings), emptied.
+take_inbox(bp: ptr) -> ptr {
+    b = bp as *Background
+    lock.acquire(b.guard)
+    l = b.inbox
+    b.inbox = list.list_new()
+    lock.release(b.guard)
+    return l
+}
+
+set_result(jp: ptr, ok: int, text: string) {
+    j = jp as *Job
+    j.ok = ok
+    j.text = text
+}

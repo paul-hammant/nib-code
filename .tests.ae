@@ -6,6 +6,9 @@
 import bldr
 import aether
 import aether (source, lib, caps)
+import bldr (dep)
+import bash
+import bash (script)
 
 aeb(cap) {
     bldr.build() {
@@ -84,6 +87,15 @@ aeb(cap) {
         aether.program_test() {
             source("ae/tests/tools_test.ae")
             lib("ae")
+        }
+        aether.program_test() {
+            source("ae/tests/background_test.ae")
+            lib("ae")
+        }
+        // Workspace mode end to end, through the built binary.
+        dep(".build.ae")
+        bash.test() {
+            script("ae/tests/workspace.sh")
         }
         return 0
     }

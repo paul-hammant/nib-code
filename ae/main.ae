@@ -1,17 +1,38 @@
 // The nib binary (its name is set once, in .build.ae's output()).
-// This slice has `nib js '<code>'`: one Run in a fresh Sandbox with the
-// ported Tools, its console and result printed. `ask`, the TUI and the
-// Session come with later slices.
+// This slice has `nib js '<code>'` (one Run in a fresh Sandbox with the
+// ported Tools; console, then the result or error, as upstream's `nib js`)
+// and the hidden `nib __jail <root>... -- <command>...` helper the Linux
+// write sandbox execs. `ask`, the TUI and the Session come with later slices.
 
 import std.os
 import std.string
+import std.list
+import std.fs
 import nib.sandbox
+import nib.tools
+import nib.tools.jail
+import nib.tools.background
 
 const VERSION = "0.13.0-ae"
 
 usage_() {
     println("usage: nib js '<code>'")
     println("       nib --version")
+}
+
+home_() -> string {
+    h = os.getenv("HOME")
+    if h == null { return "/" }
+    return h
+}
+
+self_exe_() -> string {
+    a0 = os.args_get(0)
+    if string.index_of(a0, "/") >= 0 {
+        real, _k, err = fs.realpath(a0)
+        if err == "" { return real }
+    }
+    return a0
 }
 
 main() {
@@ -21,12 +42,28 @@ main() {
         exit(2)
     }
     cmd = os.args_get(1)
+    if cmd == jail.HELPER_COMMAND {
+        rest = list.list_new()
+        i = 2
+        while i < n {
+            list.list_add(rest, os.args_get(i))
+            i = i + 1
+        }
+        println("nib __jail: ${jail.helper(rest)}")
+        exit(126)
+    }
     if cmd == "--version" {
         println("nib ${VERSION}")
         return
     }
     if cmd == "js" && n >= 3 {
-        o = sandbox.eval(os.args_get(2), sandbox.limits(), null, null) as *sandbox.Outcome
+        t = tools.new(home_())
+        (t as *tools.Tools).self_exe = self_exe_()
+        mode = os.getenv("NIB_SANDBOX")
+        if mode != null && mode == "workspace" { tools.set_workspace(t, 1) }
+        s = tools.new_scope(t, 0)
+        o = sandbox.eval(os.args_get(2), sandbox.limits(), tools.host(s), null) as *sandbox.Outcome
+        background.stop_all((t as *tools.Tools).background)
         print(o.logs)
         if o.ok == 1 {
             if o.text != "undefined" { println(o.text) }
