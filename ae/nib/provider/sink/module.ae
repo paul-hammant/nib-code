@@ -1,0 +1,53 @@
+// provider.sink: what a provider stream reports while it reads (upstream
+// provider.Sink): text and reasoning deltas, tool-argument progress, and
+// that bytes arrived. Each callback is optional (has_* flags). `monitor`
+// is the live response's *http.Reader (content progress feeds its
+// content timeout), null on fixtures.
+
+import nib.provider.http
+
+exports(Sink, new, delta, tool_arguments, received, content)
+
+struct Sink {
+    ctx: ptr
+    on_delta: fn          // |ctx: ptr, kind: string, text: string|  kind: text, reasoning
+    has_delta: int
+    on_tool_arguments: fn // |ctx: ptr|
+    has_tool_arguments: int
+    on_data: fn           // |ctx: ptr|
+    has_data: int
+    emitted: int          // a delta was forwarded (retry may not replay it)
+    monitor: ptr
+}
+
+new(ctx: @keep ptr) -> ptr {
+    s = heap.new(Sink)
+    s.ctx = ctx
+    s.has_delta = 0
+    s.has_tool_arguments = 0
+    s.has_data = 0
+    s.emitted = 0
+    s.monitor = null
+    return s as ptr
+}
+
+delta(sp: ptr, kind: string, text: string) {
+    s = sp as *Sink
+    s.emitted = 1
+    if s.has_delta == 1 { call(s.on_delta, s.ctx, kind, text) }
+}
+
+tool_arguments(sp: ptr) {
+    s = sp as *Sink
+    if s.has_tool_arguments == 1 { call(s.on_tool_arguments, s.ctx) }
+}
+
+received(sp: ptr) {
+    s = sp as *Sink
+    if s.has_data == 1 { call(s.on_data, s.ctx) }
+}
+
+content(sp: ptr, bytes: int) {
+    s = sp as *Sink
+    if s.monitor != null { http.content(s.monitor, bytes) }
+}

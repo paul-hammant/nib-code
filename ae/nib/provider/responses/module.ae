@@ -1,0 +1,740 @@
+// provider.responses: the OpenAI Responses wire protocol over SSE (upstream
+// src/provider/responses.zig), as `openai`, `xai` and custom
+// `protocol = "responses"` endpoints use it: the request body (instructions,
+// input items, custom or function tools, encrypted reasoning replay,
+// prompt_cache_key) and the streamed reply.
+//
+// Errors are names (upstream's error set) with a detail text:
+// HttpStatus, HttpTransient, ProviderTransient, RateLimited, ProviderFailed,
+// InvalidResponse, IncompleteResponse, TooManyToolCalls, Canceled, the http
+// timeouts, Transport.
+//
+// Not ported, by policy: the Codex backend (ChatGPT sign-in, chatgpt-account-id
+// and the codex headers, the websocket transport, codex_state), and images
+// (a message's `images` are not sent). Web search is not in this slice.
+//
+// A model-built custom call (type "custom") reaches the log as a function
+// call named "run" with arguments {"code":...} (types.ToolCall carries no
+// wire type), so a tool result for it is recognised as custom by the
+// replayed custom_tool_call reasoning item with the same call id, or by a
+// logged tool call whose "type" is "custom".
+
+import std.json
+import std.list
+import std.string
+import std.strbuilder
+import nib.jsonx
+import nib.msg
+import nib.provider.types
+import nib.provider.sink
+import nib.provider.sse
+import nib.provider.http
+
+exports(reasoning_effort, request_body, read_stream, stream, retry_delay_ms, fatal_code)
+
+const CUSTOM_RUN_DESCRIPTION = "Run JavaScript in a fresh sandbox using the tools API described in the system prompt. Send raw JavaScript, not JSON, a quoted string or markdown fences. Top-level await is allowed; the last expression's value is returned."
+const CUSTOM_RUN_GRAMMAR = "start: SOURCE\nSOURCE: /[\\s\\S]+/"
+
+// The effort level sent, or "" for none.
+reasoning_effort(cp: ptr) -> string {
+    c = cp as *types.Config
+    if c.provider == "xai" {
+        if c.thinking == 0 || c.reasoning_effort == "none" || c.reasoning_effort == "minimal" { return "" }
+    }
+    if c.thinking == 0 {
+        if types.model_can_disable_reasoning(c.model) == 0 { return "low" }
+        return "none"
+    }
+    if c.reasoning_effort != "" { return c.reasoning_effort }
+    if c.thinking == 1 { return "medium" }
+    return ""
+}
+
+// ---- items -----------------------------------------------------------------
+
+// The item as it is replayed (upstream ws_state.normalize): reasoning items
+// as they are, calls and messages reduced to their input form. "" when the
+// item has no replayable form.
+normalize_(item: ptr) -> string {
+    if item == null || json.json_type(item) != json.JSON_OBJECT { return "" }
+    if jsonx.kind(item, "type") != json.JSON_STRING { return "" }
+    kind = jsonx.str_or(item, "type", "")
+    if kind == "reasoning" { return jsonx.encode(item) }
+    if kind == "function_call" || kind == "custom_tool_call" {
+        key = "input"
+        if kind == "function_call" { key = "arguments" }
+        t = jsonx.field(item, "type")
+        id = jsonx.field(item, "call_id")
+        nm = jsonx.field(item, "name")
+        body = jsonx.field(item, key)
+        if t == null || id == null || nm == null || body == null { return "" }
+        return "{\"type\":${jsonx.encode(t)},\"call_id\":${jsonx.encode(id)},\"name\":${jsonx.encode(nm)},${jsonx.quote(key)}:${jsonx.encode(body)}}"
+    }
+    if kind == "message" {
+        content = jsonx.field(item, "content")
+        if content == null || json.json_type(content) != json.JSON_ARRAY { return "" }
+        text = ""
+        n = json.json_array_size(content)
+        k = 0
+        while k < n {
+            part = json.json_array_get_raw(content, k)
+            if json.json_type(part) != json.JSON_OBJECT { return "" }
+            if jsonx.kind(part, "type") != json.JSON_STRING { return "" }
+            pt = jsonx.str_or(part, "type", "")
+            pkey = ""
+            if pt == "output_text" { pkey = "text" }
+            if pt == "refusal" { pkey = "refusal" }
+            if pkey == "" { return "" }
+            if jsonx.kind(part, pkey) != json.JSON_STRING { return "" }
+            text = "${text}${jsonx.str_or(part, pkey, "")}"
+            k = k + 1
+        }
+        role = jsonx.field(item, "role")
+        if role == null { return "" }
+        ph = ""
+        phase = jsonx.field(item, "phase")
+        if phase != null && json.json_type(phase) != json.JSON_NULL { ph = ",\"phase\":${jsonx.encode(phase)}" }
+        return "{\"role\":${jsonx.encode(role)},\"content\":${jsonx.quote(text)}${ph}}"
+    }
+    return ""
+}
+
+// Whether the call `id`, issued before message `upto`, was a custom call.
+is_custom_call_(provider: string, messages: ptr, upto: int, id: string) -> int {
+    j = 0
+    while j < upto {
+        pm, _e = list.get_string(messages, j)
+        tcs = jsonx.parse(msg.raw(pm, "tool_calls"))
+        if tcs != null && json.json_type(tcs) == json.JSON_ARRAY {
+            q = 0
+            while q < json.json_array_size(tcs) {
+                tc = json.json_array_get_raw(tcs, q)
+                if jsonx.str_or(tc, "id", "") == id && jsonx.str_or(tc, "type", "function") == "custom" {
+                    jsonx.free(tcs)
+                    return 1
+                }
+                q = q + 1
+            }
+        }
+        jsonx.free(tcs)
+        if msg.reasoning_provider(pm) == provider && msg.reasoning_includes_output(pm) == 1 {
+            items = jsonx.parse(msg.reasoning_data(pm))
+            if items != null && json.json_type(items) == json.JSON_ARRAY {
+                q = 0
+                while q < json.json_array_size(items) {
+                    it = json.json_array_get_raw(items, q)
+                    if jsonx.str_or(it, "type", "") == "custom_tool_call" && jsonx.str_or(it, "call_id", "") == id {
+                        jsonx.free(items)
+                        return 1
+                    }
+                    q = q + 1
+                }
+            }
+            jsonx.free(items)
+        }
+        j = j + 1
+    }
+    return 0
+}
+
+// (body, "") or ("", "InvalidResponse") when a stored message, the tools or
+// the output schema are malformed.
+request_body(cp: ptr, cache_key: string, messages: ptr, tools_json: string, max_tokens: int) -> (string, string) {
+    c = cp as *types.Config
+    n = list.list_size(messages)
+    instructions = "You are a helpful assistant."
+    w = strbuilder.new(4096)
+    strbuilder.append(w, "[")
+    sep = ""
+    i = 0
+    while i < n {
+        m, _e = list.get_string(messages, i)
+        r = msg.role(m)
+        if r == "system" {
+            if msg.has_content(m) == 1 { instructions = msg.content(m) }
+            i = i + 1
+            continue
+        }
+        if msg.reasoning_provider(m) == c.provider {
+            items = jsonx.parse(msg.reasoning_data(m))
+            if items == null || json.json_type(items) != json.JSON_ARRAY {
+                jsonx.free(items)
+                return "", "InvalidResponse"
+            }
+            inc = msg.reasoning_includes_output(m)
+            k = 0
+            while k < json.json_array_size(items) {
+                raw = json.json_array_get_raw(items, k)
+                piece = jsonx.encode(raw)
+                if inc == 1 { piece = normalize_(raw) }
+                if piece == "" {
+                    jsonx.free(items)
+                    return "", "InvalidResponse"
+                }
+                strbuilder.append(w, "${sep}${piece}")
+                sep = ","
+                k = k + 1
+            }
+            jsonx.free(items)
+            if inc == 1 {
+                i = i + 1
+                continue
+            }
+        }
+        if r == "tool" {
+            id_raw = msg.raw(m, "tool_call_id")
+            id = msg.str_or(m, "tool_call_id", "")
+            kind = "function_call_output"
+            if id_raw != "" && is_custom_call_(c.provider, messages, i, id) == 1 { kind = "custom_tool_call_output" }
+            idj = "null"
+            if id_raw != "" { idj = id_raw }
+            strbuilder.append(w, "${sep}{\"type\":\"${kind}\",\"call_id\":${idj},\"output\":${jsonx.quote(msg.content(m))}}")
+            sep = ","
+            i = i + 1
+            continue
+        }
+        body_text = msg.content(m)
+        if msg.has_content(m) == 1 && string.length(body_text) > 0 {
+            if max_tokens >= 0 && r == "user" && i == n - 1 {
+                body_text = "${body_text}\nKeep the summary within ${max_tokens} tokens."
+            }
+            ph = ""
+            phase_raw = msg.raw(m, "phase")
+            if phase_raw != "" && phase_raw != "null" { ph = ",\"phase\":${phase_raw}" }
+            strbuilder.append(w, "${sep}{\"role\":${jsonx.quote(r)},\"content\":${jsonx.quote(body_text)}${ph}}")
+            sep = ","
+        }
+        tcs = jsonx.parse(msg.raw(m, "tool_calls"))
+        if tcs != null && json.json_type(tcs) == json.JSON_ARRAY {
+            q = 0
+            while q < json.json_array_size(tcs) {
+                tc = json.json_array_get_raw(tcs, q)
+                call_id = jsonx.str_or(tc, "id", "")
+                fo = jsonx.field(tc, "function")
+                call_name = jsonx.str_or(fo, "name", "")
+                call_args = jsonx.str_or(fo, "arguments", "")
+                if jsonx.str_or(tc, "type", "function") == "custom" {
+                    av = jsonx.parse(call_args)
+                    if av == null || jsonx.kind(av, "code") != json.JSON_STRING {
+                        jsonx.free(av)
+                        jsonx.free(tcs)
+                        return "", "InvalidResponse"
+                    }
+                    strbuilder.append(w, "${sep}{\"type\":\"custom_tool_call\",\"call_id\":${jsonx.quote(call_id)},\"name\":${jsonx.quote(call_name)},\"input\":${jsonx.quote(jsonx.str_or(av, "code", ""))}}")
+                    jsonx.free(av)
+                } else {
+                    strbuilder.append(w, "${sep}{\"type\":\"function_call\",\"call_id\":${jsonx.quote(call_id)},\"name\":${jsonx.quote(call_name)},\"arguments\":${jsonx.quote(call_args)}}")
+                }
+                sep = ","
+                q = q + 1
+            }
+        }
+        jsonx.free(tcs)
+        i = i + 1
+    }
+    strbuilder.append(w, "]")
+    input = strbuilder.finish(w)
+
+    tools = jsonx.parse(tools_json)
+    if tools == null || json.json_type(tools) != json.JSON_ARRAY {
+        jsonx.free(tools)
+        return "", "InvalidResponse"
+    }
+    tool_text = ""
+    tn = json.json_array_size(tools)
+    if tn > 0 {
+        tw = strbuilder.new(1024)
+        strbuilder.append(tw, ",\"tools\":[")
+        t = 0
+        while t < tn {
+            f = jsonx.field(json.json_array_get_raw(tools, t), "function")
+            if t > 0 { strbuilder.append(tw, ",") }
+            tname = jsonx.str_or(f, "name", "")
+            if types.custom_run(cp) == 1 && tname == "run" {
+                strbuilder.append(tw, "{\"type\":\"custom\",\"name\":\"run\",\"description\":${jsonx.quote(CUSTOM_RUN_DESCRIPTION)},\"format\":{\"type\":\"grammar\",\"syntax\":\"lark\",\"definition\":${jsonx.quote(CUSTOM_RUN_GRAMMAR)}}}")
+            } else {
+                params = jsonx.field(f, "parameters")
+                ptext = "null"
+                if params != null { ptext = jsonx.encode(params) }
+                strbuilder.append(tw, "{\"type\":\"function\",\"name\":${jsonx.quote(tname)},\"description\":${jsonx.quote(jsonx.str_or(f, "description", ""))},\"parameters\":${ptext},\"strict\":false}")
+            }
+            t = t + 1
+        }
+        strbuilder.append(tw, "]")
+        tool_text = strbuilder.finish(tw)
+    }
+    jsonx.free(tools)
+
+    effort = reasoning_effort(cp)
+    auto = 0
+    if c.reasoning_summary == "auto" { auto = 1 }
+    reasoning = ""
+    if effort != "" || auto == 1 {
+        parts = ""
+        if effort != "" { parts = "\"effort\":${jsonx.quote(effort)}" }
+        if auto == 1 {
+            if parts != "" { parts = "${parts}," }
+            parts = "${parts}\"summary\":\"auto\""
+        }
+        reasoning = ",\"reasoning\":{${parts}}"
+    }
+    format = ""
+    if c.output_schema != "" {
+        sv = jsonx.parse(c.output_schema)
+        if sv == null { return "", "InvalidResponse" }
+        format = ",\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":\"result\",\"strict\":true,\"schema\":${jsonx.encode(sv)}}}"
+        jsonx.free(sv)
+    }
+    body = "{\"model\":${jsonx.quote(c.model)},\"prompt_cache_key\":${jsonx.quote(cache_key)},\"store\":false,\"stream\":true,\"instructions\":${jsonx.quote(instructions)},\"input\":${input},\"include\":[\"reasoning.encrypted_content\"]${tool_text}${reasoning}${format}}"
+    return body, ""
+}
+
+// ---- the stream --------------------------------------------------------------
+
+struct Item {
+    text: string       // the output item as JSON
+    set: int
+}
+
+fail_(err: string, detail: string) -> (ptr, string, string) {
+    return null, err, detail
+}
+
+clip_(s: string, limit: int) -> string {
+    end = string.length(s)
+    if limit < end { end = limit }
+    while end > 0 && end < string.length(s) && (string.char_at(s, end) & 192) == 128 { end = end - 1 }
+    return string.substring(s, 0, end)
+}
+
+is_digit_(c: int) -> int {
+    if c >= 48 && c <= 57 { return 1 }
+    return 0
+}
+
+status_from_code_(code: string) -> int {
+    digits = code
+    if string.starts_with(code, "http_") == 1 || string.starts_with(code, "HTTP ") == 1 { digits = string.substring(code, 5, string.length(code)) }
+    if string.length(digits) != 3 { return 0 }
+    k = 0
+    while k < 3 {
+        if is_digit_(string.char_at(digits, k)) == 0 { return 0 }
+        k = k + 1
+    }
+    return string.char_at(digits, 0) * 100 + string.char_at(digits, 1) * 10 + string.char_at(digits, 2) - 5328
+}
+
+fatal_code(code: string) -> int {
+    names = string.split("context_length_exceeded insufficient_quota usage_not_included invalid_prompt invalid_request_error invalid_request bad_request unauthorized authentication_error invalid_api_key permission_denied forbidden not_found method_not_allowed request_too_large unsupported_media_type unprocessable_entity", " ")
+    k = string.array_size(names)
+    found = 0
+    i = 0
+    while i < k {
+        if string.array_get(names, i) == code { found = 1 }
+        i = i + 1
+    }
+    string.string_array_free(names)
+    return found
+}
+
+// The delay in a "try again in 1.2s" hint in milliseconds, rounded up, or -1.
+// The decimal is read exactly (digits and a point), so 1.2s is 1200ms.
+retry_delay_ms(text: string) -> long {
+    needle = "try again in "
+    low = string.to_lower(text)
+    nl = string.length(needle)
+    total = string.length(low)
+    start = 0
+    while start + nl <= total {
+        if string.starts_with(string.substring(low, start, total), needle) == 0 {
+            start = start + 1
+            continue
+        }
+        p = start + nl
+        while p < total && (string.char_at(low, p) == 32 || string.char_at(low, p) == 9) { p = p + 1 }
+        mant = 0 as long
+        frac = 0
+        digits = 0
+        dots = 0
+        e = p
+        while e < total && (is_digit_(string.char_at(low, e)) == 1 || string.char_at(low, e) == 46) {
+            ch = string.char_at(low, e)
+            if ch == 46 {
+                dots = dots + 1
+            } else {
+                digits = digits + 1
+                if digits <= 15 { mant = mant * (10 as long) + ((ch - 48) as long) }
+                if dots > 0 && digits <= 15 { frac = frac + 1 }
+            }
+            e = e + 1
+        }
+        if e == p || dots > 1 || digits > 15 {
+            start = start + 1
+            continue
+        }
+        u = e
+        while u < total && (string.char_at(low, u) == 32 || string.char_at(low, u) == 9) { u = u + 1 }
+        unit = string.substring(low, u, total)
+        mult = 0 as long
+        if string.starts_with(unit, "ms") == 1 {
+            mult = 1 as long
+        } else if string.starts_with(unit, "s") == 1 {
+            mult = 1000 as long
+        } else {
+            start = start + 1
+            continue
+        }
+        scale = 1 as long
+        f = 0
+        while f < frac {
+            scale = scale * (10 as long)
+            f = f + 1
+        }
+        return (mant * mult + scale - (1 as long)) / scale
+    }
+    return -1 as long
+}
+
+// (error name, detail) for a failed/error/incomplete event.
+failure_(cp: ptr, ev: ptr) -> (string, string) {
+    fcode = jsonx.field(ev, "code")
+    fmsg_set = 0
+    fmsg = ""
+    if jsonx.kind(ev, "message") == json.JSON_STRING {
+        fmsg_set = 1
+        fmsg = string.copy(jsonx.str_or(ev, "message", ""))
+    }
+    ftype = "unknown"
+    fstat = jsonx.int_or(ev, "status", -1)
+    fsc = jsonx.int_or(ev, "status_code", -1)
+    eo = jsonx.field(ev, "error")
+    if eo != null && json.json_type(eo) == json.JSON_OBJECT {
+        fcode = jsonx.field(eo, "code")
+        fmsg_set = 0
+        fmsg = ""
+        if jsonx.kind(eo, "message") == json.JSON_STRING {
+            fmsg_set = 1
+            fmsg = string.copy(jsonx.str_or(eo, "message", ""))
+        }
+        ftype = string.copy(jsonx.str_or(eo, "type", "unknown"))
+        fstat = jsonx.int_or(eo, "status", fstat)
+        fsc = jsonx.int_or(eo, "status_code", fsc)
+    }
+    reason_set = 0
+    reason = ""
+    resp = jsonx.field(ev, "response")
+    if resp != null && json.json_type(resp) == json.JSON_OBJECT {
+        re = jsonx.field(resp, "error")
+        if re != null && json.json_type(re) == json.JSON_OBJECT {
+            fcode = jsonx.field(re, "code")
+            fmsg_set = 0
+            fmsg = ""
+            if jsonx.kind(re, "message") == json.JSON_STRING {
+                fmsg_set = 1
+                fmsg = string.copy(jsonx.str_or(re, "message", ""))
+            }
+            ftype = string.copy(jsonx.str_or(re, "type", "unknown"))
+            fstat = jsonx.int_or(re, "status", -1)
+            fsc = jsonx.int_or(re, "status_code", -1)
+        }
+        inc = jsonx.field(resp, "incomplete_details")
+        if inc != null && jsonx.kind(inc, "reason") == json.JSON_STRING {
+            reason_set = 1
+            reason = string.copy(jsonx.str_or(inc, "reason", ""))
+        }
+    }
+    code = ftype
+    if reason_set == 1 {
+        code = reason
+    } else if fcode != null {
+        if json.json_type(fcode) == json.JSON_STRING {
+            code = string.copy(jsonx.str_field(fcode))
+        } else if jsonx.is_integer(fcode) == 1 {
+            code = "${json.json_get_long(fcode)}"
+        }
+    }
+    shown_msg = "No error message was provided"
+    if fmsg_set == 1 {
+        shown_msg = fmsg
+    } else if reason_set == 1 {
+        shown_msg = reason
+    }
+    status = status_from_code_(code)
+    if fstat >= 0 { status = fstat }
+    if fsc >= 0 { status = fsc }
+    fatal = 0
+    if fatal_code(code) == 1 || (status >= 400 && status < 500 && status != 429) { fatal = 1 }
+    limited = 0
+    if fatal == 0 && (code == "rate_limit_exceeded" || status == 429) { limited = 1 }
+    shown = clip_(shown_msg, 300)
+    if limited == 1 && string.length(shown) < string.length(shown_msg) && retry_delay_ms(shown) < (0 as long) {
+        ms = retry_delay_ms(shown_msg)
+        if ms >= (0 as long) { shown = "${clip_(shown_msg, 260)}… try again in ${ms}ms" }
+    }
+    detail = "${types.name(cp)} stream failed: ${code}: ${shown}; the Step was not committed."
+    if fatal == 1 { return "ProviderFailed", detail }
+    if limited == 1 { return "RateLimited", detail }
+    return "ProviderTransient", detail
+}
+
+// 1 when the event's fields have the shapes the decoder needs (upstream's
+// typed decode); the failing event's contents are never echoed.
+decodes_(ev: ptr) -> int {
+    k = jsonx.kind(ev, "delta")
+    if k != -1 && k != json.JSON_STRING && k != json.JSON_NULL { return 0 }
+    k = jsonx.kind(ev, "output_index")
+    if k != -1 && k != json.JSON_NUMBER { return 0 }
+    k = jsonx.kind(ev, "response")
+    if k != -1 && k != json.JSON_OBJECT && k != json.JSON_NULL { return 0 }
+    resp = jsonx.field(ev, "response")
+    if resp != null && json.json_type(resp) == json.JSON_OBJECT {
+        k = jsonx.kind(resp, "status")
+        if k != -1 && k != json.JSON_STRING && k != json.JSON_NULL { return 0 }
+        k = jsonx.kind(resp, "usage")
+        if k != -1 && k != json.JSON_OBJECT && k != json.JSON_NULL { return 0 }
+        u = jsonx.field(resp, "usage")
+        if u != null && json.json_type(u) == json.JSON_OBJECT {
+            k = jsonx.kind(u, "input_tokens")
+            if k != -1 && k != json.JSON_NUMBER { return 0 }
+            k = jsonx.kind(u, "output_tokens")
+            if k != -1 && k != json.JSON_NUMBER { return 0 }
+        }
+    }
+    return 1
+}
+
+incomplete_(cp: ptr) -> (ptr, string, string) {
+    return null, "IncompleteResponse", "${types.name(cp)} stream failed: IncompleteResponse: the stream ended before a complete response; the Step was not committed."
+}
+
+// The streamed reply. (reply, "", "") or (null, error name, detail).
+read_stream(lines: ptr, cp: ptr, sk: ptr, cancel: ptr) -> (ptr, string, string) {
+    c = cp as *types.Config
+    parser = sse.parser()
+    items = list.list_new()
+    text = ""
+    pending = 0
+    in_tok = 0 as long
+    out_tok = 0 as long
+    hit_tok = 0 as long
+    write_tok = 0 as long
+    completed = 0
+    event_type = "before_event"
+    event_index = 0
+    while completed == 0 {
+        line, lerr = sse.next(lines, cancel)
+        if lerr != "" && lerr != "EOF" { return fail_(lerr, "") }
+        data, ready = sse.feed(parser, line)
+        if ready == 0 {
+            if lerr == "EOF" {
+                data, ready = sse.feed(parser, "")
+                if ready == 0 { return incomplete_(cp) }
+            } else {
+                continue
+            }
+        }
+        ev = jsonx.parse(data)
+        if ev == null || json.json_type(ev) != json.JSON_OBJECT || jsonx.kind(ev, "type") != json.JSON_STRING || decodes_(ev) == 0 {
+            jsonx.free(ev)
+            return fail_("InvalidResponse", "${types.name(cp)} event decode failed: UnexpectedToken; last event=${event_type}, output_index=${event_index}")
+        }
+        kind = string.copy(jsonx.str_or(ev, "type", ""))
+        event_type = kind
+        event_index = jsonx.int_or(ev, "output_index", 0)
+        has_delta = 0
+        delta = ""
+        if jsonx.kind(ev, "delta") == json.JSON_STRING {
+            has_delta = 1
+            delta = string.copy(jsonx.str_or(ev, "delta", ""))
+        }
+        if has_delta == 1 {
+            if kind == "response.output_text.delta" || kind == "response.refusal.delta" || kind == "response.reasoning_summary_text.delta" || kind == "response.reasoning_text.delta" || kind == "response.function_call_arguments.delta" || kind == "response.custom_tool_call_input.delta" {
+                sink.content(sk, string.length(delta))
+            }
+            if string.length(delta) > 0 && (kind == "response.function_call_arguments.delta" || kind == "response.custom_tool_call_input.delta") { sink.tool_arguments(sk) }
+        }
+        if kind == "response.output_text.delta" || kind == "response.refusal.delta" {
+            if has_delta == 0 {
+                jsonx.free(ev)
+                return fail_("InvalidResponse", "")
+            }
+            text = "${text}${delta}"
+            sink.delta(sk, "text", delta)
+        } else if kind == "response.reasoning_summary_text.delta" || kind == "response.reasoning_text.delta" {
+            if has_delta == 0 {
+                jsonx.free(ev)
+                return fail_("InvalidResponse", "")
+            }
+            sink.delta(sk, "reasoning", delta)
+        } else if kind == "response.output_item.added" {
+            pending = pending + 1
+        } else if kind == "response.output_item.done" {
+            idx = event_index
+            iv = jsonx.field(ev, "item")
+            if idx > 256 || idx < 0 || iv == null || json.json_type(iv) == json.JSON_NULL {
+                jsonx.free(ev)
+                return fail_("InvalidResponse", "")
+            }
+            while list.list_size(items) <= idx {
+                fresh = heap.new(Item)
+                fresh.text = ""
+                fresh.set = 0
+                list.list_add(items, fresh as ptr)
+            }
+            slot = list.list_get_raw(items, idx) as *Item
+            if slot.set == 1 {
+                jsonx.free(ev)
+                return fail_("InvalidResponse", "")
+            }
+            slot.text = jsonx.encode(iv)
+            slot.set = 1
+            if pending > 0 { pending = pending - 1 }
+        } else if kind == "response.failed" || kind == "error" || kind == "response.incomplete" {
+            ferr, fdetail = failure_(cp, ev)
+            jsonx.free(ev)
+            return fail_(ferr, fdetail)
+        } else if kind == "response.completed" || kind == "response.done" {
+            resp = jsonx.field(ev, "response")
+            if resp == null || json.json_type(resp) != json.JSON_OBJECT {
+                jsonx.free(ev)
+                return fail_("InvalidResponse", "")
+            }
+            if jsonx.kind(resp, "status") == json.JSON_STRING && jsonx.str_or(resp, "status", "") != "completed" {
+                ferr2, fdetail2 = failure_(cp, ev)
+                jsonx.free(ev)
+                return fail_(ferr2, fdetail2)
+            }
+            if pending != 0 {
+                jsonx.free(ev)
+                return incomplete_(cp)
+            }
+            u = jsonx.field(resp, "usage")
+            if u != null && json.json_type(u) == json.JSON_OBJECT {
+                in_tok = jsonx.long_or(u, "input_tokens", 0 as long)
+                out_tok = jsonx.long_or(u, "output_tokens", 0 as long)
+                d = jsonx.field(u, "input_tokens_details")
+                if d != null && json.json_type(d) == json.JSON_OBJECT {
+                    hit_tok = jsonx.long_or(d, "cached_tokens", 0 as long)
+                    write_tok = jsonx.long_or(d, "cache_write_tokens", 0 as long)
+                }
+            }
+            completed = 1
+        }
+        jsonx.free(ev)
+        if completed == 0 && lerr == "EOF" { return incomplete_(cp) }
+    }
+    rep = types.reply_new() as *types.Reply
+    reasoning_items = list.list_new()
+    all = ""
+    replayable = 1
+    phase = ""
+    i = 0
+    while i < list.list_size(items) {
+        slot = list.list_get_raw(items, i) as *Item
+        if slot.set == 0 { return fail_("InvalidResponse", "") }
+        v = jsonx.parse(slot.text)
+        if v == null || jsonx.kind(v, "type") != json.JSON_STRING {
+            jsonx.free(v)
+            return fail_("InvalidResponse", "")
+        }
+        itype = string.copy(jsonx.str_or(v, "type", ""))
+        if normalize_(v) == "" { replayable = 0 }
+        if itype == "message" {
+            if jsonx.kind(v, "phase") == json.JSON_STRING { phase = string.copy(jsonx.str_or(v, "phase", "")) }
+        } else if itype == "reasoning" {
+            list.list_add(reasoning_items, string.copy(slot.text))
+        } else if itype == "function_call" || itype == "custom_tool_call" {
+            if list.list_size(rep.tool_calls) >= 64 {
+                jsonx.free(v)
+                return fail_("TooManyToolCalls", "")
+            }
+            custom = 0
+            argkey = "arguments"
+            if itype == "custom_tool_call" {
+                custom = 1
+                argkey = "input"
+            }
+            if jsonx.kind(v, argkey) != json.JSON_STRING || jsonx.kind(v, "call_id") != json.JSON_STRING || jsonx.kind(v, "name") != json.JSON_STRING {
+                jsonx.free(v)
+                return fail_("InvalidResponse", "")
+            }
+            args = string.copy(jsonx.str_or(v, argkey, ""))
+            if custom == 1 { args = "{\"code\":${jsonx.quote(args)}}" }
+            ntc = types.tool_call_new(string.copy(jsonx.str_or(v, "call_id", "")), string.copy(jsonx.str_or(v, "name", "")), args) as *types.ToolCall
+            if custom == 1 { ntc.kind = "custom" }
+            list.list_add(rep.tool_calls, ntc as ptr)
+        }
+        jsonx.free(v)
+        if i > 0 { all = "${all}," }
+        all = "${all}${slot.text}"
+        i = i + 1
+    }
+    rep.text = text
+    rep.phase = phase
+    if replayable == 1 && list.list_size(items) > 0 {
+        rep.reasoning_provider = string.copy(c.provider)
+        rep.reasoning_data = "[${all}]"
+        rep.reasoning_includes_output = 1
+    } else if list.list_size(reasoning_items) > 0 {
+        joined = ""
+        q = 0
+        while q < list.list_size(reasoning_items) {
+            ri, _e = list.get_string(reasoning_items, q)
+            if q > 0 { joined = "${joined}," }
+            joined = "${joined}${ri}"
+            q = q + 1
+        }
+        rep.reasoning_provider = string.copy(c.provider)
+        rep.reasoning_data = "[${joined}]"
+    }
+    uu = rep.usage as *types.Usage
+    uu.prompt_tokens = in_tok
+    uu.completion_tokens = out_tok
+    uu.prompt_cache_hit_tokens = hit_tok
+    uu.prompt_cache_write_tokens = write_tok
+    return rep as ptr, "", ""
+}
+
+trim_slash_(s: string) -> string {
+    out = s
+    while string.length(out) > 0 && string.ends_with(out, "/") == 1 {
+        out = string.substring(out, 0, string.length(out) - 1)
+    }
+    return out
+}
+
+timeout_detail_(r: ptr, err: string) -> string {
+    if err == http.TIMEOUT_BYTES || err == http.TIMEOUT_CONTENT || err == http.TIMEOUT_REQUEST { return http.timeout_message(r, err) }
+    if string.starts_with(err, "Transport: ") == 1 { return string.substring(err, 11, string.length(err)) }
+    return ""
+}
+
+// One request attempt against `cfg.base_url`/responses.
+stream(cp: ptr, cache_key: string, messages: ptr, tools_json: string, max_tokens: int, sk: ptr, cancel: ptr) -> (ptr, string, string) {
+    c = cp as *types.Config
+    body, berr = request_body(cp, cache_key, messages, tools_json, max_tokens)
+    if berr != "" { return fail_(berr, "") }
+    names = list.list_new()
+    values = list.list_new()
+    if string.length(c.api_key) > 0 {
+        list.list_add(names, "authorization")
+        list.list_add(values, "Bearer ${c.api_key}")
+    }
+    list.list_add(names, "accept")
+    list.list_add(values, "text/event-stream")
+    l = c.limits as *types.Limits
+    st = http.open("${trim_slash_(c.base_url)}/responses", names, values, body, l.request_timeout_s + 5)
+    r = http.reader(st, l.stream_idle_timeout_s, l.stream_content_timeout_s, l.request_timeout_s)
+    (sk as *sink.Sink).monitor = r
+    status, herr = http.wait_head(r, cancel)
+    if herr != "" { return fail_(herr, timeout_detail_(r, herr)) }
+    sink.received(sk)
+    if status < 200 || status > 299 {
+        detail = "${types.name(cp)}: HTTP ${status}; check ${types.key_hint(cp)}."
+        if status == 429 || status >= 500 { return fail_("HttpTransient", detail) }
+        return fail_("HttpStatus", detail)
+    }
+    rep, err, detail = read_stream(sse.from_http(r), cp, sk, cancel)
+    if err != "" && detail == "" { detail = timeout_detail_(r, err) }
+    return rep, err, detail
+}

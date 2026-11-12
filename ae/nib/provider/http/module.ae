@@ -1,0 +1,261 @@
+// provider.http: one streaming model request (upstream's use of std.http
+// in provider/*.zig, provider/cancel.zig, idle.zig and body.zig), on
+// Aether's std.http.client.
+//
+// The request runs on its own thread, which appends body bytes to the
+// Stream as they arrive; the caller polls lines from it, so cancellation
+// and the three timeouts (no bytes, no content, whole attempt) are checked
+// every few milliseconds, as upstream's cancelable.run and idle.Monitor do.
+// An abandoned request (cancel, timeout) keeps its thread until the server
+// closes or the client's own whole-exchange timeout fires; nothing reads
+// its bytes after that.
+//
+// No `Expect: 100-continue` is sent: std.http.client returns an interim
+// 100 Continue as the final response (a known Aether bug), so a request
+// must never ask for one. std.http.client sends Content-Length bodies and
+// no Expect header by default.
+
+import std.http.client
+import std.list
+import std.string
+import std.sync
+import std.time
+import std.worker
+import nib.lock
+
+exports(Stream, Reader, open, reader, wait_head, next_line, content, read_rest, status_of,
+        timeout_message, TIMEOUT_BYTES, TIMEOUT_CONTENT, TIMEOUT_REQUEST)
+
+const TIMEOUT_BYTES = "StreamIdleTimeout"
+const TIMEOUT_CONTENT = "StreamContentTimeout"
+const TIMEOUT_REQUEST = "ModelRequestTimeout"
+
+struct Stream {
+    guard: ptr
+    buf: string
+    status: int        // 0 until the head arrives
+    done: ptr          // std.sync cell: 1 once the body ended (or failed)
+    err: string        // transport error text, "" none
+}
+
+struct Reader {
+    stream: ptr
+    pending: string    // received bytes not yet returned as lines
+    started_ms: long
+    last_ms: long      // last bytes
+    last_content_ms: long
+    body: int          // 1 once the head arrived
+    idle_s: int
+    content_s: int
+    request_s: int
+    timeout_kind: string
+    received: long
+}
+
+now_() -> long { return time.now_ms() }
+
+// Starts POST `url` with `body`. names/values: parallel lists of headers.
+open(url: string, names: @keep ptr, values: @keep ptr, body: string, request_s: int) -> ptr {
+    st = heap.new(Stream)
+    st.guard = lock.new()
+    st.buf = ""
+    st.status = 0
+    st.done = sync.atomic_new(0)
+    st.err = ""
+    sp = st as ptr
+    u = string.copy(url)
+    b = string.copy(body)
+    hn = names
+    hv = values
+    limit = request_s
+    worker.run_detached(|| {
+        s = sp as *Stream
+        req = client.request("POST", u)
+        i = 0
+        while i < list.list_size(hn) {
+            n, _a = list.get_string(hn, i)
+            v, _b = list.get_string(hv, i)
+            client.set_header(req, n, v)
+            i = i + 1
+        }
+        client.set_body(req, string.bytes(b), "application/json")
+        if limit > 0 { client.set_timeout(req, (limit as long) * 1s) }
+        resp, err = client.send_stream(req)
+        if err != "" {
+            lock.acquire(s.guard)
+            s.err = err
+            lock.release(s.guard)
+            sync.atomic_store(s.done, 1)
+            return null
+        }
+        lock.acquire(s.guard)
+        s.status = client.response_status(resp)
+        lock.release(s.guard)
+        while true {
+            chunk = client.response_read(resp, 65536)
+            if string.length(chunk) == 0 { break }
+            lock.acquire(s.guard)
+            s.buf = "${s.buf}${chunk}"
+            lock.release(s.guard)
+        }
+        e = client.response_error(resp)
+        if e != "" {
+            lock.acquire(s.guard)
+            s.err = e
+            lock.release(s.guard)
+        }
+        sync.atomic_store(s.done, 1)
+        return null
+    })
+    return sp
+}
+
+reader(sp: @keep ptr, idle_s: int, content_s: int, request_s: int) -> ptr {
+    r = heap.new(Reader)
+    r.stream = sp
+    r.pending = ""
+    r.started_ms = now_()
+    r.last_ms = r.started_ms
+    r.last_content_ms = r.started_ms
+    r.body = 0
+    r.idle_s = idle_s
+    r.content_s = content_s
+    r.request_s = request_s
+    r.timeout_kind = ""
+    r.received = 0 as long
+    return r as ptr
+}
+
+status_of(rp: ptr) -> int {
+    r = rp as *Reader
+    s = r.stream as *Stream
+    lock.acquire(s.guard)
+    n = s.status
+    lock.release(s.guard)
+    return n
+}
+
+// Records reasoning, text or tool-argument progress (the content timeout).
+content(rp: ptr, bytes: int) {
+    if bytes == 0 { return }
+    r = rp as *Reader
+    r.last_content_ms = now_()
+}
+
+// "" or the timeout error name, set in r.timeout_kind.
+check_(r: *Reader) -> string {
+    t = now_()
+    if r.request_s > 0 && t - r.started_ms >= (r.request_s as long) * 1000 {
+        r.timeout_kind = TIMEOUT_REQUEST
+        return TIMEOUT_REQUEST
+    }
+    if r.idle_s > 0 && t - r.last_ms >= (r.idle_s as long) * 1000 {
+        r.timeout_kind = TIMEOUT_BYTES
+        return TIMEOUT_BYTES
+    }
+    if r.body == 1 && r.content_s > 0 && t - r.last_content_ms >= (r.content_s as long) * 1000 {
+        r.timeout_kind = TIMEOUT_CONTENT
+        return TIMEOUT_CONTENT
+    }
+    return ""
+}
+
+// Moves arrived bytes into pending. (got bytes, done, transport error).
+pull_(r: *Reader) -> (int, int, string) {
+    s = r.stream as *Stream
+    done = sync.atomic_load(s.done) as int
+    lock.acquire(s.guard)
+    got = s.buf
+    s.buf = ""
+    e = s.err
+    if s.status != 0 { r.body = 1 }
+    lock.release(s.guard)
+    n = string.length(got)
+    if n > 0 {
+        r.pending = "${r.pending}${got}"
+        r.last_ms = now_()
+        r.received = r.received + (n as long)
+    }
+    return n, done, e
+}
+
+// Waits for the response head. (status, err): err "Canceled", a timeout
+// name, or "Transport: <text>".
+wait_head(rp: ptr, cancel: ptr) -> (int, string) {
+    r = rp as *Reader
+    while true {
+        if cancel != null && sync.atomic_load(cancel) != 0 { return 0, "Canceled" }
+        _n, done, e = pull_(r)
+        st = status_of(rp)
+        if st != 0 {
+            if r.body == 0 {
+                r.body = 1
+                r.last_content_ms = now_()
+            }
+            return st, ""
+        }
+        if done == 1 {
+            if e == "" { e = "connection closed before the response head" }
+            return 0, "Transport: ${e}"
+        }
+        t = check_(r)
+        if t != "" { return 0, t }
+        sleep(5)
+    }
+}
+
+// The next body line without its newline. (line, err): err "" a line,
+// "EOF" at the end of the body (line holds an unterminated tail, if any),
+// "Canceled", a timeout name, or "Transport: <text>".
+next_line(rp: ptr, cancel: ptr) -> (string, string) {
+    r = rp as *Reader
+    while true {
+        nl = string.index_of(r.pending, "\n")
+        if nl >= 0 {
+            line = string.substring(r.pending, 0, nl)
+            r.pending = string.substring(r.pending, nl + 1, string.length(r.pending))
+            return line, ""
+        }
+        if cancel != null && sync.atomic_load(cancel) != 0 { return "", "Canceled" }
+        n, done, e = pull_(r)
+        if n == 0 {
+            if done == 1 {
+                // Bytes may land between the load of done and the pull.
+                n2, _d, _e2 = pull_(r)
+                if n2 == 0 {
+                    if e != "" { return "", "Transport: ${e}" }
+                    tail = r.pending
+                    r.pending = ""
+                    return tail, "EOF"
+                }
+            } else {
+                t = check_(r)
+                if t != "" { return "", t }
+                sleep(2)
+            }
+        }
+    }
+}
+
+// The rest of the body (an error response), bounded by the same checks.
+read_rest(rp: ptr, cancel: ptr) -> (string, string) {
+    out = ""
+    while true {
+        line, err = next_line(rp, cancel)
+        if err == "" {
+            out = "${out}${line}\n"
+        } else if err == "EOF" {
+            return "${out}${line}", ""
+        } else {
+            return out, err
+        }
+    }
+}
+
+// Upstream idle.Monitor.failure's text for a timeout error name.
+timeout_message(rp: ptr, kind: string) -> string {
+    r = rp as *Reader
+    if kind == TIMEOUT_BYTES { return "Stream idle timeout after ${r.idle_s}s without receiving bytes." }
+    if kind == TIMEOUT_CONTENT { return "Stream content idle timeout after ${r.content_s}s without reasoning, text or tool arguments." }
+    return "Model request timeout after ${r.request_s}s without completing the attempt."
+}

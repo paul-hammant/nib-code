@@ -9,7 +9,7 @@ import std.list
 @source("sysgap.c")
 
 exports(Stat, new_stat, stat, errname, lock_open, try_lock, close, fd_size, fd_truncate,
-        create_excl, write_all, environ, fchmod, fsync, rename, unlink, chmod, mkdir,
+        create_excl, write_all, pwrite_all, watch_signals, signal_received, stdin_echo, environ, fchmod, fsync, rename, unlink, chmod, mkdir,
         KIND_FILE, KIND_DIR, KIND_LINK, KIND_OTHER, ENOENT_NAME)
 
 const KIND_FILE = 1
@@ -36,6 +36,10 @@ extern nibsys_fd_size(fd: int) -> long
 extern nibsys_fd_truncate(fd: int, n: long) -> int
 extern nibsys_create_excl(path: string, mode: int) -> int
 extern nibsys_write_all(fd: int, data: string, n: long) -> int
+extern nibsys_pwrite_all(fd: int, data: string, n: long, offset: long) -> int
+extern nibsys_watch_signals() -> int
+extern nibsys_stdin_echo(on: int) -> int
+extern nibsys_signal_received() -> int
 extern nibsys_fchmod(fd: int, mode: int) -> int
 extern nibsys_fsync(fd: int) -> int
 extern nibsys_rename(from: string, to: string) -> int
@@ -69,6 +73,13 @@ fd_size(fd: int) -> long { return nibsys_fd_size(fd) }
 fd_truncate(fd: int, n: long) -> int { return nibsys_fd_truncate(fd, n) }
 create_excl(path: string, mode: int) -> int { return nibsys_create_excl(path, mode) }
 write_all(fd: int, data: string) -> int { return nibsys_write_all(fd, data, string.length(data) as long) }
+pwrite_all(fd: int, data: string, offset: long) -> int { return nibsys_pwrite_all(fd, data, string.length(data) as long, offset) }
+// SIGINT/SIGTERM set a flag instead of ending the process; signal_received()
+// is the last one's number, 0 none.
+// Turns stdin's terminal echo on (1) or off (0); 1 if stdin is a terminal.
+stdin_echo(on: int) -> int { return nibsys_stdin_echo(on) }
+watch_signals() -> int { return nibsys_watch_signals() }
+signal_received() -> int { return nibsys_signal_received() }
 fchmod(fd: int, mode: int) -> int { return nibsys_fchmod(fd, mode) }
 fsync(fd: int) -> int { return nibsys_fsync(fd) }
 rename(from: string, to: string) -> int { return nibsys_rename(from, to) }

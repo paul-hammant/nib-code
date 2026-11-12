@@ -1,0 +1,695 @@
+// session.log: the append-only Session log (upstream src/session/log.zig;
+// docs/session-log.md). One JSON record per line under
+// $NIB_HOME/sessions/<id>.jsonl, created 0600 and held under an exclusive
+// flock while a Session uses it. Records are stamped with `at` (Unix ms);
+// a commit record replaces history[from..] with its messages, so replaying
+// every record rebuilds the safe history. A torn last line is repaired on
+// restore by writing a `"repair":true` record after a newline.
+//
+// Records are JSON text: the Session builds the members it logs (usage,
+// timing, run_results, ...) and this module adds at/from/messages/
+// context_tokens/repair, as upstream's Record serialises its non-optional
+// fields on every line.
+//
+// Not yet ported: restoring tool summaries and bash replacements onto
+// replayed messages (the TUI slice needs them; `ask` does not), the
+// MCP/skills summary members beyond keeping them in the header.
+//
+// File access is on nib.sysgap (flock, O_EXCL with a mode, pwrite, fsync):
+// a marked stand-in, asks/aether-fs-stat-flock-exclusive.md.
+
+import std.json
+import std.list
+import std.string
+import std.fs
+import std.dir
+import std.time
+import nib.jsonx
+import nib.lock
+import nib.msg
+import nib.sysgap
+import nib.provider.types
+
+exports(Log, Replayed, Summary, create, restore, close, commit, event, background, replay, list_sessions,
+        latest, first_line)
+
+struct Log {
+    fd: int
+    offset: long
+    guard: ptr
+    poisoned: int
+    steps: int
+    provider: string
+    custom_provider: string
+    model: string
+    parent_session_id: string
+    cache_key: string
+    forked_from: string        // the forked_from object's JSON, "" none
+    next_agent_id: long
+    next_bash_id: long
+    next_run_id: long
+    agent_sessions: ptr        // list of agent_session JSON texts
+    lost_background: ptr       // list of background event JSON texts
+    pending_background_bytes: long
+    context_tokens: long
+}
+
+struct Replayed {
+    err: string
+    needs_repair: int
+    steps: int
+    parent_session_id: string
+    cache_key: string
+    forked_from: string
+    provider: string
+    custom_provider: string
+    model: string
+    next_agent_id: long
+    next_bash_id: long
+    next_run_id: long
+    agent_sessions: ptr
+    lost_background: ptr
+    background_repairs: ptr
+    pending_background_bytes: long
+    context_tokens: long
+}
+
+new_log_(fd: int, offset: long) -> ptr {
+    l = heap.new(Log)
+    l.fd = fd
+    l.offset = offset
+    l.guard = lock.new()
+    l.poisoned = 0
+    l.steps = 0
+    l.provider = "chat_completions"
+    l.custom_provider = ""
+    l.model = ""
+    l.parent_session_id = ""
+    l.cache_key = ""
+    l.forked_from = ""
+    l.next_agent_id = 1 as long
+    l.next_bash_id = 1 as long
+    l.next_run_id = 1 as long
+    l.agent_sessions = list.list_new()
+    l.lost_background = list.list_new()
+    l.pending_background_bytes = 0 as long
+    l.context_tokens = 0 as long
+    return l as ptr
+}
+
+// A new log at `path` (must not exist). (log, "") or (null, error name).
+create(path: string) -> (ptr, string) {
+    fd = sysgap.create_excl(path, 384)
+    if fd < 0 { return null, sysgap.errname(fd) }
+    sysgap.close(fd)
+    lfd = sysgap.lock_open(path)
+    if lfd < 0 { return null, sysgap.errname(lfd) }
+    if sysgap.try_lock(lfd) != 1 {
+        sysgap.close(lfd)
+        return null, "SessionBusy"
+    }
+    return new_log_(lfd, 0 as long), ""
+}
+
+// Opens and replays an existing log into `history` (a list of message
+// texts). expected_parent: "" to skip the check. (log, "") or (null, error).
+restore(path: string, history: ptr, expected_parent: string, check_parent: int) -> (ptr, string) {
+    if fs.exists(path) == 0 { return null, "FileNotFound" }
+    lfd = sysgap.lock_open(path)
+    if lfd < 0 { return null, sysgap.errname(lfd) }
+    if sysgap.try_lock(lfd) != 1 {
+        sysgap.close(lfd)
+        return null, "SessionBusy"
+    }
+    data, rerr = fs.read(path)
+    if rerr != "" {
+        sysgap.close(lfd)
+        return null, "ReadFailed"
+    }
+    r = replay(data, history) as *Replayed
+    if r.err != "" {
+        sysgap.close(lfd)
+        return null, r.err
+    }
+    if check_parent == 1 && expected_parent != r.parent_session_id {
+        sysgap.close(lfd)
+        return null, "AgentSessionParentMismatch"
+    }
+    l = new_log_(lfd, string.length(data) as long) as *Log
+    l.steps = r.steps
+    l.provider = r.provider
+    l.custom_provider = r.custom_provider
+    l.model = r.model
+    l.parent_session_id = r.parent_session_id
+    l.cache_key = r.cache_key
+    l.forked_from = r.forked_from
+    l.next_agent_id = r.next_agent_id
+    l.next_bash_id = r.next_bash_id
+    l.next_run_id = r.next_run_id
+    l.agent_sessions = r.agent_sessions
+    l.lost_background = r.lost_background
+    l.pending_background_bytes = r.pending_background_bytes
+    l.context_tokens = r.context_tokens
+    if r.needs_repair == 1 {
+        e = append_(l as ptr, "", 1)
+        if e != "" { return null, e }
+    }
+    i = 0
+    while i < list.list_size(r.background_repairs) {
+        b, _g = list.get_string(r.background_repairs, i)
+        e2 = append_(l as ptr, ",\"background\":${b}", 0)
+        if e2 != "" { return null, e2 }
+        i = i + 1
+    }
+    if r.needs_repair == 1 || list.list_size(r.background_repairs) > 0 { sysgap.fsync(l.fd) }
+    return l as ptr, ""
+}
+
+close(lp: ptr) {
+    l = lp as *Log
+    if l.fd >= 0 { sysgap.close(l.fd) }
+    l.fd = -1
+}
+
+// Writes one record: {"at":…<members>,"from":…,"messages":[…],"context_tokens":…,"repair":…}.
+record_(members: string, from: int, messages: string, tokens: long, repair: int) -> string {
+    rep = "false"
+    if repair == 1 { rep = "true" }
+    return "{\"at\":${time.now_ms()}${members},\"from\":${from},\"messages\":${messages},\"context_tokens\":${tokens},\"repair\":${rep}}"
+}
+
+append_raw_(lp: ptr, line: string) -> string {
+    l = lp as *Log
+    if l.poisoned == 1 { return "SessionLogFailed" }
+    rc = sysgap.pwrite_all(l.fd, line, l.offset)
+    if rc != 0 {
+        l.poisoned = 1
+        return "SessionLogFailed"
+    }
+    l.offset = l.offset + (string.length(line) as long)
+    return ""
+}
+
+append_(lp: ptr, members: string, repair: int) -> string {
+    prefix = ""
+    if repair == 1 { prefix = "\n" }
+    return append_raw_(lp, "${prefix}${record_(members, 0, "[]", 0 as long, repair)}\n")
+}
+
+sync_(lp: ptr) -> string {
+    l = lp as *Log
+    if sysgap.fsync(l.fd) != 0 {
+        l.poisoned = 1
+        return "SessionLogFailed"
+    }
+    return ""
+}
+
+// A record that commits no messages (bash, task_stop, sandbox_unavailable,
+// hook, diagnostic, agent_session…). members: ",\"bash\":{…}". sync: fsync after.
+event(lp: ptr, members: string, sync: int) -> string {
+    l = lp as *Log
+    lock.acquire(l.guard)
+    e = append_(lp, members, 0)
+    if e == "" && sync == 1 { e = sync_(lp) }
+    lock.release(l.guard)
+    return e
+}
+
+// A background lifecycle record (synced).
+background(lp: ptr, event_json: string, step: int) -> string {
+    return event(lp, ",\"background\":${event_json},\"turn_step\":${step}", 1)
+}
+
+assistant_count_(messages: ptr, from: int) -> int {
+    n = 0
+    i = from
+    while i < list.list_size(messages) {
+        m, _g = list.get_string(messages, i)
+        if msg.role(m) == "assistant" { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// history[from..] := messages (list of texts), logged first and synced.
+// members: further record members (",\"usage\":…" or ""); forked: the
+// record carries forked_from (its messages are inherited, not Steps).
+commit(lp: ptr, history: ptr, from: int, messages: ptr, tokens: long, members: string, forked: int) -> string {
+    l = lp as *Log
+    lock.acquire(l.guard)
+    if from > list.list_size(history) {
+        lock.release(l.guard)
+        return "InvalidSessionLog"
+    }
+    line = "${record_(members, from, msg.history_json(messages, 0), tokens, 0)}\n"
+    e = append_raw_(lp, line)
+    if e != "" {
+        lock.release(l.guard)
+        return e
+    }
+    if from == list.list_size(history) && forked == 0 { l.steps = l.steps + assistant_count_(messages, 0) }
+    apply_(history, from, messages, effort_of_(members))
+    l.context_tokens = tokens
+    e2 = sync_(lp)
+    lock.release(l.guard)
+    return e2
+}
+
+effort_of_(members: string) -> string {
+    if string.index_of(members, "\"effort\"") < 0 { return "" }
+    v = jsonx.parse("{${string.substring(members, 1, string.length(members))}}")
+    if v == null { return "" }
+    out = string.copy(jsonx.str_or(v, "effort", ""))
+    jsonx.free(v)
+    return out
+}
+
+truncate_(history: ptr, n: int) {
+    while list.list_size(history) > n { list.list_remove(history, list.list_size(history) - 1) }
+}
+
+apply_(history: ptr, from: int, messages: ptr, effort: string) {
+    truncate_(history, from)
+    i = 0
+    while i < list.list_size(messages) {
+        m, _g = list.get_string(messages, i)
+        mm = string.copy(m)
+        if effort != "" && msg.role(mm) == "assistant" {
+            mm = msg.set_raw(mm, "step_effort", "{\"effort\":${jsonx.quote(effort)}}")
+        }
+        list.list_add(history, mm)
+        i = i + 1
+    }
+}
+
+// The next counter for a task id ("a3" -> agent 4). err "" or InvalidSessionLog.
+restore_id_(r: *Replayed, id: string) -> string {
+    if string.length(id) < 2 { return "" }
+    c = string.char_at(id, 0)
+    if c != 97 && c != 98 && c != 114 { return "" }
+    num_text = string.substring(id, 1, string.length(id))
+    i = 0
+    while i < string.length(num_text) {
+        d = string.char_at(num_text, i)
+        if d < 48 || d > 57 { return "InvalidSessionLog" }
+        i = i + 1
+    }
+    if string.length(num_text) > 18 { return "InvalidSessionLog" }
+    n = jsonx.long_of(num_text) + 1
+    if c == 97 && n > r.next_agent_id { r.next_agent_id = n }
+    if c == 98 && n > r.next_bash_id { r.next_bash_id = n }
+    if c == 114 && n > r.next_run_id { r.next_run_id = n }
+    return ""
+}
+
+// The messages array of a record, with legacy reasoning_content migrated
+// to reasoning {provider: chat_completions, data}.
+messages_of_(rec: ptr) -> ptr {
+    out = list.list_new()
+    arr = jsonx.field(rec, "messages")
+    if arr == null || json.json_type(arr) != json.JSON_ARRAY { return out }
+    n = json.json_array_size(arr)
+    i = 0
+    while i < n {
+        m = json.json_array_get_raw(arr, i)
+        t = jsonx.encode(m)
+        if jsonx.kind(m, "reasoning_content") != jsonx.KIND_MISSING {
+            legacy = jsonx.field(m, "reasoning_content")
+            t = msg.without(t, "reasoning_content")
+            if json.json_type(legacy) == json.JSON_STRING {
+                t = msg.set_raw(t, "reasoning", "{\"provider\":\"chat_completions\",\"data\":${jsonx.encode(legacy)}}")
+            }
+        }
+        list.list_add(out, t)
+        i = i + 1
+    }
+    return out
+}
+
+// Upstream `validate`: a system message first, then users, and every
+// assistant's tool calls answered by tool messages in order.
+validate_(history: ptr) -> int {
+    n = list.list_size(history)
+    if n == 0 { return 0 }
+    first, _g = list.get_string(history, 0)
+    if msg.role(first) != "system" { return 0 }
+    i = 1
+    while i < n {
+        m, _g2 = list.get_string(history, i)
+        r = msg.role(m)
+        if r != "user" {
+            if r != "assistant" { return 0 }
+            calls = msg.tool_calls(m)
+            k = 0
+            while k < list.list_size(calls) {
+                tc = list.list_get_raw(calls, k)
+                i = i + 1
+                if i >= n { return 0 }
+                t, _g3 = list.get_string(history, i)
+                if msg.role(t) != "tool" { return 0 }
+                if msg.str_or(t, "tool_call_id", "") != (tc as *types.ToolCall).id { return 0 }
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+struct Pending {
+    event: string
+    id: string
+    delivered: int
+}
+
+new_replayed_() -> ptr {
+    r = heap.new(Replayed)
+    r.err = ""
+    r.needs_repair = 0
+    r.steps = 0
+    r.parent_session_id = ""
+    r.cache_key = ""
+    r.forked_from = ""
+    r.provider = "chat_completions"
+    r.custom_provider = ""
+    r.model = ""
+    r.next_agent_id = 1 as long
+    r.next_bash_id = 1 as long
+    r.next_run_id = 1 as long
+    r.agent_sessions = list.list_new()
+    r.lost_background = list.list_new()
+    r.background_repairs = list.list_new()
+    r.pending_background_bytes = 0 as long
+    r.context_tokens = 0 as long
+    return r as ptr
+}
+
+fail_(r: *Replayed, err: string) -> ptr {
+    r.err = err
+    return r as ptr
+}
+
+// Rebuilds history from log text. Returns *Replayed (err set on failure).
+replay(data: string, history: ptr) -> ptr {
+    r = new_replayed_() as *Replayed
+    pending = list.list_new()
+    lines = string.split(data, "\n")
+    count = string.array_size(lines)
+    torn = 0
+    li = 0
+    // The last piece follows the final newline: empty, or a torn tail.
+    while li < count - 1 {
+        line = string.copy(string.array_get(lines, li))
+        li = li + 1
+        if string.length(line) == 0 { continue }
+        rec = jsonx.parse(line)
+        if rec == null || json.json_type(rec) != json.JSON_OBJECT {
+            torn = 1
+            continue
+        }
+        if jsonx.has(rec, "hook") == 1 {
+            jsonx.free(rec)
+            continue
+        }
+        from = jsonx.int_or(rec, "from", 0)
+        has_provider = jsonx.kind(rec, "provider") == json.JSON_STRING
+        if list.list_size(history) == 0 || (r.steps == 0 && from == 0 && has_provider) {
+            r.parent_session_id = string.copy(jsonx.str_or(rec, "parent_session_id", ""))
+            r.cache_key = string.copy(jsonx.str_or(rec, "cache_key", ""))
+            ff = jsonx.field(rec, "forked_from")
+            r.forked_from = ""
+            if ff != null { r.forked_from = jsonx.encode(ff) }
+            r.provider = string.copy(jsonx.str_or(rec, "provider", "chat_completions"))
+            r.custom_provider = string.copy(jsonx.str_or(rec, "custom_provider", ""))
+        }
+        if jsonx.kind(rec, "model") == json.JSON_STRING { r.model = string.copy(jsonx.str_or(rec, "model", "")) }
+        if jsonx.bool_or(rec, "repair", 0) == 1 {
+            torn = 0
+            jsonx.free(rec)
+            continue
+        }
+        if torn == 1 {
+            jsonx.free(rec)
+            string.string_array_free(lines)
+            return fail_(r, "InvalidSessionLog")
+        }
+        calls = jsonx.field(rec, "calls")
+        if calls != null && json.json_type(calls) == json.JSON_ARRAY {
+            ci = 0
+            while ci < json.json_array_size(calls) {
+                cid = jsonx.str_or(json.json_array_get_raw(calls, ci), "id", "")
+                if cid != "" {
+                    e = restore_id_(r, cid)
+                    if e != "" { return fail_(r, e) }
+                }
+                ci = ci + 1
+            }
+        }
+        ids = jsonx.field(rec, "task_ids")
+        if ids != null {
+            a = jsonx.long_or(ids, "agent", 0 as long) + 1
+            b = jsonx.long_or(ids, "bash", 0 as long) + 1
+            rn = jsonx.long_or(ids, "run", 0 as long) + 1
+            if a > r.next_agent_id { r.next_agent_id = a }
+            if b > r.next_bash_id { r.next_bash_id = b }
+            if rn > r.next_run_id { r.next_run_id = rn }
+        }
+        mapping = jsonx.field(rec, "agent_session")
+        if mapping != null {
+            e2 = restore_id_(r, jsonx.str_or(mapping, "id", ""))
+            if e2 != "" { return fail_(r, e2) }
+            list.list_add(r.agent_sessions, jsonx.encode(mapping))
+            jsonx.free(rec)
+            continue
+        }
+        bg = jsonx.field(rec, "background")
+        if bg != null {
+            bid = string.copy(jsonx.str_or(bg, "id", ""))
+            e3 = restore_id_(r, bid)
+            if e3 != "" { return fail_(r, e3) }
+            if jsonx.str_or(bg, "state", "") == "started" {
+                p = heap.new(Pending)
+                p.event = jsonx.encode(bg)
+                p.id = bid
+                p.delivered = 0
+                list.list_add(pending, p as ptr)
+            } else {
+                pi = 0
+                while pi < list.list_size(pending) {
+                    pp = list.list_get_raw(pending, pi) as *Pending
+                    if pp.id == bid {
+                        list.list_remove(pending, pi)
+                        break
+                    }
+                    pi = pi + 1
+                }
+            }
+            jsonx.free(rec)
+            continue
+        }
+        msgs = messages_of_(rec)
+        mi = 0
+        while mi < list.list_size(msgs) {
+            m, _g = list.get_string(msgs, mi)
+            if msg.str_or(m, "source", "") == "background" {
+                mbid = msg.str_or(m, "background_id", "")
+                if mbid != "" {
+                    pi2 = 0
+                    while pi2 < list.list_size(pending) {
+                        pp2 = list.list_get_raw(pending, pi2) as *Pending
+                        if pp2.delivered == 0 && pp2.id == mbid {
+                            pp2.delivered = 1
+                            ok = msg.bool_of(m, "background_ok")
+                            ev = jsonx.parse(pp2.event)
+                            kind = string.copy(jsonx.str_or(ev, "kind", ""))
+                            jsonx.free(ev)
+                            if ok == -1 {
+                                pp2.event = "{\"id\":${jsonx.quote(pp2.id)},\"kind\":${jsonx.quote(kind)},\"state\":\"lost\"}"
+                            } else {
+                                okt = "false"
+                                if ok == 1 { okt = "true" }
+                                pp2.event = "{\"id\":${jsonx.quote(pp2.id)},\"kind\":${jsonx.quote(kind)},\"state\":\"finished\",\"ok\":${okt}}"
+                            }
+                            break
+                        }
+                        pi2 = pi2 + 1
+                    }
+                }
+            }
+            mi = mi + 1
+        }
+        bash = jsonx.field(rec, "bash")
+        if bash != null {
+            e4 = restore_id_(r, jsonx.str_or(bash, "id", ""))
+            if e4 != "" { return fail_(r, e4) }
+            jsonx.free(rec)
+            continue
+        }
+        if jsonx.has(rec, "task_stop") == 1 || jsonx.has(rec, "sandbox_unavailable") == 1 || jsonx.has(rec, "diagnostic") == 1 ||
+           (jsonx.has(rec, "transport_fallback") == 1 && list.list_size(msgs) == 0) {
+            jsonx.free(rec)
+            continue
+        }
+        if from > list.list_size(history) {
+            jsonx.free(rec)
+            return fail_(r, "InvalidSessionLog")
+        }
+        if from == list.list_size(history) && jsonx.has(rec, "forked_from") == 0 {
+            r.steps = r.steps + assistant_count_(msgs, 0)
+            mi2 = 0
+            while mi2 < list.list_size(msgs) {
+                m2, _g2 = list.get_string(msgs, mi2)
+                if msg.str_or(m2, "source", "") == "background" {
+                    r.pending_background_bytes = r.pending_background_bytes + (string.length(msg.content(m2)) as long)
+                }
+                mi2 = mi2 + 1
+            }
+            if jsonx.has(rec, "model_ms") == 1 { r.pending_background_bytes = 0 as long }
+        }
+        apply_(history, from, msgs, string.copy(jsonx.str_or(rec, "effort", "")))
+        if validate_(history) == 0 {
+            jsonx.free(rec)
+            return fail_(r, "InvalidSessionLog")
+        }
+        r.context_tokens = jsonx.long_or(rec, "context_tokens", 0 as long)
+        jsonx.free(rec)
+    }
+    tail = ""
+    if count > 0 { tail = string.copy(string.array_get(lines, count - 1)) }
+    string.string_array_free(lines)
+    if list.list_size(history) == 0 { return fail_(r, "InvalidSessionLog") }
+    pi3 = 0
+    while pi3 < list.list_size(pending) {
+        pp3 = list.list_get_raw(pending, pi3) as *Pending
+        if pp3.delivered == 1 {
+            list.list_add(r.background_repairs, pp3.event)
+        } else {
+            list.list_add(r.lost_background, pp3.event)
+        }
+        pi3 = pi3 + 1
+    }
+    if torn == 1 || string.length(tail) > 0 { r.needs_repair = 1 }
+    return r as ptr
+}
+
+struct Summary {
+    id: string
+    path: string
+    modified_ns: long
+    preview: string
+}
+
+// The first line of trimmed `text`, at most `max` bytes, never splitting UTF-8.
+first_line(text: string, max: int) -> string {
+    t = string.trim(text)
+    nl = string.index_of(t, "\n")
+    line = t
+    if nl >= 0 { line = string.substring(t, 0, nl) }
+    if string.length(line) <= max { return line }
+    end = max
+    while end > 0 && (string.char_at(line, end) / 64) == 2 { end = end - 1 }
+    return string.substring(line, 0, end)
+}
+
+// Top-level Sessions started in `cwd` with a user message, newest first
+// (a list of *Summary).
+list_sessions(directory: string, cwd: string) -> ptr {
+    found = list.list_new()
+    entries, derr = dir.list(directory)
+    if derr != "" { return found }
+    n = dir.list_count(entries)
+    i = 0
+    while i < n {
+        name = string.copy(dir.list_get(entries, i))
+        i = i + 1
+        if string.ends_with(name, ".jsonl") == 0 || string.ends_with(name, ".calls.jsonl") == 1 { continue }
+        path = "${directory}/${name}"
+        data, rerr = fs.read(path)
+        if rerr != "" { continue }
+        lines = string.split(data, "\n")
+        lc = string.array_size(lines)
+        line_no = 0
+        k = 0
+        preview = ""
+        matched = 0
+        while k < lc && line_no < 8 {
+            text = string.array_get(lines, k)
+            k = k + 1
+            rec = jsonx.parse(text)
+            if rec == null {
+                if line_no == 0 { break }
+                line_no = line_no + 1
+                continue
+            }
+            if jsonx.has(rec, "diagnostic") == 1 {
+                jsonx.free(rec)
+                continue
+            }
+            header = line_no == 0
+            line_no = line_no + 1
+            if header {
+                stop = jsonx.kind(rec, "parent_session_id") == json.JSON_STRING || jsonx.str_or(rec, "cwd", "") != cwd
+                jsonx.free(rec)
+                if stop { break }
+                continue
+            }
+            msgs = messages_of_(rec)
+            jsonx.free(rec)
+            mi = 0
+            while mi < list.list_size(msgs) {
+                m, _g = list.get_string(msgs, mi)
+                if msg.role(m) == "user" {
+                    preview = first_line(msg.content(m), 60)
+                    matched = 1
+                    break
+                }
+                mi = mi + 1
+            }
+            if matched == 1 { break }
+        }
+        string.string_array_free(lines)
+        if matched == 0 { continue }
+        st = sysgap.new_stat()
+        sysgap.stat(path, 1, st)
+        s = heap.new(Summary)
+        s.id = string.substring(name, 0, string.length(name) - 6)
+        s.path = path
+        s.modified_ns = (st as *sysgap.Stat).mtime_ns
+        s.preview = preview
+        list.list_add(found, s as ptr)
+    }
+    dir.list_free(entries)
+    return newest_first_(found)
+}
+
+newest_first_(items: ptr) -> ptr {
+    out = list.list_new()
+    left = list.list_new()
+    i = 0
+    while i < list.list_size(items) {
+        list.list_add(left, list.list_get_raw(items, i))
+        i = i + 1
+    }
+    while list.list_size(left) > 0 {
+        best = 0
+        j = 1
+        while j < list.list_size(left) {
+            a = list.list_get_raw(left, j) as *Summary
+            b = list.list_get_raw(left, best) as *Summary
+            if a.modified_ns > b.modified_ns { best = j }
+            j = j + 1
+        }
+        list.list_add(out, list.list_get_raw(left, best))
+        list.list_remove(left, best)
+    }
+    return out
+}
+
+// The newest Session's log path for `cwd`, or ("", "NoSession").
+latest(directory: string, cwd: string) -> (string, string) {
+    all = list_sessions(directory, cwd)
+    if list.list_size(all) == 0 { return "", "NoSession" }
+    s = list.list_get_raw(all, 0) as *Summary
+    return s.path, ""
+}

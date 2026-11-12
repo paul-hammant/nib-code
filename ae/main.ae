@@ -1,30 +1,31 @@
-// The nib binary (its name is set once, in .build.ae's output()).
-// This slice has `nib js '<code>'` (one Run in a fresh Sandbox with the
-// ported Tools; console, then the result or error, as upstream's `nib js`)
-// and the hidden `nib __jail <root>... -- <command>...` helper the Linux
-// write sandbox execs. `ask`, the TUI and the Session come with later slices.
+// The nib binary (its name is set once, in .build.ae's output()); upstream
+// src/main.zig. This slice has `nib ask [--json] [-c|--resume <id>]
+// [--effort <level>] <prompt|->`, `nib js '<code>'`, `nib login`/`logout`
+// (API keys only), `--help` and `--version`, and the hidden
+// `nib __jail <root>... -- <command>...` helper the Linux write sandbox
+// execs. The TUI comes with the TUI slice (bare `nib` says so); `replay`,
+// `update` and `--agent-input` (subagents) are not ported yet.
 
 import std.os
 import std.string
 import std.list
 import std.fs
+import std.io
+import std.sync
+import std.worker
+import nib.jsonx
+import nib.sysgap
 import nib.sandbox
 import nib.tools
 import nib.tools.jail
 import nib.tools.background
+import nib.provider.types
+import nib.config
+import nib.config.env
+import nib.auth
+import nib.session
 
-const VERSION = "0.13.0-ae"
-
-usage_() {
-    println("usage: nib js '<code>'")
-    println("       nib --version")
-}
-
-home_() -> string {
-    h = os.getenv("HOME")
-    if h == null { return "/" }
-    return h
-}
+const HELP = "nib · a coding agent whose unit of work is a Run\n\nUsage:\n  nib [options]                         Open the TUI\n  nib ask [options] <prompt|->           Ask once; - reads stdin\n  nib js <code>                         Run sandbox JavaScript\n  nib login [service] [--device]        Sign in or store a key; no service lists them\n  nib update [version]                  Upgrade in place\n  nib logout <service>                  Remove nib's stored credential\n  nib replay <session-id> --all [--json] Replay recorded Runs offline\n\nOptions:\n  -h, --help            Show help\n  -V, --version         Show version\n  -c, --continue        Continue this directory's latest session\n  --resume <id>         Resume a session (32 lowercase hex characters)\n  --effort <level>      Set reasoning effort; /effort lists levels\n  --json                Stream NDJSON events (ask only)\n\nTUI: Enter sends · Shift+Enter adds a line · Esc cancels · Ctrl+O opens latest details · click a Run\nType / for commands, /help for keys, /status for timing and cache details.\nFirst run: nib, then /provider to sign in; /model picks a model.\nSetup: see README.md and docs/config.md.\n"
 
 self_exe_() -> string {
     a0 = os.args_get(0)
@@ -35,43 +36,307 @@ self_exe_() -> string {
     return a0
 }
 
-main() {
-    n = os.args_count()
-    if n < 2 {
-        usage_()
-        exit(2)
+read_stdin_() -> string {
+    out = ""
+    while true {
+        chunk, count, err = io.fd_read_n(0, 65536)
+        if err != "" || count == 0 { break }
+        out = "${out}${chunk}"
     }
-    cmd = os.args_get(1)
-    if cmd == jail.HELPER_COMMAND {
-        rest = list.list_new()
-        i = 2
-        while i < n {
-            list.list_add(rest, os.args_get(i))
+    return out
+}
+
+eprint_(text: string) { io.fd_write(2, string.bytes(text)) }
+
+// What the CLI parsed.
+struct Args {
+    ask: int
+    json: int
+    agent_input: int
+    prompt: string
+    has_prompt: int
+    effort: string
+    has_effort: int
+    resume_id: string
+    continue_latest: int
+    err: string          // error name, "" none
+    detail: string
+}
+
+parse_args_(n: int) -> ptr {
+    a = heap.new(Args)
+    a.ask = 0
+    a.json = 0
+    a.agent_input = 0
+    a.prompt = ""
+    a.has_prompt = 0
+    a.effort = ""
+    a.has_effort = 0
+    a.resume_id = ""
+    a.continue_latest = 0
+    a.err = ""
+    a.detail = ""
+    i = 1
+    while i < n {
+        arg = os.args_get(i)
+        if a.ask == 0 && arg == "ask" {
+            a.ask = 1
+        } else if a.ask == 1 && arg == "--agent-input" {
+            a.agent_input = 1
+        } else if a.ask == 1 && arg == "--json" {
+            a.json = 1
+        } else if arg == "-c" || arg == "--continue" {
+            a.continue_latest = 1
+        } else if arg == "--effort" {
             i = i + 1
+            if i == n {
+                a.err = "MissingReasoningEffort"
+                return a as ptr
+            }
+            a.effort = os.args_get(i)
+            a.has_effort = 1
+        } else if arg == "--resume" {
+            i = i + 1
+            if i == n {
+                a.err = "MissingSessionId"
+                return a as ptr
+            }
+            a.resume_id = os.args_get(i)
+        } else if string.length(arg) > 1 && string.starts_with(arg, "-") == 1 {
+            a.err = "InvalidArguments"
+            a.detail = "Unknown option: ${arg} · run nib --help"
+            return a as ptr
+        } else if a.ask == 1 && a.has_prompt == 0 {
+            a.prompt = arg
+            a.has_prompt = 1
+        } else {
+            a.err = "InvalidArguments"
+            return a as ptr
         }
-        println("nib __jail: ${jail.helper(rest)}")
-        exit(126)
+        i = i + 1
     }
-    if cmd == "--version" {
-        println("nib ${VERSION}")
-        return
+    if a.continue_latest == 1 && a.resume_id != "" {
+        a.err = "ConflictingResumeOptions"
+        return a as ptr
     }
-    if cmd == "js" && n >= 3 {
-        t = tools.new(home_())
-        (t as *tools.Tools).self_exe = self_exe_()
-        mode = os.getenv("NIB_SANDBOX")
-        if mode != null && mode == "workspace" { tools.set_workspace(t, 1) }
-        s = tools.new_scope(t, 0)
-        o = sandbox.eval(os.args_get(2), sandbox.limits(), tools.host(s), null) as *sandbox.Outcome
-        background.stop_all((t as *tools.Tools).background)
-        print(o.logs)
-        if o.ok == 1 {
-            if o.text != "undefined" { println(o.text) }
+    if a.ask == 1 && a.has_prompt == 0 { a.err = "MissingPrompt" }
+    return a as ptr
+}
+
+// The failure line: {"error":{…}} in JSON mode, else "nib: <text>" on stderr.
+fail_(json: int, err: string, detail: string, usage_json: string, steps: int, timing: string) {
+    text = detail
+    if text == "" {
+        if json == 1 && (err == "MissingPrompt" || err == "InvalidArguments") {
+            text = err
+        } else {
+            text = session.error_message(err)
+        }
+    }
+    if json == 1 {
+        t = ""
+        if timing != "" { t = ",\"timing\":${timing}" }
+        println("{\"error\":{\"message\":${jsonx.quote(text)},\"usage\":${usage_json},\"steps\":${steps}${t}}}")
+    } else {
+        eprint_("nib: ${text}\n")
+    }
+    exit(1)
+}
+
+zero_usage_() -> string { return types.usage_json(types.usage_new()) }
+
+help_(envp: ptr) {
+    print(HELP)
+    home, herr = config.home(envp)
+    if herr == "" {
+        cfg, err, _d = config.load(envp, home)
+        if err == "" {
+            println("Active provider: ${types.name(cfg)}")
             return
         }
-        println(o.text)
+    }
+    println("Active provider: unavailable (invalid configuration)")
+}
+
+line_reader_(secret: int) -> fn {
+    return |prompt: string| {
+        io.fd_write(1, string.bytes(prompt))
+        changed = 0
+        if secret == 1 { changed = sysgap.stdin_echo(0) }
+        line, eof, err = io.fd_read_line_status(0)
+        if changed == 1 {
+            sysgap.stdin_echo(1)
+            io.fd_write(1, string.bytes("\n"))
+        }
+        if err != "" || (eof == true && string.length(line) == 0) { return auth.EOF_LINE }
+        return line
+    }
+}
+
+rest_args_(from: int) -> ptr {
+    l = list.list_new()
+    i = from
+    while i < os.args_count() {
+        list.list_add(l, os.args_get(i))
+        i = i + 1
+    }
+    return l
+}
+
+// Plain `nib ask` output: text deltas on stdout, Runs dimmed on stderr.
+print_event_(ev: string) {
+    v = jsonx.parse(ev)
+    if v == null { return }
+    if jsonx.has(v, "delta") == 1 {
+        d = jsonx.field(v, "delta")
+        if jsonx.str_or(d, "kind", "") == "text" { print(jsonx.str_or(d, "text", "")) }
+    } else if jsonx.has(v, "run_start") == 1 {
+        eprint_("\n\x1b[33mrun ▸\x1b[0m ${jsonx.str_or(v, "run_start", "")}\n")
+    } else if jsonx.has(v, "run_end") == 1 {
+        r = jsonx.field(v, "run_end")
+        eprint_("\x1b[2m${jsonx.str_or(r, "output", "")}\x1b[0m\n")
+        changes = jsonx.field(r, "changes")
+        n = jsonx.array_size(changes)
+        i = 0
+        while i < n {
+            c = jsonx.array_at(changes, i)
+            created = ""
+            if jsonx.bool_or(c, "created", 0) == 1 { created = " (new)" }
+            eprint_("\x1b[2mchanged ${jsonx.str_or(c, "path", "")}${created} +${jsonx.long_or(c, "added", 0 as long)} −${jsonx.long_or(c, "removed", 0 as long)}\x1b[0m\n")
+            i = i + 1
+        }
+    } else if jsonx.has(v, "retry") == 1 {
+        r2 = jsonx.field(v, "retry")
+        eprint_("\x1b[2mretry ${jsonx.int_or(r2, "attempt", 0)} in ${jsonx.long_or(r2, "delay_ms", 0 as long) / 1000}s: ${jsonx.str_or(r2, "reason", "")}\x1b[0m\n")
+    } else if jsonx.has(v, "notice") == 1 {
+        eprint_("\x1b[2m${jsonx.str_or(v, "notice", "")}\x1b[0m\n")
+    }
+    jsonx.free(v)
+}
+
+main() {
+    n = os.args_count()
+    if n >= 2 && os.args_get(1) == jail.HELPER_COMMAND {
+        println("nib __jail: ${jail.helper(rest_args_(2))}")
+        exit(126)
+    }
+    envp = env.from_process()
+    i = 1
+    while i < n {
+        h = os.args_get(i)
+        if h == "--help" || h == "-h" {
+            help_(envp)
+            return
+        }
+        i = i + 1
+    }
+    if n == 2 && (os.args_get(1) == "--version" || os.args_get(1) == "-V") {
+        println("nib ${session.VERSION}")
+        return
+    }
+    if n >= 2 && (os.args_get(1) == "login" || os.args_get(1) == "logout") {
+        lhome, lherr = config.home(envp)
+        if lherr != "" {
+            eprint_("nib: ${session.error_message(lherr)}\n")
+            exit(1)
+        }
+        code = 0
+        out = ""
+        errtext = ""
+        if os.args_get(1) == "login" {
+            code, out, errtext = auth.login(lhome, envp, rest_args_(2), line_reader_(0), line_reader_(1))
+        } else {
+            code, out, errtext = auth.logout(lhome, envp, rest_args_(2))
+        }
+        print(out)
+        eprint_(errtext)
+        if code != 0 { exit(code) }
+        return
+    }
+    if n >= 3 && os.args_get(1) == "js" {
+        home_dir = env.get(envp, "HOME")
+        if home_dir == "" { home_dir = "/" }
+        t = tools.new(home_dir)
+        (t as *tools.Tools).self_exe = self_exe_()
+        if env.get(envp, "NIB_SANDBOX") == "workspace" { tools.set_workspace(t, 1) }
+        sc = tools.new_scope(t, 0)
+        jo = sandbox.eval(os.args_get(2), sandbox.limits(), tools.host(sc), null) as *sandbox.Outcome
+        background.stop_all((t as *tools.Tools).background)
+        print(jo.logs)
+        if jo.ok == 1 {
+            if jo.text != "undefined" { println(jo.text) }
+            return
+        }
+        println(jo.text)
         exit(1)
     }
-    usage_()
-    exit(2)
+    ap = parse_args_(n)
+    a = ap as *Args
+    if a.err != "" { fail_(a.json, a.err, a.detail, zero_usage_(), 0, "") }
+    if a.ask == 0 {
+        eprint_("nib: the TUI is not ported yet; use nib ask '<prompt>' · run nib --help\n")
+        exit(2)
+    }
+    if a.agent_input == 1 { fail_(a.json, "AgentInputNotPorted", "subagents (--agent-input) are not ported yet", zero_usage_(), 0, "") }
+    home, herr = config.home(envp)
+    if herr != "" { fail_(a.json, herr, "", zero_usage_(), 0, "") }
+    cfg, cerr, cdetail = config.load(envp, home)
+    if cerr != "" { fail_(a.json, cerr, cdetail, zero_usage_(), 0, "") }
+    c = cfg as *types.Config
+    if a.has_effort == 1 {
+        eerr = types.set_effort(cfg, a.effort)
+        if eerr != "" { fail_(a.json, eerr, "", zero_usage_(), 0, "") }
+    }
+    if config.credentialed(cfg) == 0 {
+        if env.has(envp, "NIB_PROVIDER") == 0 {
+            fail_(a.json, "MissingApiKey", "No provider · run nib login", zero_usage_(), 0, "")
+        }
+        hint = c.api_key_env
+        if hint == "" { hint = "the provider key environment variable" }
+        fail_(a.json, "MissingApiKey", "${types.name(cfg)}: no API key; set ${hint} or run nib login ${types.name(cfg)}.", zero_usage_(), 0, "")
+    }
+    op = session.new_options(home, env.get(envp, "HOME"))
+    o = op as *session.Options
+    o.resume_id = a.resume_id
+    o.continue_latest = a.continue_latest
+    o.patches_off = env.get(envp, "NIB_PATCHES_OFF")
+    o.parent_session_id = env.get(envp, "NIB_PARENT_SESSION_ID")
+    depth_text = env.get(envp, "NIB_AGENT_DEPTH")
+    if depth_text != "" { o.depth = jsonx.long_of(depth_text) as int }
+    o.self_exe = self_exe_()
+    sp, serr, sdetail = session.init(cfg, op)
+    if serr != "" { fail_(a.json, serr, sdetail, zero_usage_(), 0, "") }
+    s = sp as *session.Session
+    prompt_text = a.prompt
+    if prompt_text == "-" { prompt_text = read_stdin_() }
+    if a.json == 1 { println("{\"start\":{\"session_id\":${jsonx.quote(s.id)}}}") }
+    cancel = sync.atomic_new(0)
+    sysgap.watch_signals()
+    sig_cell = s.signal
+    worker.run_detached(|| {
+        while sysgap.signal_received() == 0 { sleep(20) }
+        sync.atomic_store(sig_cell, sysgap.signal_received() as long)
+        sync.atomic_store(cancel, 1)
+        return null
+    })
+    json = a.json
+    sink = session.new_sink(null, |ctx: ptr, ev: string| {
+        if json == 1 {
+            println(ev)
+        } else {
+            print_event_(ev)
+        }
+    })
+    err, detail = session.turn(sp, prompt_text, sink, cancel)
+    session.close(sp)
+    if err != "" { fail_(a.json, err, detail, types.usage_json(s.usage), s.steps, session.timing_json(sp)) }
+    if a.json == 1 {
+        println("{\"end\":{\"text\":${jsonx.quote(s.final_text)},\"usage\":${types.usage_json(s.usage)},\"steps\":${s.steps},\"timing\":${session.timing_json(sp)}}}")
+        return
+    }
+    println("")
+    u = s.usage as *types.Usage
+    plural = "s"
+    if s.steps == 1 { plural = "" }
+    eprint_("[${c.model}] turn: ${s.steps} step${plural}, in=${u.prompt_tokens} (cache hit ${u.prompt_cache_hit_tokens}) out=${u.completion_tokens}\n")
 }

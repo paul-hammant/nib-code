@@ -3,9 +3,10 @@
 
 import std.json
 import std.string
+import std.strbuilder
 
 exports(parse, free, kind, has, field, str_or, str_field, int_or, long_or, bool_or, num_or,
-        is_integer, long_of, quote, encode, KIND_MISSING)
+        is_integer, long_of, quote, encode, with_member, array_size, array_at, KIND_MISSING)
 
 const KIND_MISSING = -1
 
@@ -107,3 +108,51 @@ long_of(text: string) -> long {
     free(v)
     return n
 }
+
+// The JSON object text `obj` with member `key` set to the JSON text
+// `value`: replaced where it stands, or appended. `obj` unchanged if it is
+// not an object.
+with_member(obj: string, key: string, value: string) -> string {
+    v = parse(obj)
+    if v == null { return obj }
+    if json.json_type(v) != json.JSON_OBJECT {
+        free(v)
+        return obj
+    }
+    b = strbuilder.new(string.length(obj) + string.length(value) + 16)
+    strbuilder.append(b, "{")
+    n = json.object_size(v)
+    found = 0
+    i = 0
+    while i < n {
+        k, fv, _e = json.object_entry(v, i)
+        if i > 0 { strbuilder.append(b, ",") }
+        strbuilder.append(b, quote(k))
+        strbuilder.append(b, ":")
+        if k == key {
+            strbuilder.append(b, value)
+            found = 1
+        } else {
+            strbuilder.append(b, encode(fv))
+        }
+        i = i + 1
+    }
+    if found == 0 {
+        if n > 0 { strbuilder.append(b, ",") }
+        strbuilder.append(b, quote(key))
+        strbuilder.append(b, ":")
+        strbuilder.append(b, value)
+    }
+    strbuilder.append(b, "}")
+    free(v)
+    return strbuilder.finish(b)
+}
+
+// Elements of array `a` (0 when not an array) and the i-th (borrowed).
+array_size(a: ptr) -> int {
+    if a == null { return 0 }
+    if json.json_type(a) != json.JSON_ARRAY { return 0 }
+    return json.json_array_size(a)
+}
+
+array_at(a: ptr, i: int) -> ptr { return json.json_array_get_raw(a, i) }

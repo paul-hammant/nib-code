@@ -184,8 +184,10 @@ tool_calls(m: string) -> ptr {
         while i < n {
             c = json.json_array_get_raw(calls, i)
             f = jsonx.field(c, "function")
-            list.list_add(out, types.tool_call_new(string.copy(jsonx.str_or(c, "id", "")),
-                string.copy(jsonx.str_or(f, "name", "")), string.copy(jsonx.str_or(f, "arguments", ""))))
+            tc = types.tool_call_new(string.copy(jsonx.str_or(c, "id", "")),
+                string.copy(jsonx.str_or(f, "name", "")), string.copy(jsonx.str_or(f, "arguments", ""))) as *types.ToolCall
+            tc.kind = string.copy(jsonx.str_or(c, "type", "function"))
+            list.list_add(out, tc as ptr)
             i = i + 1
         }
     }

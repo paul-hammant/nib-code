@@ -1,0 +1,783 @@
+// session: the Session engine (upstream src/session.zig, session/run.zig,
+// session/history.zig's role in a Turn, session/inbox.zig's background
+// delivery for bash): Session/Turn/Step/Run lifecycle over the append-only
+// log, model requests through nib.provider, Runs in the sandbox with the
+// ported Tools, and resume.
+//
+// A frontend observes a Session only through a Sink: every event arrives as
+// the JSON text `ask --json` prints for it ({"step":…}, {"delta":…},
+// {"run_start":…}, {"run_end":…}, {"retry":…}, {"notice":…},
+// {"usage":…}, {"background":…}). Errors are names plus a detail text.
+//
+// Not yet ported here (next slices, PORT_STATUS.md): automatic Run
+// backgrounding (run_job), subagents and fork, MCP, skills, hooks, images,
+// record/replay, the progress tree, user interjections (inbox users), the
+// Codex transport. Undo snapshots (tools/undo.zig) wait for the TUI's /undo.
+
+import std.json
+import std.list
+import std.os
+import std.fs
+import std.string
+import std.sync
+import std.cryptography
+import nib.jsonx
+import nib.msg
+import nib.sandbox
+import nib.sandbox.timing
+import nib.tools
+import nib.tools.atomic_file
+import nib.tools.background
+import nib.tools.diff
+import nib.provider
+import nib.provider.types
+import nib.provider.sink
+import nib.session.log
+import nib.session.output
+import nib.session.prompt
+import nib.session.profile
+import nib.session.instructions
+import nib.session.compact
+import nib.session.tool_summary
+
+exports(Session, Options, Sink, new_options, new_sink, init, turn, compact_now, close, error_message, timing_json,
+        VERSION)
+
+const VERSION = "0.13.0-ae"
+
+struct Options {
+    home: string             // $NIB_HOME
+    user_home: string        // $HOME
+    depth: int
+    parent_session_id: string
+    resume_id: string
+    continue_latest: int
+    patches_off: string      // NIB_PATCHES_OFF
+    self_exe: string
+    record_env: string       // NIB_RECORD
+}
+
+struct Sink {
+    ctx: ptr
+    emit: fn                 // |ctx: ptr, event_json: string|
+}
+
+struct Session {
+    cfg: ptr
+    options: ptr
+    tools: ptr               // *tools.Tools
+    log: ptr                 // *log.Log
+    history: ptr             // list of message texts
+    id: string
+    cache_key: string
+    parent_session_id: string
+    usage: ptr               // this Turn's *types.Usage
+    steps: int
+    status: string           // completed, canceled, failed
+    wall_ms: long
+    model_ms: long
+    run_ms: long
+    tool_bytes: long
+    output_bytes: long
+    llm_calls: long
+    agent_calls: long
+    pending_background_bytes: long
+    compact_backoff: long
+    run_id: int
+    signal: ptr              // std.sync cell holding the interrupting signal (15: TERM)
+    partial_text: string
+    partial_reasoning: string
+    final_text: string
+}
+
+new_options(home: string, user_home: string) -> ptr {
+    o = heap.new(Options)
+    o.home = home
+    o.user_home = user_home
+    o.depth = 0
+    o.parent_session_id = ""
+    o.resume_id = ""
+    o.continue_latest = 0
+    o.patches_off = ""
+    o.self_exe = ""
+    o.record_env = ""
+    return o as ptr
+}
+
+new_sink(ctx: @keep ptr, emit: @keep fn) -> ptr {
+    s = heap.new(Sink)
+    s.ctx = ctx
+    s.emit = emit
+    return s as ptr
+}
+
+emit_(sp: ptr, ev: string) {
+    if sp == null { return }
+    s = sp as *Sink
+    call(s.emit, s.ctx, ev)
+}
+
+// main's errorMessage: the user-facing text of an error name.
+error_message(err: string) -> string {
+    match err {
+        "InvalidArguments" -> { return "Invalid arguments · run nib --help" }
+        "MissingPrompt" -> { return "Missing prompt · run nib --help" }
+        "AgentSessionParentMismatch" -> { return "Cannot continue a session that is not a child of this parent session." }
+        "SessionBusy" -> { return "Session is busy in another process; wait for its current task to finish." }
+        "InvalidSessionId" -> { return "Session ID must be exactly 32 lowercase hexadecimal characters." }
+        "InvalidReasoningEffort" -> { return "Use --effort default|off|none|minimal|low|medium|high|xhigh|max (model support varies)." }
+        "MissingReasoningEffort" -> { return "Use --effort default|off|none|minimal|low|medium|high|xhigh|max (model support varies)." }
+        "UnknownService" -> { return "Unknown service · run nib login to list services" }
+        "EmptyKey" -> { return "API key cannot be empty" }
+        "SessionProviderMismatch" -> { return "Cannot resume this session with a different provider; use its original NIB_PROVIDER or start a new session." }
+        "SessionModelMismatch" -> { return "Cannot resume this Codex session with a different model; set NIB_MODEL to its original model or start a new session." }
+        _ -> { return err }
+    }
+}
+
+hex32_(id: string) -> int {
+    if string.length(id) != 32 { return 0 }
+    i = 0
+    while i < 32 {
+        c = string.char_at(id, i)
+        if !((c >= 48 && c <= 57) || (c >= 97 && c <= 102)) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+stem_(path: string) -> string {
+    b = atomic_file.basename(path)
+    if string.ends_with(b, ".jsonl") == 1 { return string.substring(b, 0, string.length(b) - 6) }
+    return b
+}
+
+new_tools_(cp: ptr, op: ptr) -> ptr {
+    c = cp as *types.Config
+    o = op as *Options
+    t = tools.new(o.user_home)
+    tt = t as *tools.Tools
+    tt.data_home = o.home
+    tt.depth = o.depth
+    tt.track_changes = 1
+    tt.self_exe = o.self_exe
+    if c.sandbox_workspace == 1 { tools.set_workspace(t, 1) }
+    i = 0
+    while i < list.list_size(c.sandbox_writable) {
+        w, _g = list.get_string(c.sandbox_writable, i)
+        list.list_add(tt.extra_writable, string.copy(w))
+        i = i + 1
+    }
+    return t
+}
+
+// Opens a new Session or resumes one. (session, "", "") or (null, err, detail).
+init(cp: @keep ptr, op: @keep ptr) -> (ptr, string, string) {
+    c = cp as *types.Config
+    o = op as *Options
+    s = heap.new(Session)
+    s.cfg = cp
+    s.options = op
+    s.tools = new_tools_(cp, op)
+    s.history = list.list_new()
+    s.parent_session_id = o.parent_session_id
+    s.usage = types.usage_new()
+    s.steps = 0
+    s.status = "completed"
+    s.pending_background_bytes = 0 as long
+    s.compact_backoff = 0 as long
+    s.run_id = 0
+    s.signal = sync.atomic_new(0)
+    s.partial_text = ""
+    s.partial_reasoning = ""
+    s.final_text = ""
+    reset_timing_(s)
+    directory = atomic_file.join(o.home, "sessions")
+    fs.mkdir_p(directory)
+    cwd = os.getcwd()
+    if o.resume_id != "" || o.continue_latest == 1 {
+        path = ""
+        if o.resume_id != "" {
+            if hex32_(o.resume_id) == 0 { return null, "InvalidSessionId", "" }
+            path = "${directory}/${o.resume_id}.jsonl"
+        } else {
+            p, lerr = log.latest(directory, cwd)
+            if lerr != "" { return null, lerr, "" }
+            path = p
+        }
+        s.id = stem_(path)
+        lp, rerr = log.restore(path, s.history, o.parent_session_id, o.parent_session_id != "")
+        if rerr != "" { return null, rerr, "" }
+        s.log = lp
+        l = lp as *log.Log
+        cerr = types.check_session(cp, l.provider, l.model)
+        if cerr == "" && c.custom_provider != l.custom_provider { cerr = "SessionProviderMismatch" }
+        if cerr != "" {
+            log.close(lp)
+            return null, cerr, ""
+        }
+        s.pending_background_bytes = l.pending_background_bytes
+        s.cache_key = l.cache_key
+        if s.cache_key == "" { s.cache_key = s.id }
+        s.parent_session_id = l.parent_session_id
+        if s.parent_session_id != "" && (s.tools as *tools.Tools).depth < 1 { (s.tools as *tools.Tools).depth = 1 }
+    } else {
+        hex, _h = cryptography.random_hex(16)
+        s.id = hex
+        lp2, cerr2 = log.create("${directory}/${s.id}.jsonl")
+        if cerr2 != "" { return null, cerr2, "" }
+        s.log = lp2
+        s.cache_key = s.id
+        ierr = initialize_history_(s, cwd)
+        if ierr != "" { return null, ierr, "" }
+    }
+    return s as ptr, "", ""
+}
+
+json_list_(l: ptr) -> string {
+    out = "["
+    i = 0
+    while i < list.list_size(l) {
+        x, _g = list.get_string(l, i)
+        if i > 0 { out = "${out}," }
+        out = "${out}${jsonx.quote(x)}"
+        i = i + 1
+    }
+    return "${out}]"
+}
+
+initialize_history_(s: *Session, cwd: string) -> string {
+    c = s.cfg as *types.Config
+    o = s.options as *Options
+    l = c.limits as *types.Limits
+    template = prompt.render_system(cwd, tools.docs(s.tools), l.run_output_bytes as long, o.patches_off, c.model)
+    base = prompt.step_limit_prompt(template, l.max_steps as long)
+    global = atomic_file.join(o.home, "AGENTS.md")
+    root = instructions.project_root(cwd)
+    project = atomic_file.join(root, "AGENTS.md")
+    system, aerr = instructions.append(base, global, project)
+    if aerr != "" { return aerr }
+    members = ",\"cwd\":${jsonx.quote(cwd)},\"provider\":${jsonx.quote(c.provider)}"
+    if c.custom_provider != "" { members = "${members},\"custom_provider\":${jsonx.quote(c.custom_provider)}" }
+    members = "${members},\"model\":${jsonx.quote(c.model)}"
+    if s.parent_session_id != "" { members = "${members},\"parent_session_id\":${jsonx.quote(s.parent_session_id)}" }
+    members = "${members},\"cache_key\":${jsonx.quote(s.cache_key)},\"nib_version\":${jsonx.quote(VERSION)},\"system_sha\":${jsonx.quote(prompt.system_sha(base))}"
+    off = prompt.disabled_patches(o.patches_off)
+    if list.list_size(off) > 0 { members = "${members},\"patches_off\":${json_list_(off)}" }
+    members = "${members},\"profile\":${jsonx.quote(profile.name(profile.for_model(c.model)))}"
+    msgs = list.list_new()
+    list.list_add(msgs, msg.system(system))
+    one = list.list_new()
+    list.list_add(one, msg.system(system))
+    tokens = compact.estimate_tokens(one, 0, 1)
+    return log.commit(s.log, s.history, 0, msgs, tokens, members, 0)
+}
+
+close(sp: ptr) {
+    s = sp as *Session
+    background.stop_all((s.tools as *tools.Tools).background)
+    log.close(s.log)
+}
+
+reset_timing_(s: *Session) {
+    s.wall_ms = 0 as long
+    s.model_ms = 0 as long
+    s.run_ms = 0 as long
+    s.tool_bytes = 0 as long
+    s.output_bytes = 0 as long
+    s.llm_calls = 0 as long
+    s.agent_calls = 0 as long
+}
+
+usage_event_(s: *Session) -> string { return "{\"usage\":${types.usage_json(s.usage)}}" }
+
+// The timing object end/error carry.
+timing_json(sp: ptr) -> string {
+    s = sp as *Session
+    return "{\"wall_ms\":${s.wall_ms},\"model_ms\":${s.model_ms},\"run_ms\":${s.run_ms},\"tool_bytes\":${s.tool_bytes},\"output_bytes\":${s.output_bytes},\"llm_calls\":${s.llm_calls},\"agent_calls\":${s.agent_calls}}"
+}
+
+remaining_steps_(s: *Session) -> long {
+    l = (s.cfg as *types.Config).limits as *types.Limits
+    if l.max_steps < 0 { return -1 as long }
+    left = l.max_steps - s.steps
+    if left < 0 { left = 0 }
+    return left as long
+}
+
+changes_json_(changes: ptr) -> string {
+    out = "["
+    i = 0
+    while i < list.list_size(changes) {
+        ch = list.list_get_raw(changes, i) as *diff.Change
+        if i > 0 { out = "${out}," }
+        cr = "false"
+        if ch.created == 1 { cr = "true" }
+        out = "${out}{\"path\":${jsonx.quote(ch.path)},\"added\":${ch.added},\"removed\":${ch.removed},\"created\":${cr},\"diff\":${jsonx.quote(ch.diff)}}"
+        i = i + 1
+    }
+    return "${out}]"
+}
+
+calls_json_(run: ptr) -> string {
+    out = "["
+    n = timing.count(run)
+    i = 0
+    while i < n {
+        e = timing.entry(run, i) as *timing.Call
+        if i > 0 { out = "${out}," }
+        okt = "false"
+        if e.ok == 1 { okt = "true" }
+        out = "${out}{\"name\":${jsonx.quote(e.name)},\"start_ms\":${e.start_ms},\"end_ms\":${e.end_ms},\"ok\":${okt},\"run_index\":${e.run_index}"
+        if e.path != "" { out = "${out},\"path\":${jsonx.quote(e.path)}" }
+        if e.result_bytes >= 0 { out = "${out},\"result_bytes\":${e.result_bytes}" }
+        if e.dispatched == 0 { out = "${out},\"dispatched\":false" }
+        if e.background == 1 { out = "${out},\"background\":true" }
+        if e.background == 0 { out = "${out},\"background\":false" }
+        if e.id != "" { out = "${out},\"id\":${jsonx.quote(e.id)}" }
+        out = "${out}}"
+        i = i + 1
+    }
+    return "${out}]"
+}
+
+struct Executed {
+    output: string
+    ok: int
+    empty: int
+    run_ms: long
+    has_run_ms: int
+    summary: string          // tool_summary JSON, "" none
+    tool_bytes: long
+    omitted: long
+}
+
+new_executed_(output: string, ok: int) -> *Executed {
+    e = heap.new(Executed)
+    e.output = output
+    e.ok = ok
+    e.empty = 0
+    e.run_ms = 0 as long
+    e.has_run_ms = 0
+    e.summary = ""
+    e.tool_bytes = 0 as long
+    e.omitted = 0 as long
+    return e
+}
+
+// One `run` tool call (upstream run.zig execute + executeTimed, without
+// automatic backgrounding).
+execute_(s: *Session, tc: *types.ToolCall, sk: ptr, cancel: @keep ptr, run: @keep ptr, run_index: int) -> ptr {
+    c = s.cfg as *types.Config
+    l = c.limits as *types.Limits
+    if tc.name != "run" { return new_executed_("error: unknown tool `${tc.name}`; the only tool is `run`", 0) as ptr }
+    args = jsonx.parse(tc.arguments)
+    if args == null || json.json_type(args) != json.JSON_OBJECT || jsonx.kind(args, "code") != json.JSON_STRING {
+        jsonx.free(args)
+        return new_executed_("error: arguments must be a JSON object { \"code\": string }", 0) as ptr
+    }
+    code = string.copy(jsonx.str_or(args, "code", ""))
+    jsonx.free(args)
+    emit_(sk, "{\"run_start\":${jsonx.quote(code)}}")
+    before_omitted = timing.omitted(run)
+    before_bytes = timing.tool_bytes(run)
+    timing.set_run_index(run, run_index)
+    s.run_id = s.run_id + 1
+    scope = tools.new_scope(s.tools, s.run_id)
+    h = tools.host(scope)
+    sandbox.host_set_timing(h, run)
+    started = os.now_monotonic_ms()
+    o = sandbox.eval(code, sandbox.limits(), h, cancel) as *sandbox.Outcome
+    run_ms = os.now_monotonic_ms() - started
+    changes = tools.take_changes(scope)
+    out_text = output.step_limit_output(output.format(o as ptr, l.run_output_bytes as long), remaining_steps_(s))
+    summary = tool_summary.init(run, run_index, timing.omitted(run) - before_omitted)
+    sj = tool_summary.to_json(summary)
+    okt = "false"
+    if o.ok == 1 { okt = "true" }
+    emit_(sk, "{\"run_end\":{\"ok\":${okt},\"output\":${jsonx.quote(out_text)},\"changes\":${changes_json_(changes)},\"tool_summary\":${sj}}}")
+    e = new_executed_(out_text, o.ok)
+    if o.text == "undefined" && string.length(string.trim(o.logs)) == 0 { e.empty = 1 }
+    e.run_ms = run_ms
+    e.has_run_ms = 1
+    e.summary = sj
+    e.tool_bytes = timing.tool_bytes(run) - before_bytes
+    e.omitted = timing.omitted(run) - before_omitted
+    return e as ptr
+}
+
+struct Fwd {
+    session: ptr
+    sink: ptr
+    buffer_text: int
+    first_data_ms: long
+    started_ms: long
+}
+
+// Delivers finished background bash results as user messages before the
+// next request (upstream inbox insertBackground, bash only).
+insert_background_(s: *Session, pending: ptr, sk: ptr) -> string {
+    t = s.tools as *tools.Tools
+    items = background.take_inbox(t.background)
+    n = list.list_size(items)
+    if n == 0 { return "" }
+    l = (s.cfg as *types.Config).limits as *types.Limits
+    added = list.list_new()
+    i = 0
+    while i < n {
+        text, _g = list.get_string(items, i)
+        nl = string.index_of(text, "\n")
+        head = text
+        body = ""
+        if nl >= 0 {
+            head = string.substring(text, 0, nl + 1)
+            body = string.substring(text, nl + 1, string.length(text))
+        }
+        // "[background bash bN finished]\n"
+        id = ""
+        parts = string.split(head, " ")
+        if string.array_size(parts) >= 3 { id = string.copy(string.array_get(parts, 2)) }
+        string.string_array_free(parts)
+        content = output.format_message(head, body, l.run_output_bytes as long)
+        ok = 0
+        if string.starts_with(body, "{\"exit_code\":0,") == 1 { ok = 1 }
+        okt = "false"
+        if ok == 1 { okt = "true" }
+        m = msg.user_from(content, "background")
+        m = msg.set_raw(m, "background_id", jsonx.quote(id))
+        m = msg.set_raw(m, "background_ok", okt)
+        m = msg.set_raw(m, "background_kind", "\"bash\"")
+        list.list_add(pending, m)
+        list.list_add(added, "{\"id\":${jsonx.quote(id)},\"kind\":\"bash\",\"state\":\"finished\",\"ok\":${okt}}")
+        s.pending_background_bytes = s.pending_background_bytes + (string.length(content) as long)
+        emit_(sk, "{\"background\":{\"id\":${jsonx.quote(id)},\"kind\":\"bash\",\"state\":\"finished\",\"ok\":${okt}}}")
+        i = i + 1
+    }
+    tokens = (s.log as *log.Log).context_tokens + compact.estimate_tokens(pending, 0, list.list_size(pending))
+    e = log.commit(s.log, s.history, list.list_size(s.history), pending, tokens, "", 0)
+    if e != "" { return e }
+    list.list_clear(pending)
+    k = 0
+    while k < list.list_size(added) {
+        ev, _g2 = list.get_string(added, k)
+        log.background(s.log, ev, s.steps + 1)
+        k = k + 1
+    }
+    return ""
+}
+
+// The model call, with retries; deltas forwarded (buffered while
+// background work is pending). (reply, err, detail, attempts).
+complete_(s: *Session, request: ptr, sk: @keep ptr, cancel: @keep ptr, buffer_text: int, fwd: *Fwd) -> (ptr, string, string, int) {
+    fp = fwd as ptr
+    ps = sink.new(fp)
+    pk = ps as *sink.Sink
+    pk.on_delta = |ctx: ptr, kind: string, text: string| {
+        f = ctx as *Fwd
+        ss = f.session as *Session
+        if kind == "text" {
+            ss.partial_text = "${ss.partial_text}${text}"
+        } else {
+            ss.partial_reasoning = "${ss.partial_reasoning}${text}"
+        }
+        if f.buffer_text == 0 || kind != "text" {
+            emit_(f.sink, "{\"delta\":{\"kind\":${jsonx.quote(kind)},\"text\":${jsonx.quote(text)}}}")
+        }
+    }
+    pk.has_delta = 1
+    pk.on_data = |ctx: ptr| {
+        f = ctx as *Fwd
+        if f.first_data_ms < 0 { f.first_data_ms = os.now_monotonic_ms() - f.started_ms }
+    }
+    pk.has_data = 1
+    rp = provider.retry_new(fp)
+    rr = rp as *provider.Retry
+    rr.on_event = |ctx: ptr, kind: string, attempt: int, delay: long, reason: string| {
+        f = ctx as *Fwd
+        if kind == "retry" {
+            emit_(f.sink, "{\"retry\":{\"attempt\":${attempt},\"delay_ms\":${delay},\"reason\":${jsonx.quote(reason)}}}")
+            ss = f.session as *Session
+            // Visible failed-attempt deltas must not be committed on later cancellation.
+            ss.partial_text = ""
+            ss.partial_reasoning = ""
+        }
+    }
+    rr.has_event = 1
+    return provider.complete(s.cfg, s.cache_key, request, prompt.TOOLS_JSON, -1, ps, cancel, 0, rp)
+}
+
+// An unfinished Step is dropped, since its tool calls would need results.
+commit_interrupted_(s: *Session, pending: ptr) {
+    c = s.cfg as *types.Config
+    marker = "[interrupted by user]"
+    if sync.atomic_load(s.signal) == 15 { marker = "[interrupted: process terminated]" }
+    text = marker
+    if string.length(s.partial_text) > 0 { text = "${s.partial_text}\n\n${marker}" }
+    rprov = ""
+    rdata = ""
+    if types.protocol(s.cfg) == "chat_completions" && c.thinking != 0 {
+        // DeepSeek thinking mode rejects later requests whose assistant messages lack reasoning_content.
+        rprov = c.provider
+        rdata = marker
+        if string.length(s.partial_reasoning) > 0 { rdata = s.partial_reasoning }
+    }
+    msgs = list.list_new()
+    i = 0
+    while i < list.list_size(pending) {
+        m, _g = list.get_string(pending, i)
+        if msg.role(m) != "user" { break }
+        list.list_add(msgs, string.copy(m))
+        i = i + 1
+    }
+    list.list_add(msgs, msg.assistant(text, list.list_new(), rprov, rdata, 0, "", -1, ""))
+    tokens = (s.log as *log.Log).context_tokens + compact.estimate_tokens(msgs, 0, list.list_size(msgs))
+    log.commit(s.log, s.history, list.list_size(s.history), msgs, tokens, "", 0)
+}
+
+canceled_(cancel: ptr) -> int {
+    if cancel != null && sync.atomic_load(cancel) != 0 { return 1 }
+    return 0
+}
+
+// Compaction through the Session's provider (manual: /compact, or automatic).
+compact_now(sp: @keep ptr, sk: ptr, cancel: ptr, automatic: int) -> (string, string) {
+    s = sp as *Session
+    c = s.cfg as *types.Config
+    window = c.context_window
+    sp2 = sp
+    r = compact.compact(s.history, window, (s.log as *log.Log).context_tokens, |request: ptr, out: ptr| {
+        ss = sp2 as *Session
+        small = types.copy(ss.cfg)
+        types.set_effort(small, "off")
+        quiet = sink.new(sp2)
+        o = out as *compact.ModelReply
+        rep, err, detail, _a = provider.complete(small, ss.cache_key, request, "[]", compact.summary_max_tokens(window) as int, quiet, cancel, 1, null)
+        if err != "" {
+            o.err = err
+            if detail != "" { o.err = detail }
+            if err == "Canceled" { o.err = "Canceled" }
+            return
+        }
+        rr = rep as *types.Reply
+        if list.list_size(rr.tool_calls) > 0 {
+            o.err = "InvalidSummary"
+            return
+        }
+        o.text = rr.text
+        o.usage = rr.usage
+    })
+    if r.usage != null {
+        types.usage_add(s.usage, r.usage)
+        emit_(sk, usage_event_(s))
+    }
+    if r.err != "" {
+        if canceled_(cancel) == 1 || r.err == "Canceled" { return "Canceled", "" }
+        if automatic == 1 {
+            emit_(sk, "{\"notice\":${jsonx.quote(compact.auto_failed_notice(r.err))}}")
+            s.compact_backoff = compact.auto_backoff((s.log as *log.Log).context_tokens, window)
+            return "", ""
+        }
+        return "CompactionFailed", r.err
+    }
+    if r.notice != "" { emit_(sk, "{\"notice\":${jsonx.quote(r.notice)}}") }
+    if r.status == compact.INEFFECTIVE && automatic == 1 { s.compact_backoff = compact.auto_backoff((s.log as *log.Log).context_tokens, window) }
+    if r.status == compact.COMPACTED {
+        e = log.commit(s.log, s.history, 1, r.replacement, r.after, "", 0)
+        if e != "" { return e, "" }
+        emit_(sk, usage_event_(s))
+    }
+    return "", ""
+}
+
+// One Turn. (err, detail): "" on success; the final text in s.final_text.
+turn(sp: @keep ptr, user_text: string, sk: @keep ptr, cancel: @keep ptr) -> (string, string) {
+    s = sp as *Session
+    c = s.cfg as *types.Config
+    reset_timing_(s)
+    s.status = "completed"
+    started = os.now_monotonic_ms()
+    s.usage = types.usage_new()
+    s.steps = 0
+    first, _g = list.get_string(s.history, 0)
+    pending = list.list_new()
+    lim = c.limits as *types.Limits
+    list.list_add(pending, msg.user(prompt.turn_budget_text(msg.content(first), lim.max_steps as long, user_text)))
+    emit_(sk, usage_event_(s))
+    err, detail = run_steps_(s, pending, sk, cancel)
+    stop_background = 1
+    if err != "" {
+        if err == "Canceled" || canceled_(cancel) == 1 {
+            s.status = "canceled"
+            commit_interrupted_(s, pending)
+            err = "Canceled"
+        } else {
+            s.status = "failed"
+        }
+        if err == "TooManySteps" && canceled_(cancel) == 0 { stop_background = 0 }
+    }
+    if stop_background == 1 || canceled_(cancel) == 1 {
+        background.finish_turn((s.tools as *tools.Tools).background)
+    }
+    s.wall_ms = os.now_monotonic_ms() - started
+    return err, detail
+}
+
+run_steps_(s: *Session, pending: ptr, sk: @keep ptr, cancel: @keep ptr) -> (string, string) {
+    c = s.cfg as *types.Config
+    lim = c.limits as *types.Limits
+    t = s.tools as *tools.Tools
+    step_index = 0
+    while true {
+        if canceled_(cancel) == 1 { return "Canceled", "" }
+        if lim.max_steps >= 0 && step_index >= lim.max_steps {
+            return "TooManySteps", step_limit_detail_(s, sk, cancel, lim.max_steps)
+        }
+        size = (s.log as *log.Log).context_tokens + compact.estimate_tokens(pending, 0, list.list_size(pending))
+        if size >= c.context_window - c.context_window / 4 && size >= s.compact_backoff {
+            cerr, cdetail = compact_now(s as ptr, sk, cancel, 1)
+            if cerr != "" { return cerr, cdetail }
+        }
+        if canceled_(cancel) == 1 { return "Canceled", "" }
+        berr = insert_background_(s, pending, sk)
+        if berr != "" { return berr, "" }
+        background_output_bytes = s.pending_background_bytes
+        request = list.list_new()
+        i = 0
+        while i < list.list_size(s.history) {
+            m, _g = list.get_string(s.history, i)
+            list.list_add(request, m)
+            i = i + 1
+        }
+        i = 0
+        while i < list.list_size(pending) {
+            m2, _g2 = list.get_string(pending, i)
+            list.list_add(request, m2)
+            i = i + 1
+        }
+        effort = provider.logged_effort(s.cfg)
+        emit_(sk, "{\"step\":{\"n\":${s.steps + 1},\"effort\":${jsonx.quote(effort)}}}")
+        step_started = os.now_monotonic_ms()
+        buffer_text = 0
+        if background.active_bash(t.background) > 0 { buffer_text = 1 }
+        fwd = heap.new(Fwd)
+        fwd.session = s as ptr
+        fwd.sink = sk
+        fwd.buffer_text = buffer_text
+        fwd.first_data_ms = -1 as long
+        fwd.started_ms = step_started
+        s.partial_text = ""
+        s.partial_reasoning = ""
+        rep, err, detail, attempts = complete_(s, request, sk, cancel, buffer_text, fwd)
+        if err != "" { return err, detail }
+        r = rep as *types.Reply
+        ncalls = list.list_size(r.tool_calls)
+        waiting = 0
+        if ncalls == 0 && background.active_bash(t.background) > 0 { waiting = 1 }
+        if waiting == 1 {
+            note = r.text
+            if string.length(note) == 0 { note = "Waiting for background results." }
+            emit_(sk, "{\"notice\":${jsonx.quote(note)}}")
+        } else if buffer_text == 1 && string.length(r.text) > 0 {
+            emit_(sk, "{\"delta\":{\"kind\":\"text\",\"text\":${jsonx.quote(r.text)}}}")
+        }
+        model_ms = os.now_monotonic_ms() - step_started
+        s.partial_text = ""
+        s.partial_reasoning = ""
+        types.usage_add(s.usage, r.usage)
+        emit_(sk, usage_event_(s))
+        s.steps = s.steps + 1
+        assistant_index = list.list_size(pending)
+        wflag = -1
+        if waiting == 1 { wflag = 1 }
+        list.list_add(pending, msg.assistant(r.text, r.tool_calls, r.reasoning_provider, r.reasoning_data, r.reasoning_includes_output, r.phase, wflag, effort))
+        run = timing.new()
+        run_results = "["
+        run_ms = 0 as long
+        output_bytes = 0 as long
+        output_tokens = 0 as long
+        empty_runs = 0
+        if ncalls > 0 { empty_runs = 1 }
+        k = 0
+        while k < ncalls {
+            tc = list.list_get_raw(r.tool_calls, k) as *types.ToolCall
+            ex = execute_(s, tc, sk, cancel, run, k) as *Executed
+            if !(ex.ok == 1 && ex.empty == 1 && ex.summary != "" && string.index_of(ex.summary, "\"counts\":[]") >= 0 && string.index_of(ex.summary, "\"omitted\":0") >= 0) { empty_runs = 0 }
+            output_bytes = output_bytes + (string.length(ex.output) as long)
+            run_ms = run_ms + ex.run_ms
+            emit_(sk, usage_event_(s))
+            extra = ""
+            okt = "false"
+            if ex.ok == 1 { okt = "true" }
+            if ex.has_run_ms == 1 { extra = ",\"run_ok\":${okt}" }
+            if ex.summary != "" { extra = "${extra},\"tool_summary\":${ex.summary}" }
+            list.list_add(pending, msg.tool(tc.id, ex.output, extra))
+            if k > 0 { run_results = "${run_results}," }
+            run_results = "${run_results}{\"tool_call_id\":${jsonx.quote(tc.id)},\"ok\":${okt}"
+            if ex.has_run_ms == 1 { run_results = "${run_results},\"run_ms\":${ex.run_ms}" }
+            run_results = "${run_results},\"tool_bytes\":${ex.tool_bytes},\"calls_omitted\":${ex.omitted},\"output_bytes\":${string.length(ex.output)}"
+            rem = remaining_steps_(s)
+            if rem >= 0 { run_results = "${run_results},\"remaining_steps\":${rem}" }
+            run_results = "${run_results}}"
+            output_tokens = output_tokens + (string.length(ex.output) as long) / 3 + 1
+            k = k + 1
+        }
+        run_results = "${run_results}]"
+        if empty_runs == 1 && background.active_bash(t.background) > 0 {
+            waiting = 1
+            am, _g3 = list.get_string(pending, assistant_index)
+            list.list_set(pending, assistant_index, msg.set_raw(am, "waiting", "true"))
+            emit_(sk, "{\"notice\":\"Waiting for background results.\"}")
+        }
+        u = r.usage as *types.Usage
+        tokens = u.prompt_tokens + u.completion_tokens + output_tokens
+        ms = os.now_monotonic_ms() - step_started
+        members = ",\"usage\":${types.usage_json(r.usage)},\"effort\":${jsonx.quote(effort)},\"turn_step\":${step_index + 1},\"ms\":${ms},\"model_ms\":${model_ms},\"transport\":\"sse\",\"attempts\":${attempts}"
+        if fwd.first_data_ms >= 0 { members = "${members},\"first_data_ms\":${fwd.first_data_ms}" }
+        if ncalls > 0 {
+            members = "${members},\"run_ms\":${run_ms},\"calls\":${calls_json_(run)},\"calls_omitted\":${timing.omitted(run)}"
+        }
+        members = "${members},\"task_ids\":{\"agent\":0,\"bash\":${sync.atomic_load(t.bash_ids)},\"run\":0},\"tool_bytes\":${timing.tool_bytes(run)},\"output_bytes\":${output_bytes + background_output_bytes}"
+        if ncalls > 0 { members = "${members},\"run_results\":${run_results}" }
+        members = ",\"model\":${jsonx.quote(c.model)}${members}"
+        e = log.commit(s.log, s.history, list.list_size(s.history), pending, tokens, members, 0)
+        if e != "" { return e, "" }
+        s.pending_background_bytes = 0 as long
+        s.model_ms = s.model_ms + model_ms
+        s.run_ms = s.run_ms + run_ms
+        s.tool_bytes = s.tool_bytes + timing.tool_bytes(run)
+        s.output_bytes = s.output_bytes + output_bytes + background_output_bytes
+        s.llm_calls = s.llm_calls + timing.llm_calls(run)
+        s.agent_calls = s.agent_calls + timing.agent_calls(run)
+        s.final_text = r.text
+        list.list_clear(pending)
+        emit_(sk, usage_event_(s))
+        if ncalls == 0 || waiting == 1 {
+            if background.active_bash(t.background) == 0 && background.inbox_size(t.background) == 0 { return "", "" }
+            if lim.max_steps < 0 || s.steps < lim.max_steps {
+                while background.inbox_size(t.background) == 0 && background.active_bash(t.background) > 0 {
+                    if canceled_(cancel) == 1 { return "Canceled", "" }
+                    sleep(20)
+                }
+                if background.inbox_size(t.background) == 0 { return "", "" }
+            }
+        }
+        if canceled_(cancel) == 1 { return "Canceled", "" }
+        step_index = step_index + 1
+    }
+}
+
+step_limit_detail_(s: *Session, sk: ptr, cancel: ptr, max_steps: int) -> string {
+    t = s.tools as *tools.Tools
+    waited = background.active_bash(t.background)
+    plural = "s"
+    if max_steps == 1 { plural = "" }
+    if waited > 0 {
+        emit_(sk, "{\"notice\":\"Step limit reached; waiting for background tasks\"}")
+        while background.active_bash(t.background) > 0 {
+            if canceled_(cancel) == 1 { return "" }
+            sleep(20)
+        }
+        return "stopped after ${max_steps} step${plural} (waited for background tasks)"
+    }
+    return "stopped after ${max_steps} step${plural}"
+}

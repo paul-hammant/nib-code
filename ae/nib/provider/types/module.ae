@@ -83,6 +83,7 @@ struct Usage {
 
 struct ToolCall {
     id: string
+    kind: string                  // the wire `type`: function (default) or custom
     name: string
     arguments: string             // JSON object text
 }
@@ -513,6 +514,7 @@ usage_json(up: ptr) -> string {
 tool_call_new(id: string, name: string, arguments: string) -> ptr {
     t = heap.new(ToolCall)
     t.id = id
+    t.kind = "function"
     t.name = name
     t.arguments = arguments
     return t as ptr
@@ -526,7 +528,7 @@ tool_calls_json(calls: ptr) -> string {
     while i < list.list_size(calls) {
         t = list.list_get_raw(calls, i) as *ToolCall
         if i > 0 { out = "${out}," }
-        out = "${out}{\"id\":${jsonx.quote(t.id)},\"type\":\"function\",\"function\":{\"name\":${jsonx.quote(t.name)},\"arguments\":${jsonx.quote(t.arguments)}}}"
+        out = "${out}{\"id\":${jsonx.quote(t.id)},\"type\":${jsonx.quote(t.kind)},\"function\":{\"name\":${jsonx.quote(t.name)},\"arguments\":${jsonx.quote(t.arguments)}}}"
         i = i + 1
     }
     return "${out}]"

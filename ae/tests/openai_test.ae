@@ -1,0 +1,260 @@
+// Ports the inline tests of upstream src/provider/openai.zig (Chat
+// Completions) under their names, on fixtures (sse.fixed), never a network.
+//
+// Not ported (images): "Chat Completions images use image_url parts and follow
+// tool results in a user message".
+// Adapted: "chat timing collects argument chunks without emitted text" drove
+// ModelTiming (not ported); it keeps the stream half (the chunks assemble one
+// call and report two argument deltas, no text delta). "chunk decodes ..."
+// drove the Chunk type; it reads the same chunk through read_stream.
+import std.spec
+import std.string
+import std.list
+import std.json
+import nib.jsonx
+import nib.msg
+import nib.provider.types
+import nib.provider.sink
+import nib.provider.sse
+import nib.provider.openai
+
+struct Counter {
+    deltas: int
+    args: int
+}
+
+cfg_(provider: string) -> ptr {
+    return types.new_config(provider, "", "", "m")
+}
+
+counter_() -> ptr {
+    k = heap.new(Counter)
+    k.deltas = 0
+    k.args = 0
+    return k as ptr
+}
+
+sink_(ctr: @keep ptr) -> ptr {
+    s = sink.new(ctr)
+    sp = s as *sink.Sink
+    sp.on_delta = |ctx: ptr, kind: string, text: string| {
+        k = ctx as *Counter
+        k.deltas = k.deltas + 1
+    }
+    sp.has_delta = 1
+    sp.on_tool_arguments = |ctx: ptr| {
+        k = ctx as *Counter
+        k.args = k.args + 1
+    }
+    sp.has_tool_arguments = 1
+    return s
+}
+
+doc_(text: string) -> ptr {
+    v = jsonx.parse(text)
+    spec.assert_not_null(v, "valid JSON: ${text}")
+    return v
+}
+
+at_(o: ptr, key: string, i: int) -> ptr {
+    return json.json_array_get_raw(jsonx.field(o, key), i)
+}
+
+user_only_(text: string) -> ptr {
+    l = list.list_new()
+    list.list_add(l, msg.user(text))
+    return l
+}
+
+data_(v: string) -> string {
+    return "data: ${v}\n\n"
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "provider.openai") {
+        spec.it("chunk decodes deepseek deltas, tool call fragments and usage") callback {
+            chunk = "{\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\",\"reasoning_content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"co\"}}]}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1,\"prompt_cache_hit_tokens\":4,\"total_tokens\":6}}"
+            cp = cfg_("deepseek")
+            rep, e, detail = openai.read_stream(sse.fixed("${data_(chunk)}data: [DONE]\n\n"), cp, sink.new(null), null)
+            spec.assert_str_eq(e, "", "reads")
+            r = rep as *types.Reply
+            spec.assert_str_eq(r.text, "hi", "content")
+            tc = list.list_get_raw(r.tool_calls, 0) as *types.ToolCall
+            spec.assert_str_eq(tc.arguments, "{\"co", "arguments fragment")
+            spec.assert_str_eq(tc.id, "call_1", "id")
+            u = r.usage as *types.Usage
+            spec.assert_eq_long(u.prompt_cache_hit_tokens, 4 as long, "cache hit")
+            spec.assert_eq_long(u.prompt_tokens, 5 as long, "prompt")
+            spec.assert_eq_long(u.completion_tokens, 1 as long, "completion")
+        }
+
+        spec.it("request body omits null fields and absent tools") callback {
+            calls = list.list_new()
+            list.list_add(calls, types.tool_call_new("c1", "run", "{}"))
+            history = list.list_new()
+            list.list_add(history, msg.user("hi"))
+            list.list_add(history, msg.assistant("", calls, "", "", 0, "", -1, ""))
+            list.list_add(history, msg.tool("c1", "ok", ""))
+            body, err = openai.request_body(cfg_("chat_completions"), history, "[]", -1)
+            spec.assert_str_eq(err, "", "body")
+            spec.assert_str_eq_diff(body, "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]},{\"role\":\"tool\",\"content\":\"ok\",\"tool_call_id\":\"c1\"}],\"stream\":true,\"stream_options\":{\"include_usage\":true}}", "exact body")
+        }
+
+        spec.it("request body passes reasoning back and sends thinking only when configured") callback {
+            history = list.list_new()
+            list.list_add(history, msg.assistant("a", list.list_new(), "chat_completions", "r", 0, "", -1, ""))
+            cp = cfg_("chat_completions")
+            c = cp as *types.Config
+            c.thinking = 1
+            c.reasoning_effort = "max"
+            on, err = openai.request_body(cp, history, "[]", -1)
+            spec.assert_str_eq(err, "", "body")
+            spec.assert_str_eq_diff(on, "{\"model\":\"m\",\"messages\":[{\"role\":\"assistant\",\"content\":\"a\",\"reasoning_content\":\"r\"}],\"thinking\":{\"type\":\"enabled\"},\"reasoning_effort\":\"max\",\"stream\":true,\"stream_options\":{\"include_usage\":true}}", "enabled")
+            c.thinking = 0
+            off, err2 = openai.request_body(cp, history, "[]", -1)
+            spec.assert_contains(off, "\"thinking\":{\"type\":\"disabled\"}", "disabled")
+            spec.assert_eq(string.index_of(off, "reasoning_effort"), -1, "no effort when off")
+            // Reasoning of another provider is not sent back.
+            c.provider = "deepseek"
+            other, err3 = openai.request_body(cp, history, "[]", -1)
+            spec.assert_eq(string.index_of(other, "reasoning_content"), -1, "provider guard")
+        }
+
+        spec.it("summary request limits output and omits tools") callback {
+            body, err = openai.request_body(cfg_("chat_completions"), user_only_("summary"), "[]", 512)
+            spec.assert_str_eq(err, "", "body")
+            root = doc_(body)
+            spec.assert_eq(jsonx.has(root, "tools"), 0, "no tools")
+            spec.assert_eq(jsonx.int_or(root, "max_tokens", 0), 512, "max_tokens")
+            jsonx.free(root)
+        }
+
+        spec.it("chat timing collects argument chunks without emitted text") callback {
+            s = data_("{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call\",\"function\":{\"name\":\"run\"}}]}}]}")
+            chunk_ = data_("{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\"}}]}}]}")
+            s = "${s}${chunk_}"
+            chunk_ = data_("{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"}\"}}]}}]}")
+            s = "${s}${chunk_}"
+            s = "${s}data: [DONE]\n\n"
+            ctr = counter_()
+            rep, e, detail = openai.read_stream(sse.fixed(s), cfg_("chat_completions"), sink_(ctr), null)
+            spec.assert_str_eq(e, "", "reads")
+            kc = ctr as *Counter
+            spec.assert_eq(kc.args, 2, "two argument deltas")
+            spec.assert_eq(kc.deltas, 0, "no text")
+            r = rep as *types.Reply
+            tc = list.list_get_raw(r.tool_calls, 0) as *types.ToolCall
+            spec.assert_str_eq(tc.id, "call", "id")
+            spec.assert_str_eq(tc.name, "run", "name")
+            spec.assert_str_eq(tc.arguments, "{}", "assembled arguments")
+        }
+
+        spec.it("tool-free JSON requests retain system and use json_object without leaking schema") callback {
+            schema = "{\"type\":\"object\",\"properties\":{\"answer\":{\"type\":\"string\"}},\"required\":[\"answer\"],\"additionalProperties\":false}"
+            system = "Return JSON.\nUse the \"answer\" field."
+            history = list.list_new()
+            list.list_add(history, msg.system(system))
+            list.list_add(history, msg.user("question"))
+            pass = 0
+            while pass < 2 {
+                cp = cfg_("chat_completions")
+                c = cp as *types.Config
+                if pass == 1 { c.output_schema = schema }
+                body, err = openai.request_body(cp, history, "[]", -1)
+                spec.assert_str_eq(err, "", "body")
+                root = doc_(body)
+                spec.assert_eq(jsonx.has(root, "tools"), 0, "no tools")
+                spec.assert_eq(json.json_array_size(jsonx.field(root, "messages")), 2, "two messages")
+                spec.assert_str_eq(jsonx.str_or(at_(root, "messages", 0), "role", ""), "system", "system kept")
+                spec.assert_str_eq(jsonx.str_or(at_(root, "messages", 0), "content", ""), system, "system text")
+                if pass == 1 {
+                    f = jsonx.field(root, "response_format")
+                    spec.assert_eq(json.object_size(f), 1, "one member")
+                    spec.assert_str_eq(jsonx.str_or(f, "type", ""), "json_object", "json_object")
+                    spec.assert_eq(string.index_of(body, "additionalProperties"), -1, "schema not leaked")
+                } else {
+                    spec.assert_eq(jsonx.has(root, "response_format"), 0, "no response_format")
+                }
+                jsonx.free(root)
+                pass = pass + 1
+            }
+        }
+
+        spec.it("custom Chat Completions effort avoids DeepSeek-only thinking fields") callback {
+            cp = types.new_config("custom", "", "", "local")
+            c = cp as *types.Config
+            c.custom_provider = "site"
+            spec.assert_str_eq(types.set_effort(cp, "high"), "", "effort set")
+            body, err = openai.request_body(cp, user_only_("hi"), "[]", -1)
+            spec.assert_eq(string.index_of(body, "\"thinking\""), -1, "no thinking field")
+            spec.assert_contains(body, "\"reasoning_effort\":\"high\"", "effort sent")
+        }
+
+        // ---- port extras: the mock's wire shape and error paths ----
+        spec.it("a tool-call reply keeps DeepSeek reasoning_content and usage (mock shape)") callback {
+            s = data_("{\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"reason\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"code\\\":\\\"1\\\"}\"}}]}}]}")
+            chunk_ = data_("{\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10,\"prompt_cache_hit_tokens\":8}}")
+            s = "${s}${chunk_}"
+            s = "${s}data: [DONE]\n\n"
+            ctr = counter_()
+            cp = cfg_("chat_completions")
+            rep, e, detail = openai.read_stream(sse.fixed(s), cp, sink_(ctr), null)
+            spec.assert_str_eq(e, "", "reads")
+            r = rep as *types.Reply
+            spec.assert_str_eq(r.reasoning_provider, "chat_completions", "provider")
+            spec.assert_str_eq(r.reasoning_data, "reason", "reasoning text")
+            spec.assert_eq(r.reasoning_includes_output, 0, "not includes_output")
+            kc = ctr as *Counter
+            spec.assert_eq(kc.deltas, 1, "reasoning delta")
+            u = r.usage as *types.Usage
+            spec.assert_eq_long(u.prompt_tokens, 100 as long, "prompt")
+            spec.assert_eq_long(u.completion_tokens, 10 as long, "completion")
+            spec.assert_eq_long(u.prompt_cache_hit_tokens, 8 as long, "hit")
+            spec.assert_eq_long(u.prompt_cache_write_tokens, 0 as long, "no write")
+            // It goes back as reasoning_content on the next request.
+            history = list.list_new()
+            list.list_add(history, msg.user("task"))
+            list.list_add(history, msg.assistant(r.text, r.tool_calls, r.reasoning_provider, r.reasoning_data, r.reasoning_includes_output, r.phase, -1, ""))
+            list.list_add(history, msg.tool("call_1", "done", ""))
+            body, err = openai.request_body(cp, history, "[]", -1)
+            root = doc_(body)
+            spec.assert_str_eq(jsonx.str_or(at_(root, "messages", 1), "reasoning_content", ""), "reason", "replayed")
+            spec.assert_str_eq(jsonx.str_or(at_(root, "messages", 2), "tool_call_id", ""), "call_1", "tool result id")
+            jsonx.free(root)
+        }
+
+        spec.it("usage prefers prompt_tokens_details for cache hits and writes") callback {
+            s = data_("{\"choices\":[],\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":2,\"prompt_cache_hit_tokens\":1,\"prompt_tokens_details\":{\"cached_tokens\":7,\"cache_write_tokens\":3}}}")
+            s = "${s}data: [DONE]\n\n"
+            rep, e, detail = openai.read_stream(sse.fixed(s), cfg_("chat_completions"), sink.new(null), null)
+            spec.assert_str_eq(e, "", "reads")
+            u = (rep as *types.Reply).usage as *types.Usage
+            spec.assert_eq_long(u.prompt_cache_hit_tokens, 7 as long, "details hit")
+            spec.assert_eq_long(u.prompt_cache_write_tokens, 3 as long, "details write")
+        }
+
+        spec.it("a stream without [DONE] is incomplete and a call without id or name is invalid") callback {
+            rep, e, detail = openai.read_stream(sse.fixed(data_("{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}")), cfg_("chat_completions"), sink.new(null), null)
+            spec.assert_str_eq(e, "IncompleteResponse", "no DONE")
+            chunk_ = data_("{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}}]}")
+            bad = "${chunk_}data: [DONE]\n\n"
+            rep2, e2, detail2 = openai.read_stream(sse.fixed(bad), cfg_("chat_completions"), sink.new(null), null)
+            spec.assert_str_eq(e2, "InvalidResponse", "no id")
+            rep3, e3, detail3 = openai.read_stream(sse.fixed("data: not json\n\n"), cfg_("chat_completions"), sink.new(null), null)
+            spec.assert_str_eq(e3, "InvalidResponse", "bad JSON")
+            chunk_ = data_("{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":65,\"id\":\"x\",\"function\":{\"name\":\"run\"}}]}}]}")
+            far = "${chunk_}data: [DONE]\n\n"
+            rep4, e4, detail4 = openai.read_stream(sse.fixed(far), cfg_("chat_completions"), sink.new(null), null)
+            spec.assert_str_eq(e4, "TooManyToolCalls", "index over 64")
+        }
+
+        spec.it("the default model, and request bodies never carry the key") callback {
+            spec.assert_str_eq(openai.DEFAULT_MODEL, "deepseek-flash", "default model")
+            cp = types.new_config("deepseek", "", "fake-key", "m")
+            body, err = openai.request_body(cp, user_only_("hi"), "[]", -1)
+            spec.assert_eq(string.index_of(body, "fake-key"), -1, "key not in body")
+        }
+    }
+    return spec.run_summary(fw)
+}

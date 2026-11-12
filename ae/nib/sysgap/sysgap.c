@@ -12,6 +12,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <signal.h>
+#include <termios.h>
 
 /* Matches the Aether struct nib.sysgap.Stat field for field. */
 typedef struct { int kind; int mode; int64_t ino; int64_t size; int64_t mtime_ns; int64_t dev; } NibStat;
@@ -94,6 +96,18 @@ int nibsys_write_all(int fd, const char *data, int64_t n) {
     return 0;
 }
 
+/* Positional write of all n bytes at offset (the Session log appends at its
+   own offset, so a torn tail is overwritten rather than appended after). */
+int nibsys_pwrite_all(int fd, const char *data, int64_t n, int64_t offset) {
+    int64_t off = 0;
+    while (off < n) {
+        ssize_t w = pwrite(fd, data + off, (size_t)(n - off), (off_t)(offset + off));
+        if (w < 0) { if (errno == EINTR) continue; return -errno; }
+        off += w;
+    }
+    return 0;
+}
+
 int nibsys_fchmod(int fd, int mode) { return fchmod(fd, (mode_t)mode) == 0 ? 0 : -errno; }
 int nibsys_fsync(int fd) { return fsync(fd) == 0 ? 0 : -errno; }
 int nibsys_rename(const char *from, const char *to) { return rename(from, to) == 0 ? 0 : -errno; }
@@ -105,3 +119,26 @@ int nibsys_mkdir(const char *path, int mode) { return mkdir(path, (mode_t)mode) 
 extern char **environ;
 int nibsys_environ_count(void) { int n = 0; while (environ && environ[n]) n++; return n; }
 const char *nibsys_environ_get(int i) { return environ[i]; }
+
+/* SIGINT/SIGTERM as a flag the Session polls (nib ask's cancellation;
+   asks/aether-signal-handlers.md). The handler only stores the number. */
+static volatile sig_atomic_t nibsys_signal = 0;
+static void nibsys_on_signal(int sig) { nibsys_signal = sig; }
+int nibsys_watch_signals(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = nibsys_on_signal;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGINT, &sa, 0) != 0) return -errno;
+    if (sigaction(SIGTERM, &sa, 0) != 0) return -errno;
+    return 0;
+}
+int nibsys_signal_received(void) { return (int)nibsys_signal; }
+
+/* Terminal echo on stdin (nib login's masked key entry). 1 changed, 0 not a tty. */
+int nibsys_stdin_echo(int on) {
+    struct termios t;
+    if (!isatty(0) || tcgetattr(0, &t) != 0) return 0;
+    if (on) t.c_lflag |= ECHO; else t.c_lflag &= ~(tcflag_t)ECHO;
+    return tcsetattr(0, TCSANOW, &t) == 0 ? 1 : 0;
+}

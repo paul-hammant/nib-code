@@ -1,0 +1,504 @@
+// provider.anthropic: the Anthropic Messages wire protocol (upstream
+// src/provider/anthropic.zig): effort mapping, the request body (cached
+// system, paired tool results, signed thinking continuation, adaptive or
+// budgeted thinking), and the streamed rep.
+//
+// Errors are names (upstream's error set) with a detail text:
+// HttpStatus, HttpTransient, ProviderTransient, RateLimited, ProviderFailed,
+// InvalidResponse, IncompleteResponse, TooManyToolCalls, Canceled, the
+// http timeouts, Transport. Images are not ported: a message's `images`
+// are not sent (the Session image store comes with tools.view).
+
+import std.json
+import std.list
+import std.string
+import std.strbuilder
+import nib.jsonx
+import nib.msg
+import nib.provider.types
+import nib.provider.sink
+import nib.provider.sse
+import nib.provider.http
+
+exports(effort, adaptive, family, request_body, read_stream, stream)
+
+const EPHEMERAL = ",\"cache_control\":{\"type\":\"ephemeral\"}"
+
+is_digit_(c: int) -> int {
+    if c >= 48 && c <= 57 { return 1 }
+    return 0
+}
+
+// `model` is `name` or `name` plus a -YYYYMMDD date.
+family(model: string, name: string) -> int {
+    if string.starts_with(model, name) == 0 { return 0 }
+    n = string.length(name)
+    rest = string.length(model) - n
+    if rest == 0 { return 1 }
+    if rest != 9 { return 0 }
+    if string.char_at(model, n) != 45 { return 0 }
+    i = n + 1
+    while i < string.length(model) {
+        if is_digit_(string.char_at(model, i)) == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+any_family_(model: string, names: string) -> int {
+    parts = string.split(names, " ")
+    k = string.array_size(parts)
+    i = 0
+    found = 0
+    while i < k {
+        if family(model, string.array_get(parts, i)) == 1 { found = 1 }
+        i = i + 1
+    }
+    string.string_array_free(parts)
+    return found
+}
+
+adaptive(model: string) -> int {
+    return any_family_(model, "claude-opus-4-6 claude-opus-4-7 claude-opus-4-8 claude-opus-5 claude-opus-5-5 claude-sonnet-4-6 claude-sonnet-5-5 claude-haiku-5-5 claude-fable-5 claude-fable-5-1 claude-mythos-5 claude-mythos-5-1")
+}
+
+managed_effort_(model: string) -> int {
+    return any_family_(model, "claude-opus-5 claude-opus-5-5 claude-sonnet-5-5 claude-haiku-5-5 claude-fable-5 claude-fable-5-1 claude-mythos-5 claude-mythos-5-1")
+}
+
+can_disable_(model: string) -> int {
+    if any_family_(model, "claude-opus-5-5 claude-sonnet-5-5 claude-fable-5 claude-fable-5-1 claude-mythos-5 claude-mythos-5-1") == 1 { return 0 }
+    return 1
+}
+
+off_or_low_(model: string) -> string {
+    if can_disable_(model) == 1 { return "off" }
+    return "low"
+}
+
+// The effort level sent, or "" for none (the server default).
+effort(cp: ptr) -> string {
+    c = cp as *types.Config
+    if c.thinking == 0 { return off_or_low_(c.model) }
+    value = c.reasoning_effort
+    if value == "" {
+        if c.thinking == 1 { return "high" }
+        return ""
+    }
+    if value == "none" { return off_or_low_(c.model) }
+    if value == "minimal" {
+        if adaptive(c.model) == 1 { return "low" }
+        return "minimal"
+    }
+    if (family(c.model, "claude-opus-4-6") == 1 || family(c.model, "claude-sonnet-4-6") == 1) && value == "xhigh" { return "high" }
+    return value
+}
+
+valid_history_effort_(e: string) -> int {
+    if e == "low" || e == "medium" || e == "high" || e == "xhigh" || e == "max" { return 1 }
+    return 0
+}
+
+// (body, "") or ("", "InvalidResponse") when a stored message is malformed.
+request_body(cp: ptr, messages: ptr, tools_json: string, max_tokens: int) -> (string, string) {
+    c = cp as *types.Config
+    level = effort(cp)
+    managed = 0
+    if managed_effort_(c.model) == 1 && level != "" && level != "off" { managed = 1 }
+    budget = 0
+    if adaptive(c.model) == 0 && level != "" && level != "off" {
+        budget = 16384
+        if level == "minimal" { budget = 1024 }
+        if level == "low" { budget = 2048 }
+        if level == "medium" { budget = 8192 }
+    }
+    cap = 128000
+    if max_tokens >= 0 { cap = max_tokens }
+    if cap < budget + 1024 { cap = budget + 1024 }
+    if cap > 128000 { cap = 128000 }
+    w = strbuilder.new(4096)
+    strbuilder.append(w, "{\"model\":${jsonx.quote(c.model)},\"max_tokens\":${cap},\"stream\":true,\"system\":[")
+    n = list.list_size(messages)
+    sep = ""
+    i = 0
+    while i < n {
+        m, _e = list.get_string(messages, i)
+        if msg.role(m) == "system" {
+            strbuilder.append(w, "${sep}{\"type\":\"text\",\"text\":${jsonx.quote(msg.content(m))},\"cache_control\":{\"type\":\"ephemeral\"}}")
+            sep = ","
+        }
+        i = i + 1
+    }
+    strbuilder.append(w, "],\"messages\":[")
+    last_user = -1
+    i = 0
+    while i < n {
+        m, _e = list.get_string(messages, i)
+        r = msg.role(m)
+        if r == "user" || r == "tool" { last_user = i }
+        i = i + 1
+    }
+    sep = ""
+    i = 0
+    while i < n {
+        m, _e = list.get_string(messages, i)
+        r = msg.role(m)
+        if r == "system" {
+            i = i + 1
+            continue
+        }
+        if r == "assistant" {
+            if managed == 1 {
+                historical = msg.step_effort(m)
+                if valid_history_effort_(historical) == 0 { historical = "high" }
+                strbuilder.append(w, "${sep}{\"role\":\"system\",\"content\":[],\"output_config\":{\"effort\":${jsonx.quote(historical)}}},")
+                sep = ""
+            }
+            if msg.reasoning_provider(m) == c.provider && msg.reasoning_includes_output(m) == 1 {
+                blocks = jsonx.parse(msg.reasoning_data(m))
+                if blocks == null { return "", "InvalidResponse" }
+                strbuilder.append(w, "${sep}{\"role\":\"assistant\",\"content\":${jsonx.encode(blocks)}}")
+                jsonx.free(blocks)
+                sep = ","
+                i = i + 1
+                continue
+            }
+            strbuilder.append(w, "${sep}{\"role\":\"assistant\",\"content\":[")
+            block_sep = ""
+            text = msg.content(m)
+            if string.length(text) > 0 {
+                strbuilder.append(w, "{\"type\":\"text\",\"text\":${jsonx.quote(text)}}")
+                block_sep = ","
+            }
+            calls = msg.tool_calls(m)
+            k = 0
+            while k < list.list_size(calls) {
+                tc = list.list_get_raw(calls, k) as *types.ToolCall
+                args = jsonx.parse(tc.arguments)
+                if args == null { return "", "InvalidResponse" }
+                strbuilder.append(w, "${block_sep}{\"type\":\"tool_use\",\"id\":${jsonx.quote(tc.id)},\"name\":${jsonx.quote(tc.name)},\"input\":${jsonx.encode(args)}}")
+                jsonx.free(args)
+                block_sep = ","
+                k = k + 1
+            }
+            strbuilder.append(w, "]}")
+        } else {
+            strbuilder.append(w, "${sep}{\"role\":\"user\",\"content\":[")
+            if r == "tool" {
+                block_sep = ""
+                while true {
+                    res, _e2 = list.get_string(messages, i)
+                    id = msg.str_or(res, "tool_call_id", "")
+                    if id == "" { return "", "InvalidResponse" }
+                    cache = ""
+                    if last_user == i { cache = EPHEMERAL }
+                    strbuilder.append(w, "${block_sep}{\"type\":\"tool_result\",\"tool_use_id\":${jsonx.quote(id)},\"content\":${jsonx.quote(msg.content(res))}${cache}}")
+                    if i + 1 == n { break }
+                    nx, _e3 = list.get_string(messages, i + 1)
+                    if msg.role(nx) != "tool" { break }
+                    i = i + 1
+                    block_sep = ","
+                }
+            } else {
+                cache = ""
+                if last_user == i { cache = EPHEMERAL }
+                strbuilder.append(w, "{\"type\":\"text\",\"text\":${jsonx.quote(msg.content(m))}${cache}}")
+            }
+            strbuilder.append(w, "]}")
+        }
+        sep = ","
+        i = i + 1
+    }
+    if managed == 1 { strbuilder.append(w, "${sep}{\"role\":\"system\",\"content\":[],\"output_config\":{\"effort\":${jsonx.quote(level)}}}") }
+    strbuilder.append(w, "]")
+    tools = jsonx.parse(tools_json)
+    if tools != null && json.json_type(tools) == json.JSON_ARRAY && json.json_array_size(tools) > 0 {
+        strbuilder.append(w, ",\"tools\":[")
+        tn = json.json_array_size(tools)
+        k = 0
+        while k < tn {
+            f = jsonx.field(json.json_array_get_raw(tools, k), "function")
+            if k > 0 { strbuilder.append(w, ",") }
+            params = jsonx.field(f, "parameters")
+            ptext = "null"
+            if params != null { ptext = jsonx.encode(params) }
+            last = ""
+            if k + 1 == tn { last = EPHEMERAL }
+            strbuilder.append(w, "{\"name\":${jsonx.quote(jsonx.str_or(f, "name", ""))},\"description\":${jsonx.quote(jsonx.str_or(f, "description", ""))},\"input_schema\":${ptext}${last}}")
+            k = k + 1
+        }
+        strbuilder.append(w, "]")
+    }
+    jsonx.free(tools)
+    if level != "" {
+        if level == "off" {
+            strbuilder.append(w, ",\"thinking\":{\"type\":\"disabled\"}")
+        } else if managed == 1 {
+            strbuilder.append(w, ",\"thinking\":{\"type\":\"adaptive\",\"display\":\"summarized\",\"block_binding\":{\"prefix_mismatch_behavior\":\"drop_block\"}},\"output_config\":{\"effort\":\"low\"}")
+        } else if adaptive(c.model) == 1 {
+            strbuilder.append(w, ",\"thinking\":{\"type\":\"adaptive\"},\"output_config\":{\"effort\":${jsonx.quote(level)}}")
+        } else {
+            strbuilder.append(w, ",\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":${budget}}")
+        }
+    }
+    strbuilder.append(w, "}")
+    return strbuilder.finish(w), ""
+}
+
+struct Block {
+    value: string      // the content_block object as started
+    kind: string
+    text: string
+    signature: string
+    args: string
+    done: int
+}
+
+fail_(err: string, detail: string) -> (ptr, string, string) {
+    return null, err, detail
+}
+
+// The streamed rep. (rep, "", "") or (null, error name, detail).
+read_stream(lines: ptr, cp: ptr, sk: ptr, cancel: ptr) -> (ptr, string, string) {
+    c = cp as *types.Config
+    parser = sse.parser()
+    blocks = list.list_new()
+    in_tok = 0 as long
+    out_tok = 0 as long
+    read_tok = 0 as long
+    write_tok = 0 as long
+    stopped = 0
+    reason = ""
+    has_reason = 0
+    while stopped == 0 {
+        line, lerr = sse.next(lines, cancel)
+        if lerr != "" && lerr != "EOF" { return fail_(lerr, "") }
+        data, ready = sse.feed(parser, line)
+        if ready == 0 {
+            if lerr == "EOF" {
+                // A final event may lack its blank line.
+                data, ready = sse.feed(parser, "")
+                if ready == 0 { break }
+            } else {
+                continue
+            }
+        }
+        ev = jsonx.parse(data)
+        if ev == null { return fail_("InvalidResponse", "") }
+        kind = jsonx.str_or(ev, "type", "")
+        if kind == "error" {
+            ekind = "api_error"
+            eo = jsonx.field(ev, "error")
+            if eo != null { ekind = jsonx.str_or(eo, "type", "api_error") }
+            detail = "${types.name(cp)}: ${ekind}; the Step was not committed."
+            jsonx.free(ev)
+            if ekind == "overloaded_error" || ekind == "api_error" { return fail_("ProviderTransient", detail) }
+            if ekind == "rate_limit_error" { return fail_("RateLimited", detail) }
+            return fail_("ProviderFailed", detail)
+        }
+        mo = jsonx.field(ev, "message")
+        if mo != null {
+            u = jsonx.field(mo, "usage")
+            if u != null {
+                in_tok = jsonx.long_or(u, "input_tokens", 0 as long)
+                out_tok = jsonx.long_or(u, "output_tokens", 0 as long)
+                read_tok = jsonx.long_or(u, "cache_read_input_tokens", 0 as long)
+                write_tok = jsonx.long_or(u, "cache_creation_input_tokens", 0 as long)
+            }
+        }
+        u2 = jsonx.field(ev, "usage")
+        if u2 != null {
+            in_tok = jsonx.long_or(u2, "input_tokens", in_tok)
+            out_tok = jsonx.long_or(u2, "output_tokens", out_tok)
+            read_tok = jsonx.long_or(u2, "cache_read_input_tokens", read_tok)
+            write_tok = jsonx.long_or(u2, "cache_creation_input_tokens", write_tok)
+        }
+        index = jsonx.int_or(ev, "index", 0)
+        if kind == "content_block_start" {
+            cb = jsonx.field(ev, "content_block")
+            if index != list.list_size(blocks) || index > 256 || cb == null || json.json_type(cb) != json.JSON_OBJECT {
+                jsonx.free(ev)
+                return fail_("InvalidResponse", "")
+            }
+            b = heap.new(Block)
+            b.value = jsonx.encode(cb)
+            b.kind = string.copy(jsonx.str_or(cb, "type", ""))
+            b.text = ""
+            if jsonx.kind(cb, "text") == json.JSON_STRING { b.text = string.copy(jsonx.str_or(cb, "text", "")) }
+            if jsonx.kind(cb, "thinking") == json.JSON_STRING { b.text = string.copy(jsonx.str_or(cb, "thinking", "")) }
+            b.signature = ""
+            if jsonx.kind(cb, "signature") == json.JSON_STRING { b.signature = string.copy(jsonx.str_or(cb, "signature", "")) }
+            b.args = ""
+            b.done = 0
+            list.list_add(blocks, b as ptr)
+        } else if kind == "content_block_delta" {
+            if index >= list.list_size(blocks) {
+                jsonx.free(ev)
+                return fail_("InvalidResponse", "")
+            }
+            b = list.list_get_raw(blocks, index) as *Block
+            d = jsonx.field(ev, "delta")
+            if b.done == 1 || d == null {
+                jsonx.free(ev)
+                return fail_("InvalidResponse", "")
+            }
+            if jsonx.kind(d, "text") == json.JSON_STRING {
+                t = string.copy(jsonx.str_or(d, "text", ""))
+                b.text = "${b.text}${t}"
+                sink.content(sk, string.length(t))
+                sink.delta(sk, "text", t)
+            } else if jsonx.kind(d, "thinking") == json.JSON_STRING {
+                t = string.copy(jsonx.str_or(d, "thinking", ""))
+                b.text = "${b.text}${t}"
+                sink.content(sk, string.length(t))
+                sink.delta(sk, "reasoning", t)
+            }
+            if jsonx.kind(d, "signature") == json.JSON_STRING {
+                s = string.copy(jsonx.str_or(d, "signature", ""))
+                b.signature = "${b.signature}${s}"
+            }
+            if jsonx.kind(d, "partial_json") == json.JSON_STRING {
+                pj = string.copy(jsonx.str_or(d, "partial_json", ""))
+                b.args = "${b.args}${pj}"
+                sink.content(sk, string.length(pj))
+                if string.length(pj) > 0 { sink.tool_arguments(sk) }
+            }
+        } else if kind == "content_block_stop" {
+            if index >= list.list_size(blocks) {
+                jsonx.free(ev)
+                return fail_("InvalidResponse", "")
+            }
+            b = list.list_get_raw(blocks, index) as *Block
+            if b.done == 1 {
+                jsonx.free(ev)
+                return fail_("InvalidResponse", "")
+            }
+            b.done = 1
+        } else if kind == "message_delta" {
+            d = jsonx.field(ev, "delta")
+            if d != null {
+                if jsonx.kind(d, "stop_reason") == json.JSON_STRING {
+                    reason = string.copy(jsonx.str_or(d, "stop_reason", ""))
+                    has_reason = 1
+                } else {
+                    has_reason = 0
+                }
+            }
+        } else if kind == "message_stop" {
+            stopped = 1
+        }
+        jsonx.free(ev)
+        if lerr == "EOF" { break }
+    }
+    if stopped == 0 || has_reason == 0 { return fail_("IncompleteResponse", "") }
+    if reason != "end_turn" && reason != "tool_use" && reason != "stop_sequence" { return fail_("ProviderFailed", "") }
+    rep = types.reply_new() as *types.Reply
+    text = ""
+    content = "["
+    i = 0
+    while i < list.list_size(blocks) {
+        b = list.list_get_raw(blocks, i) as *Block
+        if b.done == 0 { return fail_("IncompleteResponse", "") }
+        v = b.value
+        if b.kind == "text" {
+            v = jsonx.with_member(v, "text", jsonx.quote(b.text))
+            text = "${text}${b.text}"
+        } else if b.kind == "thinking" {
+            if string.length(b.signature) == 0 { return fail_("InvalidResponse", "") }
+            v = jsonx.with_member(v, "thinking", jsonx.quote(b.text))
+            v = jsonx.with_member(v, "signature", jsonx.quote(b.signature))
+        } else if b.kind == "tool_use" {
+            if list.list_size(rep.tool_calls) >= 64 { return fail_("TooManyToolCalls", "") }
+            input = ""
+            if string.length(b.args) > 0 {
+                iv = jsonx.parse(b.args)
+                if iv == null { return fail_("InvalidResponse", "") }
+                if json.json_type(iv) != json.JSON_OBJECT {
+                    jsonx.free(iv)
+                    return fail_("InvalidResponse", "")
+                }
+                input = jsonx.encode(iv)
+                jsonx.free(iv)
+            } else {
+                bv = jsonx.parse(v)
+                f = jsonx.field(bv, "input")
+                if f == null || json.json_type(f) != json.JSON_OBJECT {
+                    jsonx.free(bv)
+                    return fail_("InvalidResponse", "")
+                }
+                input = jsonx.encode(f)
+                jsonx.free(bv)
+            }
+            v = jsonx.with_member(v, "input", input)
+            bv2 = jsonx.parse(v)
+            id = string.copy(jsonx.str_or(bv2, "id", ""))
+            nm = string.copy(jsonx.str_or(bv2, "name", ""))
+            ok_id = jsonx.kind(bv2, "id") == json.JSON_STRING && jsonx.kind(bv2, "name") == json.JSON_STRING
+            jsonx.free(bv2)
+            if ok_id == false { return fail_("InvalidResponse", "") }
+            list.list_add(rep.tool_calls, types.tool_call_new(id, nm, input))
+        }
+        if i > 0 { content = "${content}," }
+        content = "${content}${v}"
+        i = i + 1
+    }
+    content = "${content}]"
+    rep.text = text
+    if list.list_size(blocks) > 0 {
+        rep.reasoning_provider = string.copy(c.provider)
+        rep.reasoning_data = content
+        rep.reasoning_includes_output = 1
+    }
+    uu = rep.usage as *types.Usage
+    uu.prompt_tokens = in_tok + read_tok + write_tok
+    uu.completion_tokens = out_tok
+    uu.prompt_cache_hit_tokens = read_tok
+    uu.prompt_cache_write_tokens = write_tok
+    return rep as ptr, "", ""
+}
+
+trim_slash_(s: string) -> string {
+    out = s
+    while string.length(out) > 0 && string.ends_with(out, "/") == 1 {
+        out = string.substring(out, 0, string.length(out) - 1)
+    }
+    return out
+}
+
+// One request attempt against `cfg.base_url`/v1/messages.
+stream(cp: ptr, messages: ptr, tools_json: string, max_tokens: int, sk: ptr, cancel: ptr) -> (ptr, string, string) {
+    c = cp as *types.Config
+    body, berr = request_body(cp, messages, tools_json, max_tokens)
+    if berr != "" { return fail_(berr, "") }
+    names = list.list_new()
+    values = list.list_new()
+    if string.length(c.api_key) > 0 {
+        list.list_add(names, "x-api-key")
+        list.list_add(values, c.api_key)
+    }
+    list.list_add(names, "anthropic-version")
+    list.list_add(values, "2023-06-01")
+    list.list_add(names, "accept")
+    list.list_add(values, "text/event-stream")
+    l = c.limits as *types.Limits
+    st = http.open("${trim_slash_(c.base_url)}/v1/messages", names, values, body, l.request_timeout_s + 5)
+    r = http.reader(st, l.stream_idle_timeout_s, l.stream_content_timeout_s, l.request_timeout_s)
+    (sk as *sink.Sink).monitor = r
+    status, herr = http.wait_head(r, cancel)
+    if herr != "" { return fail_(herr, timeout_detail_(r, herr)) }
+    sink.received(sk)
+    if status < 200 || status > 299 {
+        detail = "${types.name(cp)}: HTTP ${status}; check ${types.key_hint(cp)}."
+        if status == 429 || status >= 500 { return fail_("HttpTransient", detail) }
+        return fail_("HttpStatus", detail)
+    }
+    rep, err, detail = read_stream(sse.from_http(r), cp, sk, cancel)
+    if err != "" && detail == "" { detail = timeout_detail_(r, err) }
+    return rep, err, detail
+}
+
+timeout_detail_(r: ptr, err: string) -> string {
+    if err == http.TIMEOUT_BYTES || err == http.TIMEOUT_CONTENT || err == http.TIMEOUT_REQUEST { return http.timeout_message(r, err) }
+    if string.starts_with(err, "Transport: ") == 1 { return string.substring(err, 11, string.length(err)) }
+    return ""
+}

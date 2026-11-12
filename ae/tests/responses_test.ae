@@ -1,0 +1,550 @@
+// Ports the inline tests of upstream src/provider/responses.zig under their
+// names, on fixtures (sse.fixed), never a network.
+//
+// Not ported, by policy (no Codex, no websocket, no images):
+//  - "Codex catalog context windows" (the Codex model catalog and its
+//    contextWindow; the built-in windows live in provider.types),
+//  - "WebSocket protocol fallback keeps cancellation and transient failures
+//    on their existing paths" (websocket),
+//  - "Responses images use input_image and tool outputs only where the API
+//    accepts them" (images).
+// Adapted: tests that drove ModelTiming/idle.Monitor/body.Reader (no
+// equivalent in the port) keep their stream assertions and drop the timing
+// ones; the Codex provider is the openai provider; codex_run_tool custom/
+// function is the openai/xai provider (types.custom_run).
+import std.spec
+import std.string
+import std.list
+import std.json
+import nib.jsonx
+import nib.msg
+import nib.provider.types
+import nib.provider.sink
+import nib.provider.sse
+import nib.provider.responses
+
+struct Counter {
+    deltas: int
+    args: int
+}
+
+cfg_(provider: string, model: string) -> ptr {
+    return types.new_config(provider, "", "", model)
+}
+
+sink_(ctr: @keep ptr) -> ptr {
+    s = sink.new(ctr)
+    sp = s as *sink.Sink
+    sp.on_delta = |ctx: ptr, kind: string, text: string| {
+        k = ctx as *Counter
+        k.deltas = k.deltas + 1
+    }
+    sp.has_delta = 1
+    sp.on_tool_arguments = |ctx: ptr| {
+        k = ctx as *Counter
+        k.args = k.args + 1
+    }
+    sp.has_tool_arguments = 1
+    return s
+}
+
+counter_() -> ptr {
+    k = heap.new(Counter)
+    k.deltas = 0
+    k.args = 0
+    return k as ptr
+}
+
+// The JSON document, failing the test when it does not parse.
+doc_(text: string) -> ptr {
+    v = jsonx.parse(text)
+    spec.assert_not_null(v, "valid JSON: ${text}")
+    return v
+}
+
+arr_(o: ptr, key: string, i: int) -> ptr {
+    return json.json_array_get_raw(jsonx.field(o, key), i)
+}
+
+has_(s: string, part: string) -> int {
+    if string.index_of(s, part) >= 0 { return 1 }
+    return 0
+}
+
+msgs_user_(text: string) -> ptr {
+    l = list.list_new()
+    list.list_add(l, msg.user(text))
+    return l
+}
+
+none_() -> ptr { return list.list_new() }
+
+expect_failure_(ev: string, err: string, code: string, text_part: string) {
+    cp = cfg_("openai", "m")
+    rep, e, detail = responses.read_stream(sse.fixed("data: ${ev}\n\n"), cp, sink.new(null), null)
+    spec.assert_str_eq(e, err, "error for ${ev}")
+    spec.assert_contains(detail, code, "code in detail")
+    spec.assert_contains(detail, text_part, "message in detail")
+    spec.assert_true(string.ends_with(detail, "; the Step was not committed.") == 1 || err == "IncompleteResponse", "step not committed suffix")
+}
+
+// 1 when `s` is well-formed UTF-8.
+utf8_ok_(s: string) -> int {
+    n = string.length(s)
+    i = 0
+    while i < n {
+        b = string.char_at(s, i)
+        need = 0
+        if b >= 192 && b < 224 { need = 1 }
+        if b >= 224 && b < 240 { need = 2 }
+        if b >= 240 { need = 3 }
+        if b >= 128 && b < 192 { return 0 }
+        k = 0
+        while k < need {
+            i = i + 1
+            if i >= n { return 0 }
+            if (string.char_at(s, i) & 192) != 128 { return 0 }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+sig_(rep: ptr) -> string {
+    r = rep as *types.Reply
+    return "${r.text}|${types.tool_calls_json(r.tool_calls)}|${r.reasoning_data}|${r.phase}|${types.usage_json(r.usage)}"
+}
+
+const RUN_TOOLS = "[{\"type\":\"function\",\"function\":{\"name\":\"run\",\"description\":\"execute\",\"parameters\":{\"type\":\"object\",\"properties\":{\"code\":{\"type\":\"string\"}},\"required\":[\"code\"]}}}]"
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "provider.responses") {
+        spec.it("Codex reasoning mapping and readable summaries") callback {
+            cp = cfg_("openai", "gpt-6.1-sol")
+            c = cp as *types.Config
+            spec.assert_str_eq(responses.reasoning_effort(cp), "", "default")
+            c.thinking = 1
+            spec.assert_str_eq(responses.reasoning_effort(cp), "medium", "thinking")
+            c.reasoning_effort = "high"
+            spec.assert_str_eq(responses.reasoning_effort(cp), "high", "explicit")
+            c.thinking = 0
+            spec.assert_str_eq(responses.reasoning_effort(cp), "low", "cannot disable")
+            c.model = "gpt-6.1-terra"
+            spec.assert_str_eq(responses.reasoning_effort(cp), "none", "can disable")
+            spec.assert_eq(types.model_can_disable_reasoning("gpt-6.1-sol"), 0, "sol cannot")
+            // xAI sends no effort for off, none and minimal.
+            xp = cfg_("xai", "grok-4.7")
+            x = xp as *types.Config
+            x.thinking = 0
+            spec.assert_str_eq(responses.reasoning_effort(xp), "", "xai off")
+            x.thinking = 1
+            x.reasoning_effort = "minimal"
+            spec.assert_str_eq(responses.reasoning_effort(xp), "", "xai minimal")
+            x.reasoning_effort = "high"
+            spec.assert_str_eq(responses.reasoning_effort(xp), "high", "xai high")
+        }
+
+        spec.it("Codex request body defaults to no summary and supports opt in") callback {
+            // model|thinking(-1 none, 0, 1)|effort|expected effort
+            cases = string.split("gpt-6.1-sol|-1||;gpt-6.1-sol|1||medium;gpt-6.1-sol|-1|high|high;gpt-6.1-sol|0||low;gpt-6.1-terra|0||none;gpt-6.1-sol|-1|none|none", ";")
+            ncase = string.array_size(cases)
+            ci = 0
+            while ci < ncase {
+                f = string.split(string.array_get(cases, ci), "|")
+                si = 0
+                while si < 2 {
+                    cp = cfg_("openai", string.array_get(f, 0))
+                    c = cp as *types.Config
+                    th, _te = string.to_int(string.array_get(f, 1))
+                    c.thinking = th
+                    c.reasoning_effort = string.array_get(f, 2)
+                    if si == 1 { c.reasoning_summary = "auto" }
+                    expected = string.array_get(f, 3)
+                    body, err = responses.request_body(cp, "cache-key", none_(), "[]", -1)
+                    spec.assert_str_eq(err, "", "body")
+                    root = doc_(body)
+                    spec.assert_eq(jsonx.has(root, "summary"), 0, "no top-level summary")
+                    spec.assert_eq(jsonx.bool_or(root, "store", 1), 0, "store false")
+                    spec.assert_str_eq(jsonx.str_field(arr_(root, "include", 0)), "reasoning.encrypted_content", "include")
+                    if expected != "" || si == 1 {
+                        r = jsonx.field(root, "reasoning")
+                        spec.assert_not_null(r, "reasoning present")
+                        if expected != "" {
+                            spec.assert_str_eq(jsonx.str_or(r, "effort", ""), expected, "effort")
+                        } else {
+                            spec.assert_eq(jsonx.has(r, "effort"), 0, "no effort")
+                        }
+                        if si == 1 {
+                            spec.assert_str_eq(jsonx.str_or(r, "summary", ""), "auto", "summary auto")
+                        } else {
+                            spec.assert_eq(jsonx.has(r, "summary"), 0, "no summary")
+                        }
+                    } else {
+                        spec.assert_eq(jsonx.has(root, "reasoning"), 0, "no reasoning")
+                    }
+                    jsonx.free(root)
+                    si = si + 1
+                }
+                ci = ci + 1
+            }
+        }
+
+        spec.it("Codex request body carries the session cache key") callback {
+            cp = cfg_("openai", "gpt-6.1-sol")
+            key = "0123456789abcdef0123456789abcdef"
+            body, err = responses.request_body(cp, key, msgs_user_("hello"), "[]", -1)
+            spec.assert_str_eq(err, "", "body")
+            root = doc_(body)
+            spec.assert_str_eq(jsonx.str_or(root, "prompt_cache_key", ""), key, "key")
+            jsonx.free(root)
+        }
+
+        spec.it("Codex custom and legacy history retain their wire types across tool configuration changes") callback {
+            dollar = "$"
+            code = "// @run: {\"effort\":\"low\"}\nconst text = `line one\n${dollar}{1}\\path`; text"
+            new_args = "{\"code\":${jsonx.quote(code)}}"
+            old_args = "{\"code\":\"42\",\"effort\":\"high\"}"
+            raw_item = "{\"type\":\"custom_tool_call\",\"id\":\"server-id\",\"status\":\"completed\",\"call_id\":\"new\",\"name\":\"run\",\"input\":${jsonx.quote(code)}}"
+            providers = string.split("openai xai", " ")
+            pi = 0
+            while pi < 2 {
+                provider = string.array_get(providers, pi)
+                inc = 0
+                while inc < 2 {
+                    old_calls = list.list_new()
+                    list.list_add(old_calls, types.tool_call_new("old", "run", old_args))
+                    new_calls = list.list_new()
+                    list.list_add(new_calls, types.tool_call_new("new", "run", new_args))
+                    custom = msg.assistant("", new_calls, "", "", 0, "", -1, "")
+                    custom = msg.set_raw(custom, "tool_calls", "[{\"id\":\"new\",\"type\":\"custom\",\"function\":{\"name\":\"run\",\"arguments\":${jsonx.quote(new_args)}}}]")
+                    if inc == 1 {
+                        custom = msg.set_raw(custom, "reasoning", "{\"provider\":${jsonx.quote(provider)},\"data\":${jsonx.quote("[${raw_item}]")},\"includes_output\":true}")
+                    }
+                    history = list.list_new()
+                    list.list_add(history, msg.assistant("", old_calls, "", "", 0, "", -1, ""))
+                    list.list_add(history, msg.tool("old", "42", ""))
+                    list.list_add(history, custom)
+                    list.list_add(history, msg.tool("new", "result", ""))
+                    cp = cfg_(provider, "gpt-6.1-sol")
+                    body, err = responses.request_body(cp, "key", history, RUN_TOOLS, -1)
+                    spec.assert_str_eq(err, "", "body")
+                    root = doc_(body)
+                    spec.assert_eq(json.json_array_size(jsonx.field(root, "input")), 4, "four input items")
+                    kinds = string.split("function_call function_call_output custom_tool_call custom_tool_call_output", " ")
+                    k = 0
+                    while k < 4 {
+                        spec.assert_str_eq(jsonx.str_or(arr_(root, "input", k), "type", ""), string.array_get(kinds, k), "wire type ${k}")
+                        k = k + 1
+                    }
+                    spec.assert_str_eq(jsonx.str_or(arr_(root, "input", 0), "arguments", ""), old_args, "legacy arguments kept")
+                    spec.assert_str_eq(jsonx.str_or(arr_(root, "input", 2), "input", ""), code, "custom input is the code")
+                    spec.assert_eq(jsonx.has(arr_(root, "input", 2), "id") + jsonx.has(arr_(root, "input", 2), "status"), 0, "no server id/status")
+                    tool = arr_(root, "tools", 0)
+                    if provider == "openai" {
+                        spec.assert_str_eq(jsonx.str_or(tool, "type", ""), "custom", "custom tool")
+                        spec.assert_str_eq(jsonx.str_or(jsonx.field(tool, "format"), "definition", ""), "start: SOURCE\nSOURCE: /[\\s\\S]+/", "grammar")
+                        spec.assert_eq(jsonx.has(tool, "parameters"), 0, "no parameters")
+                    } else {
+                        spec.assert_str_eq(jsonx.str_or(tool, "type", ""), "function", "function tool")
+                        spec.assert_eq(jsonx.has(tool, "parameters"), 1, "parameters")
+                        spec.assert_eq(jsonx.bool_or(tool, "strict", 1), 0, "not strict")
+                    }
+                    jsonx.free(root)
+                    inc = inc + 1
+                }
+                pi = pi + 1
+            }
+        }
+
+        spec.it("Codex stream errors preserve reasons and distinguish retryable failures") callback {
+            expect_failure_("{\"type\":\"error\",\"code\":\"server_error\",\"message\":\"service broke\"}", "ProviderTransient", "server_error", "service broke")
+            expect_failure_("{\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"too much context\"}}}", "ProviderFailed", "context_length_exceeded", "too much context")
+            expect_failure_("{\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"usage_not_included\"}}}", "ProviderFailed", "usage_not_included", "usage_not_included")
+            expect_failure_("{\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}", "ProviderTransient", "max_output_tokens", "max_output_tokens")
+            expect_failure_("{\"type\":\"error\",\"code\":\"rate_limit_exceeded\",\"message\":\"try again in 30ms\"}", "RateLimited", "rate_limit_exceeded", "try again in 30ms")
+            expect_failure_("{\"type\":\"response.completed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"invalid_prompt\",\"message\":\"bad prompt\"}}}", "ProviderFailed", "invalid_prompt", "bad prompt")
+            expect_failure_("{\"type\":\"error\",\"code\":400,\"message\":\"bad request\"}", "ProviderFailed", "400", "bad request")
+            expect_failure_("{\"type\":\"error\",\"status_code\":403,\"message\":\"denied\"}", "ProviderFailed", "unknown", "denied")
+            expect_failure_("{\"type\":\"error\",\"code\":\"new_server_code\",\"message\":\"unknown issue\"}", "ProviderTransient", "new_server_code", "unknown issue")
+            expect_failure_("{\"type\":\"response.created\"}", "IncompleteResponse", "IncompleteResponse", "stream ended")
+            fatal = string.split("context_length_exceeded insufficient_quota usage_not_included invalid_prompt invalid_request_error", " ")
+            k = 0
+            while k < 5 {
+                spec.assert_eq(responses.fatal_code(string.array_get(fatal, k)), 1, "fatal ${string.array_get(fatal, k)}")
+                k = k + 1
+            }
+            soft = string.split("server_error overloaded service_unavailable unknown", " ")
+            k = 0
+            while k < 4 {
+                spec.assert_eq(responses.fatal_code(string.array_get(soft, k)), 0, "not fatal ${string.array_get(soft, k)}")
+                k = k + 1
+            }
+        }
+
+        spec.it("Codex malformed events report the decoder failure without event contents") callback {
+            cp = cfg_("openai", "m")
+            rep, e, detail = responses.read_stream(sse.fixed("data: {\"type\":\"response.custom_tool_call_input.delta\",\"delta\":42,\"private\":\"hidden\"}\n\n"), cp, sink.new(null), null)
+            spec.assert_str_eq(e, "InvalidResponse", "error")
+            spec.assert_contains(detail, "event decode failed: UnexpectedToken", "decoder failure")
+            spec.assert_eq(has_(detail, "hidden"), 0, "no event contents")
+        }
+
+        spec.it("Codex errors bound UTF-8 messages and retain rate-limit hints beyond the cutoff") callback {
+            cp = cfg_("openai", "m")
+            big = ""
+            k = 0
+            while k < 150 {
+                big = "${big}中"
+                k = k + 1
+            }
+            ev = "{\"type\":\"error\",\"code\":\"server_error\",\"message\":${jsonx.quote(big)}}"
+            rep, e, detail = responses.read_stream(sse.fixed("data: ${ev}\n\n"), cp, sink.new(null), null)
+            spec.assert_str_eq(e, "ProviderTransient", "transient")
+            spec.assert_eq(utf8_ok_(detail), 1, "valid UTF-8")
+            spec.assert_true(string.length(detail) < 400, "bounded")
+            // A cut that would fall inside a character backs up to its start.
+            ev2 = "{\"type\":\"error\",\"code\":\"server_error\",\"message\":${jsonx.quote("x${big}")}}"
+            rep2, e2, detail2 = responses.read_stream(sse.fixed("data: ${ev2}\n\n"), cp, sink.new(null), null)
+            spec.assert_eq(utf8_ok_(detail2), 1, "valid UTF-8 mid-character cut")
+            long_msg = "${big} try again in 0.25s"
+            ev3 = "{\"type\":\"error\",\"code\":\"rate_limit_exceeded\",\"message\":${jsonx.quote(long_msg)}}"
+            rep3, e3, detail3 = responses.read_stream(sse.fixed("data: ${ev3}\n\n"), cp, sink.new(null), null)
+            spec.assert_str_eq(e3, "RateLimited", "rate limited")
+            spec.assert_eq_long(responses.retry_delay_ms(detail3), 250 as long, "hint survives the cutoff")
+            spec.assert_true(string.length(detail3) < 420, "bounded with hint")
+        }
+
+        spec.it("Codex retry hints accept seconds and milliseconds without overflow") callback {
+            spec.assert_eq_long(responses.retry_delay_ms("Please try again in 1.2s."), 1200 as long, "seconds")
+            spec.assert_eq_long(responses.retry_delay_ms("Try again in 25ms"), 25 as long, "ms")
+            spec.assert_eq_long(responses.retry_delay_ms("try again in 0.1ms"), 1 as long, "rounds up")
+            spec.assert_eq_long(responses.retry_delay_ms("try again in 0s"), 0 as long, "zero")
+            bad = string.split("try again later|try again in -1s|try again in 1minute|try again in 1.2.3s|try again in 999999999999999999999999999999s", "|")
+            k = 0
+            while k < 5 {
+                spec.assert_eq_long(responses.retry_delay_ms(string.array_get(bad, k)), -1 as long, "none: ${string.array_get(bad, k)}")
+                k = k + 1
+            }
+        }
+
+        spec.it("Codex stream activity covers non-text events and SSE heartbeats") callback {
+            // Upstream also counts sink.onData per received chunk (body.Reader);
+            // here the readers see events, so only argument progress is checked.
+            tail = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+            prefixes = list.list_new()
+            list.list_add(prefixes, ": ping\n\n")
+            list.list_add(prefixes, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"text\"}\n\n")
+            list.list_add(prefixes, "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"reasoning\"}\n\n")
+            list.list_add(prefixes, "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"args\"}\n\n")
+            list.list_add(prefixes, "data: {\"type\":\"response.output_item.added\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[]}}\n\n")
+            k = 0
+            while k < 5 {
+                prefix, _e = list.get_string(prefixes, k)
+                ctr = counter_()
+                cp = cfg_("openai", "m")
+                rep, e, detail = responses.read_stream(sse.fixed("${prefix}${tail}"), cp, sink_(ctr), null)
+                spec.assert_str_eq(e, "", "completes: ${prefix}")
+                kc = ctr as *Counter
+                want = 0
+                if has_(prefix, "arguments.delta") == 1 { want = 1 }
+                spec.assert_eq(kc.args, want, "argument progress for ${prefix}")
+                k = k + 1
+            }
+        }
+
+        spec.it("Codex parser times argument deltas and final-only calls at sparse output indices") callback {
+            // The timing half needs ModelTiming (not ported); the stream half:
+            // 70 reasoning items before the calls, deltas never reach the
+            // text sink, three calls arrive, and an unobserved read agrees.
+            bytes = ""
+            i = 0
+            while i < 70 {
+                bytes = "${bytes}data: {\"type\":\"response.output_item.done\",\"output_index\":${i},\"item\":{\"type\":\"reasoning\"}}\n\n"
+                i = i + 1
+            }
+            bytes = "${bytes}data: {\"type\":\"response.output_item.added\",\"output_index\":70,\"item\":{\"type\":\"function_call\",\"call_id\":\"streamed\",\"name\":\"run\",\"arguments\":\"\"}}\n\n"
+            bytes = "${bytes}data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":70,\"delta\":\"{\"}\n\n"
+            bytes = "${bytes}data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":70,\"delta\":\"}\"}\n\n"
+            bytes = "${bytes}data: {\"type\":\"response.output_item.done\",\"output_index\":70,\"item\":{\"type\":\"function_call\",\"call_id\":\"streamed\",\"name\":\"run\",\"arguments\":\"{}\"}}\n\n"
+            bytes = "${bytes}data: {\"type\":\"response.output_item.done\",\"output_index\":71,\"item\":{\"type\":\"function_call\",\"call_id\":\"final\",\"name\":\"run\",\"arguments\":\"{ }\"}}\n\n"
+            bytes = "${bytes}data: {\"type\":\"response.output_item.done\",\"output_index\":72,\"item\":{\"type\":\"function_call\",\"call_id\":\"other\",\"name\":\"search\",\"arguments\":\"{}\"}}\n\n"
+            bytes = "${bytes}data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+            ctr = counter_()
+            cp = cfg_("openai", "m")
+            rep, e, detail = responses.read_stream(sse.fixed(bytes), cp, sink_(ctr), null)
+            spec.assert_str_eq(e, "", "reads")
+            kc = ctr as *Counter
+            spec.assert_eq(kc.deltas, 0, "no text deltas")
+            spec.assert_eq(kc.args, 2, "two argument deltas")
+            r = rep as *types.Reply
+            spec.assert_eq(list.list_size(r.tool_calls), 3, "three calls")
+            c0 = list.list_get_raw(r.tool_calls, 0) as *types.ToolCall
+            c1 = list.list_get_raw(r.tool_calls, 1) as *types.ToolCall
+            c2 = list.list_get_raw(r.tool_calls, 2) as *types.ToolCall
+            spec.assert_str_eq(c0.id, "streamed", "first call")
+            spec.assert_str_eq(c1.id, "final", "second call")
+            spec.assert_str_eq(c1.arguments, "{ }", "arguments kept verbatim")
+            spec.assert_str_eq(c2.name, "search", "third call")
+            rep2, e2, detail2 = responses.read_stream(sse.fixed(bytes), cp, sink.new(null), null)
+            spec.assert_str_eq(sig_(rep2), sig_(rep), "an unobserved read gives the same reply")
+        }
+
+        spec.it("tool-free JSON requests move system to instructions and use strict named schema") callback {
+            schema = "{\"type\":\"object\",\"properties\":{\"answer\":{\"type\":\"string\"}},\"required\":[\"answer\"],\"additionalProperties\":false}"
+            system = "Return JSON.\nUse the \"answer\" field."
+            history = list.list_new()
+            list.list_add(history, msg.system(system))
+            list.list_add(history, msg.user("question"))
+            pass = 0
+            while pass < 2 {
+                cp = cfg_("openai", "m")
+                c = cp as *types.Config
+                if pass == 1 { c.output_schema = schema }
+                body, err = responses.request_body(cp, "cache", history, "[]", -1)
+                spec.assert_str_eq(err, "", "body")
+                root = doc_(body)
+                spec.assert_eq(jsonx.has(root, "tools"), 0, "no tools")
+                spec.assert_eq(jsonx.has(root, "response_format"), 0, "no response_format")
+                spec.assert_str_eq(jsonx.str_or(root, "instructions", ""), system, "system is the instructions")
+                spec.assert_eq(json.json_array_size(jsonx.field(root, "input")), 1, "one input")
+                spec.assert_str_eq(jsonx.str_or(arr_(root, "input", 0), "role", ""), "user", "user")
+                spec.assert_str_eq(jsonx.str_or(arr_(root, "input", 0), "content", ""), "question", "question")
+                if pass == 1 {
+                    t = jsonx.field(root, "text")
+                    spec.assert_eq(json.object_size(t), 1, "text has only format")
+                    f = jsonx.field(t, "format")
+                    spec.assert_eq(json.object_size(f), 4, "format has four members")
+                    spec.assert_str_eq(jsonx.str_or(f, "type", ""), "json_schema", "type")
+                    spec.assert_str_eq(jsonx.str_or(f, "name", ""), "result", "name")
+                    spec.assert_eq(jsonx.bool_or(f, "strict", 0), 1, "strict")
+                    spec.assert_str_eq(jsonx.encode(jsonx.field(f, "schema")), schema, "schema")
+                } else {
+                    spec.assert_eq(jsonx.has(root, "text"), 0, "no text")
+                }
+                jsonx.free(root)
+                pass = pass + 1
+            }
+        }
+
+        spec.it("Responses API custom Run is a catalog capability and xAI uses function") callback {
+            ids = string.split("openai xai", " ")
+            k = 0
+            while k < 2 {
+                id = string.array_get(ids, k)
+                cp = types.new_config(id, "", "fake", "model")
+                body, err = responses.request_body(cp, "cache", msgs_user_("task"), RUN_TOOLS, -1)
+                spec.assert_str_eq(err, "", "body")
+                root = doc_(body)
+                want = "function"
+                if id == "openai" { want = "custom" }
+                spec.assert_str_eq(jsonx.str_or(arr_(root, "tools", 0), "type", ""), want, "tool type for ${id}")
+                spec.assert_eq(jsonx.bool_or(root, "store", 1), 0, "store false")
+                spec.assert_eq(has_(body, "fake"), 0, "the key is not in the body")
+                jsonx.free(root)
+                k = k + 1
+            }
+        }
+
+        // ---- port extras: the mock's wire shape, end to end on fixtures ----
+        spec.it("a function-call reply keeps encrypted reasoning, usage and calls (mock shape)") callback {
+            r1 = "{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],\"encrypted_content\":\"opaque-response\"}"
+            r2 = "{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"run\",\"arguments\":\"{\\\"code\\\":\\\"1\\\"}\"}"
+            s = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"response-1\",\"status\":\"in_progress\"}}\n\n"
+            s = "${s}data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":${r1}}\n\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":${r1}}\n\n"
+            s = "${s}data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":${r2}}\n\ndata: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":${r2}}\n\n"
+            s = "${s}data: {\"type\":\"response.completed\",\"response\":{\"id\":\"response-1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":8,\"cache_write_tokens\":4}}}}\n\n"
+            cp = cfg_("openai", "gpt-6.1-sol")
+            rep, e, detail = responses.read_stream(sse.fixed(s), cp, sink.new(null), null)
+            spec.assert_str_eq(e, "", "reads")
+            r = rep as *types.Reply
+            spec.assert_eq(list.list_size(r.tool_calls), 1, "one call")
+            tc = list.list_get_raw(r.tool_calls, 0) as *types.ToolCall
+            spec.assert_str_eq(tc.id, "call_1", "call id")
+            spec.assert_str_eq(tc.arguments, "{\"code\":\"1\"}", "arguments")
+            spec.assert_str_eq(r.reasoning_provider, "openai", "reasoning provider")
+            spec.assert_eq(r.reasoning_includes_output, 1, "includes output")
+            spec.assert_contains(r.reasoning_data, "opaque-response", "encrypted content kept")
+            u = r.usage as *types.Usage
+            spec.assert_eq_long(u.prompt_tokens, 100 as long, "prompt")
+            spec.assert_eq_long(u.completion_tokens, 10 as long, "completion")
+            spec.assert_eq_long(u.prompt_cache_hit_tokens, 8 as long, "cached")
+            spec.assert_eq_long(u.prompt_cache_write_tokens, 4 as long, "cache write")
+            // The next request replays the reasoning item and the call, then the result.
+            history = list.list_new()
+            list.list_add(history, msg.user("task"))
+            list.list_add(history, msg.assistant(r.text, r.tool_calls, r.reasoning_provider, r.reasoning_data, r.reasoning_includes_output, r.phase, -1, ""))
+            list.list_add(history, msg.tool("call_1", "done", ""))
+            body, err = responses.request_body(cp, "key", history, RUN_TOOLS, -1)
+            spec.assert_str_eq(err, "", "body")
+            root = doc_(body)
+            spec.assert_eq(json.json_array_size(jsonx.field(root, "input")), 4, "user, reasoning, call, output")
+            spec.assert_str_eq(jsonx.str_or(arr_(root, "input", 1), "encrypted_content", ""), "opaque-response", "reasoning replayed")
+            spec.assert_str_eq(jsonx.str_or(arr_(root, "input", 2), "type", ""), "function_call", "call")
+            spec.assert_eq(jsonx.has(arr_(root, "input", 2), "id"), 0, "server id dropped")
+            spec.assert_str_eq(jsonx.str_or(arr_(root, "input", 3), "call_id", ""), "call_1", "output call id")
+            jsonx.free(root)
+        }
+
+        spec.it("a custom-call reply carries its code and the next request keeps the custom wire type (mock shape)") callback {
+            r1 = "{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],\"encrypted_content\":\"opaque-response\"}"
+            r2 = "{\"type\":\"custom_tool_call\",\"id\":\"ctc_1\",\"call_id\":\"call_1\",\"name\":\"run\",\"input\":\"console.log(1);\"}"
+            s = "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":${r1}}\n\n"
+            s = "${s}data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":${r2}}\n\n"
+            s = "${s}data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+            cp = cfg_("openai", "gpt-6.1-sol")
+            rep, e, detail = responses.read_stream(sse.fixed(s), cp, sink.new(null), null)
+            spec.assert_str_eq(e, "", "reads")
+            r = rep as *types.Reply
+            tc = list.list_get_raw(r.tool_calls, 0) as *types.ToolCall
+            spec.assert_str_eq(tc.arguments, "{\"code\":\"console.log(1);\"}", "code as arguments")
+            history = list.list_new()
+            list.list_add(history, msg.user("task"))
+            list.list_add(history, msg.assistant(r.text, r.tool_calls, r.reasoning_provider, r.reasoning_data, r.reasoning_includes_output, r.phase, -1, ""))
+            list.list_add(history, msg.tool("call_1", "done", ""))
+            body, err = responses.request_body(cp, "key", history, RUN_TOOLS, -1)
+            spec.assert_str_eq(err, "", "body")
+            root = doc_(body)
+            spec.assert_str_eq(jsonx.str_or(arr_(root, "input", 2), "type", ""), "custom_tool_call", "replayed custom call")
+            spec.assert_str_eq(jsonx.str_or(arr_(root, "input", 3), "type", ""), "custom_tool_call_output", "custom output")
+            jsonx.free(root)
+        }
+
+        spec.it("a message reply carries text, phase and refusal text; items replay as plain messages") callback {
+            m1 = "{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"completed\",\"phase\":\"final_answer\",\"content\":[{\"type\":\"output_text\",\"text\":\"mock \",\"annotations\":[]},{\"type\":\"refusal\",\"refusal\":\"answer\"}]}"
+            s = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"mock \",\"output_index\":0}\n\n"
+            s = "${s}data: {\"type\":\"response.refusal.delta\",\"delta\":\"answer\",\"output_index\":0}\n\n"
+            s = "${s}data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":${m1}}\n\n"
+            s = "${s}data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+            ctr = counter_()
+            cp = cfg_("xai", "grok-4.7")
+            rep, e, detail = responses.read_stream(sse.fixed(s), cp, sink_(ctr), null)
+            spec.assert_str_eq(e, "", "reads")
+            r = rep as *types.Reply
+            spec.assert_str_eq(r.text, "mock answer", "text")
+            spec.assert_str_eq(r.phase, "final_answer", "phase")
+            spec.assert_str_eq(r.reasoning_provider, "xai", "provider is the config's")
+            kc = ctr as *Counter
+            spec.assert_eq(kc.deltas, 2, "two deltas")
+            history = list.list_new()
+            list.list_add(history, msg.user("hi"))
+            list.list_add(history, msg.assistant(r.text, r.tool_calls, r.reasoning_provider, r.reasoning_data, r.reasoning_includes_output, r.phase, -1, ""))
+            body, err = responses.request_body(cp, "key", history, "[]", -1)
+            root = doc_(body)
+            spec.assert_str_eq(jsonx.str_or(arr_(root, "input", 1), "content", ""), "mock answer", "normalized message content")
+            spec.assert_str_eq(jsonx.str_or(arr_(root, "input", 1), "phase", ""), "final_answer", "phase replayed")
+            spec.assert_eq(json.json_array_size(jsonx.field(root, "input")), 2, "no duplicate message item")
+            jsonx.free(root)
+        }
+
+        spec.it("a summary request asks to stay within max_tokens on its last user message") callback {
+            cp = cfg_("openai", "gpt-6.1-sol")
+            body, err = responses.request_body(cp, "key", msgs_user_("summary"), "[]", 512)
+            root = doc_(body)
+            spec.assert_str_eq(jsonx.str_or(arr_(root, "input", 0), "content", ""), "summary\nKeep the summary within 512 tokens.", "limit note")
+            jsonx.free(root)
+        }
+    }
+    return spec.run_summary(fw)
+}

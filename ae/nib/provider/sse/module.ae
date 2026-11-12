@@ -1,0 +1,86 @@
+// provider.sse: Server-Sent Events data parsing (upstream src/provider/sse.zig)
+// and the line source a stream reader takes: a live response
+// (provider.http) or fixed text (tests), so readers are tested on fixtures.
+
+import std.string
+import nib.provider.http
+
+exports(Parser, Lines, parser, feed, fixed, from_http, next)
+
+struct Parser {
+    data: string
+    pending: int
+}
+
+parser() -> ptr {
+    p = heap.new(Parser)
+    p.data = ""
+    p.pending = 0
+    return p as ptr
+}
+
+// One raw line in; (event data, 1) when a blank line ends an event, else ("", 0).
+feed(pp: ptr, raw: string) -> (string, int) {
+    p = pp as *Parser
+    line = raw
+    n = string.length(line)
+    if n > 0 && string.ends_with(line, "\r") == 1 { line = string.substring(line, 0, n - 1) }
+    if string.length(line) == 0 {
+        if p.pending == 0 { return "", 0 }
+        p.pending = 0
+        out = p.data
+        p.data = ""
+        return out, 1
+    }
+    if string.starts_with(line, ":") == 1 { return "", 0 }
+    colon = string.index_of(line, ":")
+    field = line
+    value = ""
+    if colon >= 0 {
+        field = string.substring(line, 0, colon)
+        value = string.substring(line, colon + 1, string.length(line))
+    }
+    if field != "data" { return "", 0 }
+    if string.starts_with(value, " ") == 1 { value = string.substring(value, 1, string.length(value)) }
+    if p.pending == 1 {
+        p.data = "${p.data}\n${value}"
+    } else {
+        p.data = string.copy(value)
+    }
+    p.pending = 1
+    return "", 0
+}
+
+struct Lines {
+    text: string       // fixed source: what is left
+    reader: ptr        // or a *http.Reader
+}
+
+fixed(text: string) -> ptr {
+    l = heap.new(Lines)
+    l.text = text
+    l.reader = null
+    return l as ptr
+}
+
+from_http(rp: @keep ptr) -> ptr {
+    l = heap.new(Lines)
+    l.text = ""
+    l.reader = rp
+    return l as ptr
+}
+
+// (line, err) as http.next_line: "" a line, "EOF" at the end, or a failure.
+next(lp: ptr, cancel: ptr) -> (string, string) {
+    l = lp as *Lines
+    if l.reader != null { return http.next_line(l.reader, cancel) }
+    nl = string.index_of(l.text, "\n")
+    if nl < 0 {
+        tail = l.text
+        l.text = ""
+        return tail, "EOF"
+    }
+    line = string.substring(l.text, 0, nl)
+    l.text = string.substring(l.text, nl + 1, string.length(l.text))
+    return line, ""
+}
