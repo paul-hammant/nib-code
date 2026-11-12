@@ -339,7 +339,8 @@ mutation-checked (`tools/mutate.py` for the app).
 **Stand-ins and stubs (marked).** Images: Ctrl+V and an empty paste say
 "No image in clipboard", pasted image paths are pasted as text, the
 editor's Image and clipboard's PNG check stand in for `nib.image`. MCP:
-`/mcp` reads no servers. Tool activity names (upstream onToolActivity) are
+`/mcp` lists and switches config.toml's servers; with no MCP client yet it
+shows no connection state. Tool activity names (upstream onToolActivity) are
 not emitted; the Running line uses the Run's progress. Hooks run after a
 TUI Turn on the Turn's worker, not a thread of their own.
 

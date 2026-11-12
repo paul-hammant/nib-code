@@ -685,6 +685,18 @@ main() {
             end = string.index_of(text, "--- standard")
             driver.expect_screen(r.t, string.substring(text, start, end))
         }
+        spec.it("/mcp lists config.toml's servers and switches one for new sessions") callback {
+            r = rig_(80, 24)
+            tui.execute(r.a, commands.CMD_MCP, "", "/mcp")
+            spec.assert_str_eq(transcript.at(r.a.transcript, 0).text, "No MCP servers configured.\nApplies to new sessions.", "none")
+            fs.write("${r.home}/config.toml", "[mcp.docs]\ncommand = \"docs-server\"\n")
+            tui.execute(r.a, commands.CMD_MCP, "off docs", "/mcp off docs")
+            spec.assert_str_eq(transcript.at(r.a.transcript, 1).text, "docs: off · Applies to new sessions.", "switched")
+            tui.execute(r.a, commands.CMD_MCP, "", "/mcp")
+            spec.assert_str_eq(transcript.at(r.a.transcript, 2).text, "docs  off\nApplies to new sessions.", "listed off")
+            tui.execute(r.a, commands.CMD_MCP, "on nope", "/mcp on nope")
+            spec.assert_str_eq(transcript.at(r.a.transcript, 3).text, "MCP server not found: nope", "unknown")
+        }
         spec.it("closed queues refuse events") callback {
             q = app_queue.new()
             app_queue.close(q)

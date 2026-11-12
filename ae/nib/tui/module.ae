@@ -16,8 +16,9 @@
 // ticker thread is the poll timeout (an empty poll while busy is a tick);
 // events are handled one at a time with the same frame pacing (frames.due).
 // Images (src/image.zig) are not ported: Ctrl+V, an empty paste and pasted
-// image paths say images are not available yet (marked stand-in). MCP has
-// its command with the data source stubbed (marked).
+// image paths say images are not available yet (marked stand-in). /mcp
+// lists and switches config.toml's servers; there is no MCP client yet, so
+// no connection state (marked).
 
 import std.string
 import std.strbuilder
@@ -1710,8 +1711,7 @@ execute(a: *App, c: int, arg: string, line: string) {
         details = if a.has_last_summary != 0 { bill.details(a.last_summary) } else { "No completed turn yet." }
         report(a, entry.KIND_INFO, "Provider ${types.name(a.cfg)} · ${cc.model} · ${auth.describe(a.cfg)} · effort ${effective_effort_(a)} · context ${a.context * 100 / window}%\n${details}")
     } else if c == commands.CMD_MCP {
-        // MCP (src/mcp*) is not ported: the listing reads config only (stub).
-        transcript.add(a.transcript, entry.KIND_INFO, "No MCP servers configured.\nApplies to new sessions.")
+        mcp_command_(a, arg)
     } else if c == commands.CMD_SKILLS {
         skills_command_(a, arg)
     } else if c == commands.CMD_TASKS {
@@ -1861,6 +1861,51 @@ execute(a: *App, c: int, arg: string, line: string) {
         a.reflecting = arg
         a.has_reflecting = 1
     }
+}
+
+// /mcp [on|off <id>] (upstream commands.zig .mcp) over config.toml's
+// servers. The MCP client is not ported: no connection state (failure,
+// tool count) is shown (marked).
+mcp_command_(a: *App, arg: string) {
+    servers, err = config.load_mcp(a.home)
+    if err != "" || servers == null {
+        servers = list.list_new()
+    }
+    n = list.list_size(servers)
+    if string.length(arg) > 0 {
+        words = words_(arg)
+        if words.len < 2 || words.len > 2 || (words[0] != "on" && words[0] != "off") {
+            transcript.add(a.transcript, entry.KIND_ERR, "usage: /mcp [on|off <id>]")
+            return
+        }
+        id = words[1]
+        exists = false
+        for i in 0..n {
+            if (list.list_get_raw(servers, i) as *types.McpServer).id == id {
+                exists = true
+            }
+        }
+        if !exists {
+            report(a, entry.KIND_ERR, "MCP server not found: ${id}")
+            return
+        }
+        serr = config.save_mcp(a.home, id, if words[0] == "on" { 1 } else { 0 })
+        if serr != "" {
+            report(a, entry.KIND_ERR, "could not save MCP settings: ${serr}")
+            return
+        }
+        report(a, entry.KIND_INFO, "${id}: ${words[0]} · Applies to new sessions.")
+        return
+    }
+    text = ""
+    for i in 0..n {
+        sv = list.list_get_raw(servers, i) as *types.McpServer
+        text = "${text}${sv.id}  ${if sv.enabled != 0 { "on" } else { "off" }}\n"
+    }
+    if n == 0 {
+        text = "No MCP servers configured.\n"
+    }
+    transcript.add(a.transcript, entry.KIND_INFO, "${text}Applies to new sessions.")
 }
 
 // The [skills] switches of config.toml (a list of *config.Switch).
