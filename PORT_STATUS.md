@@ -63,16 +63,16 @@ pins                     AE_PIN / AEB_REF the port is verified against
 
 | Upstream | Lines | Aether | Ported through | Notes |
 |---|---|---|---|---|
-| `src/sandbox.zig` | 799 | `ae/nib/sandbox/module.ae` | a2dd439 | eval, Limits, prelude, syntax context; record/replay hooks not yet |
-| `src/sandbox/scheduler.zig` | 296 | `ae/nib/sandbox/module.ae` | a2dd439 | concurrency 8, completion order, timers, drain, stopped calls; Host.poll's role is a 20 ms Session ticker (session) |
-| `src/sandbox/native.zig` | 163 | `ae/nib/sandbox/module.ae` | a2dd439 | __log/__host as contrib.quickjs host functions with a `hide` veto line; installVirtual not yet |
+| `src/sandbox.zig` | 799 | `ae/nib/sandbox/module.ae` | a2dd439 | eval, Limits, prelude, syntax context; Host.record (settle at delivery, eval_end), Host.virtual |
+| `src/sandbox/scheduler.zig` | 296 | `ae/nib/sandbox/module.ae` | a2dd439 | virtual selection in jobs_; concurrency 8, completion order, timers, drain, stopped calls; Host.poll's role is a 20 ms Session ticker (session) |
+| `src/sandbox/native.zig` | 163 | `ae/nib/sandbox/module.ae` | a2dd439 | __log/__host as contrib.quickjs host functions with a `hide` veto line; installVirtual (__replayEpoch/Time/Random, "replay diverged"); the virtual stop interrupts JS through a stop cell in nib.qjsgap |
 | `src/sandbox/timer.zig` | 18 | `ae/nib/sandbox/module.ae` | a2dd439 |  |
 | `src/sandbox/console.zig` | 181 | `ae/nib/sandbox/console/module.ae` | a2dd439 |  |
 | `src/sandbox/timing.zig` | 168 | `ae/nib/sandbox/timing/module.ae` | a2dd439 | Execution epoch times live on process.Result |
-| `src/sandbox/timer_test.zig` | 237 | `ae/tests/timer_test.ae` | a2dd439 | less the replay test |
-| `src/sandbox/record.zig` | 510 | not yet |  | next: record/replay slice |
-| `src/sandbox/replay.zig` | 303 | not yet |  | next: record/replay slice |
-| `src/sandbox/virtual.zig` | 19 | not yet |  | next: record/replay slice |
+| `src/sandbox/timer_test.zig` | 237 | `ae/tests/timer_test.ae` | a2dd439 |  |
+| `src/sandbox/record.zig` | 510 | `ae/nib/sandbox/record/module.ae` | a2dd439 | file via nib.sysgap (flock, pwrite, ftruncate, fsync); dedup keys are sha256 hex |
+| `src/sandbox/replay.zig` | 303 | `ae/nib/sandbox/replay/module.ae` | a2dd439 | Virtual.stopped is a std.sync cell, not a callback |
+| `src/sandbox/virtual.zig` | 19 | `ae/nib/sandbox/module.ae` (VIRTUAL_PRELUDE) | a2dd439 |  |
 | `src/tools.zig` | 813 | `ae/nib/tools/module.ae` | a2dd439 | table verbatim; only ported tools enter a Run's API; RunScope replaces the threadlocal; docs fill {{llm_limits}}/{{llm_options}}; search options wait for web search |
 | `src/tools/files.zig` | 587 | `ae/nib/tools/files/module.ae` | a2dd439 | undo snapshots in edit/write |
 | `src/tools/atomic_file.zig` | 243 | `ae/nib/tools/atomic_file/module.ae` | a2dd439 | on nib.sysgap (stand-in) |
@@ -104,7 +104,7 @@ pins                     AE_PIN / AEB_REF the port is verified against
 | `src/tools/mcp.zig` | 101 | not yet |  | with src/mcp* |
 | `src/session.zig` | 999 | `ae/nib/session/module.ae` | a2dd439 | Turn/Step loop, resume/continue, interrupted commits, auto compaction, Step-limit wait, undo wiring, the Run's viewed images on its tool message; no fork, reopen/switchConfig (TUI), skills, MCP, user-message images (`turnWithImages`, TUI) |
 | `src/session/run.zig` | 236 | `ae/nib/session/module.ae` | a2dd439 | execute; no automatic Run backgrounding |
-| `src/session/run_job.zig` | 116 | not yet |  | automatic Run backgrounding (rN): next |
+| `src/session/run_job.zig` | 116 | `ae/nib/session/module.ae` | a2dd439 | RunJob; its recorder is a fork of the Session's (begin at start, finish before done) |
 | `src/session/log.zig` | 1402 | `ae/nib/session/log/module.ae` | a2dd439 | records are JSON text; tool summaries travel on the logged tool messages (the TUI reads them on resume); bash replacements (superseded bash rows) are not restored onto replayed messages yet |
 | `src/session/output.zig` | 596 | `ae/nib/session/output/module.ae` | a2dd439 |  |
 | `src/session/prompt.zig` | 322 | `ae/nib/session/prompt/module.ae` | a2dd439 |  |
@@ -127,8 +127,8 @@ pins                     AE_PIN / AEB_REF the port is verified against
 | `src/provider/codex_ws.zig`, `websocket.zig` | 523 | not ported |  | policy: API keys only |
 | `src/config.zig` | 1680 | `ae/nib/config/module.ae`, `ae/nib/config/env/module.ae` | a2dd439 | no Codex provider ([codex] validated and ignored); default service anthropic |
 | `src/mcp*` | 700 | | | |
-| `src/main.zig` | 311 | `ae/main.ae` | a2dd439 | ask, js, login/logout, help, version, __jail; bare `nib` opens the TUI (`run_tui_`); no replay, update |
-| `src/replay.zig` | 900 | not yet | | |
+| `src/main.zig` | 311 | `ae/main.ae` | a2dd439 | ask, js, login/logout, help, version, __jail; bare `nib` opens the TUI (`run_tui_`); `nib replay` with its three error texts; no update |
+| `src/replay.zig` | 541 | `ae/nib/run_replay/module.ae` | a2dd439 | renamed (basename `replay` is the core's) |
 | `src/image.zig` | 324 | `ae/nib/image/module.ae` | a2dd439 | images are JSON texts (the log's `images` entries); binary-safe reads; SHA-256 hash name; Attached/Target for the Run's images; pastedPath is ported, the TUI still has its stand-ins |
 | `src/tui.zig` | 1911 | `ae/nib/tui/module.ae` | 7788541 | the App; takes term, Session port and clock; app events through `nib.tui.app_queue`; the Ticker is the poll timeout; images are a marked stand-in |
 | `src/tui/view.zig` | 744 | `ae/nib/tui/tui_view/module.ae` | 7788541 | renamed (basename `view`); both snapshot files match cell for cell |
@@ -238,7 +238,7 @@ module was mutation-checked.
 | test_effort.py | the chat_completions half passes | its second half is Codex |
 | test_model.py, test_undo.py, test_tui_*.py, test_at_files.py, test_interjections.py, test_prediction.py | pass (TUI slice) | |
 | test_images.py | pass (its `View` cases; the TUI functions need the TUI's clipboard and paste, still stand-ins) | |
-| test_mcp.py, test_replay.py, test_web_search.py, test_stats.py | not yet | their slices (agents, Run backgrounding, TUI, hooks/skills, MCP, replay, web search) |
+| test_mcp.py, test_web_search.py, test_stats.py | not yet | their slices (agents, Run backgrounding, TUI, hooks/skills, MCP, replay, web search) |
 | test_codex.py, test_codex_websocket.py, test_provider_login.py | excluded | policy: no Codex sign-in or WebSocket |
 
 **Lanes.** macOS arm64, ae-x64 (Ubuntu 22.04) and cachyos: unit suites green on all
@@ -335,7 +335,8 @@ mutation-checked (`tools/mutate.py` for the app).
 | test_hooks.py, test_skills.py, test_skill_mentions.py (TUI parts included) | pass | pass except `test_sandbox_denies_external_write` (kernel 5.15: no Landlock ABI 2) | pass |
 | TUI cases of test_background_agent/bash/run (escape, interjection, `/tasks`, `/stop`, step-limit result in the next TUI Turn) | their `/proc` helper needs Linux | pass | pass |
 | test_images.py | `View` cases pass; its four `test_tui_*` functions need the paste UI (stand-ins) | | |
-| test_replay.py, test_codex_websocket.py, test_provider_login.py | excluded: replay not ported; Codex by policy | | |
+| test_replay.py | pass (20 of 20) | | |
+| test_codex_websocket.py, test_provider_login.py | excluded: Codex by policy | | |
 
 **Stand-ins and stubs (marked).** Images: Ctrl+V and an empty paste say
 "No image in clipboard", pasted image paths are pasted as text, the
@@ -355,3 +356,29 @@ upstream; after it the port opens a new Session.
 the struct's strings), `asks/aether-qualified-slice-local.md` (`m.P[] xs =
 []` does not parse), `asks/aether-ptr-passed-as-string.md` (a `ptr` is
 accepted for a `string` parameter), plus ae/term's.
+
+## Run recording and offline replay slice (2026-11-12)
+
+`nib.sandbox.record` (record.zig), `nib.sandbox.replay` (sandbox/replay.zig),
+the virtual prelude and Host.record/Host.virtual hooks in `nib.sandbox`, the
+Session's recorder (`<id>.calls.jsonl` beside the log; `NIB_RECORD=off`
+disables it; each RunJob forks it), and `nib replay` (`nib.run_replay`,
+src/replay.zig) with main.zig's three replay error texts.
+
+**Tests.** Every inline test of record.zig, sandbox/replay.zig and replay.zig,
+the record/replay tests of sandbox.zig and timer_test.zig's replay test, under
+their upstream names (record_test, replay_test, run_replay_test,
+sandbox_test, timer_test). Not portable: the FailingAllocator halves of two
+record.zig tests (Aether has no allocation failure to inject); "eval end
+counts creations..." fails its finish on IO instead. Each new module was
+mutation-checked.
+
+**Upstream e2e, unchanged.** test_replay.py: 20 of 20 on macOS. The replay
+steps elsewhere pass on macOS: test_background_run
+`test_overlap_keeps_await_console_changes_and_replay`, test_limits
+`test_configured_run_output_budget`, test_web_search `test_deepseek`,
+test_mcp `test_stdio_modern_and_legacy` and `test_subagent`.
+
+**Stand-in.** nib.qjsgap gains a stop cell its interrupt honours (replay's
+divergence stops a running script without it reading as canceled); written
+into asks/aether-quickjs-async-eval-and-interrupt.md.

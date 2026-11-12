@@ -374,6 +374,7 @@ reopen_(l: *Live, id: string, cfg: @keep ptr) -> string {
     o2.resume_id = id
     o2.continue_latest = 0
     o2.patches_off = o.patches_off
+    o2.record_env = o.record_env
     o2.self_exe = o.self_exe
     o2.undo_enabled = o.undo_enabled
     if id == "" {

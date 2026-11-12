@@ -3,8 +3,8 @@
 // [--effort <level>] <prompt|->`, `nib js '<code>'`, `nib login`/`logout`
 // (API keys only), `--help` and `--version`, and the hidden
 // `nib __jail <root>... -- <command>...` helper the Linux write sandbox
-// execs. The TUI comes with the TUI slice (bare `nib` says so); `replay`,
-// `update` and `--agent-input` (subagents) are not ported yet.
+// execs, and `nib replay` (offline Run replay, nib.run_replay). The TUI
+// comes with the TUI slice (bare `nib` says so); `update` is not ported.
 
 import std.os
 import std.string
@@ -25,6 +25,7 @@ import nib.config
 import nib.config.env
 import nib.auth
 import nib.session
+import nib.run_replay
 import term
 import term.input
 import nib.tui
@@ -50,6 +51,7 @@ run_tui_(envp: @keep ptr, ap: ptr) {
     o.resume_id = a.resume_id
     o.continue_latest = a.continue_latest
     o.patches_off = env.get(envp, "NIB_PATCHES_OFF")
+    o.record_env = env.get(envp, "NIB_RECORD")
     o.self_exe = self_exe_()
     o.undo_enabled = 1
     sp, serr, sdetail = session.init(cfg, op)
@@ -193,6 +195,16 @@ fail_(json: int, err: string, detail: string, usage_json: string, steps: int, ti
     exit(1)
 }
 
+// main.zig's errorMessage for the replay errors, else the Session's.
+replay_error_message_(err: string) -> string {
+    match err {
+        "InvalidReplayArguments" -> { return "Use nib replay <session-id> --run <step>:<run> [--script <file>] [--json], or nib replay <session-id> --all [--json]." }
+        "ReplayMetadataNotFound" -> { return "No replay recording found for this Run; recording must be enabled when the original Run executes." }
+        "ReplayRunNotFound" -> { return "Run not found; step counts assistant messages across the entire session (1-based), run indexes tool_calls (0-based)." }
+        _ -> { return session.error_message(err) }
+    }
+}
+
 zero_usage_() -> string { return types.usage_json(types.usage_new()) }
 
 help_(envp: ptr) {
@@ -303,6 +315,21 @@ main() {
         if code != 0 { exit(code) }
         return
     }
+    if n >= 2 && os.args_get(1) == "replay" {
+        rhome, rherr = config.home(envp)
+        if rherr != "" {
+            eprint_("nib: ${replay_error_message_(rherr)}\n")
+            exit(1)
+        }
+        rout, rerrs, rerr = run_replay.run(rhome, rest_args_(2))
+        if rerr != "" {
+            eprint_("nib: ${replay_error_message_(rerr)}\n")
+            exit(1)
+        }
+        io.stdout_write(rout)
+        eprint_(rerrs)
+        return
+    }
     if n >= 3 && os.args_get(1) == "js" {
         home_dir = env.get(envp, "HOME")
         if home_dir == "" { home_dir = "/" }
@@ -367,6 +394,7 @@ main() {
     o.resume_id = a.resume_id
     o.continue_latest = a.continue_latest
     o.patches_off = env.get(envp, "NIB_PATCHES_OFF")
+    o.record_env = env.get(envp, "NIB_RECORD")
     o.parent_session_id = env.get(envp, "NIB_PARENT_SESSION_ID")
     depth_text = env.get(envp, "NIB_AGENT_DEPTH")
     if depth_text != "" { o.depth = jsonx.long_of(depth_text) as int }

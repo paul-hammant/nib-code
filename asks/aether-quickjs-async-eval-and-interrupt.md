@@ -49,6 +49,17 @@ Note `qjs_to_string` does not call `enter_`, so today a stale per-entry
 deadline can interrupt a later `to_string` immediately, and a `toString`
 that loops forever is unbounded when the limit is 0.
 
+- A second cell, `quickjs.set_stop_cell(q, cell)` (or a list of cells):
+  nib's offline replay (`nib replay`) must stop a script the moment it
+  diverges from its recording, the way upstream's interrupt handler returns
+  `isInterrupted(st) or virtualStopped(st)`, without the Run reading as
+  canceled (its text is whatever the script threw). The stand-in has it as
+  `nibqjs_set_stop` (reason 3). Repro of the need, 0.912.0: a replayed
+  script that catches the divergence and spins (`try { await tools.read({x:2}) }
+  catch {} for(;;){}` against a recording of `read({x:1})`) can only be
+  stopped by the 5-minute budget or by the cancel cell, which rewrites its
+  outcome to "Error: run canceled".
+
 ## 3. Promise state and result
 
 `quickjs.promise_state(q, h) -> int` (-1 not a promise, 0 pending,

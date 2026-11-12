@@ -37,6 +37,10 @@ aeb(cap) {
             lib("ae")
         }
         aether.program_test() {
+            source("ae/tests/run_replay_test.ae")
+            lib("ae")
+        }
+        aether.program_test() {
             source("ae/tests/policy_test.ae")
             lib("ae")
         }

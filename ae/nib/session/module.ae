@@ -33,6 +33,7 @@ import nib.lock
 import nib.msg
 import nib.sandbox
 import nib.sandbox.timing
+import nib.sandbox.record
 import nib.tools
 import nib.tools.atomic_file
 import nib.tools.background
@@ -118,6 +119,7 @@ struct Session {
     ticker_stop: ptr         // std.sync cells of the poll thread
     ticker_done: ptr
     bg_runs: ptr             // *RunJob of Runs in the background, until finished
+    recorder: ptr            // *record.Recorder of <id>.calls.jsonl (NIB_RECORD=off: disabled)
 }
 
 new_options(home: string, user_home: string) -> ptr {
@@ -345,6 +347,9 @@ init(cp: @keep ptr, op: @keep ptr) -> (ptr, string, string) {
             if ierr != "" { return null, ierr, "" }
         }
     }
+    recording = 1
+    if o.record_env == "off" { recording = 0 }
+    s.recorder = record.new("${directory}/${s.id}.calls.jsonl", recording)
     tools.set_config(s.tools, cp, s.id)
     tt2 = s.tools as *tools.Tools
     tt2.session_id = s.id
@@ -483,6 +488,7 @@ close(sp: ptr) {
     tools.close_undo(s.tools)
     t = s.tools as *tools.Tools
     if t.mcp_client != null { mcp.close(t.mcp_client) }
+    record.close(s.recorder)
     log.close(s.log)
 }
 
@@ -655,6 +661,7 @@ struct RunJob {
     id: string               // rN once in the background
     hook: string             // an after-edit hook failure's payload, "" none
     hook_notice: string
+    recorder: ptr            // this Run's fork of the Session's recorder
 }
 
 start_run_job_(s: *Session, code: string, run_index: int) -> *RunJob {
@@ -677,6 +684,8 @@ start_run_job_(s: *Session, code: string, run_index: int) -> *RunJob {
     j.id = ""
     j.hook = ""
     j.hook_notice = ""
+    j.recorder = record.fork(s.recorder, j.step, run_index)
+    (j.recorder as *record.Recorder).run_output_bytes = ((s.cfg as *types.Config).limits as *types.Limits).run_output_bytes as long
     sp = s as ptr
     jp = j as ptr
     worker.run_detached(|| {
@@ -684,8 +693,12 @@ start_run_job_(s: *Session, code: string, run_index: int) -> *RunJob {
         h = tools.host(jj.scope)
         sandbox.host_set_timing(h, jj.timing)
         sandbox.host_set_waiting(h, jj.waiting)
+        sandbox.host_set_record(h, jj.recorder)
         jj.outcome = sandbox.eval(jj.code, sandbox.limits(), h, jj.cancel)
         after_edit_(sp as *Session, jj)
+        jo = jj.outcome as *sandbox.Outcome
+        end = if sync.atomic_load(jj.cancel) != 0 { record.END_CANCELLED } else if jo.ok == 1 { record.END_OK } else if jo.text == "Error: run timed out" { record.END_TIMEOUT } else { record.END_ERROR }
+        record.finish(jj.recorder, end)
         jj.elapsed_ms = timing.elapsed(jj.timing)
         jj.exec_end = os.now_unix_ms()
         sync.atomic_store(jj.done, 1)

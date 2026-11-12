@@ -41,6 +41,7 @@ tests/test_agent_reuse.py|CodexTests
 tests/test_background_agent.py|CodexTests
 tests/test_background_bash.py|CodexTests
 tests/test_background_run.py|codex
+tests/test_replay.py
 tests/test_tui_stream.py
 tests/test_tui_mouse.py
 tests/test_model.py

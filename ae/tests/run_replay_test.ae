@@ -1,0 +1,209 @@
+// Ports the tests of upstream src/replay.zig (a2dd439), `nib replay`'s
+// loaders and options (nib.run_replay).
+
+import std.spec
+import std.string
+import std.list
+import nib.sandbox.replay
+import nib.run_replay
+
+const RAW_MAIN = <<LOG
+{"messages":[{"role":"system","content":"s"},{"role":"user","content":"one"}]}
+{"from":2,"turn_step":1,"messages":[{"role":"assistant","tool_calls":[{"id":"a","function":{"name":"run","arguments":"{\"code\":\"first\"}"}},{"id":"x","function":{"name":"other","arguments":"{\"code\":\"ignored\"}"}},{"id":"b","function":{"name":"run","arguments":"{\"code\":\"second\"}"}}]},{"role":"tool","tool_call_id":"a","content":"one"},{"role":"tool","tool_call_id":"x","content":"unknown"},{"role":"tool","tool_call_id":"b","content":"two"}]}
+{"agent_session":{"id":"a1","session":"0123456789abcdef0123456789abcdef"}}
+{"task_stop":{"id":"b1","reason":"user requested stop","stopped":true},"from":0,"messages":[]}
+{"transport_fallback":"WebSocketProtocol","from":0,"messages":[]}
+{"from":6,"turn_step":2,"messages":[{"role":"assistant","content":"done"}]}
+{"from":7,"turn_step":1,"messages":[{"role":"user","content":"two"},{"role":"assistant","tool_calls":[{"id":"c","function":{"name":"run","arguments":"{\"code\":\"third\"}"}}]},{"role":"tool","tool_call_id":"c","content":"three"}]}
+{"from":1,"messages":[{"role":"user","content":"summary"},{"role":"assistant","tool_calls":[{"id":"c","function":{"name":"run","arguments":"{\"code\":\"third\"}"}}]},{"role":"tool","tool_call_id":"c","content":"three"}]}
+{"from":4,"turn_step":1,"messages":[{"role":"assistant","tool_calls":[{"id":"d","function":{"name":"run","arguments":"{\"code\":\"fourth\"}"}}]},{"role":"tool","tool_call_id":"d","content":"four"}]}
+LOG
+
+const FORK_MAIN = <<LOG
+{"parent_session_id":"parent","forked_from":{"session":"parent","message_count":5},"messages":[{"role":"system","content":"system"},{"role":"user","content":"parent task"},{"role":"assistant","tool_calls":[{"id":"p1","function":{"name":"run","arguments":"{\"code\":\"parent-first\"}"}}]},{"role":"tool","tool_call_id":"p1","content":"parent output"},{"role":"assistant","tool_calls":[{"id":"p2","function":{"name":"run","arguments":"{\"code\":\"parent-fork\"}"}}]},{"role":"tool","tool_call_id":"p2","content":"synthetic result"}]}
+{"from":6,"messages":[{"role":"user","content":"child task"},{"role":"assistant","tool_calls":[{"id":"c1","function":{"name":"run","arguments":"{\"code\":\"child-first\"}"}},{"id":"c2","function":{"name":"run","arguments":"{\"code\":\"child-second\"}"}}]},{"role":"tool","tool_call_id":"c1","content":"first"},{"role":"tool","tool_call_id":"c2","content":"second"}]}
+{"from":10,"messages":[{"role":"assistant","content":"child done"}]}
+{"from":1,"messages":[{"role":"user","content":"summary"},{"role":"assistant","content":"retained child done"}]}
+{"from":3,"forked_from":null,"messages":[{"role":"user","content":"resume"},{"role":"assistant","tool_calls":[{"id":"c3","function":{"name":"run","arguments":"{\"code\":\"child-resumed\"}"}}]},{"role":"tool","tool_call_id":"c3","content":"resumed"}]}
+LOG
+
+const BACKGROUND_MAIN = <<LOG
+{"messages":[{"role":"system","content":"s"}]}
+{"from":0,"messages":[],"background":{"id":"b1","kind":"bash","state":"started"}}
+{"bash":{"id":"b1","run":1,"state":"started","command":"check","cwd":"/a"}}
+{"from":1,"messages":[{"role":"assistant","tool_calls":[{"id":"r1","function":{"name":"run","arguments":"{\"code\":\"42\"}"}}]},{"role":"tool","tool_call_id":"r1","content":"42"}]}
+{"from":0,"messages":[],"background":{"id":"b1","kind":"bash","state":"finished"}}
+{"bash":{"id":"b1","run":1,"state":"superseded","superseded_by":"b2","elapsed_ms":20}}
+LOG
+
+const SAME_AS_CALLS = <<LOG
+{"step":1,"run":0,"index":0,"seq":0,"name":"read","args":{"path":"a"},"ok":true,"result":"{\"text\":\"hello\"}","sha256":"same","truncated":false}
+{"step":1,"run":0,"meta":{"start_ms_epoch":10,"end":"ok"}}
+{"step":3,"run":0,"index":0,"seq":0,"name":"read","args":{"path":"b"},"ok":true,"sha256":"same","truncated":false,"result":{"same_as":"same"}}
+{"step":3,"run":0,"meta":{"start_ms_epoch":20,"end":"ok"}}
+{"step":4,"run":0,"meta":{"start_ms_epoch":30,"end":"ok"}}
+LOG
+
+const TRUNCATED_CALLS = <<LOG
+{"step":1,"run":0,"index":0,"seq":0,"name":"read","args":{},"ok":true,"result":"{\"text\":","sha256":"h","truncated":true}
+{"step":1,"run":0,"meta":{"start_ms_epoch":1,"end":"ok"}}
+{"step":2,"run":0,"index":0,"seq":0,"name":"read","args":{},"ok":true,"sha256":"h","truncated":false,"result":{"same_as":"h"}}
+{"step":2,"run":0,"meta":{"start_ms_epoch":2,"end":"ok"}}
+{"step":3,"run":0,"index":0,"seq":0,"name":"read","args":{},"ok":true,"sha256":"h","truncated":false,"result":{"same_as":"missing"}}
+{"step":3,"run":0,"meta":{"start_ms_epoch":3,"end":"ok"}}
+{"step":4,"run":0,"index":0,"seq":0,"name":"read","args":{},"ok":true,"result":"1"}
+LOG
+
+const INCOMPLETE_META_CALLS = <<LOG
+{"step":1,"run":0,"meta":{"start_ms_epoch":1,"end":"error","incomplete":true}}
+{"step":2,"run":0,"meta":{"start_ms_epoch":2,"end":"error"}}
+{"step":3,"run":0,"meta":{"start_ms_epoch":3,"end":"error","incomplete":false}}
+LOG
+
+nl_(s: string) -> string { return "${s}\n" }
+
+run_at_(l: ptr, i: int) -> *run_replay.Run { return list.list_get_raw(l, i) as *run_replay.Run }
+rec_at_(l: ptr, i: int) -> *run_replay.Recording { return list.list_get_raw(l, i) as *run_replay.Recording }
+entry0_(r: *run_replay.Recording) -> *replay.Entry { return list.list_get_raw(r.entries, 0) as *replay.Entry }
+
+args_(a: string, b: string, c: string, d: string, e: string, f: string, n: int) -> ptr {
+    l = list.list_new()
+    all = [a, b, c, d, e, f]
+    i = 0
+    while i < n {
+        list.list_add(l, all[i])
+        i = i + 1
+    }
+    return l
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "run_replay") {
+        spec.it("raw main records count global assistant Steps across turns and compaction") callback {
+            runs, err = run_replay.load_main(nl_(RAW_MAIN))
+            spec.assert_str_eq(err, "", "loaded")
+            spec.assert_eq(list.list_size(runs), 4, "runs")
+            steps = [1, 1, 3, 4]
+            indexes = [0, 2, 0, 0]
+            codes = ["first", "second", "third", "fourth"]
+            results = ["one", "two", "three", "four"]
+            i = 0
+            while i < 4 {
+                r = run_at_(runs, i)
+                spec.assert_eq(r.step, steps[i], "step ${i}")
+                spec.assert_eq(r.run, indexes[i], "run ${i}")
+                spec.assert_str_eq(r.code, codes[i], "code ${i}")
+                spec.assert_str_eq(r.expected, results[i], "expected ${i}")
+                i = i + 1
+            }
+        }
+        spec.it("fork headers do not contribute Steps or Runs across compaction and resume") callback {
+            runs, err = run_replay.load_main(nl_(FORK_MAIN))
+            spec.assert_str_eq(err, "", "loaded")
+            spec.assert_eq(list.list_size(runs), 3, "runs")
+            steps = [1, 1, 3]
+            indexes = [0, 1, 0]
+            codes = ["child-first", "child-second", "child-resumed"]
+            results = ["first", "second", "resumed"]
+            i = 0
+            while i < 3 {
+                r = run_at_(runs, i)
+                spec.assert_eq(r.step, steps[i], "step ${i}")
+                spec.assert_eq(r.run, indexes[i], "run ${i}")
+                spec.assert_str_eq(r.code, codes[i], "code ${i}")
+                spec.assert_str_eq(r.expected, results[i], "expected ${i}")
+                spec.assert_eq(r.child, 1, "child ${i}")
+                i = i + 1
+            }
+        }
+        spec.it("background lifecycle records do not replace replay history") callback {
+            runs, err = run_replay.load_main(nl_(BACKGROUND_MAIN))
+            spec.assert_str_eq(err, "", "loaded")
+            spec.assert_eq(list.list_size(runs), 1, "runs")
+            spec.assert_str_eq(run_at_(runs, 0).code, "42", "code")
+            spec.assert_str_eq(run_at_(runs, 0).expected, "42", "expected")
+        }
+        spec.it("calls resolve session wide same_as and retain zero call metadata") callback {
+            recs, err = run_replay.load_calls(nl_(SAME_AS_CALLS))
+            spec.assert_str_eq(err, "", "loaded")
+            spec.assert_eq(list.list_size(recs), 3, "recordings")
+            spec.assert_str_eq(entry0_(rec_at_(recs, 1)).result, entry0_(rec_at_(recs, 0)).result, "resolved")
+            spec.assert_eq(rec_at_(recs, 0).incomplete, 0, "first complete")
+            spec.assert_true(rec_at_(recs, 0).start_ms_epoch == 10, "start")
+            spec.assert_eq(rec_at_(recs, 1).incomplete, 0, "alias complete")
+            spec.assert_eq(list.list_size(rec_at_(recs, 2).entries), 0, "zero calls")
+            spec.assert_str_eq(rec_at_(recs, 2).end, "ok", "end")
+        }
+        spec.it("strict replay arguments") callback {
+            id = "0123456789abcdef0123456789abcdef"
+            vp, verr = run_replay.parse_options(args_(id, "--json", "--run", "2:0", "--script", "replacement.js", 6))
+            spec.assert_str_eq(verr, "", "valid")
+            v = vp as *run_replay.Options
+            spec.assert_eq(v.step, 2, "step")
+            spec.assert_eq(v.json, 1, "json")
+            invalid = list.list_new()
+            list.list_add(invalid, args_("", "", "", "", "", "", 0))
+            list.list_add(invalid, args_(id, "", "", "", "", "", 1))
+            list.list_add(invalid, args_(id, "--run", "", "", "", "", 2))
+            list.list_add(invalid, args_(id, "--run", "0:0", "", "", "", 3))
+            list.list_add(invalid, args_(id, "--run", "1:-1", "", "", "", 3))
+            list.list_add(invalid, args_(id, "--run", "1:0:0", "", "", "", 3))
+            list.list_add(invalid, args_(id, "--run", "+1:0", "", "", "", 3))
+            list.list_add(invalid, args_(id, "--all", "--run", "1:0", "", "", 4))
+            list.list_add(invalid, args_(id, "--all", "--script", "a", "", "", 4))
+            list.list_add(invalid, args_(id, "--all", "--json", "--json", "", "", 4))
+            list.list_add(invalid, args_(id, "--all", "--all", "", "", "", 3))
+            list.list_add(invalid, args_(id, "--run", "1:0", "--run", "2:0", "", 5))
+            list.list_add(invalid, args_(id, "--all", "--unknown", "", "", "", 3))
+            list.list_add(invalid, args_(id, "--run", "1:0", "--script", "a", "--script", 6))
+            i = 0
+            while i < list.list_size(invalid) {
+                _p, e = run_replay.parse_options(list.list_get_raw(invalid, i))
+                spec.assert_str_eq(e, "InvalidReplayArguments", "invalid ${i}")
+                i = i + 1
+            }
+            _p2, e2 = run_replay.parse_options(args_("0123456789ABCDEF0123456789abcdef", "--all", "", "", "", "", 2))
+            spec.assert_str_eq(e2, "InvalidSessionId", "uppercase")
+            _p3, e3 = run_replay.parse_options(args_("../a", "--all", "", "", "", "", 2))
+            spec.assert_str_eq(e3, "InvalidSessionId", "path")
+        }
+        spec.it("truncated aliases missing references and unfinished recordings are incomplete") callback {
+            recs, err = run_replay.load_calls(nl_(TRUNCATED_CALLS))
+            spec.assert_str_eq(err, "", "loaded")
+            spec.assert_eq(list.list_size(recs), 4, "recordings")
+            i = 0
+            while i < 4 {
+                spec.assert_eq(rec_at_(recs, i).incomplete, 1, "incomplete ${i}")
+                i = i + 1
+            }
+            spec.assert_eq(entry0_(rec_at_(recs, 1)).truncated, 1, "alias inherits truncation")
+            spec.assert_str_eq(entry0_(rec_at_(recs, 1)).result, entry0_(rec_at_(recs, 0)).result, "resolved")
+            spec.assert_str_eq(entry0_(rec_at_(recs, 2)).result, "", "missing reference is empty")
+            spec.assert_eq(entry0_(rec_at_(recs, 2)).has_error, 0, "and no error")
+            spec.assert_str_eq(rec_at_(recs, 3).end, "", "unfinished")
+        }
+        spec.it("optional incomplete metadata distinguishes pending and settled ordinary errors") callback {
+            recs, err = run_replay.load_calls(nl_(INCOMPLETE_META_CALLS))
+            spec.assert_str_eq(err, "", "loaded")
+            spec.assert_eq(rec_at_(recs, 0).incomplete, 1, "incomplete")
+            spec.assert_eq(rec_at_(recs, 1).incomplete, 0, "absent")
+            spec.assert_eq(rec_at_(recs, 2).incomplete, 0, "false")
+            pending = heap.new(run_replay.Run)
+            pending.step = 1
+            pending.run = 0
+            pending.code = "tools.read(); throw new Error('boom')"
+            pending.expected = "Error: boom"
+            pending.has_expected = 1
+            pending.child = 0
+            pending.remaining_steps = -1 as long
+            rp, rerr = run_replay.replay_one(pending as ptr, rec_at_(recs, 0) as ptr, "", 0)
+            spec.assert_str_eq(rerr, "", "replayed")
+            rep = rp as *run_replay.Report
+            spec.assert_eq(rep.incomplete, 1, "incomplete")
+            spec.assert_eq(rep.verdict, -1, "match null")
+            spec.assert_eq(rep.has_divergence, 1, "divergence kept")
+        }
+    }
+    return spec.run_summary(fw)
+}
