@@ -1,0 +1,241 @@
+// tools.web: tools.fetch, an http(s) GET following up to 5 redirects, HTML
+// as Markdown unless raw, other text as is (upstream src/tools/web.zig).
+// The request runs on its own thread; the caller watches cancel and the
+// deadline every 50 ms, as upstream's Select of request and watch.
+
+import std.http.client
+import std.string
+import std.sync
+import std.worker
+import std.json
+import nib.jsonx
+import nib.tools.html
+
+exports(Page, USAGE_TEXT, MAX_BODY, MAX_TEXT, fetch, get, render, cap, utf8_valid)
+
+const USAGE_TEXT = "expected { url: string, raw?: boolean, timeout_ms?: number }"
+const MAX_BODY = 5242880
+const MAX_TEXT = 1048576
+const MAX_REDIRECTS = 5
+const ACCEPT = "text/markdown, text/plain;q=0.9, text/html;q=0.8, */*;q=0.5"
+
+struct Page {
+    url: string
+    status: int
+    content_type: string
+    text: string
+    truncated: int
+}
+
+struct Job {
+    url: string
+    raw: int
+    done: ptr
+    page: ptr
+    err: string
+    content_type: string
+}
+
+// Whether `s` is well-formed UTF-8 (no overlongs, surrogates or > U+10FFFF).
+utf8_valid(s: string) -> int {
+    n = string.length(s)
+    i = 0
+    while i < n {
+        c = string.char_at(s, i)
+        if c < 128 {
+            i = i + 1
+            continue
+        }
+        need = 0
+        lo = 128
+        hi = 191
+        if c >= 194 && c <= 223 {
+            need = 1
+        } else if c >= 224 && c <= 239 {
+            need = 2
+            if c == 224 { lo = 160 }
+            if c == 237 { hi = 159 }
+        } else if c >= 240 && c <= 244 {
+            need = 3
+            if c == 240 { lo = 144 }
+            if c == 244 { hi = 143 }
+        } else {
+            return 0
+        }
+        k = 1
+        while k <= need {
+            if i + k >= n { return 0 }
+            b = string.char_at(s, i + k)
+            if k == 1 {
+                if b < lo || b > hi { return 0 }
+            } else if b < 128 || b > 191 {
+                return 0
+            }
+            k = k + 1
+        }
+        i = i + need + 1
+    }
+    return 1
+}
+
+lower_(s: string) -> string { return string.to_lower(s) }
+
+// The text of `body` (upstream render): HTML to Markdown unless raw.
+// ("", "BinaryContent") for NUL bytes in the first 4 KiB or invalid UTF-8.
+render(body: string, content_type: string, url: string, raw: int) -> (string, string) {
+    semi = string.index_of(content_type, ";")
+    media = content_type
+    if semi >= 0 { media = string.substring(content_type, 0, semi) }
+    media = lower_(string.trim(media))
+    is_html = 0
+    if media == "text/html" || media == "application/xhtml+xml" { is_html = 1 }
+    if media == "" && string.starts_with(lower_(string.trim(body)), "<!doctype html") == 1 { is_html = 1 }
+    head = string.length(body)
+    if head > 4096 { head = 4096 }
+    i = 0
+    while i < head {
+        if string.char_at(body, i) == 0 { return "", "BinaryContent" }
+        i = i + 1
+    }
+    if utf8_valid(body) == 0 { return "", "BinaryContent" }
+    if is_html == 1 && raw == 0 {
+        md, _e = html.to_markdown(body, url)
+        return md, ""
+    }
+    return body, ""
+}
+
+// At most MAX_TEXT bytes, not splitting a UTF-8 sequence.
+cap(text: string) -> string {
+    if string.length(text) <= MAX_TEXT { return text }
+    end = MAX_TEXT
+    while end > 0 && (string.char_at(text, end) & 192) == 128 { end = end - 1 }
+    return string.substring(text, 0, end)
+}
+
+request_(jp: ptr) {
+    j = jp as *Job
+    req = client.request("GET", j.url)
+    if req == null {
+        j.err = "InvalidUrl"
+        sync.atomic_store(j.done, 1)
+        return
+    }
+    client.set_follow_redirects(req, MAX_REDIRECTS)
+    client.set_header(req, "user-agent", "Mozilla/5.0 (compatible; nib)")
+    client.set_header(req, "accept", ACCEPT)
+    resp, err = client.send_stream(req)
+    if err != "" {
+        j.err = err
+        client.request_free(req)
+        sync.atomic_store(j.done, 1)
+        return
+    }
+    rerr = client.response_redirect_error(resp)
+    if rerr != "" {
+        j.err = rerr
+        client.response_free(resp)
+        client.request_free(req)
+        sync.atomic_store(j.done, 1)
+        return
+    }
+    ct = client.response_header(resp, "content-type")
+    j.content_type = ct
+    body = ""
+    too_large = 0
+    while true {
+        chunk = client.response_read(resp, 65536)
+        if string.length(chunk) == 0 { break }
+        body = "${body}${chunk}"
+        if string.length(body) > MAX_BODY {
+            too_large = 1
+            break
+        }
+    }
+    url = string.copy(client.response_url(resp))
+    status = client.response_status(resp)
+    client.response_free(resp)
+    client.request_free(req)
+    if too_large == 1 {
+        j.err = "ResponseTooLarge"
+        sync.atomic_store(j.done, 1)
+        return
+    }
+    text, berr = render(body, ct, url, j.raw)
+    if berr != "" {
+        j.err = berr
+        sync.atomic_store(j.done, 1)
+        return
+    }
+    p = heap.new(Page)
+    p.url = url
+    p.status = status
+    p.content_type = ct
+    p.text = cap(text)
+    p.truncated = 0
+    if string.length(text) > MAX_TEXT { p.truncated = 1 }
+    j.page = p as ptr
+    sync.atomic_store(j.done, 1)
+}
+
+// (page, "", content_type) or (null, error name, content_type). Errors:
+// UnsupportedUrlScheme, Canceled, Timeout, BinaryContent, ResponseTooLarge,
+// or the client's transport error.
+get(url: string, raw: int, timeout_ms: long, cancel: ptr) -> (ptr, string, string) {
+    if string.starts_with(url, "http://") == 0 && string.starts_with(url, "https://") == 0 { return null, "UnsupportedUrlScheme", "" }
+    j = heap.new(Job)
+    j.url = url
+    j.raw = raw
+    j.done = sync.atomic_new(0)
+    j.page = null
+    j.err = ""
+    j.content_type = ""
+    jp = j as ptr
+    // The request may outlive a canceled call; it owns its Job.
+    worker.run_detached(|| {
+        request_(jp)
+        return null
+    })
+    waited = 0 as long
+    while sync.atomic_load(j.done) == 0 {
+        if cancel != null && sync.atomic_load(cancel) != 0 { return null, "Canceled", "" }
+        if waited >= timeout_ms { return null, "Timeout", "" }
+        sleep(10)
+        waited = waited + 10
+    }
+    if j.err != "" { return null, j.err, j.content_type }
+    return j.page, "", j.content_type
+}
+
+// tools.fetch. (1, page JSON) or (0, rejection message).
+fetch(args: string, cancel: ptr) -> (int, string) {
+    v = jsonx.parse(args)
+    if v == null || json.json_type(v) != json.JSON_OBJECT || jsonx.kind(v, "url") != json.JSON_STRING {
+        jsonx.free(v)
+        return 0, USAGE_TEXT
+    }
+    rk = jsonx.kind(v, "raw")
+    tk = jsonx.kind(v, "timeout_ms")
+    if (rk != jsonx.KIND_MISSING && rk != json.JSON_BOOL) || (tk != jsonx.KIND_MISSING && (tk != json.JSON_NUMBER || jsonx.is_integer(jsonx.field(v, "timeout_ms")) == 0 || jsonx.long_or(v, "timeout_ms", 0 as long) < 0)) {
+        jsonx.free(v)
+        return 0, USAGE_TEXT
+    }
+    url = string.copy(jsonx.str_or(v, "url", ""))
+    raw = jsonx.bool_or(v, "raw", 0)
+    timeout_ms = jsonx.long_or(v, "timeout_ms", 30000 as long)
+    jsonx.free(v)
+    pp, err, content_type = get(url, raw, timeout_ms, cancel)
+    if err != "" {
+        match err {
+            "Canceled" -> { return 0, "canceled" }
+            "Timeout" -> { return 0, "timed out after ${timeout_ms} ms" }
+            "BinaryContent" -> { return 0, "binary content (${content_type}); download it with bash if needed" }
+            "ResponseTooLarge" -> { return 0, "response exceeds 5 MB" }
+            _ -> { return 0, "${url}: ${err}" }
+        }
+    }
+    p = pp as *Page
+    tr = "false"
+    if p.truncated == 1 { tr = "true" }
+    return 1, "{\"url\":${jsonx.quote(p.url)},\"status\":${p.status},\"content_type\":${jsonx.quote(p.content_type)},\"text\":${jsonx.quote(p.text)},\"truncated\":${tr}}"
+}

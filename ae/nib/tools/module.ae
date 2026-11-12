@@ -32,6 +32,8 @@ import nib.tools.agent
 import nib.tools.agent_sessions
 import nib.tools.agent_input
 import nib.tools.mcp_tool
+import nib.tools.web
+import nib.tools.web_search
 import nib.provider.types
 
 exports(Tools, RunScope, new, new_scope, host, call_tool, names_json, docs, all_docs, tool_names,
@@ -102,6 +104,8 @@ is_ported(name: string) -> int {
         "llm" -> { return 1 }
         "agent" -> { return 1 }
         "mcp" -> { return 1 }
+        "fetch" -> { return 1 }
+        "search" -> { return 1 }
         "mcp_schema" -> { return 1 }
         _ -> { return 0 }
     }
@@ -362,7 +366,8 @@ docs(tp: ptr) -> string {
     i = 0
     while i < list.list_size(all) {
         n, _e = list.get_string(all, i)
-        if enabled_(t, n) == 1 { body = "${body}${doc_of_(n)}" }
+        // search stays callable, but is documented only where a provider route exists.
+        if enabled_(t, n) == 1 && !(n == "search" && web_search.supported(t.cfg) == 0) { body = "${body}${doc_of_(n)}" }
         i = i + 1
     }
     return llm_call.fill_docs(wrap_docs_(body), cfg)
@@ -685,6 +690,12 @@ call_tool(sp: ptr, name: string, args: string, out: ptr) {
         "agent" -> {
             agent_(s, args, out)
             return
+        }
+        "fetch" -> {
+            ok, text = web.fetch(args, s.cancel)
+        }
+        "search" -> {
+            ok, text = web_search.search(t.cfg, args, s.cancel)
         }
         "mcp" -> {
             ok, text = mcp_tool.execute(t.mcp_client, args, 0, s.cancel, vision_(t))

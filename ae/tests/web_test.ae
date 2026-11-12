@@ -1,0 +1,46 @@
+// tools.web (upstream src/tools/web.zig): render, the text cap, refused schemes.
+import std.spec
+import std.string
+import nib.tools.web
+
+repeat_(c: string, n: int) -> string {
+    out = c
+    while string.length(out) * 2 <= n { out = "${out}${out}" }
+    while string.length(out) < n { out = "${out}${c}" }
+    return out
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tools.web") {
+        spec.it("render converts HTML, passes text through and rejects binary") callback {
+            t1, e1 = web.render("<h1>Hi</h1><a href=b>next</a>", "text/html; charset=utf-8", "https://x.dev/a", 0)
+            spec.assert_str_eq(t1, "# Hi\n\n[next](https://x.dev/b)", "html")
+            spec.assert_str_eq(e1, "", "no error")
+            t2, _e2 = web.render("<h1>Hi</h1>", "text/html", "https://x.dev/", 1)
+            spec.assert_str_eq(t2, "<h1>Hi</h1>", "raw")
+            t3, _e3 = web.render("# Doc\n", "text/markdown", "https://x.dev/", 0)
+            spec.assert_str_eq(t3, "# Doc\n", "markdown")
+            t4, _e4 = web.render("<!DOCTYPE html><h1>Doc</h1>", "", "https://x.dev/", 0)
+            spec.assert_str_eq(t4, "# Doc", "sniffed")
+            _t5, e5 = web.render("PNG\x00\x01", "image/png", "https://x.dev/", 0)
+            spec.assert_str_eq(e5, "BinaryContent", "binary")
+            long_text = repeat_("x", web.MAX_TEXT + 10)
+            spec.assert_eq(string.length(web.cap(long_text)), web.MAX_TEXT, "capped")
+        }
+        spec.it("fetch text cap preserves UTF-8 and adds no marker") callback {
+            exact = repeat_("x", web.MAX_TEXT)
+            spec.assert_eq(string.length(web.cap(exact)), web.MAX_TEXT, "exact")
+            text = "${repeat_("x", web.MAX_TEXT - 1)}中文"
+            capped = web.cap(text)
+            spec.assert_eq(string.length(capped), web.MAX_TEXT - 1, "cut before the sequence")
+            spec.assert_eq(web.utf8_valid(capped), 1, "valid UTF-8")
+            spec.assert_str_eq(web.cap("short"), "short", "short")
+        }
+        spec.it("unsupported schemes are refused before any request") callback {
+            _p, err, _ct = web.get("file:///etc/passwd", 0, 30000 as long, null)
+            spec.assert_str_eq(err, "UnsupportedUrlScheme", "refused")
+        }
+    }
+    return spec.run_summary(fw)
+}
