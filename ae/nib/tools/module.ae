@@ -28,11 +28,14 @@ import nib.tools.background
 import nib.tools.progress
 import nib.tools.undo
 import nib.tools.llm_call
+import nib.tools.agent
+import nib.tools.agent_sessions
+import nib.tools.agent_input
 import nib.provider.types
 
 exports(Tools, RunScope, new, new_scope, host, call_tool, names_json, docs, all_docs, tool_names,
         is_ported, credential_paths, writable_roots, nib_home, take_changes, set_workspace,
-        cancel_cell, set_log, set_config, take_usage, take_jail_notice, enable_undo, begin_turn_undo, finish_turn_undo, run_undo, turn_undo_dir, attach_turn_undo_dir, close_undo)
+        cancel_cell, set_log, export_versions, import_versions, set_config, take_usage, take_jail_notice, enable_undo, begin_turn_undo, finish_turn_undo, run_undo, turn_undo_dir, attach_turn_undo_dir, close_undo)
 
 const DOC_MCP = "  // Call an enabled MCP server tool. Server/transport failures are data; argument errors reject. Full results stay in JS; images share the Run image limit.\n  async mcp(name, args = {}) {}, // → { ok, content, structured?, error? }\n"
 const DOC_MCP_SCHEMA = "  // Full input JSON Schema for an enabled server.tool, including tools omitted from the compact index.\n  async mcp_schema(name) {}, // → JSON Schema or { ok: false, error }\n"
@@ -96,6 +99,7 @@ is_ported(name: string) -> int {
         "bash" -> { return 1 }
         "stop" -> { return 1 }
         "llm" -> { return 1 }
+        "agent" -> { return 1 }
         _ -> { return 0 }
     }
 }
@@ -128,6 +132,11 @@ struct Tools {
     jail_noticed: int
     cfg: ptr               // *types.Config of the Session, or null (nib js)
     llm: ptr               // *llm_call.State
+    session_id: string     // "" outside a Session
+    agent_sessions: ptr    // *agent_sessions.Registry
+    agent_gate: ptr        // *agent.Gate
+    fork_snapshot: ptr     // *agent_input.Fork of the running Step, or null
+    undo_dir: string       // a sub-agent's: the parent Turn's snapshot directory
 }
 
 struct RunScope {
@@ -136,6 +145,7 @@ struct RunScope {
     cancel: ptr
     changes: ptr           // *changes.Tracker for this Run
     llm_calls: ptr         // std.sync cell: tools.llm calls admitted in this Run
+    fork: ptr              // the Step's *agent_input.Fork when the Run started, or null
 }
 
 new(home: string) -> ptr {
@@ -169,6 +179,11 @@ new(home: string) -> ptr {
     t.jail_noticed = 0
     t.cfg = null
     t.llm = llm_call.new()
+    t.session_id = ""
+    t.agent_sessions = agent_sessions.new()
+    t.agent_gate = agent.new_gate()
+    t.fork_snapshot = null
+    t.undo_dir = ""
     return t as ptr
 }
 
@@ -202,6 +217,37 @@ take_jail_notice(tp: ptr) -> string {
     return t.jail_reason
 }
 cancel_cell(tp: ptr) -> ptr { return (tp as *Tools).cancel }
+
+// The files this Session read or wrote, as a fork's file_versions (list of *agent_input.Observation).
+export_versions(tp: ptr) -> ptr {
+    pairs = file_state.export_versions((tp as *Tools).file_state)
+    out = list.list_new()
+    i = 0
+    while i + 1 < list.list_size(pairs) {
+        path, _g = list.get_string(pairs, i)
+        v = list.list_get_raw(pairs, i + 1) as *file_state.Version
+        list.list_add(out, agent_input.new_observation(string.copy(path), v.ino, v.size, v.mtime_ns))
+        i = i + 2
+    }
+    return out
+}
+
+// A fork child starts knowing the parent's file versions.
+import_versions(tp: ptr, observations: ptr) {
+    pairs = list.list_new()
+    i = 0
+    while i < list.list_size(observations) {
+        o = list.list_get_raw(observations, i) as *agent_input.Observation
+        v = heap.new(file_state.Version)
+        v.ino = o.inode
+        v.size = o.size
+        v.mtime_ns = o.mtime
+        list.list_add(pairs, string.copy(o.path))
+        list.list_add(pairs, v as ptr)
+        i = i + 1
+    }
+    file_state.import_versions((tp as *Tools).file_state, pairs)
+}
 
 // ---- Turn undo (tools/undo) ----
 
@@ -262,6 +308,7 @@ new_scope(tp: @keep ptr, id: int) -> ptr {
     s.cancel = sync.atomic_new(0)
     s.changes = changes.new() as ptr
     s.llm_calls = sync.atomic_new(0)
+    s.fork = (tp as *Tools).fork_snapshot
     return s as ptr
 }
 
@@ -463,6 +510,43 @@ bash_(s: *RunScope, args: string, out: ptr) {
     if ok == 1 { sandbox.result_set_ok(out, text) } else { sandbox.result_set_err(out, text) }
 }
 
+// What tools.agent needs from the Tools and this Run.
+agent_ctx_(s: *RunScope) -> ptr {
+    t = s.tools as *Tools
+    cp = agent.new_ctx(t.progress, t.agent_sessions, t.agent_gate)
+    c = cp as *agent.Ctx
+    c.cfg = t.cfg
+    c.depth = t.depth
+    c.forked = t.forked
+    c.session_id = t.session_id
+    c.self_exe = t.self_exe
+    c.env = t.env
+    c.undo_dir = t.undo_dir
+    td = turn_undo_dir(s.tools)
+    if td != "" { c.undo_dir = td }
+    c.fork = s.fork
+    c.run_id = s.id
+    c.cancel = s.cancel
+    c.usage_ctx = t.llm
+    c.usage_fn = |ctx: ptr, u: ptr| {
+        llm_call.add_usage(ctx, u)
+    }
+    c.has_log = t.has_log
+    c.log_ctx = t.log_ctx
+    c.log_fn = t.log_fn
+    return cp
+}
+
+agent_(s: *RunScope, args: string, out: ptr) {
+    ids = list.list_new()
+    ok, text = agent.agent(agent_ctx_(s), args, ids)
+    if list.list_size(ids) > 0 {
+        id, _g = list.get_string(ids, 0)
+        sandbox.result_set_identity(out, id, 0)
+    }
+    if ok == 1 { sandbox.result_set_ok(out, text) } else { sandbox.result_set_err(out, text) }
+}
+
 const STOP_REASON_REQUIRED = "stop requires a nonempty reason. Canceling a running test discards its progress and prevents a completed validation result. Elapsed time or no output alone does not mean it is stuck; reply without tools to wait locally. Stop only for a concrete failure, changed requirement or user request."
 
 stop_(s: *RunScope, args: string, out: ptr) {
@@ -540,6 +624,10 @@ call_tool(sp: ptr, name: string, args: string, out: ptr) {
         }
         "llm" -> {
             ok, text = llm_call.call(t.llm, args, s.cancel)
+        }
+        "agent" -> {
+            agent_(s, args, out)
+            return
         }
         _ -> {
             text = "SandboxOnlyTool"

@@ -48,7 +48,7 @@ expect_imports $T/walk/module.ae "std.dir|std.fs|std.list|std.strbuilder|std.str
 expect_imports $T/grep/module.ae "contrib.quickjs|nib.tools.walk|std.fs|std.list|std.strbuilder|std.string|std.sync"
 expect_imports $T/search/module.ae "nib.jsonx|nib.tools.grep|nib.tools.walk|std.json|std.list|std.strbuilder|std.string"
 # Processes.
-expect_imports $T/process/module.ae "nib.sysgap|std.cryptography|std.fs|std.list|std.os|std.string|std.sync|std.worker"
+expect_imports $T/process/module.ae "nib.sysgap|std.cryptography|std.fs|std.io|std.ipc|std.list|std.os|std.string|std.sync|std.worker"
 expect_imports $T/bash/module.ae "nib.jsonx|nib.sysgap|nib.tools.jail|nib.tools.policy|nib.tools.process|nib.tools.progress|nib.tools.registry|nib.tools.secrets|std.list|std.os|std.string|std.sync"
 expect_imports $T/jail/module.ae "nib.tools.atomic_file|std.fs|std.list|std.os|std.string"
 expect_imports $T/llm_call/module.ae "nib.jsonx|nib.lock|nib.msg|nib.provider|nib.provider.sink|nib.provider.types|std.json|std.list|std.strbuilder|std.string|std.sync"

@@ -1,0 +1,780 @@
+// tools.agent: a subagent is a child `nib ask --json --agent-input -` with its
+// own Session (upstream src/tools/agent.zig, docs/tool-delegation.md, ADR
+// 0015). The parent writes the prompt and its Config (and, for fork, its
+// history) to the child's stdin and reads the child's NDJSON events as they
+// come: the Tracker turns them into progress snapshots (Steps, tools used,
+// files changed), the Output keeps what the call returns (final text, usage,
+// merged changes, failure). Child failures are data ({ok:false, error});
+// argument errors and user cancellation reject.
+//
+// A call runs on its tool thread. Everything it needs from the Tools comes
+// in a Ctx the tools module builds per call; nothing here is module state.
+
+import std.json
+import std.list
+import std.string
+import std.strbuilder
+import std.os
+import std.sync
+import nib.jsonx
+import nib.lock
+import nib.provider.types
+import nib.tools.progress
+import nib.tools.agent_sessions
+import nib.tools.agent_input
+import nib.tools.process
+import nib.tools.secrets
+
+exports(Ctx, Gate, Args, Output, Tracker, Change, new_ctx, new_gate, parse_args, agent, execute, new_output,
+        observe, result, new_tracker, tracker_observe, tracker_line, USAGE_TEXT, DEFAULT_TIMEOUT_MS)
+
+const USAGE_TEXT = "expected { prompt: string, resume?: string, fork?: boolean, timeout_ms?: number, model?: string, effort?: string, background?: boolean }"
+const DEFAULT_TIMEOUT_MS = 1800000
+
+// Agents running at once, across a Session's Runs (limits.agent_concurrency).
+struct Gate {
+    guard: ptr
+    active: int
+}
+
+struct Ctx {
+    progress: ptr            // *progress.Queue
+    sessions: ptr            // *agent_sessions.Registry
+    gate: ptr                // *Gate
+    cfg: ptr                 // *types.Config, or null (no Session)
+    depth: int
+    forked: int
+    session_id: string       // "" none
+    self_exe: string
+    env: ptr                 // "NAME=value" list the child starts from, null: this process's
+    undo_dir: string
+    fork: ptr                // *agent_input.Fork of the running Step, or null
+    run_id: int
+    cancel: ptr              // the Run's std.sync cell
+    usage_ctx: ptr
+    usage_fn: fn             // |ctx: ptr, usage: ptr|: the call's usage joins the Turn's
+    has_log: int
+    log_ctx: ptr
+    log_fn: fn               // |ctx: ptr, members: string|: a session-log record
+}
+
+struct Args {
+    prompt: string
+    resume: string
+    has_resume: int
+    fork: int
+    has_fork: int
+    timeout_ms: long
+    model: string
+    effort: string
+    background: int
+}
+
+struct Change {
+    path: string
+    added: long
+    removed: long
+    created: int
+}
+
+struct Output {
+    text: string
+    usage: ptr               // *types.Usage
+    changes: ptr             // list of *Change
+    child_id: string
+    requested_session: string
+    id: string
+    steps: int               // -1 none
+    ended: int
+    failure: string          // "" none
+}
+
+struct Tracker {
+    ctx: ptr                 // *Ctx (null in tests that only observe)
+    value: ptr               // *progress.Progress
+    completed_steps: int
+    reply_started: int
+    pending_reply: int
+    post_run_usage: int
+    output: ptr              // *Output
+}
+
+new_gate() -> ptr {
+    g = heap.new(Gate)
+    g.guard = lock.new()
+    g.active = 0
+    return g as ptr
+}
+
+new_ctx(progress_q: @keep ptr, sessions: @keep ptr, gate: @keep ptr) -> ptr {
+    c = heap.new(Ctx)
+    c.progress = progress_q
+    c.sessions = sessions
+    c.gate = gate
+    c.cfg = null
+    c.depth = 0
+    c.forked = 0
+    c.session_id = ""
+    c.self_exe = ""
+    c.env = null
+    c.undo_dir = ""
+    c.fork = null
+    c.run_id = 0
+    c.cancel = sync.atomic_new(0)
+    c.usage_ctx = null
+    c.usage_fn = |ctx: ptr, u: ptr| {}
+    c.has_log = 0
+    c.log_ctx = null
+    c.log_fn = |ctx: ptr, members: string| {}
+    return c as ptr
+}
+
+canceled_(c: ptr) -> int {
+    if c != null && sync.atomic_load(c) != 0 { return 1 }
+    return 0
+}
+
+opt_string_ok_(v: ptr, key: string) -> int {
+    k = jsonx.kind(v, key)
+    if k == jsonx.KIND_MISSING || k == json.JSON_NULL || k == json.JSON_STRING { return 1 }
+    return 0
+}
+
+opt_bool_ok_(v: ptr, key: string) -> int {
+    k = jsonx.kind(v, key)
+    if k == jsonx.KIND_MISSING || k == json.JSON_BOOL { return 1 }
+    return 0
+}
+
+// The arguments, or null when they do not have upstream's Args shape.
+parse_args(text: string) -> ptr {
+    v = jsonx.parse(text)
+    if v == null || json.json_type(v) != json.JSON_OBJECT || jsonx.kind(v, "prompt") != json.JSON_STRING {
+        jsonx.free(v)
+        return null
+    }
+    tk = jsonx.kind(v, "timeout_ms")
+    bad = 0
+    if opt_string_ok_(v, "resume") == 0 || opt_string_ok_(v, "model") == 0 || opt_string_ok_(v, "effort") == 0 { bad = 1 }
+    if opt_bool_ok_(v, "fork") == 0 || opt_bool_ok_(v, "background") == 0 { bad = 1 }
+    if tk != jsonx.KIND_MISSING && (tk != json.JSON_NUMBER || jsonx.is_integer(jsonx.field(v, "timeout_ms")) == 0) { bad = 1 }
+    if bad == 1 {
+        jsonx.free(v)
+        return null
+    }
+    a = heap.new(Args)
+    a.prompt = string.copy(jsonx.str_or(v, "prompt", ""))
+    a.resume = string.copy(jsonx.str_or(v, "resume", ""))
+    a.has_resume = jsonx.has(v, "resume")
+    a.fork = jsonx.bool_or(v, "fork", 0)
+    a.has_fork = jsonx.has(v, "fork")
+    a.timeout_ms = jsonx.long_or(v, "timeout_ms", DEFAULT_TIMEOUT_MS as long)
+    a.model = string.copy(jsonx.str_or(v, "model", ""))
+    a.effort = string.copy(jsonx.str_or(v, "effort", ""))
+    a.background = jsonx.bool_or(v, "background", 0)
+    jsonx.free(v)
+    return a as ptr
+}
+
+// ---- Output: what the call returns ----
+
+new_output(id: string, requested_session: string) -> ptr {
+    o = heap.new(Output)
+    o.text = ""
+    o.usage = types.usage_new()
+    o.changes = list.list_new()
+    o.child_id = ""
+    o.requested_session = requested_session
+    o.id = id
+    o.steps = -1
+    o.ended = 0
+    o.failure = ""
+    return o as ptr
+}
+
+usage_from_(v: ptr) -> ptr {
+    up = types.usage_new()
+    u = up as *types.Usage
+    u.prompt_tokens = jsonx.long_or(v, "prompt_tokens", 0 as long)
+    u.completion_tokens = jsonx.long_or(v, "completion_tokens", 0 as long)
+    u.prompt_cache_hit_tokens = jsonx.long_or(v, "prompt_cache_hit_tokens", 0 as long)
+    u.prompt_cache_write_tokens = jsonx.long_or(v, "prompt_cache_write_tokens", 0 as long)
+    return up
+}
+
+// run_end, or background.completion: a completed Run's object; null none (or JSON null).
+completed_run_(v: ptr) -> ptr {
+    r = jsonx.field(v, "run_end")
+    if r != null { return r }
+    b = jsonx.field(v, "background")
+    if b != null && json.json_type(b) == json.JSON_OBJECT { return jsonx.field(b, "completion") }
+    return null
+}
+
+merge_changes_(o: *Output, run: ptr) -> string {
+    if jsonx.has(run, "changes") == 0 { return "" }
+    cs = jsonx.field(run, "changes")
+    if json.json_type(cs) != json.JSON_ARRAY { return "InvalidAgentOutput" }
+    n = jsonx.array_size(cs)
+    i = 0
+    while i < n {
+        c = jsonx.array_at(cs, i)
+        if jsonx.kind(c, "path") != json.JSON_STRING { return "InvalidAgentOutput" }
+        path = string.copy(jsonx.str_or(c, "path", ""))
+        added = jsonx.long_or(c, "added", 0 as long)
+        removed = jsonx.long_or(c, "removed", 0 as long)
+        created = jsonx.bool_or(c, "created", 0)
+        found = 0
+        k = 0
+        while k < list.list_size(o.changes) {
+            known = list.list_get_raw(o.changes, k) as *Change
+            if known.path == path {
+                known.added = known.added + added
+                known.removed = known.removed + removed
+                if created == 1 { known.created = 1 }
+                found = 1
+                break
+            }
+            k = k + 1
+        }
+        if found == 0 {
+            ch = heap.new(Change)
+            ch.path = path
+            ch.added = added
+            ch.removed = removed
+            ch.created = created
+            list.list_add(o.changes, ch as ptr)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// One child event line. "" or the error name (InvalidAgentOutput, InvalidJson).
+observe(op: ptr, line: string) -> string {
+    o = op as *Output
+    v = jsonx.parse(line)
+    if v == null { return "SyntaxError" }
+    if json.json_type(v) != json.JSON_OBJECT {
+        jsonx.free(v)
+        return "InvalidAgentOutput"
+    }
+    err = observe_value_(o, v)
+    jsonx.free(v)
+    return err
+}
+
+observe_value_(o: *Output, v: ptr) -> string {
+    if jsonx.has(v, "start") == 1 {
+        if o.child_id != "" { return "InvalidAgentOutput" }
+        st = jsonx.field(v, "start")
+        if jsonx.kind(st, "session_id") != json.JSON_STRING { return "InvalidAgentOutput" }
+        sid = string.copy(jsonx.str_or(st, "session_id", ""))
+        if o.requested_session != "" && o.requested_session != sid { return "InvalidAgentOutput" }
+        o.child_id = sid
+    }
+    d = jsonx.field(v, "delta")
+    if d != null {
+        kind = jsonx.str_or(d, "kind", "")
+        if kind != "text" && kind != "reasoning" { return "InvalidAgentOutput" }
+        if jsonx.kind(d, "text") != json.JSON_STRING { return "InvalidAgentOutput" }
+        if kind == "text" { o.text = "${o.text}${jsonx.str_or(d, "text", "")}" }
+    }
+    u = jsonx.field(v, "usage")
+    if u != null { o.usage = usage_from_(u) }
+    run = completed_run_(v)
+    if run != null && json.json_type(run) != json.JSON_NULL {
+        e = merge_changes_(o, run)
+        if e != "" { return e }
+    }
+    if jsonx.has(v, "end") == 1 || jsonx.has(v, "error") == 1 {
+        if o.ended == 1 { return "InvalidAgentOutput" }
+        o.ended = 1
+        if jsonx.has(v, "end") == 1 {
+            en = jsonx.field(v, "end")
+            o.text = string.copy(jsonx.str_or(en, "text", ""))
+            o.usage = usage_from_(jsonx.field(en, "usage"))
+            o.steps = jsonx.int_or(en, "steps", 0)
+        } else {
+            er = jsonx.field(v, "error")
+            o.failure = string.copy(jsonx.str_or(er, "message", ""))
+            o.usage = usage_from_(jsonx.field(er, "usage"))
+            o.steps = jsonx.int_or(er, "steps", 0)
+        }
+    }
+    return ""
+}
+
+changes_json_(l: ptr) -> string {
+    b = strbuilder.new(64)
+    strbuilder.append(b, "[")
+    i = 0
+    while i < list.list_size(l) {
+        c = list.list_get_raw(l, i) as *Change
+        if i > 0 { strbuilder.append(b, ",") }
+        cr = "false"
+        if c.created == 1 { cr = "true" }
+        strbuilder.append(b, "{\"path\":${jsonx.quote(c.path)},\"added\":${c.added},\"removed\":${c.removed},\"created\":${cr}}")
+        i = i + 1
+    }
+    strbuilder.append(b, "]")
+    return strbuilder.finish(b)
+}
+
+// The call's result JSON. reason "" means success; timeout_ms >= 0 means it timed out.
+result(op: ptr, elapsed_ms: long, reason: string, timeout_ms: long) -> string {
+    o = op as *Output
+    tail = ",\"text\":${jsonx.quote(o.text)},\"usage\":${types.usage_json(o.usage)},\"changes\":${changes_json_(o.changes)}}"
+    if reason == "" { return "{\"ok\":true,\"id\":${jsonx.quote(o.id)}${tail}" }
+    detail = "subagent: ${reason} after ${elapsed_ms} ms; task id: ${o.id}. Files it changed may be incomplete; inspect them before continuing."
+    if timeout_ms >= 0 { detail = "subagent stopped due to timeout after ${elapsed_ms} ms (limit ${timeout_ms} ms); task id: ${o.id}. Files it changed may be incomplete; inspect them before continuing." }
+    return "{\"ok\":false,\"id\":${jsonx.quote(o.id)},\"error\":${jsonx.quote(detail)}${tail}"
+}
+
+// ---- Tracker: progress from the child's events ----
+
+new_tracker(cp: @keep ptr, value: @keep ptr, output: @keep ptr) -> ptr {
+    t = heap.new(Tracker)
+    t.ctx = cp
+    t.value = value
+    t.completed_steps = 0
+    t.reply_started = 0
+    t.pending_reply = 0
+    t.post_run_usage = 0
+    t.output = output
+    return t as ptr
+}
+
+publish_(t: *Tracker) {
+    if t.ctx == null { return }
+    progress.update((t.ctx as *Ctx).progress, t.value)
+}
+
+ident_char_(c: int) -> int {
+    if (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 { return 1 }
+    return 0
+}
+
+space_(c: int) -> int {
+    if c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12 { return 1 }
+    return 0
+}
+
+// The distinct tools.<name>( calls of a Run's code, in order.
+tools_used_(code: string) -> ptr {
+    used = list.list_new()
+    rest = code
+    while true {
+        i = string.index_of(rest, "tools.")
+        if i < 0 { break }
+        rest = string.substring(rest, i + 6, string.length(rest))
+        n = string.length(rest)
+        e = 0
+        while e < n && ident_char_(string.char_at(rest, e)) == 1 { e = e + 1 }
+        if e == 0 { continue }
+        name = string.substring(rest, 0, e)
+        c = e
+        while c < n && space_(string.char_at(rest, c)) == 1 { c = c + 1 }
+        if c == n || string.char_at(rest, c) != 40 { continue }
+        known = 0
+        k = 0
+        while k < list.list_size(used) {
+            u, _g = list.get_string(used, k)
+            if u == name {
+                known = 1
+                break
+            }
+            k = k + 1
+        }
+        if known == 0 { list.list_add(used, string.copy(name)) }
+    }
+    return used
+}
+
+// The progress half of a child event (upstream Tracker.observe).
+tracker_observe(tp: ptr, line: string) -> string {
+    t = tp as *Tracker
+    v = jsonx.parse(line)
+    if v == null { return "SyntaxError" }
+    if json.json_type(v) != json.JSON_OBJECT {
+        jsonx.free(v)
+        return ""
+    }
+    err = tracker_value_(t, v)
+    jsonx.free(v)
+    return err
+}
+
+tracker_value_(t: *Tracker, v: ptr) -> string {
+    pv = t.value as *progress.Progress
+    if jsonx.has(v, "notice") == 1 {
+        t.pending_reply = 0
+        return ""
+    }
+    if jsonx.has(v, "delta") == 1 {
+        if t.reply_started == 1 { return "" }
+        pv.step = t.completed_steps + 1
+        t.reply_started = 1
+    } else if jsonx.has(v, "run_start") == 0 && jsonx.has(v, "usage") == 0 && jsonx.has(v, "run_end") == 0 {
+        return ""
+    }
+    if jsonx.has(v, "run_start") == 1 {
+        if jsonx.kind(v, "run_start") != json.JSON_STRING { return "" }
+        if t.pending_reply == 1 {
+            t.completed_steps = t.completed_steps + 1
+            pv.step = t.completed_steps
+            t.pending_reply = 0
+        }
+        pv.tools = tools_used_(jsonx.str_or(v, "run_start", ""))
+        pv.files = list.list_new()
+    }
+    run = completed_run_(v)
+    if run != null {
+        if json.json_type(run) == json.JSON_NULL { return "" }
+        files = list.list_new()
+        cs = jsonx.field(run, "changes")
+        i = 0
+        while i < jsonx.array_size(cs) {
+            list.list_add(files, string.copy(jsonx.str_or(jsonx.array_at(cs, i), "path", "")))
+            i = i + 1
+        }
+        pv.files = files
+        t.post_run_usage = 1
+    }
+    u = jsonx.field(v, "usage")
+    if u != null {
+        pv.usage = types.usage_json(usage_from_(u))
+        // Each Run repeats the Step's usage; compaction usage has no following Run.
+        if t.post_run_usage == 1 {
+            t.post_run_usage = 0
+        } else if t.reply_started == 1 {
+            t.completed_steps = pv.step
+            t.reply_started = 0
+        } else {
+            t.pending_reply = 1
+        }
+    }
+    publish_(t)
+    return ""
+}
+
+// Records the child Session the first `start` names (agent_session log
+// record, then the registry). "" or the error name.
+bind_session_(t: *Tracker, session: string) -> string {
+    c = t.ctx as *Ctx
+    pv = t.value as *progress.Progress
+    known = agent_sessions.session(c.sessions, pv.id)
+    if known != "" {
+        if known != session { return "AgentSessionMismatch" }
+        return ""
+    }
+    if c.has_log == 0 { return "AgentLogUnavailable" }
+    fk = "false"
+    if pv.fork == 1 { fk = "true" }
+    call(c.log_fn, c.log_ctx, ",\"agent_session\":{\"id\":${jsonx.quote(pv.id)},\"session\":${jsonx.quote(session)},\"fork\":${fk}}")
+    return agent_sessions.bind(c.sessions, pv.id, session)
+}
+
+capture_(t: *Tracker, line: string) {
+    o = t.output as *Output
+    had = 0
+    if o.child_id != "" { had = 1 }
+    e = observe(t.output, line)
+    if e != "" { o.failure = e }
+    if had == 0 && o.child_id != "" && t.ctx != null {
+        e2 = bind_session_(t, o.child_id)
+        if e2 != "" { o.failure = e2 }
+    }
+}
+
+// One complete stdout line of the child.
+tracker_line(tp: ptr, line: string) {
+    t = tp as *Tracker
+    capture_(t, line)
+    tracker_observe(tp, line)
+}
+
+// ---- the tool ----
+
+fail_(text: string) -> (int, string) { return 0, text }
+
+// tools.agent. (1, result JSON) or (0, rejection message). identity: the
+// call's task id is written to id_out (a *string cell list: [id]).
+agent(cp: ptr, args: string, id_out: ptr) -> (int, string) {
+    c = cp as *Ctx
+    ap = parse_args(args)
+    if ap == null { return fail_(USAGE_TEXT) }
+    a = ap as *Args
+    if c.depth != 0 || c.forked != 0 {
+        if c.forked != 0 { return fail_("agent is unavailable inside a forked sub-agent") }
+        return fail_("agent is unavailable inside a sub-agent")
+    }
+    if a.has_fork == 1 && a.has_resume == 1 { return fail_("fork and resume cannot be passed together") }
+    if a.fork == 1 && c.fork == null { return fail_("fork requires a current conversation history") }
+    if a.has_resume == 1 {
+        v = jsonx.parse(args)
+        k = jsonx.kind(v, "resume")
+        jsonx.free(v)
+        if k != json.JSON_STRING { return fail_("resume must be a string") }
+    }
+    if a.timeout_ms <= 0 { return fail_("timeout_ms must be positive") }
+    if c.cfg == null { return fail_("AgentConfigUnavailable") }
+    cfg = types.copy(c.cfg)
+    cc = cfg as *types.Config
+    if a.fork == 1 {
+        f = c.fork as *agent_input.Fork
+        cc.thinking = f.thinking
+        cc.reasoning_effort = string.copy(f.reasoning_effort)
+    }
+    if a.model != "" { cc.model = a.model }
+    if a.effort != "" {
+        ee = types.set_effort(cfg, a.effort)
+        if ee != "" { return fail_(ee) }
+    }
+    id = ""
+    if a.has_resume == 1 {
+        rerr = agent_sessions.reserve(c.sessions, a.resume)
+        if rerr != "" { return 1, result(new_output(a.resume, ""), 0 as long, rerr, -1 as long) }
+        id = a.resume
+        rv = progress.new_value(id, progress.KIND_AGENT, a.prompt, c.run_id) as *progress.Progress
+        rv.background = a.background
+        rv.fork = agent_sessions.is_fork(c.sessions, id)
+        rv.state = "queued"
+        progress.restart(c.progress, rv as ptr)
+    } else {
+        id = progress.add_agent(c.progress, a.prompt, c.run_id, a.background, a.fork)
+        agent_sessions.add(c.sessions, id, "", 1)
+        agent_sessions.set_fork(c.sessions, id, a.fork)
+    }
+    list.list_add(id_out, id)
+    if cc.api_key_env != "" || cc.key_source == "store" { cc.api_key = "" }
+    fork_input = ""
+    if a.fork == 1 {
+        snap = c.fork as *agent_input.Fork
+        copyf = agent_input.new_fork() as *agent_input.Fork
+        copyf.session = snap.session
+        copyf.message_count = snap.message_count
+        copyf.history = snap.history
+        copyf.cache_key = snap.cache_key
+        copyf.id = id
+        copyf.provider = snap.provider
+        copyf.custom_provider = snap.custom_provider
+        copyf.model = snap.model
+        copyf.thinking = snap.thinking
+        copyf.reasoning_effort = snap.reasoning_effort
+        copyf.file_versions = snap.file_versions
+        ip = agent_input.new_input(a.prompt, cfg) as *agent_input.Input
+        ip.fork = copyf as ptr
+        ip.undo_dir = c.undo_dir
+        fork_input = agent_input.input_json(ip as ptr)
+    }
+    return execute(cp, args, c.cancel, id, c.run_id, 0, fork_input)
+}
+
+gate_enter_(c: *Ctx, limit: int, cancel: ptr) -> int {
+    g = c.gate as *Gate
+    while true {
+        lock.acquire(g.guard)
+        if canceled_(cancel) == 1 {
+            lock.release(g.guard)
+            return 0
+        }
+        if g.active < limit {
+            g.active = g.active + 1
+            lock.release(g.guard)
+            return 1
+        }
+        lock.release(g.guard)
+        sleep(20)
+    }
+    return 0
+}
+
+gate_leave_(c: *Ctx) {
+    g = c.gate as *Gate
+    lock.acquire(g.guard)
+    g.active = g.active - 1
+    lock.release(g.guard)
+}
+
+env_name_(entry: string) -> string {
+    eq = string.index_of(entry, "=")
+    if eq < 0 { return entry }
+    return string.substring(entry, 0, eq)
+}
+
+env_set_(env: ptr, name: string, value: string) -> ptr {
+    out = list.list_new()
+    i = 0
+    while i < list.list_size(env) {
+        e, _g = list.get_string(env, i)
+        if env_name_(e) != name { list.list_add(out, e) }
+        i = i + 1
+    }
+    list.list_add(out, "${name}=${value}")
+    return out
+}
+
+env_lookup_(env: ptr, name: string) -> (string, int) {
+    i = 0
+    while i < list.list_size(env) {
+        e, _g = list.get_string(env, i)
+        if env_name_(e) == name { return string.substring(e, string.length(name) + 1, string.length(e)), 1 }
+        i = i + 1
+    }
+    return "", 0
+}
+
+// The child's environment: the parent's without credentials, then the
+// selected key variable and the enabled MCP servers' variables put back.
+child_env_(c: *Ctx, cfg: ptr) -> ptr {
+    cc = cfg as *types.Config
+    source = c.env
+    if source == null { source = process.environ() }
+    source = env_set_(source, "NIB_AGENT_DEPTH", "${c.depth + 1}")
+    source = env_set_(source, "NIB_PARENT_SESSION_ID", c.session_id)
+    env = secrets.remove_from(source)
+    keep = list.list_new()
+    if cc.api_key_env != "" { list.list_add(keep, cc.api_key_env) }
+    i = 0
+    while i < list.list_size(cc.mcp_servers) {
+        m = list.list_get_raw(cc.mcp_servers, i) as *types.McpServer
+        if m.enabled == 1 {
+            k = 0
+            while k < list.list_size(m.env) {
+                n, _g = list.get_string(m.env, k)
+                list.list_add(keep, n)
+                k = k + 1
+            }
+            if m.header_env != "" { list.list_add(keep, m.header_env) }
+        }
+        i = i + 1
+    }
+    k2 = 0
+    while k2 < list.list_size(keep) {
+        name, _g2 = list.get_string(keep, k2)
+        value, found = env_lookup_(source, name)
+        if found == 1 { env = env_set_(env, name, value) }
+        k2 = k2 + 1
+    }
+    return env
+}
+
+finish_(t: *Tracker, c: *Ctx, state: string) {
+    pv = t.value as *progress.Progress
+    pv.state = state
+    publish_(t)
+    o = t.output as *Output
+    call(c.usage_fn, c.usage_ctx, o.usage)
+}
+
+// Runs the child for task `id` (upstream execute). background 1: the call
+// is a background job, which releases the registry itself. (1, result) or
+// (0, "Canceled" or another rejection).
+execute(cp: ptr, args: string, cancel: ptr, id: string, run_id: int, background: int, fork_input: string) -> (int, string) {
+    c = cp as *Ctx
+    ok, text = execute_(c, args, cancel, id, run_id, background, fork_input)
+    if background == 0 { agent_sessions.release(c.sessions, id) }
+    return ok, text
+}
+
+execute_(c: *Ctx, args: string, cancel: ptr, id: string, run_id: int, background: int, fork_input: string) -> (int, string) {
+    session = agent_sessions.session(c.sessions, id)
+    a = parse_args(args) as *Args
+    if c.cfg == null { return fail_("AgentConfigUnavailable") }
+    cfg = types.copy(c.cfg)
+    cc = cfg as *types.Config
+    if a.model != "" { cc.model = a.model }
+    if a.effort != "" {
+        ee = types.set_effort(cfg, a.effort)
+        if ee != "" { return fail_(ee) }
+    }
+    vp = progress.new_value(id, progress.KIND_AGENT, a.prompt, run_id)
+    pv = vp as *progress.Progress
+    pv.invocation = progress.current_invocation(c.progress, id)
+    pv.background = background
+    pv.fork = agent_sessions.is_fork(c.sessions, id)
+    op = new_output(id, session)
+    tp = new_tracker(c as ptr, vp, op)
+    t = tp as *Tracker
+    if canceled_(cancel) == 1 {
+        finish_(t, c, "canceled")
+        return fail_("Canceled")
+    }
+    l = cc.limits as *types.Limits
+    if gate_enter_(c, l.agent_concurrency, cancel) == 0 {
+        finish_(t, c, "canceled")
+        return fail_("Canceled")
+    }
+    publish_(t)
+    ok, text, state = run_child_(c, a, cfg, cancel, id, session, fork_input, t)
+    gate_leave_(c)
+    finish_(t, c, state)
+    return ok, text
+}
+
+run_child_(c: *Ctx, a: *Args, cfg: @keep ptr, cancel: ptr, id: string, session: string, fork_input: string, t: *Tracker) -> (int, string, string) {
+    cc = cfg as *types.Config
+    o = t.output as *Output
+    if c.session_id == "" { return 0, "MissingSessionId", "failed" }
+    env = child_env_(c, cfg)
+    if cc.api_key_env != "" || cc.key_source == "store" { cc.api_key = "" }
+    input = fork_input
+    if input == "" {
+        ip = agent_input.new_input(a.prompt, cfg) as *agent_input.Input
+        ip.undo_dir = c.undo_dir
+        input = agent_input.input_json(ip as ptr)
+    }
+    argv = list.list_new()
+    list.list_add(argv, c.self_exe)
+    list.list_add(argv, "ask")
+    list.list_add(argv, "--json")
+    list.list_add(argv, "--agent-input")
+    if session != "" {
+        list.list_add(argv, "--resume")
+        list.list_add(argv, session)
+    }
+    list.list_add(argv, "-")
+    started = os.now_monotonic_ms()
+    rp = process.run_lines(argv, env, input, cancel, a.timeout_ms, 500 as long, 67108864 as long, t as ptr, |ctx: ptr, line: string| {
+        tracker_line(ctx, line)
+    })
+    r = rp as *process.Result
+    elapsed = os.now_monotonic_ms() - started
+    if r.error != "" && r.error != "OutputLimit" {
+        if canceled_(cancel) == 1 { return 0, "Canceled", "canceled" }
+        return 1, result(t.output, elapsed, r.error, -1 as long), "failed"
+    }
+    if r.stop == "" {
+        out = r.output
+        last = -1
+        i = string.length(out) - 1
+        while i >= 0 {
+            if string.char_at(out, i) == 10 {
+                last = i
+                break
+            }
+            i = i - 1
+        }
+        tail = string.substring(out, last + 1, string.length(out))
+        if string.length(tail) > 0 { capture_(t, tail) }
+    }
+    pv = t.value as *progress.Progress
+    pv.usage = types.usage_json(o.usage)
+    if o.steps >= 0 { pv.step = o.steps }
+    if canceled_(cancel) == 1 || r.stop == process.STOP_CANCELED { return 0, "Canceled", "canceled" }
+    if r.stop == process.STOP_TIMED_OUT { return 1, result(t.output, elapsed, "stopped due to timeout", a.timeout_ms), "timed_out" }
+    reason = ""
+    if r.error == "OutputLimit" {
+        reason = "OutputLimit"
+    } else if r.exit_code != 0 {
+        reason = o.failure
+        if reason == "" { reason = "AgentFailed (process crashed or exited nonzero)" }
+    } else if o.failure != "" {
+        reason = o.failure
+    } else if o.ended == 0 {
+        reason = "MissingAgentResult"
+    }
+    if reason == "" { return 1, result(t.output, elapsed, "", -1 as long), "done" }
+    return 1, result(t.output, elapsed, reason, -1 as long), "failed"
+}

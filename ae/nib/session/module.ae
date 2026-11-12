@@ -48,6 +48,9 @@ import nib.session.profile
 import nib.session.instructions
 import nib.session.compact
 import nib.session.tool_summary
+import nib.session.fork_history
+import nib.tools.agent_input
+import nib.tools.agent_sessions
 
 exports(Session, Options, Sink, new_options, new_sink, init, turn, compact_now, close, error_message, timing_json, undo,
         VERSION)
@@ -65,6 +68,8 @@ struct Options {
     self_exe: string
     record_env: string       // NIB_RECORD
     undo_enabled: int        // the TUI's /undo (nib ask has none, as upstream)
+    fork: ptr                // *agent_input.Fork: a forked subagent's inherited history, or null
+    undo_dir: string         // a subagent's: the parent Turn's undo directory
 }
 
 struct Sink {
@@ -116,6 +121,8 @@ new_options(home: string, user_home: string) -> ptr {
     o.self_exe = ""
     o.record_env = ""
     o.undo_enabled = 0
+    o.fork = null
+    o.undo_dir = ""
     return o as ptr
 }
 
@@ -194,6 +201,13 @@ new_tools_(cp: @keep ptr, op: ptr) -> ptr {
 init(cp: @keep ptr, op: @keep ptr) -> (ptr, string, string) {
     c = cp as *types.Config
     o = op as *Options
+    if o.fork != null {
+        fk = o.fork as *agent_input.Fork
+        if o.resume_id != "" || o.continue_latest == 1 { return null, "ConflictingForkOptions", "" }
+        ferr = types.check_session(cp, fk.provider, fk.model)
+        if ferr != "" { return null, ferr, "" }
+        if c.custom_provider != fk.custom_provider { return null, "SessionProviderMismatch", "" }
+    }
     s = heap.new(Session)
     s.cfg = cp
     s.options = op
@@ -242,6 +256,7 @@ init(cp: @keep ptr, op: @keep ptr) -> (ptr, string, string) {
         s.cache_key = l.cache_key
         if s.cache_key == "" { s.cache_key = s.id }
         s.parent_session_id = l.parent_session_id
+        if l.forked_from != "" { (s.tools as *tools.Tools).forked = 1 }
         if s.parent_session_id != "" && (s.tools as *tools.Tools).depth < 1 { (s.tools as *tools.Tools).depth = 1 }
     } else {
         hex, _h = cryptography.random_hex(16)
@@ -250,10 +265,22 @@ init(cp: @keep ptr, op: @keep ptr) -> (ptr, string, string) {
         if cerr2 != "" { return null, cerr2, "" }
         s.log = lp2
         s.cache_key = s.id
-        ierr = initialize_history_(s, cwd)
-        if ierr != "" { return null, ierr, "" }
+        if o.fork != null {
+            ierr2 = initialize_fork_(s, o.fork, cwd)
+            if ierr2 != "" { return null, ierr2, "" }
+        } else {
+            ierr = initialize_history_(s, cwd)
+            if ierr != "" { return null, ierr, "" }
+        }
     }
     tools.set_config(s.tools, cp, s.id)
+    tt2 = s.tools as *tools.Tools
+    tt2.session_id = s.id
+    restore_agent_sessions_(s)
+    if o.undo_dir != "" {
+        tt2.undo_dir = o.undo_dir
+        tools.attach_turn_undo_dir(s.tools, o.undo_dir)
+    }
     if o.undo_enabled == 1 && s.parent_session_id == "" { tools.enable_undo(s.tools, "${directory}/${s.id}.undo") }
     attach_log_(s as ptr)
     return s as ptr, "", ""
@@ -280,6 +307,47 @@ attach_log_(sp: @keep ptr) {
         ev, _g = list.get_string(l.lost_background, i)
         v = jsonx.parse(ev)
         if v != null { background.enqueue_lost(t.background, string.copy(jsonx.str_or(v, "id", "")), string.copy(jsonx.str_or(v, "kind", "bash"))) }
+        jsonx.free(v)
+        i = i + 1
+    }
+}
+
+// The child of a fork: the parent's history up to its Step, under the
+// parent's cache key (upstream Session.init with options.fork).
+initialize_fork_(s: *Session, fp: ptr, cwd: string) -> string {
+    c = s.cfg as *types.Config
+    o = s.options as *Options
+    f = fp as *agent_input.Fork
+    t = s.tools as *tools.Tools
+    s.cache_key = f.cache_key
+    t.forked = 1
+    if t.depth < 1 { t.depth = 1 }
+    s.parent_session_id = o.parent_session_id
+    if s.parent_session_id == "" { s.parent_session_id = f.session }
+    tools.import_versions(s.tools, f.file_versions)
+    msgs, herr = fork_history.inherit(f.history, f.message_count, f.id, f.session)
+    if herr != "" { return herr }
+    members = ",\"cwd\":${jsonx.quote(cwd)},\"provider\":${jsonx.quote(c.provider)}"
+    if c.custom_provider != "" { members = "${members},\"custom_provider\":${jsonx.quote(c.custom_provider)}" }
+    members = "${members},\"model\":${jsonx.quote(c.model)},\"parent_session_id\":${jsonx.quote(s.parent_session_id)},\"cache_key\":${jsonx.quote(s.cache_key)}"
+    members = "${members},\"forked_from\":{\"session\":${jsonx.quote(f.session)},\"message_count\":${f.message_count}},\"nib_version\":${jsonx.quote(VERSION)}"
+    tokens = compact.estimate_tokens(msgs, 0, list.list_size(msgs))
+    return log.commit(s.log, s.history, 0, msgs, tokens, members, 1)
+}
+
+// Agent task ids the log maps to child Sessions (resume continues them).
+restore_agent_sessions_(s: *Session) {
+    t = s.tools as *tools.Tools
+    l = s.log as *log.Log
+    i = 0
+    while i < list.list_size(l.agent_sessions) {
+        text, _g = list.get_string(l.agent_sessions, i)
+        v = jsonx.parse(text)
+        if v != null {
+            id = string.copy(jsonx.str_or(v, "id", ""))
+            agent_sessions.add(t.agent_sessions, id, string.copy(jsonx.str_or(v, "session", "")), 0)
+            agent_sessions.set_fork(t.agent_sessions, id, jsonx.bool_or(v, "fork", 0))
+        }
         jsonx.free(v)
         i = i + 1
     }
@@ -528,6 +596,25 @@ struct Fwd {
     model: ptr            // the Step's provider timing model
 }
 
+// What tools.agent({fork: true}) copies: the history through this Step's
+// assistant message, with the Session's identity and reasoning settings.
+fork_snapshot_(s: *Session, pending: ptr) -> ptr {
+    c = s.cfg as *types.Config
+    fp = agent_input.new_fork()
+    f = fp as *agent_input.Fork
+    f.history = fork_history.snapshot(s.history, pending)
+    f.message_count = list.list_size(f.history)
+    f.session = s.id
+    f.cache_key = s.cache_key
+    f.provider = c.provider
+    f.custom_provider = c.custom_provider
+    f.model = c.model
+    f.thinking = c.thinking
+    f.reasoning_effort = c.reasoning_effort
+    f.file_versions = tools.export_versions(s.tools)
+    return fp
+}
+
 // Delivers finished (or lost) background bash results as user messages before
 // the next request (upstream inbox insert / insertBackground, bash only).
 // include_detached 0: only jobs a Turn waits for (the step-limit wait).
@@ -771,7 +858,10 @@ run_steps_(s: *Session, pending: ptr, sk: @keep ptr, cancel: @keep ptr) -> (stri
             return finish_step_limit_(s, pending, sk, cancel, lim.max_steps)
         }
         size = (s.log as *log.Log).context_tokens + compact.estimate_tokens(pending, 0, list.list_size(pending))
-        if size >= c.context_window - c.context_window / 4 && size >= s.compact_backoff {
+        // The first fork request must send the inherited cache prefix before compaction can rewrite it.
+        first_fork = 0
+        if t.forked == 1 && (s.log as *log.Log).steps == 0 { first_fork = 1 }
+        if first_fork == 0 && size >= c.context_window - c.context_window / 4 && size >= s.compact_backoff {
             cerr, cdetail = compact_now(s as ptr, sk, cancel, 1)
             if cerr != "" { return cerr, cdetail }
         }
@@ -835,6 +925,7 @@ run_steps_(s: *Session, pending: ptr, sk: @keep ptr, cancel: @keep ptr) -> (stri
         wflag = -1
         if waiting == 1 { wflag = 1 }
         list.list_add(pending, msg.assistant(r.text, r.tool_calls, r.reasoning_provider, r.reasoning_data, r.reasoning_includes_output, r.phase, wflag, effort))
+        if ncalls > 0 && t.depth == 0 && t.forked == 0 { t.fork_snapshot = fork_snapshot_(s, pending) }
         run = timing.new()
         timing.set_detail(run, 1)
         run_results = "["
@@ -868,6 +959,7 @@ run_steps_(s: *Session, pending: ptr, sk: @keep ptr, cancel: @keep ptr) -> (stri
             k = k + 1
         }
         run_results = "${run_results}]"
+        t.fork_snapshot = null
         if empty_runs == 1 && background.pending(t.background) == 1 {
             waiting = 1
             am, _g3 = list.get_string(pending, assistant_index)

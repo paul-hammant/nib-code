@@ -754,6 +754,8 @@ stream(cp: ptr, cache_key: string, messages: ptr, tools_json: string, max_tokens
     if herr != "" { return fail_(herr, timeout_detail_(r, herr)) }
     if status < 200 || status > 299 {
         detail = "${types.name(cp)}: HTTP ${status}; check ${types.key_hint(cp)}."
+        // Upstream's wording for every Responses service.
+        if status != 401 { detail = "Codex request failed (HTTP ${status})" }
         if status == 429 || status >= 500 { return fail_("HttpTransient", detail) }
         return fail_("HttpStatus", detail)
     }

@@ -19,6 +19,7 @@ import nib.sandbox
 import nib.tools
 import nib.tools.jail
 import nib.tools.background
+import nib.tools.agent_input
 import nib.provider.types
 import nib.config
 import nib.config.env
@@ -280,11 +281,28 @@ main() {
         eprint_("nib: the TUI is not ported yet; use nib ask '<prompt>' · run nib --help\n")
         exit(2)
     }
-    if a.agent_input == 1 { fail_(a.json, "AgentInputNotPorted", "subagents (--agent-input) are not ported yet", zero_usage_(), 0, "") }
     home, herr = config.home(envp)
     if herr != "" { fail_(a.json, herr, "", zero_usage_(), 0, "") }
-    cfg, cerr, cdetail = config.load(envp, home)
-    if cerr != "" { fail_(a.json, cerr, cdetail, zero_usage_(), 0, "") }
+    cfg = null
+    fork = null
+    undo_dir = ""
+    if a.agent_input == 1 {
+        // A subagent: prompt, Config and fork come from the parent on stdin.
+        ip, ierr = agent_input.parse(read_stdin_())
+        if ierr != "" { fail_(a.json, ierr, "", zero_usage_(), 0, "") }
+        input = ip as *agent_input.Input
+        cfg = input.config
+        ic = cfg as *types.Config
+        if ic.api_key_env != "" { ic.api_key = env.get(envp, ic.api_key_env) }
+        config.apply_store(home, cfg)
+        a.prompt = input.prompt
+        fork = input.fork
+        undo_dir = input.undo_dir
+    } else {
+        lcfg, cerr, cdetail = config.load(envp, home)
+        if cerr != "" { fail_(a.json, cerr, cdetail, zero_usage_(), 0, "") }
+        cfg = lcfg
+    }
     c = cfg as *types.Config
     if a.has_effort == 1 {
         eerr = types.set_effort(cfg, a.effort)
@@ -307,11 +325,13 @@ main() {
     depth_text = env.get(envp, "NIB_AGENT_DEPTH")
     if depth_text != "" { o.depth = jsonx.long_of(depth_text) as int }
     o.self_exe = self_exe_()
+    o.fork = fork
+    o.undo_dir = undo_dir
     sp, serr, sdetail = session.init(cfg, op)
     if serr != "" { fail_(a.json, serr, sdetail, zero_usage_(), 0, "") }
     s = sp as *session.Session
     prompt_text = a.prompt
-    if prompt_text == "-" { prompt_text = read_stdin_() }
+    if a.agent_input == 0 && prompt_text == "-" { prompt_text = read_stdin_() }
     if a.json == 1 { jline_("{\"start\":{\"session_id\":${jsonx.quote(s.id)}}}") }
     cancel = sync.atomic_new(0)
     sysgap.watch_signals()

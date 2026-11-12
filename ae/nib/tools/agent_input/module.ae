@@ -1,0 +1,319 @@
+// tools.agent_input: what a parent nib writes to a child's stdin for
+// `nib ask --json --agent-input -` (upstream src/tools/agent/input.zig): the
+// prompt, the parent's provider Config, an optional fork of the parent's
+// history, and the parent Turn's undo directory. Both ends are this binary,
+// so the Config's spelling is the port's own: one member per types.Config
+// field, nulls left out. Upstream's ?T fields read back as their "none"
+// values (-1, "") when absent.
+
+import std.json
+import std.list
+import std.string
+import std.strbuilder
+import nib.jsonx
+import nib.provider.types
+
+exports(Fork, Input, new_fork, new_input, config_json, config_from, fork_json, fork_from,
+        input_json, parse, Observation, new_observation)
+
+// One remembered file version (upstream file_state.Observation).
+struct Observation {
+    path: string
+    inode: long
+    size: long
+    mtime: long
+}
+
+struct Fork {
+    session: string
+    message_count: int
+    history: ptr             // list of message JSON texts (nib.msg)
+    cache_key: string
+    id: string
+    provider: string
+    custom_provider: string  // "" none
+    model: string
+    thinking: int            // -1 none
+    reasoning_effort: string // "" none
+    file_versions: ptr       // list of *Observation
+}
+
+struct Input {
+    prompt: string
+    config: ptr              // *types.Config
+    fork: ptr                // *Fork or null
+    undo_dir: string         // "" none
+}
+
+new_observation(path: string, inode: long, size: long, mtime: long) -> ptr {
+    o = heap.new(Observation)
+    o.path = path
+    o.inode = inode
+    o.size = size
+    o.mtime = mtime
+    return o as ptr
+}
+
+new_fork() -> ptr {
+    f = heap.new(Fork)
+    f.session = ""
+    f.message_count = 0
+    f.history = list.list_new()
+    f.cache_key = ""
+    f.id = ""
+    f.provider = ""
+    f.custom_provider = ""
+    f.model = ""
+    f.thinking = -1
+    f.reasoning_effort = ""
+    f.file_versions = list.list_new()
+    return f as ptr
+}
+
+new_input(prompt: string, cfg: @keep ptr) -> ptr {
+    i = heap.new(Input)
+    i.prompt = prompt
+    i.config = cfg
+    i.fork = null
+    i.undo_dir = ""
+    return i as ptr
+}
+
+strings_json_(l: ptr) -> string {
+    b = strbuilder.new(64)
+    strbuilder.append(b, "[")
+    i = 0
+    while i < list.list_size(l) {
+        s, _g = list.get_string(l, i)
+        if i > 0 { strbuilder.append(b, ",") }
+        strbuilder.append(b, jsonx.quote(s))
+        i = i + 1
+    }
+    strbuilder.append(b, "]")
+    return strbuilder.finish(b)
+}
+
+strings_from_(v: ptr, key: string) -> ptr {
+    out = list.list_new()
+    a = jsonx.field(v, key)
+    n = jsonx.array_size(a)
+    i = 0
+    while i < n {
+        list.list_add(out, string.copy(jsonx.str_field(jsonx.array_at(a, i))))
+        i = i + 1
+    }
+    return out
+}
+
+opt_bool_(name: string, n: int) -> string {
+    if n < 0 { return "" }
+    if n == 0 { return ",\"${name}\":false" }
+    return ",\"${name}\":true"
+}
+
+opt_bool_from_(v: ptr, key: string) -> int {
+    if jsonx.kind(v, key) != json.JSON_BOOL { return -1 }
+    return jsonx.bool_or(v, key, 0)
+}
+
+opt_str_(name: string, s: string) -> string {
+    if s == "" { return "" }
+    return ",\"${name}\":${jsonx.quote(s)}"
+}
+
+limits_json_(lp: ptr) -> string {
+    l = lp as *types.Limits
+    out = "{\"llm_concurrency\":${l.llm_concurrency},\"llm_calls_per_run\":${l.llm_calls_per_run},\"llm_input_kib\":${l.llm_input_kib},\"agent_concurrency\":${l.agent_concurrency}"
+    if l.max_steps >= 0 { out = "${out},\"max_steps\":${l.max_steps}" }
+    return "${out},\"stream_idle_timeout_s\":${l.stream_idle_timeout_s},\"stream_content_timeout_s\":${l.stream_content_timeout_s},\"request_timeout_s\":${l.request_timeout_s},\"run_background_after_ms\":${l.run_background_after_ms},\"run_output_bytes\":${l.run_output_bytes}}"
+}
+
+limits_from_(v: ptr) -> ptr {
+    lp = types.new_limits()
+    l = lp as *types.Limits
+    if v == null { return lp }
+    l.llm_concurrency = jsonx.int_or(v, "llm_concurrency", l.llm_concurrency)
+    l.llm_calls_per_run = jsonx.int_or(v, "llm_calls_per_run", l.llm_calls_per_run)
+    l.llm_input_kib = jsonx.int_or(v, "llm_input_kib", l.llm_input_kib)
+    l.agent_concurrency = jsonx.int_or(v, "agent_concurrency", l.agent_concurrency)
+    l.max_steps = jsonx.int_or(v, "max_steps", -1)
+    l.stream_idle_timeout_s = jsonx.int_or(v, "stream_idle_timeout_s", l.stream_idle_timeout_s)
+    l.stream_content_timeout_s = jsonx.int_or(v, "stream_content_timeout_s", l.stream_content_timeout_s)
+    l.request_timeout_s = jsonx.int_or(v, "request_timeout_s", l.request_timeout_s)
+    l.run_background_after_ms = jsonx.int_or(v, "run_background_after_ms", l.run_background_after_ms)
+    l.run_output_bytes = jsonx.int_or(v, "run_output_bytes", l.run_output_bytes)
+    return lp
+}
+
+bool_text_(n: int) -> string {
+    if n != 0 { return "true" }
+    return "false"
+}
+
+mcp_server_json_(mp: ptr) -> string {
+    m = mp as *types.McpServer
+    out = "{\"id\":${jsonx.quote(m.id)}${opt_str_("command", m.command)}${opt_str_("url", m.url)},\"args\":${strings_json_(m.args)},\"env\":${strings_json_(m.env)}${opt_str_("header_env", m.header_env)}"
+    return "${out},\"enabled\":${bool_text_(m.enabled)},\"line\":${m.line}}"
+}
+
+mcp_server_from_(v: ptr) -> ptr {
+    mp = types.mcp_server_new(string.copy(jsonx.str_or(v, "id", "")))
+    m = mp as *types.McpServer
+    m.command = string.copy(jsonx.str_or(v, "command", ""))
+    m.url = string.copy(jsonx.str_or(v, "url", ""))
+    m.args = strings_from_(v, "args")
+    m.env = strings_from_(v, "env")
+    m.header_env = string.copy(jsonx.str_or(v, "header_env", ""))
+    m.enabled = jsonx.bool_or(v, "enabled", 0)
+    m.line = jsonx.int_or(v, "line", 1)
+    return mp
+}
+
+// The Config as one JSON object.
+config_json(cp: ptr) -> string {
+    c = cp as *types.Config
+    b = strbuilder.new(1024)
+    strbuilder.append(b, "{\"provider\":${jsonx.quote(c.provider)},\"base_url\":${jsonx.quote(c.base_url)},\"api_key\":${jsonx.quote(c.api_key)},\"model\":${jsonx.quote(c.model)}")
+    strbuilder.append(b, ",\"context_window\":${c.context_window}${opt_bool_("thinking", c.thinking)}${opt_str_("reasoning_effort", c.reasoning_effort)}")
+    strbuilder.append(b, "${opt_str_("output_schema", c.output_schema)}${opt_str_("prompt_cache_key", c.prompt_cache_key)}")
+    strbuilder.append(b, ",\"simple\":${bool_text_(c.simple)}${opt_str_("open", c.open)},\"sandbox_workspace\":${bool_text_(c.sandbox_workspace)},\"sandbox_writable\":${strings_json_(c.sandbox_writable)}")
+    strbuilder.append(b, ",\"hooks_after_edit\":${strings_json_(c.hooks_after_edit)},\"hooks_turn_end\":${strings_json_(c.hooks_turn_end)},\"enabled_skills\":${strings_json_(c.enabled_skills)}")
+    strbuilder.append(b, ",\"limits\":${limits_json_(c.limits)}${opt_str_("custom_provider", c.custom_provider)},\"custom_protocol\":${jsonx.quote(c.custom_protocol)}${opt_bool_("custom_vision", c.custom_vision)}")
+    if c.custom_max_output >= 0 { strbuilder.append(b, ",\"custom_max_output\":${c.custom_max_output}") }
+    strbuilder.append(b, "${opt_str_("api_key_env", c.api_key_env)},\"key_source\":${jsonx.quote(c.key_source)}${opt_str_("nib_home", c.nib_home)},\"reasoning_summary\":${jsonx.quote(c.reasoning_summary)}")
+    strbuilder.append(b, ",\"mcp_servers\":[")
+    i = 0
+    while i < list.list_size(c.mcp_servers) {
+        if i > 0 { strbuilder.append(b, ",") }
+        strbuilder.append(b, mcp_server_json_(list.list_get_raw(c.mcp_servers, i)))
+        i = i + 1
+    }
+    strbuilder.append(b, "]}")
+    return strbuilder.finish(b)
+}
+
+// A Config from config_json's object (a parsed value), or null when it is
+// not an object with string provider/base_url/api_key/model.
+config_from(v: ptr) -> ptr {
+    if v == null || json.json_type(v) != json.JSON_OBJECT { return null }
+    if jsonx.kind(v, "base_url") != json.JSON_STRING || jsonx.kind(v, "api_key") != json.JSON_STRING || jsonx.kind(v, "model") != json.JSON_STRING { return null }
+    cp = types.new_config(string.copy(jsonx.str_or(v, "provider", "chat_completions")), string.copy(jsonx.str_or(v, "base_url", "")), string.copy(jsonx.str_or(v, "api_key", "")), string.copy(jsonx.str_or(v, "model", "")))
+    c = cp as *types.Config
+    c.context_window = jsonx.long_or(v, "context_window", c.context_window)
+    c.thinking = opt_bool_from_(v, "thinking")
+    c.reasoning_effort = string.copy(jsonx.str_or(v, "reasoning_effort", ""))
+    c.output_schema = string.copy(jsonx.str_or(v, "output_schema", ""))
+    c.prompt_cache_key = string.copy(jsonx.str_or(v, "prompt_cache_key", ""))
+    c.simple = jsonx.bool_or(v, "simple", 0)
+    c.open = string.copy(jsonx.str_or(v, "open", ""))
+    c.sandbox_workspace = jsonx.bool_or(v, "sandbox_workspace", 0)
+    c.sandbox_writable = strings_from_(v, "sandbox_writable")
+    c.hooks_after_edit = strings_from_(v, "hooks_after_edit")
+    c.hooks_turn_end = strings_from_(v, "hooks_turn_end")
+    c.enabled_skills = strings_from_(v, "enabled_skills")
+    c.limits = limits_from_(jsonx.field(v, "limits"))
+    c.custom_provider = string.copy(jsonx.str_or(v, "custom_provider", ""))
+    c.custom_protocol = string.copy(jsonx.str_or(v, "custom_protocol", "chat_completions"))
+    c.custom_vision = opt_bool_from_(v, "custom_vision")
+    c.custom_max_output = jsonx.long_or(v, "custom_max_output", -1 as long)
+    c.api_key_env = string.copy(jsonx.str_or(v, "api_key_env", ""))
+    c.key_source = string.copy(jsonx.str_or(v, "key_source", "none"))
+    c.nib_home = string.copy(jsonx.str_or(v, "nib_home", ""))
+    c.reasoning_summary = string.copy(jsonx.str_or(v, "reasoning_summary", "off"))
+    ms = jsonx.field(v, "mcp_servers")
+    i = 0
+    while i < jsonx.array_size(ms) {
+        list.list_add(c.mcp_servers, mcp_server_from_(jsonx.array_at(ms, i)))
+        i = i + 1
+    }
+    return cp
+}
+
+fork_json(fp: ptr) -> string {
+    f = fp as *Fork
+    b = strbuilder.new(4096)
+    strbuilder.append(b, "{\"session\":${jsonx.quote(f.session)},\"message_count\":${f.message_count},\"history\":[")
+    i = 0
+    while i < list.list_size(f.history) {
+        m, _g = list.get_string(f.history, i)
+        if i > 0 { strbuilder.append(b, ",") }
+        strbuilder.append(b, m)
+        i = i + 1
+    }
+    strbuilder.append(b, "],\"cache_key\":${jsonx.quote(f.cache_key)},\"id\":${jsonx.quote(f.id)},\"provider\":${jsonx.quote(f.provider)}${opt_str_("custom_provider", f.custom_provider)},\"model\":${jsonx.quote(f.model)}")
+    strbuilder.append(b, "${opt_bool_("thinking", f.thinking)}${opt_str_("reasoning_effort", f.reasoning_effort)},\"file_versions\":[")
+    k = 0
+    while k < list.list_size(f.file_versions) {
+        o = list.list_get_raw(f.file_versions, k) as *Observation
+        if k > 0 { strbuilder.append(b, ",") }
+        strbuilder.append(b, "{\"path\":${jsonx.quote(o.path)},\"version\":{\"inode\":${o.inode},\"size\":${o.size},\"mtime\":${o.mtime}}}")
+        k = k + 1
+    }
+    strbuilder.append(b, "]}")
+    return strbuilder.finish(b)
+}
+
+// A Fork from fork_json's object, or null when a required member is missing.
+fork_from(v: ptr) -> ptr {
+    if v == null || json.json_type(v) != json.JSON_OBJECT { return null }
+    if jsonx.kind(v, "session") != json.JSON_STRING || jsonx.kind(v, "history") != json.JSON_ARRAY || jsonx.kind(v, "message_count") != json.JSON_NUMBER { return null }
+    fp = new_fork()
+    f = fp as *Fork
+    f.session = string.copy(jsonx.str_or(v, "session", ""))
+    f.message_count = jsonx.int_or(v, "message_count", 0)
+    h = jsonx.field(v, "history")
+    i = 0
+    while i < jsonx.array_size(h) {
+        list.list_add(f.history, jsonx.encode(jsonx.array_at(h, i)))
+        i = i + 1
+    }
+    f.cache_key = string.copy(jsonx.str_or(v, "cache_key", ""))
+    f.id = string.copy(jsonx.str_or(v, "id", ""))
+    f.provider = string.copy(jsonx.str_or(v, "provider", ""))
+    f.custom_provider = string.copy(jsonx.str_or(v, "custom_provider", ""))
+    f.model = string.copy(jsonx.str_or(v, "model", ""))
+    f.thinking = opt_bool_from_(v, "thinking")
+    f.reasoning_effort = string.copy(jsonx.str_or(v, "reasoning_effort", ""))
+    fv = jsonx.field(v, "file_versions")
+    k = 0
+    while k < jsonx.array_size(fv) {
+        e = jsonx.array_at(fv, k)
+        ver = jsonx.field(e, "version")
+        list.list_add(f.file_versions, new_observation(string.copy(jsonx.str_or(e, "path", "")), jsonx.long_or(ver, "inode", 0 as long), jsonx.long_or(ver, "size", 0 as long), jsonx.long_or(ver, "mtime", 0 as long)))
+        k = k + 1
+    }
+    return fp
+}
+
+input_json(ip: ptr) -> string {
+    i = ip as *Input
+    out = "{\"prompt\":${jsonx.quote(i.prompt)},\"config\":${config_json(i.config)}"
+    if i.fork != null { out = "${out},\"fork\":${fork_json(i.fork)}" }
+    return "${out}${opt_str_("undo_dir", i.undo_dir)}}"
+}
+
+// (input, "") or (null, "InvalidAgentInput").
+parse(text: string) -> (ptr, string) {
+    v = jsonx.parse(text)
+    if v == null || jsonx.kind(v, "prompt") != json.JSON_STRING {
+        jsonx.free(v)
+        return null, "InvalidAgentInput"
+    }
+    cp = config_from(jsonx.field(v, "config"))
+    if cp == null {
+        jsonx.free(v)
+        return null, "InvalidAgentInput"
+    }
+    ip = new_input(string.copy(jsonx.str_or(v, "prompt", "")), cp)
+    i = ip as *Input
+    if jsonx.has(v, "fork") == 1 && jsonx.kind(v, "fork") != json.JSON_NULL {
+        i.fork = fork_from(jsonx.field(v, "fork"))
+        if i.fork == null {
+            jsonx.free(v)
+            return null, "InvalidAgentInput"
+        }
+    }
+    i.undo_dir = string.copy(jsonx.str_or(v, "undo_dir", ""))
+    jsonx.free(v)
+    return ip, ""
+}

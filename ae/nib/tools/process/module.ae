@@ -12,9 +12,11 @@ import std.list
 import std.sync
 import std.worker
 import std.cryptography
+import std.ipc
+import std.io
 import nib.sysgap
 
-exports(Result, run, run_ticking, STOP_NONE, STOP_CANCELED, STOP_TIMED_OUT)
+exports(Result, run, run_ticking, run_lines, environ, STOP_NONE, STOP_CANCELED, STOP_TIMED_OUT)
 
 const STOP_NONE = ""
 const STOP_CANCELED = "Canceled"
@@ -28,6 +30,9 @@ struct Result {
     start_ms_epoch: long
     end_ms_epoch: long
 }
+
+// This process's environment as "NAME=value" strings.
+environ() -> ptr { return sysgap.environ() }
 
 struct Waiter {
     token: int
@@ -125,5 +130,139 @@ run_ticking(argv: ptr, env: ptr, cancel_a: ptr, cancel_b: ptr, timeout_ms: long,
         if rerr == "" { r.output = data }
     }
     sysgap.unlink(out_path)
+    return r as ptr
+}
+
+// ---- a child nib (tools.agent): stdin input, stdout lines as they come ----
+
+struct Feeder {
+    fd: int
+    input: string
+    done: ptr
+}
+
+// Starts argv with `input` on its stdin and stdout read as it arrives:
+// line(line_ctx, text) for each complete line (newline removed) before the
+// child exits, the whole output kept in Result.output. Stderr is this
+// process's. Cancel or the deadline (timeout_ms 0: none) sends TERM, then
+// KILL after grace_ms. After exit, output is drained for at most 500 ms
+// (a descendant may hold the pipe). exit_code is the status (128+n after a
+// signal); error "OutputLimit" past max_output, or the spawn error.
+run_lines(argv: ptr, env: ptr, input: string, cancel: ptr, timeout_ms: long, grace_ms: long, max_output: long, line_ctx: @keep ptr, line: @keep fn) -> ptr {
+    r = heap.new(Result)
+    r.exit_code = -1
+    r.stop = ""
+    r.output = ""
+    r.error = ""
+    r.start_ms_epoch = os.now_unix_ms()
+    r.end_ms_epoch = 0
+    prog, _e = list.get_string(argv, 0)
+    rest = list.list_new()
+    i = 1
+    while i < list.list_size(argv) {
+        a, _e2 = list.get_string(argv, i)
+        list.list_add(rest, a)
+        i = i + 1
+    }
+    to_fd, from_fd, pid, serr = os.run_stdio(prog, rest, env)
+    if serr != "" {
+        r.error = serr
+        return r as ptr
+    }
+    f = heap.new(Feeder)
+    f.fd = to_fd
+    f.input = input
+    f.done = sync.atomic_new(0)
+    fp = f as ptr
+    worker.run_detached(|| {
+        ff = fp as *Feeder
+        ipc.write(ff.fd, ff.input)
+        io.fd_close(ff.fd)
+        sync.atomic_store(ff.done, 1)
+        return null
+    })
+    w = heap.new(Waiter)
+    w.token = pid
+    w.done = sync.atomic_new(0)
+    w.code = -1
+    wp = w as ptr
+    worker.run_detached(|| {
+        ww = wp as *Waiter
+        code, _we = os.wait_pid(ww.token)
+        ww.code = code
+        sync.atomic_store(ww.done, 1)
+        return null
+    })
+    deadline = 0 as long
+    if timeout_ms > 0 { deadline = os.now_monotonic_ms() + timeout_ms }
+    term_at = 0 as long
+    killed = 0
+    exited_at = 0 as long
+    buffer = ""
+    total = ""
+    while true {
+        now = os.now_monotonic_ms()
+        if sync.atomic_load(w.done) != 0 {
+            if exited_at == 0 { exited_at = now }
+        } else if r.stop == "" && r.error == "" {
+            if set_(cancel) == 1 {
+                r.stop = STOP_CANCELED
+            } else if deadline != 0 && now >= deadline {
+                r.stop = STOP_TIMED_OUT
+            }
+            if r.stop != "" {
+                os.kill(pid, 15)
+                term_at = now
+            }
+        }
+        if term_at > 0 && killed == 0 && sync.atomic_load(w.done) == 0 && now - term_at >= grace_ms {
+            os.kill(pid, 9)
+            killed = 1
+        }
+        if exited_at > 0 && now - exited_at > 500 { break }
+        ready, _rerr = ipc.wait_readable(from_fd, 20)
+        if ready == 1 {
+            data, derr = ipc.read(from_fd, 65536)
+            if derr != "" || string.length(data) == 0 { break }
+            total = "${total}${data}"
+            if string.length(total) > max_output {
+                r.error = "OutputLimit"
+                os.kill(pid, 9)
+                killed = 1
+                break
+            }
+            buffer = "${buffer}${data}"
+            nl = string.index_of(buffer, "\n")
+            while nl >= 0 {
+                text = string.substring(buffer, 0, nl)
+                call(line, line_ctx, text)
+                buffer = string.substring(buffer, nl + 1, string.length(buffer))
+                nl = string.index_of(buffer, "\n")
+            }
+        }
+    }
+    while sync.atomic_load(w.done) == 0 {
+        now2 = os.now_monotonic_ms()
+        if r.stop == "" && r.error == "" {
+            if set_(cancel) == 1 {
+                r.stop = STOP_CANCELED
+            } else if deadline != 0 && now2 >= deadline {
+                r.stop = STOP_TIMED_OUT
+            }
+            if r.stop != "" {
+                os.kill(pid, 15)
+                term_at = now2
+            }
+        }
+        if term_at > 0 && killed == 0 && now2 - term_at >= grace_ms {
+            os.kill(pid, 9)
+            killed = 1
+        }
+        sleep(10)
+    }
+    io.fd_close(from_fd)
+    r.end_ms_epoch = os.now_unix_ms()
+    r.exit_code = w.code
+    r.output = total
     return r as ptr
 }

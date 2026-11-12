@@ -1,0 +1,130 @@
+// tools.agent_sessions: which child Session each agent task id (a1, a2, …)
+// continues, whether it is a fork, and whether a call holds it now
+// (upstream src/tools/agent/sessions.zig). One Registry per Tools.
+// Errors are upstream's names: AgentBusy, AgentNotFound, NotSessionAgent,
+// AgentSessionUnavailable, AgentSessionMismatch.
+
+import std.list
+import std.string
+import nib.lock
+
+exports(Registry, Entry, new, add, set_fork, is_fork, reserve, release, session, bind)
+
+struct Entry {
+    id: string
+    session: string      // "" none yet
+    busy: int
+    fork: int
+}
+
+struct Registry {
+    guard: ptr
+    entries: ptr         // list of *Entry
+}
+
+new() -> ptr {
+    r = heap.new(Registry)
+    r.guard = lock.new()
+    r.entries = list.list_new()
+    return r as ptr
+}
+
+find_(r: *Registry, id: string) -> ptr {
+    i = 0
+    while i < list.list_size(r.entries) {
+        e = list.list_get_raw(r.entries, i) as *Entry
+        if e.id == id { return e as ptr }
+        i = i + 1
+    }
+    return null
+}
+
+add(rp: ptr, id: string, child: string, busy: int) {
+    r = rp as *Registry
+    e = heap.new(Entry)
+    e.id = string.copy(id)
+    e.session = string.copy(child)
+    e.busy = busy
+    e.fork = 0
+    lock.acquire(r.guard)
+    list.list_add(r.entries, e as ptr)
+    lock.release(r.guard)
+}
+
+set_fork(rp: ptr, id: string, fork: int) {
+    r = rp as *Registry
+    lock.acquire(r.guard)
+    ep = find_(r, id)
+    if ep != null { (ep as *Entry).fork = fork }
+    lock.release(r.guard)
+}
+
+is_fork(rp: ptr, id: string) -> int {
+    r = rp as *Registry
+    lock.acquire(r.guard)
+    n = 0
+    ep = find_(r, id)
+    if ep != null { n = (ep as *Entry).fork }
+    lock.release(r.guard)
+    return n
+}
+
+// Marks id busy for one call. "" or the error name.
+reserve(rp: ptr, id: string) -> string {
+    r = rp as *Registry
+    if string.starts_with(id, "a") == 0 { return "NotSessionAgent" }
+    lock.acquire(r.guard)
+    ep = find_(r, id)
+    err = "AgentNotFound"
+    if ep != null {
+        e = ep as *Entry
+        if e.busy == 1 {
+            err = "AgentBusy"
+        } else if e.session == "" {
+            err = "AgentSessionUnavailable"
+        } else {
+            e.busy = 1
+            err = ""
+        }
+    }
+    lock.release(r.guard)
+    return err
+}
+
+release(rp: ptr, id: string) {
+    r = rp as *Registry
+    lock.acquire(r.guard)
+    ep = find_(r, id)
+    if ep != null { (ep as *Entry).busy = 0 }
+    lock.release(r.guard)
+}
+
+// The child Session id of id, "" none.
+session(rp: ptr, id: string) -> string {
+    r = rp as *Registry
+    lock.acquire(r.guard)
+    s = ""
+    ep = find_(r, id)
+    if ep != null { s = string.copy((ep as *Entry).session) }
+    lock.release(r.guard)
+    return s
+}
+
+// Records id's child Session. "" or AgentSessionMismatch / AgentNotFound.
+bind(rp: ptr, id: string, child: string) -> string {
+    r = rp as *Registry
+    lock.acquire(r.guard)
+    ep = find_(r, id)
+    err = "AgentNotFound"
+    if ep != null {
+        e = ep as *Entry
+        err = ""
+        if e.session == "" {
+            e.session = string.copy(child)
+        } else if e.session != child {
+            err = "AgentSessionMismatch"
+        }
+    }
+    lock.release(r.guard)
+    return err
+}

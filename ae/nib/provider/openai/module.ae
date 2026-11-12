@@ -6,8 +6,8 @@
 //
 // Errors are names (upstream's error set) with a detail text:
 // HttpStatus, HttpTransient, InvalidResponse, IncompleteResponse,
-// TooManyToolCalls, Canceled, the http timeouts, Transport. The HTTP status
-// detail never echoes the response body. Images are not ported: a message's
+// TooManyToolCalls, Canceled, the http timeouts, Transport. A 401 names the
+// key to check; other HTTP statuses carry the response body (64 KiB at most), as upstream. Images are not ported: a message's
 // `images` are not sent.
 
 import std.json
@@ -260,6 +260,11 @@ stream(cp: ptr, messages: ptr, tools_json: string, max_tokens: int, sk: @keep pt
     if herr != "" { return fail_(herr, timeout_detail_(r, herr)) }
     if status < 200 || status > 299 {
         detail = "${types.name(cp)}: HTTP ${status}; check ${types.key_hint(cp)}."
+        if status != 401 {
+            text, _rerr = http.read_rest(r, cancel)
+            if string.length(text) > 65536 { text = string.substring(text, 0, 65536) }
+            detail = "HTTP ${status}: ${text}"
+        }
         if status == 429 || status >= 500 { return fail_("HttpTransient", detail) }
         return fail_("HttpStatus", detail)
     }
