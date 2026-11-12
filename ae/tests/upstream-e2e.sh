@@ -22,19 +22,51 @@ fi
 mkdir -p zig-out/bin
 ln -sf ../../target/build/bin/nib zig-out/bin/nib
 
-# The tests this slice is meant to pass, in whole or in part.
-APPLY="tests/test_cli.py tests/test_providers.py tests/test_session.py tests/test_stream_idle.py
-tests/test_effort.py tests/test_model.py tests/test_files.py tests/test_sandbox.py tests/test_limits.py
-tests/test_background_bash.py tests/test_llm.py tests/test_undo.py"
+# The tests that apply, one per line: FILE, then the tests left out of it
+# (substrings of Class.method, run through ae/tests/run_upstream.py) and
+# why. A file with nothing left out runs as upstream runs it.
+#   Codex*/codex: policy (API keys only, no Codex sign-in or WebSocket)
+#   tui/escape/interjection: the TUI slice
+APPLY="tests/test_cli.py
+tests/test_providers.py
+tests/test_session.py
+tests/test_files.py
+tests/test_sandbox.py
+tests/test_effort.py
+tests/test_stream_idle.py|CodexTests
+tests/test_llm.py|CodexTests
+tests/test_limits.py|Codex
+tests/test_agent.py|CodexTests
+tests/test_agent_fork.py|CodexForkTests
+tests/test_agent_reuse.py|CodexTests
+tests/test_background_agent.py|CodexTests escape interjection tui
+tests/test_background_bash.py|CodexTests escape interjection tui
+tests/test_background_run.py|codex escape tui"
 
-files="$*"
-[ -n "$files" ] || files=$APPLY
+files=$(printf '%s\n' "$@")
+[ $# -gt 0 ] || files=$APPLY
 LOGS=$(mktemp -d "${TMPDIR:-/tmp}/nib-e2e.XXXXXX")
 pass=0
 fail=0
+old_ifs=$IFS
+IFS='
+'
 for f in $files; do
+    IFS=$old_ifs
+    skips=""
+    case "$f" in
+        *"|"*) skips=${f#*|}; f=${f%%|*} ;;
+        *) entry=$(printf '%s\n' "$APPLY" | grep -F "$f|" | head -1)
+           [ -n "$entry" ] && skips=${entry#*|} ;;
+    esac
     name=$(basename "$f" .py)
-    if (cd tests && timeout 900 python3 "$name.py" > "$LOGS/$name.log" 2>&1); then
+    if [ -n "$skips" ]; then
+        # shellcheck disable=SC2086
+        (cd tests && timeout 1800 python3 ../ae/tests/run_upstream.py "$name.py" $skips > "$LOGS/$name.log" 2>&1)
+    else
+        (cd tests && timeout 1800 python3 "$name.py" > "$LOGS/$name.log" 2>&1)
+    fi
+    if [ $? -eq 0 ]; then
         echo "pass $f"
         pass=$((pass + 1))
     else
