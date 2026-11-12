@@ -105,8 +105,10 @@ Not yet. `tty.c` compiles there and every call fails, so `term.open` says
 size from `GetConsoleScreenBufferInfo`, and `WaitForSingleObject` +
 `ReadConsoleInputW` for input with a timeout and resize events; the
 decoder, renderer and everything above stay as they are (Windows Terminal
-and conhost read the same VT sequences, with legacy SGR). The in-memory
-terminal works on Windows today.
+and conhost read the same VT sequences, with legacy SGR). The rest works on
+Windows today: `test_screen`, `test_input` and `test_render` pass when
+cross-built for x86_64-windows and run under Wine (`AETHER_LIB_DIR=ae aelane
+win ae/term/tests/test_render.ae`).
 
 ## Tests
 
