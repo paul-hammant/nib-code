@@ -72,7 +72,6 @@ canonical_path(path: string) -> (string, string) {
     comps = components_(pending)
     idx = 0
     total = list.list_size(comps)
-    trailing_dir = 0
     while idx < total {
         name, _ge = list.get_string(comps, idx)
         is_last = 0
@@ -142,7 +141,6 @@ replace(path: string, data: string, mode: int, force_mode: int, sync: int, out: 
     target, err = canonical_path(path)
     if err != "" { return err }
     dir = dirname(target)
-    base = basename(target)
     st = sysgap.new_stat()
     drc = sysgap.stat(dir, 1, st)
     if drc != 0 { return sysgap.errname(drc) }

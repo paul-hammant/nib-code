@@ -5,6 +5,11 @@
  * nib's own process. A STAND-IN for an Aether primitive (asks/
  * aether-landlock-write-roots.md); std.sandbox's kernel layer restricts
  * reads, processes and the network too, which nib's workspace mode leaves open. */
+#ifdef __linux__
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#endif
 #include <string.h>
 #include <stdint.h>
 #ifdef __linux__

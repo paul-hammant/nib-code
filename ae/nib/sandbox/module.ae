@@ -692,6 +692,9 @@ install_(st: *State) {
     q = st.q
     stp = st as ptr
     log_fn = quickjs.function(q, "__log", 1, |q: @keep ptr, this_h: int, args: int| {
+        // The veto: what a script reaches is these two functions; neither may
+        // name the process, threads or the host's tools directly.
+        hide os, worker, dispatch_, work_
         s = stp as *State
         if quickjs.arg_count(q, args) < 1 { return 0 }
         console.append(s.logs, quickjs.arg_string(q, args, 0))
@@ -700,6 +703,7 @@ install_(st: *State) {
     quickjs.set_global(q, "__log", log_fn)
     quickjs.release(q, log_fn)
     host_fn = quickjs.function(q, "__host", 2, |q: @keep ptr, this_h: int, args: int| {
+        hide os, worker, dispatch_, work_
         s = stp as *State
         if s.host == null || quickjs.arg_count(q, args) < 2 {
             return quickjs.throw_error(q, "Error", "invalid host call")
