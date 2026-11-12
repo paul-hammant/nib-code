@@ -51,6 +51,7 @@ import nib.session.tool_summary
 import nib.session.fork_history
 import nib.build_info
 import nib.session.hooks
+import nib.session.skills
 import nib.tools.agent_input
 import nib.tools.agent_sessions
 
@@ -438,9 +439,11 @@ initialize_history_(s: *Session, cwd: string) -> string {
     global = atomic_file.join(o.home, "AGENTS.md")
     root = instructions.project_root(cwd)
     project = atomic_file.join(root, "AGENTS.md")
-    system, aerr = instructions.append(base, global, project)
+    instructed, aerr = instructions.append(base, global, project)
     if aerr != "" { return aerr }
-    members = ",\"cwd\":${jsonx.quote(cwd)},\"provider\":${jsonx.quote(c.provider)}"
+    found = skills.select(skills.load(o.home, o.user_home, root), c.enabled_skills)
+    system = skills.append(instructed, found.skills)
+    members = ",\"skills\":${skills.summary_json(found.summary)},\"cwd\":${jsonx.quote(cwd)},\"provider\":${jsonx.quote(c.provider)}"
     if c.custom_provider != "" { members = "${members},\"custom_provider\":${jsonx.quote(c.custom_provider)}" }
     members = "${members},\"model\":${jsonx.quote(c.model)}"
     if s.parent_session_id != "" { members = "${members},\"parent_session_id\":${jsonx.quote(s.parent_session_id)}" }
@@ -1066,6 +1069,14 @@ compact_now(sp: @keep ptr, sk: ptr, cancel: ptr, automatic: int) -> (string, str
     return "", ""
 }
 
+// `text` with the SKILL.md of every skill it names as $name (upstream expandSkills).
+expand_skills_(s: *Session, text: string) -> string {
+    if string.index_of(text, "$") < 0 { return text }
+    o = s.options as *Options
+    root = instructions.project_root(os.getcwd())
+    return skills.expand(text, (skills.load(o.home, o.user_home, root)).skills)
+}
+
 // One Turn. (err, detail): "" on success; the final text in s.final_text.
 turn(sp: @keep ptr, user_text: string, sk: @keep ptr, cancel: @keep ptr) -> (string, string) {
     s = sp as *Session
@@ -1079,7 +1090,7 @@ turn(sp: @keep ptr, user_text: string, sk: @keep ptr, cancel: @keep ptr) -> (str
     first, _g = list.get_string(s.history, 0)
     pending = list.list_new()
     lim = c.limits as *types.Limits
-    list.list_add(pending, msg.user(prompt.turn_budget_text(msg.content(first), lim.max_steps as long, user_text)))
+    list.list_add(pending, msg.user(prompt.turn_budget_text(msg.content(first), lim.max_steps as long, expand_skills_(s, user_text))))
     emit_(sk, usage_event_(s))
     tools.begin_turn_undo(s.tools)
     background.begin_turn(t.background)
