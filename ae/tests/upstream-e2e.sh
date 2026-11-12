@@ -51,7 +51,11 @@ tests/test_at_files.py
 tests/test_prediction.py
 tests/test_hooks.py
 tests/test_skills.py
-tests/test_skill_mentions.py"
+tests/test_skill_mentions.py
+tests/test_mcp.py
+tests/test_web_search.py|test_codex
+tests/test_images.py
+tests/test_stats.py"
 
 files=$(printf '%s\n' "$@")
 [ $# -gt 0 ] || files=$APPLY
