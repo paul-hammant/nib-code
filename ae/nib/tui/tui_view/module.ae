@@ -1,0 +1,276 @@
+// tui_view: one frame of the TUI (upstream src/tui/view.zig): the transcript
+// body scrolled by the viewport, the status line, the `/` and `@` menu, the
+// framed input box with its footer, the Simple-mode context label. Named
+// tui_view because nib.tools.view will hold upstream's tools/view.zig and
+// module basenames must be unique (asks/aether-module-basename-collision.md).
+//
+// Differences: upstream returns `?Frame`; here `(Frame, bool)`. The status
+// Text buffer is gone (status.format_width and footer return strings).
+
+import std.string
+import term.screen
+import nib.provider.types
+import nib.tui.format
+import nib.tui.entry
+import nib.tui.editor
+import nib.tui.viewport
+import nib.tui.sel_history
+import nib.tui.status
+import nib.tui.commands
+
+exports(MAX_MENU_ROWS, MenuLayout, draw, draw_frame, status_height, menu_layout, group_header)
+
+const MAX_MENU_ROWS = 11
+
+struct MenuLayout {
+    first: int
+    end: int
+    rows: int
+}
+
+min_(a: int, b: int) -> int { return if a < b { a } else { b } }
+max_(a: int, b: int) -> int { return if a > b { a } else { b } }
+sat_(a: int) -> int { return if a < 0 { 0 } else { a } }
+
+draw(win: screen.Window, entries: ptr[], input: *editor.Editor, scroll: *viewport.Viewport, menu: commands.Candidate[], menu_sel: int, s: status.Status) {
+    _f, _ok = draw_frame(win, entries, input, scroll, menu, menu_sel, s)
+}
+
+copy_view_(v: *viewport.Viewport) -> viewport.Viewport {
+    return viewport.Viewport { has_top: v.has_top, top_entry: v.top_entry, top_row: v.top_row, pending: v.pending, revision: v.revision, new_output: v.new_output }
+}
+
+restore_view_(v: *viewport.Viewport, saved: viewport.Viewport) {
+    v.has_top = saved.has_top
+    v.top_entry = saved.top_entry
+    v.top_row = saved.top_row
+    v.pending = saved.pending
+    v.revision = saved.revision
+    v.new_output = saved.new_output
+}
+
+draw_frame(outer: screen.Window, entries: ptr[], input: *editor.Editor, scroll: *viewport.Viewport, menu: commands.Candidate[], menu_sel: int, s: status.Status) -> (sel_history.Frame, bool) {
+    screen.clear(outer)
+    win = outer
+    screen.hide_cursor(win)
+    cfg = s.cfg as *types.Config
+    simple = cfg.simple != 0
+    for i in 0..entries.len {
+        e = entries[i] as *entry.Entry
+        if (e.simple != 0) != simple {
+            entry.invalidate(e)
+        }
+        e.simple = if simple { 1 } else { 0 }
+        hidden = simple && (e.kind == entry.KIND_BILL || e.kind == entry.KIND_CHANGES)
+        joined = e.kind == entry.KIND_BILL && i + 1 < entries.len && (entries[i + 1] as *entry.Entry).kind == entry.KIND_CHANGES
+        e.gap = if hidden || joined { 0 } else { 1 }
+    }
+    none_frame = sel_history.Frame { top: viewport.Anchor { entry: 0, row: 0 }, window: win }
+    if win.height == 0 || win.width == 0 {
+        return none_frame, false
+    }
+
+    framed = win.height >= 6 && win.width >= 8
+    status_fixed = framed && win.height >= 8
+    borders = if framed { 2 } else { 0 }
+    x = if framed { 2 } else { min_(3, win.width - 1) }
+    input_w = win.width - x - (if framed { 2 } else { 0 })
+    input_h = min_(editor.rows(input, screen.child(win, width: input_w)), max_(1, win.height / 3))
+    saved_scroll = copy_view_(scroll)
+    above_input = win.height - input_h - borders
+    activity_h = status_height(status_fixed, s.has_busy != 0 || s.background_count > 0 || s.has_notice != 0 || string.length(s.hint) > 0 || scroll.has_top != 0 || scroll.pending < 0, above_input)
+    ml = menu_layout(menu, menu_sel, min_(MAX_MENU_ROWS, sat_(above_input - activity_h) / 2))
+    menu_h = ml.rows
+    body_h = above_input - menu_h - activity_h
+    body = screen.child(win, x_off: min_(1, win.width - 1), width: max_(1, sat_(win.width - 2)), height: body_h)
+    top = viewport.layout(scroll, entries, body)
+    viewport.observe(scroll, s.revision as long, saved_scroll.has_top != 0)
+    activity_status = s
+    activity_status.new_output = scroll.new_output
+    actual_h = status_height(status_fixed, string.length(status.format_width(activity_status, scroll.has_top != 0, sat_(win.width - 2))) > 0, above_input - menu_h)
+    if actual_h != activity_h {
+        activity_h = actual_h
+        body_h = above_input - menu_h - activity_h
+        body.height = body_h
+        restore_view_(scroll, saved_scroll)
+        top = viewport.layout(scroll, entries, body)
+        viewport.observe(scroll, s.revision as long, saved_scroll.has_top != 0)
+        activity_status.new_output = scroll.new_output
+    }
+    y = 0 - top.row
+    surf = win.surf
+    index = top.entry
+    while index < entries.len {
+        if y >= body_h {
+            break
+        }
+        e = entries[index] as *entry.Entry
+        e.user_bg = s.user_bg
+        e.code_bg = s.code_bg
+        h = entry.height(e, body)
+        if y + h > 0 {
+            entry.draw(e, screen.child(body, y_off: y, height: h), true)
+        }
+        if s.hovered == index {
+            rows = entry.toggle_rows(e, body)
+            for hr in 0..body_h {
+                if hr < y || hr >= y + rows {
+                    continue
+                }
+                for col in 0..body.width {
+                    ci = hr * surf.width + col + body.x_off
+                    surf.cells[ci].style.bg = s.hover_bg
+                    surf.cells[ci].is_default = false
+                }
+            }
+        }
+        y = y + entry.extent(e, body)
+        index = index + 1
+    }
+
+    if s.signed_out != 0 && entries.len == 0 && body_h > 0 {
+        screen.draw_segment(body, screen.seg("No provider · /provider to sign in", screen.style(attrs: screen.DIM)), wrap: screen.WRAP_NONE)
+    } else if string.length(s.title) > 0 && entries.len == 0 && body_h > 0 {
+        screen.draw_segment(body, screen.seg(s.title, screen.style(attrs: screen.DIM)), wrap: screen.WRAP_NONE)
+    }
+
+    if activity_h > 0 {
+        line = status.format_width(activity_status, scroll.has_top != 0, sat_(win.width - 2))
+        screen.draw_segment(screen.child(win, x_off: 1, y_off: body_h, height: 1), screen.seg(line, status.activity_style(s)), wrap: screen.WRAP_NONE)
+    }
+    menu_y = body_h + activity_h
+    i = ml.first
+    while i < ml.end {
+        c = menu[i]
+        g = group_header(menu, i, ml.first)
+        if g >= 0 {
+            screen.draw_segment(screen.child(win, x_off: 2, y_off: menu_y, height: 1), screen.seg(commands.group_name(g), screen.style(attrs: screen.BOLD | screen.DIM)), wrap: screen.WRAP_NONE)
+            menu_y = menu_y + 1
+        }
+        chosen = i == menu_sel
+        row = screen.child(win, x_off: 2, y_off: menu_y, height: 1)
+        label_width = 0
+        if c.is_path != 0 {
+            label_width = if string.length(c.detail) == 0 { row.width } else { min_(row.width, 24) }
+        } else if c.command == commands.CMD_MODEL && c.has_value != 0 {
+            label_width = sat_(row.width - 16)
+        } else if c.command == commands.CMD_PROVIDER && c.has_value != 0 {
+            label_width = min_(row.width, 14)
+        } else {
+            label_width = min_(row.width, 12)
+        }
+        label_style = if chosen { screen.style(attrs: screen.REVERSE | screen.BOLD) } else { screen.style(attrs: screen.BOLD) }
+        print_fitted_(screen.child(row, width: label_width), c.label, label_style)
+        if row.width > label_width + 2 {
+            print_fitted_(screen.child(row, x_off: label_width + 2), c.detail, screen.style(attrs: screen.DIM))
+        }
+        menu_y = menu_y + 1
+        i = i + 1
+    }
+
+    input_y = body_h + activity_h + menu_h
+    if framed {
+        horizontal_(win, input_y, "╭", "╮")
+        horizontal_(win, input_y + input_h + 1, "╰", "╯")
+        for ir in 0..input_h {
+            put_(win, 0, input_y + 1 + ir, "│")
+            put_(win, win.width - 1, input_y + 1 + ir, "│")
+        }
+        if simple {
+            window_tokens = if cfg.context_window > (1 as long) { cfg.context_window } else { 1 as long }
+            percent = s.context * 100 / window_tokens
+            if percent >= 80 {
+                label = " context ${percent}% "
+                w = screen.win_gwidth(win, label)
+                if w <= win.width - 2 {
+                    screen.draw_segment(screen.child(win, x_off: win.width - 1 - w, y_off: input_y, height: 1, width: w), screen.seg(label, screen.style(attrs: screen.DIM)), wrap: screen.WRAP_NONE)
+                }
+            }
+        } else {
+            meta = status.footer(s, win.width - 7)
+            if string.length(meta) > 0 {
+                meta_w = screen.win_gwidth(win, meta)
+                put_(win, 2, input_y + input_h + 1, " ")
+                screen.draw_segment(screen.child(win, x_off: 3, y_off: input_y + input_h + 1, width: meta_w, height: 1), screen.seg(meta, screen.style(attrs: screen.DIM)), wrap: screen.WRAP_NONE)
+                put_(win, 3 + meta_w, input_y + input_h + 1, " ")
+            }
+        }
+    } else if win.width >= 3 {
+        screen.draw_segment(screen.child(win, x_off: 1, y_off: input_y, height: 1), screen.seg("› ", screen.style(fg: screen.color_index(4))), wrap: screen.WRAP_NONE)
+    }
+    placeholder = input.placeholder
+    if simple {
+        input.placeholder = ""
+    }
+    editor.draw(input, screen.child(win, x_off: x, y_off: input_y + (if framed { 1 } else { 0 }), width: input_w, height: input_h))
+    input.placeholder = placeholder
+    return sel_history.Frame { top: top, window: body }, true
+}
+
+// Framed terminals of 8+ rows always reserve one status row so the input
+// never moves; smaller ones reserve it only while it has text.
+status_height(fixed: bool, visible: bool, available: int) -> int {
+    if available <= 0 {
+        return 0
+    }
+    return if fixed || visible { 1 } else { 0 }
+}
+
+// The group whose header goes above menu[index], -1 for none.
+group_header(menu: commands.Candidate[], index: int, first: int) -> int {
+    g = commands.candidate_group(menu[index])
+    if g < 0 {
+        return -1
+    }
+    if index == first || commands.candidate_group(menu[index - 1]) != g {
+        return g
+    }
+    return -1
+}
+
+menu_layout(menu: commands.Candidate[], selected: int, limit: int) -> MenuLayout {
+    if menu.len == 0 || limit <= 0 {
+        return MenuLayout { first: 0, end: 0, rows: 0 }
+    }
+    first = 0
+    while first < selected {
+        needed = 0
+        for i in first..(selected + 1) {
+            needed = needed + 1 + (if group_header(menu, i, first) >= 0 { 1 } else { 0 })
+        }
+        if needed <= limit {
+            break
+        }
+        first = first + 1
+    }
+    end = first
+    rows = 0
+    while end < menu.len {
+        r = 1 + (if group_header(menu, end, first) >= 0 { 1 } else { 0 })
+        if rows + r > limit {
+            break
+        }
+        rows = rows + r
+        end = end + 1
+    }
+    return MenuLayout { first: first, end: end, rows: rows }
+}
+
+print_fitted_(win: screen.Window, text: string, st: screen.Style) {
+    fitted = format.fit(text, win.width)
+    a = screen.seg(fitted.text, st)
+    b = screen.seg(fitted.suffix, st)
+    screen.draw(win, [a, b], wrap: screen.WRAP_NONE)
+}
+
+put_(win: screen.Window, x: int, y: int, glyph: string) {
+    screen.draw_segment(screen.child(win, x_off: x, y_off: y, width: 1, height: 1), screen.seg(glyph, screen.style(attrs: screen.DIM)), wrap: screen.WRAP_NONE)
+}
+
+horizontal_(win: screen.Window, y: int, left: string, right: string) {
+    put_(win, 0, y, left)
+    for i in 1..(win.width - 1) {
+        put_(win, i, y, "─")
+    }
+    put_(win, win.width - 1, y, right)
+}

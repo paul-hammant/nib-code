@@ -1,0 +1,581 @@
+// Ports the tests of upstream src/tui/view.zig under their names. The two
+// snapshot tests read upstream's own src/tui/layout_snapshots.txt and
+// simple_snapshots.txt and must match them cell for cell (their whole text,
+// headers included). "draw benchmark: 5000 entries" and "stream stress frame
+// timings" run as upstream does without NIB_TUI_BENCH (one frame per sample),
+// checking what upstream checks; the timings are not printed.
+import std.spec
+import std.string
+import std.strbuilder
+import std.fs
+import std.list
+import term.screen
+import term.input
+import nib.provider.types
+import nib.tools.changes
+import nib.tui.entry
+import nib.tui.markdown
+import nib.tui.transcript
+import nib.tui.turn_changes
+import nib.tui.editor
+import nib.tui.viewport
+import nib.tui.status
+import nib.tui.commands
+import nib.tui.selection
+import nib.tui.sel_history
+import nib.tui.tui_view
+
+mock_cfg_() -> ptr { return types.new_config("custom", "", "", "mock") }
+
+cfg_with_(simple: int, window: long) -> ptr {
+    c = mock_cfg_()
+    cc = c as *types.Config
+    cc.simple = simple
+    cc.context_window = window
+    return c
+}
+
+no_menu_() -> commands.Candidate[] {
+    m = make([]commands.Candidate, 0)
+    return m
+}
+
+entries_(t: *transcript.Transcript) -> ptr[] { return t.entries }
+
+at_(t: *transcript.Transcript, i: int) -> *entry.Entry { return t.entries[i] as *entry.Entry }
+
+cell_(s: *screen.Surface, col: int, row: int) -> screen.Cell {
+    c, _ok = screen.read_cell(s, col, row)
+    return c
+}
+
+// view.zig's snapshot(): rows, trailing spaces trimmed, each ended by \n.
+snap_(s: *screen.Surface) -> string { return screen.text(s) }
+
+busy_(s: status.Status, phase: int, ms: long) -> status.Status {
+    out = s
+    out.has_busy = 1
+    out.busy = status.Label { phase: phase, ms: ms, turn_ms: 0 as long, quiet_ms: 0 as long }
+    return out
+}
+
+notice_(s: status.Status, text: string) -> status.Status {
+    out = s
+    out.has_notice = 1
+    out.notice = text
+    return out
+}
+
+read_file_(path: string) -> string {
+    data, err = fs.read(path)
+    if err != "" {
+        spec.fail("cannot read ${path}: ${err}")
+        return ""
+    }
+    return data
+}
+
+lines_text_(prefix: string, n: int) -> string {
+    sb = strbuilder.new(256)
+    for i in 0..n {
+        strbuilder.append(sb, "${prefix}${i}\n")
+    }
+    return strbuilder.finish(sb)
+}
+
+// One layout-snapshot case of upstream's table.
+layout_case_(name: string, w: int, h: int, busy: bool, history: bool, menu: bool, notice: bool) -> string {
+    surf = screen.surface(w, h)
+    win = screen.window(surf)
+    input = editor.new()
+    t = transcript.new()
+    transcript.add(t, entry.KIND_ASSISTANT, if history { "0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14" } else { "Answer" })
+    vp = viewport.new()
+    vp.pending = if history { -100 as long } else { 0 as long }
+    cands = make([]commands.Candidate, 0)
+    if menu {
+        cands.push(commands.Candidate { command: commands.CMD_HELP, has_value: 0, value: "", label: "/help", detail: "show help", is_path: 0 })
+    }
+    s = status.new(mock_cfg_())
+    if busy {
+        s = busy_(s, status.PHASE_THINKING, 1200 as long)
+    }
+    if notice {
+        s = notice_(s, "copied 3 chars")
+    }
+    tui_view.draw(win, t.entries, input, vp, cands, 0, s)
+    spec.assert_true(surf.cursor_vis, "${name}: cursor shown")
+    spec.assert_eq(surf.cursor_row, if h >= 6 { h - 2 } else { h - 1 }, "${name}: cursor row")
+    image = snap_(surf)
+    if h >= 6 {
+        spec.assert_str_eq(cell_(surf, 0, h - 1).grapheme, "╰", "${name}: bottom left")
+        spec.assert_str_eq(cell_(surf, w - 1, h - 1).grapheme, "╯", "${name}: bottom right")
+    } else {
+        spec.assert_contains(image, "› Ask about this project · / for commands", "${name}: unframed prompt")
+    }
+    if busy {
+        spec.assert_contains(image, "Waiting for model · turn <1s", "${name}: busy")
+    }
+    if notice {
+        spec.assert_contains(image, "copied 3 chars", "${name}: notice")
+    }
+    if menu {
+        spec.assert_contains(image, "/help", "${name}: menu")
+    }
+    return "--- ${name} ${w}x${h} ---\n${image}"
+}
+
+// The transcript of "Simple layout snapshots and full-width hit testing".
+simple_transcript_() -> *transcript.Transcript {
+    t = transcript.new()
+    transcript.add(t, entry.KIND_USER, "Check the change")
+    transcript.add(t, entry.KIND_ASSISTANT, "I will edit and verify it.")
+    transcript.add(t, entry.KIND_RUN, "await tools.bash({command: 'zig build'});")
+    e = at_(t, t.entries.len - 1)
+    e.run = entry.RUN_OK
+    entry.refresh_label(e)
+    transcript.add(t, entry.KIND_ASSISTANT, "Done.")
+    transcript.add(t, entry.KIND_BILL, "1 Run · 2 steps · 41s · 6.6k tokens")
+    transcript.add(t, entry.KIND_USER, "Thanks")
+    return t
+}
+
+draw_text_(t: *transcript.Transcript, cfg: @keep ptr, title: string, signed_out: bool, width: int) -> string {
+    input = editor.new()
+    vp = viewport.new()
+    surf = screen.surface(width, 16)
+    s = status.new(cfg)
+    s.title = title
+    s.signed_out = if signed_out { 1 } else { 0 }
+    tui_view.draw(screen.window(surf), t.entries, input, vp, no_menu_(), 0, s)
+    return snap_(surf)
+}
+
+row_of_(image: string, n: int) -> string {
+    start = 0
+    row = 0
+    for i in 0..string.length(image) {
+        if image[i] == 10 {
+            if row == n {
+                return string.substring(image, start, i)
+            }
+            row = row + 1
+            start = i + 1
+        }
+    }
+    return ""
+}
+
+cells_text_(s: *screen.Surface, rows: int) -> string {
+    sb = strbuilder.new(4096)
+    for r in 0..rows {
+        for c in 0..s.width {
+            cl = cell_(s, c, r)
+            strbuilder.append(sb, "${cl.grapheme}|${cl.width}|${cl.style.fg}|${cl.style.bg}|${cl.style.attrs}|${cl.style.ul_style};")
+        }
+    }
+    return strbuilder.finish(sb)
+}
+
+main() {
+    fw = spec.init()
+    spec.describe(fw, "tui.view") {
+        spec.it("draw benchmark: 5000 entries") callback {
+            t = transcript.new()
+            sample = "A long session entry with enough words to wrap over several lines. A long session entry with enough words to wrap over several lines. A long session entry with enough words to wrap over several lines. A long session entry with enough words to wrap over several lines. A long session entry with enough words to wrap over several lines. A long session entry with enough words to wrap over several lines. "
+            for i in 0..5000 {
+                transcript.add(t, entry.KIND_ASSISTANT, sample)
+            }
+            surf = screen.surface(100, 24)
+            win = screen.window(surf)
+            input = editor.new()
+            offsets = [0, 1200]
+            for k in 0..2 {
+                vp = viewport.new()
+                vp.pending = 0 - (offsets[k] as long)
+                tui_view.draw(win, t.entries, input, vp, no_menu_(), 0, status.new(mock_cfg_()))
+                tui_view.draw(win, t.entries, input, vp, no_menu_(), 0, status.new(mock_cfg_()))
+                spec.assert_true(surf.cursor_vis, "cursor shown")
+            }
+        }
+
+        spec.it("draw keeps scrolled body fixed while output arrives and caps input height") callback {
+            surf = screen.surface(100, 24)
+            win = screen.window(surf)
+            t = transcript.new()
+            transcript.add(t, entry.KIND_ASSISTANT, lines_text_("line ", 40))
+            transcript.add(t, entry.KIND_ASSISTANT, "stream")
+            input = editor.new()
+            vp = viewport.new()
+            vp.pending = -30 as long
+            busy = busy_(status.new(mock_cfg_()), status.PHASE_THINKING, 0 as long)
+            tui_view.draw(win, t.entries, input, vp, no_menu_(), 0, busy)
+            before = cells_text_(surf, 19)
+            e1 = at_(t, 1)
+            e1.text = "${e1.text}\nmore streamed text"
+            transcript.add(t, entry.KIND_INFO, "Run output")
+            tui_view.draw(win, t.entries, input, vp, no_menu_(), 0, busy)
+            spec.assert_str_eq(cells_text_(surf, 19), before, "body unchanged")
+            for i in 0..16 {
+                input.buf = "${input.buf}input ${i}\n"
+            }
+            input.cursor = string.length(input.buf)
+            tui_view.draw(win, t.entries, input, vp, no_menu_(), 0, busy)
+            spec.assert_eq(input.top_row, 9, "top row")
+            spec.assert_eq(surf.cursor_row, 22, "cursor row")
+            spec.assert_true(surf.cursor_vis, "cursor shown")
+            spec.assert_str_eq(cell_(surf, 2, 15).grapheme, "i", "input text")
+        }
+
+        spec.it("layout snapshots: normal, short, tiny, narrow, menu, busy and history") callback {
+            sb = strbuilder.new(8192)
+            strbuilder.append(sb, layout_case_("normal", 80, 12, false, false, false, false))
+            strbuilder.append(sb, layout_case_("standard", 80, 24, false, false, false, false))
+            strbuilder.append(sb, layout_case_("large", 120, 40, false, false, false, false))
+            strbuilder.append(sb, layout_case_("compact", 60, 16, false, false, false, false))
+            strbuilder.append(sb, layout_case_("small", 40, 10, false, false, false, false))
+            strbuilder.append(sb, layout_case_("short", 80, 7, false, false, false, false))
+            strbuilder.append(sb, layout_case_("tiny", 80, 4, false, false, false, false))
+            strbuilder.append(sb, layout_case_("narrow", 18, 12, false, false, false, false))
+            strbuilder.append(sb, layout_case_("menu", 80, 12, false, false, true, false))
+            strbuilder.append(sb, layout_case_("busy", 80, 12, true, false, false, false))
+            strbuilder.append(sb, layout_case_("history", 80, 12, false, true, false, false))
+            strbuilder.append(sb, layout_case_("notice", 80, 12, false, false, false, true))
+            got = strbuilder.finish(sb)
+            spec.assert_str_eq_diff(got, read_file_("src/tui/layout_snapshots.txt"), "layout_snapshots.txt")
+        }
+
+        spec.it("status row is reserved so the input box never moves") callback {
+            widths = [40, 60, 80, 120, 160]
+            heights = [6, 7, 8, 9, 10, 16, 24, 40]
+            for wi in 0..5 {
+                for hi in 0..8 {
+                    width = widths[wi]
+                    height = heights[hi]
+                    surf = screen.surface(width, height)
+                    win = screen.window(surf)
+                    input = editor.new()
+                    t = transcript.new()
+                    transcript.add(t, entry.KIND_ASSISTANT, lines_text_("line-", 40))
+                    status_y = height - 4
+                    for k in 0..3 {
+                        s = status.new(mock_cfg_())
+                        if k == 0 {
+                            s = busy_(s, status.PHASE_SCRIPTING, 0 as long)
+                        } else if k == 1 {
+                            s.background_count = 1
+                        } else {
+                            s = notice_(s, "copied 3 chars")
+                        }
+                        vp = viewport.new()
+                        frame, ok = tui_view.draw_frame(win, t.entries, input, vp, no_menu_(), 0, s)
+                        spec.assert_true(ok, "frame")
+                        spec.assert_eq(frame.window.height, status_y, "${width}x${height} body height")
+                        spec.assert_str_eq(cell_(surf, 0, status_y + 1).grapheme, "╭", "top border")
+                        spec.assert_str_eq(cell_(surf, 0, height - 1).grapheme, "╰", "bottom border")
+                        spec.assert_true(cell_(surf, 1, status_y).grapheme != " ", "status text")
+                        spec.assert_true(surf.cursor_vis, "cursor")
+                        spec.assert_eq(surf.cursor_row, height - 2, "cursor row")
+                    }
+                    vp = viewport.new()
+                    frame, ok = tui_view.draw_frame(win, t.entries, input, vp, no_menu_(), 0, status.new(mock_cfg_()))
+                    spec.assert_eq(frame.window.height, if height >= 8 { status_y } else { status_y + 1 }, "${width}x${height} idle body")
+                    spec.assert_str_eq(cell_(surf, 0, height - 3).grapheme, "╭", "idle top border")
+                    if height >= 8 {
+                        for col in 0..width {
+                            spec.assert_str_eq(cell_(surf, col, status_y).grapheme, " ", "reserved row blank")
+                        }
+                    }
+                    spec.assert_eq(surf.cursor_row, height - 2, "idle cursor row")
+                }
+            }
+        }
+
+        spec.it("Simple context label sits on the top border and Normal metadata is spaced") callback {
+            contexts = [0, 79, 80]
+            for sm in 0..2 {
+                for ci in 0..3 {
+                    context = contexts[ci]
+                    surf = screen.surface(60, 12)
+                    win = screen.window(surf)
+                    input = editor.new()
+                    vp = viewport.new()
+                    s = status.new(cfg_with_(sm, 100 as long))
+                    s.context = context as long
+                    tui_view.draw(win, transcript.new().entries, input, vp, no_menu_(), 0, s)
+                    image = snap_(surf)
+                    top_row = row_of_(image, 9)
+                    bottom_row = row_of_(image, 11)
+                    if sm == 1 {
+                        spec.assert_eq(if string.ends_with(top_row, " context 80% ╮") != 0 { 1 } else { 0 }, if context >= 80 { 1 } else { 0 }, "label at ${context}")
+                        spec.assert_false(string.contains(bottom_row, "context") != 0, "no bottom context")
+                        spec.assert_false(string.contains(bottom_row, "mock") != 0, "no bottom model")
+                    } else {
+                        spec.assert_false(string.contains(top_row, "context") != 0, "no top context")
+                        spec.assert_true(string.starts_with(bottom_row, if context == 0 { "╰─ mock ─" } else { "╰─ mock · context " }) != 0, "footer ${context}: ${bottom_row}")
+                        spec.assert_true(string.contains(bottom_row, "% ─") != 0 || context == 0, "spaced")
+                    }
+                }
+            }
+        }
+
+        spec.it("selection copies displayed blocks at the framed input coordinates") callback {
+            surf = screen.surface(60, 12)
+            win = screen.window(surf)
+            ed = editor.new()
+            editor.insert(ed, "你")
+            editor.paste(ed, "1\n2\n3\n4\n5\n6")
+            vp = viewport.new()
+            tui_view.draw(win, transcript.new().entries, ed, vp, no_menu_(), 0, status.new(mock_cfg_()))
+            spec.assert_eq(surf.cursor_col, 29, "cursor col")
+            spec.assert_eq(surf.cursor_row, 10, "cursor row")
+            sel = selection.new()
+            selection.mouse(sel, input.Mouse { col: 28, row: 10, button: input.BUTTON_LEFT, mods: 0, kind: input.MOUSE_PRESS }, surf)
+            selection.mouse(sel, input.Mouse { col: 2, row: 10, button: input.BUTTON_LEFT, mods: 0, kind: input.MOUSE_DRAG }, surf)
+            spec.assert_true(selection.mouse(sel, input.Mouse { col: 2, row: 10, button: input.BUTTON_LEFT, mods: 0, kind: input.MOUSE_RELEASE }, surf), "released")
+            spec.assert_str_eq(selection.text(sel, surf), "你[Pasted #1 · 6 lines · 1]", "copied")
+            selection.highlight(sel, surf)
+            spec.assert_true(screen.has_attr(cell_(surf, 2, 10).style, screen.REVERSE), "highlighted")
+            spec.assert_false(screen.has_attr(cell_(surf, 0, 10).style, screen.REVERSE), "border not highlighted")
+        }
+
+        spec.it("minimal terminal dimensions retain an input cursor") callback {
+            for w in 1..9 {
+                for h in 1..9 {
+                    surf = screen.surface(w, h)
+                    input = editor.new()
+                    vp = viewport.new()
+                    tui_view.draw(screen.window(surf), transcript.new().entries, input, vp, no_menu_(), 0, busy_(status.new(mock_cfg_()), status.PHASE_THINKING, 0 as long))
+                    spec.assert_true(surf.cursor_vis, "${w}x${h} cursor")
+                    spec.assert_true(surf.cursor_col < w && surf.cursor_row < h, "${w}x${h} inside")
+                }
+            }
+        }
+
+        spec.it("grouped menus keep the selected command visible within their row budget") callback {
+            menu = commands.candidates("/", commands.no_choices(), commands.no_choices(), commands.no_choices(), commands.no_choices(), 16)
+            for limit in 2..12 {
+                for selected in 0..menu.len {
+                    ml = tui_view.menu_layout(menu, selected, limit)
+                    spec.assert_true(ml.rows <= limit, "rows within ${limit}")
+                    spec.assert_true(ml.first <= selected && ml.end > selected, "selected ${selected} visible at ${limit}")
+                }
+            }
+        }
+
+        spec.it("empty screen has one guidance line and no zero statistics") callback {
+            surf = screen.surface(60, 12)
+            tui_view.draw(screen.window(surf), transcript.new().entries, editor.new(), viewport.new(), no_menu_(), 0, status.new(mock_cfg_()))
+            image = snap_(surf)
+            spec.assert_contains(image, "Ask about this project · / for commands", "guidance")
+            spec.assert_false(string.contains(image, "Enter send") != 0, "no key help")
+            spec.assert_false(string.contains(image, "0%") != 0, "no zero percent")
+        }
+
+        spec.it("model menu shows distinct model names and current marker at common widths") callback {
+            widths = [60, 120, 160]
+            for wi in 0..3 {
+                surf = screen.surface(widths[wi], 16)
+                menu = make([]commands.Candidate, 0)
+                menu.push(commands.Candidate { command: commands.CMD_MODEL, has_value: 1, value: "openai/gpt-6.1-sol", label: "openai · gpt-6.1-sol", detail: "current", is_path: 0 })
+                menu.push(commands.Candidate { command: commands.CMD_MODEL, has_value: 1, value: "openai/gpt-6.1-terra", label: "openai · gpt-6.1-terra", detail: "", is_path: 0 })
+                tui_view.draw(screen.window(surf), transcript.new().entries, editor.new(), viewport.new(), menu, 0, status.new(mock_cfg_()))
+                rendered = snap_(surf)
+                spec.assert_contains(rendered, "openai · gpt-6.1-sol", "sol")
+                spec.assert_contains(rendered, "openai · gpt-6.1-terra", "terra")
+                spec.assert_contains(rendered, "current", "current")
+            }
+        }
+
+        spec.it("stream stress frame timings") callback {
+            surf = screen.surface(120, 32)
+            win = screen.window(surf)
+            t = transcript.new()
+            input = editor.new()
+            vp = viewport.new()
+            sample = "English 中文 👩‍💻 🙂 **late bold\n- list `late code\n```zig\nconst value = 123; // 中文\n```\nclose` bold**\n"
+            sb = strbuilder.new(4096)
+            for i in 0..40 {
+                strbuilder.append(sb, sample)
+            }
+            answer = strbuilder.finish(sb)
+            transcript.add(t, entry.KIND_ASSISTANT, answer)
+            for i in 0..10 {
+                entry.invalidate(at_(t, 0))
+                editor.insert(input, if i % 2 == 0 { "x" } else { "y" })
+                tui_view.draw(win, t.entries, input, vp, no_menu_(), 0, status.new(mock_cfg_()))
+            }
+            spec.assert_true(surf.cursor_vis, "drawn")
+        }
+
+        spec.it("hover covers full summary width and leaves expanded details unchanged") callback {
+            surf = screen.surface(80, 24)
+            win = screen.window(surf)
+            t = transcript.new()
+            transcript.start_run(t, "console.log('details')")
+            e = at_(t, 0)
+            e.files = "read example.zig"
+            e.open = 1
+            color = screen.color_rgb(8, 8, 8)
+            s = status.new(mock_cfg_())
+            s.hovered = 0
+            s.hover_bg = color
+            frame, _ok = tui_view.draw_frame(win, t.entries, editor.new(), viewport.new(), no_menu_(), 0, s)
+            rows = entry.toggle_rows(e, frame.window)
+            spec.assert_true(rows >= 2, "two summary rows")
+            for row in 0..rows {
+                for col in 1..79 {
+                    spec.assert_eq(cell_(surf, col, row).style.bg, color, "hover ${col},${row}")
+                }
+            }
+            spec.assert_true(cell_(surf, 1, rows).style.bg != color, "details not hovered")
+        }
+
+        spec.it("Simple layout snapshots and full-width hit testing") callback {
+            sizes_w = [80, 120, 160, 40]
+            sizes_h = [24, 40, 50, 10]
+            contexts = [0, 84]
+            sb = strbuilder.new(32768)
+            for si in 0..4 {
+                for sm in 0..2 {
+                    for ci in 0..2 {
+                        w = sizes_w[si]
+                        h = sizes_h[si]
+                        context = contexts[ci]
+                        surf = screen.surface(w, h)
+                        t = simple_transcript_()
+                        s = status.new(cfg_with_(sm, 100 as long))
+                        s.context = context as long
+                        frame, _ok = tui_view.draw_frame(screen.window(surf), t.entries, editor.new(), viewport.new(), no_menu_(), 0, s)
+                        image = snap_(surf)
+                        strbuilder.append(sb, "--- ${if sm == 1 { "simple" } else { "normal" }} ${w}x${h} context ${context}% ---\n${image}")
+                        spec.assert_eq(frame.window.x_off, 1, "x_off")
+                        spec.assert_eq(if string.contains(image, "context 84%") != 0 { 1 } else { 0 }, if context >= 80 { 1 } else { 0 }, "context label")
+                        if sm == 1 {
+                            spec.assert_contains(image, "╭", "border")
+                            spec.assert_false(string.contains(image, "6.6k") != 0, "no bill")
+                            spec.assert_false(string.contains(image, "Ask about") != 0, "no placeholder")
+                            spec.assert_eq(entry.height(at_(t, 2), frame.window), 1, "one-row Run")
+                            p, found = sel_history.position(frame, t.entries, frame.window.x_off + 4, 0)
+                            spec.assert_true(found && p.entry < t.entries.len, "hit")
+                        }
+                        spec.assert_str_eq(cell_(surf, 0, h - 1).grapheme, "╰", "bottom border")
+                    }
+                }
+            }
+            spec.assert_str_eq_diff(strbuilder.finish(sb), read_file_("src/tui/simple_snapshots.txt"), "simple_snapshots.txt")
+        }
+
+        spec.it("Simple Run marks and selection preserve details") callback {
+            surf = screen.surface(120, 40)
+            win = screen.window(surf)
+            t = transcript.new()
+            transcript.add(t, entry.KIND_RUN, "script")
+            e = at_(t, 0)
+            e.output = "result"
+            input = editor.new()
+            vp = viewport.new()
+            cfg = cfg_with_(1, 0 as long)
+            runs = [entry.RUN_OK, entry.RUN_FAILED, entry.RUN_RUNNING, entry.RUN_WARNING]
+            wants = ["  Run", "✗ Run", "Run · running", "! Run"]
+            for k in 0..4 {
+                e.run = runs[k]
+                entry.refresh_label(e)
+                s = status.new(cfg)
+                s.hovered = 0
+                s.hover_bg = screen.color_rgb(18, 18, 18)
+                frame, _ok = tui_view.draw_frame(win, t.entries, input, vp, no_menu_(), 0, s)
+                spec.assert_eq(entry.height(e, frame.window), 1, "one row")
+                image = snap_(surf)
+                spec.assert_contains(image, wants[k], "mark ${k}")
+                spec.assert_false(string.contains(image, "mock") != 0, "no model")
+                p, found = sel_history.position(frame, t.entries, 15, 0)
+                spec.assert_true(found, "position")
+                spec.assert_eq(p.entry, 0, "entry")
+                spec.assert_eq(p.row, 0, "row")
+                spec.assert_eq(cell_(surf, 11, 0).style.bg, screen.color_rgb(18, 18, 18), "hover bg")
+                spec.assert_eq(cell_(surf, 0, 0).style.bg, screen.DEFAULT, "margin bg")
+                e.open = 1
+                expanded, _ok2 = tui_view.draw_frame(win, t.entries, input, vp, no_menu_(), 0, status.new(cfg))
+                spec.assert_true(entry.height(e, expanded.window) > 1, "expanded")
+                h = sel_history.History { anchor: sel_history.Position { entry: 0, row: 0, col: 0 }, end: sel_history.Position { entry: 0, row: 0, col: 119 } }
+                copied = sel_history.text(h, expanded, t.entries)
+                spec.assert_false(string.starts_with(copied, "          ") != 0, "no indent")
+                e.open = 0
+            }
+        }
+
+        spec.it("resize and mode transitions match a fresh frame") callback {
+            t = transcript.new()
+            transcript.add(t, entry.KIND_USER, "Check symbols 界 and wrapping")
+            transcript.add(t, entry.KIND_ASSISTANT, "# Heading\nA completed **Markdown** line with 界 symbols and enough words to wrap in a narrow terminal.\n```zig\nconst value = 42;\n```\nDone.")
+            transcript.add(t, entry.KIND_RUN, "script")
+            transcript.add(t, entry.KIND_BILL, "1 Run · 2 steps")
+            transcript.add(t, entry.KIND_USER, "Again")
+            input = editor.new()
+            vp = viewport.new()
+            widths = [60, 120, 120, 160, 160, 60]
+            simples = [0, 0, 1, 1, 0, 0]
+            surf = screen.surface(160, 40)
+            for k in 0..6 {
+                cfg = cfg_with_(simples[k], 0 as long)
+                if surf.width != widths[k] {
+                    surf = screen.surface(widths[k], 40)
+                }
+                frame, _ok = tui_view.draw_frame(screen.window(surf), t.entries, input, vp, no_menu_(), 0, status.new(cfg))
+                spec.assert_eq(frame.window.x_off, 1, "x_off")
+                before = snap_(surf)
+                for i in 0..t.entries.len {
+                    entry.invalidate(at_(t, i))
+                    ee = at_(t, i)
+                    markdown.cache_free(ee.markdown_cache)
+                    ee.markdown_cache = markdown.cache_new()
+                }
+                fresh_surf = screen.surface(widths[k], 40)
+                tui_view.draw(screen.window(fresh_surf), t.entries, input, viewport.new(), no_menu_(), 0, status.new(cfg))
+                spec.assert_str_eq_diff(snap_(fresh_surf), before, "fresh frame ${k}")
+            }
+        }
+
+        spec.it("title line shows on an empty transcript, also in Simple mode, never when signed out or with entries") callback {
+            t = transcript.new()
+            empty = draw_text_(t, mock_cfg_(), "nibcode · main · mock", false, 60)
+            spec.assert_true(string.starts_with(empty, " nibcode · main · mock\n") != 0, "title")
+            simple = draw_text_(t, cfg_with_(1, 0 as long), "nibcode · main · mock", false, 60)
+            spec.assert_true(string.starts_with(simple, " nibcode · main · mock\n") != 0, "simple title")
+            out = draw_text_(t, mock_cfg_(), "", true, 60)
+            spec.assert_true(string.starts_with(out, " No provider · /provider to sign in\n") != 0, "signed out")
+            transcript.add(t, entry.KIND_ASSISTANT, "Hello")
+            used = draw_text_(t, mock_cfg_(), "nibcode · main · mock", false, 60)
+            spec.assert_false(string.contains(used, "nibcode") != 0, "no title with entries")
+        }
+
+        spec.it("changes line sits directly under the footer, opens to file rows and is hidden in Simple mode") callback {
+            t = transcript.new()
+            transcript.add(t, entry.KIND_ASSISTANT, "Done")
+            transcript.add(t, entry.KIND_BILL, "2 Runs · 6 steps · 48s · 120k tokens")
+            files = list.list_new()
+            f1 = heap.new(changes.File)
+            f1.path = "src/tui.zig"
+            f1.added = 30
+            f1.removed = 4
+            list.list_add(files, f1 as ptr)
+            f2 = heap.new(changes.File)
+            f2.path = "docs/ui-style.md"
+            f2.added = 2
+            f2.removed = 0
+            list.list_add(files, f2 as ptr)
+            tc, ok = turn_changes.turn_changes(files)
+            spec.assert_true(ok, "changes")
+            transcript.add_changes(t, tc)
+            closed = draw_text_(t, mock_cfg_(), "", false, 60)
+            spec.assert_true(string.starts_with(closed, " Done\n\n 2 Runs · 6 steps · 48s · 120k tokens\n 2 files changed · +32 −4\n\n") != 0, "closed: ${closed}")
+            at_(t, 2).open = 1
+            opened = draw_text_(t, mock_cfg_(), "", false, 60)
+            spec.assert_contains(opened, " 2 files changed · +32 −4\n   src/tui.zig       +30 −4\n   docs/ui-style.md   +2\n", "open")
+            simple = draw_text_(t, cfg_with_(1, 0 as long), "", false, 60)
+            spec.assert_false(string.contains(simple, "files changed") != 0, "simple hides changes")
+            spec.assert_false(string.contains(simple, "120k") != 0, "simple hides bill")
+        }
+    }
+}
