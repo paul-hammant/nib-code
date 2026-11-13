@@ -339,6 +339,7 @@ aeb(cap) {
         dep(".build.ae")
         bash.test() {
             script("ae/tests/workspace.sh")
+            script("ae/tests/tool_activity.sh")
             script("tools/check_layers.sh")
         }
         return 0

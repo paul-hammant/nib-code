@@ -9,9 +9,7 @@
 // activity goes through nib.tui.turn's throttle. The Turn ends with its
 // summary ({"turn_end":..}) and {"done":{}} or {"failed":..}.
 //
-// Not here yet (marked): hooks after a Turn (src/session/hooks.zig), tool
-// activity names (the transcript shows the running tool from the Run's
-// progress instead).
+// Not here yet (marked): hooks after a Turn (src/session/hooks.zig).
 
 import std.list
 import std.string

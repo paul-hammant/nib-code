@@ -43,7 +43,7 @@ import nib.tools.view
 import nib.image
 import nib.provider.types
 
-exports(Tools, RunScope, new, new_scope, host, call_tool, names_json, docs, all_docs, tool_names,
+exports(Tools, RunScope, new, new_scope, host, call_tool, active_tool, names_json, docs, all_docs, tool_names,
         is_ported, take_images, credential_paths, writable_roots, nib_home, take_changes, set_workspace,
         cancel_cell, set_log, sandbox_roots, change_paths, export_versions, import_versions, set_config, take_usage, take_jail_notice, enable_undo, begin_turn_undo, finish_turn_undo, run_undo, turn_undo_dir, attach_turn_undo_dir, close_undo)
 
@@ -63,14 +63,19 @@ const DOC_STOP = "  // Requires a concrete reason; elapsed time/no output alone 
 const DOC_LLM = "  // Pure single-step model call: judgments, classification, extraction on supplied data; no tools/side effects, usually seconds. Limits: {{llm_limits}} prompt+input.\n  // {{llm_options}}\n  // Example: await Promise.all([\"yes\", \"no\"].map(input => tools.llm({prompt: \"Classify the input\", input})))\n  async llm({ prompt, input, schema, model, effort }) {}, // → { text, data, usage }\n"
 const DOC_AGENT = "  // Default: work yourself. Unless requested, delegate only parallel independent read-only investigations with discardable results.\n  // Serial edits/builds/tests/reviews:parent. No nesting; shared cwd, partial files possible.\n  // fork:parent history; model/effort switch loses cache. resume:a1 after completion; busy:wait, don't retry/replace. fork+resume rejects.\n  // background:{id}, auto-delivered result message. No ps/log reads/sleep/reruns to check/wait. No independent work:brief reply without tools; Session waits. Failure:ok:false; args/cancel reject.\n  async agent({ prompt, resume, fork = false, timeout_ms = 1800000, model, effort, background = false }) {}, // → { ok, id, text, usage, changes, error? } or { id }\n"
 
+const TOOL_COUNT = 15
+
+// The i-th tool of the table, in upstream order.
+tool_name_at_(i: int) -> string {
+    names = ["mcp", "mcp_schema", "sleep", "read", "view", "edit", "write", "grep", "glob", "fetch", "search", "bash", "stop", "llm", "agent"]
+    return names[i]
+}
+
 // The table in upstream order: name, root-only, description.
 tool_names() -> ptr {
     l = list.list_new()
-    names = ["mcp", "mcp_schema", "sleep", "read", "view", "edit", "write", "grep", "glob", "fetch", "search", "bash", "stop", "llm", "agent"]
-    i = 0
-    while i < 15 {
-        list.list_add(l, names[i])
-        i = i + 1
+    for i in 0..TOOL_COUNT {
+        list.list_add(l, tool_name_at_(i))
     }
     return l
 }
@@ -164,6 +169,7 @@ struct RunScope {
     llm_calls: ptr         // std.sync cell: tools.llm calls admitted in this Run
     fork: ptr              // the Step's *agent_input.Fork when the Run started, or null
     images: ptr            // *image.Attached: the images this Run viewed, for its result
+    active: ptr[]          // std.sync cells, one per tool of tool_names(): calls in flight
 }
 
 new(home: string) -> ptr {
@@ -330,7 +336,31 @@ new_scope(tp: @keep ptr, id: int) -> ptr {
     s.llm_calls = sync.atomic_new(0)
     s.fork = (tp as *Tools).fork_snapshot
     s.images = image.new_attached()
+    ptr[] active = []
+    for i in 0..TOOL_COUNT {
+        active.push(sync.atomic_new(0))
+    }
+    s.active = active
     return s as ptr
+}
+
+// The first tool of the table with a call in flight in this Run, "" none
+// (upstream RunScope.activeTool).
+active_tool(sp: ptr) -> string {
+    s = sp as *RunScope
+    for i in 0..TOOL_COUNT {
+        if sync.atomic_load(s.active[i]) > 0 {
+            return tool_name_at_(i)
+        }
+    }
+    return ""
+}
+
+tool_index_(name: string) -> int {
+    for i in 0..TOOL_COUNT {
+        if tool_name_at_(i) == name { return i }
+    }
+    return -1
 }
 
 enabled_(t: *Tools, name: string) -> int {
@@ -668,7 +698,8 @@ stop_(s: *RunScope, args: string, out: ptr) {
     }
 }
 
-// One tool call, from a Run scope. out: *sandbox.ToolResult.
+// One tool call, from a Run scope. out: *sandbox.ToolResult. While it runs
+// the tool counts as active in the scope (active_tool).
 call_tool(sp: ptr, name: string, args: string, out: ptr) {
     s = sp as *RunScope
     t = s.tools as *Tools
@@ -680,6 +711,13 @@ call_tool(sp: ptr, name: string, args: string, out: ptr) {
         sandbox.result_set_err(out, "unknown tool")
         return
     }
+    i = tool_index_(name)
+    if i >= 0 { sync.atomic_add(s.active[i], 1 as long) }
+    run_tool_(s, t, name, args, out)
+    if i >= 0 { sync.atomic_sub(s.active[i], 1 as long) }
+}
+
+run_tool_(s: *RunScope, t: *Tools, name: string, args: string, out: ptr) {
     ok = 0
     text = ""
     match name {

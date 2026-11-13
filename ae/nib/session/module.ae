@@ -812,9 +812,15 @@ execute_(s: *Session, tc: *types.ToolCall, sk: ptr, cancel: @keep ptr, run: @kee
     j = start_run_job_(s, code, run_index)
     attempted = 0
     beat = 0
+    last_tool = ""
     while sync.atomic_load(j.done) == 0 {
         if canceled_(cancel) == 1 { sync.atomic_store(j.cancel, 1) }
         if beat % 10 == 0 {
+            active = tools.active_tool(j.scope)
+            if active != last_tool {
+                activity_(sk, "tool", active)
+                last_tool = active
+            }
             poll_(s, sk)
             if attempted == 0 && canceled_(cancel) == 0 && timing.elapsed(j.timing) >= (l.run_background_after_ms as long) && sync.atomic_load(j.waiting) == 1 {
                 attempted = 1

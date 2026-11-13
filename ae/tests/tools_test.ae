@@ -127,6 +127,29 @@ main() {
             spec.assert_true(os.now_monotonic_ms() - t1 < 3000, "joined the running tools promptly")
             fs.remove_tree(d)
         }
+        spec.it("(port) active_tool names the table's first tool with a call in flight, as upstream activeTool") callback {
+            d = tmp_()
+            s = tools.new_scope(new_tools_(d), 1)
+            spec.assert_str_eq(tools.active_tool(s), "", "idle")
+            done = sync.atomic_new(0)
+            worker.run_detached(|| {
+                out = sandbox.result_ok("")
+                tools.call_tool(s, "bash", "{\"command\":\"sleep 0.4\"}", out)
+                sync.atomic_store(done, 1)
+                return null
+            })
+            t0 = os.now_monotonic_ms()
+            while tools.active_tool(s) != "bash" && os.now_monotonic_ms() - t0 < 3000 { sleep(5) }
+            spec.assert_str_eq(tools.active_tool(s), "bash", "bash in flight")
+            out2 = sandbox.result_ok("")
+            tools.call_tool(s, "read", "{\"path\":\"${d}/none.txt\"}", out2)
+            spec.assert_str_eq(tools.active_tool(s), "bash", "a finished read leaves bash")
+            while sync.atomic_load(done) == 0 { sleep(5) }
+            spec.assert_str_eq(tools.active_tool(s), "", "idle again")
+            tools.call_tool(s, "nope", "{}", out2)
+            spec.assert_str_eq(tools.active_tool(s), "", "an unknown tool is never active")
+            fs.remove_tree(d)
+        }
         spec.it("dangling symlink and target share the same path lock") callback {
             d = tmp_()
             spec.assert_str_eq(fs.symlink("target", "${d}/link"), "", "symlink")

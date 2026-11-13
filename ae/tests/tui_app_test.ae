@@ -606,6 +606,21 @@ main() {
             tui.settle(r.a)
             driver.expect_row_contains(r.t, "file contents")
         }
+        spec.it("tool activity: the Running line names the Run's active tool, then the Run again") callback {
+            r = rig_(80, 24)
+            type_(r, "ask it")
+            key_(r, "enter")
+            emit_(r, "{\"step\":{\"n\":1,\"effort\":\"\"}}")
+            emit_(r, "{\"run_start\":\"await tools.llm({prompt: 'p'})\",\"step\":1}")
+            tui.settle(r.a)
+            driver.expect_row_contains(r.t, "Running Run")
+            emit_(r, "{\"tool_activity\":\"llm\"}")
+            tui.settle(r.a)
+            driver.expect_row_contains(r.t, "Running llm")
+            emit_(r, "{\"tool_activity\":\"\"}")
+            tui.settle(r.a)
+            driver.expect_row_contains(r.t, "Running Run")
+        }
         spec.it("interjection: a message typed during a Turn is queued, then marked inserted") callback {
             r = rig_(80, 24)
             type_(r, "first")
