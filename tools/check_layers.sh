@@ -5,9 +5,10 @@
 # fails), so widening one is a reviewed change here, and checks the rules a
 # single import list cannot: who may start a process, who may embed QuickJS,
 # who may use the marked stand-ins, who reaches the network, and that the
-# sandbox's host functions keep their `hide` veto line. The TUI's three
-# exceptions (tui/open's launch, tui/reflect's flock, auth/models' GET) are
-# each named with the calls they may make and why.
+# sandbox's host functions keep their `hide` veto line. Who may start a
+# program is the compiler's (`import std.os hiding (...)`); this checks the
+# hiding lists. The TUI's three exceptions (tui/open's launch, tui/reflect's
+# flock, auth/models' GET) are each named with what they may do and why.
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
@@ -16,7 +17,7 @@ fail=0
 PINNED=""
 expect_imports() {   # expect_imports FILE "a|b|..."
     PINNED="$PINNED $1"
-    got=$(grep -E '^import ' "$1" | sed 's/^import //' | sort | tr '\n' '|')
+    got=$(grep -E '^import ' "$1" | sed -e 's/^import //' -e 's/ hiding .*//' | sort | tr '\n' '|')
     want=$(printf '%s' "$2" | tr '|' '\n' | sort | tr '\n' '|')
     if [ "$got" = "$want" ]; then
         echo "ok   $1"
@@ -179,16 +180,37 @@ rule() {   # rule "what" "pattern" "allowed path regex"
     fi
 }
 
-# Exceptions, each as narrow as the code needs:
-# - tui/open launches the user's `open` command for a clicked path, detached,
-#   stdio to /dev/null (upstream open.zig). tools/process ties a child to a
-#   Run (output capture, deadline, kill on cancel); a click is outside any Run
-#   and must outlive none of that. Only os.spawn_proc_to, and os.wait on its
-#   own worker to reap it.
-# - tools/jail probes Landlock and execs the bash helper (`nib __jail`).
-rule "a program is started only in tools/process (the jail's probe and exec helper aside)" \
-    'os\.(run|run_capture|run_full|run_stdio|run_socket|run_pipe|spawn_proc|spawn_proc_to|exec|os_execv|run_supervised)[[:space:]]*\(' \
-    "$T/process/|$T/jail/|$U/open/module.ae:[0-9]+:[[:space:]]*token, err = os\.spawn_proc_to\(prog, rest, env, sink\)"
+# Who may start a program is the compiler's rule (Aether 0.911.0's
+# `import ns hiding (...)`, aether #3653; a use is E0304): every file that
+# imports std.os outside tools/process and tools/jail (the Landlock probe and
+# the `nib __jail` exec helper) hides each std.os member that starts a
+# program. The list is std.os's as of 0.912.0; a new such member must join it.
+PROC="exec run_capture run_pipe run_pipe_drain_and_wait run_socket run_stdio run_full run_supervised spawn_proc spawn_proc_to os_system os_exec_raw os_execv os_run os_run_capture_raw os_run_capture_status_raw os_run_pipe_raw os_run_pipe_drain_and_wait_raw os_run_socket_raw os_run_stdio_raw os_run_full_raw os_run_supervised_raw os_spawn_raw os_spawn_to_raw"
+# The one exception: tui/open launches the user's `open` command for a
+# clicked path, detached, stdio to /dev/null (upstream open.zig). tools/process
+# ties a child to a Run (output capture, deadline, kill on cancel); a click is
+# outside any Run. So tui/open alone keeps spawn_proc_to (and os.wait on its
+# own worker to reap the child).
+for f in $(grep -rlE '^import std\.os( |$)' --include='*.ae' ae/nib ae/main.ae | sort); do
+    case $f in $T/process/*|$T/jail/*) continue ;; esac
+    stmt=$(awk '/^import std\.os( |$)/ { on = 1 } on { printf "%s ", $0; if ($0 ~ /\)/ || $0 ~ /^import std\.os$/) exit }' "$f")
+    keep=""
+    [ "$f" = "$U/open/module.ae" ] && keep=spawn_proc_to
+    bad=""
+    for n in $PROC; do
+        [ "$n" = "$keep" ] && continue
+        case "$stmt" in *hiding*[\(\ ]"$n"[,\)]*) ;; *) bad="$bad $n" ;; esac
+    done
+    if [ -n "$keep" ]; then
+        case "$stmt" in *[\(\ ]"$keep"[,\)]*) bad="$bad (hides $keep: the exception is gone, drop it here)" ;; esac
+    fi
+    if [ -n "$bad" ]; then
+        echo "FAIL $f: its std.os import does not hide:$bad"
+        fail=1
+    else
+        echo "ok   $f hides std.os's program starts${keep:+ but $keep}"
+    fi
+done
 only_calls() {   # only_calls FILE MODULE "allowed members|..." "why"
     used=$(grep -oE "(^|[^A-Za-z0-9_.])$2\.[a-z_]+[[:space:]]*\(" "$1" | sed -E "s/.*$2\.([a-z_]+).*/\1/" | sort -u | tr '\n' ' ')
     bad=""
@@ -202,7 +224,6 @@ only_calls() {   # only_calls FILE MODULE "allowed members|..." "why"
         echo "ok   $1 calls only $2.($(printf '%s' "$3" | sed 's/|/, /g')): $4"
     fi
 }
-only_calls $U/open/module.ae os "platform|spawn_proc_to|wait" "a detached launch"
 rule "QuickJS is embedded only by the sandbox and grep's private matcher" \
     '^import contrib\.quickjs' "ae/nib/sandbox/module.ae|$T/grep/"
 # - tui/reflect appends to $NIB_HOME/reflections.md under an exclusive flock,

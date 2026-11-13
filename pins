@@ -16,7 +16,14 @@
 # on macOS arm64, ae-x64 and cachyos; ae/tests/upstream-e2e.sh gives the same
 # results on all three, except test_sandbox's workspace cases on ae-x64
 # (kernel 5.15, no Landlock ABI 2: bash runs unsandboxed there, as upstream).
-AE_PIN=0.909.0
+# 0.912.0 (2026-11-13): `import std.os hiding (...)` (0.911.0, aether #3653)
+# makes "only tools/process, tools/jail and tui/open's launch start a program"
+# a compile error (E0304) instead of a check_layers grep; the 0.910.0 fixes
+# (aether #3655: a returned local optional owning a string, a local read once
+# in a loop) let ae/term's surface loops store one blank again. std.posix.regex
+# (#3654, 0.912.0) is not used. Verified: aeb .tests.ae, tools/tui_tests.sh and
+# ae/tests/upstream-e2e.sh on macOS arm64, ae-x64 and cachyos.
+AE_PIN=0.912.0
 
 # v0.344 (2026-11-12): aether.program and aether.program_test with lib().
 AEB_REF=v0.344

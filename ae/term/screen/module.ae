@@ -198,10 +198,9 @@ surface_resize(s: *Surface, cols: int, rows: int) {
     w = if cols < 0 { 0 } else { cols }
     h = if rows < 0 { 0 } else { rows }
     cells = make([]Cell, w * h)
-    // a fresh cell per store: a local stored in a loop is moved by the
-    // first store in Aether 0.909.0 (asks/loop-store-moves-local.md)
+    blank = blank_cell()
     for i in 0..w * h {
-        cells[i] = blank_cell()
+        cells[i] = blank
     }
     s.cells = cells
     s.width = w
@@ -223,8 +222,9 @@ write_cell(s: *Surface, col: int, row: int, c: Cell) {
 }
 
 // The cell, and whether (col, row) is on the surface at all (a blank cell
-// when not). libvaxis returns an optional; a local `Cell?` cannot be
-// returned safely in Aether 0.909.0 (asks/optional-return-frees-string.md).
+// when not). libvaxis returns `?Cell`; the pair stays because every caller
+// wants the blank cell off the surface, which an optional would make each
+// one spell out.
 read_cell(s: *Surface, col: int, row: int) -> (Cell, bool) {
     if col < 0 || row < 0 || col >= s.width || row >= s.height {
         return blank_cell(), false
@@ -233,8 +233,9 @@ read_cell(s: *Surface, col: int, row: int) -> (Cell, bool) {
 }
 
 surface_clear(s: *Surface) {
+    blank = blank_cell()
     for i in 0..s.cells.len {
-        s.cells[i] = blank_cell()
+        s.cells[i] = blank
     }
 }
 

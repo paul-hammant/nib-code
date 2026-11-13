@@ -1,5 +1,11 @@
 # Returning a local `T?` whose `T` owns a string returns freed memory
 
+**RESOLVED** in Aether 0.910.0 by aether PR #3655 (fix/batch-2026-11-12b,
+released 2026-11-12; nib-code's port pins 0.912.0). Verified with the repro below on 0.912.0 (prints `text=y`). `ae/term` keeps
+`poll -> Event` with `NoEvent` and `read_cell -> (Cell, bool)` as its API by
+choice now (the decoder's `(Event, consumed)` tuples need a no-event value;
+read_cell's callers want the blank cell); the comments no longer cite this.
+
 **For:** aether (compiler, ownership of optionals). **From:** nib-code's
 `ae/term`, 2026-11-12, Aether 0.909.0 on macOS arm64.
 

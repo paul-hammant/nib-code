@@ -10,10 +10,9 @@
 // closes or the client's own whole-exchange timeout fires; nothing reads
 // its bytes after that.
 //
-// No `Expect: 100-continue` is sent: std.http.client returns an interim
-// 100 Continue as the final response (a known Aether bug), so a request
-// must never ask for one. std.http.client sends Content-Length bodies and
-// no Expect header by default.
+// std.http.client sends Content-Length bodies and no Expect header, as
+// upstream's std.http does; it reads past interim 1xx responses to the
+// final one (Aether 0.910.0, aether #3655).
 
 import std.http.client
 import std.list

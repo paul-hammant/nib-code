@@ -140,13 +140,13 @@ pinned byte for byte in `test_render.ae`.
 
 ## Aether notes
 
-Two compiler bugs (Aether 0.909.0) shape the code, each worked around where
-it bites and written up in `asks/`: returning a local optional whose type
-owns a string frees the string (`asks/optional-return-frees-string.md`; so
-`poll` returns `Event` with a `NoEvent` variant and `read_cell` a
-`(Cell, bool)`), and a local stored into slice elements in a loop is moved
-by the first store (`asks/loop-store-moves-local.md`). The C shims and what
-`std` should offer instead: `asks/terminal-control.md`,
+Two compiler bugs met here are fixed in Aether 0.910.0 (aether #3655; both
+asks are RESOLVED): a returned local optional whose type owns a string no
+longer frees it, and a local stored into slice elements in a loop is no
+longer moved by the first store. `poll` still returns `Event` with a
+`NoEvent` variant (the decoder's `(Event, consumed)` results need one) and
+`read_cell` a `(Cell, bool)` (callers want the blank cell off the surface).
+The C shims and what `std` should offer instead: `asks/terminal-control.md`,
 `asks/unicode-grapheme-width.md`.
 
 Names that differ from libvaxis because Aether reserves them: `draw`

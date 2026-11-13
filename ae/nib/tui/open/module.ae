@@ -24,7 +24,11 @@ import std.string
 import std.list
 import std.map
 import std.fs
-import std.os
+import std.os hiding (exec, run_capture, run_pipe, run_pipe_drain_and_wait, run_socket,
+    run_stdio, run_full, run_supervised, spawn_proc, os_system, os_exec_raw, os_execv,
+    os_run, os_run_capture_raw, os_run_capture_status_raw, os_run_pipe_raw,
+    os_run_pipe_drain_and_wait_raw, os_run_socket_raw, os_run_stdio_raw,
+    os_run_full_raw, os_run_supervised_raw, os_spawn_raw, os_spawn_to_raw)
 import std.worker
 import std.strbuilder
 

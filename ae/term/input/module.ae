@@ -194,9 +194,9 @@ struct Capability {
     what: int
 }
 
-// No event: what next_event and poll return when there is none. (An
-// optional would be the natural shape; returning a local `T?` whose T owns
-// a string frees the string in Aether 0.909.0, see asks/.)
+// No event: what next_event and poll return when there is none. The
+// decoder's (Event, consumed) results need a no-event value of the same
+// type, so poll keeps it too rather than an `Event?`.
 struct NoEvent {}
 
 type Event = NoEvent | Key | Mouse | Winsize | PasteStart | PasteEnd | Paste | FocusIn | FocusOut | ColorReport | ColorScheme | Capability

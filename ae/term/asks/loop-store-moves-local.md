@@ -1,5 +1,10 @@
 # A local stored into a slice element inside a loop is moved by the first store
 
+**RESOLVED** in Aether 0.910.0 by aether PR #3655 (fix/batch-2026-11-12b,
+released 2026-11-12; nib-code's port pins 0.912.0). Verified with both repros below on 0.912.0 (`[ ][ ][ ]`, `[x][x][x]`).
+`ae/term`'s fresh-value-per-store loops (screen.surface_resize,
+surface_clear, render.reset) store one hoisted blank again.
+
 **For:** aether (compiler, last-use moves). **From:** nib-code's `ae/term`,
 2026-11-12, Aether 0.909.0 on macOS arm64.
 

@@ -63,8 +63,9 @@ renderer(cols: int, rows: int, sgr: int = 0) -> *Renderer {
 // The terminal was cleared (and maybe resized): the last frame is blank.
 reset(r: *Renderer, cols: int, rows: int) {
     screen.surface_resize(r.last, cols, rows)
+    blank = _default_cell()
     for i in 0..r.last.cells.len {
-        r.last.cells[i] = _default_cell()
+        r.last.cells[i] = blank
     }
     r.skipped = make([]int, cols * rows)
     r.cursor_row = 0
