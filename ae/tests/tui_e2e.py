@@ -1,10 +1,16 @@
-"""The TUI's Running line names the tool a Run is in (upstream Sink.onToolActivity,
-session/run.zig executeTimed). Ours, beside upstream's tests: it drives the built
-binary through upstream's own PTY fixture and mock (tests/test_interjections.py,
-used as a library, unchanged). Run from the repository root after aeb .build.ae:
+"""TUI behaviour upstream's Python tests do not reach, checked through the built
+binary. Ours, beside upstream's tests: it drives the binary through upstream's
+own PTY fixture and mock (tests/test_interjections.py, used as a library,
+unchanged). Run from the repository root after aeb .build.ae:
 
-    python3 ae/tests/tool_activity.py
+    python3 ae/tests/tui_e2e.py
+
+- tool_activity: the Running line names the tool a Run is in (upstream
+  Sink.onToolActivity, session/run.zig executeTimed).
+- turn_end_hooks_joined: the turn_end hooks run on their own thread and
+  quitting waits for them (upstream TurnJob, Session.finishHooks).
 """
+import json
 import os
 from pathlib import Path
 import sys
@@ -23,7 +29,7 @@ def status_line(terminal):
     return next((line for line in screen(terminal.read(), 120, 32) if "turn " in line and "·" in line), "")
 
 
-def main():
+def tool_activity():
     # tools.llm is a tool with no background task, so only the tool activity
     # can name it: its request is held by the mock until released.
     with tempfile.TemporaryDirectory(prefix="nib-tool-activity-") as directory:
@@ -39,5 +45,20 @@ def main():
     print("ok   the Running line names the active tool")
 
 
+def turn_end_hooks_joined():
+    with tempfile.TemporaryDirectory(prefix="nib-turn-end-") as directory:
+        tmp = Path(directory) / "case"
+        hooked = Path(directory) / "hooked"
+        config = "[hooks]\nturn_end = " + json.dumps(["sleep 1; touch " + str(hooked)]) + "\n"
+        with fixture(tmp, [Reply("done")], config=config) as (terminal, home, _):
+            terminal.send("go\r")
+            wait_for(lambda: tui.finished(home, "done"), "turn committed")
+            assert not hooked.exists(), "the hook is still sleeping"
+            terminal.close()
+            assert hooked.exists(), "quitting waited for the turn_end hook"
+    print("ok   quitting waits for the turn_end hooks")
+
+
 if __name__ == "__main__":
-    main()
+    tool_activity()
+    turn_end_hooks_joined()

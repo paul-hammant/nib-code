@@ -63,7 +63,7 @@ import nib.mcp
 import nib.tools.agent_input
 import nib.tools.agent_sessions
 
-exports(Session, Options, Sink, Ran, new_options, new_sink, init, turn, turn_with_images, image_directory, run, compact_now, close, turn_end_hooks, error_message, timing_json, undo,
+exports(Session, Options, Sink, Ran, new_options, new_sink, init, turn, turn_with_images, image_directory, run, compact_now, close, start_turn_end_hooks, finish_hooks, error_message, timing_json, undo,
         set_activity, enqueue, take_queued, switch_config, steps_logged,
         VERSION)
 
@@ -125,6 +125,13 @@ struct Session {
     ticker_done: ptr
     bg_runs: ptr             // *RunJob of Runs in the background, until finished
     recorder: ptr            // *record.Recorder of <id>.calls.jsonl (NIB_RECORD=off: disabled)
+    hook_jobs: ptr           // *HookJob of turn_end hooks still running or not yet reaped
+}
+
+// The turn_end hooks of one Turn on a thread of their own (upstream
+// session/hooks.zig TurnJob), held by the Session until finish_hooks.
+struct HookJob {
+    done: ptr                // std.sync cell, 1 once the hooks ran
 }
 
 new_options(home: string, user_home: string) -> ptr {
@@ -302,6 +309,7 @@ init(cp: @keep ptr, op: @keep ptr) -> (ptr, string, string) {
     s.ticker_stop = sync.atomic_new(0)
     s.ticker_done = sync.atomic_new(1)
     s.bg_runs = list.list_new()
+    s.hook_jobs = list.list_new()
     reset_timing_(s)
     directory = atomic_file.join(o.home, "sessions")
     fs.mkdir_p(directory)
@@ -488,6 +496,7 @@ initialize_history_(s: *Session, cwd: string) -> string {
 
 close(sp: ptr) {
     s = sp as *Session
+    finish_hooks(sp)
     stop_ticker_(s)
     background.stop_all((s.tools as *tools.Tools).background)
     tools.close_undo(s.tools)
@@ -745,13 +754,53 @@ after_edit_(s: *Session, j: *RunJob) {
 
 // turn_end hooks of a root Session (status: completed, failed, cancelled).
 // The TUI's notice of a failed one ("hook turn_end · exit N"), "" none.
-turn_end_hooks(sp: ptr, status: string) -> string {
+// Starts the Session's turn_end hooks for a Turn that ended with `status`
+// on their own thread and returns (upstream TurnJob.start); finished jobs
+// are reaped first. A failure reaches `notify(ctx, notice)` from that thread
+// when has_notify is 1 (the TUI posts it; `nib ask` passes none).
+// close (finish_hooks) waits for them.
+start_turn_end_hooks(sp: @keep ptr, status: string, ctx: @keep ptr, notify: @keep fn, has_notify: int) {
     s = sp as *Session
     c = s.cfg as *types.Config
-    if (s.tools as *tools.Tools).depth != 0 || list.list_size(c.hooks_turn_end) == 0 { return "" }
-    f = hooks.run(hooks_ctx_(s), "turn_end", c.hooks_turn_end, list.list_new(), status, hooks.TIMEOUT_MS as long)
-    if f == null { return "" }
-    return "hook turn_end · exit ${(f as *hooks.Failure).exit_code}"
+    if (s.tools as *tools.Tools).depth != 0 || list.list_size(c.hooks_turn_end) == 0 { return }
+    i = 0
+    while i < list.list_size(s.hook_jobs) {
+        previous = list.list_get_raw(s.hook_jobs, i) as *HookJob
+        if sync.atomic_load(previous.done) != 0 {
+            list.list_remove(s.hook_jobs, i)
+            sync.atomic_free(previous.done)
+            heap.free(previous)
+        } else {
+            i = i + 1
+        }
+    }
+    job = heap.new(HookJob)
+    job.done = sync.atomic_new(0)
+    list.list_add_raw(s.hook_jobs, job as ptr)
+    hctx = hooks_ctx_(s)
+    commands = c.hooks_turn_end
+    done = job.done
+    st = string.copy(status)
+    worker.run_detached(|| {
+        f = hooks.run(hctx, "turn_end", commands, list.list_new(), st, hooks.TIMEOUT_MS as long)
+        if f != null && has_notify == 1 {
+            call(notify, ctx, "hook turn_end · exit ${(f as *hooks.Failure).exit_code}")
+        }
+        sync.atomic_store(done, 1)
+        return null
+    })
+}
+
+// Waits for every turn_end hook job (upstream finishHooks).
+finish_hooks(sp: ptr) {
+    s = sp as *Session
+    while list.list_size(s.hook_jobs) > 0 {
+        job = list.list_get_raw(s.hook_jobs, 0) as *HookJob
+        while sync.atomic_load(job.done) == 0 { sleep(2) }
+        list.list_remove(s.hook_jobs, 0)
+        sync.atomic_free(job.done)
+        heap.free(job)
+    }
 }
 
 // A Run outside a Turn (upstream session/run.zig run + runTimed: the TUI's

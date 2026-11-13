@@ -435,7 +435,7 @@ main() {
         hook_status = "failed"
         if sync.atomic_load(cancel) != 0 { hook_status = "cancelled" }
     }
-    session.turn_end_hooks(sp, hook_status)
+    session.start_turn_end_hooks(sp, hook_status, null, |c: ptr, notice: string| { }, 0)
     session.close(sp)
     if err != "" { fail_(a.json, err, detail, types.usage_json(s.usage), s.steps, session.timing_json(sp)) }
     if a.json == 1 {

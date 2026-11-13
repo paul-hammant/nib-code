@@ -9,7 +9,9 @@
 // activity goes through nib.tui.turn's throttle. The Turn ends with its
 // summary ({"turn_end":..}) and {"done":{}} or {"failed":..}.
 //
-// Not here yet (marked): hooks after a Turn (src/session/hooks.zig).
+// After a Turn the Session's turn_end hooks run on a thread of their own
+// (session.start_turn_end_hooks, upstream TurnJob); closing the Session
+// waits for them.
 
 import std.list
 import std.string
@@ -162,15 +164,16 @@ new(sp: @keep ptr, cfg: @keep ptr, op: @keep ptr, home: string) -> *port.Port {
                 msg = if detail != "" { detail } else { err }
                 app_queue.post(q, "{\"failed\":{\"message\":${jsonx.quote(msg)},\"reason\":${jsonx.quote(reason_name_(r))}}}")
             }
-            sync.atomic_store(lw.running, 0)
-            // upstream's TurnJob: turn_end hooks after the Turn, their notice last
+            // upstream's TurnJob: the turn_end hooks start on their own thread
+            // before this one ends (finish_turn waits for that); a failure's
+            // notice reaches the app from there
             if compact == 0 {
                 hs = if err == "" { "completed" } else if sync.atomic_load(cancel) != 0 { "cancelled" } else { "failed" }
-                hn = session.turn_end_hooks(lw.sp, hs)
-                if hn != "" {
-                    app_queue.post(q, "{\"notice\":${jsonx.quote(hn)}}")
-                }
+                session.start_turn_end_hooks(lw.sp, hs, qp, |c: ptr, notice: string| {
+                    app_queue.post(c as *app_queue.Queue, "{\"notice\":${jsonx.quote(notice)}}")
+                }, 1)
             }
+            sync.atomic_store(lw.running, 0)
             return null
         })
     }
