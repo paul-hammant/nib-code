@@ -13,22 +13,19 @@
 //    killed with its group on timeout) because std.os has no timed capture;
 //    that merges stderr into the output, so the Linux branches of the script
 //    redirect the tool's stderr to /dev/null (upstream discards it separately).
-//    `env` is a list of "NAME=value" or null (inherit).
-//  - STAND-IN: upstream's image check is src/image.zig `probe` and `max_bytes`
-//    (5 MB). Until nib.image is ported, MAX_BYTES and probe_png_ (an 8-byte
-//    PNG signature check) are defined here; switch to nib.image then.
+//    `env` is a list of "NAME=value" or null (inherit); the app passes its
+//    environment (config.env.pairs), as upstream passes app.environ.
+//  - The image check is nib.image's probe and MAX_BYTES, as upstream.
 //  - read_script(script, env, timeout_ms) is the part below read_image, exposed
 //    so the shell/exit-code/timeout handling can be tested with other scripts.
 
 import std.string
 import std.list
+import nib.image
 import nib.tools.process
 
 exports(Result, Clipboard, KIND_PNG, KIND_NO_TOOL, KIND_NO_IMAGE, KIND_TOO_LARGE,
-        MAX_BYTES, TIMEOUT_MS, SCRIPT, new, free, read_image, read_script)
-
-// A stand-in for nib.image.max_bytes.
-const MAX_BYTES = 5242880
+        TIMEOUT_MS, SCRIPT, new, free, read_image, read_script)
 
 const KIND_PNG = 0
 const KIND_NO_TOOL = 1
@@ -54,7 +51,7 @@ esac"
 
 struct Result {
     kind: int
-    png: string     // PNG bytes when kind is KIND_PNG
+    png: string     // the image bytes when kind is KIND_PNG
     error: string   // "" or why the script could not run
 }
 
@@ -70,33 +67,21 @@ result_(kind: int, png: string, error: string) -> ptr {
     return r as ptr
 }
 
-// STAND-IN for nib.image.probe: true for data starting with the PNG signature
-// and no larger than MAX_BYTES.
-probe_png_(data: string) -> int {
-    n = string.length(data)
-    if n < 8 || n > MAX_BYTES { return 0 }
-    sig = [137, 80, 78, 71, 13, 10, 26, 10]
-    i = 0
-    while i < 8 {
-        if (data[i] & 255) != sig[i] { return 0 }
-        i = i + 1
-    }
-    return 1
-}
-
 // Runs `script` under /bin/sh with a deadline; see read_image for the results.
 read_script(script: string, env: ptr, timeout_ms: long) -> ptr {
     argv = list.list_new()
     list.list_add(argv, "/bin/sh")
     list.list_add(argv, "-c")
     list.list_add(argv, script)
-    pr = process.run(argv, env, null, null, timeout_ms, (MAX_BYTES + 1) as long) as *process.Result
+    pr = process.run(argv, env, null, null, timeout_ms, (image.MAX_BYTES + 1) as long) as *process.Result
     list.list_free(argv)
     if pr.error == "OutputLimit" { return result_(KIND_TOO_LARGE, "", "") }
     if pr.error != "" { return result_(KIND_NO_IMAGE, "", pr.error) }
     if pr.stop == process.STOP_TIMED_OUT { return result_(KIND_NO_IMAGE, "", "") }
     if pr.exit_code == 127 { return result_(KIND_NO_TOOL, "", "") }
-    if pr.exit_code != 0 || probe_png_(pr.output) == 0 { return result_(KIND_NO_IMAGE, "", "") }
+    if pr.exit_code != 0 { return result_(KIND_NO_IMAGE, "", "") }
+    fmt, _w, _h = image.probe(pr.output)
+    if fmt == "" { return result_(KIND_NO_IMAGE, "", "") }
     return result_(KIND_PNG, pr.output, "")
 }
 

@@ -9,9 +9,7 @@
 // drains owned events and closed queues reject Turn payloads without leaks"
 // and "shutdown closes a full queue before joining the canceled Turn" (Zig
 // allocator/thread ownership; the queue's close is covered by "closed queues
-// refuse events"), "empty or whitespace-only paste reads the clipboard image
-// like Ctrl+V" (images are not ported; ported as the notice that stands in),
-// "file paths are links only when open is configured..." runs with a recording
+// refuse events"), "file paths are links only when open is configured..." runs with a recording
 // launcher instead of /usr/bin/env.
 //
 // Part two: specs for the main flows (streaming states, a Run block,
@@ -19,6 +17,7 @@
 // mouse selection, resize).
 import std.spec
 import std.string
+import std.strbuilder
 import std.list
 import std.fs
 import std.sync
@@ -43,6 +42,9 @@ import nib.tui.menu
 import nib.tui.paths
 import nib.tui.frames
 import nib.tui.provider_flow
+import nib.tui.clipboard
+import nib.image
+import nib.sysgap
 
 struct Rig {
     t: *term.Terminal
@@ -100,6 +102,12 @@ mouse_(r: *Rig, col: int, row: int, kind: int, button: int) {
 }
 
 shown_contains_(r: *Rig, text: string) -> bool { return driver.find_row(r.t, text) >= 0 }
+
+repeat_(s: string, n: int) -> string {
+    sb = strbuilder.new(64)
+    for i in 0..n { strbuilder.append(sb, s) }
+    return strbuilder.finish(sb)
+}
 
 main() {
     fw = spec.init()
@@ -202,12 +210,27 @@ main() {
             r = rig_(80, 24)
             a = r.a
             (a.cfg as *types.Config).custom_vision = 1
+            reads = sync.atomic_new(0)
+            a.clip.reader = |env: ptr| {
+                sync.atomic_add(reads, 1)
+                res = heap.new(clipboard.Result)
+                res.kind = clipboard.KIND_NO_IMAGE
+                res.png = ""
+                res.error = ""
+                return res as ptr
+            }
             tui.handle_input(a, input.PasteStart {})
             tui.handle_input(a, input.PasteEnd {})
+            spec.assert_eq(sync.atomic_load(reads), 1, "one read")
             spec.assert_str_eq(a.notice, "No image in clipboard", "empty paste")
+            tui.handle_input(a, input.PasteStart {})
+            a.paste_buf = " \n\t"
+            tui.handle_input(a, input.PasteEnd {})
+            spec.assert_eq(sync.atomic_load(reads), 2, "whitespace reads too")
             tui.handle_input(a, input.PasteStart {})
             a.paste_buf = "text"
             tui.handle_input(a, input.PasteEnd {})
+            spec.assert_eq(sync.atomic_load(reads), 2, "text does not read")
             spec.assert_str_eq(text_(r), "text", "text pasted")
         }
         spec.it("usage snapshots refresh the footer without reading the running Session") callback {
@@ -684,6 +707,91 @@ main() {
             start = string.index_of(text, "--- normal 80x12 ---\n") + 21
             end = string.index_of(text, "--- standard")
             driver.expect_screen(r.t, string.substring(text, start, end))
+        }
+        spec.it("images: Ctrl+V attaches the clipboard image, Enter sends it with the Turn") callback {
+            r = rig_(80, 24)
+            a = r.a
+            a.clip.reader = |env: ptr| {
+                res = heap.new(clipboard.Result)
+                res.kind = clipboard.KIND_PNG
+                res.png = image.sample_png()
+                res.error = ""
+                return res as ptr
+            }
+            key_(r, "ctrl+v")
+            spec.assert_str_eq(a.notice, "mock has no image input", "no vision: refused")
+            spec.assert_eq(editor.image_count(a.input), 0, "nothing attached")
+            (a.cfg as *types.Config).custom_vision = 1
+            key_(r, "ctrl+v")
+            spec.assert_str_eq(text_(r), "[Image #1]", "attached")
+            type_(r, " what is this")
+            key_(r, "enter")
+            spec.assert_eq(port.turn_count(r.s), 1, "a Turn")
+            spec.assert_str_eq(port.turn_text(r.s, 0), "[Image #1] what is this", "its text")
+            sent = port.turn_images(r.s, 0)
+            spec.assert_eq(image.count(sent), 1, "one image")
+            first = image.image_at(sent, 0)
+            spec.assert_str_eq(image.name_of(first), "clipboard.png", "named")
+            spec.assert_eq(image.width_of(first) as int, 640, "probed width")
+            spec.assert_contains(first, "${r.home}/sessions/", "stored under the Session")
+            spec.assert_contains(first, ".images/", "in its images directory")
+            port.end_turn(r.s, 1)
+            tui.step(a)
+            type_(r, "no image now")
+            key_(r, "enter")
+            spec.assert_str_eq(port.turn_images(r.s, 1), "", "the next Turn has none")
+        }
+        spec.it("images: a pasted image path attaches the file, other paths stay text, other clipboard results say why") callback {
+            r = rig_(80, 24)
+            a = r.a
+            (a.cfg as *types.Config).custom_vision = 1
+            dir = home_()
+            png = image.sample_png()
+            fs.write_binary("${dir}/my shot.png", string.bytes(png)[0..string.length(png)])
+            tui.handle_input(a, input.PasteStart {})
+            a.paste_buf = "${dir}/my\\ shot.png"
+            tui.handle_input(a, input.PasteEnd {})
+            spec.assert_str_eq(text_(r), "[Image #1]", "attached from the path")
+            tui.handle_input(a, input.PasteStart {})
+            a.paste_buf = "/does/not/exist.png"
+            tui.handle_input(a, input.PasteEnd {})
+            spec.assert_str_eq(text_(r), "[Image #1]/does/not/exist.png", "a missing file is text")
+            fs.write("${dir}/fake.png", "not an image")
+            tui.handle_input(a, input.PasteStart {})
+            a.paste_buf = "${dir}/fake.png"
+            tui.handle_input(a, input.PasteEnd {})
+            spec.assert_str_eq(a.notice, "fake.png: unsupported image: expected png, jpeg, gif or webp", "unsupported")
+            spec.assert_eq(editor.image_count(a.input), 1, "still one")
+            fs.mkdir_p("${dir}/folder.png")
+            editor.replace(a.input, "")
+            tui.handle_input(a, input.PasteStart {})
+            a.paste_buf = "${dir}/folder.png"
+            tui.handle_input(a, input.PasteEnd {})
+            spec.assert_str_eq(text_(r), "${dir}/folder.png", "a directory is text")
+            sb = strbuilder.new(64)
+            strbuilder.append(sb, png)
+            for i in 0..5300 { strbuilder.append(sb, repeat_(" ", 1000)) }
+            fs.write("${dir}/big.png", strbuilder.finish(sb))
+            // unreadable: the size is judged from stat, before any read
+            sysgap.chmod("${dir}/big.png", 0)
+            tui.handle_input(a, input.PasteStart {})
+            a.paste_buf = "${dir}/big.png"
+            tui.handle_input(a, input.PasteEnd {})
+            spec.assert_str_eq(a.notice, "big.png: image is larger than 5 MB", "too large, before reading")
+            kinds = [clipboard.KIND_NO_TOOL, clipboard.KIND_TOO_LARGE]
+            notices = ["No clipboard image tool · install wl-paste or xclip", "Clipboard image is larger than 5 MB"]
+            for i in 0..2 {
+                k = kinds[i]
+                a.clip.reader = |env: ptr| {
+                    res = heap.new(clipboard.Result)
+                    res.kind = k
+                    res.png = ""
+                    res.error = ""
+                    return res as ptr
+                }
+                key_(r, "ctrl+v")
+                spec.assert_str_eq(a.notice, notices[i], "clipboard result ${i}")
+            }
         }
         spec.it("/mcp lists config.toml's servers and switches one for new sessions") callback {
             r = rig_(80, 24)

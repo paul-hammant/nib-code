@@ -10,11 +10,11 @@
 //  - Optionals become values: file_mention/skill_mention return
 //    (start, query) with start -1 for "no mention"; history_index is -1 for
 //    "none"; draft is a null ptr when there is none.
-//  - blocks, history and sent_images are `ptr[]` of heap boxes (*Block,
-//    *Snapshot, *Image). Offsets, cursor and top_row are ints.
-//  - Image is a STAND-IN for upstream's src/image.zig Image (the fields the
-//    editor needs: path, name, media_type, bytes, width, height); replace
-//    with nib.image when that is ported. image_new() builds one.
+//  - blocks and history are `ptr[]` of heap boxes (*Block, *Snapshot).
+//    Offsets, cursor and top_row are ints.
+//  - An image is nib.image's Image: its JSON object text. A block's `image` is
+//    "" for a paste block; sent_images is the JSON array of the last take's
+//    images ("" none), what nib.session's turn_with_images takes.
 //  - skill_mention carries the parsing of src/session/skills.zig mentionAt
 //    (skills are not ported; it only parses text).
 //  - draw/rows/column/at_column are as upstream; column/at_column/prev/next/
@@ -28,7 +28,7 @@ import nib.tui.long_text
 import nib.tui.paths
 import nib.tui.format
 
-exports(Image, Block, Snapshot, Editor, DEFAULT_PLACEHOLDER, image_new,
+exports(Block, Snapshot, Editor, DEFAULT_PLACEHOLDER,
         new, free, text, image_count, expanded, take, replace, remember, insert,
         file_mention, skill_mention, complete_mention, paste, attach, key, rows,
         draw, column, at_column, prev, next, line_start, line_end)
@@ -36,21 +36,11 @@ exports(Image, Block, Snapshot, Editor, DEFAULT_PLACEHOLDER, image_new,
 const DEFAULT_PLACEHOLDER = "Ask about this project · / for commands"
 const MAX_U16 = 65535
 
-// Stand-in for nib.image's Image.
-struct Image {
-    path: string
-    name: string
-    media_type: string
-    bytes: long
-    width: int
-    height: int
-}
-
 struct Block {
     start: int
     end: int
     original: string
-    image: ptr          // *Image for [Image #N] blocks (original is then the label), else null
+    image: string       // the Image JSON for [Image #N] blocks (original is then the label), else ""
     number: int
 }
 
@@ -64,7 +54,7 @@ struct Editor {
     buf: string
     cursor: int         // byte offset, always on a UTF-8 codepoint boundary
     blocks: ptr[]       // of *Block
-    sent_images: ptr[]  // of *Image: the most recent take, until the next one
+    sent_images: string // JSON array of the most recent take's images until the next one, "" none
     number: int
     history: ptr[]      // of *Snapshot
     history_index: int  // -1 when not browsing
@@ -75,34 +65,17 @@ struct Editor {
     ghost: string       // dim text drawn instead of the placeholder while empty
 }
 
-image_new(path: string, name: string, media_type: string, bytes: long, width: int, height: int) -> *Image {
-    i = heap.new(Image)
-    i.path = string.copy(path)
-    i.name = string.copy(name)
-    i.media_type = string.copy(media_type)
-    i.bytes = bytes
-    i.width = width
-    i.height = height
-    return i
-}
-
-clone_image_(i: *Image) -> *Image {
-    return image_new(i.path, i.name, i.media_type, i.bytes, i.width, i.height)
-}
-
 clone_block_(b: *Block) -> *Block {
     c = heap.new(Block)
     c.start = b.start
     c.end = b.end
     c.original = string.copy(b.original)
-    c.image = null
-    if b.image != null { c.image = clone_image_(b.image as *Image) as ptr }
+    c.image = string.copy(b.image)
     c.number = b.number
     return c
 }
 
 free_block_(b: *Block) {
-    if b.image != null { heap.free(b.image as *Image) }
     heap.free(b)
 }
 
@@ -126,6 +99,7 @@ new(placeholder: string = "Ask about this project · / for commands") -> *Editor
     e.top_row = 0
     e.placeholder = string.copy(placeholder)
     e.ghost = ""
+    e.sent_images = ""
     return e
 }
 
@@ -156,21 +130,13 @@ clear_blocks_(e: *Editor) {
     e.blocks = none_
 }
 
-clear_sent_(e: *Editor) {
-    i = 0
-    while i < e.sent_images.len {
-        heap.free(e.sent_images[i] as *Image)
-        i = i + 1
-    }
-    ptr[] none_ = []
-    e.sent_images = none_
-}
+clear_sent_(e: *Editor) { e.sent_images = "" }
 
 image_count(e: *Editor) -> int {
     count = 0
     i = 0
     while i < e.blocks.len {
-        if (e.blocks[i] as *Block).image != null { count = count + 1 }
+        if (e.blocks[i] as *Block).image != "" { count = count + 1 }
         i = i + 1
     }
     return count
@@ -245,14 +211,22 @@ take(e: *Editor) -> string {
     out = expanded(e)
     clear_sent_(e)
     sort_blocks_(e)
-    ptr[] sent = []
+    sent = strbuilder.new(64)
     i = 0
     while i < e.blocks.len {
         b = e.blocks[i] as *Block
-        if b.image != null { sent.push(clone_image_(b.image as *Image) as ptr) }
+        if b.image != "" {
+            strbuilder.append(sent, if strbuilder.length(sent) == 0 { "[" } else { "," })
+            strbuilder.append(sent, b.image)
+        }
         i = i + 1
     }
-    e.sent_images = sent
+    if strbuilder.length(sent) > 0 {
+        strbuilder.append(sent, "]")
+        e.sent_images = strbuilder.finish(sent)
+    } else {
+        strbuilder.free(sent)
+    }
     if string.length(e.buf) > 0 {
         e.history.push(snapshot_(e) as ptr)
     }
@@ -403,14 +377,15 @@ paste(e: *Editor, s: string) {
     b.start = start
     b.end = e.cursor
     b.original = string.copy(s)
-    b.image = null
+    b.image = ""
     b.number = e.number
     e.blocks.push(b as ptr)
     e.number = e.number + 1
 }
 
-// Inserts an atomic `[Image #N]` block at the cursor, taking a copy of `attached`.
-attach(e: *Editor, attached: *Image) {
+// Inserts an atomic `[Image #N]` block at the cursor, taking a copy of
+// `attached` (an Image's JSON object text).
+attach(e: *Editor, attached: string) {
     shown = "[Image #${e.number}]"
     start = e.cursor
     insert(e, shown)
@@ -418,7 +393,7 @@ attach(e: *Editor, attached: *Image) {
     b.start = start
     b.end = e.cursor
     b.original = string.copy(shown)
-    b.image = clone_image_(attached) as ptr
+    b.image = string.copy(attached)
     b.number = e.number
     e.blocks.push(b as ptr)
     e.number = e.number + 1

@@ -23,11 +23,12 @@ import nib.provider.types
 import nib.tui.app_queue
 
 exports(Port, Script, scripted, script_of, emit, end_turn, fail_turn, play_next, turn_text,
-        turn_count, canceled, set_stats, add_history_message, set_reply, queue_events, queue_progress)
+        turn_images, turn_count, canceled, set_stats, add_history_message, set_reply, queue_events, queue_progress)
 
 // Signatures (all called with `call(p.f, p.ctx, ...)`):
-//   start_turn(ctx, text: string, compact: int, q: *app_queue.Queue, cancel: std.sync cell)
-//       starts a Turn (or /compact) and returns; its events go to q.
+//   start_turn(ctx, text: string, images: string, compact: int, q: *app_queue.Queue, cancel: std.sync cell)
+//       starts a Turn (or /compact) and returns; its events go to q. images is
+//       the user message's images, a JSON array of nib.image Images ("" none).
 //   finish_turn(ctx)                  joins the finished Turn's thread
 //   enqueue(ctx, text) -> string      a user interjection while a Turn runs: its id
 //   take_queued(ctx) -> ptr           std.list of the interjections not yet sent
@@ -96,6 +97,7 @@ struct Script {
     cancel: ptr
     running: int
     turns: string[]         // every text a Turn was started with
+    images: string[]        // and its images ("" none)
     compacts: int
     next: ptr[]             // queued scripts: each a *Events to play at a Turn's start
     queued: ptr             // std.list of interjections
@@ -135,7 +137,7 @@ scripted(cfg: @keep ptr, home: string) -> *Port {
     s.hint = ""
     p = heap.new(Port)
     p.ctx = s as ptr
-    p.start_turn = |ctx: ptr, text: string, compact: int, q: @keep ptr, cancel: @keep ptr| {
+    p.start_turn = |ctx: ptr, text: string, images: string, compact: int, q: @keep ptr, cancel: @keep ptr| {
         sc = ctx as *Script
         sc.q = q
         sc.cancel = cancel
@@ -144,6 +146,7 @@ scripted(cfg: @keep ptr, home: string) -> *Port {
             sc.compacts = sc.compacts + 1
         } else {
             sc.turns.push(string.copy(text))
+            sc.images.push(string.copy(images))
         }
         play_next(sc)
     }
@@ -258,6 +261,7 @@ fail_turn(s: *Script, text: string, reason: string) {
 }
 
 turn_text(s: *Script, i: int) -> string { return s.turns[i] }
+turn_images(s: *Script, i: int) -> string { return s.images[i] }
 turn_count(s: *Script) -> int { return s.turns.len }
 
 // The app's cancel cell for the running Turn is set (Esc).

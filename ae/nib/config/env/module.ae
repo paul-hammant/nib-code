@@ -8,7 +8,7 @@ import std.list
 import std.string
 import nib.sysgap
 
-exports(Env, new, set, get, has, remove, clone, from_process)
+exports(Env, new, set, get, has, remove, clone, pairs, from_process)
 
 struct Env {
     names: ptr     // list of strings
@@ -77,6 +77,22 @@ clone(ep: ptr) -> ptr {
         k, _g = list.get_string(e.names, i)
         v, _g2 = list.get_string(e.values, i)
         set(out, k, v)
+        i = i + 1
+    }
+    return out
+}
+
+// The environment as a std.list of "NAME=value" strings, what a child's
+// environment is passed as (nib.tools.process, std.os).
+pairs(ep: ptr) -> ptr {
+    e = ep as *Env
+    out = list.list_new()
+    i = 0
+    n = list.list_size(e.names)
+    while i < n {
+        k, _g = list.get_string(e.names, i)
+        v, _g2 = list.get_string(e.values, i)
+        list.list_add(out, "${k}=${v}")
         i = i + 1
     }
     return out

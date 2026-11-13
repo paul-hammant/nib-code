@@ -63,7 +63,7 @@ import nib.mcp
 import nib.tools.agent_input
 import nib.tools.agent_sessions
 
-exports(Session, Options, Sink, Ran, new_options, new_sink, init, turn, run, compact_now, close, turn_end_hooks, error_message, timing_json, undo,
+exports(Session, Options, Sink, Ran, new_options, new_sink, init, turn, turn_with_images, image_directory, run, compact_now, close, turn_end_hooks, error_message, timing_json, undo,
         set_activity, enqueue, take_queued, switch_config, steps_logged,
         VERSION)
 
@@ -1160,6 +1160,18 @@ expand_skills_(s: *Session, text: string) -> string {
 
 // One Turn. (err, detail): "" on success; the final text in s.final_text.
 turn(sp: @keep ptr, user_text: string, sk: @keep ptr, cancel: @keep ptr) -> (string, string) {
+    return turn_with_images(sp, user_text, "", sk, cancel)
+}
+
+// The directory holding this Session's stored images (upstream imageDirectory).
+image_directory(sp: ptr) -> string {
+    s = sp as *Session
+    return image.image_dir((s.options as *Options).home, s.id)
+}
+
+// One Turn whose user message carries `images` (a JSON array of nib.image
+// Images, "" none): upstream turnWithImages.
+turn_with_images(sp: @keep ptr, user_text: string, images: string, sk: @keep ptr, cancel: @keep ptr) -> (string, string) {
     s = sp as *Session
     c = s.cfg as *types.Config
     t = s.tools as *tools.Tools
@@ -1171,7 +1183,9 @@ turn(sp: @keep ptr, user_text: string, sk: @keep ptr, cancel: @keep ptr) -> (str
     first, _g = list.get_string(s.history, 0)
     pending = list.list_new()
     lim = c.limits as *types.Limits
-    list.list_add(pending, msg.user(prompt.turn_budget_text(msg.content(first), lim.max_steps as long, expand_skills_(s, user_text))))
+    user_msg = msg.user(prompt.turn_budget_text(msg.content(first), lim.max_steps as long, expand_skills_(s, user_text)))
+    if image.count(images) > 0 { user_msg = msg.set_raw(user_msg, "images", images) }
+    list.list_add(pending, user_msg)
     emit_(sk, usage_event_(s))
     tools.begin_turn_undo(s.tools)
     background.begin_turn(t.background)

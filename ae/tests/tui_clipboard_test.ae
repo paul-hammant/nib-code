@@ -2,7 +2,7 @@
 // These tests are added: the reader field is replaceable per instance, and
 // the shell machinery (read_script: PNG check, exit 127, other failure,
 // deadline, size limit) is exercised with stand-in scripts, never the real
-// clipboard. The image check is the module's stand-in for nib.image.
+// clipboard. The image check is nib.image's probe, as upstream.
 import std.spec
 import std.string
 import nib.tui.clipboard
@@ -30,11 +30,20 @@ main() {
             clipboard.free(a)
             clipboard.free(b)
         }
-        spec.it("(extra) a script printing a PNG signature gives the bytes") callback {
-            r = clipboard.read_script("printf '\\211PNG\\r\\n\\032\\nrest'", null, 2000 as long) as *clipboard.Result
+        spec.it("(extra) a script printing a PNG header gives the bytes") callback {
+            r = clipboard.read_script("printf '\\211PNG\\r\\n\\032\\n\\000\\000\\000\\rIHDR\\000\\000\\002\\200\\000\\000\\001\\340rest'", null, 2000 as long) as *clipboard.Result
             spec.assert_eq(r.kind, clipboard.KIND_PNG, "png")
-            spec.assert_eq(string.length(r.png), 12, "12 bytes")
+            spec.assert_eq(string.length(r.png), 28, "28 bytes")
             spec.assert_eq(r.png[0] & 255, 137, "first byte survives")
+            spec.assert_eq(r.png[8] & 255, 0, "NUL bytes survive")
+            heap.free(r)
+        }
+        spec.it("(extra) any image nib.image probes counts; a bare PNG signature does not") callback {
+            g = clipboard.read_script("printf 'GIF89a\\001\\000\\001\\000'", null, 2000 as long) as *clipboard.Result
+            spec.assert_eq(g.kind, clipboard.KIND_PNG, "a gif")
+            heap.free(g)
+            r = clipboard.read_script("printf '\\211PNG\\r\\n\\032\\nrest'", null, 2000 as long) as *clipboard.Result
+            spec.assert_eq(r.kind, clipboard.KIND_NO_IMAGE, "no IHDR, no size")
             heap.free(r)
         }
         spec.it("(extra) non-PNG output, exit 127 and other failures") callback {

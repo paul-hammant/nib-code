@@ -1,21 +1,22 @@
 // Ports the tests of upstream src/tui/editor.zig under their names.
 // Not ported: the anonymous `test { _ = @import("../tui.zig"); }` (a Zig
 // test-discovery hook, no behaviour).
-// Image is the editor's stand-in struct (editor.image_new), see the module.
+// An image is nib.image's Image JSON (image.image_json).
 // Extra tests at the end (not upstream): mention parsing, ghost/placeholder.
 import std.spec
 import std.string
 import std.strbuilder
 import term.screen
 import term.input
+import nib.image
 import nib.tui.editor
 
 press_(e: *editor.Editor, cp: int, mods: int) {
     editor.key(e, input.key(cp, mods: mods))
 }
 
-shot_() -> *editor.Image {
-    return editor.image_new("/tmp/a.png", "a.png", "image/png", 1 as long, 4, 3)
+shot_() -> string {
+    return image.image_json("/tmp/a.png", "a.png", "image/png", 1 as long, 4 as long, 3 as long)
 }
 
 repeat_(s: string, n: int) -> string {
@@ -204,7 +205,7 @@ main() {
             editor.attach(e, shot_())
             editor.insert(e, " and ")
             editor.paste(e, "1\n2\n3\n4\n5\n6")
-            second = editor.image_new("/tmp/a.png", "b.png", "image/png", 1 as long, 4, 3)
+            second = image.image_json("/tmp/a.png", "b.png", "image/png", 1 as long, 4 as long, 3 as long)
             editor.attach(e, second)
             spec.assert_eq(editor.image_count(e), 2, "two images")
             spec.assert_true(string.contains(editor.text(e), "[Image #1]") != 0, "image 1")
@@ -217,8 +218,8 @@ main() {
             spec.assert_true(string.ends_with(editor.text(e), "[Image #4]") != 0, "image 4")
             sent = editor.take(e)
             spec.assert_true(string.ends_with(sent, "[Image #4]") != 0, "sent ends with label")
-            spec.assert_eq(e.sent_images.len, 2, "two sent images")
-            spec.assert_str_eq((e.sent_images[0] as *editor.Image).name, "a.png", "first sent a.png")
+            spec.assert_eq(image.count(e.sent_images), 2, "two sent images")
+            spec.assert_str_eq(image.name_of(image.image_at(e.sent_images, 0)), "a.png", "first sent a.png")
             spec.assert_eq(editor.image_count(e), 0, "no images left")
         }
 

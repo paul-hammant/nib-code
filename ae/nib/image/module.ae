@@ -27,7 +27,7 @@ import nib.sysgap
 import nib.tools.atomic_file
 
 exports(MAX_BYTES, MAX_PER_RUN, ESTIMATED_TOKENS, probe, probe_json, media_type, extension, store, rejection, image_json,
-        omitted_text, omitted_text_at, count, image_at, name_of, width_of, height_of, bytes_of, part_at, data_url, pasted_path,
+        omitted_text, omitted_text_at, count, image_at, name_of, width_of, height_of, bytes_of, part_at, data_url, pasted_path, read_pasted,
         sample_png, Attached, new_attached, attach, attached_count, take, clear, free_attached, Target, new_target,
         image_dir)
 
@@ -459,4 +459,19 @@ pasted_path(pasted: string) -> string {
     ext = string.to_lower(string.substring(base, dot, string.length(base)))
     if ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" || ext == ".webp" { return path }
     return ""
+}
+
+// The data of the file a pasted path names (upstream attachPastedFile's stat
+// and read): (data, ""), or ("", "NotFile") when it is missing or not a
+// regular file (symlinks followed), or ("", "ImageTooLarge") past MAX_BYTES,
+// which is checked before reading.
+read_pasted(path: string) -> (string, string) {
+    st = sysgap.new_stat()
+    if sysgap.stat(path, 1, st) != 0 { return "", "NotFile" }
+    info = st as *sysgap.Stat
+    if info.kind != sysgap.KIND_FILE { return "", "NotFile" }
+    if info.size > (MAX_BYTES as long) { return "", "ImageTooLarge" }
+    data, _n, rerr = fs.read_binary(path)
+    if string.length(rerr) > 0 { return "", "NotFile" }
+    return data, ""
 }

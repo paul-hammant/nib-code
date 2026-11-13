@@ -110,7 +110,7 @@ new(sp: @keep ptr, cfg: @keep ptr, op: @keep ptr, home: string) -> *port.Port {
     l.skills = skills_json_(l)
     p = heap.new(port.Port)
     p.ctx = l as ptr
-    p.start_turn = |ctx: @keep ptr, text: string, compact: int, qp: @keep ptr, cancel: @keep ptr| {
+    p.start_turn = |ctx: @keep ptr, text: string, images: string, compact: int, qp: @keep ptr, cancel: @keep ptr| {
         lv = ctx as *Live
         q = qp as *app_queue.Queue
         tr = turn.new(text, compact, qp)
@@ -146,7 +146,7 @@ new(sp: @keep ptr, cfg: @keep ptr, op: @keep ptr, home: string) -> *port.Port {
                 err = e1
                 detail = d1
             } else {
-                e2, d2 = session.turn(lw.sp, text, sk, cancel)
+                e2, d2 = session.turn_with_images(lw.sp, text, images, sk, cancel)
                 err = e2
                 detail = d2
             }

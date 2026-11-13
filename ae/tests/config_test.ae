@@ -796,6 +796,20 @@ main() {
             h, err = config.home(e)
             spec.assert_true(err == "" && h == "/h/.nib", "trailing slash joins once: ${h}")
         }
+        spec.it("env.pairs gives a child's environment as NAME=value strings") callback {
+            e = env.new()
+            env.set(e, "PATH", "/a:/b")
+            env.set(e, "EMPTY", "")
+            env.set(e, "EQ", "x=y")
+            ps = env.pairs(e)
+            spec.assert_eq(list.list_size(ps), 3, "three")
+            p0, _g0 = list.get_string(ps, 0)
+            p1, _g1 = list.get_string(ps, 1)
+            p2, _g2 = list.get_string(ps, 2)
+            spec.assert_str_eq(p0, "PATH=/a:/b", "path")
+            spec.assert_str_eq(p1, "EMPTY=", "empty kept")
+            spec.assert_str_eq(p2, "EQ=x=y", "value with =")
+        }
         spec.it("environment variables beat the file for every setting they cover") callback {
             e = env.new()
             env.set(e, "NIB_PROVIDER", "openai")

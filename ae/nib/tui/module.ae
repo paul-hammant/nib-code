@@ -15,10 +15,10 @@
 // events from the app's own queue (nib.tui.app_queue) as JSON text; the
 // ticker thread is the poll timeout (an empty poll while busy is a tick);
 // events are handled one at a time with the same frame pacing (frames.due).
-// Images (src/image.zig) are not ported: Ctrl+V, an empty paste and pasted
-// image paths say images are not available yet (marked stand-in). /mcp
-// lists and switches config.toml's servers; there is no MCP client yet, so
-// no connection state (marked).
+// The clipboard reader is an instance field (`clip`, nib.tui.clipboard),
+// where upstream has a test-only global override. /mcp lists and switches
+// config.toml's servers; there is no MCP client yet, so no connection state
+// (marked).
 
 import std.string
 import std.strbuilder
@@ -73,6 +73,8 @@ import nib.tui.prediction
 import nib.tui.provider_flow
 import nib.tui.reflect
 import nib.tui.long_text
+import nib.tui.clipboard
+import nib.image
 import nib.session.skills
 
 exports(App, new, free, start, run, step, settle, handle_input, handle_app, on_key, submit, render,
@@ -152,10 +154,11 @@ struct App {
     quit: int
     // replaceable for specs: launching `open`, the local clipboard copier,
     // the gh runner, the model lister
-    launcher: fn                   // |argv: ptr (std.list), envp: ptr| -> string error
+    launcher: fn                   // |argv: ptr (std.list), env: ptr ("NAME=value" list or null)| -> string error
     local_copy: fn                 // |text: string|
     gh: fn                         // reflect.gh_run's shape
     list_models: fn                // provider_flow Launch.list_models
+    clip: *clipboard.Clipboard     // its reader is replaceable for specs
     cwd: string
 }
 
@@ -311,6 +314,7 @@ new(t: @keep ptr, p: @keep ptr, clk: @keep ptr, envp: @keep ptr) -> *App {
         return err
     }
     a.local_copy = |text: string| { }
+    a.clip = clipboard.new()
     a.gh = |argv: ptr, input_text: string, out: ptr| {
         int code = reflect.gh_run(argv, input_text, out)
         return code
@@ -817,17 +821,70 @@ on_key(a: *App, k: input.Key) -> bool {
     return true
 }
 
-// Images (src/image.zig) are not ported: a marked stand-in.
-attach_clipboard_image_(a: *App) {
-    if types.vision(a.cfg) == 0 {
-        set_notice_(a, "${(a.cfg as *types.Config).model} has no image input")
-        return
+// The environment as "NAME=value" strings for a child, or null (inherit).
+env_pairs_(a: *App) -> ptr {
+    if a.envp == null {
+        return null
     }
-    set_notice_(a, "No image in clipboard")
+    return env.pairs(a.envp)
 }
 
+no_vision_notice_(a: *App) {
+    set_notice_(a, "${(a.cfg as *types.Config).model} has no image input")
+}
+
+attach_bytes_(a: *App, name: string, data: string) {
+    if types.vision(a.cfg) == 0 {
+        no_vision_notice_(a)
+        return
+    }
+    string sid = call(a.p.session_id, a.p.ctx)
+    stored, err = image.store(image.image_dir(a.home, sid), name, data)
+    if err != "" {
+        set_notice_(a, "${name}: ${image.rejection(err)}")
+        return
+    }
+    editor.attach(a.input, stored)
+    menu.input_changed(a.menu, editor.text(a.input))
+}
+
+// True when pasted text names an existing image file and was handled.
 attach_pasted_file_(a: *App, pasted: string) -> bool {
-    return false
+    path = image.pasted_path(pasted)
+    if path == "" {
+        return false
+    }
+    name = basename_(path)
+    data, err = image.read_pasted(path)
+    if err == "ImageTooLarge" {
+        set_notice_(a, "${name}: ${image.rejection(err)}")
+        return true
+    }
+    if err != "" {
+        return false
+    }
+    attach_bytes_(a, name, data)
+    return true
+}
+
+attach_clipboard_image_(a: *App) {
+    if types.vision(a.cfg) == 0 {
+        no_vision_notice_(a)
+        return
+    }
+    r = clipboard.read_image(a.clip, env_pairs_(a)) as *clipboard.Result
+    kind = r.kind
+    png = r.png
+    heap.free(r)
+    if kind == clipboard.KIND_PNG {
+        attach_bytes_(a, "clipboard.png", png)
+    } else if kind == clipboard.KIND_NO_TOOL {
+        set_notice_(a, "No clipboard image tool · install wl-paste or xclip")
+    } else if kind == clipboard.KIND_TOO_LARGE {
+        set_notice_(a, "Clipboard image is larger than 5 MB")
+    } else {
+        set_notice_(a, "No image in clipboard")
+    }
 }
 
 // ---------------------------------------------------------------- submitting
@@ -859,24 +916,25 @@ submit(a: *App, line: string) {
         last.queued = n
         return
     }
-    start_turn_(a, line, 0)
+    start_turn_with_images_(a, line, a.input.sent_images)
 }
 
-start_turn_(a: *App, text: string, compact: int) {
+// Starts a Turn on text, without interpreting slash commands.
+start_turn_(a: *App, text: string) { start_turn_with_images_(a, text, "") }
+
+start_turn_with_images_(a: *App, text: string, images: string) {
     drop_prediction_(a)
-    if compact == 0 {
-        transcript.add(a.transcript, entry.KIND_USER, text)
-    }
-    begin_turn_(a, text, compact, if compact != 0 { status.PHASE_COMPACTING } else { status.PHASE_THINKING })
+    transcript.add(a.transcript, entry.KIND_USER, text)
+    begin_turn_(a, text, images, 0, status.PHASE_THINKING)
 }
 
-begin_turn_(a: *App, text: string, compact: int, phase: int) {
+begin_turn_(a: *App, text: string, images: string, compact: int, phase: int) {
     a.turn = turn.new(text, compact, a.q as ptr)
     a.has_turn = 1
     a.live_steps = 0
     a.turn_runs = 0
     a.activity = status.activity_start(clock.now(a.clk), phase)
-    call(a.p.start_turn, a.p.ctx, text, compact, a.q as ptr, a.turn.cancel)
+    call(a.p.start_turn, a.p.ctx, text, images, compact, a.q as ptr, a.turn.cancel)
 }
 
 drop_prediction_(a: *App) { prediction.invalidate(a.prediction) }
@@ -1245,7 +1303,7 @@ finish_queued(a: *App, send_now: bool) {
     selection.clear(a.selection)
     transcript.remove_queued(a.transcript)
     if send_now {
-        start_turn_(a, text, 0)
+        start_turn_(a, text)
         return
     }
     draft = editor.expanded(a.input)
@@ -1391,7 +1449,7 @@ open_click_(a: *App, index: int, entry_row: int, m: input.Mouse) -> bool {
     for i in 0..words.len {
         list.list_add(argv, words[i])
     }
-    string failed = call(a.launcher, argv, a.envp)
+    string failed = call(a.launcher, argv, env_pairs_(a))
     if failed != "" {
         set_notice_(a, "Could not run ${basename_(words[0])}")
     }
@@ -1860,7 +1918,7 @@ execute(a: *App, c: int, arg: string, line: string) {
         jsonx.free(v)
     } else if c == commands.CMD_COMPACT {
         drop_prediction_(a)
-        begin_turn_(a, line, 1, status.PHASE_COMPACTING)
+        begin_turn_(a, line, "", 1, status.PHASE_COMPACTING)
     } else if c == commands.CMD_REFLECT {
         if !credentialed(a) {
             transcript.add(a.transcript, entry.KIND_ERR, "No provider · /provider to sign in")
@@ -1871,7 +1929,7 @@ execute(a: *App, c: int, arg: string, line: string) {
         text = reflect.prompt(sid, log_path, issue_repo_(a), arg)
         transcript.add(a.transcript, entry.KIND_USER, line)
         drop_prediction_(a)
-        begin_turn_(a, text, 0, status.PHASE_THINKING)
+        begin_turn_(a, text, "", 0, status.PHASE_THINKING)
         a.reflecting = arg
         a.has_reflecting = 1
     }
