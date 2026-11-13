@@ -26,6 +26,10 @@ ln -sf ../../target/build/bin/nib zig-out/bin/nib
 # (substrings of Class.method, run through ae/tests/run_upstream.py) and
 # why. A file with nothing left out runs as upstream runs it.
 #   Codex*/codex: policy (API keys only, no Codex sign-in or WebSocket)
+#   tui_only_functions_left_out: matches no test id; going through run_upstream.py
+#     runs only the unittest classes, leaving out the file's module-level
+#     terminal functions (test_mcp: the /mcp menu; test_images: clipboard
+#     and paste, still stand-ins in the TUI)
 APPLY="tests/test_cli.py
 tests/test_providers.py
 tests/test_session.py
@@ -52,9 +56,9 @@ tests/test_prediction.py
 tests/test_hooks.py
 tests/test_skills.py
 tests/test_skill_mentions.py
-tests/test_mcp.py
+tests/test_mcp.py|tui_only_functions_left_out
 tests/test_web_search.py|test_codex
-tests/test_images.py
+tests/test_images.py|tui_only_functions_left_out
 tests/test_stats.py"
 
 files=$(printf '%s\n' "$@")

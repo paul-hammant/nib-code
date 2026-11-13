@@ -85,25 +85,25 @@ pins                     AE_PIN / AEB_REF the port is verified against
 | `src/tools/walk.zig` | 385 | `ae/nib/tools/walk/module.ae` | a2dd439 |  |
 | `src/tools/policy.zig` | 698 | `ae/nib/tools/policy/module.ae` | a2dd439 | rule for rule, same texts |
 | `src/tools/secrets.zig` | 16 | `ae/nib/tools/secrets/module.ae` | a2dd439 |  |
-| `src/tools/process.zig` | 358 | `ae/nib/tools/process/module.ae` | a2dd439 | output to a file, not a pipe; a 20 ms tick with the output byte count (progress); no stdin input or line observer yet (agent slice); a signal reads as 128+n |
+| `src/tools/process.zig` | 358 | `ae/nib/tools/process/module.ae` | a2dd439 | output to a file, not a pipe; a 20 ms tick with the output byte count (progress); run_lines (a child nib: stdin input, stdout lines, TERM then KILL after a grace) through os.run_stdio, its stderr discarded via sh (asks/aether-run-stdio-stderr.md) and SIGPIPE ignored (asks/aether-ipc-write-sigpipe.md); open_stdio for MCP; a signal reads as 128+n |
 | `src/tools/bash.zig` | 433 | `ae/nib/tools/bash/module.ae` | a2dd439 | progress Tracker; ids reserved at start, snapshot after 3 s |
 | `src/tools/bash/registry.zig` | 146 | `ae/nib/tools/registry/module.ae` | a2dd439 | supersession; started/superseded/finished log records |
 | `src/tools/bash/jail.zig` | 304 | `ae/nib/tools/jail/module.ae` | a2dd439 | Landlock in jail/landlock.c (stand-in); probe cached per Tools, not per process |
-| `src/tools/background.zig` | 866 | `ae/nib/tools/background/module.ae` | a2dd439 | bash only: typed inbox, started record, lost on resume, detached across Turns; agents and background Runs not yet |
+| `src/tools/background.zig` | 866 | `ae/nib/tools/background/module.ae` | a2dd439 | bash, agents (start_agent, completion without usage, invocation-matched delivery) and adopted Runs (adopt_run, take_done_runs, enqueue_run with the run completion); typed inbox, started record, lost on resume, detached across Turns; a Run cannot stop itself |
 | `src/tools/stop.zig` | 29 | `ae/nib/tools/module.ae`, `ae/nib/tui/live/module.ae` | a2dd439 | userStop is the TUI port's `user_stop_`; a stop requested during a Turn runs on a worker, not in Tools.poll |
 | `src/tools/undo.zig` | 606 | `ae/nib/tools/undo/module.ae` | a2dd439 | Session wires begin/finish/undo; off for `nib ask` as upstream; /undo itself is the TUI's |
 | `src/tools/view.zig` | 92 | `ae/nib/tools/view/module.ae` | a2dd439 | credential-path refusal as read; the Run's images in `RunScope.images` (`nib.image` Attached, 4 per Run, none from background Runs) |
-| `src/tools/progress.zig` | 249 | `ae/nib/tools/progress/module.ae` | a2dd439 | agent kinds wait for tools.agent |
-| `src/tools/web.zig` | 161 | not yet |  | fetch: a later slice |
-| `src/tools/html.zig` | 504 | not yet |  | with fetch |
-| `src/tools/web_search.zig` | 404 | not yet |  | needs providers |
-| `src/tools/llm.zig` | 246 | `ae/nib/tools/llm_call/module.ae` | a2dd439 | the gate is per Tools (subagents will share it) |
-| `src/tools/agent.zig` | 497 | not yet |  | needs the session |
-| `src/tools/agent/input.zig` | 90 | not yet |  |  |
-| `src/tools/agent/sessions.zig` | 119 | not yet |  |  |
-| `src/tools/mcp.zig` | 101 | not yet |  | with src/mcp* |
-| `src/session.zig` | 999 | `ae/nib/session/module.ae` | a2dd439 | Turn/Step loop, resume/continue, interrupted commits, auto compaction, Step-limit wait, undo wiring, the Run's viewed images on its tool message; no fork, reopen/switchConfig (TUI), skills, MCP, user-message images (`turnWithImages`, TUI) |
-| `src/session/run.zig` | 236 | `ae/nib/session/module.ae` | a2dd439 | execute; no automatic Run backgrounding |
+| `src/tools/progress.zig` | 249 | `ae/nib/tools/progress/module.ae` | a2dd439 |  |
+| `src/tools/web.zig` | 161 | `ae/nib/tools/web/module.ae` | a2dd439 | std.http.client on a worker, caller watches cancel/deadline; no response decompression (no accept-encoding is sent) and no environment proxy |
+| `src/tools/html.zig` | 504 | `ae/nib/tools/html/module.ae` | a2dd439 | byte-identical to upstream on 310 differential inputs; a stale link offset leaves output alone where upstream would trap |
+| `src/tools/web_search.zig` | 404 | `ae/nib/tools/web_search/module.ae` | a2dd439 | openai, anthropic, deepseek routes; no Codex (policy); transport errors carry std.http.client's text |
+| `src/tools/llm.zig` | 246 | `ae/nib/tools/llm_call/module.ae` | a2dd439 | the gate is per Tools; subagent usage joins through the same cell |
+| `src/tools/agent.zig` | 497 | `ae/nib/tools/agent/module.ae` | a2dd439 | a Ctx per call from the Tools (no threadlocal); the child is `self_exe ask --json --agent-input [--resume] -` via process.run_lines; background calls return status 2 and the tools module starts the job |
+| `src/tools/agent/input.zig` | 90 | `ae/nib/tools/agent_input/module.ae` | a2dd439 | renamed (basenames); the Config's JSON spelling is the port's own (both ends are this binary); also the header's mcp_servers JSON |
+| `src/tools/agent/sessions.zig` | 119 | `ae/nib/tools/agent_sessions/module.ae` | a2dd439 | renamed |
+| `src/tools/mcp.zig` | 101 | `ae/nib/tools/mcp_tool/module.ae` | a2dd439 | renamed (basename `mcp` is the client's) |
+| `src/session.zig` | 999 | `ae/nib/session/module.ae` | a2dd439 | Turn/Step loop, resume/continue, interrupted commits, auto compaction, Step-limit wait, undo wiring, the Run's viewed images on its tool message, fork init and per-Step fork snapshots, agent_session restore, skills, MCP (header mcp_servers, the log's on resume), hooks, the calls recorder; no user-message images (`turnWithImages`, TUI) |
+| `src/session/run.zig` | 236 | `ae/nib/session/module.ae` | a2dd439 | execute + executeTimed: every Run on its own thread (RunJob) with its own timing, merged into the Step's; the waiting flag is the sandbox Host's `waiting` cell |
 | `src/session/run_job.zig` | 116 | `ae/nib/session/module.ae` | a2dd439 | RunJob; its recorder is a fork of the Session's (begin at start, finish before done) |
 | `src/session/log.zig` | 1402 | `ae/nib/session/log/module.ae` | a2dd439 | records are JSON text; tool summaries travel on the logged tool messages (the TUI reads them on resume); bash replacements (superseded bash rows) are not restored onto replayed messages yet |
 | `src/session/output.zig` | 596 | `ae/nib/session/output/module.ae` | a2dd439 |  |
@@ -114,19 +114,19 @@ pins                     AE_PIN / AEB_REF the port is verified against
 | `src/session/tool_summary.zig` | 249 | `ae/nib/session/tool_summary/module.ae` | a2dd439 | annotateViews takes the images as JSON text |
 | `src/session/events.zig` | 182 | `ae/nib/session/module.ae` | a2dd439 | events are the NDJSON text they print as |
 | `src/session/inbox.zig` | 278 | `ae/nib/tools/background/module.ae` | a2dd439 | bash results, FIFO, detached kept; user interjections (`enqueue_user`/`take_users`, kind "user") inserted before the next Step |
-| `src/session/history.zig` | 130 | not yet |  | fork (subagents): next |
-| `src/session/hooks.zig`, `skills.zig` | 538 | not yet |  | next slice |
+| `src/session/history.zig` | 130 | `ae/nib/session/fork_history/module.ae` | a2dd439 | renamed; messages are JSON texts, copies are fresh strings |
+| `src/session/hooks.zig`, `skills.zig` | 538 | `ae/nib/session/hooks/module.ae`, `ae/nib/session/skills/module.ae` | a2dd439 | hooks run `cd <root>` inside the script (process.run has no cwd); skills: unlistable roots report NotDir/AccessDenied, disabled skills are reported in name order |
 | `src/provider.zig` | 395 | `ae/nib/provider/types/module.ae`, `ae/nib/provider/module.ae` | a2dd439 | less Codex |
 | `src/provider/retry.zig` | 331 | `ae/nib/provider/module.ae` | a2dd439 | no Codex Retry-After or stale-socket paths |
 | `src/provider/anthropic.zig` | 444 | `ae/nib/provider/anthropic/module.ae` | a2dd439 | |
 | `src/provider/responses.zig` | 1033 | `ae/nib/provider/responses/module.ae` | a2dd439 | SSE only; no Codex auth/WebSocket or web search |
-| `src/provider/openai.zig` | 428 | `ae/nib/provider/openai/module.ae` | a2dd439 | HTTP errors never echo the body |
+| `src/provider/openai.zig` | 428 | `ae/nib/provider/openai/module.ae` | a2dd439 | HTTP errors other than 401 carry the body (64 KiB), as upstream |
 | `src/provider/sse.zig` | 52 | `ae/nib/provider/sse/module.ae` | a2dd439 | plus fixed/live line sources |
 | `src/provider/timing.zig` | 319 | `ae/nib/provider/model_timing/module.ae` | a2dd439 | renamed: asks/aether-module-basename-collision.md |
 | `src/provider/body.zig`, `cancel.zig`, `idle.zig` | 393 | `ae/nib/provider/http/module.ae` | a2dd439 | a request thread plus a polling reader on std.http.client |
 | `src/provider/codex_ws.zig`, `websocket.zig` | 523 | not ported |  | policy: API keys only |
 | `src/config.zig` | 1680 | `ae/nib/config/module.ae`, `ae/nib/config/env/module.ae` | a2dd439 | no Codex provider ([codex] validated and ignored); default service anthropic |
-| `src/mcp*` | 700 | | | |
+| `src/mcp.zig`, `src/mcp/*` | 700 | `ae/nib/mcp/module.ae`, `mcp/mcp_index`, `mcp/mcp_headers`, `mcp/mcp_transport` | a2dd439 | stdio over os.run_stdio (newline-delimited JSON-RPC; cwd and stderr via sh; kill by pid, no process group); Streamable HTTP on std.http.client from a worker thread; no environment proxy |
 | `src/main.zig` | 311 | `ae/main.ae` | a2dd439 | ask, js, login/logout, help, version, __jail; bare `nib` opens the TUI (`run_tui_`); `nib replay` with its three error texts; no update |
 | `src/replay.zig` | 541 | `ae/nib/run_replay/module.ae` | a2dd439 | renamed (basename `replay` is the core's) |
 | `src/image.zig` | 324 | `ae/nib/image/module.ae` | a2dd439 | images are JSON texts (the log's `images` entries); binary-safe reads; SHA-256 hash name; Attached/Target for the Run's images; pastedPath is ported, the TUI still has its stand-ins |
@@ -222,7 +222,7 @@ is ported under its upstream name, except those listed in each suite's
 header (Codex, MCP, allocation failures, the Zig Record type). Each
 module was mutation-checked.
 
-**Upstream e2e (`ae/tests/upstream-e2e.sh`, tests unchanged).**
+**Upstream e2e (`ae/tests/upstream-e2e.sh`, tests unchanged)** at the end of this slice; the current table is in the headless features section below.
 
 | Test | Result | Why not all of it |
 |---|---|---|
@@ -382,3 +382,63 @@ test_mcp `test_stdio_modern_and_legacy` and `test_subagent`.
 **Stand-in.** nib.qjsgap gains a stop cell its interrupt honours (replay's
 divergence stops a running script without it reading as canceled); written
 into asks/aether-quickjs-async-eval-and-interrupt.md.
+
+## Headless features slice (2026-11-13)
+
+**What it adds.** Subagents: `tools.agent` (foreground and background, resume
+by task id, fork with the Step's history and file versions, limits and the
+concurrency gate), `nib ask --agent-input`, the child-Session registry and its
+log records. Automatic Run backgrounding (every Run on its own thread; adopted
+as rN after `run_background_after_ms` while waiting on tools). Hooks
+(`after_edit`, `turn_end`) and skills (index, `$name` expansion). MCP (stdio and
+Streamable HTTP, `tools.mcp`, `tools.mcp_schema`). `tools.fetch` (HTML to
+Markdown) and `tools.search` (openai, anthropic, deepseek). Images and
+`tools.view`. Run recording and `nib replay` (its own section above). Session
+headers record `nib_version` as build.zig.zon's version plus the commit
+(.build.ae writes it; `nib --version` keeps `0.13.0-ae`). Upstream's
+`[providers.<id>] max_output` (8537d53) is ported; `main` was fast-forwarded to
+upstream 8537d53 (two Config commits: dd82e39, 8537d53).
+
+**Unit tests.** Every inline test of the ported files is in a std.spec suite
+under its upstream name (agent, agent_input, agent_sessions, fork_history,
+process stdin/line observer, hooks, skills, html, web, web_search, mcp, image,
+view, record, replay, run_replay), each mutation-checked; `aeb .tests.ae` and
+`tools/check_layers.sh` are green on macOS arm64, ae-x64 and cachyos (Aether
+0.912.0; the code still builds as 0.909-compatible).
+
+**Upstream e2e (`ae/tests/upstream-e2e.sh`, tests unchanged; exclusions and
+their reasons are in the script).**
+
+| Test | macOS arm64 | ae-x64 (Ubuntu 22.04, kernel 5.15) | cachyos |
+|---|---|---|---|
+| test_cli, test_providers, test_files, test_stream_idle, test_llm, test_limits, test_agent_fork, test_replay, test_web_search, test_stats, test_skills, test_skill_mentions, test_hooks* | pass | pass (*test_hooks: all but `test_sandbox_denies_external_write`, no Landlock ABI 2) | pass |
+| test_session | stops at a `/proc` read (Linux-only helper); every section before it passes | pass | pass |
+| test_sandbox | pass | workspace cases fail: no Landlock ABI 2 (bash runs unsandboxed, as upstream's) | pass |
+| test_agent, test_agent_reuse, test_background_agent, test_background_run | the cases whose mock worker walks `/proc` fail | pass | pass |
+| test_background_bash | `/proc` cases fail | all but 3 TUI-driven cases (below) | same 3 |
+| test_mcp (unittest classes) | pass | all but `test_stdio_sandbox` (SandboxUnavailable: no Landlock ABI 2, as upstream) | pass |
+| test_images (unittest classes) | pass | pass | pass |
+| test_effort | its chat_completions half passes; the second half is Codex | same | same |
+| test_codex, test_codex_websocket, test_provider_login | excluded: policy (Codex) | | |
+
+Not passing yet, TUI slice: test_background_bash's
+`test_js_foreground_bash_counter_is_persisted_for_resume`,
+`test_js_keeps_later_background_progress_attached_to_its_run` and
+`test_detached_idle_completion_is_delivered_next_turn_exactly_once` drive the
+TUI's `/js`, which evaluates in a bare scope (`nib.tui.live` run_js) instead of
+upstream's `session.run` (Run commit with task_ids, progress, background
+delivery); test_mcp's `/mcp` terminal function and test_images' clipboard and
+paste functions (TUI stand-ins) are left out of the run.
+
+**Stand-ins added (marked, each with an ask).** `nib.sysgap` ignores SIGPIPE
+before a child's stdin is written (asks/aether-ipc-write-sigpipe.md); a child
+nib's or MCP server's stderr is discarded and its cwd set through `sh -c`
+(asks/aether-run-stdio-stderr.md); the QuickJS stand-in's stop cell for replay
+(asks/aether-quickjs-async-eval-and-interrupt.md).
+
+**Differences kept on purpose or by gap.** Chat Completions HTTP errors other
+than 401 now carry the body, Responses ones say "Codex request failed (HTTP n)",
+as upstream (the earlier slice never echoed bodies). MCP stdio servers are
+killed by pid (os.run_stdio makes no process group). No environment proxy for
+fetch, search or MCP HTTP. No response decompression in fetch (no
+accept-encoding is sent).
