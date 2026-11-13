@@ -2,8 +2,9 @@
 // under their upstream names. Real temp directories and real files; records
 // are JSON text, as the port's log works on message and record text.
 //
-// Dropped or adapted (the port has no Record struct and does not yet restore
-// tool summaries / bash replacements onto messages):
+// Dropped or adapted (the port has no Record struct; tool summaries travel
+// on the logged tool messages, so only bash replacements and background ids
+// are restored onto messages):
 //  - "legacy chat reasoning": the parseRecord(`{}`/`{"at":null}`) asserts
 //    are about the Zig Record type and have no counterpart.
 //  - "timing fields are optional": the Record field/Stringify round trip is
@@ -13,11 +14,9 @@
 //  - "ID restoration rejects overflow": restoreId is private; it is driven
 //    through replay. The port holds counters in signed long, so ids beyond
 //    18 digits are refused (upstream refuses only past u64).
-//  - "0.4.0 replay restores background Run ids and bash replacements":
-//    only the id restoration applies (run_results background_id and
-//    bash_replacements onto messages are not ported).
-//  - "background Run completion restores its superseded bash": dropped,
-//    it tests only restoreToolSummaries.
+//  - "background Run completion restores its superseded bash": upstream
+//    calls the private restoreToolSummaries; here the same records go
+//    through replay.
 //  - "replay restores image references and view summaries": the images
 //    survive (messages are JSON text); the tool_summary view path is
 //    dropped.
@@ -817,6 +816,47 @@ t_run_ids_() {
     spec.assert_str_eq(r.err, "", "replay ok")
     spec.assert_eq(list.list_size(h), 3, "history")
     spec.assert_eq(r.next_bash_id as int, 2, "b1 restores the bash counter")
+    spec.assert_str_eq(msg.str_or(item_(h, 2), "background_id", ""), "r3", "the Run's background id")
+    reps = jsonx.parse(msg.raw(item_(h, 2), "bash_replacements"))
+    spec.assert_str_eq(jsonx.str_or(jsonx.array_at(reps, 0), "superseded_by", ""), "b2", "its superseded bash")
+}
+
+t_replacements_per_run_() {
+    base = rec_("", 0, "[{\"role\":\"system\",\"content\":\"system\"}]", 0)
+    s1 = "{\"bash\":{\"id\":\"b1\",\"run\":1,\"state\":\"superseded\",\"superseded_by\":\"b4\"}}"
+    s3 = "{\"bash\":{\"id\":\"b3\",\"run\":2,\"state\":\"superseded\",\"superseded_by\":\"b5\"}}"
+    calls = list.list_new()
+    list.list_add_raw(calls, types.tool_call_new("ra", "run", "{}"))
+    list.list_add_raw(calls, types.tool_call_new("rb", "run", "{}"))
+    asst = msg.assistant("", calls, "", "", 0, "", -1, "")
+    ta = msg.tool("ra", "a", "")
+    tb = msg.tool("rb", "b", "")
+    logged = ",\"calls\":[{\"name\":\"bash\",\"id\":\"b1\",\"run_index\":0},{\"name\":\"bash\",\"id\":\"b2\",\"run_index\":0},{\"name\":\"bash\",\"id\":\"b3\",\"run_index\":1}]"
+    step = rec_(logged, 1, "[${asst},${ta},${tb}]", 0)
+    h = list.list_new()
+    r = rp_("${base}\n${s1}\n${s3}\n${step}\n", h)
+    spec.assert_str_eq(r.err, "", "replay ok")
+    spec.assert_str_eq(msg.raw(item_(h, 2), "bash_replacements"), "[{\"id\":\"b1\",\"run\":1,\"state\":\"superseded\",\"superseded_by\":\"b4\"}]", "first Run: b1 only")
+    spec.assert_str_eq(msg.raw(item_(h, 3), "bash_replacements"), "[{\"id\":\"b3\",\"run\":2,\"state\":\"superseded\",\"superseded_by\":\"b5\"}]", "second Run: b3 only")
+}
+
+t_completion_replacements_() {
+    base = rec_("", 0, "[{\"role\":\"system\",\"content\":\"system\"}]", 0)
+    bg_extra = ",\"background_id\":\"r1\""
+    origin_tool = msg.tool("call", "continuing in background as r1", bg_extra)
+    origin = rec_("", 1, "[${asst_call_("call")},${origin_tool}]", 0)
+    superseded = "{\"bash\":{\"id\":\"b1\",\"run\":1,\"state\":\"superseded\",\"superseded_by\":\"b2\"}}"
+    completion = "{\"step\":1,\"run_index\":0,\"ok\":true,\"output\":\"done\",\"run_ms\":1,\"tool_bytes\":0,\"calls_omitted\":0,\"changes\":[],\"calls\":[{\"name\":\"bash\",\"id\":\"b1\",\"start_ms\":0,\"end_ms\":1,\"ok\":true,\"run_index\":0}]}"
+    result = "{\"role\":\"user\",\"content\":\"done\",\"source\":\"background\",\"background_id\":\"r1\",\"background_run\":${completion}}"
+    delivered = rec_("", 3, "[${result}]", 0)
+    h = list.list_new()
+    r = rp_("${base}\n${origin}\n${superseded}\n${delivered}\n", h)
+    spec.assert_str_eq(r.err, "", "replay ok")
+    spec.assert_eq(list.list_size(h), 4, "history")
+    reps = jsonx.parse(msg.raw(item_(h, 2), "bash_replacements"))
+    spec.assert_true(reps != null, "the originating Run's tool message carries them")
+    spec.assert_str_eq(jsonx.str_or(jsonx.array_at(reps, 0), "superseded_by", ""), "b2", "b1 superseded by b2")
+    spec.assert_str_eq(msg.raw(item_(h, 3), "bash_replacements"), "", "not the completion itself")
 }
 
 t_images_() {
@@ -858,6 +898,8 @@ main() {
         spec.it("restore preserves pending background bytes across snapshots and idempotent lifecycle repairs") callback { t_pending_restore_() }
         spec.it("fork header retains provenance and cache across compaction without billing inherited Steps") callback { t_fork_header_() }
         spec.it("0.4.0 replay restores background Run ids and bash replacements from lifecycle records") callback { t_run_ids_() }
+        spec.it("background Run completion restores its superseded bash on the originating Run") callback { t_completion_replacements_() }
+        spec.it("(port) each Run of a Step gets the superseded bash of its own calls") callback { t_replacements_per_run_() }
         spec.it("replay restores image references and view summaries") callback { t_images_() }
     }
     return spec.run_summary(fw)

@@ -11,9 +11,13 @@
 // context_tokens/repair, as upstream's Record serialises its non-optional
 // fields on every line.
 //
-// Not yet ported: restoring tool summaries and bash replacements onto
-// replayed messages (the TUI slice needs them; `ask` does not), the
-// MCP/skills summary members beyond keeping them in the header.
+// Replay restores a Run's background id (from run_results) and its
+// superseded bash rows (bash_replacements, from `bash` records with
+// superseded_by) onto the replayed tool messages, as upstream
+// restoreToolSummaries. The tool summaries themselves travel on the logged
+// tool messages (the port logs them there), so they are not rebuilt from
+// `calls`. Not ported: the MCP/skills summary members beyond keeping them in
+// the header.
 //
 // File access is on nib.sysgap (flock, O_EXCL with a mode, pwrite, fsync):
 // a marked stand-in, asks/aether-fs-stat-flock-exclusive.md.
@@ -395,9 +399,121 @@ fail_(r: *Replayed, err: string) -> ptr {
     return r as ptr
 }
 
+// A superseded bash row by id (the replay's map of `bash` records with
+// superseded_by; later records win).
+struct Replacement {
+    id: string
+    event: string        // the bash record's JSON object
+}
+
+replacement_of_(reps: ptr, id: string) -> string {
+    if id == "" { return "" }
+    i = list.list_size(reps)
+    while i > 0 {
+        i = i - 1
+        rp = list.list_get_raw(reps, i) as *Replacement
+        if rp.id == id { return rp.event }
+    }
+    return ""
+}
+
+// The bash_replacements array of `calls` (a JSON array of call records),
+// keeping those whose run_index is `run_index` (-1: every call); "" none.
+replaced_(reps: ptr, calls: ptr, run_index: int) -> string {
+    if calls == null || json.json_type(calls) != json.JSON_ARRAY { return "" }
+    out = ""
+    n = json.json_array_size(calls)
+    i = 0
+    while i < n {
+        c = json.json_array_get_raw(calls, i)
+        if run_index < 0 || jsonx.int_or(c, "run_index", -1) == run_index {
+            ev = replacement_of_(reps, jsonx.str_or(c, "id", ""))
+            if ev != "" {
+                if out != "" { out = "${out}," }
+                out = "${out}${ev}"
+            }
+        }
+        i = i + 1
+    }
+    if out == "" { return "" }
+    return "[${out}]"
+}
+
+// upstream restoreToolSummaries, less the summaries (see the header): a
+// committed record's run_results background ids onto its tool messages, a
+// background Run completion's replaced bash onto the originating Run's tool
+// message, and each foreground Run's replaced bash onto its tool message.
+restore_replacements_(history: ptr, from: int, rec: ptr, msgs: ptr, reps: ptr) {
+    n = list.list_size(history)
+    results = jsonx.field(rec, "run_results")
+    if results != null && json.json_type(results) == json.JSON_ARRAY {
+        ri = 0
+        while ri < json.json_array_size(results) {
+            res = json.json_array_get_raw(results, ri)
+            bid = jsonx.str_or(res, "background_id", "")
+            if bid != "" {
+                call_id = jsonx.str_or(res, "tool_call_id", "")
+                hi = from
+                while hi < n {
+                    m, _g = list.get_string(history, hi)
+                    if msg.role(m) == "tool" && msg.str_or(m, "tool_call_id", "") == call_id {
+                        list.list_set(history, hi, msg.set_raw(m, "background_id", jsonx.quote(bid)))
+                    }
+                    hi = hi + 1
+                }
+            }
+            ri = ri + 1
+        }
+    }
+    mi = 0
+    while mi < list.list_size(msgs) {
+        rm, _g2 = list.get_string(msgs, mi)
+        mi = mi + 1
+        completion = msg.raw(rm, "background_run")
+        id = msg.str_or(rm, "background_id", "")
+        if completion == "" || id == "" { continue }
+        cv = jsonx.parse(completion)
+        replaced = replaced_(reps, jsonx.field(cv, "calls"), -1)
+        jsonx.free(cv)
+        if replaced == "" { continue }
+        hi2 = 0
+        while hi2 < n {
+            o, _g3 = list.get_string(history, hi2)
+            if msg.role(o) == "tool" && msg.str_or(o, "background_id", "") == id {
+                list.list_set(history, hi2, msg.set_raw(o, "bash_replacements", replaced))
+            }
+            hi2 = hi2 + 1
+        }
+    }
+    calls = jsonx.field(rec, "calls")
+    if calls == null { return }
+    ai = 0
+    while ai < list.list_size(msgs) {
+        am, _g4 = list.get_string(msgs, ai)
+        ai = ai + 1
+        runs = msg.tool_calls(am)
+        run_index = 0
+        while run_index < list.list_size(runs) {
+            run = list.list_get_raw(runs, run_index) as *types.ToolCall
+            hi3 = from
+            while hi3 < n {
+                tm, _g5 = list.get_string(history, hi3)
+                if msg.role(tm) == "tool" && msg.str_or(tm, "tool_call_id", "") == run.id {
+                    replaced2 = replaced_(reps, calls, run_index)
+                    if replaced2 != "" { list.list_set(history, hi3, msg.set_raw(tm, "bash_replacements", replaced2)) }
+                    break
+                }
+                hi3 = hi3 + 1
+            }
+            run_index = run_index + 1
+        }
+    }
+}
+
 // Rebuilds history from log text. Returns *Replayed (err set on failure).
 replay(data: string, history: ptr) -> ptr {
     r = new_replayed_() as *Replayed
+    reps = list.list_new()
     pending = list.list_new()
     lines = string.split(data, "\n")
     count = string.array_size(lines)
@@ -529,6 +645,12 @@ replay(data: string, history: ptr) -> ptr {
         }
         bash = jsonx.field(rec, "bash")
         if bash != null {
+            if jsonx.str_or(bash, "superseded_by", "") != "" {
+                rp = heap.new(Replacement)
+                rp.id = string.copy(jsonx.str_or(bash, "id", ""))
+                rp.event = jsonx.encode(bash)
+                list.list_add_raw(reps, rp as ptr)
+            }
             e4 = restore_id_(r, jsonx.str_or(bash, "id", ""))
             if e4 != "" { return fail_(r, e4) }
             jsonx.free(rec)
@@ -556,6 +678,7 @@ replay(data: string, history: ptr) -> ptr {
             if jsonx.has(rec, "model_ms") == 1 { r.pending_background_bytes = 0 as long }
         }
         apply_(history, from, msgs, string.copy(jsonx.str_or(rec, "effort", "")))
+        restore_replacements_(history, from, rec, msgs, reps)
         if validate_(history) == 0 {
             jsonx.free(rec)
             return fail_(r, "InvalidSessionLog")
