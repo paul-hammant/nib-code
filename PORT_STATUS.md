@@ -7,7 +7,8 @@ and is never committed to; the port follows it.
 
 Ported through upstream commit: **a2dd439** (Release 0.13.0) for the files listed with it below.
 `main` was fast-forwarded to upstream **7788541** on 2026-11-12; that delta touches only
-`src/tui/view.zig` and docs (TUI slice), so every row here is current with it.
+`src/tui/view.zig` and docs (TUI slice), so every row here is current with it. Since then
+`main` follows upstream to **a6917c6** (2026-11-13; docs only: ADR 0026, CONTEXT.md).
 
 ## How the tracking works
 
@@ -102,10 +103,10 @@ pins                     AE_PIN / AEB_REF the port is verified against
 | `src/tools/agent/input.zig` | 90 | `ae/nib/tools/agent_input/module.ae` | a2dd439 | renamed (basenames); the Config's JSON spelling is the port's own (both ends are this binary); also the header's mcp_servers JSON |
 | `src/tools/agent/sessions.zig` | 119 | `ae/nib/tools/agent_sessions/module.ae` | a2dd439 | renamed |
 | `src/tools/mcp.zig` | 101 | `ae/nib/tools/mcp_tool/module.ae` | a2dd439 | renamed (basename `mcp` is the client's) |
-| `src/session.zig` | 999 | `ae/nib/session/module.ae` | a2dd439 | Turn/Step loop, resume/continue, interrupted commits, auto compaction, Step-limit wait, undo wiring, the Run's viewed images on its tool message, fork init and per-Step fork snapshots, agent_session restore, skills, MCP (header mcp_servers, the log's on resume), hooks, the calls recorder; no user-message images (`turnWithImages`, TUI) |
+| `src/session.zig` | 999 | `ae/nib/session/module.ae` | a2dd439 | Turn/Step loop, resume/continue, interrupted commits, auto compaction, Step-limit wait, undo wiring, the Run's viewed images on its tool message, fork init and per-Step fork snapshots, agent_session restore, skills, MCP (header mcp_servers, the log's on resume), hooks (turn_end on a Session-held thread, TurnJob), the calls recorder; user-message images (`turn_with_images`) |
 | `src/session/run.zig` | 236 | `ae/nib/session/module.ae` | a2dd439 | execute + executeTimed: every Run on its own thread (RunJob) with its own timing, merged into the Step's; the waiting flag is the sandbox Host's `waiting` cell |
 | `src/session/run_job.zig` | 116 | `ae/nib/session/module.ae` | a2dd439 | RunJob; its recorder is a fork of the Session's (begin at start, finish before done) |
-| `src/session/log.zig` | 1402 | `ae/nib/session/log/module.ae` | a2dd439 | records are JSON text; tool summaries travel on the logged tool messages (the TUI reads them on resume); bash replacements (superseded bash rows) are not restored onto replayed messages yet |
+| `src/session/log.zig` | 1402 | `ae/nib/session/log/module.ae` | a2dd439 | records are JSON text; tool summaries travel on the logged tool messages (the TUI reads them on resume); background ids and bash replacements are restored onto replayed messages, as upstream restoreToolSummaries |
 | `src/session/output.zig` | 596 | `ae/nib/session/output/module.ae` | a2dd439 |  |
 | `src/session/prompt.zig` | 322 | `ae/nib/session/prompt/module.ae` | a2dd439 |  |
 | `src/session/profile.zig` | 58 | `ae/nib/session/profile/module.ae` | a2dd439 |  |
@@ -129,18 +130,18 @@ pins                     AE_PIN / AEB_REF the port is verified against
 | `src/mcp.zig`, `src/mcp/*` | 700 | `ae/nib/mcp/module.ae`, `mcp/mcp_index`, `mcp/mcp_headers`, `mcp/mcp_transport` | a2dd439 | stdio over os.run_stdio (newline-delimited JSON-RPC; cwd and stderr via sh; kill by pid, no process group); Streamable HTTP on std.http.client from a worker thread; no environment proxy |
 | `src/main.zig` | 311 | `ae/main.ae` | a2dd439 | ask, js, login/logout, help, version, __jail; bare `nib` opens the TUI (`run_tui_`); `nib replay` with its three error texts; no update |
 | `src/replay.zig` | 541 | `ae/nib/run_replay/module.ae` | a2dd439 | renamed (basename `replay` is the core's) |
-| `src/image.zig` | 324 | `ae/nib/image/module.ae` | a2dd439 | images are JSON texts (the log's `images` entries); binary-safe reads; SHA-256 hash name; Attached/Target for the Run's images; pastedPath is ported, the TUI still has its stand-ins |
-| `src/tui.zig` | 1911 | `ae/nib/tui/module.ae` | 7788541 | the App; takes term, Session port and clock; app events through `nib.tui.app_queue`; the Ticker is the poll timeout; images are a marked stand-in |
+| `src/image.zig` | 324 | `ae/nib/image/module.ae` | a2dd439 | images are JSON texts (the log's `images` entries); binary-safe reads; SHA-256 hash name; Attached/Target for the Run's images; pastedPath, and read_pasted for the TUI's stat-then-read |
+| `src/tui.zig` | 1911 | `ae/nib/tui/module.ae` | 7788541 | the App; takes term, Session port and clock; app events through `nib.tui.app_queue`; the Ticker is the poll timeout; the clipboard reader is an instance field (upstream's test override) |
 | `src/tui/view.zig` | 744 | `ae/nib/tui/tui_view/module.ae` | 7788541 | renamed (basename `view`); both snapshot files match cell for cell |
 | `src/tui/transcript.zig`, `transcript/entry.zig`, `transcript/changes.zig`, `transcript/intraline.zig`, `transcript/label.zig` | 2634 | `ae/nib/tui/transcript`, `entry`, `turn_changes` (renamed), `intraline`, `label` | 7788541 | replayed tool summaries are read from the messages' `tool_summary` members |
-| `src/tui/editor.zig` | 657 | `ae/nib/tui/editor/module.ae` | 7788541 | image blocks over an editor-local Image (stand-in for nib.image) |
+| `src/tui/editor.zig` | 657 | `ae/nib/tui/editor/module.ae` | 7788541 | image blocks hold nib.image Images (JSON text); sent_images is their JSON array |
 | `src/tui/markdown.zig`, `syntax.zig` | 1472 | `ae/nib/tui/markdown`, `syntax` | 7788541 | |
 | `src/tui/viewport.zig`, `selection.zig`, `selection/history.zig` | 595 | `ae/nib/tui/viewport`, `selection`, `sel_history` (renamed) | 7788541 | the local clipboard tool is a closure the app supplies |
 | `src/tui/status.zig`, `bill.zig`, `title.zig`, `format.zig`, `frames.zig`, `smooth.zig`, `long_text.zig`, `mode.zig` | 1076 | `ae/nib/tui/<same>`, `turn_summary` | 7788541 | times are ms from the app's clock |
 | `src/tui/commands.zig`, `menu.zig`, `providers.zig` | 1133 | `ae/nib/tui/commands`, `menu`, `module.ae` | 7788541 | execute/select/providers live in the app; `/provider` is key entry only |
 | `src/tui/provider_flow.zig` | 658 | `ae/nib/tui/provider_flow/module.ae` | 7788541 | API keys only: the Codex sign-in steps are not ported |
 | `src/tui/prediction.zig`, `reflect.zig` | 798 | `ae/nib/tui/prediction`, `reflect` | 7788541 | the model call and gh are closures (specs replace them) |
-| `src/tui/paths.zig`, `open.zig`, `clipboard.zig`, `agent_tree.zig`, `tasks.zig`, `turn.zig` | 1306 | `ae/nib/tui/<same>` | 7788541 | turn.zig's thread is the port's (`nib.tui.live`); clipboard's image check is a stand-in for nib.image |
+| `src/tui/paths.zig`, `open.zig`, `clipboard.zig`, `agent_tree.zig`, `tasks.zig`, `turn.zig` | 1306 | `ae/nib/tui/<same>` | 7788541 | turn.zig's thread is the port's (`nib.tui.live`); clipboard checks with nib.image's probe |
 | (new) | | `ae/nib/tui/port`, `live`, `clock`, `app_queue` | | the Session interface with its scripted (specs) and live (nib.session) implementations, the clock instance, the app event queue |
 | `src/auth.zig`, `src/auth/store.zig`, `src/auth/cli.zig` | 601 | `ae/nib/auth/module.ae`, `ae/nib/auth/store/module.ae` | a2dd439 | API keys only: no tokens, no Codex login |
 | `src/auth/oauth.zig`, `login.zig`, `codex.zig` | 798 | not ported | | policy |
@@ -335,17 +336,13 @@ mutation-checked (`tools/mutate.py` for the app).
 | test_tui_stream.py, test_tui_mouse.py, test_model.py, test_undo.py, test_interjections.py, test_at_files.py, test_prediction.py | pass | pass | pass |
 | test_hooks.py, test_skills.py, test_skill_mentions.py (TUI parts included) | pass | pass except `test_sandbox_denies_external_write` (kernel 5.15: no Landlock ABI 2) | pass |
 | TUI cases of test_background_agent/bash/run (escape, interjection, `/tasks`, `/stop`, step-limit result in the next TUI Turn) | their `/proc` helper needs Linux | pass | pass |
-| test_images.py | `View` cases pass; its four `test_tui_*` functions need the paste UI (stand-ins) | | |
+| test_images.py | whole file (its four `test_tui_*` functions since the 2026-11-13 parity follow-up) | | |
 | test_replay.py | pass (20 of 20) | | |
 | test_codex_websocket.py, test_provider_login.py | excluded: Codex by policy | | |
 
-**Stand-ins and stubs (marked).** Images: Ctrl+V and an empty paste say
-"No image in clipboard", pasted image paths are pasted as text, the
-editor's Image and clipboard's PNG check stand in for `nib.image`. MCP:
-`/mcp` lists and switches config.toml's servers; with no MCP client yet it
-shows no connection state. Tool activity names (upstream onToolActivity) are
-not emitted; the Running line uses the Run's progress. Hooks run after a
-TUI Turn on the Turn's worker, not a thread of their own.
+**Stand-ins and stubs (marked).** None left in this slice since the
+2026-11-13 parity follow-up (images, `/mcp` connection state, tool activity
+names, turn_end hooks on their own thread).
 
 **Differences kept.** Terminal input and app events are two queues (term
 and `app_queue`); upstream has one libvaxis loop. A stop requested during a
@@ -423,7 +420,7 @@ their reasons are in the script).**
 | test_codex, test_codex_websocket, test_provider_login | excluded: policy (Codex) | | |
 
 test_mcp's `/mcp` terminal function and test_images' clipboard and paste
-functions (TUI stand-ins) are left out of the run. (The three TUI `/js`
+functions were left out of this run; both run since the parity follow-up below. (The three TUI `/js`
 cases of test_background_bash pass since the follow-up below.)
 
 **Stand-ins added (marked, each with an ask).** `nib.sysgap` ignores SIGPIPE
@@ -480,3 +477,58 @@ test_background_bash passes whole on both Linux hosts (its three TUI `/js`
 and detached-idle cases included); on macOS no case that passed before
 fails now. `aeb .tests.ae` is green on all three, `tools/tui_tests.sh` and
 `ae/term/run-tests.sh` on macOS.
+
+## Follow-up: parity gaps closed (2026-11-13)
+
+Upstream had nothing new to port (its only commit since, a6917c6, is ADR 0026
+and CONTEXT.md); `main` is fast-forwarded to it. Five marked stand-ins and
+partial features of the port are gone, one commit each:
+
+- **TUI images.** Ctrl+V and an empty or whitespace paste read the clipboard
+  image through tui/clipboard (now checked with nib.image's probe and
+  MAX_BYTES); a pasted path naming an image file (nib.image.pasted_path,
+  read_pasted: stat before read) is stored under the Session's images
+  directory; the editor holds nib.image Images; Enter sends them with the
+  Turn (session.turn_with_images, the port's start_turn). The app owns its
+  Clipboard instance, whose reader specs replace (upstream's test override).
+  config.env.pairs gives children their environment; the `open` launcher
+  had been handed the Env struct where a NAME=value list was expected.
+  Unlocks test_images.py's four `test_tui_*` functions.
+- **`/mcp` connection state.** nib.mcp.server_state, the port's mcp_state;
+  `/mcp` shows " · failed: <error>" or " · <n> tools". `/new` reads [mcp]
+  again (as [skills]); a failed reopen keeps the current config. Unlocks
+  test_mcp.py's `tui_toggle`.
+- **Tool activity names.** Each RunScope counts its calls in flight per
+  tool; the Run's waiting loop reports a changed active tool, and the
+  Running line names it. No upstream e2e covers it; ae/tests/tui_e2e.py
+  (ours, upstream's PTY fixture used as a library) checks "Running llm".
+- **Bash replacements on restored messages.** Replay restores background
+  ids (run_results) and superseded bash rows (bash_replacements) onto the
+  tool messages, as upstream restoreToolSummaries; both upstream tests are
+  ported. No upstream e2e covers it.
+- **turn_end hooks on their own thread.** The Session holds its hook jobs
+  (an instance list, upstream TurnJob); close waits for them (finishHooks),
+  so quitting the TUI waits for a running hook. `session.turn_end_hooks`
+  is gone. ae/tests/tui_e2e.py checks the join.
+
+`upstream-e2e.sh` runs test_images.py and test_mcp.py whole (the
+`tui_only_functions_left_out` exclusion is gone); `.tests.ae` runs
+ae/tests/tui_e2e.sh. Every new function was mutation-checked.
+
+**Upstream e2e, files passing:**
+
+| Host | Before | Now | Still failing |
+|---|---|---|---|
+| macOS arm64 | 23/30 | 23/30 | test_effort (Codex half); test_session, test_agent, test_agent_reuse, test_background_agent/bash/run: their mock workers read `/proc` |
+| ae-x64 (Ubuntu 22.04, kernel 5.15) | 26/30 | 26/30 | test_effort (Codex half); test_sandbox, test_hooks `test_sandbox_denies_external_write`, test_mcp `test_stdio_sandbox`: no Landlock ABI 2 |
+| cachyos | 29/30 | 29/30 | test_effort (Codex half) |
+
+Counted as passing on rerun; the file counts stay. test_images and test_mcp now
+pass whole (on ae-x64 test_mcp stops at `test_stdio_sandbox` before its
+terminal function, as before). Timing-sensitive cases seen failing once and
+then passing on reruns, on the old binary as on the new: on macOS
+`test_two_steps_and_next_boundary`, `test_cross_process_child_log_lock_fails_then_releases`,
+`test_interjections_and_background_results_keep_fifo`; on ae-x64
+`test_step_limit_does_not_wait_for_detached_jobs` (5/5 on rerun).
+`aeb .tests.ae`, `tools/tui_tests.sh` and `tools/check_layers.sh` are green
+on all three hosts.
