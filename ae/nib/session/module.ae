@@ -58,7 +58,7 @@ import nib.mcp
 import nib.tools.agent_input
 import nib.tools.agent_sessions
 
-exports(Session, Options, Sink, new_options, new_sink, init, turn, compact_now, close, turn_end_hooks, error_message, timing_json, undo,
+exports(Session, Options, Sink, Ran, new_options, new_sink, init, turn, run, compact_now, close, turn_end_hooks, error_message, timing_json, undo,
         set_activity, enqueue, take_queued, switch_config, steps_logged,
         VERSION)
 
@@ -747,6 +747,42 @@ turn_end_hooks(sp: ptr, status: string) -> string {
     f = hooks.run(hooks_ctx_(s), "turn_end", c.hooks_turn_end, list.list_new(), status, hooks.TIMEOUT_MS as long)
     if f == null { return "" }
     return "hook turn_end · exit ${(f as *hooks.Failure).exit_code}"
+}
+
+// A Run outside a Turn (upstream session/run.zig run + runTimed: the TUI's
+// /js): it runs on the caller's thread with no Sink, then commits an empty
+// record, so the log keeps the task id counters its tools allocated.
+struct Ran {
+    outcome: ptr             // *sandbox.Outcome
+    changes: ptr             // list of *diff.Change
+    run_id: int              // the Run's id (the TUI numbers its next Run after it)
+    err: string              // the commit's error, "" none
+}
+
+run(sp: @keep ptr, code: string, cancel: @keep ptr) -> *Ran {
+    s = sp as *Session
+    t = s.tools as *tools.Tools
+    background.begin_turn(t.background)
+    if background.any_pending(t.background) == 0 { progress.clear(t.progress) }
+    s.run_id = s.run_id + 1
+    scope = tools.new_scope(s.tools, s.run_id)
+    o = sandbox.eval(code, sandbox.limits(), tools.host(scope), cancel)
+    if list.list_size(((s.cfg as *types.Config).hooks_after_edit)) > 0 {
+        paths = tools.change_paths(scope)
+        if list.list_size(paths) > 0 {
+            hooks.run(hooks_ctx_(s), "after_edit", (s.cfg as *types.Config).hooks_after_edit, paths, "", hooks.TIMEOUT_MS as long)
+        }
+    }
+    types.usage_add(s.usage, tools.take_usage(s.tools))
+    progress.drain(t.progress)
+    r = heap.new(Ran)
+    r.outcome = o
+    r.changes = tools.take_changes(scope)
+    r.run_id = s.run_id
+    l = s.log as *log.Log
+    r.err = log.commit(s.log, s.history, list.list_size(s.history), list.list_new(), l.context_tokens, ",\"model\":${jsonx.quote((s.cfg as *types.Config).model)},\"task_ids\":${progress.task_ids_json(t.progress)}", 0)
+    if canceled_(cancel) == 1 { background.stop_all(t.background) }
+    return r
 }
 
 // One `run` tool call (upstream run.zig execute + executeTimed).

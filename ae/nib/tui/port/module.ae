@@ -23,7 +23,7 @@ import nib.provider.types
 import nib.tui.app_queue
 
 exports(Port, Script, scripted, script_of, emit, end_turn, fail_turn, play_next, turn_text,
-        turn_count, canceled, set_stats, add_history_message, set_reply, queue_events)
+        turn_count, canceled, set_stats, add_history_message, set_reply, queue_events, queue_progress)
 
 // Signatures (all called with `call(p.f, p.ctx, ...)`):
 //   start_turn(ctx, text: string, compact: int, q: *app_queue.Queue, cancel: std.sync cell)
@@ -48,7 +48,9 @@ exports(Port, Script, scripted, script_of, emit, end_turn, fail_turn, play_next,
 //   waiting_task(ctx) -> string       {"id":..,"elapsed_ms":..} the Turn waits for, "" none
 //   recovery_hint(ctx, reason) -> string
 //   recovery_files(ctx) -> ptr        std.list of *changes.File this Turn changed
-//   run_js(ctx, code) -> string       {"ok":bool,"text":..,"logs":..,"diff":..}
+//   run_js(ctx, code) -> string       {"ok":bool,"text":..,"logs":..,"diff":..,"run":n,"usage":{..},"error":..}
+//                                     a Run outside a Turn (upstream session.run): committed to the log;
+//                                     run is its Run id, error the commit's ("" none)
 //   sandbox_status(ctx) -> string
 //   drain_progress(ctx) -> ptr        std.list of progress JSON objects due while idle
 //   predict(ctx, instruction, input, cancel) -> string   the model's reply, "" on failure
@@ -103,6 +105,8 @@ struct Script {
     undo_reply: string
     reopened: string[]
     js_reply: string
+    idle_progress: ptr      // std.list of progress JSON the next idle tick drains
+    pending: int            // any_pending's answer: background work still running
     prediction: string
     predictions: int
     hint: string
@@ -123,6 +127,7 @@ scripted(cfg: @keep ptr, home: string) -> *Port {
     s.id = "0123456789abcdef0123456789abcdef"
     s.queued = list.list_new()
     s.history = list.list_new()
+    s.idle_progress = list.list_new()
     s.next_id = 1 as long
     s.stats = "{\"usage\":{},\"steps\":0,\"context\":0}"
     s.undo_reply = "{\"text\":\"Nothing to undo.\"}"
@@ -182,13 +187,18 @@ scripted(cfg: @keep ptr, home: string) -> *Port {
     }
     p.user_stop = |ctx: ptr, id: string| { return "${id}: not running" }
     p.take_stop = |ctx: ptr| { return "" }
-    p.any_pending = |ctx: ptr| { return 0 }
+    p.any_pending = |ctx: ptr| { return (ctx as *Script).pending }
     p.waiting_task = |ctx: ptr| { return "" }
     p.recovery_hint = |ctx: ptr, reason: string| { return (ctx as *Script).hint }
     p.recovery_files = |ctx: ptr| { return list.list_new() }
     p.run_js = |ctx: ptr, code: string| { return (ctx as *Script).js_reply }
     p.sandbox_status = |ctx: ptr| { return "off (scripted)" }
-    p.drain_progress = |ctx: ptr| { return list.list_new() }
+    p.drain_progress = |ctx: ptr| {
+        sc = ctx as *Script
+        out = sc.idle_progress
+        sc.idle_progress = list.list_new()
+        return out
+    }
     p.predict = |ctx: ptr, instruction: string, input: string, cancel: ptr| {
         sc = ctx as *Script
         sc.predictions = sc.predictions + 1
@@ -256,5 +266,7 @@ canceled(s: *Script) -> bool {
 }
 
 set_stats(s: *Script, json: string) { s.stats = json }
+// A progress snapshot (the JSON tools.progress delivers) for the next idle tick.
+queue_progress(s: *Script, json: string) { list.list_add(s.idle_progress, string.copy(json)) }
 add_history_message(s: *Script, json: string) { list.list_add(s.history, string.copy(json)) }
 set_reply(s: *Script, prediction: string) { s.prediction = prediction }

@@ -1834,6 +1834,15 @@ execute(a: *App, c: int, arg: string, line: string) {
         transcript.add(a.transcript, entry.KIND_USER, line)
         string r = call(a.p.run_js, a.p.ctx, arg)
         v = jsonx.parse(r)
+        // The /js Run took a Run id: the next Turn's Runs are numbered after it.
+        a.transcript.next_run = jsonx.int_or(v, "run", a.transcript.next_run)
+        if jsonx.has(v, "usage") != 0 { a.usage = usage_of_(jsonx.field(v, "usage")) }
+        jerr = string.copy(jsonx.str_or(v, "error", ""))
+        if jerr != "" {
+            transcript.add(a.transcript, entry.KIND_ERR, jerr)
+            jsonx.free(v)
+            return
+        }
         logs = string.copy(jsonx.str_or(v, "logs", ""))
         if string.length(logs) > 0 {
             transcript.add(a.transcript, entry.KIND_INFO, trim_end_nl_(logs))

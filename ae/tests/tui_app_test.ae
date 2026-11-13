@@ -697,6 +697,33 @@ main() {
             tui.execute(r.a, commands.CMD_MCP, "on nope", "/mcp on nope")
             spec.assert_str_eq(transcript.at(r.a.transcript, 3).text, "MCP server not found: nope", "unknown")
         }
+        spec.it("/js is a Run: the next Turn's Runs are numbered after it and idle progress reaches its Run") callback {
+            r = rig_(80, 24)
+            r.s.js_reply = "{\"ok\":true,\"text\":\"\\\"ready\\\"\",\"logs\":\"\",\"diff\":\"\",\"run\":1,\"usage\":{},\"error\":\"\"}"
+            type_(r, "/js await tools.write({path:'js.ready',content:'ready'})")
+            key_(r, "enter")
+            tui.settle(r.a)
+            driver.expect_row_contains(r.t, "\"ready\"")
+            spec.assert_eq(r.a.transcript.next_run, 1, "the /js Run took Run id 1")
+            spec.assert_eq(port.turn_count(r.s), 0, "no Turn")
+            type_(r, "initial")
+            key_(r, "enter")
+            emit_(r, "{\"step\":{\"n\":1,\"effort\":\"\"}}")
+            emit_(r, "{\"run_start\":\"await tools.bash({command:'worker', background:true})\",\"step\":1}")
+            emit_(r, "{\"progress\":{\"id\":\"b1\",\"run\":2,\"invocation\":1,\"kind\":\"bash\",\"output_bytes\":0,\"elapsed_ms\":10,\"background\":true,\"detached\":true,\"fork\":false,\"prompt\":\"worker\",\"state\":\"working\",\"step\":1,\"tools\":[],\"files\":[],\"usage\":{}}}")
+            tui.settle(r.a)
+            driver.expect_row_contains(r.t, "b1 bash")
+            emit_(r, "{\"run_end\":{\"ok\":true,\"output\":\"{\\\"id\\\":\\\"b1\\\"}\",\"changes\":[],\"tool_summary\":{\"counts\":[{\"name\":\"bash\",\"count\":1}],\"omitted\":0,\"files\":[]}}}")
+            r.s.pending = 1
+            port.end_turn(r.s, 1)
+            tui.settle(r.a)
+            driver.expect_row_contains(r.t, "b1 bash")
+            r.s.pending = 0
+            port.queue_progress(r.s, "{\"id\":\"b1\",\"run\":2,\"invocation\":1,\"kind\":\"bash\",\"exit_code\":0,\"output_bytes\":12,\"elapsed_ms\":900,\"background\":true,\"detached\":true,\"fork\":false,\"prompt\":\"worker\",\"state\":\"done\",\"step\":1,\"tools\":[],\"files\":[],\"usage\":{}}")
+            tui.handle_app(r.a, "{\"tick\":{}}", null)
+            tui.render(r.a)
+            driver.expect_row_contains(r.t, "completed")
+        }
         spec.it("closed queues refuse events") callback {
             q = app_queue.new()
             app_queue.close(q)

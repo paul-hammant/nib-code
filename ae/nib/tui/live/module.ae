@@ -31,6 +31,7 @@ import nib.session
 import nib.session.log
 import nib.tools
 import nib.tools.background
+import nib.tools.progress
 import nib.tools.jail
 import nib.tools.changes
 import nib.tools.diff
@@ -295,18 +296,14 @@ new(sp: @keep ptr, cfg: @keep ptr, op: @keep ptr, home: string) -> *port.Port {
     }
     p.run_js = |ctx: ptr, code: string| {
         lv = ctx as *Live
-        t = tools_(lv)
-        ss = sess_(lv)
-        ss.run_id = ss.run_id + 1
-        sc = tools.new_scope(t as ptr, ss.run_id)
-        jo = sandbox.eval(code, sandbox.limits(), tools.host(sc), null) as *sandbox.Outcome
-        ch = tools.take_changes(sc)
+        r = session.run(lv.sp, code, null)
+        jo = r.outcome as *sandbox.Outcome
         d = ""
-        for i in 0..list.list_size(ch) {
-            c = list.list_get_raw(ch, i) as *diff.Change
+        for i in 0..list.list_size(r.changes) {
+            c = list.list_get_raw(r.changes, i) as *diff.Change
             d = "${d}${c.diff}"
         }
-        string out = "{\"ok\":${if jo.ok == 1 { "true" } else { "false" }},\"text\":${jsonx.quote(jo.text)},\"logs\":${jsonx.quote(jo.logs)},\"diff\":${jsonx.quote(d)}}"
+        string out = "{\"ok\":${if jo.ok == 1 { "true" } else { "false" }},\"text\":${jsonx.quote(jo.text)},\"logs\":${jsonx.quote(jo.logs)},\"diff\":${jsonx.quote(d)},\"run\":${r.run_id},\"usage\":${types.usage_json(sess_(lv).usage)},\"error\":${jsonx.quote(r.err)}}"
         return out
     }
     p.sandbox_status = |ctx: ptr| {
@@ -314,8 +311,13 @@ new(sp: @keep ptr, cfg: @keep ptr, op: @keep ptr, home: string) -> *port.Port {
         string out = if t.workspace == 0 { "off" } else if jail.unavailable() == "" { "workspace" } else { "workspace · bash unavailable" }
         return out
     }
+    // Upstream's idle tick: the progress snapshots due while no Turn runs.
     p.drain_progress = |ctx: ptr| {
+        pq = tools_(ctx as *Live).progress
         ptr out = list.list_new()
+        progress.set_sink(pq, out, |c: ptr, pj: string| { list.list_add(c, string.copy(pj)) })
+        progress.drain(pq)
+        progress.clear_sink(pq)
         return out
     }
     p.skills_summary = |ctx: ptr| {
