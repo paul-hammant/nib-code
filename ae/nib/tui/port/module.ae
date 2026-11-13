@@ -23,7 +23,8 @@ import nib.provider.types
 import nib.tui.app_queue
 
 exports(Port, Script, scripted, script_of, emit, end_turn, fail_turn, play_next, turn_text,
-        turn_images, turn_count, canceled, set_stats, add_history_message, set_reply, queue_events, queue_progress)
+        turn_images, turn_count, canceled, set_stats, add_history_message, set_reply, queue_events, queue_progress,
+        set_mcp_state)
 
 // Signatures (all called with `call(p.f, p.ctx, ...)`):
 //   start_turn(ctx, text: string, images: string, compact: int, q: *app_queue.Queue, cancel: std.sync cell)
@@ -56,6 +57,8 @@ exports(Port, Script, scripted, script_of, emit, end_turn, fail_turn, play_next,
 //   drain_progress(ctx) -> ptr        std.list of progress JSON objects due while idle
 //   predict(ctx, instruction, input, cancel) -> string   the model's reply, "" on failure
 //   skills_summary(ctx) -> string     {"count","found","skipped","missing"} of the Session's start
+//   mcp_state(ctx, id) -> string      the Session's MCP client's view of server id:
+//                                     {"failure":..|null,"listed":bool,"tools":n}, "" none
 struct Port {
     ctx: ptr
     start_turn: fn
@@ -84,6 +87,7 @@ struct Port {
     drain_progress: fn
     predict: fn
     skills_summary: fn
+    mcp_state: fn
 }
 
 // ---------------------------------------------------------------- scripted
@@ -113,6 +117,8 @@ struct Script {
     predictions: int
     hint: string
     stops: string[]
+    mcp_ids: string[]       // mcp_state's answers, by server id
+    mcp_states: string[]
 }
 
 struct Events {
@@ -208,6 +214,15 @@ scripted(cfg: @keep ptr, home: string) -> *Port {
         return sc.prediction
     }
     p.skills_summary = |ctx: ptr| { return "{\"count\":0,\"found\":0,\"skipped\":0,\"missing\":0}" }
+    p.mcp_state = |ctx: ptr, id: string| {
+        sc = ctx as *Script
+        for i in 0..sc.mcp_ids.len {
+            if sc.mcp_ids[i] == id {
+                return sc.mcp_states[i]
+            }
+        }
+        return ""
+    }
     return p
 }
 
@@ -274,3 +289,8 @@ set_stats(s: *Script, json: string) { s.stats = json }
 queue_progress(s: *Script, json: string) { list.list_add(s.idle_progress, string.copy(json)) }
 add_history_message(s: *Script, json: string) { list.list_add(s.history, string.copy(json)) }
 set_reply(s: *Script, prediction: string) { s.prediction = prediction }
+// What mcp_state answers for server `id` (see Port).
+set_mcp_state(s: *Script, id: string, json: string) {
+    s.mcp_ids.push(string.copy(id))
+    s.mcp_states.push(string.copy(json))
+}

@@ -9,9 +9,9 @@
 // activity goes through nib.tui.turn's throttle. The Turn ends with its
 // summary ({"turn_end":..}) and {"done":{}} or {"failed":..}.
 //
-// Not here yet (marked): hooks after a Turn (src/session/hooks.zig), skills
-// and MCP reloads on /new, tool activity names (the transcript shows the
-// running tool from the Run's progress instead).
+// Not here yet (marked): hooks after a Turn (src/session/hooks.zig), tool
+// activity names (the transcript shows the running tool from the Run's
+// progress instead).
 
 import std.list
 import std.string
@@ -40,6 +40,7 @@ import nib.tools.progress
 import nib.tools.jail
 import nib.tools.changes
 import nib.tools.diff
+import nib.mcp
 import nib.sandbox
 import nib.tui.app_queue
 import nib.tui.port
@@ -329,6 +330,14 @@ new(sp: @keep ptr, cfg: @keep ptr, op: @keep ptr, home: string) -> *port.Port {
         string out = (ctx as *Live).skills
         return out
     }
+    p.mcp_state = |ctx: ptr, id: string| {
+        t = tools_(ctx as *Live)
+        if t.mcp_client == null {
+            return ""
+        }
+        string out = mcp.server_state(t.mcp_client, id)
+        return out
+    }
     p.predict = |ctx: ptr, instruction: string, input_text: string, cancel: ptr| {
         string out = predict_(ctx as *Live, instruction, input_text, cancel)
         return out
@@ -384,15 +393,27 @@ reopen_(l: *Live, id: string, cfg: @keep ptr) -> string {
     o2.record_env = o.record_env
     o2.self_exe = o.self_exe
     o2.undo_enabled = o.undo_enabled
+    c = cfg as *types.Config
+    skills_before = c.enabled_skills
+    mcp_before = c.mcp_servers
     if id == "" {
-        // a new Session reads the [skills] settings again (upstream reopen)
+        // a new Session reads the [skills] and [mcp] settings again (upstream reopen)
         st, serr = config.load_skills(o.home)
         if serr == "" && st != null {
-            (cfg as *types.Config).enabled_skills = config.enabled_skills(st)
+            c.enabled_skills = config.enabled_skills(st)
         }
+        servers, merr = config.load_mcp(o.home)
+        if merr != "" {
+            c.enabled_skills = skills_before
+            return merr
+        }
+        c.mcp_servers = servers
     }
     sp2, err, detail = session.init(cfg, op2)
     if err != "" {
+        // on failure the current Session keeps its config (upstream reopen)
+        c.enabled_skills = skills_before
+        c.mcp_servers = mcp_before
         return if detail != "" { detail } else { err }
     }
     session.close(l.sp)

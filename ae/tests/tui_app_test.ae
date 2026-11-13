@@ -805,6 +805,16 @@ main() {
             tui.execute(r.a, commands.CMD_MCP, "on nope", "/mcp on nope")
             spec.assert_str_eq(transcript.at(r.a.transcript, 3).text, "MCP server not found: nope", "unknown")
         }
+        spec.it("/mcp shows the Session's connection state of enabled servers") callback {
+            r = rig_(80, 24)
+            fs.write("${r.home}/config.toml", "[mcp]\ndocs = true\ngone = true\nidle = true\n[mcp.docs]\ncommand = \"docs-server\"\n[mcp.gone]\ncommand = \"x\"\n[mcp.idle]\ncommand = \"y\"\n[mcp.off]\ncommand = \"z\"\n")
+            port.set_mcp_state(r.s, "docs", "{\"failure\":null,\"listed\":true,\"tools\":3}")
+            port.set_mcp_state(r.s, "gone", "{\"failure\":\"FileNotFound\",\"listed\":false,\"tools\":0}")
+            port.set_mcp_state(r.s, "idle", "{\"failure\":null,\"listed\":false,\"tools\":0}")
+            port.set_mcp_state(r.s, "off", "{\"failure\":null,\"listed\":true,\"tools\":9}")
+            tui.execute(r.a, commands.CMD_MCP, "", "/mcp")
+            spec.assert_str_eq(transcript.at(r.a.transcript, 0).text, "docs  on · 3 tools\ngone  on · failed: FileNotFound\nidle  on\noff  off\nApplies to new sessions.", "states")
+        }
         spec.it("/js is a Run: the next Turn's Runs are numbered after it and idle progress reaches its Run") callback {
             r = rig_(80, 24)
             r.s.js_reply = "{\"ok\":true,\"text\":\"\\\"ready\\\"\",\"logs\":\"\",\"diff\":\"\",\"run\":1,\"usage\":{},\"error\":\"\"}"

@@ -16,9 +16,7 @@
 // ticker thread is the poll timeout (an empty poll while busy is a tick);
 // events are handled one at a time with the same frame pacing (frames.due).
 // The clipboard reader is an instance field (`clip`, nib.tui.clipboard),
-// where upstream has a test-only global override. /mcp lists and switches
-// config.toml's servers; there is no MCP client yet, so no connection state
-// (marked).
+// where upstream has a test-only global override.
 
 import std.string
 import std.strbuilder
@@ -1972,12 +1970,34 @@ mcp_command_(a: *App, arg: string) {
     text = ""
     for i in 0..n {
         sv = list.list_get_raw(servers, i) as *types.McpServer
-        text = "${text}${sv.id}  ${if sv.enabled != 0 { "on" } else { "off" }}\n"
+        text = "${text}${sv.id}  ${if sv.enabled != 0 { "on" } else { "off" }}${mcp_state_text_(a, sv)}\n"
     }
     if n == 0 {
         text = "No MCP servers configured.\n"
     }
     transcript.add(a.transcript, entry.KIND_INFO, "${text}Applies to new sessions.")
+}
+
+// What the running Session's MCP client knows of an enabled server: its
+// failure or its tool count once listed.
+mcp_state_text_(a: *App, sv: *types.McpServer) -> string {
+    if sv.enabled == 0 {
+        return ""
+    }
+    string st = call(a.p.mcp_state, a.p.ctx, sv.id)
+    if st == "" {
+        return ""
+    }
+    v = jsonx.parse(st)
+    out = ""
+    failure = string.copy(jsonx.str_or(v, "failure", ""))
+    if failure != "" {
+        out = " · failed: ${failure}"
+    } else if jsonx.bool_or(v, "listed", 0) != 0 {
+        out = " · ${jsonx.long_or(v, "tools", 0 as long)} tools"
+    }
+    jsonx.free(v)
+    return out
 }
 
 // The [skills] switches of config.toml (a list of *config.Switch).

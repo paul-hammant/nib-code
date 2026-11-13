@@ -64,7 +64,12 @@ content_of_(result: string) -> string {
 
 // The behaviours every server flavour shares.
 check_flavour_(c: ptr, base: string) {
+    spec.assert_str_eq(mcp.server_state(c, "local"), "{\"failure\":null,\"listed\":false,\"tools\":0}", "not listed before the prompt")
+    spec.assert_str_eq(mcp.server_state(c, "nope"), "", "no such server")
     p = mcp.prompt(c, base)
+    st = mcp.server_state(c, "local")
+    spec.assert_true(has_(st, "\"failure\":null,\"listed\":true,") == 1, "listed: ${st}")
+    spec.assert_true(has_(st, "\"tools\":0}") == 0, "with its tools: ${st}")
     spec.assert_true(has_(p, "<mcp_tools>\n") == 1, "index opens")
     spec.assert_true(has_(p, "local.echo(text: string) — Echo the input.\n") == 1, "echo line")
     spec.assert_true(has_(p, "local.second() — Second page.\n") == 1, "second page listed")
@@ -322,6 +327,8 @@ main() {
             spec.assert_eq(mcp.enabled_any(servers), 1, "enabled")
             p = mcp.prompt(c, "BASE")
             spec.assert_true(has_(p, "gone: failed: ") == 1, "failure line: ${p}")
+            st = mcp.server_state(c, "gone")
+            spec.assert_true(has_(st, "{\"failure\":\"") == 1 && has_(st, "\"listed\":false") == 1, "state names the failure: ${st}")
             mcp.close(c)
         }
         spec.it("cancellation interrupts a call") callback {
