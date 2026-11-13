@@ -167,7 +167,8 @@ measure, enforced through the stand-in's interrupt handler.
 
 **Containment.** Tools are service modules; a module's imports are its
 reach (`tools/check_layers.sh`): only `tools/process` (and the jail's probe
-and helper exec) starts a program, only the sandbox and grep's private
+and helper exec) starts a program (since Aether 0.912.0 a compile error
+elsewhere: every other std.os import hides the program starters), only the sandbox and grep's private
 matcher embed QuickJS, nothing in this slice imports a network module. The
 sandbox's two host functions open with a `hide os, worker, ...` veto line.
 
@@ -258,8 +259,8 @@ configured the default service is anthropic (upstream: codex), a `[codex]`
 section is validated and ignored. HTTP error bodies are never echoed, for
 every protocol. The request runs on its own thread and an abandoned one ends
 at the server's close or the client's whole-exchange timeout. No `Expect:
-100-continue` is ever sent (std.http.client returns an interim 100 as the
-final response). Header `nib_version` is `0.13.0-ae`.
+100-continue` is sent, as upstream (std.http.client skips interim 1xx
+responses since Aether 0.910.0 in any case). Header `nib_version` is `0.13.0-ae`.
 
 **What the TUI slice (src/tui*, on ae/term) needs from this one.**
 `session.init(cfg, options)` (set `options.undo_enabled = 1` for the TUI),
@@ -421,14 +422,9 @@ their reasons are in the script).**
 | test_effort | its chat_completions half passes; the second half is Codex | same | same |
 | test_codex, test_codex_websocket, test_provider_login | excluded: policy (Codex) | | |
 
-Not passing yet, TUI slice: test_background_bash's
-`test_js_foreground_bash_counter_is_persisted_for_resume`,
-`test_js_keeps_later_background_progress_attached_to_its_run` and
-`test_detached_idle_completion_is_delivered_next_turn_exactly_once` drive the
-TUI's `/js`, which evaluates in a bare scope (`nib.tui.live` run_js) instead of
-upstream's `session.run` (Run commit with task_ids, progress, background
-delivery); test_mcp's `/mcp` terminal function and test_images' clipboard and
-paste functions (TUI stand-ins) are left out of the run.
+test_mcp's `/mcp` terminal function and test_images' clipboard and paste
+functions (TUI stand-ins) are left out of the run. (The three TUI `/js`
+cases of test_background_bash pass since the follow-up below.)
 
 **Stand-ins added (marked, each with an ask).** `nib.sysgap` ignores SIGPIPE
 before a child's stdin is written (asks/aether-ipc-write-sigpipe.md); a child
@@ -442,3 +438,45 @@ as upstream (the earlier slice never echoed bodies). MCP stdio servers are
 killed by pid (os.run_stdio makes no process group). No environment proxy for
 fetch, search or MCP HTTP. No response decompression in fetch (no
 accept-encoding is sent).
+
+## Follow-up: /js as a Run, check_layers on every module, Aether 0.912.0 (2026-11-13)
+
+**`/js` is a Run.** As upstream (`session.run`, session/run.zig run +
+runTimed), the TUI's `/js` goes through `nib.session.run`: the Run takes the
+Session's next Run id, tools.llm usage joins the Session's, after-edit hooks
+run, and an empty record commits the task id counters (`task_ids`), so a
+resumed Session numbers its tasks after it. The TUI numbers the next Turn's
+Runs after the `/js` Run, so later background progress attaches to its Run,
+and `nib.tui.live`'s idle tick now drains the due progress snapshots
+(upstream's `.tick` with no Turn). `tui_app_test.ae` has a spec for both.
+
+**`tools/check_layers.sh`** pins the imports of every module (ae/main.ae and
+every ae/nib module; an unpinned one fails). Who may start a program is the
+compiler's rule since Aether 0.911.0 (`import ns hiding (...)`, aether
+#3653): every std.os import outside tools/process and tools/jail hides
+std.os's program starters (E0304 on use), and the script checks those lists.
+The TUI's three exceptions are named and narrow: tui/open keeps
+`spawn_proc_to` alone (a detached `open` for a clicked path, outside any
+Run); tui/reflect may call only nib.sysgap's flock and positional-append
+calls (the locked reflections.md append); auth/models may only GET (the
+`/model` listing), imported only by the app and its provider flow.
+
+**Aether 0.912.0** (`pins`). aether #3655 (0.910.0) fixed both ae/term asks
+(RESOLVED): ae/term's surface loops store one hoisted blank again; `poll ->
+Event` with `NoEvent` and `read_cell -> (Cell, bool)` stay as the API, by
+choice. Still worked around, not fixed in 0.912.0: `xs.push(f())` losing a
+struct's strings, the module-basename collision, `m.P[] xs = []`, a `ptr`
+passed as `string`, ipc.write_some's SIGPIPE, run_stdio's stderr and cwd.
+
+**Upstream e2e (`ae/tests/upstream-e2e.sh`), files passing:**
+
+| Host | Before | Now | Still failing |
+|---|---|---|---|
+| macOS arm64 | 21/30 | 23/30 | test_effort (Codex half); test_session, test_agent, test_agent_reuse, test_background_agent/bash/run: their mock workers read `/proc` |
+| ae-x64 (Ubuntu 22.04, kernel 5.15) | 24/30 | 26/30 | test_effort (Codex half); test_sandbox, test_hooks `test_sandbox_denies_external_write`, test_mcp `test_stdio_sandbox`: no Landlock ABI 2 |
+| cachyos | 26/30 | 29/30 | test_effort (Codex half) |
+
+test_background_bash passes whole on both Linux hosts (its three TUI `/js`
+and detached-idle cases included); on macOS no case that passed before
+fails now. `aeb .tests.ae` is green on all three, `tools/tui_tests.sh` and
+`ae/term/run-tests.sh` on macOS.
