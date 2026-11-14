@@ -11,7 +11,7 @@ import std.list
 import std.string
 import nib.image
 import nib.jsonx
-import nib.sysgap
+import nib.fserr
 import nib.tools.atomic_file
 
 exports(view)
@@ -51,11 +51,9 @@ view(tp: ptr, creds: ptr, args: string) -> (int, string) {
     if perr != "" { return 0, perr }
     if credential_(creds, path) == 1 { return 0, "CredentialAccessDenied" }
     if image.attached_count(t.attached) >= image.MAX_PER_RUN { return refuse_(limit_text_()) }
-    st = sysgap.new_stat()
-    rc = sysgap.stat(path, 1, st)
-    if rc != 0 { return refuse_(image.rejection(sysgap.errname(rc))) }
-    s = st as *sysgap.Stat
-    if s.kind != sysgap.KIND_FILE { return refuse_("not a file") }
+    s, rk, _rm = fs.stat(path, 1)
+    if rk != fs.KIND_OK { return refuse_(image.rejection(fserr.errname(rk))) }
+    if s.kind != fs.STAT_KIND_FILE { return refuse_("not a file") }
     if s.size > (image.MAX_BYTES as long) { return refuse_(image.rejection("ImageTooLarge")) }
     data, _n, rerr = fs.read_binary(path)
     if string.length(rerr) > 0 { return refuse_("AccessDenied") }

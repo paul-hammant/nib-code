@@ -9,7 +9,7 @@ import std.strbuilder
 import std.list
 import std.sync
 import nib.jsonx
-import nib.sysgap
+import nib.fserr
 import nib.tools.atomic_file
 import nib.tools.file_state
 import nib.tools.jail
@@ -78,11 +78,9 @@ blocked_(c: *Ctx, path: string) -> string {
 
 // (data, "") or ("", Zig's error name).
 read_file_(path: string) -> (string, string) {
-    st = sysgap.new_stat()
-    rc = sysgap.stat(path, 1, st)
-    if rc != 0 { return "", sysgap.errname(rc) }
-    s = st as *sysgap.Stat
-    if s.kind == sysgap.KIND_DIR { return "", "IsDir" }
+    s, rk, _rm = fs.stat(path, 1)
+    if rk != fs.KIND_OK { return "", fserr.errname(rk) }
+    if s.kind == fs.STAT_KIND_DIR { return "", "IsDir" }
     if s.size > FILE_LIMIT { return "", "StreamTooLong" }
     data, err = fs.read(path)
     if err != "" { return "", "AccessDenied" }
@@ -108,11 +106,10 @@ read(cp: ptr, args: string) -> (int, string) {
     if perr != "" { return 0, perr }
     fd, lerr = file_state.lock(c.nib_home, path, c.cancel)
     if lerr != "" { return 0, lerr }
-    st = sysgap.new_stat()
-    src = sysgap.stat(path, 1, st)
-    if src != 0 {
+    st, sk, _sm = fs.stat(path, 1)
+    if sk != fs.KIND_OK {
         file_state.unlock(fd)
-        return 0, "${raw}: ${sysgap.errname(src)}"
+        return 0, "${raw}: ${fserr.errname(sk)}"
     }
     data, rerr = read_file_(path)
     if rerr != "" {
@@ -177,12 +174,11 @@ parent_dirs_(path: string) -> string {
     e = fs.mkdir_p(parent)
     if e != "" {
         // the error name of the first component that cannot be made
-        st = sysgap.new_stat()
         p = parent
         while p != "/" {
-            rc = sysgap.stat(p, 1, st)
-            if rc == 0 {
-                if (st as *sysgap.Stat).kind != sysgap.KIND_DIR { return "${parent}: NotDir" }
+            st, pk, _pm = fs.stat(p, 1)
+            if pk == fs.KIND_OK {
+                if st.kind != fs.STAT_KIND_DIR { return "${parent}: NotDir" }
                 return "${parent}: AccessDenied"
             }
             p = atomic_file.dirname(p)
@@ -233,8 +229,7 @@ edit(cp: ptr, args: string) -> (int, string) {
     out = replace_all(data, old_text, new_text)
     // the file as it is now goes into the Turn's undo record before any change
     snap = undo.prepare(c.undo, c.nib_home, path, 1, data, out)
-    written = sysgap.new_stat()
-    werr = atomic_file.replace(path, out, 438, 0, 0, written)
+    written, werr = atomic_file.replace_stat(path, out, 438, 0, 0)
     if werr != "" {
         undo.release(snap)
         file_state.unlock(fd)
@@ -264,21 +259,20 @@ write(cp: ptr, args: string) -> (int, string) {
         file_state.unlock(fd)
         return 0, "Canceled"
     }
-    current = sysgap.new_stat()
-    rc = sysgap.stat(path, 1, current)
-    if rc == 0 {
+    current, rk, _rm = fs.stat(path, 1)
+    if rk == fs.KIND_OK {
         if file_state.changed(c.state, path, current) == 1 {
             file_state.unlock(fd)
             return 0, "${raw} changed since this session last read or wrote it (by bash, a background agent, or the user); read it again before overwriting"
         }
-    } else if sysgap.errname(rc) != "FileNotFound" {
+    } else if rk != fs.KIND_NOT_FOUND {
         file_state.unlock(fd)
-        return 0, "${raw}: ${sysgap.errname(rc)}"
+        return 0, "${raw}: ${fserr.errname(rk)}"
     }
     tracked = 1
     has_before = 0
     before = ""
-    if rc == 0 {
+    if rk == fs.KIND_OK {
         b, berr = read_file_(path)
         if berr != "" { tracked = 0 } else {
             before = b
@@ -297,8 +291,7 @@ write(cp: ptr, args: string) -> (int, string) {
         file_state.unlock(fd)
         return 0, derr
     }
-    written = sysgap.new_stat()
-    werr = atomic_file.replace(path, content, 438, 0, 0, written)
+    written, werr = atomic_file.replace_stat(path, content, 438, 0, 0)
     if werr != "" {
         undo.release(snap)
         file_state.unlock(fd)

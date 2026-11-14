@@ -6,7 +6,7 @@
 
 import std.list
 import std.string
-import nib.sysgap
+import nib.sysenv
 
 exports(Env, new, set, get, has, remove, clone, pairs, from_process)
 
@@ -101,7 +101,7 @@ pairs(ep: ptr) -> ptr {
 // This process's whole environment.
 from_process() -> ptr {
     out = new()
-    all = sysgap.environ()
+    all = sysenv.environ()
     i = 0
     n = list.list_size(all)
     while i < n {

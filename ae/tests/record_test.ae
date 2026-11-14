@@ -9,7 +9,6 @@ import std.string
 import std.fs
 import std.list
 import nib.jsonx
-import nib.sysgap
 import nib.sandbox.record
 
 tmp_(tag: string) -> string {
@@ -48,10 +47,14 @@ line_(l: ptr, i: int) -> string {
     return s
 }
 
+size_of_(fd: int) -> long {
+    n, _k, _m = fs.fd_size(fd)
+    return n
+}
+
 mode_(path: string) -> int {
-    st = sysgap.new_stat()
-    sysgap.stat(path, 1, st)
-    return (st as *sysgap.Stat).mode & 511
+    st, _k, _m = fs.stat(path, 1)
+    return st.mode & 511
 }
 
 rec_(p: @into ptr) -> *record.Recorder { return p as *record.Recorder }
@@ -212,14 +215,14 @@ main() {
                 record.finish(old, record.END_OK)
                 record.begin(old, 3, 0)
                 record.finish(old, record.END_OK)
-                sysgap.pwrite_all(rec_(old).fd, "{\"step\":3", rec_(old).offset)
+                fs.fd_pwrite_all(rec_(old).fd, string.bytes("{\"step\":3"), rec_(old).offset)
                 record.close(old)
 
                 resumed = record.new(path, 1)
                 record.begin(resumed, 2, 0)
                 spec.assert_eq(rec_(resumed).enabled, 1, "enabled")
                 spec.assert_true(rec_(resumed).offset == retained, "offset at the kept Step")
-                spec.assert_true(sysgap.fd_size(rec_(resumed).fd) == retained, "file cut")
+                spec.assert_true(size_of_(rec_(resumed).fd) == retained, "file cut")
                 spec.assert_eq(record.seen_count(resumed), 1, "one retained hash")
                 record.capture(resumed, 0, "read", "{}", 1, "1")
                 record.capture(resumed, 1, "read", "{}", 1, "2")

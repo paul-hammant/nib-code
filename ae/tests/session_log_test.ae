@@ -28,7 +28,6 @@ import std.string
 import std.time
 import nib.jsonx
 import nib.msg
-import nib.sysgap
 import nib.session.log
 import nib.provider.types
 
@@ -131,7 +130,7 @@ t_list_() {
     fs.write("${d}/empty.jsonl", "{\"cwd\":\"/w\",\"messages\":[{\"role\":\"system\",\"content\":\"s\"}]}\n")
     fs.write("${d}/child.jsonl", "{\"cwd\":\"/w\",\"parent_session_id\":\"aaaa\",\"messages\":[]}\n")
     fs.write("${d}/other.jsonl", "{\"cwd\":\"/elsewhere\",\"messages\":[]}\n")
-    sysgap.mkdir("${d}/private.calls.jsonl", 448)
+    fs.create_dir_with_mode("${d}/private.calls.jsonl", 448)
     all = log.list_sessions(d, "/w")
     spec.assert_eq(list.list_size(all), 2, "two sessions")
     a = list.list_get_raw(all, 0) as *log.Summary
@@ -162,7 +161,8 @@ t_commit_replay_() {
     check_replay_(path, history, 10)
     cm_(l, history, 2, L2_(msg.user("interrupted"), msg.assistant("partial\n\n[interrupted by user]", null, "", "", 0, "", -1, "")), 10, "")
     check_replay_(path, history, 10)
-    spec.assert_eq(sysgap.pwrite_all(lg_(l).fd, "{\"from\":\n{\"repair\":", lg_(l).offset), 0, "torn tail written")
+    _n, tk, _tm = fs.fd_pwrite_all(lg_(l).fd, string.bytes("{\"from\":\n{\"repair\":"), lg_(l).offset)
+    spec.assert_eq(tk, fs.KIND_OK, "torn tail written")
     log.close(l)
     restored = list.list_new()
     l2, e2 = log.restore(path, restored, "", 0)
@@ -610,7 +610,7 @@ t_fifo_restore_one_(okmode: int, torn: int) {
     log.background(l, second, 2)
     result = "{\"role\":\"user\",\"content\":\"opaque result, not lifecycle text\",\"source\":\"background\",\"background_id\":\"a1\",\"background_kind\":\"agent\"${okmember}}"
     cm_(l, original, list.list_size(original), L1_(result), 37, "")
-    if torn == 1 { sysgap.pwrite_all(lg_(l).fd, "{\"background\":", lg_(l).offset) }
+    if torn == 1 { fs.fd_pwrite_all(lg_(l).fd, string.bytes("{\"background\":"), lg_(l).offset) }
     log.close(l)
     before = read_(path)
     h = list.list_new()
@@ -744,7 +744,7 @@ t_pending_restore_() {
     log.background(l, "{\"id\":\"a1\",\"kind\":\"agent\",\"state\":\"started\"}", 1)
     cm_(l, h, 1, L1_(bgm), 17, "")
     cm_(l, h, 0, L2_(msg.system("base"), bgm), 17, "")
-    sysgap.pwrite_all(lg_(l).fd, "{\"model_ms\":", lg_(l).offset)
+    fs.fd_pwrite_all(lg_(l).fd, string.bytes("{\"model_ms\":"), lg_(l).offset)
     log.close(l)
     previous = ""
     k = 0

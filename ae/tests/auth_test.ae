@@ -12,7 +12,6 @@ import std.fs
 import std.json
 import std.list
 import std.string
-import nib.sysgap
 import nib.config.env
 import nib.provider.types
 import nib.auth
@@ -30,9 +29,8 @@ read_(p: string) -> string {
 }
 
 mode_(p: string) -> int {
-    st = sysgap.new_stat()
-    sysgap.stat(p, 1, st)
-    return ((st as *sysgap.Stat).mode) & 4095
+    st, _k, _m = fs.stat(p, 1)
+    return st.mode & 4095
 }
 
 contains_(s: string, part: string) -> int {

@@ -1421,7 +1421,7 @@ add_endpoint(home_path: string, id: string, protocol: string, base_url: string, 
 write_file_(home_path: string, path: string, data: string) -> string {
     mk = fs.mkdir_p(home_path)
     if mk != "" { return "Unexpected" }
-    return atomic_file.replace(path, data, 384, 0, 1, null)
+    return atomic_file.replace(path, data, 384, 0, 1)
 }
 
 // ---- model selection --------------------------------------------------------

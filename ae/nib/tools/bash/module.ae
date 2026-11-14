@@ -19,7 +19,6 @@ import nib.tools.process
 import nib.tools.registry
 import nib.tools.progress
 import nib.tools.jail
-import nib.sysgap
 
 exports(Ctx, Args, Tracker, new_tracker, tick_at, finish_tracker, new_ctx, parse_args, validation_error, timeout_ms_of, check, execute, MAX_OUTPUT,
         DEFAULT_TIMEOUT_MS, child_env)
@@ -131,7 +130,7 @@ check(cp: ptr, command: string) -> string {
 child_env(cp: ptr) -> ptr {
     c = cp as *Ctx
     base = c.env
-    if base == null { base = sysenv_() }
+    if base == null { base = process.environ() }
     env = secrets.remove_from(base)
     if c.strip_env == "" { return env }
     out = list.list_new()
@@ -144,8 +143,6 @@ child_env(cp: ptr) -> ptr {
     }
     return out
 }
-
-sysenv_() -> ptr { return sysgap.environ() }
 
 // Live progress of one command (upstream's Tracker): a snapshot a second
 // once it has run 3 s (a background task's from the start), a terminal one

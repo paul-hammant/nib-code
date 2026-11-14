@@ -9,7 +9,6 @@ import std.string
 import std.sync
 import std.worker
 import std.os
-import nib.sysgap
 import nib.tools.file_state
 import nib.tools.atomic_file
 
@@ -19,13 +18,8 @@ tmp_() -> string {
     return real
 }
 
-stat_(ino: long, size: long, mtime: long) -> ptr {
-    st = sysgap.new_stat()
-    s = st as *sysgap.Stat
-    s.ino = ino
-    s.size = size
-    s.mtime_ns = mtime
-    return st
+stat_(ino: long, size: long, mtime: long) -> fs.Stat {
+    return fs.Stat { kind: 1, mode: 0, nlink: 1, ino: ino, dev: 0, size: size, mtime_ns: mtime }
 }
 
 main() {
@@ -81,8 +75,7 @@ main() {
             spec.assert_str_eq(e1, "", "alias resolves")
             spec.assert_str_eq(e2, "", "target resolves")
             spec.assert_str_eq(canonical, c2, "alias and target share a canonical path")
-            original = sysgap.new_stat()
-            sysgap.stat(target, 1, original)
+            original, _ok, _om = fs.stat(target, 1)
             parent = file_state.new()
             file_state.remember_stat(parent, canonical, original)
             fs.delete(target)
@@ -93,8 +86,7 @@ main() {
             child = file_state.new()
             file_state.import_versions(child, versions)
             fs.write(target, "replacement is longer")
-            recreated = sysgap.new_stat()
-            sysgap.stat(target, 1, recreated)
+            recreated, _rk, _rm = fs.stat(target, 1)
             ca, _a = atomic_file.canonical_path(alias)
             ct, _t = atomic_file.canonical_path(target)
             spec.assert_eq(file_state.changed(child, ca, recreated), 1, "alias sees the change")

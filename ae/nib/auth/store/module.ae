@@ -123,7 +123,7 @@ write_(d: *Doc, file_path: string, force: int) -> string {
         mk = fs.mkdir_p(dir)
         if mk != "" { return "Unexpected" }
     }
-    return atomic_file.replace(file_path, text, 384, force, 1, null)
+    return atomic_file.replace(file_path, text, 384, force, 1)
 }
 
 // Atomic replace; a new file is 0600 and an existing file keeps its mode.

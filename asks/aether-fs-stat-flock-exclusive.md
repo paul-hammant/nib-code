@@ -49,3 +49,5 @@ A `(code, signal)` form would let it. And `os.spawn_proc_to` has no cwd
    `fs.open` handles, but a handle cannot be flocked and an fd from (2) cannot
    be pwritten. Proposed: `fs.fd_pwrite_all(fd, data, offset) -> err` (and
    `fs.fd_fsync(fd)`). Stand-in: `sysgap.pwrite_all`.
+
+**RESOLVED** in Aether 0.915.0 (std.fs stat, locks, O_EXCL and fd ops, std.os.environ; 2026-11-14); the stand-in is removed from the port.

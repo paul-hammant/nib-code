@@ -26,3 +26,5 @@
    Proposed: `io.set_echo(fd, on) -> (changed, err)`: 0 and no error when fd
    is not a terminal; or a general `io.tty_mode(fd, raw|cooked|noecho)` that
    ae/term (the TUI slice) could share (see ae/term/asks/terminal-control.md).
+
+**RESOLVED** in Aether 0.915.0 (std.os.signal_watch, std.io.set_echo; 2026-11-14); the stand-in is removed from the port.

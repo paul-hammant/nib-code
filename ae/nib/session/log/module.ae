@@ -19,8 +19,7 @@
 // `calls`. Not ported: the MCP/skills summary members beyond keeping them in
 // the header.
 //
-// File access is on nib.sysgap (flock, O_EXCL with a mode, pwrite, fsync):
-// a marked stand-in, asks/aether-fs-stat-flock-exclusive.md.
+// File access is std.fs's: flock, O_EXCL with a mode, pwrite, fsync.
 
 import std.json
 import std.list
@@ -31,7 +30,8 @@ import std.time
 import nib.jsonx
 import nib.lock
 import nib.msg
-import nib.sysgap
+import std.io
+import nib.fserr
 import nib.provider.types
 
 exports(Log, Replayed, Summary, create, restore, close, commit, event, background, replay, list_sessions,
@@ -106,13 +106,14 @@ new_log_(fd: int, offset: long) -> ptr {
 
 // A new log at `path` (must not exist). (log, "") or (null, error name).
 create(path: string) -> (ptr, string) {
-    fd = sysgap.create_excl(path, 384)
-    if fd < 0 { return null, sysgap.errname(fd) }
-    sysgap.close(fd)
-    lfd = sysgap.lock_open(path)
-    if lfd < 0 { return null, sysgap.errname(lfd) }
-    if sysgap.try_lock(lfd) != 1 {
-        sysgap.close(lfd)
+    fd, ck, _cm = fs.create_exclusive(path, 384)
+    if fd < 0 { return null, fserr.errname(ck) }
+    io.fd_close(fd)
+    lfd, lk, _lm = fs.lock_open(path)
+    if lfd < 0 { return null, fserr.errname(lk) }
+    got, _tk, _tm = fs.try_lock(lfd, 1)
+    if got != 1 {
+        io.fd_close(lfd)
         return null, "SessionBusy"
     }
     return new_log_(lfd, 0 as long), ""
@@ -122,24 +123,25 @@ create(path: string) -> (ptr, string) {
 // texts). expected_parent: "" to skip the check. (log, "") or (null, error).
 restore(path: string, history: ptr, expected_parent: string, check_parent: int) -> (ptr, string) {
     if fs.exists(path) == 0 { return null, "FileNotFound" }
-    lfd = sysgap.lock_open(path)
-    if lfd < 0 { return null, sysgap.errname(lfd) }
-    if sysgap.try_lock(lfd) != 1 {
-        sysgap.close(lfd)
+    lfd, lk, _lm = fs.lock_open(path)
+    if lfd < 0 { return null, fserr.errname(lk) }
+    got, _tk, _tm = fs.try_lock(lfd, 1)
+    if got != 1 {
+        io.fd_close(lfd)
         return null, "SessionBusy"
     }
     data, rerr = fs.read(path)
     if rerr != "" {
-        sysgap.close(lfd)
+        io.fd_close(lfd)
         return null, "ReadFailed"
     }
     r = replay(data, history) as *Replayed
     if r.err != "" {
-        sysgap.close(lfd)
+        io.fd_close(lfd)
         return null, r.err
     }
     if check_parent == 1 && expected_parent != r.parent_session_id {
-        sysgap.close(lfd)
+        io.fd_close(lfd)
         return null, "AgentSessionParentMismatch"
     }
     l = new_log_(lfd, string.length(data) as long) as *Log
@@ -169,13 +171,13 @@ restore(path: string, history: ptr, expected_parent: string, check_parent: int) 
         if e2 != "" { return null, e2 }
         i = i + 1
     }
-    if r.needs_repair == 1 || list.list_size(r.background_repairs) > 0 { sysgap.fsync(l.fd) }
+    if r.needs_repair == 1 || list.list_size(r.background_repairs) > 0 { fs.fd_fsync(l.fd) }
     return l as ptr, ""
 }
 
 close(lp: ptr) {
     l = lp as *Log
-    if l.fd >= 0 { sysgap.close(l.fd) }
+    if l.fd >= 0 { io.fd_close(l.fd) }
     l.fd = -1
 }
 
@@ -189,8 +191,8 @@ record_(members: string, from: int, messages: string, tokens: long, repair: int)
 append_raw_(lp: ptr, line: string) -> string {
     l = lp as *Log
     if l.poisoned == 1 { return "SessionLogFailed" }
-    rc = sysgap.pwrite_all(l.fd, line, l.offset)
-    if rc != 0 {
+    _n, wk, _wm = fs.fd_pwrite_all(l.fd, string.bytes(line), l.offset)
+    if wk != fs.KIND_OK {
         l.poisoned = 1
         return "SessionLogFailed"
     }
@@ -206,7 +208,8 @@ append_(lp: ptr, members: string, repair: int) -> string {
 
 sync_(lp: ptr) -> string {
     l = lp as *Log
-    if sysgap.fsync(l.fd) != 0 {
+    _y, yk, _ym = fs.fd_fsync(l.fd)
+    if yk != fs.KIND_OK {
         l.poisoned = 1
         return "SessionLogFailed"
     }
@@ -781,12 +784,11 @@ list_sessions(directory: string, cwd: string) -> ptr {
         }
         string.string_array_free(lines)
         if matched == 0 { continue }
-        st = sysgap.new_stat()
-        sysgap.stat(path, 1, st)
+        st, _sk, _sm = fs.stat(path, 1)
         s = heap.new(Summary)
         s.id = string.substring(name, 0, string.length(name) - 6)
         s.path = path
-        s.modified_ns = (st as *sysgap.Stat).mtime_ns
+        s.modified_ns = st.mtime_ns
         s.preview = preview
         list.list_add(found, s as ptr)
     }

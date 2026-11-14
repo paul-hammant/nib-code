@@ -25,7 +25,7 @@
 //    sanitize() returns (*Draft, ok).
 //  - append/append_text return "" or an error text instead of an error set;
 //    the file is created with mode 0600 and appended under an exclusive
-//    flock (sysgap), several nib processes sharing it as upstream.
+//    flock (std.fs), several nib processes sharing it as upstream.
 //  - gh runs through a replaceable runner: a closure
 //    `|argv: ptr, input: string, out: ptr| -> int` that fills the *Output
 //    box `out` (ok, out, err); argv is a list of strings, program first.
@@ -56,7 +56,8 @@ import std.sync
 import std.worker
 import std.cryptography
 import nib.jsonx
-import nib.sysgap
+import std.io
+import nib.fserr
 import nib.tools.process
 
 exports(TEMPLATE, MAX_DRAFTS, Draft, Entry, Output, Issues, prompt, append, append_text, drafts,
@@ -143,21 +144,24 @@ append_text(path: string, text: string) -> string {
     if dir != "" {
         _m = fs.mkdir_p(dir)
     }
-    fd = sysgap.lock_open(path)
-    if fd < 0 { return sysgap.errname(fd) }
+    fd, ok, _om = fs.lock_open(path)
+    if fd < 0 { return fserr.errname(ok) }
     while true {
-        got = sysgap.try_lock(fd)
+        got, lk, _lm = fs.try_lock(fd, 1)
         if got == 1 { break }
-        if got < 0 {
-            sysgap.close(fd)
-            return sysgap.errname(got)
+        if lk != fs.KIND_OK {
+            failed = fserr.errname(lk)
+            io.fd_close(fd)
+            return failed
         }
         sleep(20)
     }
-    rc = sysgap.pwrite_all(fd, text, sysgap.fd_size(fd))
-    sysgap.close(fd)
-    if rc != 0 { return sysgap.errname(rc) }
-    return ""
+    size, _sk, _sm = fs.fd_size(fd)
+    _n, wk, _wm = fs.fd_pwrite_all(fd, string.bytes(text), size)
+    failed = ""
+    if wk != fs.KIND_OK { failed = fserr.errname(wk) }
+    io.fd_close(fd)
+    return failed
 }
 
 struct Draft {

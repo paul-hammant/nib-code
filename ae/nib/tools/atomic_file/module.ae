@@ -12,9 +12,10 @@ import std.os hiding (exec, run_capture, run_pipe, run_pipe_drain_and_wait, run_
 import std.string
 import std.list
 import std.cryptography
-import nib.sysgap
+import std.io
+import nib.fserr
 
-exports(canonical_path, replace, dirname, basename, join, cwd_path)
+exports(canonical_path, replace, replace_stat, dirname, basename, join, cwd_path)
 
 const MAX_LINKS = 40
 
@@ -72,7 +73,6 @@ canonical_path(path: string) -> (string, string) {
         resolved = cwd_path()
     }
     links = 0
-    st = sysgap.new_stat()
     // Process pending's components; a symlink restarts with its target + rest.
     comps = components_(pending)
     idx = 0
@@ -88,18 +88,18 @@ canonical_path(path: string) -> (string, string) {
             continue
         }
         candidate = join(resolved, name)
-        rc = sysgap.stat(candidate, 0, st)
-        if rc != 0 {
-            if sysgap.errname(rc) == "FileNotFound" {
+        st, sk, _sm = fs.stat(candidate, 0)
+        if sk != fs.KIND_OK {
+            name_err = fserr.errname(sk)
+            if name_err == "FileNotFound" {
                 resolved = candidate
                 continue
             }
-            if sysgap.errname(rc) == "NotDir" { return "", "NotDir" }
-            return "", sysgap.errname(rc)
+            return "", name_err
         }
-        if (st as *sysgap.Stat).kind != sysgap.KIND_LINK {
+        if st.kind != fs.STAT_KIND_SYMLINK {
             if is_last == 0 {
-                if (st as *sysgap.Stat).kind != sysgap.KIND_DIR { return "", "NotDir" }
+                if st.kind != fs.STAT_KIND_DIR { return "", "NotDir" }
             }
             resolved = candidate
             continue
@@ -126,9 +126,9 @@ canonical_path(path: string) -> (string, string) {
     // A trailing "/", "." or ".." requires a directory.
     last = basename(pending)
     if string.ends_with(pending, "/") == 1 || last == "." || last == ".." {
-        rc2 = sysgap.stat(resolved, 1, st)
-        if rc2 != 0 { return "", sysgap.errname(rc2) }
-        if (st as *sysgap.Stat).kind != sysgap.KIND_DIR { return "", "NotDir" }
+        rst, rk, _rm = fs.stat(resolved, 1)
+        if rk != fs.KIND_OK { return "", fserr.errname(rk) }
+        if rst.kind != fs.STAT_KIND_DIR { return "", "NotDir" }
     }
     return resolved, ""
 }
@@ -138,28 +138,35 @@ random_name_() -> string {
     return ".nib-${hex}"
 }
 
+none_() -> fs.Stat {
+    return fs.Stat { kind: 0, mode: 0, nlink: 0, ino: 0, dev: 0, size: 0, mtime_ns: 0 }
+}
+
 // Writes data to a fresh .nib-* file beside the canonical target and renames
 // it over the target. An existing target keeps its permission bits unless
-// force_mode; a new one gets `mode` (subject to umask). Fills out (*sysgap.Stat)
-// with the written file. "" or the error name.
-replace(path: string, data: string, mode: int, force_mode: int, sync: int, out: ptr) -> string {
+// force_mode; a new one gets `mode` (subject to umask). "" or the error name.
+replace(path: string, data: string, mode: int, force_mode: int, sync: int) -> string {
+    _st, err = replace_stat(path, data, mode, force_mode, sync)
+    return err
+}
+
+// replace, returning the written file's Stat (a zeroed one with an error).
+replace_stat(path: string, data: string, mode: int, force_mode: int, sync: int) -> (fs.Stat, string) {
     target, err = canonical_path(path)
-    if err != "" { return err }
+    if err != "" { return none_(), err }
     dir = dirname(target)
-    st = sysgap.new_stat()
-    drc = sysgap.stat(dir, 1, st)
-    if drc != 0 { return sysgap.errname(drc) }
-    if (st as *sysgap.Stat).kind != sysgap.KIND_DIR { return "NotDir" }
+    dst, dk, _dm = fs.stat(dir, 1)
+    if dk != fs.KIND_OK { return none_(), fserr.errname(dk) }
+    if dst.kind != fs.STAT_KIND_DIR { return none_(), "NotDir" }
     existing = 0
     existing_mode = 0
-    rc = sysgap.stat(target, 1, st)
-    if rc == 0 {
-        k = (st as *sysgap.Stat).kind
-        if k != sysgap.KIND_FILE && k != sysgap.KIND_DIR { return "NotFile" }
+    tst, tk, _tm = fs.stat(target, 1)
+    if tk == fs.KIND_OK {
+        if tst.kind != fs.STAT_KIND_FILE && tst.kind != fs.STAT_KIND_DIR { return none_(), "NotFile" }
         existing = 1
-        existing_mode = (st as *sysgap.Stat).mode
-    } else if sysgap.errname(rc) != "FileNotFound" {
-        return sysgap.errname(rc)
+        existing_mode = tst.mode
+    } else if tk != fs.KIND_NOT_FOUND {
+        return none_(), fserr.errname(tk)
     }
     create_mode = mode
     if existing == 1 { create_mode = 384 }
@@ -168,26 +175,30 @@ replace(path: string, data: string, mode: int, force_mode: int, sync: int, out: 
     tries = 0
     while tries < 16 {
         name = join(dir, random_name_())
-        fd = sysgap.create_excl(name, create_mode)
+        cfd, ck, _cm = fs.create_exclusive(name, create_mode)
+        fd = cfd
         if fd >= 0 { break }
-        if sysgap.errname(fd) != "PathAlreadyExists" { return sysgap.errname(fd) }
+        if ck != fs.KIND_EXISTS { return none_(), fserr.errname(ck) }
         tries = tries + 1
     }
-    if fd < 0 { return "PathAlreadyExists" }
-    wrc = sysgap.write_all(fd, data)
-    if wrc == 0 && existing == 1 && force_mode == 0 { wrc = sysgap.fchmod(fd, existing_mode) }
-    if wrc == 0 && force_mode == 1 { wrc = sysgap.fchmod(fd, mode) }
-    if wrc == 0 && sync == 1 { wrc = sysgap.fsync(fd) }
-    sysgap.close(fd)
-    if wrc != 0 {
-        sysgap.unlink(name)
-        return sysgap.errname(wrc)
+    if fd < 0 { return none_(), "PathAlreadyExists" }
+    _w, wk, _wm = fs.fd_pwrite_all(fd, string.bytes(data), 0 as long)
+    if wk == fs.KIND_OK && existing == 1 && force_mode == 0 { _f, wk, _fm = fs.fchmod(fd, existing_mode) }
+    if wk == fs.KIND_OK && force_mode == 1 { _f2, wk, _fm2 = fs.fchmod(fd, mode) }
+    if wk == fs.KIND_OK && sync == 1 { _y, wk, _ym = fs.fd_fsync(fd) }
+    failed = ""
+    if wk != fs.KIND_OK { failed = fserr.errname(wk) }
+    io.fd_close(fd)
+    if failed != "" {
+        fs.unlink(name)
+        return none_(), failed
     }
-    if out != null { sysgap.stat(name, 1, out) }
-    rrc = sysgap.rename(name, target)
-    if rrc != 0 {
-        sysgap.unlink(name)
-        return sysgap.errname(rrc)
+    written, _ok, _om = fs.stat(name, 1)
+    _mv, mk, _mm = fs.move(name, target)
+    if mk != fs.KIND_OK {
+        failed = fserr.errname(mk)
+        fs.unlink(name)
+        return none_(), failed
     }
-    return ""
+    return written, ""
 }

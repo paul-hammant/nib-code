@@ -4,11 +4,11 @@
 # imports of every module (ae/main.ae and each ae/nib module; an unpinned one
 # fails), so widening one is a reviewed change here, and checks the rules a
 # single import list cannot: who may start a process, who may embed QuickJS,
-# who may use the marked stand-ins, who reaches the network, and that the
+# who may use the marked stand-in, who reaches the network, and that the
 # sandbox's host functions keep their `hide` veto line. Who may start a
 # program is the compiler's (`import std.os hiding (...)`); this checks the
-# hiding lists. The TUI's three exceptions (tui/open's launch, tui/reflect's
-# flock, auth/models' GET) are each named with what they may do and why.
+# hiding lists. The TUI's two exceptions (tui/open's launch,
+# auth/models' GET) are each named with what they may do and why.
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
@@ -32,10 +32,11 @@ expect_imports() {   # expect_imports FILE "a|b|..."
 T=ae/nib/tools
 expect_imports ae/nib/jsonx/module.ae "std.json|std.strbuilder|std.string"
 expect_imports ae/nib/lock/module.ae "std.sync"
-expect_imports ae/nib/sysgap/module.ae "std.list|std.string"
+expect_imports ae/nib/fserr/module.ae "std.fs"
+expect_imports ae/nib/sysenv/module.ae "std.list|std.os|std.string"
 expect_imports ae/nib/sandbox/module.ae "contrib.quickjs|nib.jsonx|nib.qjsgap|nib.sandbox.console|nib.sandbox.record|nib.sandbox.timing|std.intarr|std.list|std.os|std.strbuilder|std.string|std.sync|std.worker"
-# The calls sidecar (record) writes one file through the stand-in; replay runs the sandbox with no tools.
-expect_imports ae/nib/sandbox/record/module.ae "nib.jsonx|nib.lock|nib.sysgap|std.cryptography|std.fs|std.io|std.list|std.map|std.os|std.strbuilder|std.string"
+# The calls sidecar (record) writes one file under its own flock; replay runs the sandbox with no tools.
+expect_imports ae/nib/sandbox/record/module.ae "nib.jsonx|nib.lock|std.cryptography|std.fs|std.io|std.list|std.map|std.os|std.strbuilder|std.string"
 expect_imports ae/nib/sandbox/replay/module.ae "nib.jsonx|nib.sandbox|std.intarr|std.json|std.list|std.string|std.sync"
 expect_imports ae/nib/sandbox/console/module.ae "std.list|std.strbuilder|std.string"
 expect_imports ae/nib/sandbox/timing/module.ae "nib.jsonx|std.list|std.os|std.string"
@@ -49,19 +50,19 @@ expect_imports $T/registry/module.ae "nib.jsonx|nib.lock|std.list|std.os|std.str
 expect_imports $T/progress/module.ae "nib.jsonx|nib.lock|std.list|std.os|std.string"
 expect_imports $T/background/module.ae "nib.jsonx|nib.lock|std.list|std.string|std.sync|std.worker"
 # File system, no process.
-expect_imports $T/atomic_file/module.ae "nib.sysgap|std.cryptography|std.fs|std.list|std.os|std.string"
-expect_imports $T/file_state/module.ae "nib.lock|nib.sysgap|std.cryptography|std.fs|std.list|std.map|std.string|std.sync"
-expect_imports $T/files/module.ae "nib.jsonx|nib.sysgap|nib.tools.atomic_file|nib.tools.file_state|nib.tools.jail|nib.tools.undo|std.fs|std.list|std.strbuilder|std.string|std.sync"
-expect_imports $T/undo/module.ae "nib.jsonx|nib.sysgap|nib.tools.atomic_file|nib.tools.file_state|nib.tools.registry|std.cryptography|std.dir|std.fs|std.list|std.string|std.strbuilder|std.sync"
+expect_imports $T/atomic_file/module.ae "nib.fserr|std.cryptography|std.fs|std.io|std.list|std.os|std.string"
+expect_imports $T/file_state/module.ae "nib.fserr|nib.lock|std.cryptography|std.fs|std.io|std.list|std.map|std.string|std.sync"
+expect_imports $T/files/module.ae "nib.fserr|nib.jsonx|nib.tools.atomic_file|nib.tools.file_state|nib.tools.jail|nib.tools.undo|std.fs|std.list|std.strbuilder|std.string|std.sync"
+expect_imports $T/undo/module.ae "nib.fserr|nib.jsonx|nib.tools.atomic_file|nib.tools.file_state|nib.tools.registry|std.cryptography|std.dir|std.fs|std.list|std.string|std.strbuilder|std.sync"
 expect_imports $T/walk/module.ae "std.dir|std.fs|std.list|std.strbuilder|std.string|std.sync"
 expect_imports $T/grep/module.ae "contrib.quickjs|nib.tools.walk|std.fs|std.list|std.strbuilder|std.string|std.sync"
 expect_imports $T/search/module.ae "nib.jsonx|nib.tools.grep|nib.tools.walk|std.json|std.list|std.strbuilder|std.string"
 # Processes.
-expect_imports $T/process/module.ae "nib.sysgap|std.cryptography|std.fs|std.io|std.ipc|std.list|std.os|std.string|std.sync|std.worker"
-expect_imports $T/bash/module.ae "nib.jsonx|nib.sysgap|nib.tools.jail|nib.tools.policy|nib.tools.process|nib.tools.progress|nib.tools.registry|nib.tools.secrets|std.list|std.os|std.string|std.sync"
+expect_imports $T/process/module.ae "nib.sysenv|std.cryptography|std.fs|std.io|std.ipc|std.list|std.os|std.string|std.sync|std.worker"
+expect_imports $T/bash/module.ae "nib.jsonx|nib.tools.jail|nib.tools.policy|nib.tools.process|nib.tools.progress|nib.tools.registry|nib.tools.secrets|std.list|std.os|std.string|std.sync"
 # Images: file system only (store, read, hash, base64), no network or process.
-expect_imports ae/nib/image/module.ae "nib.jsonx|nib.lock|nib.sysgap|nib.tools.atomic_file|std.bytes|std.cryptography|std.encoding|std.fs|std.list|std.strbuilder|std.string"
-expect_imports $T/view/module.ae "nib.image|nib.jsonx|nib.sysgap|nib.tools.atomic_file|std.fs|std.list|std.string"
+expect_imports ae/nib/image/module.ae "nib.fserr|nib.jsonx|nib.lock|nib.tools.atomic_file|std.bytes|std.cryptography|std.encoding|std.fs|std.list|std.strbuilder|std.string"
+expect_imports $T/view/module.ae "nib.fserr|nib.image|nib.jsonx|nib.tools.atomic_file|std.fs|std.list|std.string"
 expect_imports $T/jail/module.ae "nib.tools.atomic_file|std.fs|std.list|std.os|std.string"
 expect_imports $T/agent_sessions/module.ae "nib.lock|std.list|std.string"
 expect_imports $T/agent_input/module.ae "nib.jsonx|nib.provider.types|std.json|std.list|std.strbuilder|std.string"
@@ -78,7 +79,7 @@ expect_imports $T/module.ae "nib.image|nib.jsonx|nib.lock|nib.provider.types|nib
 # The Session + provider slice.
 expect_imports ae/nib/auth/module.ae "nib.auth.store|nib.config|nib.config.env|nib.provider.types|std.list|std.string"
 expect_imports ae/nib/auth/store/module.ae "nib.jsonx|nib.tools.atomic_file|std.fs|std.json|std.string"
-expect_imports ae/nib/config/env/module.ae "nib.sysgap|std.list|std.string"
+expect_imports ae/nib/config/env/module.ae "nib.sysenv|std.list|std.string"
 expect_imports ae/nib/config/module.ae "nib.auth.store|nib.config.env|nib.jsonx|nib.provider.types|nib.tools.atomic_file|std.fs|std.list|std.string"
 expect_imports ae/nib/msg/module.ae "nib.jsonx|nib.provider.types|std.json|std.list|std.string"
 expect_imports ae/nib/provider/anthropic/module.ae "nib.image|nib.jsonx|nib.msg|nib.provider.http|nib.provider.sink|nib.provider.sse|nib.provider.types|std.json|std.list|std.strbuilder|std.string"
@@ -92,7 +93,7 @@ expect_imports ae/nib/provider/sse/module.ae "nib.provider.http|std.string"
 expect_imports ae/nib/provider/types/module.ae "nib.jsonx|std.list|std.string"
 expect_imports ae/nib/session/compact/module.ae "nib.image|nib.jsonx|nib.msg|nib.provider.types|std.json|std.list|std.string"
 expect_imports ae/nib/session/instructions/module.ae "std.fs|std.strbuilder|std.string"
-expect_imports ae/nib/session/log/module.ae "nib.jsonx|nib.lock|nib.msg|nib.provider.types|nib.sysgap|std.dir|std.fs|std.json|std.list|std.string|std.time"
+expect_imports ae/nib/session/log/module.ae "nib.fserr|nib.jsonx|nib.lock|nib.msg|nib.provider.types|std.dir|std.fs|std.io|std.json|std.list|std.string|std.time"
 expect_imports ae/nib/session/module.ae "nib.build_info|nib.image|nib.jsonx|nib.lock|nib.mcp|nib.msg|nib.provider|nib.provider.timing as modeltiming|nib.provider.sink|nib.provider.types|nib.sandbox|nib.sandbox.record|nib.sandbox.timing|nib.session.compact|nib.session.fork_history|nib.session.hooks|nib.session.instructions|nib.session.log|nib.session.output|nib.session.profile|nib.session.prompt|nib.session.skills|nib.session.tool_summary|nib.tools|nib.tools.agent_input|nib.tools.agent_sessions|nib.tools.atomic_file|nib.tools.background|nib.tools.diff|nib.tools.progress|std.cryptography|std.fs|std.json|std.list|std.os|std.string|std.sync|std.worker"
 # `nib replay`: reads the two Session files, replays through nib.sandbox.replay; no tools, no provider.
 expect_imports ae/nib/run_replay/module.ae "nib.jsonx|nib.sandbox|nib.sandbox.replay|nib.session.output|std.fs|std.json|std.list|std.map|std.strbuilder|std.string"
@@ -112,7 +113,7 @@ expect_imports $T/mcp_tool/module.ae "nib.image|nib.jsonx|nib.mcp|std.encoding|s
 # The TUI (ae/term underneath; no network, no process of its own except the
 # exceptions named in the rules below).
 U=ae/nib/tui
-expect_imports ae/main.ae "nib.auth|nib.config|nib.config.env|nib.jsonx|nib.provider.types|nib.run_replay|nib.sandbox|nib.session|nib.sysgap|nib.tools|nib.tools.agent_input|nib.tools.background|nib.tools.jail|nib.tui|nib.tui.clock|nib.tui.live|std.fs|std.io|std.list|std.os|std.string|std.sync|std.worker|term|term.input"
+expect_imports ae/main.ae "nib.auth|nib.config|nib.config.env|nib.jsonx|nib.provider.types|nib.run_replay|nib.sandbox|nib.session|nib.tools|nib.tools.agent_input|nib.tools.background|nib.tools.jail|nib.tui|nib.tui.clock|nib.tui.live|std.fs|std.io|std.list|std.os|std.signal|std.string|std.sync|std.worker|term|term.input"
 expect_imports ae/nib/qjsgap/module.ae ""
 # `/model`'s listing (src/auth/models.zig): one GET of the provider's /models.
 expect_imports ae/nib/auth/models/module.ae "nib.jsonx|std.http.client|std.json|std.list|std.string|std.time"
@@ -156,7 +157,7 @@ expect_imports $U/prediction/module.ae "nib.msg|nib.tui.editor|std.list|std.strb
 expect_imports $U/provider_flow/module.ae "nib.auth.models|nib.config|std.list|std.strbuilder|std.string|std.sync|std.worker"
 # Processes through tools/process: pbcopy/xclip and friends (clipboard), gh (reflect).
 expect_imports $U/clipboard/module.ae "nib.image|nib.tools.process|std.list|std.string"
-expect_imports $U/reflect/module.ae "nib.jsonx|nib.sysgap|nib.tools.process|std.cryptography|std.fs|std.json|std.list|std.os|std.strbuilder|std.string|std.sync|std.worker"
+expect_imports $U/reflect/module.ae "nib.fserr|nib.jsonx|nib.tools.process|std.cryptography|std.fs|std.io|std.json|std.list|std.os|std.strbuilder|std.string|std.sync|std.worker"
 # A clicked path's `open` command, detached (see the exception below).
 expect_imports $U/open/module.ae "std.fs|std.list|std.map|std.os|std.strbuilder|std.string|std.worker"
 
@@ -226,12 +227,6 @@ only_calls() {   # only_calls FILE MODULE "allowed members|..." "why"
 }
 rule "QuickJS is embedded only by the sandbox and grep's private matcher" \
     '^import contrib\.quickjs' "ae/nib/sandbox/module.ae|$T/grep/"
-# - tui/reflect appends to $NIB_HOME/reflections.md under an exclusive flock,
-#   as upstream reflect.zig does (two TUIs may reflect at once); std.fs has no
-#   flock or positional write yet (asks/aether-fs-stat-flock-exclusive.md).
-rule "the file stand-in is used only by the file, undo, process and view tools, the image store, the Session log, the calls recorder, the environment, main (signals, echo) and reflect's locked append" \
-    '^import nib\.sysgap' "$T/atomic_file/|$T/file_state/|$T/files/|$T/undo/|$T/process/|$T/bash/|$T/view/|ae/nib/image/|ae/nib/session/log/|ae/nib/sandbox/record/|ae/nib/config/env/|ae/main.ae|$U/reflect/"
-only_calls $U/reflect/module.ae sysgap "lock_open|try_lock|fd_size|pwrite_all|close|errname" "the locked append"
 rule "the QuickJS stand-in is used only by the sandbox" \
     '^import nib\.qjsgap' "ae/nib/sandbox/module.ae"
 # - auth/models lists the provider's models for `/model` (upstream

@@ -16,7 +16,6 @@ import std.spec
 import std.fs
 import std.list
 import std.string
-import nib.sysgap
 import nib.config
 import nib.config.env
 import nib.provider.types
@@ -94,9 +93,8 @@ limit_(l: *types.Limits, i: int) -> int {
 }
 
 mode_(p: string) -> int {
-    st = sysgap.new_stat()
-    sysgap.stat(p, 1, st)
-    return ((st as *sysgap.Stat).mode) & 4095
+    st, _k, _m = fs.stat(p, 1)
+    return st.mode & 4095
 }
 
 env_home_(d: string) -> ptr {
@@ -429,9 +427,8 @@ main() {
             fs.symlink("settings.toml", "${d}/config.toml")
             fs.chmod("${d}/settings.toml", 416)
             spec.assert_str_eq(config.save_effort(d, "high"), "", "saved")
-            st = sysgap.new_stat()
-            sysgap.stat("${d}/config.toml", 0, st)
-            spec.assert_eq((st as *sysgap.Stat).kind, sysgap.KIND_LINK, "still a symlink")
+            st, _sk, _sm = fs.stat("${d}/config.toml", 0)
+            spec.assert_eq(st.kind, fs.STAT_KIND_SYMLINK, "still a symlink")
             spec.assert_eq(mode_("${d}/settings.toml"), 416, "mode 0640 kept")
             spec.assert_str_eq(read_("${d}/settings.toml"), "effort = \"high\"\n", "target rewritten")
             l, _e = fs.list_dir(d)

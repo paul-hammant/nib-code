@@ -11,7 +11,8 @@ import std.fs
 import std.cryptography
 import std.sync
 import nib.lock
-import nib.sysgap
+import std.io
+import nib.fserr
 
 exports(State, Version, new, remember, remember_stat, changed, export_versions, import_versions,
         version_of, count, lock_path, lock, unlock)
@@ -36,8 +37,7 @@ new() -> ptr {
     return s as ptr
 }
 
-version_of(stp: ptr) -> ptr {
-    st = stp as *sysgap.Stat
+version_of(st: fs.Stat) -> ptr {
     v = heap.new(Version)
     v.ino = st.ino
     v.size = st.size
@@ -57,19 +57,17 @@ remember(sp: ptr, path: string, v: @keep ptr) {
     lock.release(s.guard)
 }
 
-// remember from a *sysgap.Stat
-remember_stat(sp: ptr, path: string, stp: ptr) { remember(sp, path, version_of(stp)) }
+remember_stat(sp: ptr, path: string, st: fs.Stat) { remember(sp, path, version_of(st)) }
 
 count(sp: ptr) -> int { return list.list_size((sp as *State).keys) }
 
-// 1 if path was observed and its version differs from stp's.
-changed(sp: ptr, path: string, stp: ptr) -> int {
+// 1 if path was observed and its version differs from st's.
+changed(sp: ptr, path: string, st: fs.Stat) -> int {
     s = sp as *State
     lock.acquire(s.guard)
     r = 0
     if map.map_has(s.seen, path) == 1 {
         b = map.map_get_raw(s.seen, path) as *Version
-        st = stp as *sysgap.Stat
         if b.ino != st.ino || b.size != st.size || b.mtime_ns != st.mtime_ns { r = 1 }
     }
     lock.release(s.guard)
@@ -127,30 +125,31 @@ lock_path(nib_home: string, path: string) -> string {
 lock(nib_home: string, path: string, cancel: ptr) -> (int, string) {
     if canceled_(cancel) == 1 { return -1, "Canceled" }
     _m = fs.mkdir_p("${nib_home}/locks")
-    fd = sysgap.lock_open(lock_path(nib_home, path))
-    if fd < 0 { return -1, sysgap.errname(fd) }
+    fd, ok, _om = fs.lock_open(lock_path(nib_home, path))
+    if ok != fs.KIND_OK { return -1, fserr.errname(ok) }
     while true {
         if canceled_(cancel) == 1 {
-            sysgap.close(fd)
+            io.fd_close(fd)
             return -1, "Canceled"
         }
-        got = sysgap.try_lock(fd)
+        got, lk, _lm = fs.try_lock(fd, 1)
         if got == 1 { break }
-        if got < 0 {
-            sysgap.close(fd)
-            return -1, sysgap.errname(got)
+        if lk != fs.KIND_OK {
+            failed = fserr.errname(lk)
+            io.fd_close(fd)
+            return -1, failed
         }
         sleep(20)
     }
     if canceled_(cancel) == 1 {
-        sysgap.close(fd)
+        io.fd_close(fd)
         return -1, "Canceled"
     }
     // Lock files stay linked: unlinking lets waiters lock different inodes.
     return fd, ""
 }
 
-unlock(fd: int) { if fd >= 0 { sysgap.close(fd) } }
+unlock(fd: int) { if fd >= 0 { io.fd_close(fd) } }
 
 canceled_(cancel: ptr) -> int {
     if cancel == null { return 0 }

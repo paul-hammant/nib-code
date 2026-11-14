@@ -23,7 +23,7 @@ import std.cryptography
 import std.encoding
 import nib.jsonx
 import nib.lock
-import nib.sysgap
+import nib.fserr
 import nib.tools.atomic_file
 
 exports(MAX_BYTES, MAX_PER_RUN, ESTIMATED_TOKENS, probe, probe_json, media_type, extension, store, rejection, image_json,
@@ -217,22 +217,22 @@ store(dir: string, name: string, data: string) -> (string, string) {
     if herr != "" { return "", "Unexpected" }
     file = "${string.substring(hex, 0, 32)}.${extension(fmt)}"
     path = atomic_file.join(dir, file)
-    mrc = sysgap.mkdir(dir, 448)
-    if mrc != 0 {
-        e = sysgap.errname(mrc)
-        if e == "FileNotFound" {
+    mkerr = fs.create_dir_with_mode(dir, 448)
+    if mkerr != "" {
+        _d, dk, _dm = fs.stat(dir, 1)
+        if dk == fs.KIND_NOT_FOUND {
             merr = fs.mkdir_p(dir)
             if string.length(merr) > 0 { return "", "AccessDenied" }
-            sysgap.chmod(dir, 448)
-        } else if e != "PathAlreadyExists" {
-            return "", e
+            fs.chmod(dir, 448)
+        } else if dk != fs.KIND_OK {
+            return "", fserr.errname(dk)
         }
     }
-    st = sysgap.new_stat()
+    st, sk, _sm = fs.stat(path, 1)
     present = 0
-    if sysgap.stat(path, 1, st) == 0 && (st as *sysgap.Stat).size == (n as long) { present = 1 }
+    if sk == fs.KIND_OK && st.size == (n as long) { present = 1 }
     if present == 0 {
-        werr = atomic_file.replace(path, data, 384, 0, 0, null)
+        werr = atomic_file.replace(path, data, 384, 0, 0)
         if werr != "" { return "", werr }
     }
     return image_json(path, name, media_type(fmt), n as long, w, h), ""
@@ -295,9 +295,9 @@ part_at(images: string, i: int, vision: int) -> (int, string, string) {
     name = name_of(image)
     gone = "[image ${name} unavailable: file is gone]"
     path = field_str_(image, "path")
-    st = sysgap.new_stat()
-    if sysgap.stat(path, 1, st) != 0 { return 0, gone, "" }
-    if (st as *sysgap.Stat).size > (MAX_BYTES as long) { return 0, gone, "" }
+    st, sk, _sm = fs.stat(path, 1)
+    if sk != fs.KIND_OK { return 0, gone, "" }
+    if st.size > (MAX_BYTES as long) { return 0, gone, "" }
     data, n, rerr = fs.read_binary(path)
     if string.length(rerr) > 0 { return 0, gone, "" }
     if n == 0 { return 1, field_str_(image, "media_type"), "" }
@@ -466,10 +466,9 @@ pasted_path(pasted: string) -> string {
 // regular file (symlinks followed), or ("", "ImageTooLarge") past MAX_BYTES,
 // which is checked before reading.
 read_pasted(path: string) -> (string, string) {
-    st = sysgap.new_stat()
-    if sysgap.stat(path, 1, st) != 0 { return "", "NotFile" }
-    info = st as *sysgap.Stat
-    if info.kind != sysgap.KIND_FILE { return "", "NotFile" }
+    info, sk, _sm = fs.stat(path, 1)
+    if sk != fs.KIND_OK { return "", "NotFile" }
+    if info.kind != fs.STAT_KIND_FILE { return "", "NotFile" }
     if info.size > (MAX_BYTES as long) { return "", "ImageTooLarge" }
     data, _n, rerr = fs.read_binary(path)
     if string.length(rerr) > 0 { return "", "NotFile" }

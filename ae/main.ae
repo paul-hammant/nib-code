@@ -18,8 +18,8 @@ import std.fs
 import std.io
 import std.sync
 import std.worker
+import std.signal
 import nib.jsonx
-import nib.sysgap
 import nib.sandbox
 import nib.tools
 import nib.tools.jail
@@ -228,11 +228,16 @@ help_(envp: ptr) {
 line_reader_(secret: int) -> fn {
     return |prompt: string| {
         io.fd_write(1, string.bytes(prompt))
-        changed = 0
-        if secret == 1 { changed = sysgap.stdin_echo(0) }
+        masked = false
+        echo_was_on = false
+        if secret == 1 {
+            was, merr = io.set_echo(0, false)
+            echo_was_on = was
+            masked = merr == "" && io.is_terminal(0)
+        }
         line, eof, err = io.fd_read_line_status(0)
-        if changed == 1 {
-            sysgap.stdin_echo(1)
+        if masked {
+            io.set_echo(0, echo_was_on)
             io.fd_write(1, string.bytes("\n"))
         }
         if err != "" || (eof == true && string.length(line) == 0) { return auth.EOF_LINE }
@@ -413,14 +418,20 @@ main() {
     if a.agent_input == 0 && prompt_text == "-" { prompt_text = read_stdin_() }
     if a.json == 1 { jline_("{\"start\":{\"session_id\":${jsonx.quote(s.id)}}}") }
     cancel = sync.atomic_new(0)
-    sysgap.watch_signals()
     sig_cell = s.signal
-    worker.run_detached(|| {
-        while sysgap.signal_received() == 0 { sleep(20) }
-        sync.atomic_store(sig_cell, sysgap.signal_received() as long)
-        sync.atomic_store(cancel, 1)
-        return null
-    })
+    watch, werr = os.signal_watch([signal.SIGINT(), signal.SIGTERM()])
+    if werr == "" {
+        worker.run_detached(|| {
+            got = 0
+            while got == 0 {
+                got = os.signal_received(watch)
+                if got == 0 { sleep(20) }
+            }
+            sync.atomic_store(sig_cell, got as long)
+            sync.atomic_store(cancel, 1)
+            return null
+        })
+    }
     json = a.json
     sink = session.new_sink(null, |ctx: ptr, ev: string| {
         if json == 1 {

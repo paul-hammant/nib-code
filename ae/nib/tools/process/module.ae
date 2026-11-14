@@ -14,7 +14,7 @@ import std.worker
 import std.cryptography
 import std.ipc
 import std.io
-import nib.sysgap
+import nib.sysenv
 
 exports(Result, run, run_ticking, run_lines, open_stdio, kill_child, close_fd, environ, STOP_NONE, STOP_CANCELED, STOP_TIMED_OUT)
 
@@ -32,7 +32,7 @@ struct Result {
 }
 
 // This process's environment as "NAME=value" strings.
-environ() -> ptr { return sysgap.environ() }
+environ() -> ptr { return sysenv.environ() }
 
 struct Waiter {
     token: int
@@ -47,9 +47,9 @@ set_(c: ptr) -> int {
 }
 
 output_size_(path: string) -> long {
-    st = sysgap.new_stat()
-    if sysgap.stat(path, 1, st) != 0 { return 0 }
-    return (st as *sysgap.Stat).size
+    st, kind, _e = fs.stat(path, 1)
+    if kind != fs.KIND_OK { return 0 }
+    return st.size
 }
 
 // argv: program first. env: "NAME=value" list or null (inherit). cancels: up
@@ -81,7 +81,7 @@ run_ticking(argv: ptr, env: ptr, cancel_a: ptr, cancel_b: ptr, timeout_ms: long,
     token, serr = os.spawn_proc_to(prog, rest, env, out_path)
     if serr != "" {
         r.error = serr
-        sysgap.unlink(out_path)
+        fs.unlink(out_path)
         return r as ptr
     }
     w = heap.new(Waiter)
@@ -129,7 +129,7 @@ run_ticking(argv: ptr, env: ptr, cancel_a: ptr, cancel_b: ptr, timeout_ms: long,
         data, rerr = fs.read(out_path)
         if rerr == "" { r.output = data }
     }
-    sysgap.unlink(out_path)
+    fs.unlink(out_path)
     return r as ptr
 }
 

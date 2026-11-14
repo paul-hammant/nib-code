@@ -71,13 +71,13 @@ pins                     AE_PIN / AEB_REF the port is verified against
 | `src/sandbox/console.zig` | 181 | `ae/nib/sandbox/console/module.ae` | a2dd439 |  |
 | `src/sandbox/timing.zig` | 168 | `ae/nib/sandbox/timing/module.ae` | a2dd439 | Execution epoch times live on process.Result |
 | `src/sandbox/timer_test.zig` | 237 | `ae/tests/timer_test.ae` | a2dd439 |  |
-| `src/sandbox/record.zig` | 510 | `ae/nib/sandbox/record/module.ae` | a2dd439 | file via nib.sysgap (flock, pwrite, ftruncate, fsync); dedup keys are sha256 hex |
+| `src/sandbox/record.zig` | 510 | `ae/nib/sandbox/record/module.ae` | a2dd439 | file via std.fs (flock, pwrite, ftruncate, fsync); dedup keys are sha256 hex |
 | `src/sandbox/replay.zig` | 303 | `ae/nib/sandbox/replay/module.ae` | a2dd439 | Virtual.stopped is a std.sync cell, not a callback |
 | `src/sandbox/virtual.zig` | 19 | `ae/nib/sandbox/module.ae` (VIRTUAL_PRELUDE) | a2dd439 |  |
 | `src/tools.zig` | 813 | `ae/nib/tools/module.ae` | a2dd439 | table verbatim; only ported tools enter a Run's API; RunScope replaces the threadlocal; docs fill {{llm_limits}}/{{llm_options}}; search options wait for web search |
 | `src/tools/files.zig` | 587 | `ae/nib/tools/files/module.ae` | a2dd439 | undo snapshots in edit/write |
-| `src/tools/atomic_file.zig` | 243 | `ae/nib/tools/atomic_file/module.ae` | a2dd439 | on nib.sysgap (stand-in) |
-| `src/tools/file_state.zig` | 247 | `ae/nib/tools/file_state/module.ae` | a2dd439 | flock path locks on nib.sysgap (stand-in) |
+| `src/tools/atomic_file.zig` | 243 | `ae/nib/tools/atomic_file/module.ae` | a2dd439 | on std.fs (stat, O_EXCL create, fchmod, fsync, move) |
+| `src/tools/file_state.zig` | 247 | `ae/nib/tools/file_state/module.ae` | a2dd439 | flock path locks on std.fs |
 | `src/tools/changes.zig` | 253 | `ae/nib/tools/changes/module.ae` | a2dd439 | Tracker per Run scope; Recovery |
 | `src/tools/diff.zig` | 195 | `ae/nib/tools/diff/module.ae` | a2dd439 |  |
 | `src/tools/search.zig` | 173 | `ae/nib/tools/search/module.ae` | a2dd439 |  |
@@ -175,7 +175,6 @@ sandbox's two host functions open with a `hide os, worker, ...` veto line.
 
 **Stand-ins (marked, each with an ask):** `ae/nib/qjsgap` (async eval,
 interrupt, promise state: asks/aether-quickjs-async-eval-and-interrupt.md),
-`ae/nib/sysgap` (stat, flock, O_EXCL, environ: asks/aether-fs-stat-flock-exclusive.md),
 `ae/nib/tools/jail/landlock.c` (asks/aether-landlock-write-roots.md).
 
 **Differences kept on purpose or by gap:** grep scans on one thread and
@@ -249,9 +248,6 @@ no Landlock ABI 2) test_sandbox's six workspace cases fail because bash runs
 unsandboxed there, as upstream's would. On Linux test_background_bash runs
 unpatched: every non-TUI Chat case passes except the four that need tools.agent.
 
-**Stand-ins (marked, each with an ask).** `ae/nib/sysgap` grows pwrite
-(asks/aether-fs-stat-flock-exclusive.md item 6), SIGINT/SIGTERM as a polled
-flag and stdin echo (asks/aether-signal-flag-and-tty-echo.md).
 
 **Differences kept on purpose or by gap.** No Codex provider: with nothing
 configured the default service is anthropic (upstream: codex), a `[codex]`
@@ -421,8 +417,7 @@ test_mcp's `/mcp` terminal function and test_images' clipboard and paste
 functions were left out of this run; both run since the parity follow-up below. (The three TUI `/js`
 cases of test_background_bash pass since the follow-up below.)
 
-**Stand-ins added (marked, each with an ask).** `nib.sysgap` ignores SIGPIPE
-before a child's stdin is written (asks/aether-ipc-write-sigpipe.md); a child
+**Stand-ins added (marked, each with an ask).** A child
 nib's or MCP server's stderr is discarded and its cwd set through `sh -c`
 (asks/aether-run-stdio-stderr.md); the QuickJS stand-in's stop cell for replay
 (asks/aether-quickjs-async-eval-and-interrupt.md).
@@ -450,10 +445,9 @@ every ae/nib module; an unpinned one fails). Who may start a program is the
 compiler's rule since Aether 0.911.0 (`import ns hiding (...)`, aether
 #3653): every std.os import outside tools/process and tools/jail hides
 std.os's program starters (E0304 on use), and the script checks those lists.
-The TUI's three exceptions are named and narrow: tui/open keeps
+The TUI's exceptions are named and narrow: tui/open keeps
 `spawn_proc_to` alone (a detached `open` for a clicked path, outside any
-Run); tui/reflect may call only nib.sysgap's flock and positional-append
-calls (the locked reflections.md append); auth/models may only GET (the
+Run); auth/models may only GET (the
 `/model` listing), imported only by the app and its provider flow.
 
 **Aether 0.912.0** (`pins`). aether #3655 (0.910.0) fixed both ae/term asks
@@ -549,3 +543,32 @@ Verified on 0.914.0: `aeb .tests.ae`, `tools/check_layers.sh`,
 cachyos 29/30 and ae-x64 29/30 (left: the Codex half of `test_effort`, by
 policy). ae-x64 now runs Ubuntu's HWE kernel 6.8 (was 5.15), so Landlock ABI
 2+ holds there and its sandbox cases pass. macOS unchanged at 23/30.
+
+## Aether 0.915.0: nib.sysgap deleted (2026-11-14)
+
+The two remaining stand-in asks are answered in 0.915.0 and `ae/nib/sysgap/`
+(a C file and its Aether wrapper) is gone. std.fs gives `stat` (a `Stat` value
+with inode, mode and nanosecond mtime), `lock_open`/`try_lock`, `create_exclusive`,
+`fchmod`, `fd_fsync`, `fd_truncate`, `fd_size`, `fd_pwrite_all`, `move` (replaces
+an existing target; the atomic-replace step) and `chmod`/`unlink`/
+`create_dir_with_mode`; std.io gives `fd_close`/`fd_write` and `set_echo`;
+std.os gives `environ` and `signal_watch`/`signal_received`/`signal_unwatch`.
+Two small modules replace the rest: `nib.fserr` (`errname(kind)`: a std.fs
+`KIND_*` to upstream's Zig error name, read with the errno behind a `KIND_IO`
+for ReadOnlyFileSystem, DeviceBusy and FileTooBig) and `nib.sysenv` (the
+environment as a `std.list`). `nib ask` owns its signal watch: the Turn's
+poller thread holds the handle it was given and the watch lasts the process.
+Masked key entry is `io.set_echo`, restoring what it found.
+
+Not reproduced exactly: `fs.unlink` and `fs.create_dir_with_mode` report no
+errno, so `/undo`'s "failed: path: <name>" after a failed unlink derives the
+name from an lstat of the path (FileNotFound, NotDir, IsDir, else AccessDenied),
+and the image store tells a missing parent from an existing directory by a stat
+after the failed mkdir. The errno numbers behind KIND_IO are the POSIX ones
+(Linux, macOS); Windows reports GetLastError codes there.
+
+New check: `ae/tests/tui_e2e.py` `login_masks_key` runs `nib login anthropic`
+on a pseudo-terminal and checks echo is off while the key is read, back on
+afterwards, and the key never reaches the screen. SIGINT/SIGTERM during
+`nib ask` are covered by upstream's `test_session.py` (the interrupted Turn
+test) and `test_agent.py` (`check_cancel`). Pins: AE_PIN 0.915.0.

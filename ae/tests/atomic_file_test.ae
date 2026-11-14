@@ -4,7 +4,6 @@ import std.fs
 import std.string
 import std.dir
 import nib.tools.atomic_file
-import nib.sysgap
 
 tmp_() -> string {
     d, _e = fs.make_temp_dir("", "nib-atomic")
@@ -18,15 +17,13 @@ read_(p: string) -> string {
 }
 
 mode_(p: string) -> int {
-    st = sysgap.new_stat()
-    sysgap.stat(p, 1, st)
-    return (st as *sysgap.Stat).mode
+    st, _k, _m = fs.stat(p, 1)
+    return st.mode
 }
 
 kind_nofollow_(p: string) -> int {
-    st = sysgap.new_stat()
-    sysgap.stat(p, 0, st)
-    return (st as *sysgap.Stat).kind
+    st, _k, _m = fs.stat(p, 0)
+    return st.kind
 }
 
 no_temps_(d: string) -> int {
@@ -47,18 +44,18 @@ main() {
         spec.it("replacement preserves existing permissions and uses creation permissions") callback {
             d = tmp_()
             p = "${d}/file"
-            spec.assert_str_eq(atomic_file.replace(p, "first", 384, 0, 0, null), "", "created")
+            spec.assert_str_eq(atomic_file.replace(p, "first", 384, 0, 0), "", "created")
             spec.assert_eq(mode_(p), 384, "0600")
             modes = [489, 288, 3560]
             i = 0
             while i < 3 {
-                sysgap.chmod(p, modes[i])
-                spec.assert_str_eq(atomic_file.replace(p, "replacement", 420, 0, 0, null), "", "replaced")
+                fs.chmod(p, modes[i])
+                spec.assert_str_eq(atomic_file.replace(p, "replacement", 420, 0, 0), "", "replaced")
                 spec.assert_eq(mode_(p), modes[i], "kept mode ${modes[i]}")
                 spec.assert_str_eq(read_(p), "replacement", "content")
                 i = i + 1
             }
-            spec.assert_str_eq(atomic_file.replace(p, "executable", 493, 1, 1, null), "", "forced")
+            spec.assert_str_eq(atomic_file.replace(p, "executable", 493, 1, 1), "", "forced")
             spec.assert_eq(mode_(p), 493, "0755")
             spec.assert_eq(no_temps_(d), 1, "no temps")
         }
@@ -68,16 +65,16 @@ main() {
             fs.symlink("real", "${d}/alias")
             fs.symlink("alias/target", "${d}/link")
             p = "${d}/link"
-            spec.assert_str_eq(atomic_file.replace(p, "created", 420, 0, 0, null), "", "created")
-            spec.assert_str_eq(atomic_file.replace(p, "updated", 420, 0, 1, null), "", "updated")
-            spec.assert_eq(kind_nofollow_(p), sysgap.KIND_LINK, "link kept")
+            spec.assert_str_eq(atomic_file.replace(p, "created", 420, 0, 0), "", "created")
+            spec.assert_str_eq(atomic_file.replace(p, "updated", 420, 0, 1), "", "updated")
+            spec.assert_eq(kind_nofollow_(p), fs.STAT_KIND_SYMLINK, "link kept")
             spec.assert_str_eq(read_("${d}/real/target"), "updated", "target written")
             target, _e = atomic_file.canonical_path(p)
             fs.symlink(target, "${d}/absolute")
-            spec.assert_str_eq(atomic_file.replace("${d}/absolute", "absolute", 420, 0, 0, null), "", "absolute")
+            spec.assert_str_eq(atomic_file.replace("${d}/absolute", "absolute", 420, 0, 0), "", "absolute")
             actual, _e2 = atomic_file.canonical_path("${d}/absolute")
             spec.assert_str_eq(actual, target, "same target")
-            spec.assert_eq(kind_nofollow_("${d}/absolute"), sysgap.KIND_LINK, "absolute link kept")
+            spec.assert_eq(kind_nofollow_("${d}/absolute"), fs.STAT_KIND_SYMLINK, "absolute link kept")
             spec.assert_eq(no_temps_(d), 1, "no temps")
         }
         spec.it("canonical paths resolve links before dotdot and normalize missing suffixes") callback {
@@ -100,7 +97,7 @@ main() {
             d = tmp_()
             fs.create_dir("${d}/target")
             fs.write("${d}/target/keep", "original")
-            spec.assert_str_eq(atomic_file.replace("${d}/target", "replacement", 420, 0, 0, null), "IsDir", "IsDir")
+            spec.assert_str_eq(atomic_file.replace("${d}/target", "replacement", 420, 0, 0), "IsDir", "IsDir")
             spec.assert_str_eq(read_("${d}/target/keep"), "original", "intact")
             spec.assert_eq(no_temps_(d), 1, "no temps")
         }
@@ -108,8 +105,8 @@ main() {
             d = tmp_()
             fs.symlink("b", "${d}/a")
             fs.symlink("a", "${d}/b")
-            spec.assert_str_eq(atomic_file.replace("${d}/a", "replacement", 420, 0, 0, null), "SymLinkLoop", "loop")
-            spec.assert_eq(kind_nofollow_("${d}/a"), sysgap.KIND_LINK, "link kept")
+            spec.assert_str_eq(atomic_file.replace("${d}/a", "replacement", 420, 0, 0), "SymLinkLoop", "loop")
+            spec.assert_eq(kind_nofollow_("${d}/a"), fs.STAT_KIND_SYMLINK, "link kept")
             spec.assert_eq(no_temps_(d), 1, "no temps")
         }
         spec.it("canonical paths do not traverse regular files as directories") callback {
@@ -121,7 +118,7 @@ main() {
             cases = ["plain/../victim", "plain/./../victim", "plain/", "link/../victim", "link/", "directory-required"]
             i = 0
             while i < 6 {
-                spec.assert_str_eq(atomic_file.replace("${d}/${cases[i]}", "overwrite", 420, 0, 0, null), "NotDir", "NotDir ${cases[i]}")
+                spec.assert_str_eq(atomic_file.replace("${d}/${cases[i]}", "overwrite", 420, 0, 0), "NotDir", "NotDir ${cases[i]}")
                 i = i + 1
             }
             spec.assert_str_eq(read_("${d}/plain"), "plain", "plain kept")

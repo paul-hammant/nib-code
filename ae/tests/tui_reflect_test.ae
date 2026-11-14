@@ -11,7 +11,6 @@ import std.fs
 import std.list
 import std.string
 import std.sync
-import nib.sysgap
 import nib.tui.reflect
 
 tmp_() -> string {
@@ -122,7 +121,7 @@ main() {
             script = "#!/bin/sh\nif [ \"$2\" = list ]; then echo '[{\"number\":7,\"title\":\"Known Bug\",\"url\":\"https://x/7\"}]'; exit 0; fi\ncat > \"$(dirname \"$0\")/body\"; echo \"$@\" > \"$(dirname \"$0\")/args\"; echo https://x/8"
             fake = "${root}/gh"
             fs.write(fake, script)
-            sysgap.chmod(fake, 493)
+            fs.chmod(fake, 493)
             skipped = reflect.file_issue(reflect.gh_run, fake, "o/r", draft_("known bug", "b"), "footer")
             spec.assert_str_eq(skipped, "skipped: #7 already has this title · https://x/7", "skipped")
             filed = reflect.file_issue(reflect.gh_run, fake, "o/r", draft_("New bug", "body"), "footer")

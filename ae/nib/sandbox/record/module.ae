@@ -28,7 +28,6 @@ import std.os hiding (exec, run_capture, run_pipe, run_pipe_drain_and_wait, run_
     os_spawn_to_raw)
 import std.cryptography
 import nib.lock
-import nib.sysgap
 import nib.jsonx
 
 exports(Recorder, MAX_RESULT_BYTES, END_OK, END_ERROR, END_TIMEOUT, END_CANCELLED,
@@ -177,20 +176,41 @@ put_seen_(r: *Recorder, hex: string, step: int) {
     list.list_add(r.seen_keys, string.copy(hex))
 }
 
+// The file locked for this recorder: (fd, "") or (-1, open_err | "locked").
+lock_file_(path: string, open_err: string) -> (int, string) {
+    fd, ok, _om = fs.lock_open(path)
+    if ok != fs.KIND_OK { return -1, open_err }
+    got, _tk, _tm = fs.try_lock(fd, 1)
+    if got != 1 {
+        io.fd_close(fd)
+        return -1, "locked"
+    }
+    return fd, ""
+}
+
+size_of_(fd: int) -> long {
+    n, _k, _m = fs.fd_size(fd)
+    return n
+}
+
+// 0 when all of data reached the file at offset.
+write_at_(fd: int, data: string, offset: long) -> int {
+    _n, k, _m = fs.fd_pwrite_all(fd, string.bytes(data), offset)
+    if k != fs.KIND_OK { return -1 }
+    return 0
+}
+
 // Opens an existing file (locked, 0600), keeps only lines of Steps before
 // `step` and rebuilds the dedup set from them. "" or the error.
 restore_(r: *Recorder, step: int) -> string {
     r.loaded = 1
     if fs.exists(r.path) == 0 { return "" }
-    fd = sysgap.lock_open(r.path)
-    if fd < 0 { return "open" }
-    if sysgap.try_lock(fd) != 1 {
-        sysgap.close(fd)
-        return "locked"
-    }
+    fd, lerr = lock_file_(r.path, "open")
+    if lerr != "" { return lerr }
     r.fd = fd
-    if sysgap.fchmod(fd, 384) != 0 { return "chmod" }
-    r.offset = sysgap.fd_size(fd)
+    _c, ck, _cm = fs.fchmod(fd, 384)
+    if ck != fs.KIND_OK { return "chmod" }
+    r.offset = size_of_(fd)
     data, rerr = fs.read(r.path)
     if rerr != "" { return rerr }
     n = string.length(data)
@@ -223,7 +243,7 @@ restore_(r: *Recorder, step: int) -> string {
             continue
         }
         if retained != line_start {
-            if sysgap.pwrite_all(r.fd, "${line}\n", retained) != 0 {
+            if write_at_(r.fd, "${line}\n", retained) != 0 {
                 jsonx.free(v)
                 return "write"
             }
@@ -240,8 +260,10 @@ restore_(r: *Recorder, step: int) -> string {
         jsonx.free(v)
     }
     if retained != r.offset {
-        if sysgap.fd_truncate(r.fd, retained) != 0 { return "truncate" }
-        if sysgap.fsync(r.fd) != 0 { return "sync" }
+        _t, tk, _tm = fs.fd_truncate(r.fd, retained)
+        if tk != fs.KIND_OK { return "truncate" }
+        _y, yk, _ym = fs.fd_fsync(r.fd)
+        if yk != fs.KIND_OK { return "sync" }
     }
     r.offset = retained
     return ""
@@ -363,18 +385,16 @@ flush_(r: *Recorder, end: string) -> string {
 write_(target: *Recorder, data: string) -> string {
     if target.enabled == 0 { return "RecordingDisabled" }
     if target.fd < 0 {
-        fd = sysgap.lock_open(target.path)
-        if fd < 0 { return "create" }
-        if sysgap.try_lock(fd) != 1 {
-            sysgap.close(fd)
-            return "locked"
-        }
+        fd, lerr = lock_file_(target.path, "create")
+        if lerr != "" { return lerr }
         target.fd = fd
-        if sysgap.fchmod(fd, 384) != 0 { return "chmod" }
-        target.offset = sysgap.fd_size(fd)
+        _c, ck, _cm = fs.fchmod(fd, 384)
+        if ck != fs.KIND_OK { return "chmod" }
+        target.offset = size_of_(fd)
     }
-    if sysgap.pwrite_all(target.fd, data, target.offset) != 0 { return "write" }
-    if sysgap.fsync(target.fd) != 0 { return "sync" }
+    if write_at_(target.fd, data, target.offset) != 0 { return "write" }
+    _y, yk, _ym = fs.fd_fsync(target.fd)
+    if yk != fs.KIND_OK { return "sync" }
     target.offset = target.offset + string.length(data) as long
     return ""
 }
@@ -383,7 +403,7 @@ write_(target: *Recorder, data: string) -> string {
 close(rp: ptr) {
     r = rp as *Recorder
     if r.fd >= 0 {
-        sysgap.close(r.fd)
+        io.fd_close(r.fd)
         r.fd = -1
     }
 }

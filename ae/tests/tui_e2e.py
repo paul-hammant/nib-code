@@ -7,11 +7,18 @@ unchanged). Run from the repository root after aeb .build.ae:
 
 - tool_activity: the Running line names the tool a Run is in (upstream
   Sink.onToolActivity, session/run.zig executeTimed).
+- login_masks_key: `nib login <service>` on a terminal reads the key with echo
+  off (std.io.set_echo) and puts echo back.
 - turn_end_hooks_joined: the turn_end hooks run on their own thread and
   quitting waits for them (upstream TurnJob, Session.finishHooks).
 """
 import json
 import os
+import pty
+import select
+import subprocess
+import termios
+import time
 from pathlib import Path
 import sys
 import tempfile
@@ -59,6 +66,46 @@ def turn_end_hooks_joined():
     print("ok   quitting waits for the turn_end hooks")
 
 
+def login_masks_key():
+    key = "masked-key-4f2a9c"
+    with tempfile.TemporaryDirectory(prefix="nib-login-mask-") as directory:
+        home = Path(directory) / "home"
+        home.mkdir()
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("NIB_", "DEEPSEEK_", "OPENAI_", "CODEX_"))}
+        env.update(NIB_HOME=str(home), HOME=directory, TERM="xterm-256color")
+        master, slave = pty.openpty()
+        child = subprocess.Popen([str(tui.BIN), "login", "anthropic"], cwd=directory, env=env,
+                                 stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+        try:
+            seen = b""
+
+            def pump(until):
+                nonlocal seen
+                deadline = time.monotonic() + 10
+                while until not in seen and time.monotonic() < deadline:
+                    if select.select([master], [], [], .05)[0]:
+                        seen += os.read(master, 4096)
+                assert until in seen, seen
+
+            pump(b"API key: ")
+            echo_during = termios.tcgetattr(slave)[3] & termios.ECHO
+            os.write(master, (key + "\r").encode())
+            pump(b"key stored")
+            assert child.wait(timeout=10) == 0, seen
+            echo_after = termios.tcgetattr(slave)[3] & termios.ECHO
+        finally:
+            if child.poll() is None:
+                child.kill()
+            os.close(slave)
+            os.close(master)
+        assert echo_during == 0, "echo is off while the key is read"
+        assert echo_after != 0, "echo is back on afterwards"
+        assert key.encode() not in seen, "the key never reaches the screen: " + repr(seen)
+        assert json.loads(next(Path(directory).rglob("auth.json")).read_text()) == {"keys": {"anthropic": key}}
+    print("ok   nib login reads the key with echo off and restores it")
+
+
 if __name__ == "__main__":
     tool_activity()
+    login_masks_key()
     turn_end_hooks_joined()

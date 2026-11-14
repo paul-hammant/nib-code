@@ -44,7 +44,6 @@ import nib.tui.frames
 import nib.tui.provider_flow
 import nib.tui.clipboard
 import nib.image
-import nib.sysgap
 
 struct Rig {
     t: *term.Terminal
@@ -788,7 +787,7 @@ main() {
             for i in 0..5300 { strbuilder.append(sb, repeat_(" ", 1000)) }
             fs.write("${dir}/big.png", strbuilder.finish(sb))
             // unreadable: the size is judged from stat, before any read
-            sysgap.chmod("${dir}/big.png", 0)
+            fs.chmod("${dir}/big.png", 0)
             tui.handle_input(a, input.PasteStart {})
             a.paste_buf = "${dir}/big.png"
             tui.handle_input(a, input.PasteEnd {})

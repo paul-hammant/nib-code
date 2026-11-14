@@ -15,7 +15,6 @@ import nib.tools
 import nib.tools.undo
 import nib.tools.atomic_file
 import nib.tools.file_state
-import nib.sysgap
 
 struct Fx {
     d: string
@@ -84,8 +83,8 @@ read_(p: string) -> string {
 }
 
 exists_(p: string) -> int {
-    st = sysgap.new_stat()
-    if sysgap.stat(p, 0, st) == 0 { return 1 }
+    _st, k, _m = fs.stat(p, 0)
+    if k == fs.KIND_OK { return 1 }
     return 0
 }
 
@@ -345,9 +344,9 @@ main() {
             spec.assert_eq(write_(f.s, path_(f, "a"), "new"), 1, "write")
             spec.assert_eq(write_(f.s, path_(f, "b"), "created"), 1, "create")
             dirpath = tools.turn_undo_dir(f.t)
-            st = sysgap.new_stat()
-            spec.assert_eq(sysgap.stat("${f.d}/undo", 1, st), 0, "root exists")
-            spec.assert_eq((st as *sysgap.Stat).mode % 512, 448, "root mode 0700")
+            st, rk, _rm = fs.stat("${f.d}/undo", 1)
+            spec.assert_eq(rk, fs.KIND_OK, "root exists")
+            spec.assert_eq(st.mode % 512, 448, "root mode 0700")
             names, _e = fs.list_dir(dirpath)
             n = 0
             befores = 0
@@ -356,13 +355,15 @@ main() {
                 nm = fs.dir_list_get(names, i)
                 if string.ends_with(nm, ".before") == 1 {
                     befores = befores + 1
-                    spec.assert_eq(sysgap.stat("${dirpath}/${nm}", 1, st), 0, "stat before")
-                    spec.assert_eq((st as *sysgap.Stat).mode % 512, 384, "before mode 0600")
+                    bst, bk, _bm = fs.stat("${dirpath}/${nm}", 1)
+                    spec.assert_eq(bk, fs.KIND_OK, "stat before")
+                    spec.assert_eq(bst.mode % 512, 384, "before mode 0600")
                 }
                 if string.ends_with(nm, ".json") == 1 {
                     n = n + 1
-                    spec.assert_eq(sysgap.stat("${dirpath}/${nm}", 1, st), 0, "stat json")
-                    spec.assert_eq((st as *sysgap.Stat).mode % 512, 384, "json mode 0600")
+                    jst, jk, _jm = fs.stat("${dirpath}/${nm}", 1)
+                    spec.assert_eq(jk, fs.KIND_OK, "stat json")
+                    spec.assert_eq(jst.mode % 512, 384, "json mode 0600")
                 }
                 i = i + 1
             }

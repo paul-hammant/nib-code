@@ -27,7 +27,10 @@
 # qualified slice locals, basename collision on qualified types, ptr as string,
 # ipc SIGPIPE, run_stdio stderr_to/cwd, `ae run` exit on a failing spec); their
 # stand-ins are removed in the same commit.
-AE_PIN=0.914.0
+# 0.915.0 (2026-11-14): std.fs's stat (inode, mode, ns mtime), flock, O_EXCL,
+# fd ops and positional writes, std.os.environ and signal_watch, std.io.set_echo
+# replace nib.sysgap, which is deleted.
+AE_PIN=0.915.0
 
 # v0.344 (2026-11-12): aether.program and aether.program_test with lib().
 AEB_REF=v0.344

@@ -18,7 +18,6 @@ import std.strbuilder
 import std.cryptography
 import std.encoding
 import nib.image
-import nib.sysgap
 
 hexv_(c: int) -> int {
     if c >= 48 && c <= 57 { return c - 48 }
@@ -97,9 +96,8 @@ tmp_() -> string {
 }
 
 mode_(path: string) -> int {
-    st = sysgap.new_stat()
-    sysgap.stat(path, 1, st)
-    return (st as *sysgap.Stat).mode & 511
+    st, _k, _m = fs.stat(path, 1)
+    return st.mode & 511
 }
 
 filler_(n: int) -> string {
