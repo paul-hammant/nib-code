@@ -7,7 +7,8 @@ import nib.tui.mode
 import nib.tui.commands
 
 none_() -> commands.Choice[] {
-    return commands.no_choices()
+    commands.Choice[] out = []
+    return out
 }
 
 main() {
@@ -42,7 +43,7 @@ main() {
             spec.assert_str_eq(efforts[0].value, "high", "high")
             spec.assert_str_eq(commands.candidate_line(efforts[0]), "/effort high", "line")
 
-            sessions = commands.no_choices()
+            commands.Choice[] sessions = []
             sessions.push(commands.choice("abc123", "abc1", "now"))
             sessions.push(commands.choice("def456", "def4", "1h"))
             picked = commands.candidates("/resume d", sessions, e, e, e)
@@ -66,7 +67,7 @@ main() {
             e = none_()
             spec.assert_true(commands.allowed_while_busy("/tasks"), "tasks")
             spec.assert_true(commands.allowed_while_busy("/stop r3"), "stop")
-            tasks = commands.no_choices()
+            commands.Choice[] tasks = []
             tasks.push(commands.choice("r3", "r3", "Run"))
             selected = commands.candidates("/stop r", e, tasks, e, e)
             spec.assert_eq(selected.len, 1, "selected")
@@ -84,7 +85,7 @@ main() {
         }
         spec.it("model choices filter and complete without running the bare command") callback {
             e = none_()
-            models = commands.no_choices()
+            commands.Choice[] models = []
             models.push(commands.choice("gpt-6.1-sol", "gpt-6.1-sol", "current"))
             models.push(commands.choice("gpt-6.1-terra", "gpt-6.1-terra", ""))
             spec.assert_false(commands.allowed_while_busy("/model gpt-6.1-sol"), "busy")
@@ -96,7 +97,7 @@ main() {
         }
         spec.it("service choices complete /provider and run on Enter") callback {
             e = none_()
-            services = commands.no_choices()
+            commands.Choice[] services = []
             services.push(commands.choice("codex", "Codex", "signed in · ChatGPT"))
             services.push(commands.choice("anthropic", "Anthropic", "—"))
             spec.assert_false(commands.allowed_while_busy("/provider anthropic"), "busy")
@@ -118,5 +119,6 @@ main() {
 }
 
 e_() -> commands.Choice[] {
-    return commands.no_choices()
+    commands.Choice[] out = []
+    return out
 }

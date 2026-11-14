@@ -26,3 +26,5 @@ error[E0100]: Expected statement in block
 Expected: `1`. `P[] xs = []` inside module `m` parses, and so does a
 parameter or field typed `m.P[]`; only the statement form with a qualified
 element type is refused (the parser seems to read `m.P` as an expression).
+
+**RESOLVED** in Aether 0.914.0 (aether #3694, 2026-11-14); the stand-in is removed from the port.

@@ -12,7 +12,7 @@ import std.string
 import std.sync
 import nib.provider.types
 import nib.provider.sink
-import nib.provider.model_timing
+import nib.provider.timing
 import nib.provider.anthropic
 import nib.provider.responses
 import nib.provider.openai
@@ -137,8 +137,8 @@ complete_with(request: fn(ptr, string, ptr, string, int, @keep ptr, ptr, ptr), c
         tm = (sk as *sink.Sink).timing
         attempt_start = 0 as long
         if tm != null {
-            model_timing.reset_attempt(tm)
-            attempt_start = model_timing.elapsed(tm)
+            timing.reset_attempt(tm)
+            attempt_start = timing.elapsed(tm)
         }
         call(request, cp, cache_key, messages, tools_json, max_tokens, sk, cancel, out as ptr)
         emit_(rp, "finished", attempt, 0 as long, "")
@@ -146,7 +146,7 @@ complete_with(request: fn(ptr, string, ptr, string, int, @keep ptr, ptr, ptr), c
         if tm != null {
             failed_detail = out.text
             if err == "" { failed_detail = "" }
-            model_timing.finish_attempt(tm, attempt_start, err, failed_detail)
+            timing.finish_attempt(tm, attempt_start, err, failed_detail)
         }
         if err == "" { return out.tool_calls, "", "", attempt }
         detail = out.text

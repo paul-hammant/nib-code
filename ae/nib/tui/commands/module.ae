@@ -22,7 +22,7 @@ import std.strbuilder
 import nib.provider.types
 import nib.tui.mode
 
-exports(no_choices, CMD_SIMPLE, CMD_HELP, CMD_NEW, CMD_RESUME, CMD_COMPACT, CMD_UNDO, CMD_PROVIDER, CMD_MODEL,
+exports(CMD_SIMPLE, CMD_HELP, CMD_NEW, CMD_RESUME, CMD_COMPACT, CMD_UNDO, CMD_PROVIDER, CMD_MODEL,
         CMD_EFFORT, CMD_COPY, CMD_REFLECT, CMD_JS, CMD_TASKS, CMD_STOP, CMD_STATUS, CMD_SKILLS,
         CMD_MCP, CMD_COUNT,
         CH_NONE, CH_MODELS, CH_EFFORTS, CH_SESSIONS, CH_TASKS, CH_SERVICES,
@@ -198,12 +198,6 @@ candidate_runs(c: Candidate) -> bool {
 candidate_line(c: Candidate) -> string {
     if c.has_value != 0 { return "${slash_name(c.command)} ${c.value}" }
     return slash_name(c.command)
-}
-
-// An empty Choice[] (a qualified `commands.Choice[] x = []` does not parse in callers).
-no_choices() -> Choice[] {
-    Choice[] out = []
-    return out
 }
 
 effort_choices() -> Choice[] {

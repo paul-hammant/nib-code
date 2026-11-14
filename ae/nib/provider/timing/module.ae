@@ -1,4 +1,4 @@
-// provider.model_timing: per-Step model timing (upstream src/provider/timing.zig
+// provider.timing: per-Step model timing (upstream src/provider/timing.zig
 // ModelTiming): bytes-arrival gaps, content gaps, one record per request
 // attempt, and per tool call argument-arrival progress (the `code` entries
 // of a Step record). All times are milliseconds relative to the Step start.

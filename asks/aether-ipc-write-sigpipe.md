@@ -71,3 +71,5 @@ called by `nib.tools.process.run_lines` before it spawns. Remove it once
 std.ipc's pipe writes cannot raise SIGPIPE (e.g. block SIGPIPE on the writing
 thread and consume a pending one with sigtimedwait, or MSG_NOSIGNAL-style
 handling for pipes).
+
+**RESOLVED** in Aether 0.914.0 (aether #3694, 2026-11-14); the stand-in is removed from the port.

@@ -353,7 +353,8 @@ main() {
         }
 
         spec.it("grouped menus keep the selected command visible within their row budget") callback {
-            menu = commands.candidates("/", commands.no_choices(), commands.no_choices(), commands.no_choices(), commands.no_choices(), 16)
+            commands.Choice[] empty = []
+            menu = commands.candidates("/", empty, empty, empty, empty, 16)
             for limit in 2..12 {
                 for selected in 0..menu.len {
                     ml = tui_view.menu_layout(menu, selected, limit)

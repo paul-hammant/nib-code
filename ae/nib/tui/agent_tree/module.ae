@@ -226,10 +226,7 @@ update(tree: *Tree, agents: ptr[]) {
     for i in 0..agents.len {
         p = agents[i] as *Agent
         if p.kind == BK_RUN { continue }
-        // workaround: xs.push(f()) of a struct with a string field loses the
-        // string (Aether 0.909.0 to 0.912.0, asks/aether-push-call-result-string.md); bind the value first
-        row = row_init_(p, n + 1 == count)
-        next.push(row)
+        next.push(row_init_(p, n + 1 == count))
         n = n + 1
     }
     tree.rows = next

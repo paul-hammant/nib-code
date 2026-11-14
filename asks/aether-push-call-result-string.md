@@ -20,3 +20,5 @@ Prints `[]`. Expected `[x hi]`. `next.push(R { text: "x hi", k: 3 })` and
 temporary returned by the call is destroyed at the end of the statement
 after the push copied its fields without retaining the string (the same
 family as asks/../ae/term/asks/loop-store-moves-local.md).
+
+**RESOLVED** in Aether 0.914.0 (aether #3694, 2026-11-14); the stand-in is removed from the port.

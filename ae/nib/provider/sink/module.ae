@@ -3,10 +3,10 @@
 // that bytes arrived. Each callback is optional (has_* flags). `monitor`
 // is the live response's *http.Reader (content progress feeds its
 // content timeout), null on fixtures. `timing` is the Step's
-// provider.model_timing model, null when nobody records timings.
+// provider.timing model, null when nobody records timings.
 
 import nib.provider.http
-import nib.provider.model_timing
+import nib.provider.timing
 
 exports(Sink, new, attach, delta, tool_arguments, received, content, arguments, final_arguments, bind)
 
@@ -20,7 +20,7 @@ struct Sink {
     has_data: int
     emitted: int          // a delta was forwarded (retry may not replay it)
     monitor: ptr
-    timing: ptr           // the Step's provider.model_timing model
+    timing: ptr           // the Step's provider.timing model
 }
 
 new(ctx: @keep ptr) -> ptr {
@@ -69,18 +69,18 @@ content(sp: ptr, bytes: int) {
 // A fragment of tool call `index`'s arguments arrived.
 arguments(sp: ptr, index: int, bytes: int) {
     s = sp as *Sink
-    if s.timing != null { model_timing.arguments(s.timing, index, bytes) }
+    if s.timing != null { timing.arguments(s.timing, index, bytes) }
 }
 
 // The complete arguments of tool call `index` (counted only when no
 // fragment arrived).
 final_arguments(sp: ptr, index: int, bytes: int) {
     s = sp as *Sink
-    if s.timing != null { model_timing.final_arguments(s.timing, index, bytes) }
+    if s.timing != null { timing.final_arguments(s.timing, index, bytes) }
 }
 
 // Tool call `index` became call `call_index` of the reply.
 bind(sp: ptr, index: int, call_index: int) {
     s = sp as *Sink
-    if s.timing != null { model_timing.bind(s.timing, index, call_index) }
+    if s.timing != null { timing.bind(s.timing, index, call_index) }
 }

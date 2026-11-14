@@ -20,3 +20,5 @@ main() {
 expected string, got ptr*. (`string` to `ptr` at an extern is the documented
 decay; the other direction into an Aether `string` parameter has no
 conversion behind it: the callee treats the node as an AetherString.)
+
+**RESOLVED** in Aether 0.914.0 (aether #3694, 2026-11-14); the stand-in is removed from the port.

@@ -56,10 +56,10 @@ struct Menu {
 
 new() -> *Menu {
     m = heap.new(Menu)
-    m.sessions = commands.no_choices()
-    m.tasks = commands.no_choices()
-    m.models = commands.no_choices()
-    m.services = commands.no_choices()
+    m.sessions = make([]commands.Choice, 0)
+    m.tasks = make([]commands.Choice, 0)
+    m.models = make([]commands.Choice, 0)
+    m.services = make([]commands.Choice, 0)
     m.pinned = make([]commands.Candidate, 0)
     m.file_buf = make([]commands.Candidate, 0)
     m.file_query = ""
@@ -257,7 +257,7 @@ forget_sessions(m: *Menu) { m.sessions_loaded = 0 }
 load(m: *Menu, input: string, p: *port.Port, home: string, cfg: ptr, services: fn) {
     if string.starts_with(input, "/model ") != 0 {
         entries, err = config.model_entries(home, cfg)
-        out = commands.no_choices()
+        commands.Choice[] out = []
         if err == "" {
             n = list.list_size(entries)
             for i in 0..n {
@@ -277,7 +277,7 @@ load(m: *Menu, input: string, p: *port.Port, home: string, cfg: ptr, services: f
     }
     if string.starts_with(input, "/stop ") != 0 {
         string tasks_json = call(p.tasks, p.ctx)
-        out = commands.no_choices()
+        commands.Choice[] out = []
         doc = jsonx.parse(tasks_json)
         n = jsonx.array_size(doc)
         for i in 0..n {
@@ -307,7 +307,7 @@ model_of_(cfg: ptr) -> string {
 
 // A list of *commands.Choice boxes back to a slice.
 unbox_choices_(boxed: ptr) -> commands.Choice[] {
-    out = commands.no_choices()
+    commands.Choice[] out = []
     if boxed == null {
         return out
     }
@@ -325,7 +325,7 @@ unbox_choices_(boxed: ptr) -> commands.Choice[] {
 session_choices(p: *port.Port, now_ms: long) -> commands.Choice[] {
     string text = call(p.sessions, p.ctx)
     string current = call(p.session_id, p.ctx)
-    out = commands.no_choices()
+    commands.Choice[] out = []
     doc = jsonx.parse(text)
     n = jsonx.array_size(doc)
     for i in 0..n {

@@ -21,7 +21,7 @@ import std.sync
 import std.time
 import std.worker
 import nib.lock
-import nib.provider.model_timing
+import nib.provider.timing
 
 exports(Stream, Reader, open, reader, set_timing, set_data_hook, wait_head, next_line, content, read_rest, status_of,
         timeout_message, TIMEOUT_BYTES, TIMEOUT_CONTENT, TIMEOUT_REQUEST)
@@ -50,7 +50,7 @@ struct Reader {
     request_s: int
     timeout_kind: string
     received: long
-    model: ptr         // the Step's provider.model_timing model, or null
+    model: ptr         // the Step's provider.timing model, or null
     on_data: fn        // |ctx: ptr| after each body chunk
     has_data: int
     data_ctx: ptr
@@ -158,7 +158,7 @@ content(rp: ptr, bytes: int) {
     if bytes == 0 { return }
     r = rp as *Reader
     r.last_content_ms = now_()
-    if r.model != null { model_timing.content(r.model, bytes) }
+    if r.model != null { timing.content(r.model, bytes) }
 }
 
 // "" or the timeout error name, set in r.timeout_kind.
@@ -194,7 +194,7 @@ pull_(r: *Reader) -> (int, int, string) {
         r.pending = "${r.pending}${got}"
         r.last_ms = now_()
         r.received = r.received + (n as long)
-        if r.model != null { model_timing.received(r.model, n) }
+        if r.model != null { timing.received(r.model, n) }
         if r.has_data == 1 { call(r.on_data, r.data_ctx) }
     }
     return n, done, e

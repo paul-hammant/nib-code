@@ -47,7 +47,7 @@ import nib.tools.diff
 import nib.provider
 import nib.provider.types
 import nib.provider.sink
-import nib.provider.model_timing as modeltiming
+import nib.provider.timing as modeltiming
 import nib.session.log
 import nib.session.output
 import nib.session.prompt

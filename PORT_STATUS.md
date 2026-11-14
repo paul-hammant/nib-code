@@ -86,7 +86,7 @@ pins                     AE_PIN / AEB_REF the port is verified against
 | `src/tools/walk.zig` | 385 | `ae/nib/tools/walk/module.ae` | a2dd439 |  |
 | `src/tools/policy.zig` | 698 | `ae/nib/tools/policy/module.ae` | a2dd439 | rule for rule, same texts |
 | `src/tools/secrets.zig` | 16 | `ae/nib/tools/secrets/module.ae` | a2dd439 |  |
-| `src/tools/process.zig` | 358 | `ae/nib/tools/process/module.ae` | a2dd439 | output to a file, not a pipe; a 20 ms tick with the output byte count (progress); run_lines (a child nib: stdin input, stdout lines, TERM then KILL after a grace) through os.run_stdio, its stderr discarded via sh (asks/aether-run-stdio-stderr.md) and SIGPIPE ignored (asks/aether-ipc-write-sigpipe.md); open_stdio for MCP; a signal reads as 128+n |
+| `src/tools/process.zig` | 358 | `ae/nib/tools/process/module.ae` | a2dd439 | output to a file, not a pipe; a 20 ms tick with the output byte count (progress); run_lines (a child nib: stdin input, stdout lines, TERM then KILL after a grace) through os.run_stdio, its stderr discarded; open_stdio for MCP; a signal reads as 128+n |
 | `src/tools/bash.zig` | 433 | `ae/nib/tools/bash/module.ae` | a2dd439 | progress Tracker; ids reserved at start, snapshot after 3 s |
 | `src/tools/bash/registry.zig` | 146 | `ae/nib/tools/registry/module.ae` | a2dd439 | supersession; started/superseded/finished log records |
 | `src/tools/bash/jail.zig` | 304 | `ae/nib/tools/jail/module.ae` | a2dd439 | Landlock in jail/landlock.c (stand-in); probe cached per Tools, not per process |
@@ -123,11 +123,11 @@ pins                     AE_PIN / AEB_REF the port is verified against
 | `src/provider/responses.zig` | 1033 | `ae/nib/provider/responses/module.ae` | a2dd439 | SSE only; no Codex auth/WebSocket or web search |
 | `src/provider/openai.zig` | 428 | `ae/nib/provider/openai/module.ae` | a2dd439 | HTTP errors other than 401 carry the body (64 KiB), as upstream |
 | `src/provider/sse.zig` | 52 | `ae/nib/provider/sse/module.ae` | a2dd439 | plus fixed/live line sources |
-| `src/provider/timing.zig` | 319 | `ae/nib/provider/model_timing/module.ae` | a2dd439 | renamed: asks/aether-module-basename-collision.md |
+| `src/provider/timing.zig` | 319 | `ae/nib/provider/timing/module.ae` | a2dd439 | |
 | `src/provider/body.zig`, `cancel.zig`, `idle.zig` | 393 | `ae/nib/provider/http/module.ae` | a2dd439 | a request thread plus a polling reader on std.http.client |
 | `src/provider/codex_ws.zig`, `websocket.zig` | 523 | not ported |  | policy: API keys only |
 | `src/config.zig` | 1680 | `ae/nib/config/module.ae`, `ae/nib/config/env/module.ae` | a2dd439 | no Codex provider ([codex] validated and ignored); default service anthropic |
-| `src/mcp.zig`, `src/mcp/*` | 700 | `ae/nib/mcp/module.ae`, `mcp/mcp_index`, `mcp/mcp_headers`, `mcp/mcp_transport` | a2dd439 | stdio over os.run_stdio (newline-delimited JSON-RPC; cwd and stderr via sh; kill by pid, no process group); Streamable HTTP on std.http.client from a worker thread; no environment proxy |
+| `src/mcp.zig`, `src/mcp/*` | 700 | `ae/nib/mcp/module.ae`, `mcp/mcp_index`, `mcp/mcp_headers`, `mcp/mcp_transport` | a2dd439 | stdio over os.run_stdio (newline-delimited JSON-RPC; stderr discarded and cwd set by os.run_stdio; kill by pid, no process group); Streamable HTTP on std.http.client from a worker thread; no environment proxy |
 | `src/main.zig` | 311 | `ae/main.ae` | a2dd439 | ask, js, login/logout, help, version, __jail; bare `nib` opens the TUI (`run_tui_`); `nib replay` with its three error texts; no update |
 | `src/replay.zig` | 541 | `ae/nib/run_replay/module.ae` | a2dd439 | renamed (basename `replay` is the core's) |
 | `src/image.zig` | 324 | `ae/nib/image/module.ae` | a2dd439 | images are JSON texts (the log's `images` entries); binary-safe reads; SHA-256 hash name; Attached/Target for the Run's images; pastedPath, and read_pasted for the TUI's stat-then-read |
@@ -252,8 +252,6 @@ unpatched: every non-TUI Chat case passes except the four that need tools.agent.
 **Stand-ins (marked, each with an ask).** `ae/nib/sysgap` grows pwrite
 (asks/aether-fs-stat-flock-exclusive.md item 6), SIGINT/SIGTERM as a polled
 flag and stdin echo (asks/aether-signal-flag-and-tty-echo.md).
-`nib.provider.model_timing` is named to dodge
-asks/aether-module-basename-collision.md.
 
 **Differences kept on purpose or by gap.** No Codex provider: with nothing
 configured the default service is anthropic (upstream: codex), a `[codex]`
@@ -532,3 +530,22 @@ then passing on reruns, on the old binary as on the new: on macOS
 `test_step_limit_does_not_wait_for_detached_jobs` (5/5 on rerun).
 `aeb .tests.ae`, `tools/tui_tests.sh` and `tools/check_layers.sh` are green
 on all three hosts.
+
+## Aether 0.914.0: workarounds removed (2026-11-14)
+
+aether #3694 (0.914.0) fixed six of this port's asks; their stand-ins are
+gone. `xs.push(f())` keeps the struct's strings (agent_tree pushes the row
+directly); `commands.Choice[] x = []` parses, so `commands.no_choices()` is
+deleted; `nib.provider.timing` has its upstream name again (the qualified-type
+basename collision with `nib.sandbox.timing` is fixed); std.ipc never raises
+SIGPIPE, so `sysgap.ignore_sigpipe` is deleted; `os.run_stdio` takes
+`stderr_to:` and `cwd:`, so tools.process starts the program directly instead
+of through `sh -c`; `ae run` exits non-zero when a spec fails, so
+`tools/tui_tests.sh` reads the exit code alone. A `ptr` passed as a `string`
+is now a compile error (E0202). Pins: AE_PIN 0.914.0.
+
+Verified on 0.914.0: `aeb .tests.ae`, `tools/check_layers.sh`,
+`tools/tui_tests.sh` green on macOS arm64, ae-x64 and cachyos; upstream e2e
+cachyos 29/30 and ae-x64 29/30 (left: the Codex half of `test_effort`, by
+policy). ae-x64 now runs Ubuntu's HWE kernel 6.8 (was 5.15), so Landlock ABI
+2+ holds there and its sandbox cases pass. macOS unchanged at 23/30.

@@ -21,3 +21,5 @@ with "" meaning /dev/null.
 Stand-in: `nib.tools.process.run_lines` runs the child through
 `/bin/sh -c 'exec "$@" 2>/dev/null' sh <argv…>` (exec keeps the pid, so
 TERM/KILL still reach the child).
+
+**RESOLVED** in Aether 0.914.0 (aether #3694, 2026-11-14); the stand-in is removed from the port.

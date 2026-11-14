@@ -40,3 +40,5 @@ and prints 1 and 2. With only `a.timing` in the program (`one.ae`) it works.
 Probably the type-qualifier lookup is keyed by basename program-wide rather
 than per importing file (compare the earlier basename-collision fix for
 qualified calls, PR #2268).
+
+**RESOLVED** in Aether 0.914.0 (aether #3694, 2026-11-14); the stand-in is removed from the port.

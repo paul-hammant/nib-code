@@ -2140,7 +2140,7 @@ service_lister_(a: *App) -> fn {
 // Rows of the service menu; `current` is marked, `arg` decides whether
 // sign-out rows appear.
 service_choices(envp: ptr, home: string, current: string, arg: string) -> commands.Choice[] {
-    out = commands.no_choices()
+    commands.Choice[] out = []
     lst, err = auth.services(envp, home)
     if err != "" || lst == null {
         return out

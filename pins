@@ -23,7 +23,11 @@
 # in a loop) let ae/term's surface loops store one blank again. std.posix.regex
 # (#3654, 0.912.0) is not used. Verified: aeb .tests.ae, tools/tui_tests.sh and
 # ae/tests/upstream-e2e.sh on macOS arm64, ae-x64 and cachyos.
-AE_PIN=0.912.0
+# 0.914.0 (2026-11-14): aether #3694 fixes six asks and more (push of a call result,
+# qualified slice locals, basename collision on qualified types, ptr as string,
+# ipc SIGPIPE, run_stdio stderr_to/cwd, `ae run` exit on a failing spec); their
+# stand-ins are removed in the same commit.
+AE_PIN=0.914.0
 
 # v0.344 (2026-11-12): aether.program and aether.program_test with lib().
 AEB_REF=v0.344

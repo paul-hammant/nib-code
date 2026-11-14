@@ -9,7 +9,7 @@ import std.list
 @source("sysgap.c")
 
 exports(Stat, new_stat, stat, errname, lock_open, try_lock, close, fd_size, fd_truncate,
-        create_excl, write_all, pwrite_all, watch_signals, ignore_sigpipe, signal_received, stdin_echo, environ, fchmod, fsync, rename, unlink, chmod, mkdir,
+        create_excl, write_all, pwrite_all, watch_signals, signal_received, stdin_echo, environ, fchmod, fsync, rename, unlink, chmod, mkdir,
         KIND_FILE, KIND_DIR, KIND_LINK, KIND_OTHER, ENOENT_NAME)
 
 const KIND_FILE = 1
@@ -38,7 +38,6 @@ extern nibsys_create_excl(path: string, mode: int) -> int
 extern nibsys_write_all(fd: int, data: string, n: long) -> int
 extern nibsys_pwrite_all(fd: int, data: string, n: long, offset: long) -> int
 extern nibsys_watch_signals() -> int
-extern nibsys_ignore_sigpipe() -> int
 extern nibsys_stdin_echo(on: int) -> int
 extern nibsys_signal_received() -> int
 extern nibsys_fchmod(fd: int, mode: int) -> int
@@ -80,7 +79,6 @@ pwrite_all(fd: int, data: string, offset: long) -> int { return nibsys_pwrite_al
 // Turns stdin's terminal echo on (1) or off (0); 1 if stdin is a terminal.
 stdin_echo(on: int) -> int { return nibsys_stdin_echo(on) }
 watch_signals() -> int { return nibsys_watch_signals() }
-ignore_sigpipe() -> int { return nibsys_ignore_sigpipe() }
 signal_received() -> int { return nibsys_signal_received() }
 fchmod(fd: int, mode: int) -> int { return nibsys_fchmod(fd, mode) }
 fsync(fd: int) -> int { return nibsys_fsync(fd) }
